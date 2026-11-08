@@ -434,6 +434,11 @@ pub enum ShardMapError {
     #[error("`{SHARD_MAP_OPERATION_NAME}` expects {expected} global input type(s) but got {actual}")]
     InputTypeCountMismatch { expected: usize, actual: usize },
 
+    #[error(
+        "`{SHARD_MAP_OPERATION_NAME}` input index {input_index} is out of bounds for {input_count} input sharding(s)"
+    )]
+    InputIndexOutOfBounds { input_index: usize, input_count: usize },
+
     #[error("`{SHARD_MAP_OPERATION_NAME}` expects {expected} global output type(s) but got {actual}")]
     OutputTypeCountMismatch { expected: usize, actual: usize },
 
@@ -844,9 +849,10 @@ impl ShardMapBoundary {
         self.output_shardings.as_slice()
     }
 
-    /// Returns the active manual mesh axes of this manual computation, in mesh order. The list is non-empty and names
-    /// only mesh axes of type [`Manual`](MeshAxisType::Manual). The body runs once per device coordinate along these
-    /// axes and may use them as named axes of collectives.
+    /// Returns the active manual mesh axes of this manual computation, in mesh order. Every listed axis has type
+    /// [`Manual`](MeshAxisType::Manual). The list can be empty for an internally derived boundary, such as when
+    /// batching releases every active manual axis. The body runs once per device coordinate along the listed axes
+    /// and may use them as named axes of collectives.
     #[inline]
     pub fn manual_axes(&self) -> &[String] {
         self.manual_axes.as_slice()
@@ -878,21 +884,21 @@ impl ShardMapBoundary {
     ///
     /// # Parameters
     ///
-    ///   - `input_index`: Index of the input sharding to use, which must be less than the number of input shardings.
+    ///   - `input_index`: Index of the input sharding to use.
     ///   - `input_type`: Caller's global type of that input.
     ///
     /// # Errors
     ///
-    /// Returns [`ShardMapError::InputMeshMismatch`] when `input_type` carries a sharding over a mesh whose axes differ
-    /// from those of [`Self::mesh`], [`ShardMapError::ReductionStateMismatch`] when the unreduced or reduced axes of
+    /// Returns [`ShardMapError::InputIndexOutOfBounds`] when `input_index` does not identify an input sharding,
+    /// [`ShardMapError::InputMeshMismatch`] when `input_type` carries a sharding over a mesh whose axes differ from
+    /// those of [`Self::mesh`], [`ShardMapError::ReductionStateMismatch`] when the unreduced or reduced axes of
     /// `input_type` along the axes that the input sharding governs differ from those of the input sharding, and the
     /// sharding errors of applying the input sharding otherwise.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `input_index` is not less than the number of input shardings.
     pub fn global_input_type(&self, input_index: usize, input_type: &ArrayType) -> Result<ArrayType, ShardMapError> {
-        let sharding = &self.input_shardings[input_index];
+        let sharding = self
+            .input_shardings
+            .get(input_index)
+            .ok_or(ShardMapError::InputIndexOutOfBounds { input_index, input_count: self.input_shardings.len() })?;
         self.validate_input_mesh(input_type.sharding(), input_index)?;
         let carried_state =
             self.carried_reduction_state(sharding, input_type.sharding(), ShardMapValueKind::Input, input_index)?;
@@ -912,26 +918,26 @@ impl ShardMapBoundary {
     ///
     /// # Parameters
     ///
-    ///   - `input_index`: Index of the input sharding to use, which must be less than the number of input shardings.
+    ///   - `input_index`: Index of the input sharding to use.
     ///   - `global_input_type`: Global input type associated with that input, which must have a static shape.
     ///
     /// # Errors
     ///
-    /// Returns [`ShardMapError::ReductionStateMismatch`] when the unreduced or reduced axes of `global_input_type`
-    /// along the axes that the input sharding governs differ from those of the input sharding (the local type takes
-    /// its reduction state along those axes from the input sharding, so such a global type is not one that the input
+    /// Returns [`ShardMapError::InputIndexOutOfBounds`] when `input_index` does not identify an input sharding,
+    /// [`ShardMapError::ReductionStateMismatch`] when the unreduced or reduced axes of `global_input_type` along the
+    /// axes that the input sharding governs differ from those of the input sharding (the local type takes its
+    /// reduction state along those axes from the input sharding, so such a global type is not one that the input
     /// sharding places), [`ShardMapError::DynamicShapeNotSupported`] for a dynamic global shape, and the rank,
     /// divisibility, and sharding errors of the derivation otherwise.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `input_index` is not less than the number of input shardings.
     pub fn local_input_type(
         &self,
         input_index: usize,
         global_input_type: &ArrayType,
     ) -> Result<ArrayType, ShardMapError> {
-        let boundary_sharding = &self.input_shardings[input_index];
+        let boundary_sharding = self
+            .input_shardings
+            .get(input_index)
+            .ok_or(ShardMapError::InputIndexOutOfBounds { input_index, input_count: self.input_shardings.len() })?;
         let carried_state = self.carried_reduction_state(
             boundary_sharding,
             global_input_type.sharding(),
@@ -939,7 +945,24 @@ impl ShardMapBoundary {
             input_index,
         )?;
         let global_shape = Self::static_dimensions(global_input_type, ShardMapValueKind::Input, input_index)?;
-        let local_shape = self.local_input_shape(input_index, &global_shape)?;
+        let partition_counts =
+            self.manual_partition_counts(boundary_sharding, global_shape.len(), ShardMapValueKind::Input, input_index)?;
+        let local_shape = global_shape
+            .iter()
+            .zip(partition_counts)
+            .enumerate()
+            .map(|(dimension, (&dimension_size, manual_partition_count))| {
+                if dimension_size % manual_partition_count != 0 {
+                    return Err(ShardMapError::UnevenManualPartition {
+                        input_index,
+                        dimension,
+                        dimension_size,
+                        manual_partition_count,
+                    });
+                }
+                Ok(dimension_size / manual_partition_count)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let local_sharding =
             self.without_unchecked_reduction_state(boundary_sharding.local_sharding(self.manual_axes())?)?;
         let local_varying_axes = global_input_type
@@ -960,20 +983,6 @@ impl ShardMapBoundary {
         .with_layout(global_input_type.layout().cloned())
         .with_memory(global_input_type.memory())
         .with_sharding(carried_state.apply(local_sharding.with_varying_manual_axes(local_varying_axes)?)?)?)
-    }
-
-    /// Returns the active manual axes along which input `input_index` is replicated, in mesh order, which are the
-    /// manual axes that its input sharding does not shard over. Every device along such an axis holds its own copy of
-    /// the whole referent of a reference input, so a reference input replicated along some manual axis may only be
-    /// mutated in ways that keep those copies identical (i.e., with values and indices that are invariant along the
-    /// axis).
-    ///
-    /// # Panics
-    ///
-    /// Panics when `input_index` is not less than the number of input shardings.
-    fn input_replicated_manual_axes(&self, input_index: usize) -> Vec<String> {
-        let sharded_axes = Self::sharded_manual_axes(&self.input_shardings[input_index], &self.manual_axis_names());
-        self.manual_axes.iter().filter(|axis| !sharded_axes.contains(axis.as_str())).cloned().collect()
     }
 
     /// Returns the active manual axes along which the copies of a value that `sharding` places are plain replicas,
@@ -1209,48 +1218,6 @@ impl ShardMapBoundary {
         })
     }
 
-    /// Returns the local body shape for input `input_index`, which is the shape seen inside the body for the
-    /// corresponding global input shape, with each dimension divided by its manual partition count under the input
-    /// sharding. Only active manual axes reduce the local shape, and free axes remain global from the body's point of
-    /// view.
-    fn local_input_shape(&self, input_index: usize, global_shape: &[usize]) -> Result<Vec<usize>, ShardMapError> {
-        let sharding = &self.input_shardings[input_index];
-        let partition_counts =
-            self.manual_partition_counts(sharding, global_shape.len(), ShardMapValueKind::Input, input_index)?;
-        global_shape
-            .iter()
-            .zip(partition_counts)
-            .enumerate()
-            .map(|(dimension, (&dimension_size, manual_partition_count))| {
-                if dimension_size % manual_partition_count != 0 {
-                    return Err(ShardMapError::UnevenManualPartition {
-                        input_index,
-                        dimension,
-                        dimension_size,
-                        manual_partition_count,
-                    });
-                }
-                Ok(dimension_size / manual_partition_count)
-            })
-            .collect()
-    }
-
-    /// Returns the global output types for the provided local body output types, one per output sharding, through
-    /// [`Self::global_output_type`].
-    fn global_output_types(&self, local_output_types: &[ArrayType]) -> Result<Vec<ArrayType>, ShardMapError> {
-        if local_output_types.len() != self.output_shardings.len() {
-            return Err(ShardMapError::OutputTypeCountMismatch {
-                expected: self.output_shardings.len(),
-                actual: local_output_types.len(),
-            });
-        }
-        local_output_types
-            .iter()
-            .enumerate()
-            .map(|(output_index, local_output_type)| self.global_output_type(output_index, local_output_type))
-            .collect()
-    }
-
     /// Returns whether output `output_index` of a boundary without manual-variation checking carries reduction state
     /// along an active manual axis. Forwarding such an output as a residual would pass it back to the residual body
     /// with that state (e.g., an unreduced output as an unreduced input, which the reference backend cannot interpret),
@@ -1350,26 +1317,9 @@ impl ShardMapBoundary {
             .into_iter()
             .filter(|axis_name| !manual_axis_names.contains(axis_name.as_str()))
             .collect::<BTreeSet<_>>();
-        let global_shape = self.global_output_shape(output_index, local_shape)?;
-        Ok(ArrayType::new(
-            local_output_type.data_type(),
-            Shape::new(global_shape.into_iter().map(Dimension::Static).collect()),
-        )
-        .with_layout(local_output_type.layout().cloned())
-        .with_sharding(
-            carried_state
-                .apply(output_sharding.clone().with_varying_manual_axes(surviving_varying_axes)?)?
-                .with_mesh(self.caller_mesh().clone())?,
-        )?)
-    }
-
-    /// Returns the global shape of output `output_index` whose local shape is `local_shape`, scaling each dimension by
-    /// its manual partition count under the output sharding.
-    fn global_output_shape(&self, output_index: usize, local_shape: Vec<usize>) -> Result<Vec<usize>, ShardMapError> {
-        let sharding = &self.output_shardings[output_index];
         let partition_counts =
-            self.manual_partition_counts(sharding, local_shape.len(), ShardMapValueKind::Output, output_index)?;
-        local_shape
+            self.manual_partition_counts(output_sharding, local_shape.len(), ShardMapValueKind::Output, output_index)?;
+        let global_shape = local_shape
             .into_iter()
             .zip(partition_counts)
             .enumerate()
@@ -1380,7 +1330,17 @@ impl ShardMapBoundary {
                     }
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ArrayType::new(
+            local_output_type.data_type(),
+            Shape::new(global_shape.into_iter().map(Dimension::Static).collect()),
+        )
+        .with_layout(local_output_type.layout().cloned())
+        .with_sharding(
+            carried_state
+                .apply(output_sharding.clone().with_varying_manual_axes(surviving_varying_axes)?)?
+                .with_mesh(self.caller_mesh().clone())?,
+        )?)
     }
 
     /// Returns the manual partition count of every dimension of a value of rank `rank` that `sharding` places, which is
@@ -1850,7 +1810,17 @@ impl ShardMapOperation {
             .map(|r#type| boundary_array_type(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        let mut global_outputs = boundary.global_output_types(&referents)?;
+        if referents.len() != boundary.output_shardings.len() {
+            return Err(ShardMapError::OutputTypeCountMismatch {
+                expected: boundary.output_shardings.len(),
+                actual: referents.len(),
+            });
+        }
+        let mut global_outputs = referents
+            .iter()
+            .enumerate()
+            .map(|(output_index, local_output_type)| boundary.global_output_type(output_index, local_output_type))
+            .collect::<Result<Vec<_>, _>>()?;
         // References retain their ownership and replicated-state contract even when array output replication is trusted.
         if boundary.check_manual_variation()
             && !boundary.check_output_replication()
@@ -2085,8 +2055,10 @@ impl Operation for ShardMapOperation {
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
         let name = self.name();
-        let body_interface =
-            shard_map_body_interface(region_interfaces, self.input_types.len(), self.output_types.len())?;
+        check_count!("region", region_interfaces, 1, TypeError);
+        let body_interface = &region_interfaces[0];
+        check_count!("body input", body_interface.input_types(), self.input_types.len(), TypeError);
+        check_count!("body output", body_interface.output_types(), self.output_types.len(), TypeError);
         Self::validate_body_effects(body_interface.effects()).map_err(TypeError::custom)?;
         check_count!("input sharding", self.boundary.input_shardings(), self.input_types.len(), TypeError);
         check_count!("output sharding", self.boundary.output_shardings(), self.output_types.len(), TypeError);
@@ -3396,7 +3368,28 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
         let input_shardings = inputs
             .parameters()
             .enumerate()
-            .map(|(input_index, input)| inferred_input_sharding(input_index, input.r#type().as_ref(), &mesh))
+            .map(|(input_index, input)| {
+                let input_type = input.r#type();
+                let Some(sharding) = input_type.sharding() else {
+                    return Err(ShardMapError::InputShardingNotInferable {
+                        input_index,
+                        input_type: Box::new(input_type.into_owned()),
+                    });
+                };
+                if !sharding.mesh().has_same_topology(&mesh) {
+                    return Err(ShardMapError::InputMeshMismatch {
+                        input_index,
+                        expected: mesh.clone(),
+                        actual: sharding.mesh().clone(),
+                    });
+                }
+                // Inference re-expresses the caller's placement and reduction state over the map's mesh. Its manual
+                // variation belongs to enclosing regions and is carried by the input type instead.
+                Ok(Sharding::new(mesh.clone(), sharding.dimensions().to_vec())?
+                    .with_unreduced_axes(sharding.unreduced_axes().clone())?
+                    .with_unreduced_kind(sharding.unreduced_kind())?
+                    .with_reduced_axes(sharding.reduced_axes().clone())?)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let input_shardings = Input::To::<Sharding>::from_parameters(inputs.parameter_structure(), input_shardings)?;
         self.shard_map(function, inputs, mesh, input_shardings, output_shardings, options)
@@ -4944,19 +4937,6 @@ fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
     }
 }
 
-/// Validates the interface of the single `body` region of a `shard_map` and returns it.
-fn shard_map_body_interface<T: Type>(
-    region_interfaces: &[RegionInterface<T>],
-    input_count: usize,
-    output_count: usize,
-) -> Result<&RegionInterface<T>, TypeError> {
-    check_count!("region", region_interfaces, 1, TypeError);
-    let interface = &region_interfaces[0];
-    check_count!("body input", interface.input_types(), input_count, TypeError);
-    check_count!("body output", interface.output_types(), output_count, TypeError);
-    Ok(interface)
-}
-
 /// Returns the per-device `inputs` of the region operation named `operation_name` that runs in lockstep as
 /// [`LockstepValue`]s, after validating that the input of every device has the type of the input of device zero.
 /// Devices whose inputs differ in type (e.g., in the extent of the iteration count of a `scan`, which is its trip
@@ -5367,9 +5347,9 @@ fn body_has_dynamically_shaped_values<V: Value<Type = ArrayIrType>, O: Operation
 /// The local type of the edge is the residual's own type, except that the edge of a reference residual carries its
 /// referent (i.e., a snapshot of its state), that a first-class dimension crosses as its integer scalar value (refer
 /// to [`residual_edge_type`]), and that a scalar that varies along some active manual axes gains a leading dimension of
-/// size one (refer to [`promoted_residual_type`]). A residual that is replicated along every active manual axis crosses
-/// as itself, under its local placement. A residual that varies along some active manual axes has one distinct value
-/// per device along those axes, so its leading dimension is tiled along them (in mesh order and ahead of the free axes
+/// size one. A residual that is replicated along every active manual axis crosses as itself, under its local placement.
+/// A residual that varies along some active manual axes has one distinct value per device along those axes, so its
+/// leading dimension is tiled along them (in mesh order and ahead of the free axes
 /// that already place that dimension), and the global edge concatenates the local values along that dimension. This is
 /// JAX's residual specification `P(order_wrt_mesh(mesh, vma))` in `_shard_map_partial_eval` and
 /// `_shard_map_linearize`, and, because the local shard is the residual itself, neither body converts a non-scalar
@@ -5430,7 +5410,13 @@ fn residual_edge(
         let sharding = boundary_sharding(&local_sharding)?;
         return Ok(ResidualEdge { global_type: local_type.clone(), sharding, local_type });
     }
-    let boundary_type = promoted_residual_type(&local_type, boundary).map_err(ProgramError::from)?;
+    // A varying scalar needs a dimension for its global edge to tile. The inserted dimension preserves its element
+    // and variation metadata, and residuals with an existing dimension cross with their local type unchanged.
+    let boundary_type = if local_type.rank() == 0 {
+        local_type.with_inserted_dimension(0, Dimension::Static(1)).map_err(ProgramError::from)?
+    } else {
+        local_type.clone()
+    };
     let local_sharding = boundary_type.sharding().unwrap();
     let mut dimensions = local_sharding.dimensions().to_vec();
     dimensions[0] = match &dimensions[0] {
@@ -5473,17 +5459,6 @@ fn residual_manual_axes(local_type: &ArrayType, boundary: &ShardMapBoundary) -> 
         .collect()
 }
 
-/// Returns the local type with which a residual of local type `local_type` crosses a `shard_map` boundary (refer to
-/// [`residual_edge`]), which is the residual's own type, except that a scalar that varies along some active manual axis
-/// gains a leading dimension of size one, without changing its element or variation metadata, so that its global edge
-/// has a dimension to tile along those axes.
-fn promoted_residual_type(local_type: &ArrayType, boundary: &ShardMapBoundary) -> Result<ArrayType, TypeError> {
-    if local_type.rank() != 0 || residual_manual_axes(local_type, boundary).is_empty() {
-        return Ok(local_type.clone());
-    }
-    local_type.with_inserted_dimension(0, Dimension::Static(1))
-}
-
 /// Returns the local array type that carries a residual edge of local type `local_type`, which must be an array or a
 /// first-class dimension, across a `shard_map` boundary. An array residual crosses as itself. A first-class dimension
 /// residual crosses as its integer scalar value, typed as varying over every active manual axis because dimension types
@@ -5509,8 +5484,8 @@ fn residual_edge_type(local_type: &ArrayIrType, boundary: &ShardMapBoundary) -> 
 }
 
 /// Rewraps a body's boundary with element-preserving conversions. Arrays only change their shape (e.g., between a
-/// varying scalar residual and its [`promoted_residual_type`]), and reference positions must remain unchanged. A
-/// first-class dimension leaves a body as its integer scalar value, placed on the mesh of the target edge and marked
+/// varying scalar residual and its promoted type), and reference positions must remain unchanged. A first-class
+/// dimension leaves a body as its integer scalar value, placed on the mesh of the target edge and marked
 /// varying over that edge's manual axes before it is promoted, and re-enters a body by recovering that scalar and
 /// redefining the same dimension variable from it (refer to [`residual_edge_type`]). Only the first input edge that
 /// carries a given dimension identity redefines it. Later edges that carry an already defined identity reuse the value
@@ -6674,7 +6649,11 @@ fn local_accumulator_destinations<V: Value<Type = ArrayIrType>, O: Operation<Typ
             let mutated = operation.input_types[index].is_reference()
                 && analysis.is_mutated(ReferenceRoot::RegionInput { region: body.id(), input_index: index });
             *kind == CotangentDestinationKind::Reference
-                && !operation.boundary.input_replicated_manual_axes(index).is_empty()
+                && operation.boundary.manual_axes.iter().any(|axis_name| {
+                    !operation.boundary.input_shardings[index].dimensions().iter().any(
+                        |dimension| matches!(dimension, ShardingDimension::Sharded(axes) if axes.contains(axis_name)),
+                    )
+                })
                 && !mutated
         })
         .collect())
@@ -7256,30 +7235,6 @@ fn validate_parameter_structure<P: Parameter, Value: Parameterized<P>>(
         }));
     }
     Ok(())
-}
-
-/// Returns the input sharding that the `shard_map_with_inferred_input_shardings` function of [`ShardMap`] infers for
-/// input `input_index` of type `input_type` over `mesh`, which is the sharding of that type re-expressed over `mesh`
-/// with its placement and reduction state but without its manual variation, which enclosing manual regions own.
-fn inferred_input_sharding(
-    input_index: usize,
-    input_type: &ArrayType,
-    mesh: &LogicalMesh,
-) -> Result<Sharding, ShardMapError> {
-    let Some(sharding) = input_type.sharding() else {
-        return Err(ShardMapError::InputShardingNotInferable { input_index, input_type: Box::new(input_type.clone()) });
-    };
-    if !sharding.mesh().has_same_topology(mesh) {
-        return Err(ShardMapError::InputMeshMismatch {
-            input_index,
-            expected: mesh.clone(),
-            actual: sharding.mesh().clone(),
-        });
-    }
-    Ok(Sharding::new(mesh.clone(), sharding.dimensions().to_vec())?
-        .with_unreduced_axes(sharding.unreduced_axes().clone())?
-        .with_unreduced_kind(sharding.unreduced_kind())?
-        .with_reduced_axes(sharding.reduced_axes().clone())?)
 }
 
 /// Returns the sharding over `mesh` of a rank-`rank` value that the `shard_map_along` function of [`ShardMap`] places
@@ -8957,6 +8912,26 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_boundary_global_input_type_rejects_invalid_input_index() {
+        let boundary = ShardMapBoundary::new(manual_mesh(), vec![sharded_along_x()], Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            boundary.global_input_type(1, &f32_vector_type(4)),
+            Err(ShardMapError::InputIndexOutOfBounds { input_index: 1, input_count: 1 }),
+        );
+        assert_eq!(
+            boundary.global_input_type(usize::MAX, &f32_vector_type(4)),
+            Err(ShardMapError::InputIndexOutOfBounds { input_index: usize::MAX, input_count: 1 }),
+        );
+        let boundary = ShardMapBoundary::new(manual_mesh(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let error = boundary.global_input_type(0, &f32_vector_type(4)).unwrap_err();
+        assert_eq!(error, ShardMapError::InputIndexOutOfBounds { input_index: 0, input_count: 0 });
+        assert_eq!(
+            error.to_string(),
+            format!("`{SHARD_MAP_OPERATION_NAME}` input index 0 is out of bounds for 0 input sharding(s)")
+        );
+    }
+
+    #[test]
     fn test_shard_map_boundary_global_input_type_rejects_mismatched_reduced_axes() {
         let mesh = manual_mesh_2x2();
         let input_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::replicated()])
@@ -9089,6 +9064,24 @@ mod tests {
             Ok(f32_vector_type(4)
                 .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["x", "y"]).unwrap())
                 .unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_boundary_local_input_type_rejects_invalid_input_index() {
+        let boundary = ShardMapBoundary::new(manual_mesh(), vec![sharded_along_x()], Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            boundary.local_input_type(1, &f32_vector_type(4)),
+            Err(ShardMapError::InputIndexOutOfBounds { input_index: 1, input_count: 1 }),
+        );
+        assert_eq!(
+            boundary.local_input_type(usize::MAX, &f32_vector_type(4)),
+            Err(ShardMapError::InputIndexOutOfBounds { input_index: usize::MAX, input_count: 1 }),
+        );
+        let boundary = ShardMapBoundary::new(manual_mesh(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        assert_eq!(
+            boundary.local_input_type(0, &f32_vector_type(4)),
+            Err(ShardMapError::InputIndexOutOfBounds { input_index: 0, input_count: 0 }),
         );
     }
 
@@ -9329,25 +9322,6 @@ mod tests {
                 )
                 .unwrap()),
         );
-    }
-
-    #[test]
-    fn test_shard_map_boundary_input_replicated_manual_axes() {
-        let mesh = manual_mesh_2x2();
-        let boundary = ShardMapBoundary::new(
-            mesh.clone(),
-            vec![
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap(),
-                Sharding::replicated(mesh, 1),
-            ],
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
-        assert_eq!(boundary.input_replicated_manual_axes(0), vec!["y".to_string()]);
-        assert_eq!(boundary.input_replicated_manual_axes(1), Vec::<String>::new());
-        assert_eq!(boundary.input_replicated_manual_axes(2), vec!["x".to_string(), "y".to_string()]);
     }
 
     #[test]
@@ -23362,6 +23336,65 @@ mod tests {
                         [type=f32[2][sharding={mesh<['x'=2:manual]>, [{'x'}]}]]
                 in (%0, %1)"
             },
+        );
+    }
+
+    #[test]
+    fn test_local_accumulator_destinations() {
+        let mesh = manual_mesh_2x2();
+        let boundary = ShardMapBoundary::new(
+            mesh.clone(),
+            vec![
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap(),
+                Sharding::replicated(mesh, 1),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let input_types = vec![f32_vector_type(4); 3];
+        let local_types = input_types
+            .iter()
+            .enumerate()
+            .map(|(index, input_type)| ArrayIrType::Array(boundary.local_input_type(index, input_type).unwrap()))
+            .collect();
+        let body = build_program(local_types, |_, _| Vec::new());
+        assert_eq!(
+            body.to_string(),
+            indoc! {"
+                lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
+                %1:f32[1][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}], \
+                %2:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] .
+                in ()"
+            },
+        );
+        let operation = ShardMapOperation::from_program(
+            &body,
+            input_types.into_iter().map(ArrayIrType::Array).collect::<Vec<_>>(),
+            boundary,
+        )
+        .unwrap();
+        // Reference destinations can accumulate locally only when some manual axis replicates the input.
+        assert_eq!(
+            local_accumulator_destinations(
+                &operation,
+                body.entry_region_ref(),
+                &[CotangentDestinationKind::Reference; 3]
+            ),
+            Ok(vec![true, false, true]),
+        );
+        assert_eq!(
+            local_accumulator_destinations(
+                &operation,
+                body.entry_region_ref(),
+                &[
+                    CotangentDestinationKind::Return,
+                    CotangentDestinationKind::Ignore,
+                    CotangentDestinationKind::Reference
+                ],
+            ),
+            Ok(vec![false, false, true]),
         );
     }
 
