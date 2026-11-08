@@ -1,4 +1,4 @@
-use std::borrow::Borrow;
+use std::borrow::{Borrow, Cow};
 use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
@@ -1629,7 +1629,29 @@ impl Shape {
     /// Returns this shape after simultaneously renaming every dynamic dimension variable.
     #[inline]
     pub fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Self {
-        Self::new(self.dimensions.iter().map(|dimension| dimension.rename_type_identities(renaming)).collect())
+        self.map_dimensions(|_, dimension| dimension.rename_type_identities(renaming)).into_owned()
+    }
+
+    /// Maps every dimension in axis order, borrowing this shape when all mapped dimensions remain equal. The mapping
+    /// runs once per axis, including unchanged axes. A changed shape allocates its dimension vector only after the
+    /// first changed axis and preserves the unchanged prefix verbatim.
+    pub(crate) fn map_dimensions<F: FnMut(usize, &Dimension) -> Dimension>(&self, mut map_fn: F) -> Cow<'_, Self> {
+        let mut dimensions = None::<Vec<Dimension>>;
+        for (axis, dimension) in self.dimensions().iter().enumerate() {
+            let mapped = map_fn(axis, dimension);
+            if let Some(dimensions) = &mut dimensions {
+                dimensions.push(mapped);
+            } else if mapped != *dimension {
+                let mut changed = Vec::with_capacity(self.rank());
+                changed.extend_from_slice(&self.dimensions()[..axis]);
+                changed.push(mapped);
+                dimensions = Some(changed);
+            }
+        }
+        match dimensions {
+            Some(dimensions) => Cow::Owned(Self::new(dimensions)),
+            None => Cow::Borrowed(self),
+        }
     }
 }
 
@@ -2581,6 +2603,34 @@ mod tests {
         assert_eq!(format!("{s3}"), "[4, depth]");
         assert_eq!(format!("{s4}"), "[rows, 42, columns]");
         assert_eq!(format!("{s5}"), "[42, columns]");
+    }
+
+    #[test]
+    fn test_shape_map_dimensions() {
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let shape = Shape::new(vec![n.clone().into(), Dimension::Static(3), Dimension::Static(4)]);
+        let mut visited = Vec::new();
+        let unchanged = shape.map_dimensions(|axis, dimension| {
+            visited.push(axis);
+            dimension.clone()
+        });
+        assert!(matches!(&unchanged, Cow::Borrowed(_)));
+        assert_eq!(visited, vec![0, 1, 2]);
+        assert_eq!(unchanged.as_ref(), &shape);
+
+        let changed = shape.map_dimensions(
+            |axis, dimension| {
+                if axis == 0 { dimension.clone() } else { Dimension::Static(axis + 4) }
+            },
+        );
+        assert!(matches!(&changed, Cow::Owned(_)));
+        assert_eq!(changed.as_ref(), &Shape::new(vec![n.clone().into(), Dimension::Static(5), Dimension::Static(6)]));
+        assert_eq!(shape.dimensions(), &[n.into(), Dimension::Static(3), Dimension::Static(4)]);
+
+        let scalar = Shape::scalar();
+        assert!(matches!(scalar.map_dimensions(|_, _| panic!("a scalar has no dimensions")), Cow::Borrowed(_)));
+        let unchanged_rename = shape.rename_type_identities(&TypeIdentityRenaming::new());
+        assert!(Arc::ptr_eq(&shape.dimensions, &unchanged_rename.dimensions));
     }
 
     #[test]

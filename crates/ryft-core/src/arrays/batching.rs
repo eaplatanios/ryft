@@ -2092,8 +2092,11 @@ where
                 .iter()
                 .zip(unbatched_types.iter())
                 .map(|(input, unbatched_type)| -> Result<ArrayBatch<C::Value>, BatchingError> {
-                    let mut target_type = common_unbatched_type.as_ref().unwrap_or(unbatched_type).clone();
-                    target_type.data_type = unbatched_type.data_type();
+                    let target_type = common_unbatched_type
+                        .as_ref()
+                        .unwrap_or(unbatched_type)
+                        .clone()
+                        .with_data_type(unbatched_type.data_type());
                     let batched_type =
                         target_type.batched(batch_axis_position, axis_dimension.clone(), axis_sharding.clone())?;
                     if batched_type == *input.r#type() {
@@ -2735,13 +2738,9 @@ impl ArrayType {
             .transpose()
             .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
 
-        Ok(Self {
-            data_type: self.data_type(),
-            shape: Shape::new(dimensions),
-            layout: None,
-            sharding,
-            memory: self.memory(),
-        })
+        Ok(Self::new(self.data_type(), Shape::new(dimensions))
+            .with_memory(self.memory())
+            .with_sharding_unchecked(sharding))
     }
 }
 
