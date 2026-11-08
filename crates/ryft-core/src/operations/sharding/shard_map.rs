@@ -562,8 +562,6 @@ pub enum ShardMapError {
     BatchAxisPlacedOnManualAxisWithDeviceOrderedIo { axis_name: String },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl From<ProgramError> for ShardMapError {
     fn from(error: ProgramError) -> Self {
         let shard_map_error = match &error {
@@ -594,6 +592,7 @@ pub enum ShardMapValueKind {
 }
 
 impl Display for ShardMapValueKind {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Input => write!(formatter, "input"),
@@ -602,11 +601,11 @@ impl Display for ShardMapValueKind {
     }
 }
 
-/// Logical boundary metadata of one manual SPMD computation over a mesh, as carried by [`ShardMapOperation`], which is
-/// the [`LogicalMesh`] of the computation, one validated [`Sharding`] per global input and per global output, and the
-/// active manual mesh axes. Manual variation and output replication are checked by default. Output replication proof
-/// can be waived with [`Self::with_check_output_replication`], and body variation tracking with
-/// [`Self::with_check_manual_variation`].
+/// Logical boundary metadata of one manual Single Program Multiple Data (SPMD) computation over a mesh, as carried by a
+/// [`ShardMapOperation`], which is the [`LogicalMesh`] of the computation, one validated [`Sharding`] per global input
+/// and per global output, and the active manual mesh axes. Manual variation and output replication are checked by
+/// default. Output replication proof can be waived with [`Self::with_check_output_replication`], and body variation
+/// tracking with [`Self::with_check_manual_variation`].
 ///
 /// The checked constructor [`ShardMapBoundary::new`] projects the provided input and output specifications into their
 /// type-level form, so [`Auto`](MeshAxisType::Auto) mesh axes are hidden while the active manual axes drive the body.
@@ -619,8 +618,8 @@ impl Display for ShardMapValueKind {
 /// typed as [`Explicit`](MeshAxisType::Explicit). Like JAX's `shard_map`, which retypes the caller's mesh only inside
 /// of its body, the outputs of such a map are then typed like the values of its caller.
 ///
-/// This type is the logical boundary model only and carries no backend state. Backends lower it, for example, to the
-/// `in_shardings`, `out_shardings`, and `manual_axes` attributes of Shardy's
+/// This type is the logical boundary model only and carries no backend state. Backends lower it,
+/// for example, to the `in_shardings`, `out_shardings`, and `manual_axes` attributes of Shardy's
 /// [`sdy.manual_computation`](https://openxla.org/shardy/sdy_dialect#sdymanual_computation-sdymanualcomputationop)
 /// operation. Refer to the [JAX `shard_map` guide](https://docs.jax.dev/en/latest/notebooks/shard_map.html) for more
 /// information on the underlying programming model.
@@ -645,6 +644,8 @@ pub struct ShardMapBoundary {
     /// Checking policy for the local body and its output replication promises.
     manual_variation_checks: ManualVariationChecks,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ShardMapBoundary {
     /// Creates a new [`ShardMapBoundary`] after validating and normalizing its input and output shardings (i.e., the
@@ -676,6 +677,7 @@ impl ShardMapBoundary {
     /// Returns [`ShardMapError::Sharding`] when `manual_axes` names an unknown or non-manual mesh axis or when a
     /// sharding is defined over a different mesh, [`ShardMapError::MeshHasNoManualAxes`] when `mesh` has no manual
     /// axis, and [`ShardMapError::FreeAxisPrecedesManualAxis`] when a free axis precedes an active manual axis.
+    #[inline]
     pub fn new(
         mesh: LogicalMesh,
         input_shardings: Vec<Sharding>,
