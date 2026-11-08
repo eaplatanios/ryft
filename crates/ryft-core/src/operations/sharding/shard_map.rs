@@ -1010,7 +1010,7 @@ impl ShardMapBoundary {
         output_index: usize,
         local_output_type: &ArrayType,
     ) -> Result<ArrayType, ShardMapError> {
-        let manual_axis_names = self.manual_axis_names();
+        let manual_axis_names = self.manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
         let local_shape = Self::static_extents(local_output_type, ShardMapValueKind::Output, output_index)?;
         let output_sharding = &self.output_shardings[output_index];
         let expected_current_varying_axes = self.tiled_manual_axes(output_sharding);
@@ -1378,7 +1378,7 @@ impl ShardMapBoundary {
                 shape_rank: rank,
             });
         }
-        let manual_axis_names = self.manual_axis_names();
+        let manual_axis_names = self.manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
         sharding
             .dimensions()
             .iter()
@@ -1400,11 +1400,6 @@ impl ShardMapBoundary {
                 ShardingDimension::Replicated | ShardingDimension::Unconstrained => Ok(1),
             })
             .collect()
-    }
-
-    /// Returns the names of the active manual axes as a set.
-    fn manual_axis_names(&self) -> HashSet<&str> {
-        self.manual_axes.iter().map(String::as_str).collect()
     }
 
     /// Returns this boundary's active manual axes along which `sharding` tiles a dimension, so that the local value
@@ -1598,45 +1593,22 @@ impl ShardMapBoundary {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Placement of the batch dimension that batching inserts into the mapped boundary positions of a [`ShardMapOperation`]
-/// (refer to [`ShardMapBoundary::batched_placement`]). Released manual axes and free axes partition the batch dimension
-/// of inputs and outputs alike. Gathered axes (i.e., active manual placement axes that the body uses) stay manual and
-/// do not partition the batch dimension of inputs, so every device along them receives every batch item, which is what
-/// per-item semantics requires, because each batch item needs the body at every coordinate along those axes. They tile
-/// the batch dimension of outputs instead, for which the batched body slices each device's block of the batch.
-struct BatchedPlacement {
-    /// Placement of the batch dimension of mapped inputs, which names only free axes of the batched map.
-    input_placement: ShardingDimension,
-
-    /// Placement of the batch dimension of mapped outputs, which names the gathered axes followed by the free axes of
-    /// the batched map.
-    output_placement: ShardingDimension,
-
-    /// Active manual axes of the batched map, which are those of the source map without the released axes.
-    manual_axes: Vec<String>,
-
-    /// Gathered axes, in placement order.
-    gathered_axes: Vec<String>,
-}
-
-/// Canonical operation name for [`ShardMapOperation`]. Program statistics and their cross-language test cases match
-/// this name, so it must not change.
+/// Canonical operation name for [`ShardMapOperation`].
 pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 
 /// [`Operation`] that runs its local `body` [`Region`] once per device coordinate along the active manual axes of a
 /// [`ShardMapBoundary`]. The body is not part of this payload. It is the one `body` region that the operation is bound
-/// with, which is authoritative for the local boundary types, so this payload carries only the manual SPMD boundary
-/// metadata that the body cannot represent (i.e., the [`ShardMapBoundary`], the declared global input and output types,
-/// and the output forwarding). Refer to the [module documentation](mod@crate::operations::sharding::shard_map) for an
+/// with, which is authoritative for the local boundary types, so this payload carries only the manual Single Program
+/// Multiple Data (SPMD) boundary metadata that the body cannot represent (i.e., the [`ShardMapBoundary`], the declared
+/// global input and output types, and the output forwarding). Refer to the
+/// [module documentation](mod@crate::operations::sharding::shard_map) for an
 /// overview of the programming model.
 ///
 /// A boundary position may be a reference under the contract in the ``# References Under `shard_map` `` section of the
 /// module documentation. A reference input `ref<T>` carries the global referent `T` (sharded like an array input by
 /// its input sharding) and reaches the body as `ref<T_local>`, the shard that the input sharding assigns to the
-/// executing device. A reference output must forward a reference input by identity, which the operation records in its
-/// output forwarding (derived by [`Self::from_program`] from the body's reference analysis) and reports through
+/// executing device. A reference output must forward a reference input by identity, which the operation records in
+/// its output forwarding (derived by [`Self::from_program`] from the body's reference analysis) and reports through
 /// [`Operation::reference_output_identity_input`]. An output whose forwarding is not declared is rejected by type
 /// inference, so a reference output is never accepted on provenance the operation cannot name.
 ///
@@ -1657,19 +1629,19 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// of the batch that its device holds along the gathered axes, and its batch dimension is tiled along them, ahead of
 /// the free placement axes. JAX instead splits the batch along such an axis and runs each batch item at a single
 /// coordinate along it, so that its collectives over the axis combine different batch items. Batching a map with
-/// mapped inputs or outputs therefore rejects a placement axis that an input or output sharding names
-/// ([`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`]), a placement that releases an active manual axis of a body with
+/// mapped inputs or outputs therefore rejects a placement axis that an input or output sharding names (with a
+/// [`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`]), a placement that releases an active manual axis of a body with
 /// the [`EffectClass::DeviceOrderedIo`] effect ([`ShardMapError::BatchAxisPlacedOnManualAxisWithDeviceOrderedIo`]), a
-/// gathered batch extent that the devices along the gathered axes do not divide
-/// ([`ShardMapError::BatchExtentNotDivisibleAlongUsedManualAxes`]), and a batched reference input of a map with gathered
-/// axes ([`ShardMapError::BatchedReferenceGatheredAlongUsedManualAxis`]). With manual-variation checking disabled, the
-/// body carries no variation labels, so it uses exactly the axes that its collectives and `axis_index` operations name,
-/// which suffices because every input is replicated along the placement axes. It also rejects a dynamic batch extent
-/// whenever a boundary position is mapped or the body uses the extent
-/// ([`ShardMapError::DynamicBatchExtentNotSupported`]), because boundary types are static (refer to the
-/// `# Static Boundaries` section below). A forwarded reference output keeps the batch axis of the reference input that
-/// it forwards, and an unbatched reference input is shared by every batch item, so writing a batched value into it is
-/// rejected.
+/// gathered batch extent that the devices along the gathered axes do not divide (with a
+/// [`ShardMapError::BatchExtentNotDivisibleAlongUsedManualAxes`]), and a batched reference input of a map with gathered
+/// axes (with a [`ShardMapError::BatchedReferenceGatheredAlongUsedManualAxis`]). With manual-variation checking
+/// disabled, the body carries no variation labels, so it uses exactly the axes that its collectives and `axis_index`
+/// operations name, which suffices because every input is replicated along the placement axes. It also rejects a
+/// dynamic batch extent whenever a boundary position is mapped or the body uses the extent (with a
+/// [`ShardMapError::DynamicBatchExtentNotSupported`]), because boundary types are static (refer to the `# Static
+/// Boundaries` section below). A forwarded reference output keeps the batch axis of the reference input that it
+/// forwards, and an unbatched reference input is shared by every batch item, so writing a batched value into it
+/// is rejected.
 ///
 /// Interpretation over the [`Array`] values of the reference backend (i.e., in a domain whose values are
 /// [`ArrayIrValue<Array>`]) emulates the devices in lockstep, as the `# Reference Backend Emulation` section of the
@@ -1726,8 +1698,8 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 ///
 /// Every boundary type has a static shape. Checked construction rejects dynamic boundary types with
 /// [`ShardMapError::DynamicShapeNotSupported`], and boundary validation rejects them whenever the operation is bound.
-/// Transform rules that split a body into two maps keep the same invariant for the residuals that cross between them. A
-/// first-class dimension residual crosses as its static integer scalar value, partial evaluation keeps the boundary
+/// Transform rules that split a body into two maps keep the same invariant for the residuals that cross between them.
+/// A first-class dimension residual crosses as its static integer scalar value, partial evaluation keeps the boundary
 /// whole instead of splitting it across a dynamically shaped residual, and linearization (which splits the body into
 /// primal and tangent maps) rejects such a residual with [`ShardMapError::DynamicResidualNotSupported`], while forward
 /// mode differentiation in a fused context binds one fused map instead, which needs no residuals. A dynamically shaped
@@ -1748,6 +1720,8 @@ pub struct ShardMapOperation {
     /// Refer to the documentation of [`Self::output_forwarding`].
     output_forwarding: Vec<Option<usize>>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ShardMapOperation {
     /// Creates a new [`ShardMapOperation`] for an already traced local `body`, including reference inputs and
@@ -3733,6 +3707,27 @@ impl Hash for ManualVariationChecks {
     fn hash<H: Hasher>(&self, state: &mut H) {
         (self.checks_manual_variation(), self.checks_output_replication()).hash(state);
     }
+}
+
+/// Placement of the batch dimension that batching inserts into the mapped boundary positions of a [`ShardMapOperation`]
+/// (refer to [`ShardMapBoundary::batched_placement`]). Released manual axes and free axes partition the batch dimension
+/// of inputs and outputs alike. Gathered axes (i.e., active manual placement axes that the body uses) stay manual and
+/// do not partition the batch dimension of inputs, so every device along them receives every batch item, which is what
+/// per-item semantics requires, because each batch item needs the body at every coordinate along those axes. They tile
+/// the batch dimension of outputs instead, for which the batched body slices each device's block of the batch.
+struct BatchedPlacement {
+    /// Placement of the batch dimension of mapped inputs, which names only free axes of the batched map.
+    input_placement: ShardingDimension,
+
+    /// Placement of the batch dimension of mapped outputs, which names the gathered axes followed by the free axes of
+    /// the batched map.
+    output_placement: ShardingDimension,
+
+    /// Active manual axes of the batched map, which are those of the source map without the released axes.
+    manual_axes: Vec<String>,
+
+    /// Gathered axes, in placement order.
+    gathered_axes: Vec<String>,
 }
 
 /// Source of the output shardings of a closure-traced `shard_map` (refer to [`bind_shard_map`]).
