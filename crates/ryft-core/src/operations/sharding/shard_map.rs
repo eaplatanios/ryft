@@ -1873,8 +1873,6 @@ impl ShardMapOperation {
         Ok(operation)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Creates a new [`ShardMapOperation`] directly from its boundary parts, skipping the validation of
     /// [`Self::from_program`] and declaring every output as a value output. Transform rules use it to rebuild a
     /// boundary that they derive from one that was already validated, and binding the operation together with the body
@@ -1995,8 +1993,10 @@ impl ShardMapOperation {
                     && self.boundary.manual_axes().iter().any(|axis| gather.axes().contains(axis))
                 {
                     return Err(ProgramError::MalformedProgram(format!(
-                        "`{name}` with unchecked manual variation requires varying output variance for \
-                         `{PARALLEL_ALL_GATHER_OPERATION_NAME}` over active manual axis `{}`",
+                        "`{}` with unchecked manual variation requires varying output variance for \
+                         `{}` over active manual axis `{}`",
+                        name,
+                        PARALLEL_ALL_GATHER_OPERATION_NAME,
                         gather.axes(),
                     )));
                 }
@@ -2022,8 +2022,11 @@ impl ShardMapOperation {
             }
             if self.boundary.output_shardings()[index] != self.boundary.input_shardings()[forwarded] {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "`{name}` output #{index} forwards reference input #{forwarded} but its output sharding `{}` \
+                    "`{}` output #{} forwards reference input #{} but its output sharding `{}` \
                      differs from the input sharding `{}`",
+                    name,
+                    index,
+                    forwarded,
                     self.boundary.output_shardings()[index],
                     self.boundary.input_shardings()[forwarded],
                 )));
@@ -2039,6 +2042,8 @@ impl Display for ShardMapOperation {
         self.render(formatter, 0)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl Operation for ShardMapOperation {
     type Type = ArrayIrType;
