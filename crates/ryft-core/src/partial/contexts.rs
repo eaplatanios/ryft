@@ -281,12 +281,12 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// The split rules of region-carrying operations (e.g., `scan` and `condition`) partition their bodies through
     /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program), which then
     /// places the residuals of each such partition according to `policy` (which can be set using
-    /// [`PartitionedProgram::with_residual_policy`]) and carries `policy` into the partitions nested within it. This
-    /// has implications for various region-carrying operation types. For example, it means that decisions apply per
-    /// iteration of a `scan` operation and per branch of a `condition` operation, and that a `scan` operation
+    /// [`PartitionedProgram::with_top_level_residual_policy`]) and carries `policy` into the partitions nested within
+    /// it. This has implications for various region-carrying operation types. For example, it means that decisions
+    /// apply per iteration of a `scan` operation and per branch of a `condition` operation, and that a `scan` operation
     /// recomputes the changing known carries that its residual work reads from their initial values instead of saving
-    /// them on every iteration (refer to [`PartitionedProgram::with_residual_policy`]). When the residuals of an
-    /// enclosing partition are placed, the policy first classifies each demanded output. Replaying a region-carrying
+    /// them on every iteration (refer to [`PartitionedProgram::with_top_level_residual_policy`]). When the residuals of
+    /// an enclosing partition are placed, the policy first classifies each demanded output. Replaying a region-carrying
     /// operation also requires recomputation of every live value needed for that output, so that decisions of a split
     /// rule that already placed the body's residuals are never undone. Unused sibling outputs and dormant derivative
     /// regions do not contribute residual demand. An all-known operation whose selected region work is entirely
@@ -3053,6 +3053,7 @@ mod tests {
                 if message == "operation `linear_call` declares 2 region slots but 1 regions were attached",
         ));
 
+        let callees = [Arc::new(forward.clone()), Arc::new(transpose.clone())];
         let outputs = context.residualize(LinearCallOperation::new(0), vec![forward, transpose], &[input]).unwrap();
         let evaluation = context.into_evaluation(outputs).unwrap();
         assert_eq!(
@@ -3079,6 +3080,20 @@ mod tests {
             evaluation.interpret(&EagerContext::new(), &[Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap()]),
             Ok(vec![Array::vector(vec![-1.0f64, -2.0, -3.0]).unwrap()]),
         );
+
+        // Shared source callees specialize into the same concrete bodies, without changing their declarations.
+        let shared = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let input = shared.unknown_input(ArrayType::new_static(DataType::F64, [3]), 0);
+        let outputs = shared
+            .residualize(LinearCallOperation::new(0), AttachedRegions::Callees(&callees), &[input])
+            .unwrap();
+        let shared = shared.into_evaluation(outputs).unwrap();
+        assert_eq!(shared.program.to_string(), evaluation.program.to_string());
+        assert_ne!(callees[0].input_types(), shared.program.input_types());
+        assert_eq!(
+            shared.interpret(&EagerContext::new(), &[Array::vector(vec![1f64, 2., 3.]).unwrap()]),
+            Ok(vec![Array::vector(vec![-1f64, -2., -3.]).unwrap()]),
+        );
     }
 
     #[test]
@@ -3095,7 +3110,7 @@ mod tests {
             Ok(vec![ArrayType::scalar(DataType::F32)]),
         );
         assert!(matches!(
-            context.residualize(TestRegionOperation::PreparationFailure, vec![body], &[input]),
+            context.residualize(TestRegionOperation::PreparationFailure, AttachedRegions::Callees(&[Arc::new(body)]), &[input]),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == "region preparation failed",
         ));
         assert!(context.builder.borrow().instructions().is_empty());
@@ -3176,8 +3191,13 @@ mod tests {
             .with_reference_placement(ReferencePlacement::Execute);
         let left = context.unknown_input(left_type.clone().into(), 0);
         let zero = PartialEvaluationValue::known(TestValue::Dimension(DimensionValue::constant(0).unwrap()));
-        let outputs =
-            context.residualize(RematerializeOperation::new(save_nothing()), vec![body], &[left, zero]).unwrap();
+        let outputs = context
+            .residualize(
+                RematerializeOperation::new(save_nothing()),
+                AttachedRegions::Callees(&[Arc::new(body)]),
+                &[left, zero],
+            )
+            .unwrap();
 
         // Narrowing the right input to zero folds checked subtraction away. Its original assertion classification
         // conservatively keeps subsequent ordered work residual even though the specialized region is pure.
@@ -3266,6 +3286,87 @@ mod tests {
                     ]
                 in (%2)"},
         );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_residualize_replay_attachments() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = body.add_input(scalar_type.clone().into());
+        let output = body
+            .add_instruction(ArrayOperation::from(NegOperation::new()), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let source = body
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let roots = [source.entry()];
+        let mappings = RegionReplayMappings::new();
+        let other_builder = Rc::new(RefCell::new(ProgramBuilder::<TestValue, TestOperation>::new()));
+        AttachedRegions::from(ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap())
+            .import_into(&other_builder, &[None])
+            .unwrap();
+
+        // A prior import into another builder cannot supply region identifiers to residual emission.
+        let mut identity = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = identity.add_input(scalar_type.into());
+        let identity = identity
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let input = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2f32).unwrap()));
+        let first = context.residualize(RematerializeOperation::new(save_nothing()), vec![identity], &[input]).unwrap();
+        let replay = ReplayRegionDriver::new(source.entry_region_ref(), &roots, &mappings).unwrap();
+        let second = context.residualize(RematerializeOperation::new(save_nothing()), replay, &first).unwrap();
+        let evaluation = context.into_evaluation(vec![first[0].clone(), second[0].clone()]).unwrap();
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = rematerialize [policy=\"save_nothing\"] %0 [
+                    body={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                ]
+                    %2:f32[] = rematerialize [policy=\"save_nothing\"] %1 [
+                        body={
+                            lambda %0:f32[] .
+                            let %1:f32[] = neg %0
+                            in (%1)
+                        },
+                    ]
+                in (%1, %2)"},
+        );
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[TestValue::Array(Array::scalar(2f32).unwrap())]),
+            Ok(vec![TestValue::Array(Array::scalar(2f32).unwrap()), TestValue::Array(Array::scalar(-2f32).unwrap())])
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_residualize_propagates_retained_error() {
+        let reference = ArrayReference::new(Array::scalar(1f32).unwrap());
+        reference.freeze().unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let reference = context.lift(TestValue::Reference(reference)).unwrap();
+        let poisoned = context.bind(ReferenceReadOperation::new(), Vec::new(), &[reference]).unwrap();
+        assert_eq!(poisoned[0].value().unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = body.add_input(ArrayType::scalar(DataType::F32).into());
+        let body = Arc::new(
+            body.build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap(),
+        );
+        let error = context
+            .residualize(
+                RematerializeOperation::new(save_nothing()),
+                AttachedRegions::Callees(&[body]),
+                &[PartialEvaluationValue::known(TestValue::Array(Array::scalar(2f32).unwrap()))],
+            )
+            .unwrap_err();
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+        assert!(context.builder.borrow().instructions().is_empty());
+        assert_eq!(context.builder.borrow().regions.len(), 0);
     }
 
     #[test]
