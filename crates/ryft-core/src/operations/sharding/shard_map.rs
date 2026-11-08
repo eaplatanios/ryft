@@ -989,6 +989,96 @@ impl ShardMapBoundary {
         .with_sharding(carried_state.apply(local_sharding.with_varying_manual_axes(local_varying_axes)?)?)?)
     }
 
+    /// Returns the global type of output `output_index` whose body produces `local_output_type`, which is the local
+    /// shape scaled by the manual partition counts of the output sharding, under that sharding with the variation along
+    /// active manual axes dropped, re-expressed over [`Self::caller_mesh`]. Its data type and layout are preserved,
+    /// and its boundary type uses device memory.
+    ///
+    /// With manual variation checking enabled, the body output must vary along every active manual axis that the output
+    /// sharding tiles and, when [`Self::checks_output_replication`] is enabled, along no other active manual axis. Its
+    /// reduction state along the axes that the output sharding governs must equal the specification's state. An
+    /// unchecked body instead carries no reduction state along active manual axes, and the specification restores that
+    /// state on the global output. State along axes that the output sharding does not govern is carried into the global
+    /// type in either mode (refer to [`Self::carried_reduction_state`] for how this relates to JAX's
+    /// `_unshard_shaped_array`).
+    ///
+    /// A checked output never adopts unreduced axes that the body output lacks, because assembling an invariant body
+    /// output as a pending sum along an axis would scale it by the size of that axis, and its cotangent could not be
+    /// typed in reverse mode.
+    fn global_output_type(
+        &self,
+        output_index: usize,
+        local_output_type: &ArrayType,
+    ) -> Result<ArrayType, ShardMapError> {
+        let manual_axis_names = self.manual_axis_names();
+        let local_shape = Self::static_extents(local_output_type, ShardMapValueKind::Output, output_index)?;
+        let output_sharding = &self.output_shardings[output_index];
+        let expected_current_varying_axes = self.tiled_manual_axes(output_sharding);
+        let effective_local_varying_axes = local_output_type
+            .sharding()
+            .map(|sharding| sharding.varying_manual_axes().clone())
+            .unwrap_or_default();
+        if self.checks_manual_variation()
+            && let Some(axis_name) = expected_current_varying_axes.difference(&effective_local_varying_axes).next()
+        {
+            return Err(ShardMapError::OutputNotVaryingAlongTiledManualAxis {
+                output_index,
+                axis_name: axis_name.clone(),
+            });
+        }
+
+        // An unchecked body carries no reduction state along the active manual axes, so its outputs are compared with
+        // the output sharding without that state, which the output sharding then contributes to the global type.
+        let carried_state = self.carried_reduction_state(
+            &self.without_unchecked_reduction_state(output_sharding.clone())?,
+            local_output_type.sharding(),
+            ShardMapValueKind::Output,
+            output_index,
+        )?;
+
+        for axis_name in &effective_local_varying_axes {
+            if self.checks_output_replication()
+                && manual_axis_names.contains(axis_name.as_str())
+                && !expected_current_varying_axes.contains(axis_name)
+            {
+                return Err(ShardMapError::OutputVaryingAlongUntiledManualAxis {
+                    output_index,
+                    axis_name: axis_name.clone(),
+                });
+            }
+        }
+
+        let surviving_varying_axes = effective_local_varying_axes
+            .into_iter()
+            .filter(|axis_name| !manual_axis_names.contains(axis_name.as_str()))
+            .collect::<BTreeSet<_>>();
+        let partition_counts =
+            self.manual_partition_counts(output_sharding, local_shape.len(), ShardMapValueKind::Output, output_index)?;
+        let global_shape = local_shape
+            .into_iter()
+            .zip(partition_counts)
+            .enumerate()
+            .map(|(dimension, (local_dimension_size, manual_partition_count))| {
+                local_dimension_size.checked_mul(manual_partition_count).ok_or_else(|| {
+                    ShardMapError::ArithmeticOverflow {
+                        context: format!("computing the global size of output #{output_index} dimension #{dimension}"),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(ArrayType::new(
+            local_output_type.data_type(),
+            Shape::new(global_shape.into_iter().map(Dimension::Static).collect()),
+        )
+        .with_layout(local_output_type.layout().cloned())
+        .with_sharding(
+            carried_state
+                .apply(output_sharding.clone().with_varying_manual_axes(surviving_varying_axes)?)?
+                .with_mesh(self.caller_mesh().clone())?,
+        )?)
+    }
+
     /// Returns the active manual axes along which the copies of a value that `sharding` places are plain replicas,
     /// which are the axes that it neither tiles nor marks as unreduced or reduced. The reverse rule of an unchecked
     /// boundary divides an output seed and sums an input cotangent along exactly these axes. Along an unreduced axis,
@@ -1270,98 +1360,6 @@ impl ShardMapBoundary {
             .collect()
     }
 
-    /// Returns the global type of output `output_index` whose body produces `local_output_type`, which is the local
-    /// shape scaled by the manual partition counts of the output sharding, under that sharding with the variation along
-    /// active manual axes dropped, re-expressed over [`Self::caller_mesh`]. Its data type and layout are preserved,
-    /// and its boundary type uses device memory.
-    ///
-    /// With manual variation checking enabled, the body output must vary along every active manual axis that the output
-    /// sharding tiles and, when [`Self::checks_output_replication`] is enabled, along no other active manual axis. Its
-    /// reduction state along the axes that the output sharding governs must equal the specification's state. An
-    /// unchecked body instead carries no reduction state along active manual axes, and the specification restores that
-    /// state on the global output. State along axes that the output sharding does not govern is carried into the global
-    /// type in either mode (refer to [`Self::carried_reduction_state`] for how this relates to JAX's
-    /// `_unshard_shaped_array`).
-    ///
-    /// A checked output never adopts unreduced axes that the body output lacks, because assembling an invariant body
-    /// output as a pending sum along an axis would scale it by the size of that axis, and its cotangent could not be
-    /// typed in reverse mode.
-    fn global_output_type(
-        &self,
-        output_index: usize,
-        local_output_type: &ArrayType,
-    ) -> Result<ArrayType, ShardMapError> {
-        let manual_axis_names = self.manual_axis_names();
-        let local_shape = Self::static_extents(local_output_type, ShardMapValueKind::Output, output_index)?;
-        let output_sharding = &self.output_shardings[output_index];
-        let expected_current_varying_axes = self.tiled_manual_axes(output_sharding);
-        let effective_local_varying_axes = local_output_type
-            .sharding()
-            .map(|sharding| sharding.varying_manual_axes().clone())
-            .unwrap_or_default();
-        if self.checks_manual_variation()
-            && let Some(axis_name) = expected_current_varying_axes.difference(&effective_local_varying_axes).next()
-        {
-            return Err(ShardMapError::OutputNotVaryingAlongTiledManualAxis {
-                output_index,
-                axis_name: axis_name.clone(),
-            });
-        }
-
-        // An unchecked body carries no reduction state along the active manual axes, so its outputs are compared with
-        // the output sharding without that state, which the output sharding then contributes to the global type.
-        let carried_state = self.carried_reduction_state(
-            &self.without_unchecked_reduction_state(output_sharding.clone())?,
-            local_output_type.sharding(),
-            ShardMapValueKind::Output,
-            output_index,
-        )?;
-
-        for axis_name in &effective_local_varying_axes {
-            if self.checks_output_replication()
-                && manual_axis_names.contains(axis_name.as_str())
-                && !expected_current_varying_axes.contains(axis_name)
-            {
-                return Err(ShardMapError::OutputVaryingAlongUntiledManualAxis {
-                    output_index,
-                    axis_name: axis_name.clone(),
-                });
-            }
-        }
-
-        let surviving_varying_axes = effective_local_varying_axes
-            .into_iter()
-            .filter(|axis_name| !manual_axis_names.contains(axis_name.as_str()))
-            .collect::<BTreeSet<_>>();
-        let partition_counts =
-            self.manual_partition_counts(output_sharding, local_shape.len(), ShardMapValueKind::Output, output_index)?;
-        let global_shape = local_shape
-            .into_iter()
-            .zip(partition_counts)
-            .enumerate()
-            .map(|(dimension, (local_dimension_size, manual_partition_count))| {
-                local_dimension_size.checked_mul(manual_partition_count).ok_or_else(|| {
-                    ShardMapError::ArithmeticOverflow {
-                        context: format!("computing the global size of output #{output_index} dimension #{dimension}"),
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(ArrayType::new(
-            local_output_type.data_type(),
-            Shape::new(global_shape.into_iter().map(Dimension::Static).collect()),
-        )
-        .with_layout(local_output_type.layout().cloned())
-        .with_sharding(
-            carried_state
-                .apply(output_sharding.clone().with_varying_manual_axes(surviving_varying_axes)?)?
-                .with_mesh(self.caller_mesh().clone())?,
-        )?)
-    }
-
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns the manual partition count of every dimension of a value of rank `rank` that `sharding` places, which is
     /// the product of the sizes of the active manual axes that shard that dimension, after validating that `sharding`
     /// has rank `rank`. The value has index `value_index` among the values of kind `value_kind`.
@@ -1393,8 +1391,8 @@ impl ShardMapBoundary {
                         partition_count.checked_mul(self.mesh.axis_size(axis_name).unwrap()).ok_or_else(|| {
                             ShardMapError::ArithmeticOverflow {
                                 context: format!(
-                                    "computing the manual partition count of {value_kind} #{value_index} dimension \
-                                     #{dimension}",
+                                    "computing the manual partition count of {value_kind} #{value_index} \
+                                     dimension #{dimension}",
                                 ),
                             }
                         })
@@ -1449,14 +1447,14 @@ impl ShardMapBoundary {
     /// variation labels, so only its collectives and `axis_index` operations reveal its uses, which suffices, because
     /// no input or output sharding of a map whose batch axis is placed on an axis names that axis (every input is
     /// replicated along it), and so only those operations can make the devices along it compute different values.
-    fn used_manual_placement_axes<V: Value<Type = ArrayIrType>, O>(
+    fn used_manual_placement_axes<
+        V: Value<Type = ArrayIrType>,
+        O: Operation<Type = ArrayIrType> + OperationPayloadProjection,
+    >(
         &self,
         placement_axes: &[String],
         body: RegionRef<'_, V, O>,
-    ) -> Vec<String>
-    where
-        O: Operation<Type = ArrayIrType> + OperationPayloadProjection,
-    {
+    ) -> Vec<String> {
         let mut candidate_axes = Vec::new();
         for axis_name in placement_axes {
             if self.manual_axes.contains(axis_name) && !candidate_axes.contains(axis_name) {
@@ -1520,14 +1518,14 @@ impl ShardMapBoundary {
     /// [`ShardMapError::BatchPlacementOrderNotSupported`] for a placement axis that precedes a gathered axis, and
     /// [`ShardMapError::BatchAxisPlacedOnManualAxisWithDeviceOrderedIo`] for a released placement axis when `body`
     /// has the [`EffectClass::DeviceOrderedIo`] effect.
-    fn batched_placement<V: Value<Type = ArrayIrType>, O>(
+    fn batched_placement<
+        V: Value<Type = ArrayIrType>,
+        O: Operation<Type = ArrayIrType> + OperationPayloadProjection,
+    >(
         &self,
         placement_axes: &[String],
         body: RegionRef<'_, V, O>,
-    ) -> Result<BatchedPlacement, ShardMapError>
-    where
-        O: Operation<Type = ArrayIrType> + OperationPayloadProjection,
-    {
+    ) -> Result<BatchedPlacement, ShardMapError> {
         let mut boundary_axes = Vec::new();
         for axis_name in placement_axes {
             let axis_type = self
@@ -1552,8 +1550,8 @@ impl ShardMapBoundary {
         let gathered_axes = self.used_manual_placement_axes(&boundary_axes, body);
 
         // Mapped outputs tile the batch along the gathered axes ahead of every other placement axis, because manual
-        // axes precede free axes in a dimension sharding, so a placement in which another axis precedes a gathered one
-        // would place the outputs' batch items on other devices than the inputs' (and than the batching level
+        // axes precede free axes in a dimension sharding, so a placement in which another axis precedes a gathered
+        // one would place the outputs' batch items on other devices than the inputs' (and than the batching level
         // requests).
         if let Some(first_other) = boundary_axes.iter().position(|axis_name| !gathered_axes.contains(axis_name))
             && let Some(gathered_axis) =
@@ -1564,6 +1562,7 @@ impl ShardMapBoundary {
                 preceding_axis: boundary_axes[first_other].clone(),
             });
         }
+
         let released_axes = boundary_axes
             .iter()
             .filter(|axis_name| self.manual_axes.contains(axis_name) && !gathered_axes.contains(axis_name))
@@ -1576,6 +1575,7 @@ impl ShardMapBoundary {
                 axis_name: released_axis.clone(),
             });
         }
+
         let manual_axes = self
             .manual_axes
             .iter()
@@ -1588,6 +1588,7 @@ impl ShardMapBoundary {
         let placement = |axis_names: Vec<String>| {
             if axis_names.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(axis_names) }
         };
+
         Ok(BatchedPlacement {
             input_placement: placement(free_axes),
             output_placement: placement(output_axes),
@@ -1596,6 +1597,8 @@ impl ShardMapBoundary {
         })
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Placement of the batch dimension that batching inserts into the mapped boundary positions of a [`ShardMapOperation`]
 /// (refer to [`ShardMapBoundary::batched_placement`]). Released manual axes and free axes partition the batch dimension
