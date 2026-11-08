@@ -2043,8 +2043,6 @@ impl Display for ShardMapOperation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl Operation for ShardMapOperation {
     type Type = ArrayIrType;
 
@@ -2058,16 +2056,17 @@ impl Operation for ShardMapOperation {
         const { &[RegionSlot::computation("body")] }
     }
 
-    // Validates the boundary contract of the `# Boundary Validation` section of the type documentation, checking
-    // reference positions through their referents. Beyond that contract, a reference output must declare the forwarding
-    // of a reference input under an equal output sharding, and its declared type must describe that input, while an
-    // array output must not declare a forwarding. Whether the body actually forwards the reference outputs it declares
-    // needs reference analysis rather than interface types, so `validate_body` checks that property instead.
     fn infer_output_types(
         &self,
         input_types: &[ArrayIrType],
         region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
+        // Validates the boundary contract of the `# Boundary Validation` section of the type documentation, checking
+        // reference positions through their referents. Beyond that contract, a reference output must declare the
+        // forwarding of a reference input under an equal output sharding, and its declared type must describe that
+        // input, while an array output must not declare a forwarding. Whether the body actually forwards the reference
+        // outputs it declares needs reference analysis rather than interface types, so `validate_body` checks that
+        // property instead.
         let name = self.name();
         check_count!("region", region_interfaces, 1, TypeError);
         let body_interface = &region_interfaces[0];
@@ -2082,6 +2081,7 @@ impl Operation for ShardMapOperation {
             // are defined over the mesh of this map only.
             let actual_sharding = boundary_array_type(actual)?.sharding();
             self.boundary.validate_input_mesh_topology(actual_sharding, index).map_err(TypeError::custom)?;
+
             // Only values of a manual region that already made an axis manual vary along it, so an input that varies
             // along one of this map's manual axes means that this map makes that axis manual a second time.
             if let Some(axis_name) = self
@@ -2094,23 +2094,28 @@ impl Operation for ShardMapOperation {
                     ShardMapError::InputVariesAlongManualAxis { input_index: index, axis_name: axis_name.clone() };
                 return Err(TypeError::custom(error));
             }
+
             let body_input_type = &body_interface.input_types()[index];
             match declared {
                 ArrayIrType::Reference(declared) => {
                     let actual = <&ReferenceType<ArrayType>>::try_from(actual)?;
                     if !shard_map_boundary_types_match(actual.referent(), declared.referent()) {
                         return Err(TypeError::invalid(format!(
-                            "`{name}` input #{index} has type `{actual}` but its declared global input type is \
-                             `{declared}`",
+                            "`{name}` input #{index} has type `{actual}` but its declared global input type \
+                             is `{declared}`",
                         )));
                     }
+
                     let local_referent =
                         self.boundary.local_input_type(index, declared.referent()).map_err(TypeError::custom)?;
                     let body_input_type = <&ReferenceType<ArrayType>>::try_from(body_input_type)?;
                     if !shard_map_boundary_types_match(body_input_type.referent(), &local_referent) {
                         return Err(TypeError::invalid(format!(
-                            "`{name}` body input #{index} has type `{body_input_type}` but the local shard of \
-                             reference input #{index} is `{}`",
+                            "`{}` body input #{} has type `{}` but the local shard of reference input #{} is `{}`",
+                            name,
+                            index,
+                            body_input_type,
+                            index,
                             ReferenceType::new(local_referent),
                         )));
                     }
@@ -2120,10 +2125,11 @@ impl Operation for ShardMapOperation {
                     let declared = <&ArrayType>::try_from(declared)?;
                     if !shard_map_boundary_types_match(actual, declared) {
                         return Err(TypeError::invalid(format!(
-                            "`{name}` input #{index} has type `{actual}` but its declared global input type is \
-                             `{declared}`",
+                            "`{name}` input #{index} has type `{actual}` but its declared global input type \
+                             is `{declared}`",
                         )));
                     }
+
                     let local_type = self.boundary.local_input_type(index, declared).map_err(TypeError::custom)?;
                     let body_input_type = <&ArrayType>::try_from(body_input_type)?;
                     if !shard_map_boundary_types_match(body_input_type, &local_type) {
@@ -2135,6 +2141,7 @@ impl Operation for ShardMapOperation {
                 }
             }
         }
+
         let mut output_types = Vec::with_capacity(self.output_types.len());
         for (index, declared) in self.output_types.iter().enumerate() {
             let body_output_type = &body_interface.output_types()[index];
@@ -2143,23 +2150,29 @@ impl Operation for ShardMapOperation {
                     <&ReferenceType<ArrayType>>::try_from(body_output_type)?;
                     let Some(forwarded) = self.output_forwarding[index] else {
                         return Err(TypeError::invalid(format!(
-                            "`{name}` output #{index} is a reference whose forwarded input the operation does not \
-                             declare",
+                            "`{name}` output #{index} is a reference whose forwarded input the operation \
+                             does not declare",
                         )));
                     };
+
                     if forwarded >= input_types.len() || body_output_type != &body_interface.input_types()[forwarded] {
                         return Err(TypeError::invalid(format!(
                             "`{name}` output #{index} does not forward reference input #{forwarded} by identity",
                         )));
                     }
+
                     if self.boundary.output_shardings()[index] != self.boundary.input_shardings()[forwarded] {
                         return Err(TypeError::invalid(format!(
-                            "`{name}` output #{index} forwards reference input #{forwarded} but its output sharding \
+                            "`{}` output #{} forwards reference input #{} but its output sharding \
                              `{}` differs from the input sharding `{}`",
+                            name,
+                            index,
+                            forwarded,
                             self.boundary.output_shardings()[index],
                             self.boundary.input_shardings()[forwarded],
                         )));
                     }
+
                     // The output is the forwarded input itself, so its declared type must describe that input.
                     let forwarded_type = <&ReferenceType<ArrayType>>::try_from(&input_types[forwarded])?;
                     if !shard_map_boundary_types_match(forwarded_type.referent(), declared.referent()) {
@@ -2168,6 +2181,7 @@ impl Operation for ShardMapOperation {
                              input #{forwarded} of type `{forwarded_type}`",
                         )));
                     }
+
                     output_types.push(input_types[forwarded].clone());
                 }
                 declared => {
@@ -2178,6 +2192,7 @@ impl Operation for ShardMapOperation {
                              #{forwarded}; only reference outputs forward inputs",
                         )));
                     }
+
                     let body_output_type = <&ArrayType>::try_from(body_output_type)?;
                     let declared = <&ArrayType>::try_from(declared)?;
                     let global_type =
@@ -2188,17 +2203,19 @@ impl Operation for ShardMapOperation {
                              `{global_type}` does not match the declared global output type `{declared}`",
                         )));
                     }
+
                     output_types.push(ArrayIrType::Array(declared.clone()));
                 }
             }
         }
+
         Ok(output_types)
     }
 
-    // The body's inputs mirror the instruction inputs one for one and its outputs are the operation's outputs, exactly
-    // like a jitted call.
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+        // The body's inputs mirror the instruction inputs one for one and its outputs are the operation's outputs,
+        // exactly like a jitted call.
         if region_index == 0 {
             InputRegionProvenance::Input { index: input_index }
         } else {
@@ -2206,6 +2223,7 @@ impl Operation for ShardMapOperation {
         }
     }
 
+    #[inline]
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
@@ -2215,20 +2233,21 @@ impl Operation for ShardMapOperation {
         RegionDataFlow::Provenance
     }
 
-    // Instruction inputs map onto the body inputs one for one, so the inputs that the body does not use (once its dead
-    // outputs are dropped) are dropped together with their input shardings and declared global input types, and dead
-    // outputs are dropped together with their output shardings and declared global output types, which keeps the
-    // boundary metadata aligned with the pruned body. The region liveness keeps every input that the body still needs
-    // for work that is retained when unused (e.g., an input read by an observable effect). A boundary with a reference
-    // position keeps its whole boundary, because the reference contract (including the input positions that the output
-    // forwarding names) was validated against it. A body whose ordinary outputs are all dead but which has effects that
-    // remain observable is retained with no outputs, and its effects keep their per-device order.
     fn prune_boundary(
         &self,
         input_types: &[Self::Type],
         used_outputs: &[bool],
         regions: &mut dyn RegionLiveness,
     ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        // Instruction inputs map onto the body inputs one for one, so the inputs that the body does not use (once its
+        // dead outputs are dropped) are dropped together with their input shardings and declared global input types,
+        // and dead outputs are dropped together with their output shardings and declared global output types, which
+        // keeps the boundary metadata aligned with the pruned body. The region liveness keeps every input that the body
+        // still needs for work that is retained when unused (e.g., an input read by an observable effect). A boundary
+        // with a reference position keeps its whole boundary, because the reference contract (including the input
+        // positions that the output forwarding names) was validated against it. A body whose ordinary outputs are all
+        // dead but which has effects that remain observable is retained with no outputs, and its effects keep their
+        // per-device order.
         if self.input_types.iter().chain(&self.output_types).any(Type::is_reference) {
             return Ok(None);
         }
@@ -2253,11 +2272,11 @@ impl Operation for ShardMapOperation {
         Ok(Some(OperationBoundaryPruning { operation, kept_inputs, kept_outputs: used_outputs.to_vec() }))
     }
 
-    // The body is traced through a fresh root context that discards captures, so, like a jitted call and unlike nested
-    // control flow (which inherits the namespace of its parent), it establishes a fresh capture namespace that contains
-    // no captures.
     #[inline]
     fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
+        // The body is traced through a fresh root context that discards captures, so, like a jitted call and unlike
+        // nested control flow (which inherits the namespace of its parent), it establishes a fresh capture namespace
+        // that contains no captures.
         (region_index == 0).then_some(0)
     }
 
@@ -2266,22 +2285,23 @@ impl Operation for ShardMapOperation {
         self.output_forwarding().get(output_index).copied().flatten()
     }
 
-    // Every field a consumer can observe is rendered, because this rendering is the metadata fingerprint that the debug
-    // transform cache diagnostic compares programs by, so a field this rendering drops is a field whose corruption that
-    // diagnostic cannot see. All of `mesh`, `input_shardings`, `output_shardings`, and `manual_axes` steer
-    // differentiation, transposition, and backend lowering while being invisible to the instruction's rendered atom
-    // types, and so do the global boundary types, because an input type only has to match the declared global input
-    // types up to its dimension shardings and its memory kind. The declared output types retain the placement and
-    // variation established by the body and its output shardings. The output forwarding is rendered exactly when some
-    // output forwards a reference input, so a boundary with value outputs only renders without it and a boundary with a
-    // forwarded reference output never renders like one without. No state is elided. Every field is a sequence or a
-    // scalar, so the rendering is deterministic without any ordering normalization. Every mesh axis name is rendered as
-    // a single-quoted literal with Rust's character escapes (by the `Display` implementation of `MeshAxis` for the mesh
-    // axes and by `render_mesh_axis_name` for the manual axes), so that no name can imitate the quoting or the `, `
-    // separator that `OperationFormatter::list` joins items with. The two-name list `["a", "b"]` and the one-name list
-    // `["a', 'b"]` render distinctly, so a collision could not hide a genuinely different manual SPMD boundary from
-    // that diagnostic. `Display` renders the same text at indentation zero.
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        // Every field a consumer can observe is rendered, because this rendering is the metadata fingerprint that
+        // the debug transform cache diagnostic compares programs by, so a field this rendering drops is a field
+        // whose corruption that diagnostic cannot see. All of `mesh`, `input_shardings`, `output_shardings`, and
+        // `manual_axes` steer differentiation, transposition, and backend lowering while being invisible to the
+        // instruction's rendered atom types, and so do the global boundary types, because an input type only has to
+        // match the declared global input types up to its dimension shardings and its memory kind. The declared output
+        // types retain the placement and variation established by the body and its output shardings. The output
+        // forwarding is rendered exactly when some output forwards a reference input, so a boundary with value outputs
+        // only renders without it and a boundary with a forwarded reference output never renders like one without.
+        // No state is elided. Every field is a sequence or a scalar, so the rendering is deterministic without any
+        // ordering normalization. Every mesh axis name is rendered as a single-quoted literal with Rust's character
+        // escapes (by the `Display` implementation of `MeshAxis` for the mesh axes and by `render_mesh_axis_name`
+        // for the manual axes), so that no name can imitate the quoting or the `, ` separator that
+        // `OperationFormatter::list` joins items with. The two-name list `["a", "b"]` and the one-name list
+        // `["a', 'b"]` render distinctly, so a collision could not hide a genuinely different manual SPMD
+        // boundary from that diagnostic. `Display` renders the same text at indentation zero.
         let manual_axes = self.boundary.manual_axes().iter().map(|axis| render_mesh_axis_name(axis.as_str()));
         OperationFormatter::new(formatter, indentation, SHARD_MAP_OPERATION_NAME)?.bracketed(|operation| {
             // The mesh is redundant with any rendered sharding, which embeds it, but a boundary may have no
@@ -2324,10 +2344,9 @@ where
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         // This rule implements the "Discharge threads owned shards" bullet of the module documentation by rebuilding
-        // the *local* body through the driver's isolated region rebuild. Each reference input enters the rebuilt body
+        // the _local_ body through the driver's isolated region rebuild. Each reference input enters the rebuilt body
         // as a boundary view, the forwarded reference outputs are dropped, and the final state of each mutated input
         // leaves the rebuilt map as a trailing output under its input sharding.
-
         let name = self.name();
         check_count!("input", inputs, self.input_types.len(), ProgramError);
         let body = driver.region(0)?;
@@ -2338,10 +2357,12 @@ where
         if !self.boundary.checks_manual_variation() {
             self.validate_body(body)?;
         }
+
         // A body without references replays verbatim.
         if allocations.iter().all(Option::is_none) && !body.contains_references_in_closure() {
             return context.discharge_reference_free_operation(self, driver, inputs);
         }
+
         // Two reference inputs that denote one allocation would become two independent views, which would silently lose
         // their aliasing.
         for (second_input_index, allocation) in allocations.iter().enumerate() {
@@ -2353,6 +2374,7 @@ where
                 return Err(error.into());
             }
         }
+
         // The body is summarized first, so that the shared access policy and consumption checks run exactly as for
         // other structured rules. A manual region threads state rather than destination references, so a preserved
         // reference input is refused.
@@ -2424,12 +2446,12 @@ where
         );
         let program = driver.rebuild_region(context, normalized_body, &boundary)?.into_program();
 
-        // Rebuild the boundary. Every input keeps its position and input sharding (a reference input becomes its
-        // global referent, an array placed by the same input sharding), the value outputs keep theirs, and one
-        // final-state output per mutated reference input follows them under that input's input sharding. The
-        // final state is typed by the input it replaces (the allocation's current state) rather than by the declared
-        // global referent, because the declared boundary type may omit sharding metadata that the allocation carries
-        // and the discharged state must match the allocation's referent type exactly.
+        // Rebuild the boundary. Every input keeps its position and input sharding (a reference input becomes its global
+        // referent, an array placed by the same input sharding), the value outputs keep theirs, and one final-state
+        // output per mutated reference input follows them under that input's input sharding. The final state is typed
+        // by the input it replaces (the allocation's current state) rather than by the declared global referent,
+        // because the declared boundary type may omit sharding metadata that the allocation carries and the discharged
+        // state must match the allocation's referent type exactly.
         let boundary_inputs = inputs
             .iter()
             .zip(&allocations)
@@ -2462,6 +2484,7 @@ where
         )
         .with_caller_mesh(self.boundary.caller_mesh.clone())
         .with_manual_variation_checks(self.boundary.manual_variation_checks);
+
         let operation = ShardMapOperation::from_boundary(boundary, input_types, output_types);
         let mut outputs = context.parent().bind(operation, vec![program], &boundary_inputs)?;
         check_count!("output", outputs, value_output_indices.len() + mutated_inputs.len(), ProgramError);
@@ -2483,6 +2506,8 @@ where
             .collect())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C> InterpretableOperation<C> for ShardMapOperation
 where
