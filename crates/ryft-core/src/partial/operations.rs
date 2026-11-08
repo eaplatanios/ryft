@@ -582,19 +582,22 @@ impl<V: Value> ResidualDemandSplit<V> {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrType, ArrayReference, ArrayType, DataType, DimensionBounds, DimensionError, DimensionType,
-        DimensionValue, Shape,
+        Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayType, DataType, DimensionBounds, DimensionError,
+        DimensionType, DimensionValue, Shape,
     };
     use crate::contexts::EagerContext;
-    use crate::operations::{ReferenceReadOperation, ReferenceWriteOperation};
+    use crate::differentiation::NothingSavable;
+    use crate::operations::{ConditionOperation, NegOperation, ReferenceReadOperation, ReferenceWriteOperation};
     use crate::parameters::Placeholder;
     use crate::partial::contexts::PartialEvaluationContext;
+    use crate::partial::residuals::ResidualPolicyReference;
     use crate::partial::tests::{TestOperation, TestValue};
-    use crate::partial::values::PartialEvaluationOutput;
-    use crate::programs::{ProgramBuilder, ReferenceType, TypeError};
+    use crate::partial::values::{PartialEvaluationOutput, PartialValueMaterialization};
+    use crate::programs::{AtomId, ProgramBuilder, ReferenceType, TypeError};
 
     use super::*;
 
@@ -696,5 +699,179 @@ mod tests {
         let partition = driver.partition_program(&context, program.entry_region_ref(), &[true, true, true]).unwrap();
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
         assert!(!context.defer_ordered_effects());
+    }
+    #[test]
+    fn test_recursive_partial_evaluation_driver_split_instruction_on_residual_demand() {
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = branch.add_input(scalar_type.clone());
+        let output = branch
+            .add_instruction(ArrayOperation::from(NegOperation::new()), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let branch = branch
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type);
+        let first = builder.import_program(branch.clone());
+        let second = builder.import_program(branch);
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![first, second], vec![predicate, input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let regions = AttachedRegions::from(vec![program.clone()]);
+        let driver = RecursivePartialEvaluationDriver { regions: &regions, repeated_residual: false };
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        assert!(
+            driver
+                .split_instruction_on_residual_demand(&context, program.entry_region_ref(), 0, &[true])
+                .unwrap()
+                .is_none()
+        );
+        let context = context
+            .with_residual_policy(&ResidualPolicyReference::new(NothingSavable))
+            .with_defer_ordered_effects(true);
+        assert!(
+            EmptyRegionDriver
+                .split_instruction_on_residual_demand(&context, program.entry_region_ref(), 0, &[true])
+                .unwrap()
+                .is_none()
+        );
+        let partition = driver
+            .split_instruction_on_residual_demand(&context, program.entry_region_ref(), 0, &[true])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f32[] .
+                    let %2:f32[] = condition %0 %1 [
+                        true={
+                            lambda %0:f32[] .
+                            let %1:f32[] = neg %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f32[] .
+                            let %1:f32[] = neg %0
+                            in (%1)
+                        },
+                    ]
+                    in (%2, %0, %1)
+                }
+                residual={
+                    lambda %0:bool[], %1:f32[] .
+                    let %2:f32[] = condition %0 %1 [
+                        true={
+                            lambda %0:f32[] .
+                            let %1:f32[] = neg %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f32[] .
+                            let %1:f32[] = neg %0
+                            in (%1)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
+        assert!(context.defer_ordered_effects());
+    }
+
+    #[test]
+    fn test_residual_demand_split_new() {
+        let value = Array::scalar(2f32).unwrap();
+        let split = ResidualDemandSplit::new(
+            vec![PartialEvaluationValue::known(value.clone())],
+            vec![PartialEvaluationValue::<Array>::variable(ArrayType::scalar(DataType::F32), AtomId::new(3))],
+        )
+        .unwrap();
+        assert_eq!(split.known_outputs[0].as_known(), Some(&value));
+        assert_eq!(
+            split.replayed_outputs[0].materialization(),
+            PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) },
+        );
+        let empty = ResidualDemandSplit::<Array>::new(Vec::new(), Vec::new()).unwrap();
+        assert!(empty.known_outputs.is_empty());
+        assert!(empty.replayed_outputs.is_empty());
+    }
+
+    #[test]
+    fn test_residual_demand_split_new_rejects_misplaced_knownness() {
+        let known = PartialEvaluationValue::known(Array::scalar(1f32).unwrap());
+        let unknown = PartialEvaluationValue::<Array>::variable(ArrayType::scalar(DataType::F32), AtomId::new(0));
+        assert_eq!(
+            ResidualDemandSplit::new(vec![known.clone(), unknown.clone()], Vec::new()).map(|_| ()),
+            Err(ProgramError::InvalidArgument {
+                message: "output 1 of the known part of a residual demand split is unknown".to_string(),
+            }),
+        );
+        assert_eq!(
+            ResidualDemandSplit::new(vec![known.clone()], vec![unknown, known]).map(|_| ()),
+            Err(ProgramError::InvalidArgument {
+                message: "output 1 of the replay part of a residual demand split is known".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_residual_demand_split_known_outputs() {
+        let first = Array::scalar(2f32).unwrap();
+        let second = Array::scalar(3f32).unwrap();
+        let split = ResidualDemandSplit::new(
+            vec![PartialEvaluationValue::known(first.clone()), PartialEvaluationValue::known(second.clone())],
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            split.known_outputs().iter().map(PartialEvaluationValue::as_known).collect::<Vec<_>>(),
+            vec![Some(&first), Some(&second)]
+        );
+    }
+
+    #[test]
+    fn test_residual_demand_split_replayed_outputs() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let split = ResidualDemandSplit::new(
+            Vec::new(),
+            vec![
+                PartialEvaluationValue::<Array>::variable(scalar_type.clone(), AtomId::new(3)),
+                PartialEvaluationValue::<Array>::variable(scalar_type, AtomId::new(1)),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            split.replayed_outputs().iter().map(PartialEvaluationValue::materialization).collect::<Vec<_>>(),
+            vec![
+                PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) },
+                PartialValueMaterialization::Variable { residual_atom: AtomId::new(1) },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_residual_demand_split_into_parts() {
+        let value = Array::scalar(2f32).unwrap();
+        let split = ResidualDemandSplit::new(
+            vec![PartialEvaluationValue::known(value.clone())],
+            vec![PartialEvaluationValue::<Array>::variable(ArrayType::scalar(DataType::F32), AtomId::new(3))],
+        )
+        .unwrap();
+        let (known, replayed) = split.into_parts();
+        assert_eq!(known.iter().map(PartialEvaluationValue::as_known).collect::<Vec<_>>(), vec![Some(&value)]);
+        assert_eq!(
+            replayed[0].materialization(),
+            PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) }
+        );
     }
 }
