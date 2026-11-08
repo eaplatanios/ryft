@@ -2214,8 +2214,7 @@ impl Operation for ShardMapOperation {
 
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
-        // The body's inputs mirror the instruction inputs one for one and its outputs are the operation's outputs,
-        // exactly like a jitted call.
+        // The body's inputs mirror the instruction inputs one for one, and its outputs are the operation's outputs.
         if region_index == 0 {
             InputRegionProvenance::Input { index: input_index }
         } else {
@@ -2274,9 +2273,8 @@ impl Operation for ShardMapOperation {
 
     #[inline]
     fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
-        // The body is traced through a fresh root context that discards captures, so, like a jitted call and unlike
-        // nested control flow (which inherits the namespace of its parent), it establishes a fresh capture namespace
-        // that contains no captures.
+        // The body is traced through a fresh root context that discards captures, so it establishes a fresh capture
+        // namespace that contains no captures. Nested control flow instead inherits the namespace of its parent.
         (region_index == 0).then_some(0)
     }
 
@@ -2560,13 +2558,12 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        // This rule is the counterpart of the Just-In-Time (JIT) compiled call rule for map boundaries. It splits the
-        // local body by which of the caller's inputs are known, keeping the `shard_map` boundary, its mesh, and its
-        // shardings on both sides, and binds the known half into the known side context through the default fold or
-        // residualize policy, whether that context executes it eagerly (e.g., through the reference backend's emulation
-        // or a device runtime) or stages it into the outer program, as JAX's `_shard_map_partial_eval` always binds its
-        // known `shard_map`. Every operation with a region boundary feeds the shared `PartitionedProgram` protocol
-        // under this contract for known inputs.
+        // This rule splits the local body by which of the caller's inputs are known, keeping the `shard_map` boundary,
+        // its mesh, and its shardings on both sides, and binds the known half into the known side context through the
+        // default fold or residualize policy, whether that context executes it eagerly (e.g., through the reference
+        // backend's emulation or a device runtime) or stages it into the outer program, as JAX's
+        // `_shard_map_partial_eval` always binds its known `shard_map`. Every operation with a region boundary feeds the
+        // shared `PartitionedProgram` protocol under this contract for known inputs.
         if !self.boundary.checks_manual_variation() {
             self.validate_body(driver.region(0)?)?;
         }
@@ -2583,10 +2580,9 @@ where
         let body_program = driver.region(0)?;
 
         // A reference input, a reference output, or a reference access anywhere in the body keeps the shard map whole,
-        // for the same reason a `jit_call` stays whole, because splitting would spread the accesses to one root across
-        // two manual regions whose known side runs first, and the default rule preserves effect order by placing the
-        // whole application on one side instead. The contract is validated first so a malformed body is reported as
-        // such rather than residualized silently.
+        // because splitting would spread the accesses to one root across two manual regions whose known side runs
+        // first. The default rule preserves effect order by placing the whole application on one side. The contract
+        // is validated first so a malformed body is reported as such rather than residualized silently.
         if body_has_references(body_program) {
             self.validate_body(body_program)?;
             return context.fold_or_residualize(self.clone(), vec![body_program.to_program()], inputs);
@@ -2648,8 +2644,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for ShardMapOperation
 where
     C: Context<
@@ -2695,6 +2689,7 @@ where
             let outputs = context.parent().bind(self.clone(), vec![driver.region(0)?.to_program()], &input_values)?;
             return Ok(outputs.into_iter().map(ArrayIrBatch::replicated).collect::<Vec<_>>());
         }
+
         // Boundary types are static (refer to the `# Static Boundaries` section of the documentation of
         // `ShardMapOperation`), so the batch extent must be static whenever a boundary position is mapped or the body
         // uses it. That rejection is deliberate rather than a gap, because padding the batch to a static bound would
@@ -2708,6 +2703,7 @@ where
                 }))
             })
         };
+
         // A batching level may place its batch axis on mesh axes (refer to `BatchingContext::axis_sharding`), and the
         // batched boundary keeps that placement (refer to `ShardMapBoundary::batched_placement`). An unconstrained
         // batch axis imposes no placement, so its dimension is unpartitioned at the boundary, as without
@@ -2717,8 +2713,8 @@ where
         // manual axes, which is sound because every device along it computes the same values. An active manual
         // placement axis that the body uses is gathered instead. It stays manual, but it does not partition the batch
         // dimension of mapped inputs, so every device along it runs the body over every batch item, at its own
-        // coordinate along the axis, which is what each batch item needs. Mapped outputs are then sliced to the block of
-        // the batch that each device holds along the gathered axes, which their output shardings tile. JAX instead
+        // coordinate along the axis, which is what each batch item needs. Mapped outputs are then sliced to the block
+        // of the batch that each device holds along the gathered axes, which their output shardings tile. JAX instead
         // splits the batch along such an axis (i.e., its `spmd_axis_name`), which runs each batch item at one
         // coordinate only and makes collectives over the axis combine different batch items. A placement adds no manual
         // variation anywhere (refer to `Sharding::batched`), so callers may type their values over the mesh of the map
@@ -2727,8 +2723,8 @@ where
         // A placement that releases every active manual axis leaves the batched map without active manual axes, which
         // the boundary requests explicitly with `ManualAxisSelection::Listed` (because an empty list of manual axes
         // otherwise selects all of them), so its body runs once on the global values. That keeps the boundary types of
-        // this design unchanged, whereas binding the batched body inline would need its caller's values to carry exactly
-        // the declared shardings of the body.
+        // this design unchanged, whereas binding the batched body inline would need its caller's values to carry
+        // exactly the declared shardings of the body.
         //
         // When some input is mapped, the placement is validated before the body is batched, because the body context
         // keeps its explicit axes, so a placement that the boundary rejects would otherwise fail inside the batched
@@ -2869,8 +2865,8 @@ where
             let extent = static_extent()?;
 
             // Mapped outputs are sliced along the gathered axes, which requires the devices along them to divide the
-            // batch. A forwarded output forwards an unbatched reference input (a batched one was rejected above), so it
-            // is never sliced.
+            // batch. A forwarded output forwards an unbatched reference input (a batched one was rejected above), so
+            // it is never sliced.
             let sliced_positions = output_positions
                 .iter()
                 .zip(&self.output_forwarding)
@@ -2902,8 +2898,8 @@ where
             let batch_boundary =
                 |sharding: &mut Sharding, r#type: &mut ArrayIrType, position: usize, placement: &ShardingDimension| {
                     // The batch dimension is inserted without adding manual variation. Inside the batched map, the
-                    // placement of an input names only free axes, along which values never vary, and the placement of
-                    // an output tiles it along gathered axes, along which the sliced output varies.
+                    // placement of an input names only free axes, along which values never vary, and the placement
+                    // of an output tiles it along gathered axes, along which the sliced output varies.
                     *sharding =
                         sharding.with_inserted_dimension(position, placement.clone()).map_err(TypeError::from)?;
                     let array_type = boundary_array_type(r#type)?;
@@ -2965,6 +2961,7 @@ where
             .with_caller_mesh(self.boundary.caller_mesh.clone())
             .with_manual_variation_checks(self.boundary.manual_variation_checks);
         }
+
         let operation = ShardMapOperation::from_boundary(boundary, input_types, output_types)
             .with_output_forwarding(self.output_forwarding.clone())
             .map_err(ProgramError::from)?;
@@ -2980,8 +2977,6 @@ where
 
 impl<C> DifferentiableOperation<C> for ShardMapOperation
 where
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
     C: Context<
             Type = ArrayIrType,
             Operation: From<ShardMapOperation>
@@ -2994,6 +2989,8 @@ where
                            + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
                            + OperationPayloadProjection,
         > + Zero<C::Value>,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -3011,12 +3008,14 @@ where
 
         let body_program = driver.region(0)?;
         self.validate_body(body_program)?;
+
         // A structurally zero tangent is inactive, like a missing one (JAX's `which_nz`), so it gets no tangent
         // boundary slot, and every output that depends only on such inputs receives a structurally zero tangent.
         let activity = inputs
             .iter()
             .map(|input| input.is_tangent_active() && !input.tangent().is_zero())
             .collect::<Vec<_>>();
+
         // A fused context (i.e., one whose primal and tangent contexts are the same context, as for `jvp` and for the
         // fused programs that the rules of higher-order operations derive) binds one `shard_map` whose body is the
         // fused JVP program of the body (refer to `fused_shard_map_jvp`), as JAX's `_shard_map_jvp` does, so an eager
@@ -3034,12 +3033,13 @@ where
         {
             return Ok(outputs);
         }
+
         // The two-map form, which a partitioned differentiation context (i.e., a linearization) needs, as in JAX's
         // `_shard_map_linearize`, linearizes the body through `shard_map_bodies` under the activity mask. That gives a
         // primal body `inputs -> [outputs..., residual_edges...]` and a tangent body `[active(input_tangents)...,
         // residuals...] -> [live(output_tangents)...]`, whose residuals cross between the two maps as plain primal
         // edges (refer to `ShardMapResidual`), so no symbolic capture is introduced, and the enclosing partial
-        // evaluation split discovers them structurally, as for the jitted call rule.
+        // evaluation split discovers them structurally.
         let ShardMapBodies { primal_operation, primal_body, tangent, output_activity } =
             match shard_map_bodies(self, driver, body_program, activity.as_slice()) {
                 // A dynamically shaped residual cannot cross the static boundary between two maps, but the fused map
@@ -3059,8 +3059,8 @@ where
                 bodies => bodies?,
             };
 
-        // Bind the primal `shard_map`, recovering the primal outputs followed by the residual edge values. Without a
-        // tangent `shard_map`, every output tangent is a structural zero.
+        // Bind the primal `shard_map`, recovering the primal outputs followed by the residual edge values.
+        // Without a tangent `shard_map`, every output tangent is a structural zero.
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal_output_count = primal_operation.global_output_types().len();
         let mut primal_outputs = context.primal().bind(primal_operation, vec![primal_body], &primal_inputs)?;
@@ -3091,6 +3091,7 @@ where
             };
             tangent_inputs.push(context.primal_to_tangent(value)?);
         }
+
         let tangent_outputs = context.tangent().bind(tangent_operation, vec![tangent_body], &tangent_inputs)?;
         check_count!("output", tangent_outputs, output_activity.iter().filter(|active| **active).count(), ProgramError);
         let mut tangent_outputs = tangent_outputs.into_iter();
@@ -3110,7 +3111,6 @@ where
 
 impl<V, O> TransposableOperation<V, O> for ShardMapOperation
 where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     V: Value<Type = ArrayIrType>,
     O: Operation<Type = ArrayIrType>
         + OperationPayloadProjection
@@ -3130,6 +3130,7 @@ where
         > + From<ReferenceNewOperation<ArrayType, ArrayIrType>>
         + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>
         + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -3162,6 +3163,8 @@ where
         Ok(())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Global value that the [`ShardMap`] capability of the [`Context`] `C` maps over and returns, which is the array
 /// member of a value of `C` (refer to [`ValueProjection`]). For array IR contexts and their tracers, this is a
@@ -6032,8 +6035,7 @@ where
 /// input, a tangent reference `ref<tangent(T)>` under the primal's input sharding) followed by the residuals. A
 /// reference output that forwards an active reference input forwards that input's tangent reference in the tangent
 /// boundary, and one that forwards an inactive reference input keeps its primal handle and has no tangent boundary
-/// slot. This is the `shard_map` counterpart of the jitted call rule, realizing `jvp(shard_map(f)) = shard_map(jvp f)`
-/// without introducing symbolic captures.
+/// slot. This implements `jvp(shard_map(f)) = shard_map(jvp f)` without introducing symbolic captures.
 ///
 /// # Parameters
 ///
