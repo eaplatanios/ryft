@@ -1400,11 +1400,17 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     /// Partitions an existing fused Jacobian-Vector Product (JVP) [`Region`] like
     /// [`partition_jvp_program`](Self::partition_jvp_program) while placing the known values that its residual tangent
     /// program consumes according to `policy`, deciding which primal values the tangent program receives as residuals
-    /// and which it recomputes (refer to [`PartitionedProgram::with_residual_policy`] for more information). The policy
-    /// also places the residuals of the partitions that the split rules of region-carrying operations in the region
-    /// construct (refer to [`PartialEvaluationContext::with_residual_policy`]), so its decisions apply per iteration
-    /// and per branch. Rules that let users control the residuals of their linearization use this. The resulting
-    /// partition is not retained in the region's transform cache, so the policy never affects other requests.
+    /// and which it recomputes (refer to [`PartitionedProgram::with_top_level_residual_policy`] for more information).
+    /// The policy also places the residuals of the partitions that the split rules of region-carrying operations in the
+    /// region construct (refer to [`PartialEvaluationContext::with_residual_policy`]), so its decisions apply per
+    /// iteration and per branch. Rules that let users control the residuals of their linearization use this. The
+    /// resulting partition is not retained in the region's transform cache, so the policy never affects other requests.
+    ///
+    /// Like [`PartitionedProgram::with_top_level_residual_policy`], this places residuals without rounding them.
+    /// Backends may compute narrow floating-point values at a higher precision than their types, so the known consumers
+    /// of a saved value and its residual consumers can observe different values unless the values are rounded at their
+    /// producers. [`rematerialize`](crate::rematerialize) does that rounding for its own partitions, as JAX's `remat`
+    /// does, and rules that need the same consistency must round the values that their partitions save themselves.
     ///
     /// # Parameters
     ///
@@ -2094,9 +2100,12 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
                     let mut can_materialize = true;
                     for (output_index, output_type) in output_types.iter().enumerate() {
                         let tangent_type = output_type.tangent()?;
+                        if can_materialize_zero_tangent_from_type(output_type, &tangent_type) {
+                            continue;
+                        }
                         if operation.is_zero(output_index) && output_type == &tangent_type {
                             reusable_zero_outputs.push(output_index);
-                        } else if !can_materialize_zero_tangent_from_type(output_type, &tangent_type) {
+                        } else {
                             can_materialize = false;
                             break;
                         }
@@ -2114,10 +2123,12 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
                 .into_iter()
                 .enumerate()
                 .map(|(output_index, primal)| {
-                    // When the primal operation is itself known to produce zero and its output already has the required
-                    // tangent type, the primal value is the canonical materialized tangent. Reusing it avoids inventing
-                    // a nullary dynamic zero when a staged tangent is later materialized, exactly like the fused replay
-                    // in `RegionRef::jvp`.
+                    // When the primal operation is itself known to produce zero, its output already has the required
+                    // tangent type, and that type names runtime extents, the primal value is the canonical materialized
+                    // tangent. The output boundary of `ForwardModeDifferentiate::jvp` cannot trace a structural zero
+                    // back to its producer, so reusing the primal here avoids inventing a nullary dynamic zero there.
+                    // Zeros whose types alone construct them stay structural, so consumers stage no dead terms such as
+                    // `x · 0`. The fused replay in `RegionRef::jvp` instead defers every such reuse to its boundary.
                     if self.tangent.is_none() && reusable_zero_outputs.contains(&output_index) {
                         DifferentiationDual::new(primal.clone(), self.primal_to_tangent(primal)?)
                     } else {
@@ -2432,6 +2443,13 @@ where
             let mut primals: Vec<Option<Tracer<TracingContext<V, O>>>> = vec![None; self.atoms().len()];
             let mut tangents: Vec<Option<MaybeZero<Tracer<TracingContext<V, O>>>>> = vec![None; self.atoms().len()];
 
+            // Flag the atoms that the all-zero fast path computes with an operation known to produce zero, when their
+            // type is already their tangent type. Their tangents stay structural while they propagate, so consumers
+            // stage no dead terms such as `x · 0`. Only an output boundary that needs a real tangent reuses the primal
+            // Single Static Assignment (SSA) value, which preserves source-relative shapes such as explicit
+            // shaped-constructor extents and avoids inventing a nullary dynamic zero there.
+            let mut zero_producer_outputs = vec![false; self.atoms().len()];
+
             // Preserve primal input order, then allocate tangent inputs in the requested selection order. The
             // normalized selection omits zero differential spaces. Unselected inputs retain structural zeros,
             // including reference inputs for which no tangent reference is supplied.
@@ -2479,11 +2497,11 @@ where
                     .collect::<Result<Vec<_>, ProgramError>>()?;
 
                 // All-zero fast path: skip the operation's rule only when every input tangent is structural zero and
-                // every output zero tangent can later be materialized without runtime identity inputs (or by reusing
-                // a zero-producing primal). Zero-input operations remain excluded so their dedicated rules keep
-                // handling primal synthesis and tangent typing. Dynamic one already relies on this routing to stage
-                // an explicit dynamic-zero tangent. Other dynamic output rules must retain any runtime extents needed
-                // to materialize their structural zero tangents.
+                // every output zero tangent can later be materialized without runtime identity inputs (or from the
+                // primal of a zero producer at the output boundary). Zero-input operations remain excluded so their
+                // dedicated rules keep handling primal synthesis and tangent typing. Dynamic one already relies on this
+                // routing to stage an explicit dynamic-zero tangent. Other dynamic output rules must retain any runtime
+                // extents needed to materialize their structural zero tangents.
                 let all_input_tangents_are_zero =
                     !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero());
                 let can_materialize_output_tangents_without_rules = || -> Result<bool, DifferentiationError> {
@@ -2513,23 +2531,7 @@ where
                         context
                             .stage_operation(instruction.operation().clone(), regions, primal_inputs.as_slice())?
                             .into_iter()
-                            .enumerate()
-                            .map(|(output_index, primal)| {
-                                // When the primal instruction is itself known to produce zero and its output already
-                                // has the required tangent type, the primal Single Static Assignment (SSA) value is the
-                                // canonical materialized tangent. Reusing it preserves source-relative shapes such as
-                                // explicit shaped-constructor extents and avoids inventing a nullary dynamic zero at
-                                // the fused Jacobian-Vector Product (JVP) boundary.
-                                let primal_type = primal.r#type();
-                                let tangent_type = primal_type.tangent()?;
-                                if instruction.operation().is_zero(output_index)
-                                    && primal_type.as_ref() == &tangent_type
-                                {
-                                    DifferentiationDual::new(primal.clone(), primal)
-                                } else {
-                                    DifferentiationDual::new_with_zero_tangent(primal)
-                                }
-                            })
+                            .map(DifferentiationDual::new_with_zero_tangent)
                             .collect::<Result<Vec<_>, DifferentiationError>>()
                     } else {
                         let differentiation_driver =
@@ -2544,8 +2546,14 @@ where
                 })?;
 
                 check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
-                for (output_atom, dual) in instruction.outputs().iter().copied().zip(output_duals) {
+                for (output_index, (output_atom, dual)) in
+                    instruction.outputs().iter().copied().zip(output_duals).enumerate()
+                {
                     let (primal, tangent) = dual.into_parts();
+                    if use_zero_tangent_fast_path && instruction.operation().is_zero(output_index) {
+                        let primal_type = primal.r#type();
+                        zero_producer_outputs[output_atom.index()] = primal_type.as_ref() == &primal_type.tangent()?;
+                    }
                     primals[output_atom.index()] = Some(primal);
                     tangents[output_atom.index()] = Some(tangent);
                 }
@@ -2580,13 +2588,15 @@ where
                     if tangent.r#type().is_zero_space() || (primal.r#type().is_reference() && tangent.is_zero()) {
                         Ok(None)
                     } else {
-                        // A structural zero tangent has to become a real boundary value here. Its type alone cannot
-                        // construct it when it references runtime identities, so the operation family's residual
-                        // protocol reads the missing extents from the output's own primal, which is a live value of
-                        // the same shape. An identity-free tangent type declares no residuals and therefore stages
-                        // exactly the nullary zero it staged before.
+                        // A structural zero tangent has to become a real boundary value here. The primal of a zero
+                        // producer already is that value. Otherwise, its type alone cannot construct it when it
+                        // references runtime identities, so the operation family's residual protocol reads the missing
+                        // extents from the output's own primal, which is a live value of the same shape. An
+                        // identity-free tangent type declares no residuals and therefore stages exactly the nullary
+                        // zero it staged before.
                         let tangent = match tangent {
                             MaybeZero::Value(tangent) => tangent,
+                            MaybeZero::Zero(_) if zero_producer_outputs[output_atom.index()] => primal.clone(),
                             MaybeZero::Zero(tangent_type) => {
                                 let residuals = capture_and_validate_zero_residual_values(
                                     &context,
@@ -3045,10 +3055,11 @@ where
     /// Atoms that are not reached by any input tangent are structurally zero. Their tangents stay symbolic as typed
     /// [`MaybeZero::Zero`]s and stage nothing. The shared all-zero fast path short-circuits operations whose every
     /// input tangent is structural zero only when each output zero tangent can be materialized without runtime identity
-    /// inputs (or by reusing a compatible zero-producing primal). It stages the primal directly and pairs each output
-    /// with a typed structural zero tangent. Structural zeros are materialized as typed
-    /// [`ZeroOperation`](crate::ZeroOperation) instructions only when a non-zero differential output requires a real
-    /// value, preserving a compact `(primal_outputs ++ live_tangent_outputs)` program contract.
+    /// inputs (or from the primal of a compatible zero producer). It stages the primal directly and pairs each output
+    /// with a typed structural zero tangent. Structural zeros are materialized only when a non-zero differential output
+    /// requires a real value, preserving a compact `(primal_outputs ++ live_tangent_outputs)` program contract. Such an
+    /// output reuses the primal of the zero producer that computed it and otherwise stages a typed
+    /// [`ZeroOperation`](crate::ZeroOperation) instruction.
     ///
     /// Reference-typed inputs are differentiated directly, without discharging the program first. A reference type is
     /// never a zero differential space, so every reference-typed input receives a concrete tangent reference input of
@@ -4126,11 +4137,11 @@ pub(crate) mod tests {
     };
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::differentiate_at;
     use crate::differentiation::reverse::{
         CotangentDestinationKind, ReverseModeDifferentiate, TransposedProgramCotangent,
     };
     use crate::differentiation::tests::RuleProbeOperation;
+    use crate::differentiation::{EverythingSavable, NothingSavable, differentiate_at};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::impl_guardless_operation;
     use crate::operations::{
@@ -4138,7 +4149,7 @@ pub(crate) mod tests {
         MulOperation, NegOperation, PrintOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceWriteOperation, ScanOperation, SinOperation, StopGradient,
-        StopGradientOperation, ZeroOperation, composite,
+        StopGradientOperation, ZeroLikeOperation, ZeroOperation, composite,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
@@ -5481,12 +5492,7 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(
             outputs,
-            vec![
-                Array::scalar(27f64).unwrap(),
-                Array::scalar(true).unwrap(),
-                Array::scalar(3f64).unwrap(),
-                Array::scalar(0f64).unwrap(),
-            ],
+            vec![Array::scalar(27f64).unwrap(), Array::scalar(true).unwrap(), Array::scalar(3f64).unwrap()],
         );
         let backward = reverse.pullback().unwrap().into_program();
         assert_eq!(
@@ -5494,24 +5500,17 @@ pub(crate) mod tests {
                 Array::scalar(2f64).unwrap(),
                 Array::scalar(true).unwrap(),
                 Array::scalar(3f64).unwrap(),
-                Array::scalar(0f64).unwrap(),
             ]),
             Ok(vec![Array::scalar(54f64).unwrap()]),
         );
         assert_eq!(
             reverse.primal().interpret(vec![Array::scalar(false).unwrap(), Array::scalar(3f64).unwrap()]),
-            Ok(vec![
-                Array::scalar(27f64).unwrap(),
-                Array::scalar(false).unwrap(),
-                Array::scalar(0f64).unwrap(),
-                Array::scalar(3f64).unwrap(),
-            ]),
+            Ok(vec![Array::scalar(27f64).unwrap(), Array::scalar(false).unwrap(), Array::scalar(3f64).unwrap()]),
         );
         assert_eq!(
             backward.interpret(vec![
                 Array::scalar(2f64).unwrap(),
                 Array::scalar(false).unwrap(),
-                Array::scalar(0f64).unwrap(),
                 Array::scalar(3f64).unwrap(),
             ]),
             Ok(vec![Array::scalar(54f64).unwrap()]),
@@ -7308,6 +7307,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_program_jvp_keeps_zero_producer_tangents_structural() {
+        // Test that the tangent of a zero producer whose inputs carry only structural zero tangents stays structural
+        // while the replay propagates it, so that `x · zero_like(stop_gradient(u))` stages no dead `x · 0` tangent
+        // term. The zero producer's primal still serves as the materialized tangent of an output it reaches.
+        let vector_type = ArrayType::new_static(DataType::F64, [2]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let x = builder.add_input(vector_type.clone());
+        let u = builder.add_input(vector_type);
+        let severed = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![u], None).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![severed], None).unwrap()[0];
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, zero], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![product, zero], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let fused = program.jvp().unwrap();
+        assert_eq!(
+            fused.to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:f64[2], %2:f64[2], %3:f64[2] .
+                let %4:f64[2] = stop_gradient %1
+                    %5:f64[2] = zero_like %4
+                    %6:f64[2] = mul %0 %5
+                    %7:f64[2] = mul %5 %2
+                in (%6, %5, %7, %5)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_program_jvp_with_respect_to() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -8674,6 +8703,76 @@ pub(crate) mod tests {
                 in (%1, %2, %0, %4, %3)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_differentiation_driver_partition_jvp_program_with_residual_policy() {
+        // The fused JVP region `(x, ẋ) ↦ (sin(x), cos(x) · ẋ)` is partitioned with `x` known and `sin(x)` required from
+        // the primal program. The policy decides whether the tangent program receives `cos(x)` or recomputes it from
+        // `x`, and the driver places those residuals without rounding them.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let x = builder.add_input(ArrayType::scalar(DataType::F32));
+        let tangent = builder.add_input(ArrayType::scalar(DataType::F32));
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+        let output_tangent =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![cosine, tangent], None).unwrap()[0];
+        let jvp = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![sine, output_tangent], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let driver =
+            RecursiveDifferentiationDriver { regions: &AttachedRegions::Empty, rule: DifferentiationRule::Jvp };
+        let partition = |policy: ResidualPolicyReference<ArrayType>| {
+            DifferentiationDriver::<EagerContext<Array, ArrayOperation<Array>>>::partition_jvp_program_with_residual_policy(
+                &driver,
+                jvp.entry_region_ref(),
+                &[true, false],
+                &[0],
+                &policy,
+            )
+            .unwrap()
+            .to_string()
+        };
+        assert_eq!(
+            partition(ResidualPolicyReference::new(EverythingSavable)),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f32[] .
+                    let %1:f32[] = sin %0
+                        %2:f32[] = cos %0
+                    in (%1, %2)
+                }
+                residual={
+                    lambda %0:f32[], %1:f32[] .
+                    let %2:f32[] = mul %1 %0
+                    in (%2)
+                }"},
+        );
+        assert_eq!(
+            partition(ResidualPolicyReference::new(NothingSavable)),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f32[] .
+                    let %1:f32[] = sin %0
+                    in (%1, %0)
+                }
+                residual={
+                    lambda %0:f32[], %1:f32[] .
+                    let %2:f32[] = cos %1
+                        %3:f32[] = mul %2 %0
+                    in (%3)
+                }"},
         );
     }
 
