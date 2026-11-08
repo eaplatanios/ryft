@@ -1,6 +1,7 @@
 use std::borrow::{Borrow, Cow};
 use std::collections::BTreeSet;
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
+use std::sync::Arc;
 
 use ryft_macros::Parameter;
 
@@ -76,23 +77,10 @@ static EMPTY_BATCH_AXES: BTreeSet<String> = BTreeSet::new();
 ///   "c64[rows, 42]",
 /// );
 /// ```
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+#[derive(Clone, PartialEq, Eq, Hash, Parameter)]
 pub struct ArrayType {
-    /// [`DataType`] of the elements stored in the array.
-    pub(crate) data_type: DataType,
-
-    /// [`Shape`] of the array.
-    pub(crate) shape: Shape,
-
-    /// Optional physical memory/storage [`Layout`] of the array.
-    pub(crate) layout: Option<Layout>,
-
-    /// Optional [`Sharding`] information about the array.
-    pub(crate) sharding: Option<Sharding>,
-
-    /// [`Memory`] in which the array resides. For sharded arrays, the memory applies uniformly to every shard,
-    /// each residing in its own device's memory of this kind.
-    pub(crate) memory: Memory,
+    /// Shared immutable metadata, detached by consuming builders before changing a component.
+    payload: Arc<ArrayTypePayload>,
 }
 
 impl ArrayType {
@@ -101,7 +89,15 @@ impl ArrayType {
     /// [`Self::with_sharding`], and [`Self::with_memory`] to attach optional metadata.
     #[inline]
     pub fn new(data_type: DataType, shape: Shape) -> Self {
-        Self { data_type, shape, layout: None, sharding: None, memory: Memory::Device }
+        Self {
+            payload: Arc::new(ArrayTypePayload {
+                data_type,
+                shape,
+                layout: None,
+                sharding: None,
+                memory: Memory::Device,
+            }),
+        }
     }
 
     /// Constructs a new [`ArrayType`] whose dimensions are all statically known, with no [`Layout`] or [`Sharding`]
@@ -116,7 +112,10 @@ impl ArrayType {
     /// [`Layout`], [`Sharding`], and [`Memory`] unchanged.
     #[inline]
     pub fn with_data_type<D: Into<DataType>>(mut self, data_type: D) -> Self {
-        self.data_type = data_type.into();
+        let data_type = data_type.into();
+        if self.payload.data_type != data_type {
+            Arc::make_mut(&mut self.payload).data_type = data_type;
+        }
         self
     }
 
@@ -124,7 +123,10 @@ impl ArrayType {
     /// [`Layout`], [`Sharding`], and [`Memory`] unchanged.
     #[inline]
     pub fn with_shape<S: Into<Shape>>(mut self, shape: S) -> Self {
-        self.shape = shape.into();
+        let shape = shape.into();
+        if self.payload.shape != shape {
+            Arc::make_mut(&mut self.payload).shape = shape;
+        }
         self
     }
 
@@ -132,7 +134,10 @@ impl ArrayType {
     /// (or without any [`Layout`] information when [`None`] is provided).
     #[inline]
     pub fn with_layout<L: Into<Option<Layout>>>(mut self, layout: L) -> Self {
-        self.layout = layout.into();
+        let layout = layout.into();
+        if self.payload.layout != layout {
+            Arc::make_mut(&mut self.payload).layout = layout;
+        }
         self
     }
 
@@ -146,11 +151,11 @@ impl ArrayType {
     /// [`ConstrainSharding`](crate::ConstrainSharding)) or runtime metadata of a concrete array. Code that
     /// derives a type from such a placement uses [`Sharding::without_auto_axes`] explicitly.
     #[inline]
-    pub fn with_sharding<S: Into<Option<Sharding>>>(mut self, sharding: S) -> Result<Self, ShardingError> {
+    pub fn with_sharding<S: Into<Option<Sharding>>>(self, sharding: S) -> Result<Self, ShardingError> {
         let sharding = sharding.into();
         if let Some(sharding) = &sharding {
             let sharding_rank = sharding.rank();
-            let array_rank = self.shape.rank();
+            let array_rank = self.payload.shape.rank();
             if sharding_rank != array_rank {
                 return Err(ShardingError::ShardingRankMismatch { sharding_rank, array_rank });
             }
@@ -158,8 +163,19 @@ impl ArrayType {
                 return Err(ShardingError::AutoAxisInArrayType { sharding: sharding.clone() });
             }
         }
-        self.sharding = sharding;
-        Ok(self)
+        Ok(self.with_sharding_unchecked(sharding))
+    }
+
+    /// Replaces sharding metadata without checking its rank or mesh axis kinds. Internal metadata transformations use
+    /// this to preserve an existing descriptor's shape/sharding relationship, including intermediate descriptors whose
+    /// shape and sharding ranks are being changed separately. The caller must derive the replacement from existing
+    /// metadata without introducing new placement promises. New sharding attachments use [`Self::with_sharding`].
+    #[inline]
+    pub(crate) fn with_sharding_unchecked(mut self, sharding: Option<Sharding>) -> Self {
+        if self.payload.sharding != sharding {
+            Arc::make_mut(&mut self.payload).sharding = sharding;
+        }
+        self
     }
 
     /// Returns this [`ArrayType`] with the array residing in the provided [`Memory`]. This kind of placement
@@ -167,7 +183,10 @@ impl ArrayType {
     /// [`Layout`], or [`Sharding`] (for sharded arrays, every shard resides in its own device's memory of this kind).
     #[inline]
     pub fn with_memory<M: Into<Memory>>(mut self, memory: M) -> Self {
-        self.memory = memory.into();
+        let memory = memory.into();
+        if self.payload.memory != memory {
+            Arc::make_mut(&mut self.payload).memory = memory;
+        }
         self
     }
 
@@ -175,7 +194,7 @@ impl ArrayType {
     /// will be a scalar (i.e., have rank 0).
     #[inline]
     pub fn scalar(data_type: DataType) -> Self {
-        Self { data_type, shape: Shape::scalar(), layout: None, sharding: None, memory: Memory::default() }
+        Self::new(data_type, Shape::scalar())
     }
 
     /// Returns a scalar [`ArrayType`] with this array's element [`DataType`], [`Memory`] space, and mesh-level
@@ -208,13 +227,13 @@ impl ArrayType {
     /// Returns the [`DataType`] of the elements stored in the array.
     #[inline]
     pub fn data_type(&self) -> DataType {
-        self.data_type
+        self.payload.data_type
     }
 
     /// Returns the [`Shape`] of the array.
     #[inline]
     pub fn shape(&self) -> &Shape {
-        &self.shape
+        &self.payload.shape
     }
 
     /// Returns a new [`StaticShape`] for this [`ArrayType`] if all dimensions of [`Self::shape`] have static size.
@@ -222,7 +241,8 @@ impl ArrayType {
     /// reference to cached shape metadata.
     #[inline]
     pub fn static_shape(&self) -> Option<StaticShape> {
-        self.shape
+        self.payload
+            .shape
             .dimensions()
             .iter()
             .map(Dimension::value)
@@ -259,7 +279,7 @@ impl ArrayType {
     /// ```
     #[inline]
     pub fn rank(&self) -> usize {
-        self.shape.rank()
+        self.payload.shape.rank()
     }
 
     /// Returns the [`Dimension`] of the `index`-th dimension of this array type's [`Shape`]. A negative `index` can be
@@ -267,7 +287,7 @@ impl ArrayType {
     /// index value of `-1` will result in the last dimension (i.e., innermost) [`Dimension`] being returned.
     #[inline]
     pub fn dimension<A: Into<Axis>>(&self, index: A) -> Dimension {
-        self.shape.dimension(index)
+        self.payload.shape.dimension(index)
     }
 
     /// Returns the number of elements in arrays of this [`ArrayType`]. A statically zero dimension makes the result
@@ -275,40 +295,44 @@ impl ArrayType {
     /// Returns a [`TypeError`] if the static element count does not fit in [`usize`].
     #[inline]
     pub fn element_count(&self) -> Result<Option<usize>, TypeError> {
-        self.shape.element_count()
+        self.payload.shape.element_count()
     }
 
     /// Returns the physical memory/storage [`Layout`] of the array if it is known.
     #[inline]
     pub fn layout(&self) -> Option<&Layout> {
-        self.layout.as_ref()
+        self.payload.layout.as_ref()
     }
 
     /// Returns [`Sharding`] information about the array if it is known.
     #[inline]
     pub fn sharding(&self) -> Option<&Sharding> {
-        self.sharding.as_ref()
+        self.payload.sharding.as_ref()
     }
 
     /// Returns the mesh axes over which this array type's [`Sharding`] is *unreduced* (i.e.,
     /// [`Sharding::unreduced_axes`]), or an empty set when the array type carries no [`Sharding`].
     #[inline]
     pub fn unreduced_axes(&self) -> &BTreeSet<String> {
-        self.sharding.as_ref().map(|sharding| sharding.unreduced_axes()).unwrap_or(&EMPTY_BATCH_AXES)
+        self.payload
+            .sharding
+            .as_ref()
+            .map(|sharding| sharding.unreduced_axes())
+            .unwrap_or(&EMPTY_BATCH_AXES)
     }
 
     /// Returns the [`UnreducedKind`] of this array type's [`Sharding`] (i.e., [`Sharding::unreduced_kind`]),
     /// or [`UnreducedKind::Sum`] when the array type carries no [`Sharding`].
     #[inline]
     pub fn unreduced_kind(&self) -> UnreducedKind {
-        self.sharding.as_ref().map(Sharding::unreduced_kind).unwrap_or_default()
+        self.payload.sharding.as_ref().map(Sharding::unreduced_kind).unwrap_or_default()
     }
 
     /// Returns the mesh axes over which this array type's [`Sharding`] is *reduced* (i.e.,
     /// [`Sharding::reduced_axes`]), or an empty set when the array type carries no [`Sharding`].
     #[inline]
     pub fn reduced_axes(&self) -> &BTreeSet<String> {
-        self.sharding.as_ref().map(|sharding| sharding.reduced_axes()).unwrap_or(&EMPTY_BATCH_AXES)
+        self.payload.sharding.as_ref().map(|sharding| sharding.reduced_axes()).unwrap_or(&EMPTY_BATCH_AXES)
     }
 
     /// Returns an [`ArrayType`] whose [`Sharding`] (if any) has its unreduced and reduced axis sets cleared while its
@@ -318,7 +342,7 @@ impl ArrayType {
     /// combine separately.
     #[inline]
     pub fn without_reduction_axes(&self) -> Self {
-        let Some(sharding) = &self.sharding else {
+        let Some(sharding) = &self.payload.sharding else {
             return self.clone();
         };
         let stripped = sharding
@@ -333,7 +357,7 @@ impl ArrayType {
     /// Returns the [`Memory`] space in which the array resides.
     #[inline]
     pub fn memory(&self) -> Memory {
-        self.memory
+        self.payload.memory
     }
 
     /// Returns an [`ArrayType`] with a dimension inserted at the provided index. Rank-changing operations clear
@@ -348,12 +372,13 @@ impl ArrayType {
                 self.rank()
             )));
         }
-        let mut dimensions = self.shape.dimensions().to_vec();
+        let mut dimensions = self.payload.shape.dimensions().to_vec();
         dimensions.insert(index, dimension);
 
         // The inserted array dimension is replicated. Reuse the sharding-level insertion so that this method stays a
         // thin wrapper. For more information, refer to the documentation of `Sharding::with_inserted_dimension`.
         let sharding = self
+            .payload
             .sharding
             .as_ref()
             .map(|sharding| sharding.with_inserted_dimension(index, ShardingDimension::Replicated))
@@ -361,11 +386,13 @@ impl ArrayType {
             .map_err(|error| TypeError::invalid(error.to_string()))?;
 
         Ok(Self {
-            data_type: self.data_type,
-            shape: Shape::new(dimensions),
-            layout: None,
-            sharding,
-            memory: self.memory,
+            payload: Arc::new(ArrayTypePayload {
+                data_type: self.data_type(),
+                shape: Shape::new(dimensions),
+                layout: None,
+                sharding,
+                memory: self.memory(),
+            }),
         })
     }
 
@@ -384,13 +411,14 @@ impl ArrayType {
                 self.rank()
             )));
         }
-        let mut dimensions = self.shape.dimensions().to_vec();
+        let mut dimensions = self.payload.shape.dimensions().to_vec();
         let dimension = dimensions.remove(index);
 
         // Delegate the per-dimension sharding bookkeeping (i.e., manual placements are dropped and non-manual sharded
         // dimensions cannot be dropped) to the sharding itself. For more information, refer to the documentation of
         // `Sharding::without_dimension`.
         let sharding = self
+            .payload
             .sharding
             .as_ref()
             .map(|sharding| sharding.without_dimension(index))
@@ -399,11 +427,13 @@ impl ArrayType {
 
         Ok((
             Self {
-                data_type: self.data_type,
-                shape: Shape::new(dimensions),
-                layout: None,
-                sharding,
-                memory: self.memory,
+                payload: Arc::new(ArrayTypePayload {
+                    data_type: self.data_type(),
+                    shape: Shape::new(dimensions),
+                    layout: None,
+                    sharding,
+                    memory: self.memory(),
+                }),
             },
             dimension,
         ))
@@ -412,7 +442,8 @@ impl ArrayType {
     /// Returns an [`ArrayType`] with a replicated [`Sharding`] over the provided [`DeviceMesh`]. The [`Layout`]
     /// information and [`Memory`] placement are preserved.
     pub fn replicated(&self, mesh: &DeviceMesh) -> Result<Self, ShardingError> {
-        self.clone().with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), self.shape.rank()))
+        self.clone()
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), self.payload.shape.rank()))
     }
 
     /// Checks that the array inputs of an ordinary operation vary over the same manual mesh axes, which is the
@@ -463,8 +494,9 @@ impl ArrayType {
     ///
     /// Returns a [`TypeError`] describing the first layout or storage requirement that the type violates.
     pub fn validate_layout(&self) -> Result<(), TypeError> {
-        if self.layout.is_some() {
+        if self.payload.layout.is_some() {
             let dimensions = self
+                .payload
                 .shape
                 .dimensions()
                 .iter()
@@ -532,31 +564,47 @@ impl ArrayType {
     /// excluded because ordinary type refinement, identity-renaming derivation, and cross-signature refinement
     /// validation have different requirements.
     fn non_shape_components_are_refined_by(&self, other: &Self) -> bool {
-        let layout_is_refined = match (&self.layout, &other.layout) {
+        let layout_is_refined = match (&self.payload.layout, &other.payload.layout) {
             (None, _) => true,
             (Some(_), None) => false,
             (Some(declared), Some(actual)) => declared == actual,
         };
-        let sharding_is_refined = match (&self.sharding, &other.sharding) {
+        let sharding_is_refined = match (&self.payload.sharding, &other.payload.sharding) {
             (None, _) => true,
             (Some(_), None) => false,
             (Some(declared), Some(actual)) => declared == actual,
         };
-        self.data_type == other.data_type && layout_is_refined && sharding_is_refined && self.memory == other.memory
+        self.payload.data_type == other.payload.data_type
+            && layout_is_refined
+            && sharding_is_refined
+            && self.payload.memory == other.payload.memory
+    }
+}
+
+impl Debug for ArrayType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ArrayType")
+            .field("data_type", &self.payload.data_type)
+            .field("shape", &self.payload.shape)
+            .field("layout", &self.payload.layout)
+            .field("sharding", &self.payload.sharding)
+            .field("memory", &self.payload.memory)
+            .finish()
     }
 }
 
 impl Display for ArrayType {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "{}{}", self.data_type, self.shape)?;
-        if let Some(layout) = &self.layout {
+        write!(formatter, "{}{}", self.payload.data_type, self.payload.shape)?;
+        if let Some(layout) = &self.payload.layout {
             write!(formatter, "[layout={layout}]")?;
         }
-        if let Some(sharding) = &self.sharding {
+        if let Some(sharding) = &self.payload.sharding {
             write!(formatter, "[sharding={sharding}]")?;
         }
-        if self.memory != Memory::Device {
-            write!(formatter, "@{}", self.memory)?;
+        if self.payload.memory != Memory::Device {
+            write!(formatter, "@{}", self.payload.memory)?;
         }
         Ok(())
     }
@@ -583,7 +631,8 @@ impl Type for ArrayType {
     }
 
     fn identities(&self) -> impl Iterator<Item = (TypeIdentityPosition, &Self::Identity)> {
-        self.shape
+        self.payload
+            .shape
             .dimensions()
             .iter()
             .filter_map(Dimension::variable)
@@ -610,7 +659,10 @@ impl Type for ArrayType {
 
     #[inline]
     fn rename_identities(&self, renaming: &TypeIdentityRenaming<Self::Identity>) -> Result<Self, TypeError> {
-        Ok(Self { shape: self.shape.rename_type_identities(renaming), ..self.clone() })
+        Ok(match self.shape().map_dimensions(|_, dimension| dimension.rename_type_identities(renaming)) {
+            Cow::Borrowed(_) => self.clone(),
+            Cow::Owned(shape) => self.clone().with_shape(shape),
+        })
     }
 
     #[inline]
@@ -627,7 +679,7 @@ impl Type for ArrayType {
         // one that carries the component), while a declared `Some` requires the actual type to carry the exact same
         // component. This is what lets declared types staged without placement information (e.g., program input types
         // traced from metadata-free exemplars) accept concrete runtime values whose types carry normalized shardings.
-        self.non_shape_components_are_refined_by(other) && self.shape.is_refined_by(&other.shape)
+        self.non_shape_components_are_refined_by(other) && self.payload.shape.is_refined_by(&other.payload.shape)
     }
 
     #[inline]
@@ -637,7 +689,7 @@ impl Type for ArrayType {
 
     #[inline]
     fn is_complex(&self) -> bool {
-        self.data_type.is_complex()
+        self.payload.data_type.is_complex()
     }
 }
 
@@ -719,6 +771,26 @@ impl From<ReferenceType<NoReferent>> for ArrayType {
     }
 }
 
+/// Array type metadata shared by immutable copies of an [`ArrayType`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ArrayTypePayload {
+    /// [`DataType`] of the elements stored in the array.
+    data_type: DataType,
+
+    /// [`Shape`] of the array.
+    shape: Shape,
+
+    /// Optional physical memory/storage [`Layout`] of the array.
+    layout: Option<Layout>,
+
+    /// Optional [`Sharding`] information about the array.
+    sharding: Option<Sharding>,
+
+    /// [`Memory`] in which the array resides. For sharded arrays, the memory applies uniformly to every shard,
+    /// each residing in its own device's memory of this kind.
+    memory: Memory,
+}
+
 /// [`TypeRefinements`] for a complete [`ArrayType`] signature, backed by a [`DimensionRefinements`] instance. This
 /// adapter validates array metadata and shape pairs, then applies the resulting dimension facts to array axes. Refer
 /// to [`DimensionRefinements`] for the distinction between declared and actual identity scopes.
@@ -773,13 +845,30 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         A::Item: Borrow<ArrayType>,
     {
         // Ordinary admission retains nominal axes; comparing the complete signature below checks their relationships.
-        let declared = declared.into_iter().collect::<Vec<_>>();
-        let actual = actual.into_iter().collect::<Vec<_>>();
-        type_signature_pairs(declared.iter(), actual.iter())?.try_for_each(|(declared, actual)| {
-            Self::refinement_facts(declared.borrow(), actual.borrow(), DimensionComparison::Refinement)
-                .try_for_each(|refinement_fact| refinement_fact.map(|_| ()))
-        })?;
-        Self::from_local_declarations(declared, actual)
+        let mut declared_members = Vec::new();
+        let mut actual_members = Vec::new();
+        for (declared, actual) in type_signature_pairs(declared, actual)? {
+            let declared_type: &ArrayType = declared.borrow();
+            let actual_type: &ArrayType = actual.borrow();
+
+            // Equal identity-free members contribute neither refinement facts nor runtime relationships. Keep their
+            // admission check local and allocate buffers only for members whose facts can affect the signature.
+            if declared_type == actual_type && declared_type.identities().next().is_none() {
+                continue;
+            }
+
+            Self::refinement_facts(declared_type, actual_type, DimensionComparison::Refinement)
+                .try_for_each(|refinement_fact| refinement_fact.map(|_| ()))?;
+
+            declared_members.push(declared);
+            actual_members.push(actual);
+        }
+
+        if declared_members.is_empty() {
+            return Ok(Self::default());
+        }
+
+        Self::from_local_declarations(declared_members, actual_members)
     }
 
     fn from_local_declarations<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
@@ -844,13 +933,13 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         r#type: &ArrayType,
         preserved_identities: &[DimensionVariable],
     ) -> Result<ArrayType, TypeError> {
-        let dimensions = r#type
+        let shape = r#type
             .shape()
-            .dimensions()
-            .iter()
-            .map(|dimension| self.dimensions.refine_declared_dimension(dimension, preserved_identities))
-            .collect();
-        Ok(r#type.clone().with_shape(Shape::new(dimensions)))
+            .map_dimensions(|_, dimension| self.dimensions.refine_declared_dimension(dimension, preserved_identities));
+        Ok(match shape {
+            Cow::Borrowed(_) => r#type.clone(),
+            Cow::Owned(shape) => r#type.clone().with_shape(shape),
+        })
     }
 
     fn refine_actual(
@@ -858,13 +947,13 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         r#type: &ArrayType,
         preserved_identities: &[DimensionVariable],
     ) -> Result<ArrayType, TypeError> {
-        let dimensions = r#type
+        let shape = r#type
             .shape()
-            .dimensions()
-            .iter()
-            .map(|dimension| self.dimensions.refine_actual_dimension(dimension, preserved_identities))
-            .collect();
-        Ok(r#type.clone().with_shape(Shape::new(dimensions)))
+            .map_dimensions(|_, dimension| self.dimensions.refine_actual_dimension(dimension, preserved_identities));
+        Ok(match shape {
+            Cow::Borrowed(_) => r#type.clone(),
+            Cow::Owned(shape) => r#type.clone().with_shape(shape),
+        })
     }
 
     fn retype_actual(
@@ -876,14 +965,17 @@ impl TypeRefinements<ArrayType> for ArrayTypeRefinements {
         if declared.rank() != actual.rank() {
             return Err(TypeError::invalid(format!("type {actual} does not refine declared type {declared}")));
         }
-        let dimensions = declared
-            .shape()
-            .dimensions()
-            .iter()
-            .zip(actual.shape().dimensions())
-            .map(|(declared, actual)| self.dimensions.retype_actual_dimension(declared, actual, preferred_identities))
-            .collect();
-        Ok(actual.clone().with_shape(Shape::new(dimensions)))
+        let shape = actual.shape().map_dimensions(|axis, dimension| {
+            self.dimensions.retype_actual_dimension(
+                &declared.shape().dimensions()[axis],
+                dimension,
+                preferred_identities,
+            )
+        });
+        Ok(match shape {
+            Cow::Borrowed(_) => actual.clone(),
+            Cow::Owned(shape) => actual.clone().with_shape(shape),
+        })
     }
 }
 
@@ -920,7 +1012,7 @@ impl ArrayMemberType for NoReferent {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeSet, HashSet};
 
     use pretty_assertions::assert_eq;
 
@@ -933,6 +1025,116 @@ mod tests {
     use crate::arrays::types::layouts::{StridedLayout, Tile, TileDimension, TiledLayout};
 
     use super::*;
+
+    #[test]
+    fn test_array_type_clone_shares_immutable_metadata() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let shape = Shape::new(vec![rows.clone().into(), Dimension::Static(3)]);
+        let layout = Layout::Strided(StridedLayout::new(vec![3, 1]));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh, 2);
+        let source = ArrayType::new(F32, shape.clone())
+            .with_layout(layout.clone())
+            .with_sharding(sharding.clone())
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true });
+        let cloned = source.clone();
+        assert!(Arc::ptr_eq(&source.payload, &cloned.payload));
+        assert_eq!(source, cloned);
+        assert_eq!(cloned.dimension(0).variable(), Some(&rows));
+
+        let separate = ArrayType::new(F32, shape.clone())
+            .with_layout(layout.clone())
+            .with_sharding(sharding.clone())
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true });
+        assert!(!Arc::ptr_eq(&source.payload, &separate.payload));
+        assert_eq!(source, separate);
+        assert_eq!(HashSet::from([source.clone()]).get(&separate), Some(&source));
+
+        // Setting unchanged metadata keeps sharing, while changing any component detaches before the edit.
+        let unchanged = cloned
+            .with_data_type(F32)
+            .with_shape(shape.clone())
+            .with_layout(layout.clone())
+            .with_sharding(sharding.clone())
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true });
+        assert!(Arc::ptr_eq(&source.payload, &unchanged.payload));
+        let edited = source
+            .clone()
+            .with_data_type(F64)
+            .with_shape(Shape::from([2, 3]))
+            .with_layout(None)
+            .with_sharding(None)
+            .unwrap()
+            .with_memory(Memory::Device);
+        assert!(!Arc::ptr_eq(&source.payload, &edited.payload));
+        assert_eq!(edited, ArrayType::new_static(F64, [2, 3]));
+        assert_eq!(source.data_type(), F32);
+        assert_eq!(source.shape(), &shape);
+        assert_eq!(source.layout(), Some(&layout));
+        assert_eq!(source.sharding(), Some(&sharding));
+        assert_eq!(source.memory(), Memory::Host { pinned: true });
+        assert_eq!(source.dimension(0).variable(), Some(&rows));
+
+        assert_eq!(
+            source.clone().with_sharding(Sharding::replicated(sharding.mesh().clone(), 1)),
+            Err(ShardingError::ShardingRankMismatch { sharding_rank: 1, array_rank: 2 }),
+        );
+        assert_eq!(source, separate);
+    }
+
+    #[test]
+    fn test_array_type_with_sharding_unchecked_preserves_intermediate_descriptor() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let source = ArrayType::new_static(F32, [4])
+            .with_sharding(sharding.clone())
+            .unwrap()
+            .with_shape(Shape::from([2, 2]));
+        let replacement = Sharding::replicated(mesh, 1).with_reduced_axes(["x"]).unwrap();
+        let edited = source.clone().with_sharding_unchecked(Some(replacement.clone()));
+        assert_eq!(edited.rank(), 2);
+        assert_eq!(edited.sharding(), Some(&replacement));
+        assert_eq!(source.sharding(), Some(&sharding));
+        assert!(!Arc::ptr_eq(&source.payload, &edited.payload));
+    }
+
+    #[test]
+    fn test_array_type_builders_mutate_unique_metadata() {
+        let unique = ArrayType::scalar(F32);
+        let payload = Arc::as_ptr(&unique.payload);
+        let edited = unique.with_data_type(F64).with_memory(Memory::Host { pinned: false });
+        assert_eq!(Arc::as_ptr(&edited.payload), payload);
+        assert_eq!(edited, ArrayType::scalar(F64).with_memory(Memory::Host { pinned: false }));
+        assert_eq!(
+            format!("{:?}", ArrayType::new_static(F32, [2, 3])),
+            concat!(
+                "ArrayType { data_type: F32, shape: Shape { dimensions: [Static(2), Static(3)] }, ",
+                "layout: None, sharding: None, memory: Device }",
+            ),
+        );
+    }
+
+    #[test]
+    fn test_array_type_rename_identities_detaches_metadata() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(8)).unwrap());
+        let other_rows = DimensionVariable::new("rows", rows.bounds());
+        let source = ArrayType::new(F32, Shape::new(vec![rows.clone().into(), Dimension::Static(3)]))
+            .with_memory(Memory::Host { pinned: true });
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(rows.clone(), other_rows.clone()).unwrap();
+        let renamed = source.rename_identities(&renaming).unwrap();
+        assert!(!Arc::ptr_eq(&source.payload, &renamed.payload));
+        assert_eq!(source.dimension(0).variable(), Some(&rows));
+        assert_eq!(renamed.dimension(0).variable(), Some(&other_rows));
+        assert_eq!(renamed.memory(), source.memory());
+        assert_eq!(renamed.data_type(), source.data_type());
+        assert_eq!(renamed.layout(), source.layout());
+        assert_eq!(renamed.sharding(), source.sharding());
+        assert_ne!(source, renamed);
+    }
 
     #[test]
     fn test_array_type_new_static() {
@@ -1153,14 +1355,14 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
         let t4 = t3.with_inserted_dimension(1, 5.into()).unwrap();
 
-        assert_eq!(t4.layout, None);
-        assert_eq!(t4.shape, Shape::new(vec![2.into(), 5.into(), 3.into()]));
+        assert_eq!(t4.layout(), None);
+        assert_eq!(t4.shape(), &Shape::new(vec![2.into(), 5.into(), 3.into()]));
 
         let (t5, removed_dimension) = t4.without_dimension(1).unwrap();
 
         assert_eq!(removed_dimension, Dimension::Static(5));
-        assert_eq!(t5.layout, None);
-        assert_eq!(t5.shape, Shape::new(vec![2.into(), 3.into()]));
+        assert_eq!(t5.layout(), None);
+        assert_eq!(t5.shape(), &Shape::new(vec![2.into(), 3.into()]));
 
         let m0 = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let s0 = Sharding::new(m0.clone(), vec![ShardingDimension::sharded(["x"])])
@@ -1740,6 +1942,58 @@ mod tests {
     }
 
     #[test]
+    fn test_array_type_refinements_new_omits_static_pairs() {
+        let matrix = ArrayType::new_static(F32, [2, 3]);
+        let scalar = ArrayType::scalar(F32);
+        assert_eq!(
+            ArrayTypeRefinements::new([&matrix, &scalar], [&matrix, &scalar]),
+            Ok(ArrayTypeRefinements::default()),
+        );
+
+        // Equal nominal types still record their declared/actual correspondence. Static peers do not alter it.
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(F32, Shape::new(vec![n.clone().into()]));
+        let nominal = ArrayTypeRefinements::new([&symbolic], [&symbolic]).unwrap();
+        assert_eq!(nominal.identity_classes().count(), 1);
+        assert_eq!(nominal.identity_classes().next().unwrap().declared(), &[n]);
+        assert_eq!(
+            ArrayTypeRefinements::new([&matrix, &symbolic, &scalar], [&matrix, &symbolic, &scalar]),
+            Ok(nominal),
+        );
+        let exact = ArrayType::new_static(F32, [3]);
+        let expected = ArrayTypeRefinements::new([&symbolic], [&exact]).unwrap();
+        assert_eq!(ArrayTypeRefinements::new([&matrix, &symbolic, &scalar], [&matrix, &exact, &scalar]), Ok(expected),);
+    }
+
+    #[test]
+    fn test_array_type_refinements_new_preserves_error_precedence_with_static_pairs() {
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(F32, Shape::new(vec![n.into()]));
+        let prefix = ArrayType::new_static(F32, [2, 3]);
+        let two = ArrayType::new_static(F32, [2]);
+        let three = ArrayType::new_static(F32, [3]);
+        let scalar = ArrayType::scalar(F32);
+        let incompatible = ArrayType::scalar(F64);
+        assert_eq!(
+            ArrayTypeRefinements::new([&scalar, &symbolic], [&incompatible]),
+            Err(TypeError::invalid("declared type count 2 does not match actual type count 1")),
+        );
+        // Ordinary member admission still finishes before conflicts between separate members are considered.
+        assert_eq!(
+            ArrayTypeRefinements::new([&prefix, &symbolic, &symbolic, &scalar], [&prefix, &two, &three, &incompatible],),
+            Err(TypeError::invalid("type f64[] does not refine declared type f32[]")),
+        );
+        assert_eq!(
+            ArrayTypeRefinements::new([&prefix, &symbolic, &symbolic, &scalar], [&prefix, &two, &three, &scalar]),
+            Err(TypeError::from(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_string(),
+                expected: 2,
+                actual: 3,
+            })),
+        );
+    }
+
+    #[test]
     fn test_array_type_refinements_identity_classes() {
         let first = DimensionVariable::new("first", DimensionBounds::non_negative(Some(8)).unwrap());
         let second = DimensionVariable::new("second", DimensionBounds::non_negative(Some(8)).unwrap());
@@ -1966,6 +2220,35 @@ mod tests {
             .unwrap_err()
             .downcast_custom::<DimensionError>(),
             Some(&DimensionError::InputDimensionMismatch { dimension: "rows".to_string(), expected: 3, actual: 4 }),
+        );
+    }
+
+    #[test]
+    fn test_array_type_refinements_refine_declared_reuses_unchanged_metadata() {
+        let plain = ArrayType::new_static(F32, [2, 3]);
+        let refinements = ArrayTypeRefinements::default();
+        let declared = refinements.refine_declared(&plain, &[]).unwrap();
+        let actual = refinements.refine_actual(&plain, &[]).unwrap();
+        let retyped = refinements.retype_actual(&plain, &plain, &[]).unwrap();
+        assert!(Arc::ptr_eq(&plain.payload, &declared.payload));
+        assert!(Arc::ptr_eq(&plain.payload, &actual.payload));
+        assert!(Arc::ptr_eq(&plain.payload, &retyped.payload));
+
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic = ArrayType::new(F32, Shape::new(vec![n.clone().into()]));
+        let exact = ArrayType::new_static(F32, [3]);
+        let refinements = ArrayTypeRefinements::new([&symbolic], [&exact]).unwrap();
+        let refined = refinements.refine_declared(&symbolic, &[]).unwrap();
+        assert_eq!(refined, exact);
+        assert!(!Arc::ptr_eq(&symbolic.payload, &refined.payload));
+        let preserved = refinements.refine_declared(&symbolic, std::slice::from_ref(&n)).unwrap();
+        assert!(Arc::ptr_eq(&symbolic.payload, &preserved.payload));
+        assert_eq!(symbolic.dimension(0).variable(), Some(&n));
+        assert_eq!(refinements.refine_actual(&exact, &[]), Ok(exact.clone()));
+        assert_eq!(refinements.retype_actual(&symbolic, &exact, &[]), Ok(exact));
+        assert_eq!(
+            refinements.retype_actual(&symbolic, &plain, &[]),
+            Err(TypeError::invalid("type f32[2, 3] does not refine declared type f32[n]")),
         );
     }
 }
