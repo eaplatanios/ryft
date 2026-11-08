@@ -1580,13 +1580,13 @@ mod tests {
                 jvp = indoc! {"
                     lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
                     let %4:f64[] = log_add_exp %0 %1
-                        %5:f64[] = zero_like %4
+                        %5:f64[] = zero [type=f64[]]
                         %6:f64[] = mul %4 %5
                         %7:bool[] = compare [direction=NotEqual] %6 %6
                         %8:bool[] = compare [direction=GreaterThan] %4 %5
                         %9:bool[] = and %7 %8
                         %10:f64[] = select %9 %5 %4
-                        %11:f64[] = zero_like %0
+                        %11:f64[] = zero [type=f64[]]
                         %12:f64[] = mul %0 %11
                         %13:bool[] = compare [direction=NotEqual] %12 %12
                         %14:bool[] = compare [direction=GreaterThan] %0 %11
@@ -1595,7 +1595,7 @@ mod tests {
                         %17:f64[] = sub %16 %10
                         %18:f64[] = exp %17
                         %19:f64[] = mul %18 %2
-                        %20:f64[] = zero_like %1
+                        %20:f64[] = zero [type=f64[]]
                         %21:f64[] = mul %1 %20
                         %22:bool[] = compare [direction=NotEqual] %21 %21
                         %23:bool[] = compare [direction=GreaterThan] %1 %20

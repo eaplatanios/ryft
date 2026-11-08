@@ -2976,7 +2976,7 @@ mod tests {
                     lambda %0:f64[3], %1:f64[3] .
                     let %2:f64[] = reduce [kind=log_sum_exp, axes=[0]] %0
                         %3:f64[] = reduce [kind=max, axes=[0]] %0
-                        %4:f64[] = zero_like %3
+                        %4:f64[] = zero [type=f64[]]
                         %5:f64[] = sub %3 %3
                         %6:bool[] = compare [direction=Equal] %5 %4
                         %7:f64[] = select %6 %3 %4

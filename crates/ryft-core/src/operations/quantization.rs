@@ -3243,10 +3243,10 @@ mod tests {
         check_gradient, check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference,
     };
     use crate::operations::assertions::AssertionError;
-    use crate::operations::sharding::shard_map::{ShardMapOptions, ShardMapTracer, shard_map};
+    use crate::operations::sharding::shard_map::{ShardMapOptions, shard_map};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, TypedProgram};
+    use crate::programs::{EmptyRegionDriver, ProjectedValue, TypedProgram};
     use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
@@ -5716,7 +5716,7 @@ mod tests {
         let (output, pullback) = differentiate_at(quantized)
             .vjp(|quantized| {
                 let output = shard_map(
-                    |quantized: BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>| {
+                    |quantized: BlockQuantizedValue<ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>>| {
                         quantized.block_dequantize([0], DataType::F32)
                     },
                     quantized.try_map_parameters(|value| {
@@ -6745,8 +6745,8 @@ mod tests {
                 })?;
                 let output = shard_map(
                     |(lhs, rhs): (
-                        BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>,
-                        BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>,
+                        BlockQuantizedValue<ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>>,
+                        BlockQuantizedValue<ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>>,
                     )| lhs.scaled_dot(&rhs, None, None),
                     (lhs, rhs),
                     mesh.clone(),
@@ -7883,9 +7883,9 @@ mod tests {
         .vjp(|(lhs, rhs), state| {
             let output = shard_map(
                 |(lhs, rhs, state): (
-                    ShardMapTracer<EagerArrayIrContext>,
-                    ShardMapTracer<EagerArrayIrContext>,
-                    ShardMapTracer<EagerArrayIrContext>,
+                    ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>,
+                    ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>,
+                    ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>,
                 )| function.call(lhs, rhs, None, None, None, Some(state)),
                 (
                     ValueProjection::<ArrayType>::into_projected(lhs)?,

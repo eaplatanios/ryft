@@ -44,10 +44,10 @@ use crate::macros::{
 };
 use crate::operations::Capability;
 use crate::operations::arithmetic::NegOperation;
-use crate::operations::constants::zero::Zero;
-use crate::operations::constants::zero_like::ZeroLikeOperation;
+use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
 use crate::operations::manipulation::conversions::ElementType;
-use crate::programs::{MaybeZero, ProgramError, Type, TypeError, Typed};
+use crate::programs::{MaybeZero, OperationProvider, ProgramError, Type, TypeError, Typed};
 
 /// Canonical operation name for [`ComplexOperation`].
 pub const COMPLEX_OPERATION_NAME: &str = "complex";
@@ -402,7 +402,9 @@ impl_differentiable_operation! {
     where
         T: Type,
         V::Type: DifferentiableType,
-        O: From<ComplexOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
+        O: From<ComplexOperation<V::Type>>
+            + From<ZeroLikeOperation<V::Type>>
+            + OperationProvider<V::Type, ZeroOperation<V::Type>, Operation = O>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
             // Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses over complex types,
@@ -414,7 +416,7 @@ impl_differentiable_operation! {
             match &outputs[0] {
                 MaybeZero::Zero(_) => Ok(()),
                 MaybeZero::Value(output_cotangent) => {
-                    let zero = output_cotangent.unary(ZeroLikeOperation::new());
+                    let zero = output_cotangent.zero_like()?;
                     let contribution = MaybeZero::Value(output_cotangent.binary(&zero, ComplexOperation::new()));
                     accumulators[0].accumulate(context, contribution)?;
                     Ok(())
@@ -528,7 +530,10 @@ impl_differentiable_operation! {
     where
         T: Type,
         V::Type: DifferentiableType,
-        O: From<NegOperation<V::Type>> + From<ComplexOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
+        O: From<NegOperation<V::Type>>
+            + From<ComplexOperation<V::Type>>
+            + From<ZeroLikeOperation<V::Type>>
+            + OperationProvider<V::Type, ZeroOperation<V::Type>, Operation = O>,
     {
         |_operation, context, _driver, inputs, outputs, accumulators| {
             // Under the bilinear (i.e., conjugation-free) pairing that Ryft's transposition uses over complex types,
@@ -540,7 +545,7 @@ impl_differentiable_operation! {
             match &outputs[0] {
                 MaybeZero::Zero(_) => Ok(()),
                 MaybeZero::Value(output_cotangent) => {
-                    let zero = output_cotangent.unary(ZeroLikeOperation::new());
+                    let zero = output_cotangent.zero_like()?;
                     let negated = output_cotangent.unary(NegOperation::new());
                     let contribution = MaybeZero::Value(zero.binary(&negated, ComplexOperation::new()));
                     accumulators[0].accumulate(context, contribution)?;
@@ -1122,7 +1127,7 @@ mod tests {
                 input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 0.0)).unwrap()],
                 pullback = indoc! {"
                     lambda %0:f64[] .
-                    let %1:f64[] = zero_like %0
+                    let %1:f64[] = zero [type=f64[]]
                         %2:c128[] = complex %0 %1
                     in (%2)
                 "},
@@ -1282,7 +1287,7 @@ mod tests {
                 input_cotangents = [Array::scalar(ComplexNumber::new(0.0f64, -3.0)).unwrap()],
                 pullback = indoc! {"
                     lambda %0:f64[] .
-                    let %1:f64[] = zero_like %0
+                    let %1:f64[] = zero [type=f64[]]
                         %2:f64[] = neg %0
                         %3:c128[] = complex %1 %2
                     in (%3)

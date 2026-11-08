@@ -873,7 +873,7 @@ mod tests {
                             %7:f64[] = one_like %0
                             %8:f64[] = add %7 %7
                             %9:f64[] = div %7 %8
-                            %10:f64[] = zero_like %0
+                            %10:f64[] = zero [type=f64[]]
                             %11:f64[] = select %6 %9 %10
                             %12:f64[] = select %5 %7 %11
                             %13:f64[] = mul %12 %2
@@ -882,7 +882,7 @@ mod tests {
                             %16:f64[] = one_like %1
                             %17:f64[] = add %16 %16
                             %18:f64[] = div %16 %17
-                            %19:f64[] = zero_like %1
+                            %19:f64[] = zero [type=f64[]]
                             %20:f64[] = select %15 %18 %19
                             %21:f64[] = select %14 %16 %20
                             %22:f64[] = mul %21 %3
@@ -1241,7 +1241,7 @@ mod tests {
                             %7:f64[] = one_like %0
                             %8:f64[] = add %7 %7
                             %9:f64[] = div %7 %8
-                            %10:f64[] = zero_like %0
+                            %10:f64[] = zero [type=f64[]]
                             %11:f64[] = select %6 %9 %10
                             %12:f64[] = select %5 %7 %11
                             %13:f64[] = mul %12 %2
@@ -1250,7 +1250,7 @@ mod tests {
                             %16:f64[] = one_like %1
                             %17:f64[] = add %16 %16
                             %18:f64[] = div %16 %17
-                            %19:f64[] = zero_like %1
+                            %19:f64[] = zero [type=f64[]]
                             %20:f64[] = select %15 %18 %19
                             %21:f64[] = select %14 %16 %20
                             %22:f64[] = mul %21 %3
@@ -1647,16 +1647,16 @@ mod tests {
                             %7:bool[] = compare [direction=GreaterThan] %0 %1
                             %8:bool[] = compare [direction=LessThan] %0 %2
                             %9:bool[] = and %7 %8
-                            %10:f64[] = zero_like %3
+                            %10:f64[] = zero [type=f64[]]
                             %11:f64[] = select %9 %3 %10
                             %12:bool[] = compare [direction=GreaterThan] %1 %0
                             %13:bool[] = compare [direction=LessThan] %1 %2
                             %14:bool[] = and %12 %13
-                            %15:f64[] = zero_like %4
+                            %15:f64[] = zero [type=f64[]]
                             %16:f64[] = select %14 %4 %15
                             %17:f64[] = add %11 %16
                             %18:bool[] = compare [direction=LessThan] %2 %1
-                            %19:f64[] = zero_like %5
+                            %19:f64[] = zero [type=f64[]]
                             %20:f64[] = select %18 %5 %19
                             %21:f64[] = add %17 %20
                         in (%6, %21)

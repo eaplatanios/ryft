@@ -940,11 +940,11 @@ mod tests {
     use crate::macros::check_gradient;
     use crate::operations::manipulation::reshaping::Reshape;
     use crate::operations::manipulation::slicing::Slice;
-    use crate::operations::sharding::shard_map::{ShardMapOptions, ShardMapTracer, shard_map};
+    use crate::operations::sharding::shard_map::{ShardMapOptions, shard_map};
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer, PartialValue,
     };
-    use crate::programs::ValueProjection;
+    use crate::programs::{ProjectedValue, ValueProjection};
     use crate::tracing::{Trace, TracingContext};
 
     use super::*;
@@ -1115,7 +1115,7 @@ mod tests {
                 %3:i64[2] = iota [type=i64[2], dimension=0]
                 %4:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %2
                 %5:bool[2] = compare [direction=Equal] %3 %4
-                %6:f32[2] = zero_like %1
+                %6:f32[2] = zero [type=f32[2]]
                 %7:f32[2] = select %5 %1 %6
                 %8:f32[] = reduce [kind=sum, axes=[0]] %7
                 %9:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %8
@@ -1163,7 +1163,8 @@ mod tests {
                 %3:i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
                     broadcast [output_type=i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %1
                 %4:bool[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = compare [direction=Equal] %2 %3
-                %5:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = zero_like %0
+                %5:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
+                    zero [type=f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}]]
                 %6:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = select %4 %0 %5
                 %7:f32[][sharding={mesh<['d'=2:explicit]>, []}] = reduce [kind=sum, axes=[0]] %6
                 %8:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
@@ -1207,7 +1208,7 @@ mod tests {
                 %4:i64[3, 4] = iota [type=i64[3, 4], dimension=1]
                 %5:i64[3, 4] = broadcast [output_type=i64[3, 4], output_axes=[0]] %3
                 %6:bool[3, 4] = compare [direction=Equal] %4 %5
-                %7:f32[3, 4] = zero_like %2
+                %7:f32[3, 4] = zero [type=f32[3, 4]]
                 %8:f32[3, 4] = select %6 %2 %7
                 %9:f32[3] = reduce [kind=sum, axes=[1]] %8
                 %10:f32[3, 4] = broadcast [output_type=f32[3, 4], output_axes=[0]] %9
@@ -1262,31 +1263,30 @@ mod tests {
         );
         assert_eq!(known.outputs(), &[PartialEvaluationOutput::Known(input.softmax(0).unwrap())]);
 
-        // With unknown logits, the class coordinates and the NaN fill fold into known residual inputs.
+        // With unknown logits, the class coordinates, the zero, and the NaN fill fold into known residual inputs.
         let unknown = program.partially_evaluate(&[PartialValue::Unknown(input.r#type().into_owned())]).unwrap();
         assert_eq!(unknown.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(
             unknown.program().to_string(),
             indoc! {"
-            lambda %0:f64[3], %1:i64[3], %2:f64[3] .
-            let %3:i64[] = argmax [axis=0, index_data_type=i64] %0
-                %4:i64[3] = broadcast [output_type=i64[3], output_axes=[]] %3
-                %5:bool[3] = compare [direction=Equal] %1 %4
-                %6:f64[3] = zero_like %0
-                %7:f64[3] = select %5 %0 %6
+            lambda %0:f64[3], %1:i64[3], %2:f64[3], %3:f64[3] .
+            let %4:i64[] = argmax [axis=0, index_data_type=i64] %0
+                %5:i64[3] = broadcast [output_type=i64[3], output_axes=[]] %4
+                %6:bool[3] = compare [direction=Equal] %1 %5
+                %7:f64[3] = select %6 %0 %2
                 %8:f64[] = reduce [kind=sum, axes=[0]] %7
                 %9:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %8
                 %10:f64[3] = sub %9 %9
-                %11:bool[3] = compare [direction=Equal] %10 %6
+                %11:bool[3] = compare [direction=Equal] %10 %2
                 %12:f64[3] = sub %0 %9
-                %13:f64[3] = select %5 %6 %12
+                %13:f64[3] = select %6 %2 %12
                 %14:f64[3] = exp %13
-                %15:f64[3] = select %5 %6 %14
+                %15:f64[3] = select %6 %2 %14
                 %16:f64[] = reduce [kind=sum, axes=[0]] %15
                 %17:f64[] = ln_1p %16
                 %18:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %17
                 %19:f64[3] = sub %13 %18
-                %20:f64[3] = select %11 %19 %2
+                %20:f64[3] = select %11 %19 %3
                 %21:f64[3] = exp %20
             in (%21)
         "}
@@ -1457,7 +1457,10 @@ mod tests {
                 .with_auxiliary_output()
                 .value_and_gradient(|logits, mask| {
                     let (output, selected) = shard_map(
-                        |(logits, mask): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
+                        |(logits, mask): (
+                            ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                            ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                        )| {
                             let output = logits.masked_softmax(&mask, 0)?;
                             Ok((output.clone(), output.slice_axis(0, 0, 1, 1)?))
                         },
@@ -1654,7 +1657,7 @@ mod tests {
                 %2:i64[2] = iota [type=i64[2], dimension=0]
                 %3:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %1
                 %4:bool[2] = compare [direction=Equal] %2 %3
-                %5:f32[2] = zero_like %0
+                %5:f32[2] = zero [type=f32[2]]
                 %6:f32[2] = select %4 %0 %5
                 %7:f32[] = reduce [kind=sum, axes=[0]] %6
                 %8:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %7
@@ -1698,31 +1701,30 @@ mod tests {
         );
         assert_eq!(known.outputs(), &[PartialEvaluationOutput::Known(input.log_softmax(0).unwrap())]);
 
-        // With unknown logits, only the constants fold: the class coordinates and the NaN fill become known residual
-        // inputs of the residual program.
+        // With unknown logits, only the constants fold: the class coordinates, the zero, and the NaN fill become known
+        // residual inputs of the residual program.
         let unknown = program.partially_evaluate(&[PartialValue::Unknown(input.r#type().into_owned())]).unwrap();
         assert_eq!(
             unknown.program().to_string(),
             indoc! {"
-            lambda %0:f32[2], %1:i64[2], %2:f32[2] .
-            let %3:i64[] = argmax [axis=0, index_data_type=i64] %0
-                %4:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %3
-                %5:bool[2] = compare [direction=Equal] %1 %4
-                %6:f32[2] = zero_like %0
-                %7:f32[2] = select %5 %0 %6
+            lambda %0:f32[2], %1:i64[2], %2:f32[2], %3:f32[2] .
+            let %4:i64[] = argmax [axis=0, index_data_type=i64] %0
+                %5:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %4
+                %6:bool[2] = compare [direction=Equal] %1 %5
+                %7:f32[2] = select %6 %0 %2
                 %8:f32[] = reduce [kind=sum, axes=[0]] %7
                 %9:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %8
                 %10:f32[2] = sub %9 %9
-                %11:bool[2] = compare [direction=Equal] %10 %6
+                %11:bool[2] = compare [direction=Equal] %10 %2
                 %12:f32[2] = sub %0 %9
-                %13:f32[2] = select %5 %6 %12
+                %13:f32[2] = select %6 %2 %12
                 %14:f32[2] = exp %13
-                %15:f32[2] = select %5 %6 %14
+                %15:f32[2] = select %6 %2 %14
                 %16:f32[] = reduce [kind=sum, axes=[0]] %15
                 %17:f32[] = ln_1p %16
                 %18:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %17
                 %19:f32[2] = sub %13 %18
-                %20:f32[2] = select %11 %19 %2
+                %20:f32[2] = select %11 %19 %3
             in (%20)
         "}
             .trim_end(),
@@ -1871,7 +1873,7 @@ mod tests {
                 %6:i64[2] = iota [type=i64[2], dimension=0]
                 %7:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %5
                 %8:bool[2] = compare [direction=Equal] %6 %7
-                %9:f32[2] = zero_like %4
+                %9:f32[2] = zero [type=f32[2]]
                 %10:f32[2] = select %8 %4 %9
                 %11:f32[] = reduce [kind=sum, axes=[0]] %10
                 %12:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %11
@@ -1909,7 +1911,10 @@ mod tests {
                 .with_auxiliary_output()
                 .value_and_gradient(|logits, mask| {
                     let (output, selected) = shard_map(
-                        |(logits, mask): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
+                        |(logits, mask): (
+                            ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                            ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                        )| {
                             let output = logits.masked_log_softmax(&mask, 0)?;
                             Ok((output.clone(), output.slice_axis(0, 0, 1, 1)?))
                         },
@@ -2090,7 +2095,7 @@ mod tests {
                 %3:i64[2] = iota [type=i64[2], dimension=0]
                 %4:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %2
                 %5:bool[2] = compare [direction=Equal] %3 %4
-                %6:f32[2] = zero_like %0
+                %6:f32[2] = zero [type=f32[2]]
                 %7:f32[2] = select %5 %0 %6
                 %8:f32[] = reduce [kind=sum, axes=[0]] %7
                 %9:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %8
@@ -2107,7 +2112,7 @@ mod tests {
                 %20:f32[] = constant [value=NaN]
                 %21:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %20
                 %22:f32[2] = select %19 %17 %21
-                %23:f32[2] = zero_like %1
+                %23:f32[2] = zero [type=f32[2]]
                 %24:f32[] = constant [value=-inf]
                 %25:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %24
                 %26:bool[2] = compare [direction=Equal] %1 %23
@@ -2160,7 +2165,8 @@ mod tests {
                 ] %3
                 %6:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     compare [direction=Equal] %4 %5
-                %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %0
+                %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %6 %0 %7
                 %9:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %8
                 %10:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -2187,7 +2193,8 @@ mod tests {
                     output_axes=[],
                 ] %21
                 %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %20 %18 %22
-                %24:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %2
+                %24:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %25:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=-inf]
                 %26:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
@@ -2211,7 +2218,8 @@ mod tests {
     #[test]
     fn test_softmax_cross_entropy_partial_evaluation() {
         // Known logits fold the whole normalization into residual inputs (the excluded-class mask and the
-        // log-probabilities); the loss over the unknown targets remains.
+        // log-probabilities), which also receive the zero that the targets are compared with, because its type
+        // determines it. The loss over the unknown targets remains.
         let (_, program) = ArrayContext::trace(
             |inputs: Vec<_>| inputs[0].softmax_cross_entropy(&inputs[1], 0).map(|output| vec![output]),
             vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [2])],
@@ -2228,11 +2236,10 @@ mod tests {
         assert_eq!(
             known.program().to_string(),
             indoc! {"
-            lambda %0:f32[2], %1:bool[2], %2:f32[2] .
-            let %3:f32[2] = zero_like %0
-                %4:bool[2] = compare [direction=Equal] %0 %3
-                %5:bool[2] = and %4 %1
-                %6:f32[2] = select %5 %3 %2
+            lambda %0:f32[2], %1:f32[2], %2:bool[2], %3:f32[2] .
+            let %4:bool[2] = compare [direction=Equal] %0 %1
+                %5:bool[2] = and %4 %2
+                %6:f32[2] = select %5 %1 %3
                 %7:f32[2] = mul %0 %6
                 %8:f32[] = reduce [kind=sum, axes=[0]] %7
                 %9:f32[] = neg %8
@@ -2410,9 +2417,9 @@ mod tests {
             .value_and_gradient(|logits, (targets, mask)| {
                 let loss = shard_map(
                     |(logits, targets, mask): (
-                        ShardMapTracer<ArrayIrTracingContext>,
-                        ShardMapTracer<ArrayIrTracingContext>,
-                        ShardMapTracer<ArrayIrTracingContext>,
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>,
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>,
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>,
                     )| logits.masked_softmax_cross_entropy(&targets, &mask, 1),
                     (
                         ValueProjection::<ArrayType>::into_projected(logits)?,
@@ -2469,14 +2476,13 @@ mod tests {
         assert_eq!(
             known.program().to_string(),
             indoc! {"
-                lambda %0:f64[3], %1:bool[3], %2:f64[3], %3:bool[3] .
-                let %4:f64[3] = zero_like %0
-                    %5:bool[3] = compare [direction=Equal] %0 %4
-                    %6:bool[3] = and %5 %1
-                    %7:f64[3] = select %6 %4 %2
-                    %8:f64[3] = select %3 %7 %4
+                lambda %0:f64[3], %1:f64[3], %2:bool[3], %3:f64[3], %4:bool[3] .
+                let %5:bool[3] = compare [direction=Equal] %0 %1
+                    %6:bool[3] = and %5 %2
+                    %7:f64[3] = select %6 %1 %3
+                    %8:f64[3] = select %4 %7 %1
                     %9:f64[3] = mul %0 %8
-                    %10:f64[3] = select %3 %9 %4
+                    %10:f64[3] = select %4 %9 %1
                     %11:f64[] = reduce [kind=sum, axes=[0]] %10
                     %12:f64[] = neg %11
                 in (%12)
@@ -2674,7 +2680,7 @@ mod tests {
                 %4:i64[2, 3] = iota [type=i64[2, 3], dimension=1]
                 %5:i64[2, 3] = broadcast [output_type=i64[2, 3], output_axes=[0]] %3
                 %6:bool[2, 3] = compare [direction=Equal] %4 %5
-                %7:f32[2, 3] = zero_like %0
+                %7:f32[2, 3] = zero [type=f32[2, 3]]
                 %8:f32[2, 3] = select %6 %0 %7
                 %9:f32[2] = reduce [kind=sum, axes=[1]] %8
                 %10:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[0]] %9
@@ -2694,13 +2700,13 @@ mod tests {
                 %24:i64[2, 3] = iota [type=i64[2, 3], dimension=1]
                 %25:i64[2, 3] = broadcast [output_type=i64[2, 3], output_axes=[0]] %2
                 %26:bool[2, 3] = compare [direction=Equal] %24 %25
-                %27:f32[2, 3] = zero_like %23
+                %27:f32[2, 3] = zero [type=f32[2, 3]]
                 %28:f32[2, 3] = select %26 %23 %27
                 %29:f32[2] = reduce [kind=sum, axes=[1]] %28
                 %30:f32[2] = neg %29
                 %31:i64[2, 3] = convert_element_type [data_type=i64] %26
                 %32:i64[2] = reduce [kind=sum, axes=[1]] %31
-                %33:i64[2] = zero_like %2
+                %33:i64[2] = zero [type=i64[2]]
                 %34:bool[2] = compare [direction=GreaterThan] %32 %33
                 %35:f32[] = constant [value=NaN]
                 %36:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %35
@@ -2753,7 +2759,8 @@ mod tests {
                 ] %4
                 %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     compare [direction=Equal] %5 %6
-                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %0
+                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %0 %8
                 %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %9
                 %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -2790,14 +2797,16 @@ mod tests {
                 ] %3
                 %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     compare [direction=Equal] %25 %26
-                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %24
+                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %27 %24 %28
                 %30:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %29
                 %31:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = neg %30
                 %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     convert_element_type [data_type=i64] %27
                 %33:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %32
-                %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %3
+                %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    zero [type=i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
                 %35:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
                     compare [direction=GreaterThan] %33 %34
                 %36:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
@@ -2835,7 +2844,8 @@ mod tests {
                 ] %4
                 %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     compare [direction=Equal] %5 %6
-                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %3
+                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %3 %8
                 %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %9
                 %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -2872,14 +2882,16 @@ mod tests {
                 ] %2
                 %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     compare [direction=Equal] %25 %26
-                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %24
+                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %27 %24 %28
                 %30:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %29
                 %31:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = neg %30
                 %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     convert_element_type [data_type=i64] %27
                 %33:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %32
-                %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %2
+                %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    zero [type=i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
                 %35:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
                     compare [direction=GreaterThan] %33 %34
                 %36:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
@@ -2918,8 +2930,8 @@ mod tests {
             .value_and_gradient(|logits, labels| {
                 let loss = shard_map(
                     |(logits, labels): (
-                        ShardMapTracer<ArrayIrTracingContext>,
-                        ShardMapTracer<ArrayIrTracingContext>,
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>,
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>,
                     )| logits.softmax_cross_entropy_with_integer_labels(&labels, 1),
                     (
                         ValueProjection::<ArrayType>::into_projected(logits)?,
@@ -2976,30 +2988,28 @@ mod tests {
         assert_eq!(
             known.program().to_string(),
             indoc! {"
-            lambda %0:f32[2], %1:i64[2], %2:f32[2], %3:bool[2], %4:bool[], %5:f32[] .
-            let %6:i64[] = argmax [axis=0, index_data_type=i64] %0
-                %7:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %6
-                %8:bool[2] = compare [direction=Equal] %1 %7
-                %9:f32[2] = zero_like %0
-                %10:f32[2] = select %8 %0 %9
-                %11:f32[] = reduce [kind=sum, axes=[0]] %10
-                %12:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %11
-                %13:f32[2] = sub %12 %12
-                %14:bool[2] = compare [direction=Equal] %13 %9
-                %15:f32[2] = sub %0 %12
-                %16:f32[2] = select %8 %9 %15
-                %17:f32[2] = exp %16
-                %18:f32[2] = select %8 %9 %17
-                %19:f32[] = reduce [kind=sum, axes=[0]] %18
-                %20:f32[] = ln_1p %19
-                %21:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %20
-                %22:f32[2] = sub %16 %21
-                %23:f32[2] = select %14 %22 %2
-                %24:f32[2] = zero_like %23
-                %25:f32[2] = select %3 %23 %24
+            lambda %0:f32[2], %1:i64[2], %2:f32[2], %3:f32[2], %4:bool[2], %5:f32[2], %6:bool[], %7:f32[] .
+            let %8:i64[] = argmax [axis=0, index_data_type=i64] %0
+                %9:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %8
+                %10:bool[2] = compare [direction=Equal] %1 %9
+                %11:f32[2] = select %10 %0 %2
+                %12:f32[] = reduce [kind=sum, axes=[0]] %11
+                %13:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %12
+                %14:f32[2] = sub %13 %13
+                %15:bool[2] = compare [direction=Equal] %14 %2
+                %16:f32[2] = sub %0 %13
+                %17:f32[2] = select %10 %2 %16
+                %18:f32[2] = exp %17
+                %19:f32[2] = select %10 %2 %18
+                %20:f32[] = reduce [kind=sum, axes=[0]] %19
+                %21:f32[] = ln_1p %20
+                %22:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %21
+                %23:f32[2] = sub %17 %22
+                %24:f32[2] = select %15 %23 %3
+                %25:f32[2] = select %4 %24 %5
                 %26:f32[] = reduce [kind=sum, axes=[0]] %25
                 %27:f32[] = neg %26
-                %28:f32[] = select %4 %27 %5
+                %28:f32[] = select %6 %27 %7
             in (%28)
         "}
             .trim_end(),
@@ -3423,7 +3433,7 @@ mod tests {
                             %3:i64[2] = iota [type=i64[2], dimension=0]
                             %4:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %2
                             %5:bool[2] = compare [direction=Equal] %3 %4
-                            %6:f32[2] = zero_like %0
+                            %6:f32[2] = zero [type=f32[2]]
                             %7:f32[2] = select %5 %0 %6
                             %8:f32[] = reduce [kind=sum, axes=[0]] %7
                             %9:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %8
@@ -3445,7 +3455,7 @@ mod tests {
                             %25:i64[2] = iota [type=i64[2], dimension=0]
                             %26:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %24
                             %27:bool[2] = compare [direction=Equal] %25 %26
-                            %28:f32[2] = zero_like %1
+                            %28:f32[2] = zero [type=f32[2]]
                             %29:f32[2] = select %27 %1 %28
                             %30:f32[] = reduce [kind=sum, axes=[0]] %29
                             %31:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %30
@@ -3517,7 +3527,8 @@ mod tests {
                                 output_axes=[],
                             ] %2
                             %5:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %3 %4
-                            %6:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %0
+                            %6:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                                zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                             %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %5 %0 %6
                             %8:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %7
                             %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -3554,7 +3565,8 @@ mod tests {
                                 output_axes=[],
                             ] %24
                             %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %25 %26
-                            %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %1
+                            %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                                zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                             %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %27 %1 %28
                             %30:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %29
                             %31:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -3629,7 +3641,8 @@ mod tests {
                     output_axes=[],
                 ] %5
                 %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %4 %6
-                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %2
+                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %2 %8
                 %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %9
                 %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -3672,7 +3685,8 @@ mod tests {
                     output_axes=[],
                 ] %30
                 %32:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %29 %31
-                %33:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %3
+                %33:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %34:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %32 %3 %33
                 %35:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %34
                 %36:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -3818,9 +3832,10 @@ mod tests {
             .with_auxiliary_output()
             .value_and_gradient(|student, teacher| {
                 let loss = shard_map(
-                    |(student, teacher): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
-                        function.call(student, teacher)
-                    },
+                    |(student, teacher): (
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                    )| { function.call(student, teacher) },
                     (
                         ValueProjection::<ArrayType>::into_projected(student)?,
                         ValueProjection::<ArrayType>::into_projected(teacher)?,
@@ -3891,7 +3906,7 @@ mod tests {
                         %3:i64[] = argmax [axis=0, index_data_type=i64] %0
                         %4:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %3
                         %5:bool[2] = compare [direction=Equal] %2 %4
-                        %6:f64[2] = zero_like %0
+                        %6:f64[2] = zero [type=f64[2]]
                         %7:f64[2] = select %5 %0 %6
                         %8:f64[] = reduce [kind=sum, axes=[0]] %7
                         %9:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %8
@@ -3916,7 +3931,7 @@ mod tests {
                         %28:i64[] = argmax [axis=0, index_data_type=i64] %1
                         %29:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %28
                         %30:bool[2] = compare [direction=Equal] %27 %29
-                        %31:f64[2] = zero_like %1
+                        %31:f64[2] = zero [type=f64[2]]
                         %32:f64[2] = select %30 %1 %31
                         %33:f64[] = reduce [kind=sum, axes=[0]] %32
                         %34:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %33

@@ -1681,7 +1681,7 @@ mod tests {
                     %9:f64[1] = one_like %2 ; provenance=ryft::differentiation::ryft::associative_scan
                     %10:f64[1] = add %9 %9 ; provenance=ryft::differentiation::ryft::associative_scan
                     %11:f64[1] = div %9 %10 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %12:f64[1] = zero_like %2 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %12:f64[1] = zero [type=f64[1]] ; provenance=ryft::differentiation::ryft::associative_scan
                     %13:f64[1] = select %8 %11 %12 ; provenance=ryft::differentiation::ryft::associative_scan
                     %14:f64[1] = select %7 %9 %13 ; provenance=ryft::differentiation::ryft::associative_scan
                     %15:f64[1] = mul %14 %3 ; provenance=ryft::differentiation::ryft::associative_scan
@@ -1692,7 +1692,7 @@ mod tests {
                     %18:f64[1] = one_like %4 ; provenance=ryft::differentiation::ryft::associative_scan
                     %19:f64[1] = add %18 %18 ; provenance=ryft::differentiation::ryft::associative_scan
                     %20:f64[1] = div %18 %19 ; provenance=ryft::differentiation::ryft::associative_scan
-                    %21:f64[1] = zero_like %4 ; provenance=ryft::differentiation::ryft::associative_scan
+                    %21:f64[1] = zero [type=f64[1]] ; provenance=ryft::differentiation::ryft::associative_scan
                     %22:f64[1] = select %17 %20 %21 ; provenance=ryft::differentiation::ryft::associative_scan
                     %23:f64[1] = select %16 %18 %22 ; provenance=ryft::differentiation::ryft::associative_scan
                     %24:f64[1] = mul %23 %5 ; provenance=ryft::differentiation::ryft::associative_scan

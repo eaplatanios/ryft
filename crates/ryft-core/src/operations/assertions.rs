@@ -3097,7 +3097,7 @@ mod tests {
                     %5:i32[batch] = select %1 %4 %3
                     %6:i32[] = reduce [kind=min, axes=[0]] %5
                     %7:bool[] = reduce [kind=all, axes=[0]] %1
-                    %8:i32[] = zero_like %6
+                    %8:i32[] = zero [type=i32[]]
                     %9:i32[] = select %7 %8 %6
                     %10:i32[] = zero [type=i32[]]
                     %11:dimension<1> = constant [value=1]
@@ -3221,7 +3221,8 @@ mod tests {
                         axes=[0]] %5
                     %7:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=all, \
                         axes=[0]] %1
-                    %8:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %6
+                    %8:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        zero [type=i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
                     %9:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = select %7 %8 %6
                     %10:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero \
                         [type=i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
@@ -3456,7 +3457,7 @@ mod tests {
                     %5:i32[batch] = select %1 %4 %3
                     %6:i32[] = reduce [kind=min, axes=[0]] %5
                     %7:bool[] = reduce [kind=all, axes=[0]] %1
-                    %8:i32[] = zero_like %6
+                    %8:i32[] = zero [type=i32[]]
                     %9:i32[] = select %7 %8 %6
                     %10:i32[] = zero [type=i32[]]
                     %11:dimension<1> = constant [value=1]

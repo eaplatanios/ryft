@@ -325,10 +325,10 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_type_inference,
     };
-    use crate::operations::sharding::shard_map::{ShardMapOptions, ShardMapTracer, shard_map};
+    use crate::operations::sharding::shard_map::{ShardMapOptions, shard_map};
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramBuilder, Typed};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramBuilder, ProjectedValue, Typed};
     use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 
     use super::*;
@@ -547,7 +547,7 @@ mod tests {
         let (_, program) = ArrayIrContext::trace(
             |input: Tracer<ArrayIrContext>| {
                 let output = shard_map(
-                    |local: ShardMapTracer<ArrayIrContext>| {
+                    |local: ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>| {
                         local.print_with_effect_class("body", EffectClass::DeviceOrderedIo)
                     },
                     ValueProjection::<ArrayType>::into_projected(input)?,

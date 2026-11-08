@@ -8,20 +8,18 @@ use crate::contexts::StagingContext;
 use crate::macros::check_count;
 use crate::parameters::Placeholder;
 use crate::partial::contexts::{PartialEvaluationContext, ReferencePlacement};
-use crate::partial::operations::PartiallyEvaluatableOperation;
+use crate::partial::evaluations::PartialEvaluation;
+use crate::partial::operations::{PartiallyEvaluatableOperation, RecursivePartialEvaluationDriver};
 use crate::partial::residuals::{ResidualPlacement, ResidualPolicyReference};
 use crate::partial::values::{
     PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, ResidualInputSource,
 };
 use crate::programs::{
-    EffectClass, EffectsSummary, InstructionId, Operation, OperationFormatter, OperationPayloadProjection, Program,
-    ProgramError, ProgramRenderingMode, ReferenceAccessMode, ReferenceRoot, RegionRef, Type, Typed, TypedProgram,
-    Value, ValueId,
+    AtomId, AttachedRegions, EffectClass, EffectsSummary, InstructionId, Operation, OperationFormatter,
+    OperationPayloadProjection, Program, ProgramBuilder, ProgramError, ProgramRenderingMode, ReferenceAccessMode,
+    ReferenceRoot, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, Typed, TypedProgram, Value, ValueId,
 };
-use crate::tracing::TracingContext;
-
-#[cfg(doc)]
-use crate::partial::evaluations::PartialEvaluation;
+use crate::tracing::{Tracer, TracingContext};
 
 /// Reference identity shared across a [`PartitionedProgram`] boundary. Allocations belong to their emitted invocation
 /// even when the two independently constructed programs reuse region and instruction identifiers.
@@ -157,16 +155,41 @@ pub struct PartitionMetadata {
     /// identified relative to the original inputs so that accesses to the same allocation can be compared across the
     /// partition boundary; allocations created within either program have separate identities.
     effect_ordering: [EffectOrdering<PartitionReferenceRoot>; 2],
+
+    /// Number of store operations of a [`ResidualStorage`](crate::ResidualStorage) that produce each residual edge from
+    /// the known value that it saves. Entries use the indices carried by [`ResidualInputSource::ResidualEdge`]. Entry
+    /// `i` describes output `known_output_count + i` of the known program, whose first `known_output_count` outputs are
+    /// the fully known original outputs. A nonempty vector has exactly one entry per residual edge. A zero entry means
+    /// the edge directly carries its saved value, and an empty vector means every edge has count zero. Residual
+    /// placement (refer to [`PartitionedProgram::with_top_level_residual_policy`]) records these counts so that
+    /// precision rounding can find the saved value behind the stored representation of an edge,whatever
+    /// operations its storage uses.
+    edge_store_counts: Vec<usize>,
 }
 
 impl PartitionMetadata {
     /// Returns this [`PartitionMetadata`] with its residual inputs replaced by `residual_inputs`,
     /// keeping its original input count, known inputs, outputs, and effect-ordering constraints.
-    /// [`PartitionedProgram::with_residual_policy`] uses this after it rewrites which residual
-    /// edges the residual program consumes.
+    /// [`PartitionedProgram::with_top_level_residual_policy`] uses this after it rewrites which
+    /// residual edges the residual program consumes.
     pub(super) fn with_residual_inputs(mut self, residual_inputs: Vec<ResidualInputSource>) -> Self {
         self.residual_inputs = residual_inputs;
         self
+    }
+
+    /// Returns this [`PartitionMetadata`] with the number of store operations that produce each residual edge replaced
+    /// by `edge_store_counts`, in edge ordinal order. [`PartitionedProgram::with_top_level_residual_policy`] uses this
+    /// after it stages the store operations of the edges that it saves through a
+    /// [`ResidualStorage`](crate::ResidualStorage).
+    pub(super) fn with_edge_store_counts(mut self, edge_store_counts: Vec<usize>) -> Self {
+        self.edge_store_counts = edge_store_counts;
+        self
+    }
+
+    /// Returns the number of store operations that produce residual edge `edge` from the known value that it saves,
+    /// which is zero for edges that are not stored.
+    pub(super) fn edge_store_count(&self, edge: usize) -> usize {
+        self.edge_store_counts.get(edge).copied().unwrap_or(0)
     }
 }
 
@@ -238,8 +261,9 @@ impl PartitionMetadata {
 /// Here, `residual_inputs` lists the original input `1` followed by the edge `0` (i.e., known output `%3`), and
 /// `outputs` takes the first original output from the known program and the second one from the residual program.
 /// The wiring renders on one line when it is short enough. The effect-ordering constraints are not rendered, because
-/// reference analysis derives them from the two programs, and neither is the
-/// [`original_input_count`](Self::original_input_count).
+/// reference analysis derives them from the two programs, and neither are the
+/// [`original_input_count`](Self::original_input_count) and the number of store operations that produce each residual
+/// edge, whose store operations already appear in the known program.
 pub struct PartitionedProgram<V: Value, O: Operation<Type = V::Type>> {
     /// Refer to the documentation of [`known_program`](Self::known_program) for more information.
     known_program: Program<V, O, Vec<V>, Vec<V>>,
@@ -299,6 +323,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
                 residual_inputs,
                 outputs,
                 effect_ordering,
+                edge_store_counts: Vec::new(),
             },
         };
         partition.validate_wiring()?;
@@ -319,6 +344,97 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         let partition = Self { known_program, residual_program, metadata };
         debug_assert_eq!(partition.validate_wiring(), Ok(()));
         partition
+    }
+
+    /// Assembles the partition of a region that was partially evaluated through the fresh staging context `context`,
+    /// whose builder holds the known program, with the inputs that `input_known` marks known, into `evaluation`. The
+    /// known program returns the known outputs followed by the known values that the residual program reads, which
+    /// become its residual edges in residual input order.
+    fn from_evaluation(
+        context: TracingContext<V, O>,
+        evaluation: PartialEvaluation<TracingContext<V, O>>,
+        input_known: &[bool],
+    ) -> Result<Self, ProgramError>
+    where
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    {
+        let known_input_indices = input_known
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &known)| known.then_some(index))
+            .collect::<Vec<_>>();
+        let known_output_atoms = evaluation
+            .outputs
+            .iter()
+            .filter_map(|output| match output {
+                PartialEvaluationOutput::Known(value) => Some(value.atom_id()),
+                PartialEvaluationOutput::Unknown(_) => None,
+            })
+            .chain(evaluation.inputs.iter().filter_map(|input| match input {
+                PartialEvaluationInput::Known(value) => Some(value.atom_id()),
+                PartialEvaluationInput::Unknown(_) => None,
+            }))
+            .collect::<Result<Vec<_>, _>>()?;
+        let residual_inputs = evaluation
+            .inputs
+            .iter()
+            .scan(0, |edge_count, input| {
+                Some(match input {
+                    PartialEvaluationInput::Unknown(index) => ResidualInputSource::UnknownInput(*index),
+                    PartialEvaluationInput::Known(_) => {
+                        let edge = *edge_count;
+                        *edge_count += 1;
+                        ResidualInputSource::ResidualEdge(edge)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let outputs = evaluation
+            .outputs
+            .iter()
+            .scan(0, |known_count, output| {
+                Some(match output {
+                    PartialEvaluationOutput::Known(_) => {
+                        let index = *known_count;
+                        *known_count += 1;
+                        PartialEvaluationOutput::Known(index)
+                    }
+                    PartialEvaluationOutput::Unknown(ordinal) => PartialEvaluationOutput::Unknown(*ordinal),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let known_input_count = known_input_indices.len();
+        let known_output_count = known_output_atoms.len();
+
+        // The known feeders no longer need their tracer handles once their atom IDs and wiring are recorded.
+        // Move the fresh builder into its program when it has no remaining owner, and keep the previous cloning
+        // behavior when a custom rule has retained another handle.
+        let PartialEvaluation { program: residual_program, inputs, outputs: known_outputs } = evaluation;
+        drop(inputs);
+        drop(known_outputs);
+        let builder = Rc::clone(context.builder());
+        drop(context);
+        let builder = match Rc::try_unwrap(builder) {
+            Ok(builder) => builder.into_inner(),
+            Err(builder) => builder.borrow().clone(),
+        };
+        let known_program = builder
+            .build::<Vec<V>, Vec<V>>(
+                known_output_atoms,
+                vec![Placeholder; known_input_count],
+                vec![Placeholder; known_output_count],
+            )?
+            .into_simplified()?;
+
+        PartitionedProgram::from_parts(
+            known_program,
+            residual_program,
+            input_known.len(),
+            known_input_indices,
+            residual_inputs,
+            outputs,
+        )
     }
 
     /// Returns the known-side [`Program`] of this [`PartitionedProgram`], which represents the known work reified
@@ -549,15 +665,15 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     ///
     /// Forwarding is a separate step, rather than part of [`Program::partition`], because an edge and the value it
     /// repeats are interchangeable only at the boundary of a single invocation. Residual placement (refer to
-    /// [`with_residual_policy`](Self::with_residual_policy)), precision rounding, and the split rules of `condition`
-    /// and `scan` require known feeders to pass through explicit residual edges. They reject forwarded `KnownInput`
-    /// and `KnownOutput` sources because those sources bypass the edges on which their storage, rounding, and boundary
-    /// rewrites operate. Retained edges still form a contiguous suffix of the outputs of `K` after forwarding. In a
-    /// `scan` body, for example, an edge that repeats a body input carries the value of one iteration rather than the
-    /// input of the enclosing `scan`. Boundary operations whose two halves become separate operations (e.g., through
-    /// [`PartialEvaluationContext::inline_partitioned_program`]) and rematerialized calls forward residuals after
-    /// placing and rounding them, so that their known half does not return the same value twice and does not route
-    /// its own inputs back out.
+    /// [`with_top_level_residual_policy`](Self::with_top_level_residual_policy)), precision rounding, and the split
+    /// rules of `condition` and `scan` require known feeders to pass through explicit residual edges. They reject
+    /// forwarded `KnownInput` and `KnownOutput` sources because those sources bypass the edges on which their storage,
+    /// rounding, and boundary rewrites operate. Retained edges still form a contiguous suffix of the outputs of `K`
+    /// after forwarding. In a `scan` body, for example, an edge that repeats a body input carries the value of one
+    /// iteration rather than the input of the enclosing `scan`. Boundary operations whose two halves become separate
+    /// operations (e.g., through [`PartialEvaluationContext::inline_partitioned_program`]) and rematerialized calls
+    /// forward residuals after placing and rounding them, so that their known half does not return the same value twice
+    /// and does not route its own inputs back out.
     ///
     /// # Errors
     ///
@@ -582,6 +698,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
         }
 
         let mut kept_output_ids = known_output_ids[..known_output_count].to_vec();
+        let mut edge_store_counts = Vec::new();
         let residual_inputs = metadata
             .residual_inputs
             .iter()
@@ -589,9 +706,10 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
                 ResidualInputSource::ResidualEdge(edge) => {
                     let atom = known_output_ids[known_output_count + edge];
                     *sources[atom.index()].get_or_insert_with(|| {
-                        let edge = kept_output_ids.len() - known_output_count;
+                        let kept_edge = kept_output_ids.len() - known_output_count;
                         kept_output_ids.push(atom);
-                        ResidualInputSource::ResidualEdge(edge)
+                        edge_store_counts.push(metadata.edge_store_count(edge));
+                        ResidualInputSource::ResidualEdge(kept_edge)
                     })
                 }
                 source => source,
@@ -617,6 +735,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
             residual_inputs,
             outputs: metadata.outputs,
             effect_ordering,
+            edge_store_counts,
         };
         Ok(Self::from_programs_and_metadata(known_program, residual_program, metadata))
     }
@@ -709,9 +828,10 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     /// exactly one source, input sources address the [`original_input_count`](Self::original_input_count) inputs of
     /// the original boundary, [`KnownOutput`](ResidualInputSource::KnownOutput) sources and known output descriptors
     /// address the fully known outputs of the known program, [`ResidualEdge`](ResidualInputSource::ResidualEdge)
-    /// sources address its residual edges, and unknown output descriptors address the residual program outputs. Types
-    /// are not checked, because binding or interpreting either program validates them. [`from_parts`](Self::from_parts)
-    /// calls this, so that every [`PartitionedProgram`] upholds these invariants.
+    /// sources address its residual edges, unknown output descriptors address the residual program outputs, and the
+    /// store operation counts of residual edges, if any, cover every residual edge. Types are not checked, because
+    /// binding or interpreting either program validates them. [`from_parts`](Self::from_parts) calls this, so that
+    /// every [`PartitionedProgram`] upholds these invariants.
     ///
     /// # Errors
     ///
@@ -750,6 +870,14 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
                 self.known_program.output_ids().len(),
             ))
         })?;
+
+        let counted_edges = self.metadata.edge_store_counts.len();
+        if counted_edges != 0 && counted_edges != edge_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "partition lists store operation counts for {counted_edges} residual edges but its known \
+                 program has {edge_count} residual edges",
+            )));
+        }
 
         for (position, source) in self.metadata.residual_inputs.iter().enumerate() {
             let (index, count) = match *source {
@@ -882,8 +1010,15 @@ where
         let mut required_known_outputs = required_known_outputs.map(<[usize]>::to_vec);
         let mut required_roots = None;
 
+        // Placement may need to split all-known region work whose replay would recompute saved values. Delegate
+        // those demands to the operations' split rules, carrying the same placement into their nested partitions.
         let place_residuals = |partition: PartitionedProgram<V, O>| match &residual_placement {
-            Some(residual_placement) => residual_placement.place_residuals(partition),
+            Some(residual_placement) => residual_placement.place_residuals(
+                partition,
+                Some(&|region: RegionRef<'_, V, O>, instruction_index: usize, demanded_outputs: &[bool]| {
+                    region.split_on_residual_demand(instruction_index, demanded_outputs, residual_placement.clone())
+                }),
+            ),
             None => Ok(partition),
         };
 
@@ -918,74 +1053,7 @@ where
                 reference_analysis.as_deref(),
             )?;
             let evaluation = evaluation_context.into_evaluation(outputs)?;
-
-            let known_input_indices = input_known
-                .iter()
-                .enumerate()
-                .filter_map(|(index, &known)| known.then_some(index))
-                .collect::<Vec<_>>();
-            let known_output_atoms = evaluation
-                .outputs
-                .iter()
-                .filter_map(|output| match output {
-                    PartialEvaluationOutput::Known(value) => Some(value.atom_id()),
-                    PartialEvaluationOutput::Unknown(_) => None,
-                })
-                .chain(evaluation.inputs.iter().filter_map(|input| match input {
-                    PartialEvaluationInput::Known(value) => Some(value.atom_id()),
-                    PartialEvaluationInput::Unknown(_) => None,
-                }))
-                .collect::<Result<Vec<_>, _>>()?;
-            let residual_inputs = evaluation
-                .inputs
-                .iter()
-                .scan(0, |edge_count, input| {
-                    Some(match input {
-                        PartialEvaluationInput::Unknown(index) => ResidualInputSource::UnknownInput(*index),
-                        PartialEvaluationInput::Known(_) => {
-                            let edge = *edge_count;
-                            *edge_count += 1;
-                            ResidualInputSource::ResidualEdge(edge)
-                        }
-                    })
-                })
-                .collect::<Vec<_>>();
-            let outputs = evaluation
-                .outputs
-                .iter()
-                .scan(0, |known_count, output| {
-                    Some(match output {
-                        PartialEvaluationOutput::Known(_) => {
-                            let index = *known_count;
-                            *known_count += 1;
-                            PartialEvaluationOutput::Known(index)
-                        }
-                        PartialEvaluationOutput::Unknown(ordinal) => PartialEvaluationOutput::Unknown(*ordinal),
-                    })
-                })
-                .collect::<Vec<_>>();
-
-            let known_input_count = known_input_indices.len();
-            let known_output_count = known_output_atoms.len();
-            let known_program = context
-                .builder()
-                .borrow()
-                .clone()
-                .build::<Vec<V>, Vec<V>>(
-                    known_output_atoms,
-                    vec![Placeholder; known_input_count],
-                    vec![Placeholder; known_output_count],
-                )?
-                .into_simplified()?;
-
-            let mut partition = PartitionedProgram::from_parts(
-                known_program,
-                evaluation.program,
-                input_known.len(),
-                known_input_indices,
-                residual_inputs,
-                outputs,
-            )?;
+            let mut partition = PartitionedProgram::from_evaluation(context, evaluation, input_known)?;
 
             // Ordinary partitioning is complete after this first pass. Only repeated residual calls need reference
             // analysis to refine ordering and discover allocations that must be deferred before rebuilding.
@@ -1109,6 +1177,203 @@ where
             }
         }
     }
+
+    /// Partitions this region with every input known while its residual program also returns the outputs that
+    /// `demanded_outputs` marks, placing the residuals of the partition and of the partitions nested within it
+    /// with `residual_placement` (refer to [`PartialEvaluationContext::partition_residual_demand`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::InvalidOutputCount`] when `demanded_outputs` does not cover every output,
+    /// [`ProgramError::InvalidArgument`] when the initial partition has forwarded residual inputs or a demanded output
+    /// is not known, and the errors of partitioning, rebuilding either program, or placing residuals otherwise.
+    pub(crate) fn partition_with_residual_demand(
+        self,
+        demanded_outputs: &[bool],
+        allow_effect_folding: bool,
+        residual_placement: Rc<dyn ResidualPlacement<V, O>>,
+    ) -> Result<PartitionedProgram<V, O>, ProgramError>
+    where
+        O: PartiallyEvaluatableOperation<TracingContext<V, O>>,
+    {
+        let input_known = vec![true; self.input_ids().len()];
+        let (mut partition, _) = self.partition_with_configuration(
+            &input_known,
+            allow_effect_folding,
+            false,
+            None,
+            Some(residual_placement.clone()),
+        )?;
+
+        // Demand follows the original output order and may select only known outputs. Those values must cross
+        // explicit residual edges so that placement can decide whether to save or recompute each demanded result.
+        check_count!("output", demanded_outputs, partition.metadata.outputs.len(), ProgramError);
+        if partition.has_forwarded_residual_inputs() {
+            return Err(ProgramError::InvalidArgument {
+                message: "cannot instantiate the outputs of a partition whose residual inputs are already forwarded"
+                    .to_string(),
+            });
+        }
+
+        let known_outputs = partition
+            .metadata
+            .outputs
+            .iter()
+            .zip(demanded_outputs)
+            .filter(|(_, demanded)| **demanded)
+            .map(|(output, _)| match output {
+                PartialEvaluationOutput::Known(output) => Ok(*output),
+                PartialEvaluationOutput::Unknown(_) => Err(ProgramError::InvalidArgument {
+                    message: "only known outputs of a partition can be instantiated".to_string(),
+                }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !known_outputs.is_empty() {
+            // Append the demanded known outputs as new edges, preserving the existing output and edge ordinals.
+            // These edges carry their logical values directly, so any explicit store counts are extended with zeros.
+            let (known_program, residual_program, mut metadata) = partition.into_programs_and_metadata();
+            let known_program_output_count = known_program.output_ids().len();
+            let edge_count =
+                known_program_output_count - metadata.outputs.iter().filter(|output| output.is_known()).count();
+            let known_program_outputs = (0..known_program_output_count).chain(known_outputs.iter().copied());
+            let known_program = known_program.with_outputs(&known_program_outputs.collect::<Vec<_>>())?;
+            if !metadata.edge_store_counts.is_empty() {
+                metadata.edge_store_counts.resize(edge_count + known_outputs.len(), 0);
+            }
+
+            // Replay the existing residual body over its original inputs and append the new edge inputs and outputs.
+            // Returning those inputs exposes the demanded values without adding computations before placement.
+            let mut builder = ProgramBuilder::<V, O>::new();
+            let inputs = residual_program
+                .input_types()
+                .into_owned()
+                .into_iter()
+                .map(|input_type| builder.add_input(input_type))
+                .collect::<Vec<_>>();
+            let known_output_types = known_program.output_types();
+            let edge_inputs = known_outputs
+                .iter()
+                .map(|output| builder.add_input(known_output_types[*output].clone()))
+                .collect::<Vec<_>>();
+            let mut outputs = builder.splice_program(&residual_program, &inputs)?;
+            let residual_output_count = outputs.len();
+            outputs.extend_from_slice(&edge_inputs);
+            let input_count = inputs.len() + edge_inputs.len();
+            let output_count = outputs.len();
+            let residual_program = builder.build::<Vec<V>, Vec<V>>(
+                outputs,
+                vec![Placeholder; input_count],
+                vec![Placeholder; output_count],
+            )?;
+
+            // Keep the original result descriptors and wire each additional result to its new residual output.
+            metadata
+                .residual_inputs
+                .extend((0..known_outputs.len()).map(|edge| ResidualInputSource::ResidualEdge(edge_count + edge)));
+            metadata.outputs.extend(
+                (0..known_outputs.len()).map(|output| PartialEvaluationOutput::Unknown(residual_output_count + output)),
+            );
+            partition = PartitionedProgram { known_program, residual_program, metadata };
+            partition.validate_wiring()?;
+        }
+
+        // Place the new edges with the same policy, using the operations' split rules whenever obtaining a demanded
+        // value requires replaying region work that contains saved values.
+        residual_placement.place_residuals(
+            partition,
+            Some(&|region: RegionRef<'_, V, O>, instruction_index: usize, demanded_outputs: &[bool]| {
+                region.split_on_residual_demand(instruction_index, demanded_outputs, residual_placement.clone())
+            }),
+        )
+    }
+
+    /// Splits the region-carrying instruction at `instruction_index` of this region on residual demand for the outputs
+    /// that `demanded_outputs` marks, through [`PartiallyEvaluatableOperation::split_on_residual_demand`] of its
+    /// operation, and returns the split as a partition of that instruction. The partition receives every input of the
+    /// instruction as a known input. Its known program returns the outputs of the instruction followed by its residual
+    /// edges, which are the values that the residual policy of `residual_placement` saves together with the inputs that
+    /// the replay part reads, and its residual program returns the demanded outputs, in output order.
+    ///
+    /// Returns [`None`] when the operation keeps the instruction whole, and without consulting the operation when the
+    /// instruction has effects or deferred work, or when one of its inputs or outputs is a reference or has type
+    /// identities, so that those keep their behavior.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the operation returns a split that does not reproduce every
+    /// output of the instruction in its known part and every demanded output in its replay part, at the types of the
+    /// instruction, and the errors of the operation and of partitioning otherwise.
+    pub(crate) fn split_on_residual_demand(
+        self,
+        instruction_index: usize,
+        demanded_outputs: &[bool],
+        residual_placement: Rc<dyn ResidualPlacement<V, O>>,
+    ) -> Result<Option<PartitionedProgram<V, O>>, ProgramError>
+    where
+        O: PartiallyEvaluatableOperation<TracingContext<V, O>>,
+    {
+        let instruction = self.instructions().get(instruction_index).ok_or_else(|| {
+            ProgramError::MalformedProgram(format!("instruction index {instruction_index} is out of range"))
+        })?;
+        let atom_type = |atom: &AtomId| self.atoms()[atom.index()].r#type().into_owned();
+        let input_types = instruction.inputs().iter().map(atom_type).collect::<Vec<_>>();
+        let output_types = instruction.outputs().iter().map(atom_type).collect::<Vec<_>>();
+        check_count!("output", demanded_outputs, output_types.len(), ProgramError);
+        if !self.instruction_effects(instruction_index)?.is_pure()
+            || input_types
+                .iter()
+                .chain(&output_types)
+                .any(|r#type| r#type.is_reference() || r#type.identities().next().is_some())
+        {
+            return Ok(None);
+        }
+
+        // The operation sees every input as a known input of a fresh known program.
+        let context = TracingContext::<V, O>::new();
+        let evaluation_context = PartialEvaluationContext::new(context.clone())
+            .with_reference_placement(ReferencePlacement::Stage)
+            .with_residual_placement(Some(residual_placement));
+        let inputs = input_types
+            .iter()
+            .map(|input_type| PartialEvaluationValue::known_input(context.input(input_type.clone())))
+            .collect::<Vec<_>>();
+        let mappings = RegionReplayMappings::new();
+        let regions = AttachedRegions::from(ReplayRegionDriver::new(self, instruction.regions(), &mappings)?);
+        let driver = RecursivePartialEvaluationDriver { regions: &regions, repeated_residual: false };
+        let Some(split) = instruction.operation().split_on_residual_demand(
+            &evaluation_context,
+            &driver,
+            &inputs,
+            demanded_outputs,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        // The known part must reproduce every output and the replay part every demanded output, at the types of the
+        // instruction. `ResidualDemandSplit::new` already checked that the former are known and the latter unknown.
+        let demanded_types = output_types
+            .iter()
+            .zip(demanded_outputs)
+            .filter(|&(output_type, &demanded)| demanded)
+            .map(|(output_type, &demanded)| output_type.clone())
+            .collect::<Vec<_>>();
+        let reproduces = |values: &[PartialEvaluationValue<Tracer<TracingContext<V, O>>>], types: &[V::Type]| {
+            values.len() == types.len()
+                && values.iter().zip(types).all(|(value, r#type)| value.r#type().as_ref() == r#type)
+        };
+        if !reproduces(split.known_outputs(), &output_types) || !reproduces(split.replayed_outputs(), &demanded_types) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` split on residual demand does not reproduce the outputs of the instruction",
+                instruction.operation().name(),
+            )));
+        }
+        let (mut outputs, replayed_outputs) = split.into_parts();
+        outputs.extend(replayed_outputs);
+        let evaluation = evaluation_context.into_evaluation(outputs)?;
+        drop(inputs);
+        PartitionedProgram::from_evaluation(context, evaluation, &vec![true; input_types.len()]).map(Some)
+    }
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>>
@@ -1141,12 +1406,12 @@ where
     }
 
     /// Partitions this [`Program`] like [`partition`](Self::partition) while placing the known values that its residual
-    /// program consumes according to `policy` (refer to [`PartitionedProgram::with_residual_policy`] for how a policy
-    /// places them). Unlike placing the residuals of the result of [`partition`](Self::partition), the policy also
-    /// places the residuals of the partitions that the split rules of region-carrying operations construct for their
-    /// bodies (refer to [`PartialEvaluationContext::with_residual_policy`]), so that, for example, a policy that saves
-    /// only the outputs of dot products saves the per-iteration dot products of a `scan` body and recomputes the rest
-    /// of the body in the residual `scan`.
+    /// program consumes according to `policy` (refer to [`PartitionedProgram::with_top_level_residual_policy`] for how
+    /// a policy places them). Unlike placing the residuals of the result of [`partition`](Self::partition), the policy
+    /// also places the residuals of the partitions that the split rules of region-carrying operations construct for
+    /// their bodies (refer to [`PartialEvaluationContext::with_residual_policy`]), so that, for example, a policy that
+    /// saves only the outputs of dot products saves the per-iteration dot products of a `scan` body and recomputes the
+    /// rest of the body in the residual `scan`.
     ///
     /// # Parameters
     ///
@@ -1169,21 +1434,25 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::collections::HashSet;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use ryft_macros::Operation;
+
     use crate::arrays::{
-        Array, ArrayIrType, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayType, DataType,
+        Array, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform, ArrayType, DataType,
         DimensionBounds, DimensionType, Shape,
     };
     use crate::captures::CaptureReference;
+    use crate::contexts::Context;
     use crate::differentiation::NothingSavable;
     use crate::operations::{
-        AddOperation, ConditionOperation, CosOperation, DotDimensionNumbers, DotOperation, MulOperation, NegOperation,
-        PrintOperation, ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceWriteOperation, ScanOperation, SinOperation, SubOperation,
+        AddOperation, ConditionOperation, CosOperation, DotDimensionNumbers, DotOperation, GuardOperation,
+        MulOperation, NegOperation, PrintOperation, ReferenceAddUpdateOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceWriteOperation, ScanOperation, SinOperation, SubOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::residuals::{
@@ -1193,9 +1462,10 @@ mod tests {
         TestCapture, TestCaptureOperation, TestOperation, TestValue, reference_ordering_program,
     };
     use crate::partial::values::PartialEvaluationOutput;
+    use crate::partial::{PartialEvaluationDriver, ResidualDemandSplit};
     use crate::programs::{
-        EffectClass, EffectClasses, Effects, EffectsSummary, InstructionId, Operation, ProgramBuilder, ProgramError,
-        ReferenceType,
+        EffectClass, EffectClasses, Effects, EffectsSummary, InstructionId, Operation, OperationProvider,
+        ProgramBuilder, ProgramError, ReferenceType, RegionInterface, TypeError,
     };
 
     use super::*;
@@ -1224,6 +1494,71 @@ mod tests {
         }
 
         ResidualPolicyReference::new(SaveDots)
+    }
+
+    /// Way in which [`MalformedSplitOperation`] splits its applications on residual demand incorrectly.
+    #[derive(Copy, Clone, Debug)]
+    enum MalformedSplit {
+        /// Returns no replayed output for a demanded output.
+        MissingReplayedOutput,
+
+        /// Returns a known output whose type differs from that of the corresponding instruction output.
+        MistypedKnownOutput,
+    }
+
+    /// Identity operation whose split on residual demand is malformed in the way that its [`MalformedSplit`] selects.
+    #[derive(Clone, Debug)]
+    struct MalformedSplitOperation(MalformedSplit);
+
+    impl Operation for MalformedSplitOperation {
+        type Type = ArrayType;
+
+        fn name(&self) -> &'static str {
+            "malformed_split"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayType],
+            _region_interfaces: &[RegionInterface<ArrayType>],
+        ) -> Result<Vec<ArrayType>, TypeError> {
+            Ok(input_types.to_vec())
+        }
+    }
+
+    impl<
+        O: Operation<Type = ArrayType>
+            + OperationProvider<ArrayType, GuardOperation<ArrayType>, Operation = O>
+            + From<MalformedSplitOperation>,
+        C: Context<Type = ArrayType, Constant = Array, Operation = O>,
+    > PartiallyEvaluatableOperation<C> for MalformedSplitOperation
+    {
+        fn split_on_residual_demand<D: PartialEvaluationDriver<C>>(
+            &self,
+            context: &PartialEvaluationContext<C>,
+            _driver: &D,
+            inputs: &[PartialEvaluationValue<C::Value>],
+            _demanded_outputs: &[bool],
+        ) -> Result<Option<ResidualDemandSplit<C::Value>>, ProgramError>
+        where
+            C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+        {
+            let known_outputs = match self.0 {
+                MalformedSplit::MissingReplayedOutput => inputs.to_vec(),
+                MalformedSplit::MistypedKnownOutput => {
+                    vec![PartialEvaluationValue::known(context.parent().lift(Array::scalar(1f64)?)?)]
+                }
+            };
+            Ok(Some(ResidualDemandSplit::new(known_outputs, Vec::new())?))
+        }
+    }
+
+    /// Operation family of the [`MalformedSplitOperation`] tests.
+    #[derive(Clone, Debug, Operation)]
+    #[ryft(type(ArrayType), constant(Array))]
+    enum MalformedSplitFamily {
+        MalformedSplit(MalformedSplitOperation),
+        Guard(GuardOperation<ArrayType>),
     }
 
     #[test]
@@ -2005,6 +2340,194 @@ mod tests {
     }
 
     #[test]
+    fn test_partitioned_program_from_evaluation() {
+        use std::cell::Cell;
+
+        use crate::macros::impl_guardless_operation;
+        use crate::tracing::TracerState;
+
+        /// Identity whose clone count distinguishes moving an unshared builder from cloning a retained one.
+        #[derive(Debug)]
+        struct CloneCountingOperation {
+            /// Number of clones made since setup completed.
+            clones: Rc<Cell<usize>>,
+
+            /// Whether this application must survive even when its output is unused.
+            effectful: bool,
+        }
+
+        impl Clone for CloneCountingOperation {
+            fn clone(&self) -> Self {
+                self.clones.set(self.clones.get() + 1);
+                Self { clones: Rc::clone(&self.clones), effectful: self.effectful }
+            }
+        }
+
+        impl Operation for CloneCountingOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                if self.effectful { "clone_counting_effect" } else { "clone_counting_identity" }
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(input_types.to_vec())
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                if self.effectful {
+                    Cow::Owned(Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)))
+                } else {
+                    Cow::Borrowed(Effects::empty())
+                }
+            }
+        }
+
+        impl_guardless_operation!(CloneCountingOperation);
+
+        for retain_context in [false, true] {
+            let clones = Rc::new(Cell::new(0));
+            let context = TracingContext::<Array, CloneCountingOperation>::new();
+            let retained_context = retain_context.then(|| context.clone());
+            let scalar_type = ArrayType::scalar(DataType::F64);
+            let output = {
+                let mut builder = context.builder().borrow_mut();
+                let input = builder.add_input(scalar_type.clone());
+                let output = builder
+                    .add_instruction(
+                        CloneCountingOperation { clones: Rc::clone(&clones), effectful: false },
+                        Vec::new(),
+                        vec![input],
+                        None,
+                    )
+                    .unwrap()[0];
+                builder
+                    .add_instruction(
+                        CloneCountingOperation { clones: Rc::clone(&clones), effectful: true },
+                        Vec::new(),
+                        vec![input],
+                        None,
+                    )
+                    .unwrap();
+                output
+            };
+            let residual = ProgramBuilder::<Array, CloneCountingOperation>::new()
+                .build::<Vec<Array>, Vec<Array>>(Vec::new(), Vec::new(), Vec::new())
+                .unwrap();
+            let residual_rendering = residual.to_string();
+            let evaluation = PartialEvaluation {
+                program: residual,
+                inputs: Vec::new(),
+                outputs: vec![PartialEvaluationOutput::Known(Tracer::new(
+                    context.clone(),
+                    TracerState::Live(output),
+                    scalar_type,
+                ))],
+            };
+            clones.set(0);
+            let partition = PartitionedProgram::from_evaluation(context, evaluation, &[true]).unwrap();
+            assert_eq!(clones.get(), 2 * usize::from(retain_context));
+            assert_eq!(
+                partition.known_program().to_string(),
+                indoc! {"
+                    lambda %0:f64[] .
+                    let %1:f64[] = clone_counting_effect %0
+                        %2:f64[] = clone_counting_identity %0
+                    in (%2)"},
+            );
+            assert_eq!(partition.known_program().effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+            assert_eq!(partition.residual_program().to_string(), residual_rendering);
+            assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
+            if let Some(context) = retained_context {
+                assert_eq!(context.builder().borrow().instructions().len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn test_partitioned_program_from_evaluation_preserves_capture_constants() {
+        use crate::tracing::TracerState;
+
+        // The assembler preserves capture constants already staged by its caller. Unlike a standalone trace, it
+        // neither owns nor discards a runtime capture table, and taking its builder must not add such a rejection.
+        for retain_context in [false, true] {
+            let context = TracingContext::<TestCapture, TestCaptureOperation>::new();
+            let retained_context = retain_context.then(|| context.clone());
+            let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+            let capture = context.builder().borrow_mut().add_constant(TestCapture::new(0, scalar_type.clone()));
+            let residual = ProgramBuilder::<TestCapture, TestCaptureOperation>::new()
+                .build::<Vec<TestCapture>, Vec<TestCapture>>(Vec::new(), Vec::new(), Vec::new())
+                .unwrap();
+            let evaluation = PartialEvaluation {
+                program: residual,
+                inputs: Vec::new(),
+                outputs: vec![PartialEvaluationOutput::Known(Tracer::new(
+                    context.clone(),
+                    TracerState::Live(capture),
+                    scalar_type,
+                ))],
+            };
+            let partition = PartitionedProgram::from_evaluation(context, evaluation, &[]).unwrap();
+            assert_eq!(
+                partition.known_program().to_string(),
+                "lambda  .\nlet %0:f32[] = const capture#0:f32[]\nin (%0)",
+            );
+            assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
+            assert!(partition.residual_inputs().is_empty());
+            if let Some(context) = retained_context {
+                assert_eq!(context.builder().borrow().atoms().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn test_partitioned_program_from_evaluation_preserves_errors() {
+        use crate::tracing::TracerState;
+
+        for retain_context in [false, true] {
+            for (state, stored_error, expected_error) in [
+                (TracerState::Live(AtomId::new(0)), None, ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
+                (TracerState::Poison, None, ProgramError::PoisonedValue),
+                (
+                    TracerState::Live(AtomId::new(0)),
+                    Some(ProgramError::MismatchedProgramBuilders),
+                    ProgramError::MismatchedProgramBuilders,
+                ),
+            ] {
+                let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+                let retained_context = retain_context.then(|| context.clone());
+                let scalar_type = ArrayType::scalar(DataType::F64);
+                context.builder().borrow_mut().add_input(scalar_type.clone());
+                if let Some(error) = stored_error {
+                    context.error(error);
+                }
+                let residual = ProgramBuilder::<Array, ArrayOperation<Array>>::new()
+                    .build::<Vec<Array>, Vec<Array>>(Vec::new(), Vec::new(), Vec::new())
+                    .unwrap();
+                let evaluation = PartialEvaluation {
+                    program: residual,
+                    inputs: Vec::new(),
+                    outputs: vec![PartialEvaluationOutput::Known(Tracer::new(context.clone(), state, scalar_type))],
+                };
+                // No known input is declared, so successful atom extraction still reaches the builder's original
+                // input-count check. A recorded construction error retains precedence over that boundary error.
+                assert_eq!(
+                    PartitionedProgram::from_evaluation(context, evaluation, &[]).map(|_| ()),
+                    Err(expected_error),
+                );
+                if let Some(context) = retained_context {
+                    assert_eq!(context.builder().borrow().input_ids(), &[AtomId::new(0)]);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_region_partition_with_residual_policy() {
         // `f(x, t) = (sin(dot(x, x)), cos(dot(x, x)) * t)` partitioned with `x` known: the policy places the residuals
         // of the top-level partition exactly as placing them in the ordinary partition would, saving the dot product
@@ -2024,7 +2547,12 @@ mod tests {
         let partition = program.entry_region_ref().partition_with_residual_policy(&[true, false], &policy).unwrap();
         assert_eq!(
             partition.to_string(),
-            program.partition(&[true, false]).unwrap().with_residual_policy(&policy).unwrap().to_string()
+            program
+                .partition(&[true, false])
+                .unwrap()
+                .with_top_level_residual_policy(&policy)
+                .unwrap()
+                .to_string()
         );
         assert_eq!(
             partition.to_string(),
@@ -2668,8 +3196,10 @@ mod tests {
     fn test_program_partition_with_residual_policy_recomputes_known_region_operations() {
         // `f(c, xs, y)` scans `c * cos(dot(x, x))` over the two rows `x` of `xs` and multiplies the result by `y`, with
         // `c` and `xs` known and `y` unknown. No split rule runs for the scan, because all of its inputs are known, so
-        // the known program computes it whole. Saving nothing recomputes it whole in the residual program, while saving
-        // dot products saves its output, because recomputing the scan whole would also recompute its dot products.
+        // the known program computes it whole. Saving nothing recomputes it whole in the residual program. Recomputing
+        // it whole would also recompute its dot products, so saving dot products splits it on residual demand instead:
+        // the known scan stacks the dot products, and a residual scan recomputes the carry from its initial value and
+        // those dot products, as JAX does.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let _index = builder.add_input(ArrayType::scalar(DataType::I64));
         let c = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -2745,29 +3275,207 @@ mod tests {
             indoc! {"
                 partition [
                     known_inputs=[0, 1],
-                    residual_inputs=[UnknownInput(2), ResidualEdge(0)],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
                     outputs=[Unknown(0)],
                 ]
                 known={
                     lambda %0:f64[], %1:f64[2, 3] .
-                    let %2:f64[] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
+                    let %2:f64[2] = scan [carry_count=0, iteration_count=2, reverse=false] %1 [
                         body={
-                            lambda %0:i64[], %1:f64[], %2:f64[3] .
-                            let %3:f64[] = dot [
+                            lambda %0:i64[], %1:f64[3] .
+                            let %2:f64[] = dot [
                                 dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                            ] %2 %2
-                                %4:f64[] = cos %3
-                                %5:f64[] = mul %1 %4
-                            in (%5)
+                            ] %1 %1
+                            in (%2)
                         },
                     ]
-                    in (%2)
+                    in (%0, %2)
                 }
                 residual={
-                    lambda %0:f64[], %1:f64[] .
-                    let %2:f64[] = mul %1 %0
-                    in (%2)
+                    lambda %0:f64[], %1:f64[], %2:f64[2] .
+                    let %3:f64[] = scan [carry_count=1, iteration_count=2, reverse=false] %1 %2 [
+                        body={
+                            lambda %0:i64[], %1:f64[], %2:f64[] .
+                            let %3:f64[] = cos %2
+                                %4:f64[] = mul %1 %3
+                            in (%4)
+                        },
+                    ]
+                        %4:f64[] = mul %3 %0
+                    in (%4)
                 }"},
         );
+        let mut residual_inputs = vec![y.clone()];
+        residual_inputs.extend(planned.known_program().interpret(vec![c.clone(), xs.clone()]).unwrap());
+        assert_eq!(planned.residual_program().interpret(residual_inputs), program.interpret(vec![c, xs, y]));
+    }
+
+    #[test]
+    fn test_program_partition_with_residual_policy_keeps_effectful_known_regions_whole() {
+        // `f(c, xs, y)` scans `c * cos(dot(x, x)) + print(c)` over the rows `x` of `xs` and multiplies the result by
+        // `y`, with `c` and `xs` known and `y` unknown. The known scan prints, so residual work can neither replay it
+        // nor split it on residual demand, and the partition saves its output under every policy.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let _index = builder.add_input(ArrayType::scalar(DataType::I64));
+        let c = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::new_static(DataType::F64, [3]));
+        let dot = DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]));
+        let product = builder.add_instruction(dot, Vec::new(), vec![x, x], None).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![product], None).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![c, cosine], None).unwrap()[0];
+        let printed = builder.add_instruction(PrintOperation::new("c"), Vec::new(), vec![c], None).unwrap()[0];
+        let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, printed], None).unwrap()[0];
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let c = builder.add_input(ArrayType::scalar(DataType::F64));
+        let xs = builder.add_input(ArrayType::new_static(DataType::F64, [2, 3]));
+        let y = builder.add_input(ArrayType::scalar(DataType::F64));
+        let scan = ArrayOperation::Scan(ScanOperation::new(1, 2));
+        let scanned = builder.add_instruction(scan, vec![body], vec![c, xs], None).unwrap()[0];
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![scanned, y], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        for policy in [save_dots(), ResidualPolicyReference::<ArrayType>::new(NothingSavable)] {
+            let planned = program.partition_with_residual_policy(&[true, true, false], &policy).unwrap();
+            assert_eq!(
+                planned.residual_inputs(),
+                &[ResidualInputSource::UnknownInput(2), ResidualInputSource::ResidualEdge(0)]
+            );
+            assert_eq!(planned.known_program().output_ids(), &[planned.known_program().instructions()[0].outputs()[0]]);
+        }
+    }
+
+    #[test]
+    fn test_region_ref_split_on_residual_demand_rejects_unsafe_boundaries() {
+        /// Identity application whose split hook must be excluded by the shared safety checks.
+        #[derive(Clone, Debug)]
+        struct GuardedSplitOperation(Effects);
+
+        impl Operation for GuardedSplitOperation {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                "guarded_split"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayIrType],
+                _: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                Ok(input_types.to_vec())
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                Cow::Borrowed(&self.0)
+            }
+
+            fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
+                Some(output_index)
+            }
+        }
+
+        impl<C: Context<Type = ArrayIrType, Operation: From<Self> + From<GuardOperation<ArrayIrType>>>>
+            PartiallyEvaluatableOperation<C> for GuardedSplitOperation
+        {
+            fn split_on_residual_demand<D: PartialEvaluationDriver<C>>(
+                &self,
+                _: &PartialEvaluationContext<C>,
+                _: &D,
+                _: &[PartialEvaluationValue<C::Value>],
+                _: &[bool],
+            ) -> Result<Option<ResidualDemandSplit<C::Value>>, ProgramError>
+            where
+                C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+            {
+                panic!("an unsafe boundary reached the residual-demand split hook")
+            }
+        }
+
+        /// Operation family that exposes a split hook behind the shared safety boundary.
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(type(ArrayIrType), constant(ArrayIrValue<Array>))]
+        enum GuardedSplitFamily {
+            Guarded(GuardedSplitOperation),
+            Guard(GuardOperation<ArrayIrType>),
+        }
+
+        fn assert_refused(input_type: ArrayIrType, effects: Effects) {
+            let mut builder = ProgramBuilder::<TestValue, GuardedSplitFamily>::new();
+            let input = builder.add_input(input_type);
+            let output =
+                builder.add_instruction(GuardedSplitOperation(effects), Vec::new(), vec![input], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let placement: Rc<dyn ResidualPlacement<TestValue, GuardedSplitFamily>> =
+                Rc::new(ResidualPolicyReference::new(NothingSavable));
+            assert!(program.entry_region_ref().split_on_residual_demand(0, &[true], placement).unwrap().is_none());
+        }
+
+        let scalar = ArrayType::scalar(DataType::F32);
+        assert_refused(ReferenceType::new(scalar.clone()).into(), Effects::empty().clone());
+        let dimension = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
+        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dimension.dimension().clone()]));
+        assert_refused(dynamic.into(), Effects::empty().clone());
+        assert_refused(scalar.clone().into(), Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)));
+        assert_refused(scalar.into(), Effects::empty().clone().with_deferred_work());
+    }
+
+    #[test]
+    fn test_region_ref_split_on_residual_demand_rejects_invalid_demands() {
+        let mut builder = ProgramBuilder::<Array, MalformedSplitFamily>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let output = builder
+            .add_instruction(
+                MalformedSplitOperation(MalformedSplit::MissingReplayedOutput),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let placement: Rc<dyn ResidualPlacement<Array, MalformedSplitFamily>> =
+            Rc::new(ResidualPolicyReference::new(NothingSavable));
+        assert_eq!(
+            program.entry_region_ref().split_on_residual_demand(0, &[], placement.clone()).map(|_| ()),
+            Err(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+        );
+        assert_eq!(
+            program.entry_region_ref().split_on_residual_demand(1, &[true], placement).map(|_| ()),
+            Err(ProgramError::MalformedProgram("instruction index 1 is out of range".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_region_ref_split_on_residual_demand_rejects_malformed_splits() {
+        // An operation whose split omits a demanded output, or reports a known output at another type, does not
+        // reproduce the outputs of its instruction, and the split is rejected rather than wired into the partition.
+        for (defect, demanded_outputs) in
+            [(MalformedSplit::MissingReplayedOutput, [true]), (MalformedSplit::MistypedKnownOutput, [false])]
+        {
+            let mut builder = ProgramBuilder::<Array, MalformedSplitFamily>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F32));
+            let output =
+                builder.add_instruction(MalformedSplitOperation(defect), Vec::new(), vec![input], None).unwrap()[0];
+            let program =
+                builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+            let placement: Rc<dyn ResidualPlacement<Array, MalformedSplitFamily>> =
+                Rc::new(ResidualPolicyReference::new(NothingSavable));
+            assert_eq!(
+                program.entry_region_ref().split_on_residual_demand(0, &demanded_outputs, placement).map(|_| ()),
+                Err(ProgramError::MalformedProgram(
+                    "operation `malformed_split` split on residual demand does not reproduce the outputs of the \
+                     instruction"
+                        .to_string(),
+                )),
+                "{defect:?}",
+            );
+        }
     }
 }

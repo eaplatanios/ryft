@@ -2427,7 +2427,7 @@ mod tests {
                     jvp = indoc! {"
                         lambda %0:f64[], %1:f64[] .
                         let %2:f64[] = abs %0
-                            %3:f64[] = zero_like %0
+                            %3:f64[] = zero [type=f64[]]
                             %4:bool[] = compare [direction=GreaterThanOrEqual] %0 %3
                             %5:f64[] = neg %1
                             %6:f64[] = select %4 %1 %5
