@@ -810,10 +810,11 @@ pub trait Operation: Clone {
 
     /// Declares context-independent producer and execution semantics of the attached computation regions, layered
     /// on top of the boundary correspondence that [`input_region_provenance`](Self::input_region_provenance) and
-    /// [`output_region_provenance`](Self::output_region_provenance) declare. Operations whose regions execute once
-    /// per application, and whose provenance is therefore exactly their data flow, opt in with
-    /// [`RegionDataFlow::Provenance`]. Operations with recurrences (e.g., loops) or bypasses borrow their own
-    /// [`RegionDataFlowRule`](crate::programs::RegionDataFlowRule) through [`RegionDataFlow::Custom`].
+    /// [`output_region_provenance`](Self::output_region_provenance) declare. Operations whose regions execute
+    /// once per application, and whose provenance is therefore exactly their data flow, opt in with
+    /// [`RegionDataFlow::Provenance`], or with [`RegionDataFlow::Atomic`] when analyses must treat each application as
+    /// one producer of its outputs (e.g., composite calls). Operations with recurrences (e.g., loops) or bypasses
+    /// borrow their own [`RegionDataFlowRule`](crate::programs::RegionDataFlowRule) through [`RegionDataFlow::Custom`].
     /// Wrapper operations forward the declaration of the operation they wrap unchanged. The default is
     /// [`RegionDataFlow::Opaque`]: analyses must not infer single-invocation semantics, the absence of producers, or
     /// permission to replay the operation. Opaque operations (e.g., kernel calls, whose bodies execute once per grid

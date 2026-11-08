@@ -2169,7 +2169,9 @@ pub trait RegionLiveness {
 /// which values produce each boundary value and which region outputs executing the operation demands. The two layers
 /// can differ: the provenance of a `while` loop correctly maps each body input to the corresponding instruction input,
 /// but the body also receives the outputs of its previous iteration, and so its data flow is [`Custom`](Self::Custom).
-/// Kernel calls, in turn, declare operation-local region inputs while their data flow is [`Opaque`](Self::Opaque).
+/// Kernel calls, in turn, declare operation-local region inputs while their data flow is [`Opaque`](Self::Opaque), and
+/// composite calls declare exact provenance while their data flow is [`Atomic`](Self::Atomic), because residual
+/// planning treats each call as one producer rather than looking through it.
 ///
 /// No declaration implies equal runtime values or reference identity; reference contracts remain separate. Pass
 /// the declaration returned by [`Operation::region_data_flow`] to queries with that same operation and its actual
@@ -2188,6 +2190,17 @@ pub enum RegionDataFlow<'o> {
     /// region outputs that [`Operation::output_region_provenance`] names, without feedback or bypasses.
     Provenance,
 
+    /// Declares that the operation is one producer of its outputs, like an operation without regions, even though its
+    /// computation regions execute once per application as [`Provenance`](Self::Provenance) declares. Every output
+    /// has [`Unknown`](RegionDataFlowSources::Unknown) sources (i.e., the operation itself produces it), so analyses
+    /// never look through the operation to the producers inside its regions. Unlike [`Opaque`](Self::Opaque)
+    /// declarations, this grants permission to replay the whole operation, which recomputes its outputs, whenever
+    /// its effects allow replay. Region inputs and execution demands are those of [`Provenance`](Self::Provenance)
+    /// declarations. Composite calls declare this data flow, which matches how JAX's residual policies treat
+    /// `custom_jvp_call` and `custom_vjp_call`, whose outputs a policy classifies by the call itself and which
+    /// are replayed whole when the policy does not save them, whatever work the call contains.
+    Atomic,
+
     /// Borrows the operation's own [`RegionDataFlowRule`] for recurrences, bypasses, or regions that execute without
     /// producing any output of the operation (e.g., the condition of a `while` loop).
     ///
@@ -2201,9 +2214,10 @@ pub enum RegionDataFlow<'o> {
 
 impl RegionDataFlow<'_> {
     /// Returns the validated producer sources of one input of an attached computation region. For
-    /// [`Provenance`](Self::Provenance) declarations, the sources come from [`Operation::input_region_provenance`],
-    /// and an input without declared provenance has [`Unknown`](RegionDataFlowSources::Unknown) sources, like every
-    /// input of an [`Opaque`](Self::Opaque) declaration.
+    /// [`Provenance`](Self::Provenance) and [`Atomic`](Self::Atomic) declarations, the sources come
+    /// from [`Operation::input_region_provenance`], and an input without declared provenance has
+    /// [`Unknown`](RegionDataFlowSources::Unknown) sources, like every input of an [`Opaque`](Self::Opaque)
+    /// declaration.
     ///
     /// # Parameters
     ///
@@ -2236,7 +2250,7 @@ impl RegionDataFlow<'_> {
         }
         let sources = match self {
             Self::Opaque => RegionDataFlowSources::Unknown,
-            Self::Provenance => match operation.input_region_provenance(region_index, input_index) {
+            Self::Provenance | Self::Atomic => match operation.input_region_provenance(region_index, input_index) {
                 InputRegionProvenance::None => RegionDataFlowSources::Unknown,
                 InputRegionProvenance::Local => RegionDataFlowSources::Known(Vec::new()),
                 InputRegionProvenance::Input { index } => {
@@ -2252,8 +2266,8 @@ impl RegionDataFlow<'_> {
     /// Returns the validated producer sources of one instruction output. For [`Provenance`](Self::Provenance)
     /// declarations, the sources come from [`Operation::output_region_provenance`], and an output without declared
     /// provenance has [`Unknown`](RegionDataFlowSources::Unknown) sources, because the operation itself produces it.
-    /// Every output of an [`Opaque`](Self::Opaque) declaration also has unknown sources. Only a custom rule can
-    /// declare that an output has no producers, by returning an empty source list.
+    /// Every output of an [`Opaque`](Self::Opaque) or [`Atomic`](Self::Atomic) declaration also has unknown sources.
+    /// Only a custom rule can declare that an output has no producers, by returning an empty source list.
     ///
     /// # Parameters
     ///
@@ -2281,7 +2295,7 @@ impl RegionDataFlow<'_> {
             )));
         }
         let sources = match self {
-            Self::Opaque => RegionDataFlowSources::Unknown,
+            Self::Opaque | Self::Atomic => RegionDataFlowSources::Unknown,
             Self::Provenance => {
                 let origins = operation.output_region_provenance(output_index);
                 if origins.is_empty() {
@@ -2300,10 +2314,11 @@ impl RegionDataFlow<'_> {
     /// [`RegionDataFlowRule::execution_demands`]. For [`Provenance`](Self::Provenance) declarations, each used
     /// instruction output demands the region outputs that its [`Operation::output_region_provenance`] names, every
     /// computation region executes the work that it retains for its effects, and rule regions never execute. When
-    /// a used output has no declared provenance, every output of every computation region is demanded. Every output
-    /// of every computation region is also demanded for [`Opaque`](Self::Opaque) declarations, used outputs or not,
-    /// because their regions may execute for their effects. Both cases over-approximate the executed work rather
-    /// than describing it precisely.
+    /// a used output has no declared provenance, every output of every computation region is demanded.
+    /// [`Atomic`](Self::Atomic) declarations demand what [`Provenance`](Self::Provenance) declarations demand,
+    /// because their regions execute in the same way. Every output of every computation region is also demanded
+    /// for [`Opaque`](Self::Opaque) declarations, used outputs or not, because their regions may execute for their
+    /// effects. Both cases over-approximate the executed work rather than describing it precisely.
     ///
     /// # Parameters
     ///
@@ -2336,7 +2351,7 @@ impl RegionDataFlow<'_> {
         }
 
         let demand = match self {
-            Self::Opaque | Self::Provenance => {
+            Self::Opaque | Self::Provenance | Self::Atomic => {
                 let mut demand = boundary
                     .regions
                     .iter()
@@ -2354,7 +2369,10 @@ impl RegionDataFlow<'_> {
                         continue;
                     }
 
-                    match self.output_sources(operation, output_index, boundary)? {
+                    // Atomic outputs hide their sources only from producer queries, while their regions execute like
+                    // those of provenance declarations.
+                    let declaration = if matches!(self, Self::Atomic) { Self::Provenance } else { self };
+                    match declaration.output_sources(operation, output_index, boundary)? {
                         RegionDataFlowSources::Unknown => unknown = true,
                         RegionDataFlowSources::Known(sources) => {
                             for source in sources {
@@ -2503,6 +2521,7 @@ impl Debug for RegionDataFlow<'_> {
         match self {
             Self::Opaque => formatter.write_str("Opaque"),
             Self::Provenance => formatter.write_str("Provenance"),
+            Self::Atomic => formatter.write_str("Atomic"),
             Self::Custom(_) => {
                 // Custom rules are trait objects without a `Debug` bound, so only their variant is shown.
                 formatter.debug_tuple("Custom").finish_non_exhaustive()
@@ -4618,10 +4637,14 @@ pub(crate) mod tests {
             RegionDataFlow::Provenance.input_sources(&operation, 1, 0, boundary),
             Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(0)])),
         );
-        // Opaque declarations ignore the declared provenance.
+        // Opaque declarations ignore the declared provenance, while atomic declarations keep it.
         assert_eq!(
             RegionDataFlow::Opaque.input_sources(&operation, 0, 0, boundary),
             Ok(RegionDataFlowSources::Unknown),
+        );
+        assert_eq!(
+            RegionDataFlow::Atomic.input_sources(&operation, 0, 0, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(2)])),
         );
 
         // Noncontiguous, cross-region feedback preserves declared source order alongside the initial binding.
@@ -4644,7 +4667,9 @@ pub(crate) mod tests {
         ];
         let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
         let rule = DataFlowRuleFixture::default();
-        for data_flow in [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Custom(&rule)] {
+        for data_flow in
+            [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Atomic, RegionDataFlow::Custom(&rule)]
+        {
             for (region_index, input_index, message) in [
                 (3, 0, "operation `with_regions` declares region 3 but has 3 attached regions"),
                 (2, 0, "operation `with_regions` declares data flow through non-computation region 2"),
@@ -4698,6 +4723,8 @@ pub(crate) mod tests {
             Ok(RegionDataFlowSources::Unknown),
         );
         assert_eq!(RegionDataFlow::Opaque.output_sources(&operation, 0, boundary), Ok(RegionDataFlowSources::Unknown));
+        // Atomic declarations keep the operation itself as the producer of each output, despite declared provenance.
+        assert_eq!(RegionDataFlow::Atomic.output_sources(&operation, 0, boundary), Ok(RegionDataFlowSources::Unknown));
         let empty =
             DataFlowRuleFixture { sources: Some(RegionDataFlowSources::Known(Vec::new())), ..Default::default() };
         assert_eq!(
@@ -4721,7 +4748,9 @@ pub(crate) mod tests {
         ];
         let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
         let rule = DataFlowRuleFixture::default();
-        for data_flow in [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Custom(&rule)] {
+        for data_flow in
+            [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Atomic, RegionDataFlow::Custom(&rule)]
+        {
             assert_eq!(
                 data_flow.output_sources(&operation, 2, boundary),
                 Err(ProgramError::MalformedProgram(
@@ -4834,6 +4863,13 @@ pub(crate) mod tests {
             RegionDataFlow::Provenance.execution_demands(&operation, &[false, false], boundary, &mut liveness),
             Ok(vec![Some(vec![false, false]), Some(vec![false]), None]),
         );
+        // Atomic declarations demand what provenance declarations demand.
+        for used_outputs in [[true, false], [false, true], [false, false]] {
+            assert_eq!(
+                RegionDataFlow::Atomic.execution_demands(&operation, &used_outputs, boundary, &mut liveness),
+                RegionDataFlow::Provenance.execution_demands(&operation, &used_outputs, boundary, &mut liveness),
+            );
+        }
         // Opaque declarations demand every computation-region output, even without used outputs.
         for used_outputs in [[true, false], [false, false]] {
             assert_eq!(
@@ -4883,7 +4919,9 @@ pub(crate) mod tests {
         ];
         let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
         let empty = DataFlowRuleFixture::default();
-        for data_flow in [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Custom(&empty)] {
+        for data_flow in
+            [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Atomic, RegionDataFlow::Custom(&empty)]
+        {
             assert_eq!(
                 data_flow.execution_demands(&operation, &[true], boundary, &mut DataFlowLivenessFixture::default()),
                 Err(ProgramError::MalformedProgram(
@@ -4985,6 +5023,7 @@ pub(crate) mod tests {
     fn test_region_data_flow_debug() {
         assert_eq!(format!("{:?}", RegionDataFlow::Opaque), "Opaque");
         assert_eq!(format!("{:?}", RegionDataFlow::Provenance), "Provenance");
+        assert_eq!(format!("{:?}", RegionDataFlow::Atomic), "Atomic");
         assert_eq!(format!("{:?}", RegionDataFlow::Custom(&DataFlowRuleFixture::default())), "Custom(..)");
     }
 
