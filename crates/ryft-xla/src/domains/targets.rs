@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashSet};
 use ryft_core::{Device, DeviceId, DeviceMesh};
 use ryft_pjrt::{Client, Value as PjrtValue};
 
+use crate::FromPjrt;
 use crate::domains::compilation::CompilationError;
-use crate::{Error, FromPjrt};
 
 // TODO(eaplatanios): Review this module.
 
@@ -164,16 +164,16 @@ impl Target {
     ///
     /// # Errors
     ///
-    /// Returns [`CompilationError::InvalidPersistentExecutable`] wrapped in [`Error::Compilation`] if a mesh device
-    /// identifier is absent from the snapshot.
-    pub(super) fn mesh_device_kinds(&self, mesh: &DeviceMesh) -> Result<Vec<String>, Error> {
+    /// Returns [`CompilationError::InvalidPersistentExecutable`] if a mesh device identifier is absent from the
+    /// snapshot.
+    pub(super) fn mesh_device_kinds(&self, mesh: &DeviceMesh) -> Result<Vec<String>, CompilationError> {
         mesh.devices()
             .iter()
             .map(|mesh_device| {
                 self.device(mesh_device.id()).map(|device| device.kind.clone()).ok_or_else(|| {
-                    Error::Compilation(CompilationError::InvalidPersistentExecutable {
+                    CompilationError::InvalidPersistentExecutable {
                         reason: format!("device {} is not visible to the live client", mesh_device.id()),
-                    })
+                    }
                 })
             })
             .collect()
@@ -332,5 +332,48 @@ mod tests {
         assert_eq!(lowered.platform_version.as_ref(), target.platform_version());
         let device_kinds = devices.iter().map(|device| device.kind().unwrap().into_owned()).collect::<Vec<_>>();
         assert_eq!(lowered.device_kinds.as_ref(), device_kinds.as_slice());
+    }
+
+    #[test]
+    fn test_target_mesh_device_kinds() {
+        let target = Target {
+            platform_name: "test".into(),
+            platform_version: "test".into(),
+            pjrt_version: ryft_pjrt::Version { major: 0, minor: 0 },
+            has_ffi_extension: false,
+            attributes: BTreeMap::new(),
+            process_index: 0,
+            devices: vec![
+                TargetDevice {
+                    device: Device::new(7, 0),
+                    kind: "first".into(),
+                    attributes: BTreeMap::new(),
+                    addressable: true,
+                },
+                TargetDevice {
+                    device: Device::new(9, 0),
+                    kind: "second".into(),
+                    attributes: BTreeMap::new(),
+                    addressable: true,
+                },
+            ],
+        };
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(9, 0), Device::new(7, 0)],
+        )
+        .unwrap();
+        assert_eq!(target.mesh_device_kinds(&mesh).unwrap(), vec!["second", "first"]);
+
+        let missing = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![Device::new(usize::MAX, 0)],
+        )
+        .unwrap();
+        assert!(matches!(
+            target.mesh_device_kinds(&missing),
+            Err(CompilationError::InvalidPersistentExecutable { reason })
+                if reason == format!("device {} is not visible to the live client", usize::MAX),
+        ));
     }
 }

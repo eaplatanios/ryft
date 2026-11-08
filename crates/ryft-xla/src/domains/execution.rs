@@ -575,9 +575,9 @@ impl<'c> Domain<'c> {
     ) -> Result<ReadyOrPendingReferenceGuard<'g, Array<'c>>, Error> {
         reference.lock_storage().map_err(|error| {
             if let Some(reference_error) = error.downcast_custom::<ryft_core::ReferenceError>().cloned() {
-                Error::Core(ryft_core::Error::Reference(reference_error))
+                Error::from(reference_error)
             } else {
-                Error::Core(ryft_core::Error::Program(error))
+                Error::from(error)
             }
         })
     }
@@ -2571,8 +2571,11 @@ mod tests {
             );
             assert!(matches!(
                 domain.execute_statefully(program, vec![update.clone(), update.clone()]).r#await(),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
-                    if message == expected,
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                        if *message == expected,
+                ),
             ));
             let expected = format!(
                 "runtime input type `{}` does not match declared type `{}`",
@@ -2581,12 +2584,18 @@ mod tests {
             );
             assert!(matches!(
                 domain.execute_statefully(program, vec![reference.clone(), reference.clone()]).r#await(),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
-                    if message == expected,
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                        if *message == expected,
+                ),
             ));
             assert!(matches!(
                 domain.execute_statefully(program, Vec::new()).r#await(),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }))),
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+                ),
             ));
             assert_eq!(read_f32s(&client, &holder.read().unwrap()), vec![1.0]);
 

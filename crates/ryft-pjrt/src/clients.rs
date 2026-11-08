@@ -561,9 +561,9 @@ impl GpuClientOptions {
                 values.push(NamedValue::new("preallocate", false));
                 values.push(NamedValue::new("allocator", "platform"));
             }
-            GpuMemoryAllocator::BFC { memory_fraction_to_preallocate } => {
-                values.push(NamedValue::new("preallocate", true));
-                values.push(NamedValue::new("memory_fraction", memory_fraction_to_preallocate));
+            GpuMemoryAllocator::BFC { memory_fraction, preallocate } => {
+                values.push(NamedValue::new("preallocate", preallocate));
+                values.push(NamedValue::new("memory_fraction", memory_fraction));
                 values.push(NamedValue::new("allocator", "bfc"));
             }
             GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None } => {
@@ -640,12 +640,22 @@ pub enum GpuMemoryAllocator {
     Platform,
 
     /// Best-Fit with Coalescing (BFC) allocator that uses a best-fit allocation strategy with memory coalescing to
-    /// reduce fragmentation.
+    /// reduce fragmentation. This is the default [`GpuMemoryAllocator`], configured like the default allocator of JAX,
+    /// whose `XLA_PYTHON_CLIENT_MEM_FRACTION` and `XLA_PYTHON_CLIENT_PREALLOCATE` environment variables correspond to
+    /// the two fields of this variant.
     BFC {
-        /// Fraction of total GPU memory to preallocate when the first operation is run. Preallocating minimizes
-        /// allocation overhead and memory fragmentation, but can sometimes cause out-of-memory (OOM) errors.
-        /// Lowering this value can help avoid out-of-memory (OOM) errors that occur when the first operation is run.
-        memory_fraction_to_preallocate: f32,
+        /// Fraction of total GPU memory that this allocator may use. With preallocation, the allocator reserves this
+        /// fraction when the first operation is run. Without it, the allocator grows on demand up to this fraction.
+        /// Lowering this value can help avoid out-of-memory (OOM) errors that occur when the first operation is run,
+        /// and leaves memory for other processes that share the GPU.
+        memory_fraction: f32,
+
+        /// Whether to reserve [`memory_fraction`](GpuMemoryAllocator::BFC::memory_fraction) of the GPU memory when
+        /// the first operation is run. Preallocating minimizes allocation overhead and memory fragmentation. Growing
+        /// on demand instead keeps the reserved memory close to what has been used so far (e.g., so that process-level
+        /// memory measurements or other processes that share the GPU see the actual usage), at the cost of more
+        /// fragmentation, which can cause out-of-memory (OOM) errors closer to the limit.
+        preallocate: bool,
     },
 
     /// [`GpuMemoryAllocator`] that uses [`cudaMallocAsync`](
@@ -672,7 +682,7 @@ pub enum GpuMemoryAllocator {
 
 impl Default for GpuMemoryAllocator {
     fn default() -> Self {
-        Self::BFC { memory_fraction_to_preallocate: 0.75 }
+        Self::BFC { memory_fraction: 0.75, preallocate: true }
     }
 }
 
@@ -1597,6 +1607,23 @@ mod tests {
                 NamedValue::new("abort_collectives_on_failure", false),
                 NamedValue::new("use_tfrt_gpu_client", true),
                 NamedValue::new("max_inflight_computations", 32i64),
+            ],
+        );
+
+        // Without preallocation, the BFC allocator grows on demand and the memory fraction caps its growth.
+        let options = GpuClientOptions {
+            allocator: GpuMemoryAllocator::BFC { memory_fraction: 0.5, preallocate: false },
+            ..Default::default()
+        };
+        assert_eq!(
+            options.to_named_values(),
+            vec![
+                NamedValue::new("should_stage_host_to_device_transfers", true),
+                NamedValue::new("preallocate", false),
+                NamedValue::new("memory_fraction", 0.5f32),
+                NamedValue::new("allocator", "bfc"),
+                NamedValue::new("abort_collectives_on_failure", false),
+                NamedValue::new("use_tfrt_gpu_client", false),
             ],
         );
     }

@@ -47,7 +47,7 @@ where
 {
     // Tracked variation adjoints would duplicate the conservative unchecked boundary's gradient reductions. Low-level
     // programs can bypass the closure constructor, so enforce ordinary active-axis types before lowering their bodies.
-    if !boundary.check_manual_variation() {
+    if !boundary.checks_manual_variation() {
         let body = program.entry_region_ref();
         for region_id in body.region_ids_in_closure() {
             let region = &body.arena()[region_id.index()];
@@ -401,10 +401,10 @@ mod tests {
     use ryft_core::{
         AxisIndexOperation, BatchAxis, BatchAxisSpecification, Context, ConvertElementType,
         ConvertElementTypeOperation, CotangentDestinationKind, CustomCallOperation, DataType, Device, DeviceMesh,
-        Dimension as CoreDimension, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass, Exp, LogicalMesh,
-        MeshAxis, MeshAxisType, PARALLEL_BROADCAST_OPERATION_NAME, ParallelAllGather, ParallelAllToAll,
+        Dimension as CoreDimension, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass, Exp,
+        LogicalMesh, MeshAxis, MeshAxisType, PARALLEL_BROADCAST_OPERATION_NAME, ParallelAllGather, ParallelAllToAll,
         ParallelArgExtrema, ParallelBroadcast, ParallelCast, ParallelCastTarget, ParallelPermute, ParallelReduce,
-        ParallelSumScatter, Placeholder, ReductionKind, Shape, ShardMapOptions, ShardMapTracer, Typed, UnreducedKind,
+        ParallelSumScatter, Placeholder, ProjectedValue, ReductionKind, Shape, ShardMapOptions, Typed, UnreducedKind,
         ValueProjection, batch, differentiate_at, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
     };
     use ryft_mlir::Block;
@@ -825,8 +825,11 @@ mod tests {
         let expected = ShardMapError::AxisAlreadyManual { axis_name: "x".to_string() };
         assert!(matches!(
             module,
-            Err(Error::Core(ryft_core::Error::Program(error)))
-                if error.downcast_custom::<ShardMapError>() == Some(&expected),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(error)
+                    if error.downcast_custom::<ShardMapError>() == Some(&expected),
+            ),
         ));
     }
 
@@ -862,8 +865,11 @@ mod tests {
         };
         assert!(matches!(
             module,
-            Err(Error::Core(ryft_core::Error::Program(error)))
-                if error.downcast_custom::<ShardMapError>() == Some(&expected),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(error)
+                    if error.downcast_custom::<ShardMapError>() == Some(&expected),
+            ),
         ));
     }
 
@@ -1817,8 +1823,14 @@ mod tests {
                 Some(&shardings),
                 Some("cpu"),
             ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message == format!("`{PARALLEL_BROADCAST_OPERATION_NAME}` is not supported by the XLA CPU backend"),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == format!(
+                        "`{PARALLEL_BROADCAST_OPERATION_NAME}` is \
+                         not supported by the XLA CPU backend",
+                    ),
+            ),
         ));
     }
 
@@ -2386,7 +2398,7 @@ mod tests {
         let summands =
             shard_map(|x| Ok(x), input, logical_mesh.clone(), sharded, unreduced.clone(), options.clone()).unwrap();
         let squares = shard_map(
-            |summand: ShardMapTracer<Domain<'_>>| Ok(summand.clone() * summand),
+            |summand: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| Ok(summand.clone() * summand),
             summands,
             logical_mesh,
             unreduced.clone(),
@@ -2427,7 +2439,10 @@ mod tests {
         let rhs = upload(&replicated, &[10.0, 20.0]);
         let add = |lhs, rhs| {
             shard_map(
-                |(lhs, rhs): (ShardMapTracer<Domain<'_>>, ShardMapTracer<Domain<'_>>)| Ok(lhs + rhs),
+                |(lhs, rhs): (
+                    ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>,
+                    ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>,
+                )| Ok(lhs + rhs),
                 (lhs, rhs),
                 logical_mesh.clone(),
                 (sharded.clone(), replicated.clone()),
@@ -2444,7 +2459,10 @@ mod tests {
         assert_eq!(domain.program_count(), program_count);
 
         let inferred = shard_map_with_inferred_input_shardings(
-            |(lhs, rhs): (ShardMapTracer<Domain<'_>>, ShardMapTracer<Domain<'_>>)| Ok(lhs * rhs),
+            |(lhs, rhs): (
+                ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>,
+                ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>,
+            )| Ok(lhs * rhs),
             (lhs.clone(), rhs),
             logical_mesh.clone(),
             sharded.clone(),
@@ -2454,7 +2472,7 @@ mod tests {
         assert_eq!(read_device_f32s(&inferred), vec![vec![10.0, 40.0], vec![30.0, 80.0]]);
 
         let doubled = shard_map_along(
-            |x: ShardMapTracer<Domain<'_>>| Ok(x.clone() + x),
+            |x: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| Ok(x.clone() + x),
             lhs,
             logical_mesh,
             "x",
@@ -2494,9 +2512,9 @@ mod tests {
             Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
                 .unwrap();
         let doubled = shard_map(
-            |x: ShardMapTracer<Domain<'_>>| {
+            |x: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| {
                 Ok(shard_map(
-                    |x: ShardMapTracer<Domain<'_>>| Ok(x.clone() + x),
+                    |x: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| Ok(x.clone() + x),
                     x,
                     None,
                     replicated.clone(),
@@ -2513,7 +2531,7 @@ mod tests {
         .unwrap();
         assert_eq!(read_device_f32s(&doubled), vec![vec![2.0, 4.0], vec![2.0, 4.0], vec![6.0, 8.0], vec![6.0, 8.0]]);
         let missing = shard_map(
-            |x: ShardMapTracer<Domain<'_>>| Ok(x),
+            |x: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| Ok(x),
             input,
             None,
             sharded.clone(),
@@ -2528,7 +2546,7 @@ mod tests {
         let input =
             Array::from_host_buffer(&meshed_domain, r#type, mesh, values_to_bytes(&[1f32, 2., 3., 4.])).unwrap();
         let doubled = shard_map(
-            |x: ShardMapTracer<Domain<'_>>| Ok(x.clone() + x),
+            |x: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| Ok(x.clone() + x),
             input,
             None,
             sharded.clone(),

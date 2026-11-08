@@ -737,7 +737,10 @@ mod tests {
                 &context,
                 location,
             ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }))),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+            ),
         ));
         assert!(matches!(
             lower_refined_region_outputs(
@@ -748,7 +751,10 @@ mod tests {
                 &context,
                 location,
             ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }))),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+            ),
         ));
     }
 
@@ -789,8 +795,11 @@ mod tests {
             "control-flow region lowering advanced the `ordered_io` token, which the region does not thread";
         assert!(matches!(
             lower(EffectClasses::NONE),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                if message == expected_message,
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message == expected_message,
+            ),
         ));
     }
 

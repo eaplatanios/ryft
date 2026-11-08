@@ -2880,9 +2880,12 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_program(&program, 0, &Options::new(mesh.clone())),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
-                if message == "data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound \
-                    for XLA compilation",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                    if *message == "data-derived dimension `unbounded` with bounds [0, ∞) needs a finite upper bound \
+                        for XLA compilation",
+            ),
         ));
 
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
@@ -2908,9 +2911,12 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_program(&program, 0, &Options::new(mesh.clone())),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message == "operation `custom_call` cannot consume data-derived dimensions during XLA lowering \
-                    because custom-call physical-padding semantics are opaque",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "operation `custom_call` cannot consume data-derived dimensions during XLA lowering \
+                        because custom-call physical-padding semantics are opaque",
+            ),
         ));
 
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
@@ -2931,9 +2937,12 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_program(&program, 0, &Options::new(mesh.clone())),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message == "operation `reduce` cannot consume data-derived dimensions during XLA lowering \
-                    because mean over a dynamically sized reduction axis is not supported by the XLA lowering",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "operation `reduce` cannot consume data-derived dimensions during XLA lowering \
+                        because mean over a dynamically sized reduction axis is not supported by the XLA lowering",
+            ),
         ));
 
         // `print` renders whatever the physical buffer holds, so the padded suffix of a bounded-dynamic operand would
@@ -2956,9 +2965,14 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_program(&program, 0, &Options::new(mesh.clone())),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message == "operation `print` cannot consume data-derived dimensions during XLA lowering because \
-                    print exposes the physical representation of its operand",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message
+                        == "operation `print` cannot consume data-derived \
+                        dimensions during XLA lowering because \
+                        print exposes the physical representation of its operand",
+            ),
         ));
 
         // Bit generation over a bounded-dynamic result would advance the functional generator state by the physical
@@ -2984,10 +2998,13 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_program(&program, 0, &Options::new(mesh.clone())),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message == "operation `rng_bit_generator` cannot consume data-derived dimensions during XLA \
-                    lowering because random generation advances state according to physical rather than logical \
-                    element count",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "operation `rng_bit_generator` cannot consume data-derived dimensions during XLA \
+                        lowering because random generation advances state according to physical rather than logical \
+                        element count",
+            ),
         ));
 
         // Every scatter combiner is unverified against physical padding, so a data-derived operand extent is rejected
@@ -3027,9 +3044,14 @@ mod tests {
             .unwrap();
         assert!(matches!(
             domain.lower_program(&program, 0, &Options::new(mesh)),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message == "operation `scatter` cannot consume data-derived dimensions during XLA lowering because \
-                    add-scatter padding semantics have not been verified for data-derived dimensions",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message
+                        == "operation `scatter` cannot consume data-derived \
+                        dimensions during XLA lowering because \
+                        add-scatter padding semantics have not been verified for data-derived dimensions",
+            ),
         ));
     }
 
@@ -3745,8 +3767,11 @@ mod tests {
                 0,
                 &Options::new(mesh.clone()),
             ),
-            Err(Error::Core(ryft_core::Error::Sharding(ryft_core::ShardingError::MeshMismatch { expected, actual })))
-                if expected == *mesh.logical_mesh() && actual == foreign_logical_mesh,
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Sharding(ryft_core::ShardingError::MeshMismatch { expected, actual })
+                    if expected == mesh.logical_mesh() && actual == &foreign_logical_mesh,
+            ),
         ));
 
         let local_device = &mesh.devices()[0];
@@ -4576,8 +4601,11 @@ mod tests {
 
         assert!(matches!(
             domain.lower_program(&program, 2, &Options::new(mesh)),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
-                if message == "capture_count is 2, but the program has only 1 flat input(s)",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                    if *message == "capture_count is 2, but the program has only 1 flat input(s)",
+            ),
         ));
     }
 

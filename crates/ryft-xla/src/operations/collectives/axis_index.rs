@@ -94,13 +94,13 @@ impl LowerableOperation for AxisIndexOperation {
         check_count!("output", output_types, 1, ProgramError);
         let collective_state = lowerer.collective_state.clone();
         if let Some(boundary) = collective_state.manual_axis_region(self.axis_name()) {
-            if boundary.check_manual_variation() && self.mesh().is_none() {
+            if boundary.checks_manual_variation() && self.mesh().is_none() {
                 return Err(ProgramError::MalformedProgram(
                     "`axis_index` requires mesh metadata inside a manual region".to_string(),
                 )
                 .into());
             }
-            if !boundary.check_manual_variation() && self.mesh().is_some() {
+            if !boundary.checks_manual_variation() && self.mesh().is_some() {
                 return Err(ProgramError::MalformedProgram(
                     "`axis_index` cannot use tracked mesh metadata inside an unchecked manual binding".to_string(),
                 )
@@ -139,8 +139,11 @@ mod tests {
         );
         assert!(matches!(
             module,
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                if message == "`axis_index` requires mesh metadata inside a manual region",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message == "`axis_index` requires mesh metadata inside a manual region",
+            ),
         ));
     }
 }

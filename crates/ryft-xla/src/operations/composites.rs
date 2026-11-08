@@ -518,9 +518,12 @@ mod tests {
 
         assert!(matches!(
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message == "a `composite_transpose` has no forward program and cannot be lowered to \
-                               StableHLO; transpose it before lowering",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "a `composite_transpose` has no forward program and cannot be lowered to \
+                        StableHLO; transpose it before lowering",
+            ),
         ));
     }
 

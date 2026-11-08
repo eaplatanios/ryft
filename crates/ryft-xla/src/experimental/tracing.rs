@@ -29,10 +29,9 @@ use crate::experimental::ops::{Constant, Program};
 use crate::{Domain, Error};
 
 /// Array value that closures traced through [`trace`] receive and return: a [`DomainTracer`](ryft_core::DomainTracer)
-/// of [`Domain`] projected onto its array member. It is also the [`ShardMapTracer`](ryft_core::ShardMapTracer) of
-/// [`Domain`], so `shard_map` bodies traced in XLA programs (e.g., through [`ryft_core::shard_map()`] on values of
-/// type [`ArrayTracer`]) receive the same values. This alias is public so that callers (e.g., tooling binaries) can
-/// annotate traced closure parameters.
+/// of [`Domain`] projected onto its array member. The `shard_map` bodies traced in XLA programs (e.g., through
+/// [`ryft_core::shard_map()`] on values of type [`ArrayTracer`]) receive the same values. This alias is public so that
+/// callers (e.g., tooling binaries) can annotate traced closure parameters.
 pub type ArrayTracer = ProjectedValue<ArrayType, Tracer<'static>>;
 
 /// Stages an arbitrary traced XLA function over global array types.
@@ -251,11 +250,11 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Array as CoreArray, BatchAxis, BatchAxisSpecification, CollectiveOptions, ConstrainSharding, Context, DataType,
-        Device, DeviceMesh, Differentiate, Dimension as CoreDimension, EffectClass, LogicalMesh, MeshAxis,
-        MeshAxisType, Mul, NamedAxis, ParallelAllGather, ParallelAllGatherOutputVariance, ParallelRaggedAllToAll,
-        ParallelVary, Placeholder, Print, Reduce, ReductionKind, RegionRole, Reshape, Reshard, Shape, ShardMap,
-        ShardMapBoundary, ShardMapContext, ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, Sin,
-        StagingContext, Typed, Value as CoreValue, batch, shard_map,
+        Device, DeviceMesh, Differentiate, Dimension as CoreDimension, DomainTracer, EffectClass, LogicalMesh,
+        MeshAxis, MeshAxisType, Mul, NamedAxis, ParallelAllGather, ParallelAllGatherOutputVariance,
+        ParallelRaggedAllToAll, ParallelVary, Placeholder, Print, ProjectedContext, Reduce, ReductionKind, RegionRole,
+        Reshape, Reshard, Shape, ShardMap, ShardMapBoundary, ShardMapOperation, ShardMapOptions, Sharding,
+        ShardingDimension, Sin, StagingContext, Typed, Value as CoreValue, batch, shard_map,
     };
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -706,8 +705,11 @@ mod tests {
                 None,
                 Some("cpu"),
             ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                    if message == "`parallel_ragged_all_to_all` is not supported by the XLA CPU backend",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "`parallel_ragged_all_to_all` is not supported by the XLA CPU backend",
+            ),
         ));
     }
 
@@ -2936,14 +2938,16 @@ mod tests {
 
     #[test]
     fn test_batched_shard_map_matches_per_item_results_on_cpu() {
-        use ryft_core::{ArrayIrBatchingPolicy, BatchingContext, ParallelReduce, ShardMapTracer};
+        use ryft_core::{ArrayIrBatchingPolicy, BatchingContext, ParallelReduce};
 
         // Batching a `shard_map` that sums its local shards across the four devices along `x` over a leading axis of
         // three items yields, for every item, what the unbatched `shard_map` yields for that item alone. The batch
         // dimension is an unpartitioned leading dimension of the boundary, so every device holds all three items of its
         // shard.
-        type BatchedShardMapTracer =
-            ShardMapTracer<BatchingContext<DomainTracingContext<Domain<'static>>, ArrayIrBatchingPolicy>>;
+        type BatchedShardMapTracer = ProjectedValue<
+            ArrayType,
+            DomainTracer<BatchingContext<DomainTracingContext<Domain<'static>>, ArrayIrBatchingPolicy>>,
+        >;
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
@@ -3075,14 +3079,16 @@ mod tests {
 
     #[test]
     fn test_spmd_batched_shard_map_matches_per_item_results_on_cpu() {
-        use ryft_core::{ArrayIrBatchingPolicy, BatchingContext, ParallelReduce, ShardMapTracer};
+        use ryft_core::{ArrayIrBatchingPolicy, BatchingContext, ParallelReduce};
 
         // Batching a `shard_map` over the manual axes `x` and `y` of four CPU devices, whose body sums its local shards
         // along `x` only, over a leading axis of four items that the input places on `y` (the analogue of JAX's
         // `spmd_axis_name`) makes `y` free in the batched `shard_map`: every device holds the two items of its
         // coordinate along `y`, and the result for every item is what the unbatched `shard_map` yields for that item.
-        type BatchedShardMapTracer =
-            ShardMapTracer<BatchingContext<DomainTracingContext<Domain<'static>>, ArrayIrBatchingPolicy>>;
+        type BatchedShardMapTracer = ProjectedValue<
+            ArrayType,
+            DomainTracer<BatchingContext<DomainTracingContext<Domain<'static>>, ArrayIrBatchingPolicy>>,
+        >;
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
@@ -3578,9 +3584,11 @@ mod tests {
                     x.value()
                         .context()
                         .shard_map(
-                            |context: &ShardMapContext<DomainTracingContext<Domain<'static>>>, ()| {
-                                context.axis_index("x")?.reshape([1])
-                            },
+                            |context: &ProjectedContext<
+                                DomainTracingContext<DomainTracingContext<Domain<'static>>>,
+                                ArrayType,
+                            >,
+                             ()| { context.axis_index("x")?.reshape([1]) },
                             (),
                             mesh,
                             (),
@@ -4612,11 +4620,14 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 traced.to_mlir_module("main"),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                    if message == format!(
-                        "collective over axis `x` records size {axis_size}, \
-                         but the enclosing mesh axis has size 2",
-                    ),
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                        if *message == format!(
+                            "collective over axis `x` records size {axis_size}, \
+                             but the enclosing mesh axis has size 2",
+                        ),
+                ),
             ));
         }
     }

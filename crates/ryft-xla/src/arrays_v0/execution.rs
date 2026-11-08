@@ -119,7 +119,10 @@ mod tests {
     fn test_execute_arguments_from_arrays_with_donation_reuses_duplicate_device_error() {
         assert!(matches!(
             ExecuteArguments::from_arrays_with_donation(Vec::new(), Arc::from([7, 7]), &[]),
-            Err(Error::Core(CoreError::Sharding(ShardingError::DuplicateDeviceId { id: 7 }))),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Sharding(ShardingError::DuplicateDeviceId { id: 7 }),
+            ),
         ));
     }
 }

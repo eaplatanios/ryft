@@ -4,11 +4,11 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 use ryft_core::{
     AddOperation, Array as CoreArray, AtomId, CaptureReference, CastOperation, ConditionOperation, Context, Cos,
-    Differentiate, Dimension as CoreDimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Dot,
-    DotDimensionNumbers, EagerContext, EffectClasses, MeshAxis, MeshAxisType, NegOperation, OneLike,
-    ParameterizedFamily, Placeholder, Program as CoreProgram, ProgramBuilder as CoreProgramBuilder, ProvenanceScope,
-    ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate, ShardMap, ShardMapContext,
-    ShardMapOptions, Sin, Transpose, TypedProgram, ZeroLike,
+    Differentiate, Dimension as CoreDimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+    DomainTracingContext, Dot, DotDimensionNumbers, EagerContext, EffectClasses, MeshAxis, MeshAxisType, NegOperation,
+    OneLike, ParameterizedFamily, Placeholder, Program as CoreProgram, ProgramBuilder as CoreProgramBuilder,
+    ProjectedContext, ProvenanceScope, ReduceOperation, ReductionKind, ReshapeOperation, ReverseModeDifferentiate,
+    ShardMap, ShardMapOptions, Sin, Transpose, TypedProgram, ZeroLike,
 };
 use ryft_mlir::{Attribute, Operation as MlirOperation, Region, Size as MlirSize};
 use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -77,7 +77,7 @@ where
     Output: Parameterized<ArrayType>,
     Output::Family: ParameterizedFamily<Constant> + ParameterizedFamily<ArrayTracer> + ParameterizedFamily<Sharding>,
     F: FnOnce(
-        &ShardMapContext<Domain<'static>>,
+        &ProjectedContext<DomainTracingContext<Domain<'static>>, ArrayType>,
         Input::To<ArrayTracer>,
     ) -> Result<Output::To<ArrayTracer>, ProgramError>,
 {
@@ -358,8 +358,11 @@ fn test_collective_lowering_state_check_manual_collective_rejects_tracked_unchec
     });
     assert!(matches!(
         result,
-        Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-            if message == "`parallel_permute` cannot use tracked mesh metadata inside an unchecked manual binding",
+        Err(Error::Core(core_error)) if matches!(
+            core_error.as_ref(),
+            ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                if *message == "`parallel_permute` cannot use tracked mesh metadata inside an unchecked manual binding",
+        ),
     ));
 }
 
@@ -375,8 +378,11 @@ fn test_collective_lowering_state_check_manual_collective_retains_unchecked_vali
     });
     assert!(matches!(
         wrong_size,
-        Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-            if message == "collective over axis `x` records size 3, but the enclosing mesh axis has size 2",
+        Err(Error::Core(core_error)) if matches!(
+            core_error.as_ref(),
+            ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                if *message == "collective over axis `x` records size 3, but the enclosing mesh axis has size 2",
+        ),
     ));
 
     let other_mesh = test_manual_mesh("x", 3);
@@ -385,16 +391,22 @@ fn test_collective_lowering_state_check_manual_collective_retains_unchecked_vali
     });
     assert!(matches!(
         wrong_mesh,
-        Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-            if message == "`parallel_permute` operation mesh does not match the enclosing manual axis `x` mesh",
+        Err(Error::Core(core_error)) if matches!(
+            core_error.as_ref(),
+            ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                if *message == "`parallel_permute` operation mesh does not match the enclosing manual axis `x` mesh",
+        ),
     ));
 
     let wrong_outputs =
         state.check_manual_collective("parallel_permute", "x", 2, None, &[1usize], |_| Ok(vec![2usize]));
     assert!(matches!(
         wrong_outputs,
-        Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-            if message == "`parallel_permute` output types do not match the enclosing manual mesh contract",
+        Err(Error::Core(core_error)) if matches!(
+            core_error.as_ref(),
+            ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                if *message == "`parallel_permute` output types do not match the enclosing manual mesh contract",
+        ),
     ));
 }
 
@@ -530,8 +542,11 @@ fn test_array_ir_lowering_rejects_bound_manual_output_placement() {
         .unwrap();
     assert!(matches!(
         lower_replicated_shard_map_body(body, 2),
-        Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-            if message == "`cast` cannot assign bound manual mesh axes to local output dimensions",
+        Err(Error::Core(core_error)) if matches!(
+            core_error.as_ref(),
+            ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                if *message == "`cast` cannot assign bound manual mesh axes to local output dimensions",
+        ),
     ));
 }
 
@@ -1442,14 +1457,20 @@ fn test_mlir_lowerable_value_to_dense_elements_attribute_rejects_symbolic_values
     let tensor_type = lower_tensor_type(&array_type, &context, context.unknown_location()).unwrap();
     assert!(matches!(
         array_type.to_dense_elements_attribute(tensor_type, &context),
-        Err(Error::Core(ryft_core::Error::Program(ProgramError::Concretization { message })))
-            if message == "abstract XLA value `f32[]` cannot be materialized as a StableHLO literal",
+        Err(Error::Core(core_error)) if matches!(
+            core_error.as_ref(),
+            ryft_core::Error::Program(ProgramError::Concretization { message })
+                if *message == "abstract XLA value `f32[]` cannot be materialized as a StableHLO literal",
+        ),
     ));
     let captured = ArrayConstant::Captured(CaptureReference::new(3, array_type));
     assert!(matches!(
         captured.to_dense_elements_attribute(tensor_type, &context),
-        Err(Error::Core(ryft_core::Error::Program(ProgramError::Concretization { message })))
-            if message == "captured constant #3 cannot be materialized as a literal without capture bindings",
+        Err(Error::Core(core_error)) if matches!(
+            core_error.as_ref(),
+            ryft_core::Error::Program(ProgramError::Concretization { message })
+                if *message == "captured constant #3 cannot be materialized as a literal without capture bindings",
+        ),
     ));
 }
 

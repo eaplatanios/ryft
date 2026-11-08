@@ -3999,10 +3999,13 @@ pub(crate) mod tests {
         .unwrap();
         assert!(matches!(
             error,
-            Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "output 0 of the called function is a reference that the function allocates itself, \
-                               which a nested call cannot return; allocate the reference in the caller and pass it to \
-                               the function instead",
+            Error::Core(core_error) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "output 0 of the called function is a reference that the function allocates itself, \
+                        which a nested call cannot return; allocate the reference in the caller and pass it to \
+                        the function instead",
+            ),
         ));
     }
 
@@ -4351,10 +4354,13 @@ pub(crate) mod tests {
             .unwrap();
         assert!(matches!(
             compiled.execute_statefully_and_wait(&domain, Value::Reference(Reference::new(view, domain.clone()))),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })))
-                if reason
-                    == "external state input 0 must be a root reference handle that uses its allocation's stored \
-                        type identities",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })
+                    if *reason
+                        == "external state input 0 must be a root reference handle that uses its allocation's stored \
+                            type identities",
+            ),
         ));
         assert_eq!(read_f32_array(&client, &root.read().unwrap()), vec![4.0, 9.0]);
     }
@@ -4428,11 +4434,14 @@ pub(crate) mod tests {
                 &domain,
                 (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })))
-                if reason == format!(
-                    "external state input 0 reference type `{alternate_type}` does not refine effective compiled state \
-                     type `{replicated_type}`",
-                ),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })
+                    if *reason == format!(
+                        "external state input 0 reference type `{alternate_type}` does not refine effective \
+                         compiled state type `{replicated_type}`",
+                    ),
+            ),
         ));
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![1.0, 2.0]);
     }
@@ -4516,8 +4525,11 @@ pub(crate) mod tests {
                     Value::Array(update),
                 ),
             ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })))
-                if reason == "external state input 0 reference mesh does not match the compiled device mesh",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })
+                    if *reason == "external state input 0 reference mesh does not match the compiled device mesh",
+            ),
         ));
         assert_eq!(read_sharded_f32_array(&reversed_reference.read().unwrap()), vec![1.0, 2.0, 3.0, 4.0],);
     }
@@ -5183,8 +5195,11 @@ pub(crate) mod tests {
         assert!(
             matches!(
                 &error,
-                Some(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
-                    if message == "capture 0 and input 0 bind the same reference allocation",
+                Some(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                        if *message == "capture 0 and input 0 bind the same reference allocation",
+                ),
             ),
             "{error:?}",
         );
@@ -5218,8 +5233,11 @@ pub(crate) mod tests {
         );
         assert!(matches!(
             result,
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
-                if message == "capture 1 and capture 0 bind the same reference allocation",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                    if *message == "capture 1 and capture 0 bind the same reference allocation",
+            ),
         ));
     }
 
@@ -5408,8 +5426,11 @@ pub(crate) mod tests {
                     Value::Array(wrong_update),
                 ),
             ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
-                if message == expected_error,
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                    if *message == expected_error,
+            ),
         ));
         assert_eq!(read_f32_array(&client, &pre_handoff_first.read().unwrap()), vec![1.0]);
         assert_eq!(read_f32_array(&client, &pre_handoff_second.read().unwrap()), vec![10.0]);
@@ -5573,7 +5594,10 @@ pub(crate) mod tests {
                     Value::Array(update),
                 ),
             ),
-            Err(Error::Core(ryft_core::Error::Reference(ReferenceError::Frozen))),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Reference(ReferenceError::Frozen),
+            ),
         ));
         assert_eq!(read_f32_array(&client, &first.read().unwrap()), vec![1.0]);
     }
@@ -7665,8 +7689,11 @@ pub(crate) mod tests {
             compile(|x| x.sin().unwrap(), scalar_type, &engine, mesh).unwrap();
         assert!(matches!(
             function.batch(&engine, BatchAxis::new(0), BatchAxis::new(0), BatchAxisSpecification::named("i")),
-            Err(Error::Core(CoreError::Program(ProgramError::InvalidArgument { message })))
-                if message == "compiled function batching requires an explicit static batch extent",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::InvalidArgument { message })
+                    if *message == "compiled function batching requires an explicit static batch extent",
+            ),
         ));
     }
 

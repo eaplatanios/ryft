@@ -1124,23 +1124,32 @@ mod tests {
         );
         assert!(matches!(
             ConditionOperation::<ArrayType>::new().lower(&mut lowerer, &[], &[], &[]),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message == expected_message,
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == expected_message,
+            ),
         ));
 
         // An array IR condition needs exactly one region per branch.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![branch.clone()]);
         assert!(matches!(
             ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                if message == "operation `condition` declares 2 region slots but 1 regions were attached",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message == "operation `condition` declares 2 region slots but 1 regions were attached",
+            ),
         ));
 
         // It also needs the predicate followed by one input per branch input.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![branch; 2]);
         assert!(matches!(
             ConditionOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }))),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+            ),
         ));
     }
 
@@ -1816,7 +1825,7 @@ mod tests {
             batched.to_string(),
             indoc! {r#"
                 lambda %0:dimension<3>, %1:f64[], %2:f64[3] .
-                let %3:f64[] = zero_like %1
+                let %3:f64[] = zero [type=f64[]]
                     %4:bool[] = compare [direction=GreaterThan] %1 %3
                     %5:f64[3] = condition %4 %0 %2 [
                         true={
@@ -1865,7 +1874,7 @@ mod tests {
             batched.to_string(),
             indoc! {r#"
                 lambda %0:dimension<3>, %1:f64[3], %2:f64[3] .
-                let %3:f64[3] = zero_like %1
+                let %3:f64[3] = zero [type=f64[3]]
                     %4:bool[3] = compare [direction=GreaterThan] %1 %3
                     %5:f64[3] = stop_gradient %2
                     %6:f64[3] = select %4 %2 %5

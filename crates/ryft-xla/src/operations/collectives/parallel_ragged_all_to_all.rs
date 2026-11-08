@@ -809,52 +809,53 @@ mod tests {
                       %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32> loc(#loc)
                       %cst_0 = stablehlo.constant dense<0.000000e+00> : tensor<f32> loc(#loc3)
                       %2 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<3xf32> loc(#loc3)
-                      %3 = \"stablehlo.all_to_all\"(%arg8) \
+                      %3 = sdy.sharding_constraint %2 <@mesh, [{}]> : tensor<3xf32> loc(#loc3)
+                      %4 = \"stablehlo.all_to_all\"(%arg8) \
                       <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, \
                       concat_dimension = 0 : i64, \
                       replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>, split_count = 2 : i64, \
                       split_dimension = 0 : i64}> {use_global_device_ids} : \
                       (tensor<4xi32>) -> tensor<4xi32> loc(#loc3)
-                      %4 = \"stablehlo.all_to_all\"(%arg6) \
+                      %5 = \"stablehlo.all_to_all\"(%arg6) \
                       <{channel_handle = #stablehlo.channel_handle<handle = 2, type = 1>, \
                       concat_dimension = 0 : i64, \
                       replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>, split_count = 2 : i64, \
                       split_dimension = 0 : i64}> {use_global_device_ids} : \
                       (tensor<4xi32>) -> tensor<4xi32> loc(#loc3)
                       %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f32> loc(#loc3)
-                      %5 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<12xf32> loc(#loc3)
-                      %6 = stablehlo.convert %3 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
-                      %7 = stablehlo.convert %arg9 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
-                      %8 = stablehlo.convert %4 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
-                      %9 = stablehlo.convert %arg7 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
-                      %10 = stablehlo.iota dim = 0 : tensor<4xui64> loc(#loc3)
+                      %6 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f32>) -> tensor<12xf32> loc(#loc3)
+                      %7 = stablehlo.convert %4 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
+                      %8 = stablehlo.convert %arg9 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
+                      %9 = stablehlo.convert %5 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
+                      %10 = stablehlo.convert %arg7 : (tensor<4xi32>) -> tensor<4xui64> loc(#loc3)
+                      %11 = stablehlo.iota dim = 0 : tensor<4xui64> loc(#loc3)
                       %c = stablehlo.constant dense<2> : tensor<ui64> loc(#loc3)
-                      %11 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<ui64>) -> tensor<4xui64> loc(#loc3)
-                      %12 = stablehlo.remainder %10, %11 : tensor<4xui64> loc(#loc3)
-                      %13 = stablehlo.partition_id : tensor<ui32> loc(#loc3)
-                      %14 = stablehlo.convert %13 : (tensor<ui32>) -> tensor<ui64> loc(#loc3)
+                      %12 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<ui64>) -> tensor<4xui64> loc(#loc3)
+                      %13 = stablehlo.remainder %11, %12 : tensor<4xui64> loc(#loc3)
+                      %14 = stablehlo.partition_id : tensor<ui32> loc(#loc3)
+                      %15 = stablehlo.convert %14 : (tensor<ui32>) -> tensor<ui64> loc(#loc3)
                       %c_2 = stablehlo.constant dense<[0, 1, 1, 0]> : tensor<4xi64> loc(#loc3)
-                      %15 = stablehlo.dynamic_slice %c_2, %14, sizes = [1] : \
+                      %16 = stablehlo.dynamic_slice %c_2, %15, sizes = [1] : \
                       (tensor<4xi64>, tensor<ui64>) -> tensor<1xi64> loc(#loc3)
-                      %16 = stablehlo.convert %15 : (tensor<1xi64>) -> tensor<1xui64> loc(#loc3)
-                      %17 = stablehlo.reshape %16 : (tensor<1xui64>) -> tensor<ui64> loc(#loc3)
-                      %18 = stablehlo.multiply %17, %c : tensor<ui64> loc(#loc3)
-                      %19 = stablehlo.broadcast_in_dim %18, dims = [] : (tensor<ui64>) -> tensor<4xui64> loc(#loc3)
-                      %20 = stablehlo.add %19, %12 : tensor<4xui64> loc(#loc3)
+                      %17 = stablehlo.convert %16 : (tensor<1xi64>) -> tensor<1xui64> loc(#loc3)
+                      %18 = stablehlo.reshape %17 : (tensor<1xui64>) -> tensor<ui64> loc(#loc3)
+                      %19 = stablehlo.multiply %18, %c : tensor<ui64> loc(#loc3)
+                      %20 = stablehlo.broadcast_in_dim %19, dims = [] : (tensor<ui64>) -> tensor<4xui64> loc(#loc3)
+                      %21 = stablehlo.add %20, %13 : tensor<4xui64> loc(#loc3)
                       %c_3 = stablehlo.constant dense<3> : tensor<4xui64> loc(#loc3)
-                      %21 = stablehlo.multiply %20, %c_3 : tensor<4xui64> loc(#loc3)
-                      %22 = stablehlo.add %8, %21 : tensor<4xui64> loc(#loc3)
-                      %23 = stablehlo.custom_call @ragged_all_to_all(%1, %5, %6, %7, %22, %9) \
+                      %22 = stablehlo.multiply %21, %c_3 : tensor<4xui64> loc(#loc3)
+                      %23 = stablehlo.add %9, %22 : tensor<4xui64> loc(#loc3)
+                      %24 = stablehlo.custom_call @ragged_all_to_all(%1, %6, %7, %8, %23, %10) \
                       {api_version = 4 : i32, backend_config = {channel_id = 3 : i64, \
                       replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>}} : \
                       (tensor<4xf32>, tensor<12xf32>, tensor<4xui64>, tensor<4xui64>, \
                       tensor<4xui64>, tensor<4xui64>) -> tensor<12xf32> loc(#loc3)
-                      %24 = stablehlo.reshape %23 : (tensor<12xf32>) -> tensor<4x3xf32> loc(#loc3)
+                      %25 = stablehlo.reshape %24 : (tensor<12xf32>) -> tensor<4x3xf32> loc(#loc3)
                       %cst_4 = stablehlo.constant dense<0.000000e+00> : tensor<f32> loc(#loc3)
-                      %25 = stablehlo.reduce(%24 init: %cst_4) applies stablehlo.add across dimensions = [0] : \
+                      %26 = stablehlo.reduce(%25 init: %cst_4) applies stablehlo.add across dimensions = [0] : \
                       (tensor<4x3xf32>, tensor<f32>) -> tensor<3xf32> loc(#loc3)
-                      %26 = stablehlo.add %2, %25 : tensor<3xf32> loc(#loc3)
-                      sdy.return %26 : tensor<3xf32> loc(#loc)
+                      %27 = stablehlo.add %3, %26 : tensor<3xf32> loc(#loc3)
+                      sdy.return %27 : tensor<3xf32> loc(#loc)
                     } : (tensor<16xi32>, tensor<16xi32>, tensor<16xi32>, tensor<16xi32>) -> tensor<12xf32> loc(#loc)
                     return %0 : tensor<12xf32> loc(#loc)
                   } loc(#loc)
@@ -1105,10 +1106,14 @@ mod tests {
                 &mlir_context,
                 location.as_ref(),
             ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                if message
-                    == "`parallel_ragged_all_to_all` lowering does not support the batching-internal physical operand \
-                        representation",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message
+                        == "`parallel_ragged_all_to_all` lowering does not support the batching-internal \
+                            physical operand \
+                            representation",
+            ),
         ));
     }
 
@@ -1142,10 +1147,13 @@ mod tests {
                 &mlir_context,
                 location.as_ref(),
             ),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message
-                    == "`parallel_ragged_all_to_all` lowering of batch dimensions requires static input shapes but \
-                        input 0 has type `f32[2, rows]`",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message
+                        == "`parallel_ragged_all_to_all` lowering of batch dimensions requires static input shapes but \
+                            input 0 has type `f32[2, rows]`",
+            ),
         ));
     }
 }

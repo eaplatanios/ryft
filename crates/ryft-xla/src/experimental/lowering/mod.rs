@@ -11,7 +11,7 @@ use ryft_core::{
     LogicalMesh, Memory, OneLikeOperation, Operation as CoreOperation, OperationPayloadProjection, Parameterized,
     ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
     ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as RyftType,
-    TypeError, Typed, TypedProgram, Value as CoreValue, ZeroLikeOperation,
+    TypeError, Typed, TypedProgram, Value as CoreValue, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -1001,11 +1001,11 @@ impl CollectiveLoweringState {
     ) -> Result<(), Error> {
         let axis_name = axis_name.into();
         let mesh = self.checked_collective_mesh(operation_name, &axis_name, axis_size, payload_mesh)?;
-        let checked = self.manual_axis_region(&axis_name.names()[0]).unwrap().check_manual_variation();
+        let checked = self.manual_axis_region(&axis_name.names()[0]).unwrap().checks_manual_variation();
         if axis_name
             .names()
             .iter()
-            .any(|axis_name| self.manual_axis_region(axis_name).unwrap().check_manual_variation() != checked)
+            .any(|axis_name| self.manual_axis_region(axis_name).unwrap().checks_manual_variation() != checked)
         {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{operation_name}` axes `{axis_name}` must agree on whether their bindings check manual variation",
@@ -2192,6 +2192,7 @@ where
                         || operation
                             .projected_payload::<ScatterOperation>()
                             .is_some_and(|operation| operation.output_sharding().is_some())
+                        || operation.projected_payload::<ZeroOperation<ArrayType>>().is_some()
                         || operation.projected_payload::<ZeroLikeOperation<ArrayType>>().is_some()
                         || operation.projected_payload::<OneLikeOperation<ArrayType>>().is_some()
                 };

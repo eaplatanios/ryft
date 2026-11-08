@@ -27,8 +27,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, ArrayType, Cos, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Mul, Reduce,
-        ShardMapOptions, ShardMapTracer, Sharding, ShardingDimension, Sin, Typed, ValueProjection, auto_axes,
+        Add, ArrayType, Cos, DataType, Device, DeviceMesh, DomainTracer, LogicalMesh, MeshAxis, MeshAxisType, Mul,
+        ProjectedValue, Reduce, ShardMapOptions, Sharding, ShardingDimension, Sin, Typed, ValueProjection, auto_axes,
         differentiate_at, explicit_axes, shard_map,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
@@ -308,7 +308,7 @@ mod tests {
         )
         .unwrap();
         let doubled = shard_map(
-            |input: ShardMapTracer<Domain<'_>>| Ok(input.clone() + input),
+            |input: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| Ok(input.clone() + input),
             input,
             map_mesh,
             map_sharding.clone(),

@@ -121,6 +121,23 @@ pub(crate) fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
     }
 }
 
+/// Constrains the result of a nullary zero constructor to the sharding that its type declares, if any, as
+/// [`lower_like_constant`] does for constructors with an exemplar. Staging lowers a `zero_like` whose type is static to
+/// such a constructor, so without the constraint an explicitly sharded zero would rely on sharding propagation rather
+/// than keep the placement that its type declares (as JAX's `full` keeps an explicit sharding).
+fn lower_constructor_sharding_constraint<'b, 'c: 'b, 't: 'c>(
+    result: Vec<ValueRef<'b, 'c, 't>>,
+    output_type: Option<&ArrayType>,
+    bound_manual_axes: &[String],
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    match output_type.and_then(ArrayType::sharding) {
+        Some(sharding) => lower_sharding_constraint(&result, sharding, bound_manual_axes, block, location),
+        None => Ok(result),
+    }
+}
+
 /// Constrains the layout of a statically shaped physical buffer before attaching its runtime dimensions.
 pub(crate) fn lower_layout_constraint<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
@@ -341,7 +358,14 @@ impl LowerableOperation for ZeroOperation<ArrayType> {
         if !input_values.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
         }
-        lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)
+        let result = lower_constant_output(output_types, 0, &mut lowerer.block, lowerer.context, lowerer.location)?;
+        lower_constructor_sharding_constraint(
+            result,
+            output_types.first(),
+            &lowerer.collective_state.bound_manual_axes,
+            &mut lowerer.block,
+            lowerer.location,
+        )
     }
 }
 
@@ -413,7 +437,18 @@ impl MemberLowerableOperation<ArrayIrType> for ZeroOperation<ArrayType> {
         let input_values =
             dynamic_constructor_inputs(self.name(), self.r#type(), input_values, input_types, output_types, lowerer)?;
         let block = &mut lowerer.block;
-        lower_dynamic_constructor(self.name(), 0, &input_values, output_types, block, context, location)
+        let result = lower_dynamic_constructor(self.name(), 0, &input_values, output_types, block, context, location)?;
+        let output_type = match output_types {
+            [ArrayIrType::Array(output_type)] => Some(output_type),
+            _ => None,
+        };
+        lower_constructor_sharding_constraint(
+            result,
+            output_type,
+            &lowerer.collective_state.bound_manual_axes,
+            &mut lowerer.block,
+            location,
+        )
     }
 }
 
@@ -957,6 +992,40 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_zero_constrains_sharded_types() {
+        // A nullary zero of a sharded type, which staging produces for a `zero_like` of a static type, keeps the
+        // sharding of its type through a constraint, as a `zero_like` of the same type does, in both the array family
+        // and the array IR family. A zero of an unsharded type has no constraint.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unsharded_type = ArrayType::new_static(DataType::F32, [4]);
+        let sharded_type = unsharded_type
+            .clone()
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        for (output_type, constraint_count) in [(sharded_type, 1), (unsharded_type, 0)] {
+            let mut builder = ProgramBuilder::new();
+            let zero = ZeroOperation::new(output_type.clone());
+            let output = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], Vec::new(), vec![Placeholder])
+                .unwrap();
+            let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+            assert_eq!(module.matches("sdy.sharding_constraint").count(), constraint_count, "{module}");
+
+            let mut builder = ArrayIrProgramBuilder::new();
+            let zero = ArrayIrOperation::<ArrayConstant>::Zero(ZeroOperation::new(output_type.clone()));
+            let output = builder.add_instruction(zero, Vec::new(), Vec::new(), None).unwrap()[0];
+            let program =
+                builder.build::<Vec<Constant>, Vec<Constant>>(vec![output], Vec::new(), vec![Placeholder]).unwrap();
+            let input_types: Vec<ArrayType> = Vec::new();
+            let module =
+                to_mlir_module_for_program(&program, &[], &input_types, &vec![output_type], "main", None, None)
+                    .unwrap();
+            assert_eq!(module.matches("sdy.sharding_constraint").count(), constraint_count, "{module}");
+        }
+    }
+
+    #[test]
     fn test_lower_like_constant_dynamic_shape_requires_supported_bound() {
         for (operation, name) in [
             (ArrayOperation::ZeroLike(ZeroLikeOperation::new()), "zero_like"),
@@ -987,7 +1056,8 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let error = to_mlir_module_for_plain_program(&program, "main").unwrap_err();
-        let Error::Core(ryft_core::Error::Type(error)) = error else { unreachable!() };
+        let Error::Core(core_error) = error else { unreachable!() };
+        let ryft_core::Error::Type(error) = *core_error else { unreachable!() };
         assert_eq!(
             error.downcast_custom::<ryft_core::DimensionError>(),
             Some(&ryft_core::DimensionError::ExtentExceedsBackendWidth {

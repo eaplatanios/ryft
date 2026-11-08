@@ -141,8 +141,11 @@ mod tests {
                 &[ArrayType::scalar(DataType::F6E2M3FN), ArrayType::scalar(DataType::F32)],
                 &[ArrayType::scalar(DataType::Boolean)],
             ),
-            Err(Error::Core(CoreError::DataType(DataTypeError::InvalidPromotion { message, .. })))
-                if message == "cannot promote types `f6e2m3fn` and `f32` to a common type",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::DataType(DataTypeError::InvalidPromotion { message, .. })
+                    if *message == "cannot promote types `f6e2m3fn` and `f32` to a common type",
+            ),
         ));
     }
 }

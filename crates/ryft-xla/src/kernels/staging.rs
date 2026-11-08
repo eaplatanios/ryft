@@ -442,7 +442,7 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        let regions = driver.regions().map(|region| region.to_program()).collect();
+        let regions = driver.regions().map(|region| region.to_program()).collect::<Vec<_>>();
         if let PortableKernelOperation::Call(call) = &self.0 {
             let prefetch_count = call.prefetch_types().len();
             if prefetch_count != 0 && inputs[inputs.len() - prefetch_count..].iter().all(|input| input.is_known()) {

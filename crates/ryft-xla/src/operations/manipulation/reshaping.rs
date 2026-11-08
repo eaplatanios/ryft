@@ -1235,7 +1235,10 @@ mod tests {
 
         assert!(matches!(
             error,
-            Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
+            Error::Core(core_error) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+            ),
         ));
     }
 

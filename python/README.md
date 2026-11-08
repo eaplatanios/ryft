@@ -46,12 +46,15 @@ JAX staging with concretization. Use `--list` to show the case registry and repe
 
 ### Rematerialization parity
 
-The `rematerialization` suite compares Ryft's `rematerialize` with `jax.checkpoint` on CPU. Its twelve cases cover
+The `rematerialization` suite compares Ryft's `rematerialize` with `jax.checkpoint` on CPU. Its twenty cases cover
 `nothing_saveable`, `everything_saveable`, `dots_saveable`, `dots_with_no_batch_dims_saveable`,
 `save_only_these_names`, `save_any_names_but_these`, `save_from_both_policies`, and
 `save_and_offload_only_these_names`, plus `dots_saveable` around a call (a Ryft composite and a `jax.jit` function), a
-condition, and a scan, and a nested checkpoint with a different inner policy. JAX's
-`save_anything_except_these_names` is excluded because JAX 0.12.0.1 saves every value under it.
+composite with a forward mode rule (a `jax.custom_jvp` function), a condition, and a scan, `dots_saveable` around a
+condition, a scan, nested scans, a condition in a scan, and a condition, a scan, and a composite whose inputs carry no
+gradients, offloaded compact values in an all-known scan and a carried scan with a condition in its body, and a nested
+checkpoint with a different inner policy. JAX's `save_anything_except_these_names` is excluded because JAX 0.12.0.1
+saves every value under it.
 
 Each function multiplies and adds small integers, so values are exact in `f32` and must match exactly. Every case
 records its output, its JVP, and its input gradients, which both frameworks must reproduce from an independent NumPy

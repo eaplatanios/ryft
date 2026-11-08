@@ -231,6 +231,27 @@ def _scan_reference(numpy: Any, inputs: tuple[Any, ...], tangents: tuple[Any, ..
     return hidden[-1], hidden_tangent, (hidden_cotangent @ w.T, x.T @ hidden_cotangent, layers_cotangent)
 
 
+def _condition_in_scan_reference(
+    numpy: Any, inputs: tuple[Any, ...], tangents: tuple[Any, ...], seed: Any,
+) -> tuple:
+    """Differentiates the scan `hₖ₊₁ = hₖ ⊙ hₖ + eₖ` from `h₀ = x · w` analytically, where every entry of `eₖ` is the sum
+    `sₖ` of the squares of the entries of `layerₖ` when `Σ hₖ > 0` and `2 sₖ` otherwise, and `eₖ` carries no
+    gradient."""
+
+    (x, w, layers), (x_tangent, w_tangent, _) = inputs, tangents
+    hidden = [x @ w]
+    hidden_tangent = x_tangent @ w + x @ w_tangent
+    for layer in layers:
+        e = (1 if hidden[-1].sum() > 0 else 2) * (layer**2).sum() * numpy.ones_like(hidden[-1])
+        hidden_tangent = 2 * hidden[-1] * hidden_tangent
+        hidden.append(hidden[-1] * hidden[-1] + e)
+    hidden_cotangent = seed
+    for index in reversed(range(len(layers))):
+        hidden_cotangent = 2 * hidden[index] * hidden_cotangent
+    gradients = (hidden_cotangent @ w.T, x.T @ hidden_cotangent, numpy.zeros_like(layers))
+    return hidden[-1], hidden_tangent, gradients
+
+
 def _known_region_reference(
     numpy: Any, inputs: tuple[Any, ...], tangents: tuple[Any, ...], seed: Any, s: Any,
 ) -> tuple:
@@ -252,12 +273,43 @@ def _known_condition_reference(numpy: Any, inputs: tuple[Any, ...], tangents: tu
     return _known_region_reference(numpy, inputs, tangents, seed, s)
 
 
+def _known_composite_reference(numpy: Any, inputs: tuple[Any, ...], tangents: tuple[Any, ...], seed: Any) -> tuple:
+    """Differentiates `(x · w) ⊙ s` for `s = 3 wᵀ w` analytically."""
+
+    w = inputs[1]
+    return _known_region_reference(numpy, inputs, tangents, seed, 3 * (w.T @ w))
+
+
 def _known_scan_reference(numpy: Any, inputs: tuple[Any, ...], tangents: tuple[Any, ...], seed: Any) -> tuple:
     """Differentiates `(x · w) ⊙ s` for `s = 3 (Σₖ layerₖ + Σₖ layerₖ · layerₖ)` analytically."""
 
     layers = inputs[2]
     s = 3 * (layers.sum(axis=0) + sum(layer @ layer for layer in layers))
     return _known_region_reference(numpy, inputs, tangents, seed, s)
+
+
+def _offloaded_scan_reference(carried: bool) -> Callable[..., tuple]:
+    """Returns the analytic derivative of `Σ x ⊙ h`, where `h` adds expanded layer norms while scanning the layers
+    without their gradients. A carried scan starts from `x` and squares its carry before each addition, with a
+    condition on `Σ layer > 0` selecting the norm or twice the norm. An all-known scan starts from `broadcast(Σ w)`.
+    """
+
+    def reference(numpy: Any, inputs: tuple[Any, ...], tangents: tuple[Any, ...], seed: Any) -> tuple:
+        x, w, layers = inputs
+        hidden = x.copy() if carried else numpy.full_like(x, w.sum())
+        hidden_derivative = numpy.ones_like(x) if carried else numpy.zeros_like(x)
+        for layer in layers:
+            norm = (layer**2).sum()
+            if carried:
+                hidden_derivative = 2 * hidden * hidden_derivative
+                hidden = hidden**2 + (1 if layer.sum() > 0 else 2) * norm
+            else:
+                hidden = hidden + norm
+        derivative = hidden + x * hidden_derivative
+        gradients = (seed * derivative, numpy.zeros_like(w), numpy.zeros_like(layers))
+        return (x * hidden).sum(), (derivative * tangents[0]).sum(), gradients
+
+    return reference
 
 
 def _checkpointed_policy_body(policy: Callable[[Any], Any]) -> Callable[[Any, Any], Callable[..., Any]]:
@@ -276,6 +328,29 @@ def _call_function(jax: Any, jax_numpy: Any) -> Callable[..., Any]:
     def call(x: Any, w: Any) -> Any:
         y = jax_numpy.dot(x, w)
         return y * y
+
+    def body(x: Any, w: Any) -> Any:
+        z = call(x, w)
+        return z * z
+
+    return jax.checkpoint(body, policy=jax.checkpoint_policies.dots_saveable)
+
+
+def _composite_function(jax: Any, jax_numpy: Any) -> Callable[..., Any]:
+    """Returns `z ⊙ z` for `z = y ⊙ y` computed by a `jax.custom_jvp` function of `y = x · w` whose rule returns
+    `ẏ ⊙ y + y ⊙ ẏ`, under `dots_saveable`."""
+
+    @jax.custom_jvp
+    def call(x: Any, w: Any) -> Any:
+        y = jax_numpy.dot(x, w)
+        return y * y
+
+    @call.defjvp
+    def call_jvp(primals: tuple[Any, Any], tangents: tuple[Any, Any]) -> tuple[Any, Any]:
+        (x, w), (x_tangent, w_tangent) = primals, tangents
+        y = jax_numpy.dot(x, w)
+        y_tangent = jax_numpy.dot(x_tangent, w) + jax_numpy.dot(x, w_tangent)
+        return y * y, y_tangent * y + y * y_tangent
 
     def body(x: Any, w: Any) -> Any:
         z = call(x, w)
@@ -304,6 +379,45 @@ def _scan_function(jax: Any, jax_numpy: Any) -> Callable[..., Any]:
     def step(hidden: Any, layer: Any) -> tuple[Any, None]:
         t = jax_numpy.dot(hidden, layer)
         return t * t, None
+
+    def body(x: Any, w: Any, layers: Any) -> Any:
+        return jax.lax.scan(step, jax_numpy.dot(x, w), layers)[0]
+
+    return jax.checkpoint(body, policy=jax.checkpoint_policies.dots_saveable)
+
+
+def _nested_scan_function(jax: Any, jax_numpy: Any) -> Callable[..., Any]:
+    """Returns the scan of `_scan_function` with nested scans under `dots_saveable`, where an outer `lax.scan` over
+    `layers` applies an inner `lax.scan` of `h ↦ (h · layer)²` over the single-layer stack `[layer]`."""
+
+    def step(hidden: Any, layer: Any) -> tuple[Any, None]:
+        t = jax_numpy.dot(hidden, layer)
+        return t * t, None
+
+    def outer_step(hidden: Any, layer: Any) -> tuple[Any, None]:
+        return jax.lax.scan(step, hidden, jax_numpy.broadcast_to(layer, (1, 2, 2)))[0], None
+
+    def body(x: Any, w: Any, layers: Any) -> Any:
+        return jax.lax.scan(outer_step, jax_numpy.dot(x, w), layers)[0]
+
+    return jax.checkpoint(body, policy=jax.checkpoint_policies.dots_saveable)
+
+
+def _condition_in_scan_function(jax: Any, jax_numpy: Any) -> Callable[..., Any]:
+    """Returns a `lax.scan` of `h ↦ h ⊙ h + e` over `layers` from `x · w` under `dots_saveable`, where a `lax.cond` on
+    `Σ h > 0` computes `e` from the layer without its gradient by expanding the compact dot product `layer : layer`
+    (i.e., the sum of the squares of its entries) into `e = broadcast(layer : layer)` of shape `[2, 2]` or `e + e`."""
+
+    def expand(layer: Any) -> Any:
+        return jax_numpy.broadcast_to(jax.lax.dot_general(layer, layer, (((0, 1), (0, 1)), ((), ()))), (2, 2))
+
+    def double(layer: Any) -> Any:
+        e = expand(layer)
+        return e + e
+
+    def step(hidden: Any, layer: Any) -> tuple[Any, None]:
+        e = jax.lax.cond(jax_numpy.sum(hidden) > 0, expand, double, jax.lax.stop_gradient(layer))
+        return hidden * hidden + e, None
 
     def body(x: Any, w: Any, layers: Any) -> Any:
         return jax.lax.scan(step, jax_numpy.dot(x, w), layers)[0]
@@ -345,6 +459,64 @@ def _known_scan_function(jax: Any, jax_numpy: Any) -> Callable[..., Any]:
         return jax_numpy.dot(x, w) * hidden.sum(axis=0)
 
     return jax.checkpoint(body, policy=jax.checkpoint_policies.dots_saveable)
+
+
+def _known_composite_function(jax: Any, jax_numpy: Any) -> Callable[..., Any]:
+    """Returns `(x · w) ⊙ Σₖ eₖ` under `dots_saveable`, where a `jax.custom_jvp` function whose input carries no
+    gradient expands the compact `wᵀ w` into `e = broadcast(wᵀ w)` of shape `[3, 2, 2]`. The policy classifies the
+    `custom_jvp_call` itself, which it does not save, so the call is replayed whole from `w`."""
+
+    @jax.custom_jvp
+    def expand(w: Any) -> Any:
+        return jax_numpy.broadcast_to(w.T @ w, (3, 2, 2))
+
+    @expand.defjvp
+    def expand_jvp(primals: tuple[Any], tangents: tuple[Any]) -> tuple[Any, Any]:
+        (w,), (w_tangent,) = primals, tangents
+        return expand(w), jax_numpy.broadcast_to(w_tangent.T @ w + w.T @ w_tangent, (3, 2, 2))
+
+    def body(x: Any, w: Any) -> Any:
+        e = expand(jax.lax.stop_gradient(w))
+        return jax_numpy.dot(x, w) * e.sum(axis=0)
+
+    return jax.checkpoint(body, policy=jax.checkpoint_policies.dots_saveable)
+
+
+def _offloaded_scan_function(carried: bool) -> Callable[[Any, Any], Callable[..., Any]]:
+    """Returns a JAX builder for the scan of `_offloaded_scan_reference`, offloading the scalar norms tagged
+    `compact` before expanding them into `[2, 3]` arrays. The carried variant computes each norm inside a condition.
+    """
+
+    def function(jax: Any, jax_numpy: Any) -> Callable[..., Any]:
+        from jax.ad_checkpoint import checkpoint_name as name
+
+        def expand(layer: Any) -> Any:
+            norm = jax.lax.dot_general(layer, layer, (((0, 1), (0, 1)), ((), ())))
+            return jax_numpy.broadcast_to(name(norm, "compact"), (2, 3))
+
+        def double(layer: Any) -> Any:
+            e = expand(layer)
+            return e + e
+
+        def step(hidden: Any, layer: Any) -> tuple[Any, None]:
+            if carried:
+                e = jax.lax.cond(jax_numpy.sum(layer) > 0, expand, double, layer)
+                return hidden * hidden + e, None
+            return hidden + expand(layer), None
+
+        def body(x: Any, w: Any, layers: Any) -> Any:
+            w, layers = jax.lax.stop_gradient(w), jax.lax.stop_gradient(layers)
+            initial = x if carried else jax_numpy.broadcast_to(jax_numpy.sum(w), (2, 3))
+            hidden = jax.lax.scan(step, initial, layers)[0]
+            return jax_numpy.sum(x * hidden)
+
+        policy = jax.checkpoint_policies.save_and_offload_only_these_names(
+            names_which_can_be_saved=[], names_which_can_be_offloaded=["compact"],
+            offload_src="device", offload_dst="pinned_host",
+        )
+        return jax.checkpoint(body, policy=policy)
+
+    return function
 
 
 def _nested_function(jax: Any, jax_numpy: Any) -> Callable[..., Any]:
@@ -435,6 +607,13 @@ REMATERIALIZATION_CASES = (
         seed=MATRIX_SEED,
     ),
     RematerializationCase(
+        "rematerialization_dots_saveable_composite",
+        _composite_function,
+        _fourth_power_reference,
+        ((4, 32), (6, 32), (6, 32)),
+        seed=MATRIX_SEED,
+    ),
+    RematerializationCase(
         "rematerialization_dots_saveable_condition",
         _condition_function,
         _condition_reference,
@@ -451,6 +630,23 @@ REMATERIALIZATION_CASES = (
         seed=MATRIX_SEED,
     ),
     RematerializationCase(
+        "rematerialization_dots_saveable_nested_scan",
+        _nested_scan_function,
+        _scan_reference,
+        ((4, 32), (6, 32), (6, 32), (8, 32), (8, 32)),
+        input_names=("x", "w", "layers"),
+        seed=MATRIX_SEED,
+    ),
+    RematerializationCase(
+        "rematerialization_dots_saveable_condition_in_scan",
+        _condition_in_scan_function,
+        _condition_in_scan_reference,
+        ((2, 32), (4, 32), (6, 32), (6, 32)),
+        input_names=("x", "w", "layers"),
+        seed=MATRIX_SEED,
+        negated_evaluation=True,
+    ),
+    RematerializationCase(
         "rematerialization_dots_saveable_known_condition",
         _known_condition_function,
         _known_condition_reference,
@@ -465,6 +661,29 @@ REMATERIALIZATION_CASES = (
         ((6, 32), (6, 32), (8, 32), (8, 32)),
         input_names=("x", "w", "layers"),
         seed=MATRIX_SEED,
+    ),
+    RematerializationCase(
+        "rematerialization_dots_saveable_known_composite",
+        _known_composite_function,
+        _known_composite_reference,
+        ((6, 32), (6, 32)),
+        seed=MATRIX_SEED,
+    ),
+    RematerializationCase(
+        "rematerialization_offloaded_known_scan",
+        _offloaded_scan_function(False),
+        _offloaded_scan_reference(False),
+        ((2, 32), (6, 32)),
+        input_names=("x", "w", "layers"),
+        seed=1.0,
+    ),
+    RematerializationCase(
+        "rematerialization_offloaded_carried_scan",
+        _offloaded_scan_function(True),
+        _offloaded_scan_reference(True),
+        ((2, 32), (6, 32), (8, 32)),
+        input_names=("x", "w", "layers"),
+        seed=1.0,
     ),
     RematerializationCase(
         "rematerialization_nested_policies",

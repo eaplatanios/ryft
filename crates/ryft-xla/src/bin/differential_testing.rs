@@ -1129,16 +1129,22 @@ mod tests {
                 "rematerialization_save_from_both_policies",
                 "rematerialization_save_and_offload_only_these_names",
                 "rematerialization_dots_saveable_call",
+                "rematerialization_dots_saveable_composite",
                 "rematerialization_dots_saveable_condition",
                 "rematerialization_dots_saveable_scan",
+                "rematerialization_dots_saveable_nested_scan",
+                "rematerialization_dots_saveable_condition_in_scan",
                 "rematerialization_dots_saveable_known_condition",
                 "rematerialization_dots_saveable_known_scan",
+                "rematerialization_dots_saveable_known_composite",
+                "rematerialization_offloaded_known_scan",
+                "rematerialization_offloaded_carried_scan",
                 "rematerialization_nested_policies",
             ],
         );
         assert_eq!(
             registry().into_iter().map(|case| case.suite.name()).collect::<Vec<_>>(),
-            [[Some("collectives"); 3].as_slice(), &[None; 6], &[Some("rematerialization"); 14]].concat(),
+            [[Some("collectives"); 3].as_slice(), &[None; 6], &[Some("rematerialization"); 20]].concat(),
         );
     }
 

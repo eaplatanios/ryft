@@ -265,19 +265,27 @@ mod tests {
                 CollectiveLoweringState::new().enter_manual_region(checked.clone().with_check_manual_variation(false));
             assert!(matches!(
                 lower_state_cast(&operation, state, input_type.clone(), &output_types),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                    if message == format!(
-                        "`{}` cannot use tracked mesh metadata inside an unchecked manual binding", operation.name(),
-                    ),
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                        if *message == format!(
+                            "`{}` cannot use tracked mesh metadata inside an unchecked manual binding",
+                            operation.name(),
+                        ),
+                ),
             ));
 
             let state = CollectiveLoweringState::new().enter_manual_region(checked.clone());
             assert!(matches!(
                 lower_state_cast(&operation, state, input_type.clone(), &[input_type.clone()]),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                    if message == format!(
-                        "`{}` output types do not match the enclosing manual mesh contract", operation.name(),
-                    ),
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                        if *message == format!(
+                            "`{}` output types do not match the enclosing manual mesh contract",
+                            operation.name(),
+                        ),
+                ),
             ));
 
             // The input's mesh participates in the binding contract even when the axis has the same size.
@@ -290,17 +298,24 @@ mod tests {
             let state = CollectiveLoweringState::new().enter_manual_region(foreign);
             assert!(matches!(
                 lower_state_cast(&operation, state, input_type.clone(), &output_types),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                    if message == format!(
-                        "`{}` operation mesh does not match the enclosing manual axis `x` mesh", operation.name(),
-                    ),
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                        if *message == format!(
+                            "`{}` operation mesh does not match the enclosing manual axis `x` mesh",
+                            operation.name(),
+                        ),
+                ),
             ));
 
             let state = CollectiveLoweringState::new();
             assert!(matches!(
                 lower_state_cast(&operation, state, input_type, &output_types),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                    if message == "collective over axis `x` can only be lowered inside a shard_map manual region",
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                        if *message == "collective over axis `x` can only be lowered inside a shard_map manual region",
+                ),
             ));
         }
     }
@@ -330,18 +345,27 @@ mod tests {
                 .enter_manual_region(inner.clone());
             assert!(matches!(
                 lower_state_cast(&operation, state, input_type.clone(), &output_types),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                    if message == format!(
-                        "`{}` cannot use tracked mesh metadata inside an unchecked manual binding", operation.name(),
-                    ),
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                        if *message == format!(
+                            "`{}` cannot use tracked mesh metadata inside an unchecked manual binding",
+                            operation.name(),
+                        ),
+                ),
             ));
 
             let state = CollectiveLoweringState::new().enter_manual_region(inner.clone());
             assert!(matches!(
                 lower_state_cast(&operation, state, input_type.clone(), &output_types),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                    if message == "collective over axis `x` cannot lower inside this shard_map manual region because \
-                                   the region does not bind that axis as a manual mesh axis",
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                        if *message
+                            == "collective over axis `x` cannot lower \
+                            inside this shard_map manual region because \
+                            the region does not bind that axis as a manual mesh axis",
+                ),
             ));
         }
     }
@@ -447,8 +471,11 @@ mod tests {
         assert!(state.checked_collective_mesh("parallel_permute", "x", 3, Some(&outer_mesh)).is_err());
         assert!(matches!(
             state.checked_collective_mesh("parallel_permute", "x", 2, Some(&outer_mesh)),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                if message == "collective over axis `x` records size 2, but the enclosing mesh axis has size 3",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message == "collective over axis `x` records size 2, but the enclosing mesh axis has size 3",
+            ),
         ));
     }
 }

@@ -485,9 +485,9 @@ mod tests {
     use ryft_core::ParallelBroadcast;
     use ryft_core::{
         ArrayIrType, ArrayReference, ArrayType, BatchAxis, CompilationArtifactExchange,
-        CompilationArtifactExchangeError, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType,
-        ParallelReduce, ReductionKind, ReferenceType, ShardMapOptions, ShardMapTracer, Sharding, ShardingDimension,
-        UnreducedKind, ValueProjection, batch, shard_map,
+        CompilationArtifactExchangeError, DataType, Device, DeviceMesh, DomainTracer, LogicalMesh, MeshAxis,
+        MeshAxisType, ParallelReduce, ProjectedValue, ReductionKind, ReferenceType, ShardMapOptions, Sharding,
+        ShardingDimension, UnreducedKind, ValueProjection, batch, shard_map,
     };
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{
@@ -610,7 +610,9 @@ mod tests {
             .unwrap();
             assert_eq!(candidates.sharding(), &unreduced);
             shard_map(
-                |candidates: ShardMapTracer<Domain<'_>>| Ok(candidates.parallel_reduce(reduction, "x")?),
+                |candidates: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| {
+                    Ok(candidates.parallel_reduce(reduction, "x")?)
+                },
                 candidates,
                 manual_mesh.clone(),
                 unreduced,

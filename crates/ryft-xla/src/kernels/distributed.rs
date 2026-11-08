@@ -808,7 +808,13 @@ mod tests {
     #[test]
     fn test_distributed_kernel_error_roundtrip() {
         let core = Error::from(DistributedKernelError::from(Error::from(ryft_core::ProgramError::PoisonedValue)));
-        assert!(matches!(core, Error::Core(ryft_core::Error::Program(ryft_core::ProgramError::PoisonedValue))));
+        assert!(matches!(
+            core,
+            Error::Core(core_error) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ryft_core::ProgramError::PoisonedValue),
+            ),
+        ));
 
         let pjrt = Error::from(DistributedKernelError::from(Error::from(ryft_pjrt::Error::invalid_argument(
             "invalid distributed runtime input",

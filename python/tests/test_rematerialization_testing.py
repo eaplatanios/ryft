@@ -75,6 +75,19 @@ class RematerializationTestingTest(unittest.TestCase):
         self.assertEqual(reference["output"], ((16.0, 400.0, 16.0, 64.0),))
         self.assertEqual(reference["layers_gradient"], ((-1920.0, -768.0, 768.0, 0.0, 192.0, -576.0, 96.0, -96.0),))
 
+    def test_rematerialization_reference_scans_with_nested_regions(self) -> None:
+        # The nested scans compute the values of the scan case. The condition in the scan adds the sum of the squares
+        # of each layer (`3` for both), doubled at `-x` on the first iteration, whose carry sums to a negative value.
+        # JAX saves the stacked dot products of both workloads rather than the carries or the outputs of the condition.
+        reference = rematerialization_reference(CASES_BY_ID["rematerialization_dots_saveable_nested_scan"])
+        self.assertEqual(reference["output"], ((16.0, 400.0, 16.0, 64.0),))
+        self.assertEqual(reference["residual_element_counts"], ((4.0, 6.0, 6.0, 8.0, 8.0),))
+        reference = rematerialization_reference(CASES_BY_ID["rematerialization_dots_saveable_condition_in_scan"])
+        self.assertEqual(reference["output"], ((1524.0, 52.0, 12.0, 52.0),))
+        self.assertEqual(reference["false_branch_output"], ((1767.0, 103.0, 39.0, 103.0),))
+        self.assertEqual(reference["layers_gradient"], ((0.0,) * 8,))
+        self.assertEqual(reference["residual_element_counts"], ((2.0, 4.0, 6.0, 6.0),))
+
     def test_rematerialization_reference_known_regions(self) -> None:
         # The known condition scales `x · w` by `3 wᵀ w` at `x` and by `6 wᵀ w` at `-x`, and the known scan by
         # `3 (Σₖ layerₖ + Σₖ layerₖ · layerₖ)`. JAX saves the compact values of both regions rather than their outputs.
@@ -86,6 +99,33 @@ class RematerializationTestingTest(unittest.TestCase):
         self.assertEqual(reference["output"], ((54.0, -12.0, 0.0, 18.0),))
         self.assertEqual(reference["layers_gradient"], ((0.0,) * 8,))
         self.assertEqual(reference["residual_element_counts"], ((6.0, 6.0, 8.0, 8.0),))
+
+    def test_rematerialization_reference_composites(self) -> None:
+        # A differentiated `custom_jvp` call is replaced by its rule, whose dot product `x · w` is saved, while the
+        # policy classifies an all-known call itself, which it does not save, so only the inputs are saved and the
+        # call is replayed whole from `w`.
+        reference = rematerialization_reference(CASES_BY_ID["rematerialization_dots_saveable_composite"])
+        self.assertEqual(reference["output"], ((1296.0, 16.0, 0.0, 16.0),))
+        self.assertEqual(reference["residual_element_counts"], ((4.0, 6.0, 6.0),))
+        reference = rematerialization_reference(CASES_BY_ID["rematerialization_dots_saveable_known_composite"])
+        self.assertEqual(reference["output"], ((108.0, 12.0, 0.0, 12.0),))
+        self.assertEqual(reference["residual_element_counts"], ((6.0, 6.0),))
+
+    def test_rematerialization_reference_offloaded_scans(self) -> None:
+        # The known scan adds both scalar norms (`3` each) to its initial carry `sum(w) = 2`. The carried scan starts
+        # from `x` and squares each carry before adding a norm. Only `x` carries gradients in either case.
+        reference = rematerialization_reference(CASES_BY_ID["rematerialization_offloaded_known_scan"])
+        self.assertEqual(reference["output"], ((40.0,),))
+        self.assertEqual(reference["jvp"], ((8.0,),))
+        self.assertEqual(reference["x_gradient"], ((8.0,) * 6,))
+        self.assertEqual(reference["residual_element_counts"], ((2.0, 6.0),))
+        reference = rematerialization_reference(CASES_BY_ID["rematerialization_offloaded_carried_scan"])
+        self.assertEqual(reference["output"], ((227.0,),))
+        self.assertEqual(reference["jvp"], ((164.0,),))
+        self.assertEqual(reference["x_gradient"], ((35.0, 164.0, 35.0, 12.0, 35.0, 164.0),))
+        self.assertEqual(reference["w_gradient"], ((0.0,) * 6,))
+        self.assertEqual(reference["layers_gradient"], ((0.0,) * 8,))
+        self.assertEqual(reference["residual_element_counts"], ((2.0, 6.0, 8.0),))
 
     def test_build_rematerialization_jax(self) -> None:
         # Every JAX observation, including the saved residuals of JAX 0.12.0.1, matches its analytic reference, and

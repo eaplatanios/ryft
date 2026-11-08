@@ -466,7 +466,13 @@ pub(crate) mod tests {
     #[test]
     fn test_kernel_aot_error_roundtrip() {
         let core = Error::from(KernelAotError::from(Error::from(ryft_core::ProgramError::PoisonedValue)));
-        assert!(matches!(core, Error::Core(ryft_core::Error::Program(ryft_core::ProgramError::PoisonedValue))));
+        assert!(matches!(
+            core,
+            Error::Core(core_error) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ryft_core::ProgramError::PoisonedValue),
+            ),
+        ));
 
         let pjrt = Error::from(KernelAotError::from(Error::from(ryft_pjrt::Error::invalid_argument(
             "invalid AOT runtime input",

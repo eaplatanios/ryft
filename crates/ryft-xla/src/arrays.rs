@@ -2789,9 +2789,13 @@ mod tests {
         let sharding = Sharding::new(actual_mesh.clone(), vec![ShardingDimension::sharded(["z"])]).unwrap();
 
         let error = ShardLayout::new(&shape, &mesh, &sharding).unwrap_err();
-        assert!(matches!(&error,
-            Error::Core(CoreError::Sharding(ShardingError::MeshMismatch { expected, actual }))
-                if expected == &expected_mesh && actual == &actual_mesh,
+        assert!(matches!(
+            &error,
+            Error::Core(core_error) if matches!(
+                core_error.as_ref(),
+                CoreError::Sharding(ShardingError::MeshMismatch { expected, actual })
+                    if expected == &expected_mesh && actual == &actual_mesh,
+            ),
         ));
         let expected_message = format!("mesh mismatch; expected `{expected_mesh:?}` but got `{actual_mesh:?}`");
         assert_eq!(error.to_string(), expected_message);
@@ -2810,7 +2814,10 @@ mod tests {
         let error = ShardLayout::new(&shape, &mesh, &sharding).unwrap_err();
         assert!(matches!(
             &error,
-            Error::Core(CoreError::Sharding(ShardingError::ShardingRankMismatch { sharding_rank: 2, array_rank: 1 })),
+            Error::Core(core_error) if matches!(
+                core_error.as_ref(),
+                CoreError::Sharding(ShardingError::ShardingRankMismatch { sharding_rank: 2, array_rank: 1 }),
+            ),
         ));
         assert_eq!(error.to_string(), "sharding rank (2) does not match array rank (1)");
     }

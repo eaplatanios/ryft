@@ -923,8 +923,11 @@ mod tests {
         );
         assert!(matches!(
             module,
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message == "`broadcast` cannot assign bound manual mesh axes to local output dimensions",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "`broadcast` cannot assign bound manual mesh axes to local output dimensions",
+            ),
         ));
     }
 

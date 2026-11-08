@@ -933,7 +933,8 @@ mod tests {
         }
 
         let error = dimension_extent_i64(usize::MAX).unwrap_err();
-        let Error::Core(ryft_core::Error::Type(error)) = error else { unreachable!() };
+        let Error::Core(core_error) = error else { unreachable!() };
+        let ryft_core::Error::Type(error) = *core_error else { unreachable!() };
         assert_eq!(
             error.downcast_custom::<ryft_core::DimensionError>(),
             Some(&ryft_core::DimensionError::ExtentExceedsBackendWidth {
@@ -947,7 +948,8 @@ mod tests {
     fn test_dimension_extent_i32_rejects_out_of_range_values() {
         let value = i32::MAX as usize + 1;
         let error = dimension_extent_i32(value).unwrap_err();
-        let Error::Core(ryft_core::Error::Type(error)) = error else { unreachable!() };
+        let Error::Core(core_error) = error else { unreachable!() };
+        let ryft_core::Error::Type(error) = *core_error else { unreachable!() };
         assert_eq!(
             error.downcast_custom::<ryft_core::DimensionError>(),
             Some(&ryft_core::DimensionError::ExtentExceedsBackendWidth { value, maximum: i32::MAX as usize }),

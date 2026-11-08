@@ -34,7 +34,7 @@ type CoreTracer = Tracer<TracingContext<CoreArray, ArrayOperation<CoreArray>>>;
 type XlaTracer = DomainTracer<Domain<'static>>;
 
 /// Stable identifiers and emitters of the rematerialization cases, in registry order.
-pub(super) const CASES: [(&str, fn() -> Result<DifferentialObservation, Box<dyn Error>>); 14] = [
+pub(super) const CASES: [(&str, fn() -> Result<DifferentialObservation, Box<dyn Error>>); 20] = [
     ("rematerialization_nothing_saveable", emit_nothing_saveable),
     ("rematerialization_everything_saveable", emit_everything_saveable),
     ("rematerialization_dots_saveable", emit_dots_saveable),
@@ -44,10 +44,16 @@ pub(super) const CASES: [(&str, fn() -> Result<DifferentialObservation, Box<dyn 
     ("rematerialization_save_from_both_policies", emit_save_from_both_policies),
     ("rematerialization_save_and_offload_only_these_names", emit_save_and_offload_only_these_names),
     ("rematerialization_dots_saveable_call", emit_dots_saveable_call),
+    ("rematerialization_dots_saveable_composite", emit_dots_saveable_composite),
     ("rematerialization_dots_saveable_condition", emit_dots_saveable_condition),
     ("rematerialization_dots_saveable_scan", emit_dots_saveable_scan),
+    ("rematerialization_dots_saveable_nested_scan", emit_dots_saveable_nested_scan),
+    ("rematerialization_dots_saveable_condition_in_scan", emit_dots_saveable_condition_in_scan),
     ("rematerialization_dots_saveable_known_condition", emit_dots_saveable_known_condition),
     ("rematerialization_dots_saveable_known_scan", emit_dots_saveable_known_scan),
+    ("rematerialization_dots_saveable_known_composite", emit_dots_saveable_known_composite),
+    ("rematerialization_offloaded_known_scan", emit_offloaded_known_scan),
+    ("rematerialization_offloaded_carried_scan", emit_offloaded_carried_scan),
     ("rematerialization_nested_policies", emit_nested_policies),
 ];
 
@@ -84,6 +90,15 @@ fn call_body<V: Dot + Mul>(x: V, w: V) -> Result<V, ProgramError> {
     y.mul(&y)
 }
 
+/// Returns `(y ⊙ y, ẏ ⊙ y + y ⊙ ẏ)` for `y = x · w` and `ẏ = ẋ · w + x · ẇ`, the forward mode rule of the composite
+/// of [`call_body`] in the composite case.
+fn call_jvp<V: Add + Dot + Mul>(x: V, w: V, x_tangent: V, w_tangent: V) -> Result<(V, V), ProgramError> {
+    let y = x.dot(&w, &matrix_multiplication())?;
+    let y_tangent = x_tangent.dot(&w, &matrix_multiplication())?.add(&x.dot(&w_tangent, &matrix_multiplication())?)?;
+    let z_tangent = y_tangent.mul(&y)?.add(&y.mul(&y_tangent)?)?;
+    Ok((y.mul(&y)?, z_tangent))
+}
+
 /// Returns `t ⊙ t` for `t = y · y`, the `true` branch of the condition case.
 fn condition_true_branch<V: Dot + Mul>(y: V) -> Result<V, ProgramError> {
     let t = y.dot(&y, &matrix_multiplication())?;
@@ -107,6 +122,28 @@ fn scan_step<V: Dot + Mul>(hidden: V, layer: V) -> Result<V, ProgramError> {
     t.mul(&t)
 }
 
+/// Returns `broadcast(layer : layer)` of shape `[2, 2]`, which expands the compact sum of the squares of the entries
+/// of `layer` (i.e., the dot product that contracts both of its dimensions), the `true` branch of the condition in the
+/// condition-in-scan case.
+fn expanded_layer_norm<V: Broadcast + Dot + Typed<Type = ArrayType>>(layer: V) -> Result<V, ProgramError> {
+    let dimensions = DotDimensionNumbers::new(vec![0, 1], vec![0, 1], vec![], vec![]);
+    layer.dot(&layer, &dimensions)?.broadcast_to(StaticShape::new(vec![2, 2]))
+}
+
+/// Returns `e + e` for `e = broadcast(layer : layer)`, the `false` branch of the condition in the condition-in-scan
+/// case.
+fn doubled_expanded_layer_norm<V: Add + Broadcast + Dot + Typed<Type = ArrayType>>(
+    layer: V,
+) -> Result<V, ProgramError> {
+    let e = expanded_layer_norm(layer)?;
+    e.add(&e)
+}
+
+/// Returns `h ⊙ h + e`, one iteration of the condition-in-scan case for the output `e` of its condition.
+fn condition_in_scan_step<V: Add + Mul>(hidden: V, e: V) -> Result<V, ProgramError> {
+    hidden.mul(&hidden)?.add(&e)
+}
+
 /// Returns `broadcast(c)` of shape `[3, 2, 2]`, which expands the compact value `c: f32[2, 2]` of the cases whose
 /// regions carry no gradients.
 fn expand<V: Broadcast + Typed<Type = ArrayType>>(c: V) -> Result<V, ProgramError> {
@@ -127,6 +164,21 @@ fn known_condition_false_branch<V: Add + Broadcast + Dot + Typed<Type = ArrayTyp
 /// Returns `h + broadcast(layer · layer)`, one iteration of the known scan case.
 fn known_scan_step<V: Add + Broadcast + Dot + Typed<Type = ArrayType>>(hidden: V, layer: V) -> Result<V, ProgramError> {
     hidden.add(&expand(layer.dot(&layer, &matrix_multiplication())?)?)
+}
+
+/// Returns `broadcast(tag(layer : layer, "compact"))` of shape `[2, 3]`, expanding a scalar saved by the offloading
+/// policy of the storage scan cases.
+fn expanded_compact_norm<V: Broadcast + Dot + Tag + Typed<Type = ArrayType>>(layer: V) -> Result<V, ProgramError> {
+    let dimensions = DotDimensionNumbers::new(vec![0, 1], vec![0, 1], vec![], vec![]);
+    layer.dot(&layer, &dimensions)?.tag("compact")?.broadcast_to(StaticShape::new(vec![2, 3]))
+}
+
+/// Returns twice [`expanded_compact_norm`], the false branch of the carried storage scan case.
+fn doubled_expanded_compact_norm<V: Add + Broadcast + Dot + Tag + Typed<Type = ArrayType>>(
+    layer: V,
+) -> Result<V, ProgramError> {
+    let e = expanded_compact_norm(layer)?;
+    e.add(&e)
 }
 
 /// Returns `(x · w) ⊙ Σₖ eₖ` for the expansion `e` of the cases whose regions carry no gradients.
@@ -365,6 +417,33 @@ fn emit_dots_saveable_call() -> Result<DifferentialObservation, Box<dyn Error>> 
     )
 }
 
+/// Emits a rematerialized function with [`DotsSavable`] that returns `z ⊙ z` for `z` computed by a composite of
+/// [`call_body`] with the forward mode rule [`call_jvp`], which is the analogue of a `jax.custom_jvp` function called
+/// inside `jax.checkpoint`. Differentiation replaces the call with its rule, whose dot product the policy saves.
+fn emit_dots_saveable_composite() -> Result<DifferentialObservation, Box<dyn Error>> {
+    let core_call = composite(|(x, w): (CoreTracer, CoreTracer)| call_body(x, w))
+        .with_jvp(|(x, w), (x_tangent, w_tangent)| call_jvp(x, w, x_tangent, w_tangent));
+    let staged_call = composite(|(x, w): (XlaTracer, XlaTracer)| Ok(call_body(project(x)?, project(w)?)?.into_value()))
+        .with_jvp(|(x, w), (x_tangent, w_tangent)| {
+            let (z, z_tangent) = call_jvp(project(x)?, project(w)?, project(x_tangent)?, project(w_tangent)?)?;
+            Ok((z.into_value(), z_tangent.into_value()))
+        });
+    emit_case!(
+        "rematerialization_dots_saveable_composite",
+        rematerialize(move |(x, w): (CoreTracer, CoreTracer)| {
+            let z = core_call.call((x, w))?;
+            z.mul(&z)
+        })
+        .with_policy(DotsSavable),
+        rematerialize(move |(x, w): (XlaTracer, XlaTracer)| {
+            let z = project(staged_call.call((x, w))?)?;
+            Ok(z.mul(&z)?.into_value())
+        })
+        .with_policy(DotsSavable),
+        array(&[2, 2], &[1.0, -1.0, 2.0, 1.0])?,
+    )
+}
+
 /// Emits a rematerialized function with [`DotsSavable`] that applies a condition to `y = x · w`, whose `true` branch
 /// computes a dot product and whose `false` branch does not. The predicate, `sum(x) > 0`, holds at `x` and fails at
 /// `-x`, whose values are recorded under names that start with `false_branch_`.
@@ -446,6 +525,155 @@ fn emit_dots_saveable_scan() -> Result<DifferentialObservation, Box<dyn Error>> 
     Ok(DifferentialObservation {
         schema: SCHEMA,
         case_id: "rematerialization_dots_saveable_scan".into(),
+        observations,
+        staging: None,
+        stablehlo: Some(stablehlo!(staged, (x, w, layers), seed)),
+    })
+}
+
+/// Emits a rematerialized function with [`DotsSavable`] that computes the scan case with nested scans. An outer scan
+/// over the two stacked `layers` applies an inner scan of [`scan_step`] over the single-layer stack `[layer]` on each
+/// iteration, starting from `y = x · w`, so its values equal those of the scan case. The carry chain of the outer
+/// scan splits the inner scan, so the policy saves the stacked dot products and recomputes the carries, rather than
+/// also stacking the final carries of the inner scan and saving the carries that the outer scan recomputes, as JAX
+/// does.
+fn emit_dots_saveable_nested_scan() -> Result<DifferentialObservation, Box<dyn Error>> {
+    let core = rematerialize(|(x, w, layers): (CoreTracer, CoreTracer, CoreTracer)| {
+        let y = x.dot(&w, &matrix_multiplication())?;
+        let (hidden, ()) = scan(
+            |_, hidden, layer| {
+                let layer = layer.broadcast_to(StaticShape::new(vec![1, 2, 2]))?;
+                let (hidden, ()) =
+                    scan(|_, hidden, layer| Ok((scan_step(hidden, layer)?, ())), hidden, layer, ScanOptions::new())?;
+                Ok((hidden, ()))
+            },
+            y,
+            layers,
+            ScanOptions::new(),
+        )?;
+        Ok(hidden)
+    })
+    .with_policy(DotsSavable);
+    let staged = rematerialize(|(x, w, layers): (XlaTracer, XlaTracer, XlaTracer)| {
+        let y = project(x)?.dot(&project(w)?, &matrix_multiplication())?;
+        let (hidden, ()) = scan(
+            |_, hidden, layer| {
+                let layer = ValueProjection::<ArrayType>::into_projected(layer)?;
+                let (hidden, ()) = scan(
+                    |_, hidden, layer| {
+                        let hidden = ValueProjection::<ArrayType>::into_projected(hidden)?;
+                        let layer = ValueProjection::<ArrayType>::into_projected(layer)?;
+                        Ok((scan_step(hidden, layer)?.into_value(), ()))
+                    },
+                    hidden,
+                    layer.broadcast_to(StaticShape::new(vec![1, 2, 2]))?.into_value(),
+                    ScanOptions::new(),
+                )?;
+                Ok((hidden, ()))
+            },
+            y.into_value(),
+            layers,
+            ScanOptions::new(),
+        )?;
+        Ok(hidden)
+    })
+    .with_policy(DotsSavable);
+    let [x, w, x_tangent, w_tangent] = inputs()?;
+    let layers = array(&[2, 2, 2], &[1.0, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0])?;
+    let layers_tangent = array(&[2, 2, 2], &[0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0])?;
+    let seed = array(&[2, 2], &[1.0, -1.0, 2.0, 1.0])?;
+    let mut observations = BTreeMap::new();
+    observe!(observations, "", core, (x, w, layers), (x_tangent, w_tangent, layers_tangent), seed.clone());
+    let residuals = saved_residuals(
+        |(x, w, layers): (CoreTracer, CoreTracer, CoreTracer)| core.call((x, w, layers)),
+        (x.r#type().into_owned(), w.r#type().into_owned(), layers.r#type().into_owned()),
+    )?;
+    record_residuals(&mut observations, &residuals)?;
+    Ok(DifferentialObservation {
+        schema: SCHEMA,
+        case_id: "rematerialization_dots_saveable_nested_scan".into(),
+        observations,
+        staging: None,
+        stablehlo: Some(stablehlo!(staged, (x, w, layers), seed)),
+    })
+}
+
+/// Emits a rematerialized function with [`DotsSavable`] that scans [`condition_in_scan_step`] over two stacked
+/// `layers`, starting from `y = x · w`. On each iteration, a condition on `sum(h) > 0` (refer to
+/// [`condition_predicate`]) computes `e` from the layer without its gradient, as [`expanded_layer_norm`] or
+/// [`doubled_expanded_layer_norm`]. The carry chain splits the condition, so the policy saves the stacked compact dot
+/// products of the branches that run, rather than the expanded outputs of the condition, and the residual program
+/// recomputes the carries and the predicates, as JAX does. Both branches run at `-x`, whose values are recorded under names that start with
+/// `false_branch_`.
+fn emit_dots_saveable_condition_in_scan() -> Result<DifferentialObservation, Box<dyn Error>> {
+    let core = rematerialize(|(x, w, layers): (CoreTracer, CoreTracer, CoreTracer)| {
+        let y = x.dot(&w, &matrix_multiplication())?;
+        let (hidden, ()) = scan(
+            |_, hidden, layer| {
+                let layer = layer.stop_gradient()?;
+                let e =
+                    condition_predicate(&hidden)?.condition(expanded_layer_norm, doubled_expanded_layer_norm, layer)?;
+                Ok((condition_in_scan_step(hidden, e)?, ()))
+            },
+            y,
+            layers,
+            ScanOptions::new(),
+        )?;
+        Ok(hidden)
+    })
+    .with_policy(DotsSavable);
+    let staged = rematerialize(|(x, w, layers): (XlaTracer, XlaTracer, XlaTracer)| {
+        let y = project(x)?.dot(&project(w)?, &matrix_multiplication())?;
+        let (hidden, ()) = scan(
+            |_, hidden, layer| {
+                let hidden = ValueProjection::<ArrayType>::into_projected(hidden)?;
+                let layer = ValueProjection::<ArrayType>::into_projected(layer)?.stop_gradient()?;
+                let e = condition_predicate(&hidden)?.into_value().condition(
+                    |layer| Ok(expanded_layer_norm(ValueProjection::<ArrayType>::into_projected(layer)?)?.into_value()),
+                    |layer| {
+                        Ok(doubled_expanded_layer_norm(ValueProjection::<ArrayType>::into_projected(layer)?)?
+                            .into_value())
+                    },
+                    layer.into_value(),
+                )?;
+                let e = ValueProjection::<ArrayType>::into_projected(e)?;
+                Ok((condition_in_scan_step(hidden, e)?.into_value(), ()))
+            },
+            y.into_value(),
+            layers,
+            ScanOptions::new(),
+        )?;
+        Ok(hidden)
+    })
+    .with_policy(DotsSavable);
+    let [x, w, x_tangent, w_tangent] = inputs()?;
+    let negated = array(&[2, 3], &[-1.0, -2.0, 1.0, 0.0, -1.0, -2.0])?;
+    let layers = array(&[2, 2, 2], &[1.0, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0])?;
+    let layers_tangent = array(&[2, 2, 2], &[0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0])?;
+    let seed = array(&[2, 2], &[1.0, -1.0, 2.0, 1.0])?;
+    let mut observations = BTreeMap::new();
+    let tangents = (x_tangent.clone(), w_tangent.clone(), layers_tangent.clone());
+    observe!(observations, "", core, (x, w, layers), (tangents.0, tangents.1, tangents.2), seed.clone());
+    {
+        // The gradients are named after the input identifiers, so the negated input is bound to `x` as well.
+        let x = negated;
+        observe!(
+            observations,
+            "false_branch_",
+            core,
+            (x, w, layers),
+            (x_tangent, w_tangent, layers_tangent),
+            seed.clone()
+        );
+    }
+    let residuals = saved_residuals(
+        |(x, w, layers): (CoreTracer, CoreTracer, CoreTracer)| core.call((x, w, layers)),
+        (x.r#type().into_owned(), w.r#type().into_owned(), layers.r#type().into_owned()),
+    )?;
+    record_residuals(&mut observations, &residuals)?;
+    Ok(DifferentialObservation {
+        schema: SCHEMA,
+        case_id: "rematerialization_dots_saveable_condition_in_scan".into(),
         observations,
         staging: None,
         stablehlo: Some(stablehlo!(staged, (x, w, layers), seed)),
@@ -551,6 +779,134 @@ fn emit_dots_saveable_known_scan() -> Result<DifferentialObservation, Box<dyn Er
         staging: None,
         stablehlo: Some(stablehlo!(staged, (x, w, layers), seed)),
     })
+}
+
+/// Emits a rematerialized function with [`DotsSavable`] whose output [`known_region_output`] reads the output of a
+/// composite call whose input carries no gradient. The call expands the compact `wᵀ · w` into `f32[3, 2, 2]` (refer to
+/// [`known_condition_true_branch`]). The policy classifies the call itself, which is not a dot product, so it saves
+/// neither the compact value nor the expansion, and the backward pass replays the whole call from `w`, as JAX does for
+/// `custom_jvp_call`.
+fn emit_dots_saveable_known_composite() -> Result<DifferentialObservation, Box<dyn Error>> {
+    let core_call = composite(|w: CoreTracer| known_condition_true_branch(w));
+    let staged_call = composite(|w: XlaTracer| Ok(known_condition_true_branch(project(w)?)?.into_value()));
+    emit_case!(
+        "rematerialization_dots_saveable_known_composite",
+        rematerialize(move |(x, w): (CoreTracer, CoreTracer)| {
+            let e = core_call.call(w.stop_gradient()?)?;
+            known_region_output(x, w, e)
+        })
+        .with_policy(DotsSavable),
+        rematerialize(move |(x, w): (XlaTracer, XlaTracer)| {
+            let (x, w) = (project(x)?, project(w)?);
+            let e = project(staged_call.call(w.stop_gradient()?.into_value())?)?;
+            Ok(known_region_output(x, w, e)?.into_value())
+        })
+        .with_policy(DotsSavable),
+        array(&[2, 2], &[1.0, -1.0, 2.0, 1.0])?,
+    )
+}
+
+/// Emits the observations and staged gradient of a scan that saves its scalar layer norms through a storage, rather
+/// than saving their expanded arrays. The known scan starts from `broadcast(sum(w))` and adds the expansions. The
+/// carried scan starts from `x`, squares its carry before adding each expansion, and computes each norm inside a
+/// condition on the sign of the layer's sum. Both return `sum(x ⊙ h)` and stop gradients of `w` and `layers`.
+fn emit_offloaded_scan(case_id: &'static str, carried: bool) -> Result<DifferentialObservation, Box<dyn Error>> {
+    let policy = SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["compact"], Memory::Host { pinned: true })?;
+    let core = rematerialize(move |(x, w, layers): (CoreTracer, CoreTracer, CoreTracer)| {
+        let (w, layers) = (w.stop_gradient()?, layers.stop_gradient()?);
+        let initial = if carried {
+            x.clone()
+        } else {
+            w.reduce(&[0, 1], ReductionKind::Sum)?.broadcast_to(StaticShape::new(vec![2, 3]))?
+        };
+        let (hidden, ()) = scan(
+            move |_, hidden, layer| {
+                let e = if carried {
+                    condition_predicate(&layer)?.condition(
+                        expanded_compact_norm,
+                        doubled_expanded_compact_norm,
+                        layer,
+                    )?
+                } else {
+                    expanded_compact_norm(layer)?
+                };
+                let hidden = if carried { hidden.mul(&hidden)? } else { hidden };
+                Ok((hidden.add(&e)?, ()))
+            },
+            initial,
+            layers,
+            ScanOptions::new(),
+        )?;
+        x.mul(&hidden)?.reduce(&[0, 1], ReductionKind::Sum)
+    })
+    .with_policy(policy.clone());
+    let staged = rematerialize(move |(x, w, layers): (XlaTracer, XlaTracer, XlaTracer)| {
+        let (x, w, layers) = (project(x)?, project(w)?.stop_gradient()?, project(layers)?.stop_gradient()?);
+        let initial = if carried {
+            x.clone()
+        } else {
+            w.reduce(&[0, 1], ReductionKind::Sum)?.broadcast_to(StaticShape::new(vec![2, 3]))?
+        };
+        let (hidden, ()) = scan(
+            move |_, hidden, layer| {
+                let hidden = ValueProjection::<ArrayType>::into_projected(hidden)?;
+                let layer = ValueProjection::<ArrayType>::into_projected(layer)?;
+                let e = if carried {
+                    let e = condition_predicate(&layer)?.into_value().condition(
+                        |layer| {
+                            Ok(expanded_compact_norm(ValueProjection::<ArrayType>::into_projected(layer)?)?
+                                .into_value())
+                        },
+                        |layer| {
+                            Ok(doubled_expanded_compact_norm(ValueProjection::<ArrayType>::into_projected(layer)?)?
+                                .into_value())
+                        },
+                        layer.into_value(),
+                    )?;
+                    ValueProjection::<ArrayType>::into_projected(e)?
+                } else {
+                    expanded_compact_norm(layer)?
+                };
+                let hidden = if carried { hidden.mul(&hidden)? } else { hidden };
+                Ok((hidden.add(&e)?.into_value(), ()))
+            },
+            initial.into_value(),
+            layers.into_value(),
+            ScanOptions::new(),
+        )?;
+        Ok(x.mul(&project(hidden)?)?.reduce(&[0, 1], ReductionKind::Sum)?.into_value())
+    })
+    .with_policy(policy);
+    let [x, w, x_tangent, w_tangent] = inputs()?;
+    let layers = array(&[2, 2, 2], &[1.0, 0.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0])?;
+    let layers_tangent = array(&[2, 2, 2], &[0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, -1.0])?;
+    let seed = array(&[], &[1.0])?;
+    let mut observations = BTreeMap::new();
+    observe!(observations, "", core, (x, w, layers), (x_tangent, w_tangent, layers_tangent), seed.clone(),);
+    let residuals = saved_residuals(
+        |(x, w, layers): (CoreTracer, CoreTracer, CoreTracer)| core.call((x, w, layers)),
+        (x.r#type().into_owned(), w.r#type().into_owned(), layers.r#type().into_owned()),
+    )?;
+    record_residuals(&mut observations, &residuals)?;
+    Ok(DifferentialObservation {
+        schema: SCHEMA,
+        case_id: case_id.into(),
+        observations,
+        staging: None,
+        stablehlo: Some(stablehlo!(staged, (x, w, layers), seed)),
+    })
+}
+
+/// Emits the all-known scan of [`emit_offloaded_scan`], whose recomputation restores the saved scalar on each
+/// iteration instead of retaining its final expanded carry.
+fn emit_offloaded_known_scan() -> Result<DifferentialObservation, Box<dyn Error>> {
+    emit_offloaded_scan("rematerialization_offloaded_known_scan", false)
+}
+
+/// Emits the carried scan of [`emit_offloaded_scan`], which saves each compact scalar once even when residual work
+/// reads both the scan's final carry and its interior carries.
+fn emit_offloaded_carried_scan() -> Result<DifferentialObservation, Box<dyn Error>> {
+    emit_offloaded_scan("rematerialization_offloaded_carried_scan", true)
 }
 
 /// Emits a rematerialized function with [`SaveOnlyTheseNames`] selecting the `square` tag that returns `v ⊙ v` for the

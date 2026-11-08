@@ -652,7 +652,6 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
 
-    use crate::Error;
     use crate::experimental::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options, test_vector_type,
     };
@@ -663,7 +662,7 @@ mod tests {
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
-        Array, CompiledFunction, FromPjrt, Options, Session, Value, compile, compile_statefully,
+        Array, CompiledFunction, Error, FromPjrt, Options, Session, Value, compile, compile_statefully,
         to_mlir_module_for_program,
     };
 
@@ -812,23 +811,32 @@ mod tests {
             "higher-order operation `scan` must be stored directly in the enclosing backend operation family";
         assert!(matches!(
             ScanOperation::<ArrayType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })))
-                if message == expected_message,
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == expected_message,
+            ),
         ));
 
         // An array IR scan needs exactly one body region.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
         assert!(matches!(
             ScanOperation::<ArrayIrType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                if message == "operation `scan` declares 1 region slots but 0 regions were attached",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message == "operation `scan` declares 1 region slots but 0 regions were attached",
+            ),
         ));
 
         // It also needs one input per carry and per stacked input.
         let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(vec![body.clone()]);
         assert!(matches!(
             ScanOperation::<ArrayIrType>::new(1, 3).lower(&mut lowerer, &[], &[], &[]),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }))),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+            ),
         ));
 
         // A dynamic length without an upper bound leaves no physical extent at which to allocate the stacked outputs.
@@ -973,8 +981,11 @@ mod tests {
             "control-flow region lowering advanced the `ordered_io` token, which the region does not thread";
         assert!(matches!(
             lower(EffectClasses::NONE),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::MalformedProgram(message))))
-                if message == expected_message,
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message == expected_message,
+            ),
         ));
     }
 
@@ -1928,8 +1939,11 @@ mod tests {
         assert!(staged);
         assert!(matches!(
             error,
-            Error::Core(ryft_core::Error::Program(ProgramError::Type(TypeError::Invalid { message })))
-                if message == "`dynamic_slice` size 1 is out of bounds for axis 0 with size 0",
+            Error::Core(core_error) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::Type(TypeError::Invalid { message }))
+                    if *message == "`dynamic_slice` size 1 is out of bounds for axis 0 with size 0",
+            ),
         ));
     }
 

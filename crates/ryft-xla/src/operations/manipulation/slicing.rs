@@ -1219,7 +1219,8 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(bound + 1)).unwrap());
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
         let error = dynamic_constructor_types("one_like", 1, &[output_type.into()]).unwrap_err();
-        let Error::Core(ryft_core::Error::Type(error)) = error else { unreachable!() };
+        let Error::Core(core_error) = error else { unreachable!() };
+        let ryft_core::Error::Type(error) = *core_error else { unreachable!() };
         assert_eq!(
             error.downcast_custom::<ryft_core::DimensionError>(),
             Some(&ryft_core::DimensionError::ExtentExceedsBackendWidth { value: bound, maximum: i32::MAX as usize }),

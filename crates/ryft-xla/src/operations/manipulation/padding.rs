@@ -376,7 +376,10 @@ mod tests {
                 location,
             )
             .unwrap_err(),
-            Error::Core(ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })),
+            Error::Core(core_error) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 }),
+            ),
         ));
         // Interior padding is unobservable on a one-element axis, so it need not fit the native attribute type.
         let results = lower_pad_to_mlir(

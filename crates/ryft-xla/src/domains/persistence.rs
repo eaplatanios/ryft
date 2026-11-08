@@ -1741,7 +1741,10 @@ mod tests {
         // A restored program owns the complete declaration contract, including the hidden capture prefix.
         assert!(matches!(
             domain.execute(&restored, vec![Value::Array(capture.clone())]),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }))),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
+            ),
         ));
         let wrong_type = f64_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         for index in 0..2 {
@@ -1754,8 +1757,11 @@ mod tests {
             inputs[index] = Value::Array(wrong_type.clone());
             assert!(matches!(
                 domain.execute(&restored, inputs),
-                Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
-                    if message == expected,
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                        if *message == expected,
+                ),
             ));
         }
         let outputs = domain.execute(&restored, vec![Value::Array(capture), Value::Array(input)]).unwrap();
@@ -1970,10 +1976,13 @@ mod tests {
             consumer(CompilationArtifactExchangePolicy::RequireSharing { timeout: Duration::from_secs(5) });
         assert!(matches!(
             staged.lower(&required_consumer).unwrap().compile(&required_consumer),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidArgument { message })))
-                if message == "compilation artifact exchange requirement was not satisfied: received compilation \
-                               artifact is incompatible: incompatible XLA executable: cached executable has \
-                               incompatible donation flags",
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                    if *message == "compilation artifact exchange requirement was not satisfied: received compilation \
+                        artifact is incompatible: incompatible XLA executable: cached executable has \
+                        incompatible donation flags",
+            ),
         ));
         assert_eq!(required_consumer.compilation_context().statistics().compilations, 0);
     }

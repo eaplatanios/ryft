@@ -820,6 +820,23 @@ impl OperationCodeGenerator {
                 )))
             }
         });
+
+        // Splits on residual demand follow the same delegation as partial evaluation, and every other variant keeps
+        // its applications whole. The bound of the trait function is repeated here, so that the dispatcher states it
+        // on the function rather than on the implementation (which would make the enum's partial evaluation depend on
+        // itself).
+        let split_arms = self.variants.iter().map(|variant| {
+            if delegates(variant) {
+                let payload_type = &variant.program_payload_type;
+                let receiver = variant.receiver();
+                variant.arm(quote! {
+                    <#payload_type as #ryft::PartiallyEvaluatableOperation<__Context>>::
+                        split_on_residual_demand(#receiver, context, driver, inputs, demanded_outputs)
+                })
+            } else {
+                variant.wildcard_arm(quote!(::std::result::Result::Ok(::std::option::Option::None)))
+            }
+        });
         let (impl_generics, _, where_clause) = generics.split_for_impl();
         quote! {
             #[automatically_derived]
@@ -832,6 +849,32 @@ impl OperationCodeGenerator {
                     inputs: &[#value_type],
                 ) -> ::std::result::Result<::std::vec::Vec<#value_type>, #ryft::ProgramError> {
                     match self { #(#arms)* }
+                }
+
+                #[inline]
+                fn split_on_residual_demand<__D: #ryft::PartialEvaluationDriver<__Context>>(
+                    &self,
+                    context: &#ryft::PartialEvaluationContext<__Context>,
+                    driver: &__D,
+                    inputs: &[#value_type],
+                    demanded_outputs: &[bool],
+                ) -> ::std::result::Result<
+                    ::std::option::Option<
+                        #ryft::ResidualDemandSplit<<__Context as #ryft::Domain>::Value>
+                    >,
+                    #ryft::ProgramError,
+                >
+                where
+                    <__Context as #ryft::Domain>::Operation: #ryft::PartiallyEvaluatableOperation<
+                        #ryft::TracingContext<
+                            <__Context as #ryft::Domain>::Constant,
+                            <__Context as #ryft::Domain>::Operation,
+                        >,
+                    >,
+                {
+                    // Enums without delegating variants read none of the parameters.
+                    let _ = (context, driver, inputs, demanded_outputs);
+                    match self { #(#split_arms)* }
                 }
             }
         }
@@ -3473,6 +3516,7 @@ mod tests {
                     >,
                     AddOperation<ArrayIrType>: ryft::PartiallyEvaluatableOperation<__Context>,
                 {
+                    #[inline]
                     fn partially_evaluate<__D: ryft::PartialEvaluationDriver<__Context>>(
                         &self,
                         context: &ryft::PartialEvaluationContext<__Context>,
@@ -3492,6 +3536,42 @@ mod tests {
                             },
                             Self::Extension(..) => {
                                 context.fold_or_residualize(self.clone(), driver.region_programs(), inputs)
+                            },
+                        }
+                    }
+
+                    #[inline]
+                    fn split_on_residual_demand<__D: ryft::PartialEvaluationDriver<__Context>>(
+                        &self,
+                        context: &ryft::PartialEvaluationContext<__Context>,
+                        driver: &__D,
+                        inputs: &[ryft::PartialEvaluationValue<<__Context as ryft::Domain>::Value>],
+                        demanded_outputs: &[bool],
+                    ) -> ::std::result::Result<
+                        ::std::option::Option<
+                            ryft::ResidualDemandSplit<<__Context as ryft::Domain>::Value>
+                        >,
+                        ryft::ProgramError,
+                    >
+                    where
+                        <__Context as ryft::Domain>::Operation: ryft::PartiallyEvaluatableOperation<
+                            ryft::TracingContext<
+                                <__Context as ryft::Domain>::Constant,
+                                <__Context as ryft::Domain>::Operation,
+                            >,
+                        >,
+                    {
+                        let _ = (context, driver, inputs, demanded_outputs);
+                        match self {
+                            Self::Add(operation) => {
+                                <AddOperation<ArrayIrType> as ryft::PartiallyEvaluatableOperation<__Context>>::
+                                    split_on_residual_demand(operation, context, driver, inputs, demanded_outputs)
+                            },
+                            Self::Array(..) => {
+                                ::std::result::Result::Ok(::std::option::Option::None)
+                            },
+                            Self::Extension(..) => {
+                                ::std::result::Result::Ok(::std::option::Option::None)
                             },
                         }
                     }

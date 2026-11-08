@@ -107,7 +107,7 @@ impl LowerableOperation for ParallelBroadcastOperation {
                             size: mesh.axes()[axis].size(),
                             axis,
                             mesh,
-                            checks_manual_variation: boundary.check_manual_variation(),
+                            checks_manual_variation: boundary.checks_manual_variation(),
                         },
                     )
                 })

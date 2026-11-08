@@ -12,12 +12,13 @@ use crate::{ArrayError, CompilationError, ExecutionError, LoweringError, Runtime
 /// Errors returned by array preparation, tracing, lowering, compilation, and execution in `ryft-xla`. XLA-owned
 /// conditions are grouped by their owning contracts, while foreign errors keep their canonical carriers. Public entry
 /// points return this type even when their failure is owned by a more specific group. Batching and differentiation
-/// errors first convert through [`ProgramError`], preserving normalized core payloads. Array errors are boxed to keep
-/// this carrier compact. Conversion from [`ArrayError`] allocates its box.
+/// errors first convert through [`ProgramError`], preserving normalized core payloads. Core and array errors are
+/// boxed to keep this carrier compact. Converting either payload allocates one box on the error path, and cloning the
+/// error clones its boxed payload.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
-    Core(#[from] CoreError),
+    Core(Box<CoreError>),
 
     #[error(transparent)]
     Pjrt(#[from] PjrtError),
@@ -70,6 +71,13 @@ impl Error {
     }
 }
 
+impl From<CoreError> for Error {
+    #[inline]
+    fn from(error: CoreError) -> Self {
+        Self::Core(Box::new(error))
+    }
+}
+
 impl From<ArrayError> for Error {
     #[inline]
     fn from(error: ArrayError) -> Self {
@@ -80,84 +88,84 @@ impl From<ArrayError> for Error {
 impl From<ParameterError> for Error {
     #[inline]
     fn from(error: ParameterError) -> Self {
-        Self::Core(error.into())
+        Self::from(CoreError::from(error))
     }
 }
 
 impl From<DataTypeError> for Error {
     #[inline]
     fn from(error: DataTypeError) -> Self {
-        Self::Core(error.into())
+        Self::from(CoreError::from(error))
     }
 }
 
 impl From<LayoutError> for Error {
     #[inline]
     fn from(error: LayoutError) -> Self {
-        Self::Core(error.into())
+        Self::from(CoreError::from(error))
     }
 }
 
 impl From<BroadcastingError> for Error {
     #[inline]
     fn from(error: BroadcastingError) -> Self {
-        Self::Core(error.into())
+        Self::from(CoreError::from(error))
     }
 }
 
 impl From<ShardingError> for Error {
     #[inline]
     fn from(error: ShardingError) -> Self {
-        Self::Core(error.into())
+        Self::from(CoreError::from(error))
     }
 }
 
 impl From<AxisError> for Error {
     #[inline]
     fn from(error: AxisError) -> Self {
-        Self::Core(error.into())
+        Self::from(CoreError::from(error))
     }
 }
 
 impl From<TypeError> for Error {
     #[inline]
     fn from(error: TypeError) -> Self {
-        Self::Core(error.into())
+        Self::from(CoreError::from(error))
     }
 }
 
 impl From<DimensionError> for Error {
     #[inline]
     fn from(error: DimensionError) -> Self {
-        Self::Core(TypeError::from(error).into())
+        Self::from(TypeError::from(error))
     }
 }
 
 impl From<ReferenceError> for Error {
     #[inline]
     fn from(error: ReferenceError) -> Self {
-        Self::Core(error.into())
+        Self::from(CoreError::from(error))
     }
 }
 
 impl From<ProgramError> for Error {
     #[inline]
     fn from(error: ProgramError) -> Self {
-        Self::Core(error.into())
+        Self::from(CoreError::from(error))
     }
 }
 
 impl From<BatchingError> for Error {
     #[inline]
     fn from(error: BatchingError) -> Self {
-        Self::Core(ProgramError::from(error).into())
+        Self::from(ProgramError::from(error))
     }
 }
 
 impl From<DifferentiationError> for Error {
     #[inline]
     fn from(error: DifferentiationError) -> Self {
-        Self::Core(ProgramError::from(error).into())
+        Self::from(ProgramError::from(error))
     }
 }
 
@@ -178,6 +186,12 @@ mod tests {
     use crate::kernels::{DistributedKernelError, KernelAotError, KernelTuningError};
 
     use super::*;
+
+    #[test]
+    fn test_error_size() {
+        // Keep the shared carrier below Clippy's default large-error threshold.
+        assert!(size_of::<Error>() < 128, "XLA error occupies {} bytes", size_of::<Error>());
+    }
 
     #[test]
     fn test_error_custom() {
@@ -230,34 +244,74 @@ mod tests {
 
     #[test]
     fn test_error_from_core_errors() {
+        let source = ParameterError::MissingParameters { expected_count: 1, paths: None };
+        let original = CoreError::from(BroadcastingError::ParameterError(source.clone()));
+        let message = original.to_string();
+        let debug = format!("Core({original:?})");
+        let boxed = Error::from(original.clone());
+        let Error::Core(inner) = &boxed else { unreachable!() };
+        assert_eq!(inner.as_ref(), &original);
+        assert_eq!(boxed.to_string(), message);
+        assert_eq!(format!("{boxed:?}"), debug);
+        assert_eq!(boxed.source().unwrap().downcast_ref::<ParameterError>(), Some(&source));
+
+        let cloned = boxed.clone();
+        let Error::Core(cloned_inner) = &cloned else { unreachable!() };
+        assert_eq!(cloned_inner, inner);
+        assert!(!std::ptr::eq(cloned_inner.as_ref(), inner.as_ref()));
+        assert_eq!(cloned.to_string(), message);
+        assert_eq!(format!("{cloned:?}"), debug);
+        assert_eq!(cloned.source().unwrap().downcast_ref::<ParameterError>(), Some(&source));
+
         let core = Error::from(ProgramError::PoisonedValue);
-        assert!(matches!(core, Error::Core(CoreError::Program(ProgramError::PoisonedValue))));
+        assert!(matches!(
+            &core,
+            Error::Core(core_error) if matches!(
+                core_error.as_ref(),
+                CoreError::Program(ProgramError::PoisonedValue),
+            ),
+        ));
         assert_eq!(core.to_string(), "encountered poisoned value where a live value was required");
         assert_eq!(format!("{core:?}"), "Core(Program(PoisonedValue))");
 
         let reference = Error::from(ReferenceError::Frozen);
-        assert!(matches!(reference, Error::Core(CoreError::Reference(ReferenceError::Frozen))));
+        assert!(matches!(
+            &reference,
+            Error::Core(core_error) if matches!(
+                core_error.as_ref(),
+                CoreError::Reference(ReferenceError::Frozen),
+            ),
+        ));
         assert_eq!(reference.to_string(), "reference is frozen");
 
         let dimension =
             DimensionError::ExtentExceedsBackendWidth { value: i32::MAX as usize + 1, maximum: i32::MAX as usize };
         let error = Error::from(dimension.clone());
-        let Error::Core(CoreError::Type(type_error)) = error else { unreachable!() };
+        let Error::Core(core_error) = error else { unreachable!() };
+        let CoreError::Type(type_error) = *core_error else { unreachable!() };
         assert_eq!(type_error.downcast_custom::<DimensionError>(), Some(&dimension));
 
         let batching = Error::from(BatchingError::EmptyBatch);
-        let Error::Core(CoreError::Program(program)) = batching else { unreachable!() };
+        let Error::Core(core_error) = batching else { unreachable!() };
+        let CoreError::Program(program) = *core_error else { unreachable!() };
         assert_eq!(program.downcast_custom::<BatchingError>(), Some(&BatchingError::EmptyBatch));
 
         let differentiation = Error::from(DifferentiationError::EmptyInput);
-        let Error::Core(CoreError::Program(program)) = differentiation else { unreachable!() };
+        let Error::Core(core_error) = differentiation else { unreachable!() };
+        let CoreError::Program(program) = *core_error else { unreachable!() };
         assert_eq!(program.downcast_custom::<DifferentiationError>(), Some(&DifferentiationError::EmptyInput));
 
         for error in [
             Error::from(BatchingError::Program(ProgramError::PoisonedValue)),
             Error::from(DifferentiationError::Program(ProgramError::PoisonedValue)),
         ] {
-            assert!(matches!(error, Error::Core(CoreError::Program(ProgramError::PoisonedValue))));
+            assert!(matches!(
+                error,
+                Error::Core(core_error) if matches!(
+                    core_error.as_ref(),
+                    CoreError::Program(ProgramError::PoisonedValue),
+                ),
+            ));
         }
     }
 

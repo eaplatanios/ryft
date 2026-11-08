@@ -464,7 +464,10 @@ mod tests {
         let output_types = vec![state_type.into(), ArrayType::new_static(DataType::U32, [3]).into()];
         assert!(matches!(
             operation.lower(&mut lowerer, &inputs, &[], &output_types),
-            Err(Error::Core(ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }))),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+            ),
         ));
     }
 
