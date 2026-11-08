@@ -673,6 +673,13 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
         Ok(id)
     }
 
+    /// Returns every interned callee root of this arena together with the shared callee [`Program`] whose entry region
+    /// it is, in recording order.
+    #[inline]
+    pub(super) fn callee_entries(&self) -> impl '_ + Iterator<Item = (RegionId, &Arc<Program<V, O, Vec<V>, Vec<V>>>)> {
+        self.callees.entries.iter().map(|(id, callee)| (*id, callee))
+    }
+
     /// Returns the shared callee [`Program`] whose entry region is the root `id` of this arena, if `id` is an interned
     /// callee root. Refer to the documentation of [`RegionArenaCallees`] for more information.
     #[inline]
@@ -758,7 +765,9 @@ impl<'r, V: Typed + Parameter, O> IntoIterator for &'r RegionArena<V, O> {
 /// that interns it is replayed or imported (e.g., when a transform replays a cached rule program that calls a named
 /// composite). Each entry holds its callee alive, so the provenance can never refer to a later allocation. Renamed or
 /// rebuilt arenas (e.g., pruned or converted programs) do not inherit these entries, so their roots are copied, while
-/// programs materialized from a region through a builder record the callees that they import again.
+/// programs materialized from a region through a builder record the callees that they import again. Simplification and
+/// entry-boundary filtering are the exception, because they keep the entries of the roots whose complete reachable
+/// contents they carry over unchanged.
 #[derive(Clone)]
 struct RegionArenaCallees<V: Typed + Parameter, O> {
     /// Interned roots and the callee [`Program`]s whose entry regions they are.

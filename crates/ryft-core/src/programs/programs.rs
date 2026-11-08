@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::contexts::Domain;
 use crate::macros::check_count;
@@ -190,6 +191,36 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         }
 
         Ok(Self { input_structure, output_structure, regions, entry, marker: PhantomData })
+    }
+
+    /// Returns this [`Program`], which a rebuild of a source arena produced, with the interned callee roots `callees`
+    /// of that source arena recorded again wherever the rebuild kept the complete reachable contents of the root, so
+    /// that importing this program still interns those callees instead of copying them (refer to
+    /// [`ProgramBuilder::intern_callee`](crate::ProgramBuilder::intern_callee)). Simplification and entry-boundary
+    /// filtering use this, so that the regions of a shared callee called from several programs stay one region once
+    /// those programs are imported into one builder.
+    ///
+    /// # Parameters
+    ///
+    ///   - `callees`: Interned callee roots of the source arena, keyed by their source [`RegionId`]s.
+    ///   - `preserved`: Whether the rebuild kept the complete reachable contents of each source region, in source
+    ///     [`RegionId`] order.
+    ///   - `region_ids`: [`RegionId`] of each source region in this program, or [`None`] for the source regions that
+    ///     the rebuild dropped, in source [`RegionId`] order.
+    fn with_preserved_callees(
+        mut self,
+        callees: Vec<(RegionId, Arc<Program<V, O, Vec<V>, Vec<V>>>)>,
+        preserved: &[bool],
+        region_ids: &[Option<RegionId>],
+    ) -> Self {
+        for (id, callee) in callees {
+            if preserved.get(id.index()).copied().unwrap_or(false)
+                && let Some(Some(region)) = region_ids.get(id.index())
+            {
+                self.regions.record_callee(*region, callee);
+            }
+        }
+        self
     }
 
     /// Returns the [`Atom`]s contained in this [`Program`]'s entry [`Region`],
@@ -799,17 +830,20 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (mut regions, source_caches): (Vec<_>, Vec<_>) = regions.into_iter().unzip();
-        adopt_transform_caches_for_identity_rebuilds(regions.as_mut_slice(), source_caches);
+        let preserved = adopt_transform_caches_for_identity_rebuilds(regions.as_mut_slice(), source_caches);
 
         // Compaction drops unreferenced regions and renumbers the survivors while preserving the reachable graph's
         // topology, so re-sealing keeps whatever the adoption pass above decided each region may retain.
+        let region_ids = compacted_region_ids(&regions, self.entry);
         let (regions, entry) = compact_regions(regions, self.entry);
-        Self::new_preserving_transform_caches(
+        let program = Self::new_preserving_transform_caches(
             self.input_structure.clone(),
             self.output_structure.clone(),
             regions,
             entry,
-        )
+        )?;
+        let callees = self.regions.callee_entries().map(|(id, callee)| (id, callee.clone())).collect();
+        Ok(program.with_preserved_callees(callees, &preserved, &region_ids))
     }
 
     /// Consumes this [`Program`] and returns a simplified version with dead constants and [`Instruction`]s that do not
@@ -846,6 +880,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
+        let callees = self.regions.callee_entries().map(|(id, callee)| (id, callee.clone())).collect::<Vec<_>>();
         let Self { regions, input_structure, output_structure, entry, .. } = self;
         let regions = regions
             .into_regions()
@@ -942,12 +977,14 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (mut regions, source_caches): (Vec<_>, Vec<_>) = regions.into_iter().unzip();
-        adopt_transform_caches_for_identity_rebuilds(regions.as_mut_slice(), source_caches);
+        let preserved = adopt_transform_caches_for_identity_rebuilds(regions.as_mut_slice(), source_caches);
 
         // Compaction drops unreferenced regions and renumbers the survivors while preserving the reachable graph's
         // topology, so re-sealing keeps whatever the adoption pass above decided each region may retain.
+        let region_ids = compacted_region_ids(&regions, entry);
         let (regions, entry) = compact_regions(regions, entry);
-        Self::new_preserving_transform_caches(input_structure, output_structure, regions, entry)
+        let program = Self::new_preserving_transform_caches(input_structure, output_structure, regions, entry)?;
+        Ok(program.with_preserved_callees(callees, &preserved, &region_ids))
     }
 
     /// Consumes this [`Program`] and returns it with the unused boundaries of its region-carrying [`Instruction`]s
@@ -1150,6 +1187,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         // while the rebuilt entry region starts over with none.
         let mut regions = self.regions.iter().take(self.entry.index()).cloned().collect::<Vec<_>>();
         regions.push(Region::new(new_atoms, new_input_ids, output_ids, new_instructions));
+        let region_ids = compacted_region_ids(&regions, self.entry);
         let (regions, entry) = compact_regions(regions, self.entry);
         let program = Program::new_preserving_transform_caches(
             vec![Placeholder; live_input_indices.len()],
@@ -1157,7 +1195,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             regions,
             entry,
         )?;
-        Ok((program, live_input_indices))
+        let callees = self.regions.callee_entries().map(|(id, callee)| (id, callee.clone())).collect();
+        let preserved = (0..self.entry.index()).map(|_| true).chain([false]).collect::<Vec<_>>();
+        Ok((program.with_preserved_callees(callees, &preserved, &region_ids), live_input_indices))
     }
 
     /// Consumes this [`Program`] and returns the same flat subprogram as [`Self::filtered`] over the chosen `inputs`
@@ -1174,6 +1214,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         let ProgramLivenessAnalysis { instruction_by_output, input_liveness, effectful_instruction_indices } =
             self.analyze_liveness(inputs, outputs, keep_alive)?;
         let entry = self.entry;
+        let callees = self.regions.callee_entries().map(|(id, callee)| (id, callee.clone())).collect::<Vec<_>>();
         let mut nested_regions = self.regions.into_regions();
         let Region { atoms, instructions, .. } = nested_regions.pop().unwrap();
         let mut atoms = atoms.into_iter().map(Some).collect::<Vec<_>>();
@@ -1285,16 +1326,16 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         // descendant closure over verbatim is also why re-sealing keeps the transforms derived from those descendants,
         // while the rebuilt entry region starts over with none.
         nested_regions.push(Region::new(new_atoms, new_input_ids, output_ids, new_instructions));
+        let preserved = (0..entry.index()).map(|_| true).chain([false]).collect::<Vec<_>>();
+        let region_ids = compacted_region_ids(&nested_regions, entry);
         let (regions, entry) = compact_regions(nested_regions, entry);
-        Ok((
-            Program::<V, O, Vec<V>, Vec<V>>::new_preserving_transform_caches(
-                input_structure,
-                output_structure,
-                regions,
-                entry,
-            )?,
-            live_input_indices,
-        ))
+        let program = Program::<V, O, Vec<V>, Vec<V>>::new_preserving_transform_caches(
+            input_structure,
+            output_structure,
+            regions,
+            entry,
+        )?;
+        Ok((program.with_preserved_callees(callees, &preserved, &region_ids), live_input_indices))
     }
 
     /// Returns the flat subprogram of this [`Program`] whose inputs and outputs are selected by the positions in
@@ -2027,18 +2068,10 @@ pub(super) fn compact_regions<V: Typed + Parameter, O>(
     regions: Vec<Region<V, O>>,
     entry: RegionId,
 ) -> (Vec<Region<V, O>>, RegionId) {
-    let reachable = reachable_region_mask(regions.len(), [entry], |id| &regions[id.index()]);
-    let mut remapping = vec![None; regions.len()];
-    let mut kept = 0usize;
-    for (index, is_reachable) in reachable.iter().copied().enumerate() {
-        if is_reachable {
-            remapping[index] = Some(RegionId::new(kept));
-            kept += 1;
-        }
-    }
-    let mut compacted = Vec::with_capacity(kept);
+    let remapping = compacted_region_ids(&regions, entry);
+    let mut compacted = Vec::with_capacity(remapping.iter().flatten().count());
     for (index, mut region) in regions.into_iter().enumerate() {
-        if !reachable[index] {
+        if remapping[index].is_none() {
             continue;
         }
         for instruction in &mut region.instructions {
@@ -2049,6 +2082,21 @@ pub(super) fn compact_regions<V: Typed + Parameter, O>(
         compacted.push(region);
     }
     (compacted, remapping[entry.index()].unwrap())
+}
+
+/// Returns the [`RegionId`] that [`compact_regions`] assigns to each region of `regions`, or [`None`] for the regions
+/// that it drops because they are not reachable from `entry`.
+fn compacted_region_ids<V: Typed + Parameter, O>(regions: &[Region<V, O>], entry: RegionId) -> Vec<Option<RegionId>> {
+    let reachable = reachable_region_mask(regions.len(), [entry], |id| &regions[id.index()]);
+    let mut remapping = vec![None; regions.len()];
+    let mut kept = 0usize;
+    for (index, is_reachable) in reachable.iter().copied().enumerate() {
+        if is_reachable {
+            remapping[index] = Some(RegionId::new(kept));
+            kept += 1;
+        }
+    }
+    remapping
 }
 
 /// Entry-[`Region`] liveness analysis result shared by the borrowing and consuming [`Program`] filter implementations.
@@ -2399,7 +2447,9 @@ fn move_atom_to_program<V: Value, O: Operation<Type = V::Type>>(
 /// A region qualifies when its own rebuild was the identity _and_ every region it reaches also qualifies: transforms
 /// of a region consume its attached descendants too, so a parent whose nested computation lost dead work no longer has
 /// the contents its retained transforms were derived from. Regions precede the regions that reference them, which
-/// makes one ascending pass enough to decide this for the whole arena.
+/// makes one ascending pass enough to decide this for the whole arena. Returns whether each region qualifies, in
+/// the same order, which also decides whether it can keep its record as an interned callee root. Refer to
+/// [`Program::with_preserved_callees`] for more information on that.
 ///
 /// # Parameters
 ///
@@ -2409,7 +2459,7 @@ fn move_atom_to_program<V: Value, O: Operation<Type = V::Type>>(
 fn adopt_transform_caches_for_identity_rebuilds<V: Typed + Parameter, O>(
     regions: &mut [Region<V, O>],
     mut source_caches: Vec<Option<RegionTransformCache<V, O>>>,
-) {
+) -> Vec<bool> {
     for index in 0..regions.len() {
         // Adopting shares the cell rather than moving it out, so the entry stays populated and a later parent can
         // still see that this descendant kept its contents.
@@ -2427,6 +2477,7 @@ fn adopt_transform_caches_for_identity_rebuilds<V: Typed + Parameter, O>(
         }
         regions[index].adopt_transform_cache(source_cache);
     }
+    source_caches.iter().map(Option::is_some).collect()
 }
 
 /// State of [`Program::into_pruned`], which determines the pruning of regions under sets of used outputs and emits
@@ -2996,6 +3047,56 @@ mod tests {
             )
             .unwrap()[0];
         builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Returns `f(p, x) = condition(p, x)` with an unused negation of `x`, whose branches are interned callees that
+    /// negate `x`, followed by those callees. The `true` branch is simplified already, while the `false` branch
+    /// computes an unused product that simplification removes.
+    #[allow(clippy::type_complexity)]
+    fn interned_callee_program() -> (
+        Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
+        Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>,
+        Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>,
+    ) {
+        let callee = |with_unused_product: bool| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64));
+            if with_unused_product {
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, input], None).unwrap();
+            }
+            let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            Arc::new(
+                builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
+            )
+        };
+        let simplified_callee = callee(false);
+        let unsimplified_callee = callee(true);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let true_branch = builder.intern_callee(&simplified_callee, None).unwrap();
+        let false_branch = builder.intern_callee(&unsimplified_callee, None).unwrap();
+        builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap();
+        let condition = ConditionOperation::<ArrayType>::new();
+        let output = builder
+            .add_instruction(condition, vec![true_branch, false_branch], vec![predicate, input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        (program, simplified_callee, unsimplified_callee)
+    }
+
+    /// Returns the interned callee of each region that the last instruction of `program` attaches, in order.
+    fn interned_callees(
+        program: &Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
+    ) -> Vec<Option<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>>> {
+        let instruction = program.instructions().last().unwrap();
+        instruction
+            .regions()
+            .iter()
+            .map(|region| program.region_ref(*region).unwrap().interned_callee().cloned())
+            .collect()
     }
 
     #[test]
@@ -4315,6 +4416,19 @@ mod tests {
     }
 
     #[test]
+    fn test_program_simplified_retains_interned_callees_for_identity_rebuilds() {
+        // An interned callee whose region simplification leaves unchanged stays interned, so that importing the
+        // simplified program still shares it, while a callee whose region simplification rewrites is no longer
+        // interned.
+        let (program, simplified_callee, _) = interned_callee_program();
+        let simplified = program.simplified().unwrap();
+        assert_eq!(simplified.instructions().len(), 1);
+        let callees = interned_callees(&simplified);
+        assert!(callees[0].as_ref().is_some_and(|callee| Arc::ptr_eq(callee, &simplified_callee)));
+        assert!(callees[1].is_none());
+    }
+
+    #[test]
     fn test_program_simplified_preserves_provenance() {
         // Simplification is a structural rebuild, so every surviving instruction must keep its provenance verbatim,
         // including the nested-scope, fused, and unknown shapes, while the dead pure multiplication drops together
@@ -4472,6 +4586,16 @@ mod tests {
         let after = simplified.entry_region_ref().linearize_shared(&[0]).unwrap();
         assert!(Arc::ptr_eq(after.primal(), before.primal()));
         assert!(Arc::ptr_eq(after.tangent(), before.tangent()));
+    }
+
+    #[test]
+    fn test_program_into_simplified_retains_interned_callees_for_identity_rebuilds() {
+        let (program, simplified_callee, _) = interned_callee_program();
+        let simplified = program.into_simplified().unwrap();
+        assert_eq!(simplified.instructions().len(), 1);
+        let callees = interned_callees(&simplified);
+        assert!(callees[0].as_ref().is_some_and(|callee| Arc::ptr_eq(callee, &simplified_callee)));
+        assert!(callees[1].is_none());
     }
 
     #[test]
@@ -5042,6 +5166,17 @@ mod tests {
     }
 
     #[test]
+    fn test_program_filtered_retains_interned_callees() {
+        // Filtering carries every nested region over verbatim, so every interned callee stays interned.
+        let (program, simplified_callee, unsimplified_callee) = interned_callee_program();
+        let (filtered, _) = program.filtered(program.input_ids(), program.output_ids(), &[]).unwrap();
+        assert_eq!(filtered.instructions().len(), 1);
+        let callees = interned_callees(&filtered);
+        assert!(callees[0].as_ref().is_some_and(|callee| Arc::ptr_eq(callee, &simplified_callee)));
+        assert!(callees[1].as_ref().is_some_and(|callee| Arc::ptr_eq(callee, &unsimplified_callee)));
+    }
+
+    #[test]
     fn test_program_into_filtered() {
         // Build the same program twice, so that the consuming `into_filtered` can be compared
         // against the borrowing `filter`.
@@ -5085,6 +5220,18 @@ mod tests {
         let (filtered, live) = effectful.into_filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_program_into_filtered_retains_interned_callees() {
+        let (program, simplified_callee, unsimplified_callee) = interned_callee_program();
+        let inputs = program.input_ids().to_vec();
+        let outputs = program.output_ids().to_vec();
+        let (filtered, _) = program.into_filtered(&inputs, &outputs, &[]).unwrap();
+        assert_eq!(filtered.instructions().len(), 1);
+        let callees = interned_callees(&filtered);
+        assert!(callees[0].as_ref().is_some_and(|callee| Arc::ptr_eq(callee, &simplified_callee)));
+        assert!(callees[1].as_ref().is_some_and(|callee| Arc::ptr_eq(callee, &unsimplified_callee)));
     }
 
     #[test]
@@ -5453,7 +5600,7 @@ mod tests {
                     Some(Provenance::scope(ProvenanceScope::new("check"), Provenance::unknown())),
                 )
                 .unwrap()
-                .is_empty()
+                .is_empty(),
         );
         let program = builder.build::<Array, Vec<Array>>(Vec::new(), Placeholder, Vec::new()).unwrap();
         assert_eq!(
