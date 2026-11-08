@@ -327,7 +327,8 @@ use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext,
 
 /// Error type related to [`ShardMapOperation`], covering mesh and sharding validation, global and local boundary
 /// derivation, manual variation, and the semantic restrictions on `shard_map` bodies. It carries no backend state,
-/// so backend tracing and lowering errors can wrap it.
+/// so backend tracing and lowering errors can wrap it. Large diagnostic array types are boxed to keep the error
+/// representation compact.
 ///
 /// It converts into [`ProgramError`] for operation and transform rules. Its [`Program`](ShardMapError::Program) variant
 /// passes through unchanged, and every other variant becomes [`ProgramError::custom`], from which callers can recover
@@ -397,7 +398,7 @@ pub enum ShardMapError {
         "the sharding of `{SHARD_MAP_OPERATION_NAME}` input #{input_index} cannot be inferred \
          because its type `{input_type}` has no sharding"
     )]
-    InputShardingNotInferable { input_index: usize, input_type: ArrayType },
+    InputShardingNotInferable { input_index: usize, input_type: Box<ArrayType> },
 
     #[error(
         "`{SHARD_MAP_OPERATION_NAME}` {value_kind} #{value_index} has rank {rank}, so it has no \
@@ -767,7 +768,7 @@ impl ShardMapBoundary {
     }
 
     /// Returns this boundary with its global outputs typed over `caller_mesh` (i.e., setting [`Self::caller_mesh`]),
-    /// which [`shard_map_caller_mesh`] selects and validates, and which transform rules carry over from the boundary
+    /// which [`bind_shard_map`] selects and validates, and which transform rules carry over from the boundary
     /// that they derive a boundary from when the derived outputs include outputs of the original map. Their internal
     /// residual edges stay typed over [`Self::mesh`], and transposition, whose outputs are input cotangents that it
     /// reconciles with the types of the caller's inputs, does not carry it over. A `caller_mesh` equal to
@@ -776,8 +777,6 @@ impl ShardMapBoundary {
         self.caller_mesh = caller_mesh.filter(|caller_mesh| caller_mesh != &self.mesh);
         self
     }
-
-    // TODO(eaplatanios): Review from here onwards.
 
     /// Selects whether array outputs must be statically proven invariant along active manual axes that their output
     /// shardings do not tile. The default is `true`. With `false`, the caller promises that those devices produce
@@ -793,7 +792,7 @@ impl ShardMapBoundary {
         self
     }
 
-    /// Selects manual-variation checking for the entire local body. The default is `true`. With `false`, local inputs
+    /// Selects manual variation checking for the entire local body. The default is `true`. With `false`, local inputs
     /// and ordinary collective operations carry no variation labels for the active manual axes. The caller promises
     /// replicated array outputs and identical final states for replicated reference inputs, including when references
     /// temporarily differ between devices. Shape, data type, reduction-state, ownership, alias, and forwarding
@@ -805,8 +804,8 @@ impl ShardMapBoundary {
     /// the body could observe their physical summands, which logical reference arrays do not retain. Reference inputs
     /// follow the same rules, with each device writing back its own summand of an unreduced reference and its copy of
     /// a reduced one. Output replication is not checked while this option is `false`, whatever
-    /// [`Self::with_check_output_replication`] selects, and is checked again as that option selects once this option is
-    /// `true`, so the two can be set in either order.
+    /// [`Self::with_check_output_replication`] selects, and is checked again as that option
+    /// selects once this option is `true`, so the two can be set in either order.
     #[inline]
     pub fn with_check_manual_variation(mut self, check_manual_variation: bool) -> Self {
         self.manual_variation_checks.manual_variation = check_manual_variation;
@@ -819,13 +818,12 @@ impl ShardMapBoundary {
         &self.mesh
     }
 
-    /// Returns the mesh over which the global outputs of this manual computation are typed. It is either
-    /// [`Self::mesh`] or that mesh with the active manual axes typed as [`Explicit`](MeshAxisType::Explicit), as a
-    /// caller in JAX's explicit sharding mode types them, so that the outputs can be used like the other values of that
-    /// caller (e.g., switched with [`auto_axes`](crate::auto_axes)) without first being resharded. Since every other
-    /// axis keeps its type and the output shardings name no [`Auto`](MeshAxisType::Auto) axes, the output types never
-    /// record placement along auto axes. It is [`Self::mesh`] unless the map was bound by the [`ShardMap`] capability
-    /// for such a caller.
+    /// Returns the mesh over which the global outputs of this manual computation are typed. It is either [`Self::mesh`]
+    /// or that mesh with the active manual axes typed as [`Explicit`](MeshAxisType::Explicit), as a caller in JAX's
+    /// explicit sharding mode types them, so that the outputs can be used like the other values of that caller (e.g.,
+    /// switched with [`auto_axes`](crate::auto_axes)) without first being resharded. Since every other axis keeps its
+    /// type and the output shardings name no [`Auto`](MeshAxisType::Auto) axes, the output types never record placement
+    /// along auto axes. It is [`Self::mesh`] unless the map was bound by the [`ShardMap`] capability for such a caller.
     #[inline]
     pub fn caller_mesh(&self) -> &LogicalMesh {
         self.caller_mesh.as_ref().unwrap_or(&self.mesh)
@@ -846,7 +844,7 @@ impl ShardMapBoundary {
         self.output_shardings.as_slice()
     }
 
-    /// Returns the active manual mesh axes of this manual computation, in mesh order. The list is nonempty and names
+    /// Returns the active manual mesh axes of this manual computation, in mesh order. The list is non-empty and names
     /// only mesh axes of type [`Manual`](MeshAxisType::Manual). The body runs once per device coordinate along these
     /// axes and may use them as named axes of collectives.
     #[inline]
@@ -865,6 +863,8 @@ impl ShardMapBoundary {
     pub fn check_manual_variation(&self) -> bool {
         self.manual_variation_checks.check_manual_variation()
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the global boundary type of input `input_index` for the caller's global input type `input_type`, which
     /// is the data type, shape, and layout of `input_type` placed by the input sharding, together with the manual
@@ -7267,7 +7267,7 @@ fn inferred_input_sharding(
     mesh: &LogicalMesh,
 ) -> Result<Sharding, ShardMapError> {
     let Some(sharding) = input_type.sharding() else {
-        return Err(ShardMapError::InputShardingNotInferable { input_index, input_type: input_type.clone() });
+        return Err(ShardMapError::InputShardingNotInferable { input_index, input_type: Box::new(input_type.clone()) });
     };
     if !sharding.mesh().has_same_topology(mesh) {
         return Err(ShardMapError::InputMeshMismatch {
@@ -7321,7 +7321,7 @@ fn resolve_shard_map_mesh<C: MeshContext>(
 /// which is the shared implementation of the `shard_map` and `shard_map_along` functions of [`ShardMap`]. The boundary
 /// of a map whose output shardings are [`ShardMapOutputShardings::Along`] starts without outputs, since the output
 /// ranks are only known once the body is traced, and is rebuilt from the output types of the body. The outputs are
-/// typed over the caller's mesh that [`shard_map_caller_mesh`] selects.
+/// typed over the caller's mesh selected from the input types or the context's default mesh.
 fn bind_shard_map<C, F, Input, Output>(
     context: &C,
     function: F,
@@ -7362,7 +7362,32 @@ where
         options.manual_axes.clone(),
         &named_axes,
     )?;
-    let caller_mesh = shard_map_caller_mesh(&boundary, &global_input_types, context.default_mesh());
+    let caller_mesh = {
+        // The candidate is the common mesh of the sharded inputs, or the context's default mesh when no input is
+        // sharded. Inputs placed over different meshes leave no candidate.
+        let default_mesh = context.default_mesh();
+        let mut input_meshes = global_input_types.iter().filter_map(|r#type| r#type.sharding().map(Sharding::mesh));
+        let candidate = match input_meshes.next() {
+            Some(mesh) if input_meshes.all(|other| other == mesh) => Some(mesh.clone()),
+            Some(_) => None,
+            None => default_mesh,
+        };
+
+        // Use the caller's mesh only when it is the map's mesh with its active manual axes typed as explicit, as in
+        // JAX's explicit sharding mode. A caller that types them as auto receives outputs over the map's mesh instead,
+        // because types over its mesh could not record the outputs' placement along those axes without tracking it
+        // (JAX's types omit it), and dropping that placement would make backends with closed signatures replicate them.
+        candidate.filter(|candidate| {
+            candidate.has_same_topology(boundary.mesh())
+                && candidate.axes().iter().zip(boundary.mesh().axes()).all(|(axis, map_axis)| {
+                    if boundary.manual_axes().iter().any(|name| name == axis.name()) {
+                        axis.r#type() == MeshAxisType::Explicit
+                    } else {
+                        axis.r#type() == map_axis.r#type()
+                    }
+                })
+        })
+    };
     let boundary = boundary.with_caller_mesh(caller_mesh.clone()).with_manual_variation_checks(checks);
     let rebuild_boundary = output_axes.map(|(axis_name, axes)| {
         move |output_types: &[ArrayType]| -> Result<ShardMapBoundary, ShardMapError> {
@@ -7403,38 +7428,6 @@ where
         .map(|output| ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Output::To::<ShardMapValue<C>>::from_parameters(output_structure, outputs)?)
-}
-
-/// Returns the caller's mesh over which a closure-traced `shard_map` with boundary `boundary` types its outputs (refer to
-/// [`ShardMapBoundary::caller_mesh`]), or [`None`] to type them over the mesh of the map. The caller's values carry
-/// their meshes in their types, so the candidate is the mesh that every sharded input in `global_input_types` is placed
-/// over, and the default mesh `default_mesh` of the binding context (JAX's context mesh) when no input is sharded.
-/// Inputs placed over different meshes leave no candidate. The candidate is used only when it is the mesh of the map
-/// with the axes that the map makes manual typed as [`Explicit`](MeshAxisType::Explicit), which is how a caller in
-/// JAX's explicit sharding mode types them. A caller that types them as [`Auto`](MeshAxisType::Auto) receives outputs
-/// typed over the mesh of the map instead, because types over its mesh could not record the placement of the outputs
-/// along those axes without making it tracked (JAX's types omit it), and dropping it from the types would make backends
-/// whose function signatures follow the types replicate the outputs.
-fn shard_map_caller_mesh(
-    boundary: &ShardMapBoundary,
-    global_input_types: &[ArrayType],
-    default_mesh: Option<LogicalMesh>,
-) -> Option<LogicalMesh> {
-    let mut input_meshes = global_input_types.iter().filter_map(|r#type| r#type.sharding().map(Sharding::mesh));
-    let candidate = match input_meshes.next() {
-        Some(mesh) if input_meshes.all(|other| other == mesh) => mesh.clone(),
-        Some(_) => return None,
-        None => default_mesh?,
-    };
-    let is_valid = candidate.has_same_topology(boundary.mesh())
-        && candidate.axes().iter().zip(boundary.mesh().axes()).all(|(axis, map_axis)| {
-            if boundary.manual_axes().iter().any(|name| name == axis.name()) {
-                axis.r#type() == MeshAxisType::Explicit
-            } else {
-                axis.r#type() == map_axis.r#type()
-            }
-        });
-    is_valid.then_some(candidate)
 }
 
 /// Builds the [`ShardMapBoundary`] of a closure-traced `shard_map` that is bound in the scope of named axes
@@ -26584,7 +26577,7 @@ mod tests {
         for (input_type, expected) in [
             (
                 f32_vector_type(4),
-                ShardMapError::InputShardingNotInferable { input_index: 0, input_type: f32_vector_type(4) },
+                ShardMapError::InputShardingNotInferable { input_index: 0, input_type: Box::new(f32_vector_type(4)) },
             ),
             (
                 other_type,
@@ -26611,7 +26604,8 @@ mod tests {
             );
         }
         assert_eq!(
-            ShardMapError::InputShardingNotInferable { input_index: 0, input_type: f32_vector_type(4) }.to_string(),
+            ShardMapError::InputShardingNotInferable { input_index: 0, input_type: Box::new(f32_vector_type(4)) }
+                .to_string(),
             "the sharding of `shard_map` input #0 cannot be inferred because its type `f32[4]` has no sharding",
         );
     }
