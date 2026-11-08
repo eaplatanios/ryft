@@ -141,8 +141,8 @@ impl DifferentiableType for ArrayType {
         // Forward perturbations follow their primals' placement. An element-representation change clears explicit
         // layout because byte-level layout metadata cannot in general survive a change in element width.
         let data_type = self.data_type().tangent()?;
-        let layout = if data_type == self.data_type() { self.layout.clone() } else { None };
-        Ok(Self { data_type, layout, ..self.clone() })
+        let layout = if data_type == self.data_type() { self.layout().cloned() } else { None };
+        Ok(self.clone().with_data_type(data_type).with_layout(layout))
     }
 
     #[inline]
@@ -152,14 +152,13 @@ impl DifferentiableType for ArrayType {
         // that is unreduced with a kind other than a sum has no cotangent. Refer to `Sharding::cotangent` for more
         // information.
         let data_type = self.data_type().cotangent()?;
-        let layout = if data_type == self.data_type() { self.layout.clone() } else { None };
+        let layout = if data_type == self.data_type() { self.layout().cloned() } else { None };
         let sharding = self
-            .sharding
-            .as_ref()
+            .sharding()
             .map(Sharding::cotangent)
             .transpose()
             .map_err(|_| DifferentiationError::UndefinedCotangentType { primal_type: self.to_string() })?;
-        Ok(Self { data_type, layout, sharding, ..self.clone() })
+        Ok(self.clone().with_data_type(data_type).with_layout(layout).with_sharding_unchecked(sharding))
     }
 }
 
@@ -1205,6 +1204,29 @@ mod tests {
         let laid_out = ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         assert_eq!(laid_out.cotangent(), Ok(laid_out));
+    }
+
+    #[test]
+    fn test_array_type_cotangent_preserves_intermediate_shape_sharding_relationship() {
+        // Shape replacement keeps sharding metadata, so an intermediate descriptor can carry different shape and
+        // sharding ranks. Differential metadata transforms preserve that relationship without validating it again.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let unreduced = Sharding::replicated(mesh.clone(), 1).with_unreduced_axes(["x"]).unwrap();
+        let reduced = Sharding::replicated(mesh, 1).with_reduced_axes(["x"]).unwrap();
+        let source = ArrayType::new_static(F32, [4])
+            .with_sharding(unreduced.clone())
+            .unwrap()
+            .with_shape(Shape::from([2, 2]))
+            .with_memory(Memory::Host { pinned: true });
+        let expected = ArrayType::new_static(F32, [4])
+            .with_sharding(reduced)
+            .unwrap()
+            .with_shape(Shape::from([2, 2]))
+            .with_memory(Memory::Host { pinned: true });
+        assert_eq!(source.tangent(), Ok(source.clone()));
+        assert_eq!(source.cotangent(), Ok(expected));
+        assert_eq!(source.shape(), &Shape::from([2, 2]));
+        assert_eq!(source.sharding(), Some(&unreduced));
     }
 
     #[test]
