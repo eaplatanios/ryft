@@ -2507,8 +2507,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C> InterpretableOperation<C> for ShardMapOperation
 where
     C: Domain<
@@ -2526,11 +2524,11 @@ where
     ) -> Result<Vec<C::Value>, ProgramError> {
         // This rule runs the lockstep emulator that the `# Reference Backend Emulation` section of the module
         // documentation describes, rather than replaying the local body once over the global values through
-        // `interpret_region`, which would ignore the partitioning across devices. It needs only payload projection from
-        // the operation family (to recognize collectives and region operations inside the body), so it serves every
-        // domain over `ArrayIrValue<Array>` (e.g., the eager contexts of `ArrayIrOperation<Array>` and of kernel
-        // operation families). Backends with a device runtime execute the whole boundary through their own
-        // `Context::bind` instead (e.g., by compiling the manual computation for their devices).
+        // `interpret_region`, which would ignore the partitioning across devices. It needs only payload projection
+        // from the operation family (to recognize collectives and region operations inside the body), so it serves
+        // every domain over `ArrayIrValue<Array>` (e.g., the eager contexts of `ArrayIrOperation<Array>` and of
+        // kernel operation families). Backends with a device runtime execute the whole boundary through their
+        // own `Context::bind` instead (e.g., by compiling the manual computation for their devices).
         self.validate_region_interfaces(&driver.region_interfaces())?;
         let emulator =
             ShardMapEmulator { context, driver, grid: ManualDeviceGrid::default(), manual_regions: Vec::new() };
@@ -2562,25 +2560,28 @@ where
         driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        // This rule is the counterpart of the jitted call rule for map boundaries. It splits the local body by which of
-        // the caller's inputs are known, keeping the `shard_map` boundary, its mesh, and its shardings on both sides,
-        // and binds the known half into the known side context through the default fold or residualize policy, whether
-        // that context executes it eagerly (e.g., through the reference backend's emulation or a device runtime) or
-        // stages it into the outer program, as JAX's `_shard_map_partial_eval` always binds its known `shard_map`.
-        // Every operation with a region boundary feeds the shared `PartitionedProgram` protocol under this contract for
-        // known inputs.
+        // This rule is the counterpart of the Just-In-Time (JIT) compiled call rule for map boundaries. It splits the
+        // local body by which of the caller's inputs are known, keeping the `shard_map` boundary, its mesh, and its
+        // shardings on both sides, and binds the known half into the known side context through the default fold or
+        // residualize policy, whether that context executes it eagerly (e.g., through the reference backend's emulation
+        // or a device runtime) or stages it into the outer program, as JAX's `_shard_map_partial_eval` always binds its
+        // known `shard_map`. Every operation with a region boundary feeds the shared `PartitionedProgram` protocol
+        // under this contract for known inputs.
         if !self.boundary.checks_manual_variation() {
             self.validate_body(driver.region(0)?)?;
         }
+
         // Split only a boundary with both known and unknown inputs. Calls whose inputs are all known or all unknown
         // keep the default fold or residualize behavior and therefore the original boundary.
         if inputs.iter().all(PartialEvaluationValue::is_known) || inputs.iter().all(PartialEvaluationValue::is_unknown)
         {
             return context.fold_or_residualize(self.clone(), driver.region_programs(), inputs);
         }
+
         // Split the local body through the shared online boundary machinery. The body's inputs are aligned by index
-        // with the boundary inputs and carry the *local* types, so both split sides stay local programs.
+        // with the boundary inputs and carry the _local_ types, so both split sides stay local programs.
         let body_program = driver.region(0)?;
+
         // A reference input, a reference output, or a reference access anywhere in the body keeps the shard map whole,
         // for the same reason a `jit_call` stays whole, because splitting would spread the accesses to one root across
         // two manual regions whose known side runs first, and the default rule preserves effect order by placing the
@@ -2590,6 +2591,7 @@ where
             self.validate_body(body_program)?;
             return context.fold_or_residualize(self.clone(), vec![body_program.to_program()], inputs);
         }
+
         // Outputs that merely forward a known input are that input itself. When the output sharding equals the input
         // sharding and the input already has the declared output type, the global output is the global input, so it
         // stays known without any known side `shard_map`. This shortcut is a Ryft extension, since JAX's
@@ -2624,6 +2626,7 @@ where
             output_forwarding: kept_outputs.iter().map(|&index| self.output_forwarding[index]).collect(),
         };
         let body = body_program.to_program().with_outputs(&kept_outputs)?;
+
         // A body whose outputs are all forwarded leaves no work behind unless it is retained when unused, which is the
         // dead code criterion that simplification and boundary pruning apply to a `shard_map` whose outputs are all
         // dead (and that the other rules of this operation use). Its effect classes alone are not the right criterion,
@@ -2644,6 +2647,8 @@ where
             .collect())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for ShardMapOperation
 where
