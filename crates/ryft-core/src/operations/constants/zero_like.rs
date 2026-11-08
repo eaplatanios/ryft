@@ -7,13 +7,17 @@ use crate::arrays::{
     Array, ArrayElement, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType,
     dispatch_on_array_element_type,
 };
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, ValueResolution};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_elementwise_operation};
+use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::{Capability, ElementwiseOperation};
-use crate::partial::PartiallyEvaluatableOperation;
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
+};
 use crate::programs::{
-    Operation, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch, ValueProjection,
+    Operation, OperationProvider, ProgramError, RegionInterface, Type, TypeError, Typed, Value, ValueDomainDispatch,
+    ValueProjection,
 };
 
 /// Canonical operation name for [`ZeroLikeOperation`].
@@ -90,7 +94,37 @@ where
 
 impl<C: Context<Operation: From<ZeroLikeOperation<C::Type>>>> PartiallyEvaluatableOperation<C>
     for ZeroLikeOperation<C::Type>
+where
+    C::Operation: OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>,
 {
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        // Both programs stage the zero of an exemplar whose type determines that zero as the nullary zero of that type,
+        // as the `ZeroLike` capability does when staging. The zero of an unknown exemplar stays in the residual
+        // program, because folding the nullary zero would make it known, and the residual program would then receive
+        // it as a residual input. A known exemplar under an eager known side and types with runtime extents follow the
+        // default rule, which keeps `zero_like`. Types that cannot represent zero keep it too, so its type inference
+        // reports the error.
+        check_count!("input", inputs, 1, ProgramError);
+        let r#type = inputs[0].r#type();
+        if r#type.is_reference()
+            || r#type.identities().next().is_some()
+            || r#type.validate_zero().is_err()
+            || (inputs[0].is_known() && context.parent().is_eager())
+        {
+            return context.fold_or_residualize(*self, driver.region_programs(), inputs);
+        }
+        let operation = C::Operation::provide(ZeroOperation::new(r#type.into_owned()), &[])?;
+        if inputs[0].is_unknown() {
+            context.residualize(operation, Vec::new(), &[])
+        } else {
+            context.fold_or_residualize(operation, Vec::new(), &[])
+        }
+    }
 }
 
 impl_differentiable_elementwise_operation!(@constant<T> ZeroLikeOperation<T>);
@@ -113,9 +147,14 @@ impl<A: Value<Type = ArrayType>> From<ZeroLikeOperation<ArrayIrType>> for ArrayI
 /// sharding. Its elements are zeros regardless of the exemplar's values; complex elements have a zero imaginary part.
 /// Empty arrays remain empty, but their element data type must still support zero.
 ///
-/// A staged call retains the exemplar as an input so that dynamic extents are read at execution time. It does not
-/// replace dynamic dimensions with their allocation bounds. The exemplar's numerical values have no effect on the
-/// result, so differentiation returns zero for its tangent or cotangent.
+/// A staged call binds the nullary [`ZeroOperation`] of the exemplar's type when that type names no runtime extents and
+/// no other type identities, which has no data dependence on its argument. This also applies under transforms over a
+/// staging context when that context resolves the exemplar (e.g., to a known value under partial evaluation), and
+/// partial evaluation stages the nullary zero of an unknown exemplar into its residual program. Otherwise, a staged
+/// call binds [`ZeroLikeOperation`], which retains the exemplar as an input so that dynamic extents are read at
+/// execution time, rather than replacing dynamic dimensions with their allocation bounds. Eager calls always use the
+/// exemplar, whose runtime placement may be more specific than its type. The exemplar's numerical values have no effect
+/// on the result, so differentiation returns zero for its tangent or cotangent.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
@@ -159,11 +198,33 @@ impl<
     T: Type,
     V: Value<Type = T, Dispatch = ValueDomainDispatch, Domain: Context<Operation: From<ZeroLikeOperation<T>>>>,
 > ZeroLike<T> for V
+where
+    <V::Domain as Domain>::Operation:
+        OperationProvider<T, ZeroOperation<T>, Operation = <V::Domain as Domain>::Operation>,
 {
     #[inline]
     fn zero_like(&self) -> Result<Self, ProgramError> {
-        let operation = ZeroLikeOperation::new();
-        let mut outputs = self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        // The nullary zero of a type that determines it, unlike `zero_like`, does not read its exemplar, like JAX's
+        // `zeros_like`, which is a constant broadcast. Staging it lets dead code elimination drop the exemplar,
+        // so that rematerialization never saves the exemplar only to recompute a zero from it. Eager contexts keep
+        // `zero_like`, because the runtime placement of an eager value (e.g., of an automatically sharded XLA array)
+        // may be more specific than its type. Values that their context cannot resolve keep it too, and their rules
+        // decide (e.g., an unknown partially evaluated value, whose zero must stay in the residual program, or a
+        // batched value whose batch axis is mapped). Binding the nullary zero there would make the zero known (and
+        // so a residual input of the residual program) or replicated, while it depends on nothing in either case.
+        let domain = self.domain();
+        let r#type = self.r#type();
+        let mut outputs = if !domain.is_eager()
+            && !r#type.is_reference()
+            && r#type.identities().next().is_none()
+            && r#type.validate_zero().is_ok()
+            && !matches!(domain.resolve(self), ValueResolution::Opaque)
+        {
+            let operation = <V::Domain as Domain>::Operation::provide(ZeroOperation::new(r#type.into_owned()), &[])?;
+            domain.bind(operation, Vec::new(), &[])?
+        } else {
+            domain.bind(ZeroLikeOperation::new(), Vec::new(), std::slice::from_ref(self))?
+        };
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -178,8 +239,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
-        StridedLayout, f8e8m0fnu,
+        DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape,
+        Sharding, StridedLayout, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -188,7 +249,9 @@ mod tests {
     use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::operations::arithmetic::Add;
     use crate::parameters::Placeholder;
-    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialTracer};
+    use crate::partial::{
+        PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer, PartialValue,
+    };
     use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder};
     use crate::tracing::TracingContext;
 
@@ -325,6 +388,26 @@ mod tests {
             PartialTracer::new(context, PartialEvaluationValue::known(Array::vector(vec![1.5f32, -2.5]).unwrap()));
         let output = input.zero_like().unwrap();
         assert_eq!(output.value().unwrap().as_known(), Some(&Array::vector(vec![0.0f32, 0.0]).unwrap()));
+
+        // The zero of an unknown exemplar stays in the residual program, where the static type of the exemplar
+        // determines it without reading the exemplar, instead of becoming a known residual input.
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(r#type.clone());
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
+        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(r#type)]).unwrap();
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = zero [type=f32[2]]
+                in (%1)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -381,6 +464,8 @@ mod tests {
 
     #[test]
     fn test_zero_like_staging() {
+        // A static exemplar type determines the zero completely, so staging binds the nullary zero of that type and
+        // leaves the exemplar unused.
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::new_static(DataType::F32, [2]));
         let output = input.zero_like().unwrap();
@@ -394,8 +479,30 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2] .
-                let %1:f32[2] = zero_like %0
+                let %1:f32[2] = zero [type=f32[2]]
                 in (%1)
+            "}
+            .trim_end(),
+        );
+
+        // Batching over a staging context keeps the batch axis of the exemplar mapped, and the staged zero of the
+        // batched exemplar, whose type is static too, is again the nullary zero of that type.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let input = context.input(ArrayType::new_static(DataType::F32, [2, 3]));
+        let output = batch(|item| Ok(item.zero_like()?), input, BatchAxis::new(1), BatchAxis::new(0), None).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output.atom_id().unwrap()], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3] .
+                let %1:f32[2, 3] = zero [type=f32[2, 3]]
+                    %2:f32[3, 2] = transpose [permutation=[1, 0]] %1
+                in (%2)
             "}
             .trim_end(),
         );
@@ -458,5 +565,37 @@ mod tests {
                 Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0]), &[]).unwrap(),
             )]),
         );
+
+        // A staged static array type binds the nullary zero of the array member, while a first-class dimension, which
+        // has no zero, keeps `zero_like`, whose array member rejects it.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(ArrayType::new_static(DataType::F32, [2]).into());
+        let output = input.zero_like().unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[2] = zero [type=f32[2]]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let dimension_type = DimensionType::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let input = context.input(ArrayIrType::Dimension(dimension_type));
+        assert!(matches!(
+            input.zero_like(),
+            Err(ProgramError::Type(error)) if error == TypeError::invalid("expected array type but got dimension type"),
+        ));
     }
 }
