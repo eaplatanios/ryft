@@ -280,9 +280,9 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Returns this context configured to place the residuals of its nested partitions according to `policy`.
     /// The split rules of region-carrying operations (e.g., `scan` and `condition`) partition their bodies through
     /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program), which then
-    /// places the residuals of each such partition according to `policy` (which can be set using
-    /// [`PartitionedProgram::with_top_level_residual_policy`]) and carries `policy` into the partitions nested within
-    /// it. This has implications for various region-carrying operation types. For example, it means that decisions
+    /// places the residuals of each such partition according to `policy` and carries `policy` into the partitions
+    /// nested within it. Refer to [`PartitionedProgram::with_top_level_residual_policy`] for how a policy places known
+    /// values. This has implications for various region-carrying operation types. For example, it means that decisions
     /// apply per iteration of a `scan` operation and per branch of a `condition` operation, and that a `scan` operation
     /// recomputes the changing known carries that its residual work reads from their initial values instead of saving
     /// them on every iteration (refer to [`PartitionedProgram::with_top_level_residual_policy`]). When the residuals of
@@ -294,8 +294,8 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// operation whose replay would recompute values that the policy saves is instead split on residual demand when its
     /// rule supports that (refer to [`PartiallyEvaluatableOperation::split_on_residual_demand`]), so that a `condition`
     /// or a `scan` saves those values rather than its outputs. A `while` loop is an exception that saves nothing,
-    /// because its residual loop re-runs every iteration, and so its split rule partitions its regions without
-    /// the policy.
+    /// because its residual loop re-runs every iteration, and so its split rule partitions its regions without the
+    /// policy.
     ///
     /// This function changes only the returned context's configuration, without creating a new residual program
     /// or changing previously emitted work. Existing clones retain their own residual policy. The resulting partitions
@@ -591,6 +591,11 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///     when eager execution must be retried with owned programs.
     ///   - `inputs`: Partially evaluated inputs supplied to `operation`, in [`Operation`]-defined order. Their
     ///     known-ness determines whether the operation is folded or residualized.
+    ///
+    /// # Errors
+    ///
+    /// Returns the context's retained binding error, if any, or an error when the inputs or regions cannot be prepared
+    /// or the operation cannot be bound. Unsupported pure eager work follows the residual fallback described above.
     #[inline]
     pub fn fold_or_residualize<'r, P: Into<C::Operation>, R: Into<AttachedRegions<'r, C::Constant, C::Operation>>>(
         &self,
@@ -609,9 +614,9 @@ impl<C: Context> PartialEvaluationContext<C> {
     }
 
     /// Internal helper that folds or residualizes an already converted [`Operation`]. This is the body of
-    /// [`fold_or_residualize`](Self::fold_or_residualize), which only converts its input operation, so that this body
-    /// is compiled once per context rather than once per input operation type. Keep it free of the input operation type
-    /// parameter: every closure and iterator adapter in it is instantiated per distinct signature.
+    /// [`fold_or_residualize`](Self::fold_or_residualize), which only converts its operation and regions, so this body
+    /// is compiled once per context rather than once per input operation or region representation. Keep those type
+    /// parameters out of this body, because every closure and iterator adapter is instantiated per distinct signature.
     fn fold_or_residualize_operation(
         &self,
         operation: C::Operation,
@@ -767,6 +772,11 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///   - `inputs`: Partially evaluated inputs supplied to `operation`, in [`Operation`]-defined order. Known inputs
     ///     are materialized as residual program inputs or constants, while unknown inputs reuse their existing residual
     ///     atoms.
+    ///
+    /// # Errors
+    ///
+    /// Returns the context's retained binding error, if any, or an error when the inputs cannot be materialized,
+    /// the attached regions cannot be prepared, or the operation cannot be bound in the residual program.
     #[inline]
     pub fn residualize<'r, P: Into<C::Operation>, R: Into<AttachedRegions<'r, C::Constant, C::Operation>>>(
         &self,
@@ -2977,6 +2987,68 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_fold_or_residualize_preserves_shared_callees() {
+        let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = body.add_input(ArrayType::scalar(DataType::F32).into());
+        let output = body
+            .add_instruction(ArrayOperation::from(NegOperation::new()), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let body = Arc::new(
+            body.build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap(),
+        );
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let known = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2f32).unwrap()));
+        let folded = context
+            .fold_or_residualize(
+                RematerializeOperation::new(save_nothing()),
+                AttachedRegions::Callees(std::slice::from_ref(&body)),
+                &[known],
+            )
+            .unwrap();
+        assert_eq!(folded[0].as_known(), Some(&TestValue::Array(Array::scalar(-2f32).unwrap())));
+        assert!(context.builder.borrow().instructions().is_empty());
+        assert_eq!(context.builder.borrow().regions.len(), 0);
+
+        let input = context.unknown_input(ArrayType::scalar(DataType::F32).into(), 0);
+        let first = context
+            .fold_or_residualize(
+                RematerializeOperation::new(save_nothing()),
+                AttachedRegions::Callees(std::slice::from_ref(&body)),
+                &[input],
+            )
+            .unwrap();
+        let second = context
+            .fold_or_residualize(
+                RematerializeOperation::new(save_nothing()),
+                AttachedRegions::Callees(std::slice::from_ref(&body)),
+                &first,
+            )
+            .unwrap();
+        let evaluation = context.into_evaluation(second).unwrap();
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = rematerialize [policy=\"save_nothing\"] %0 [
+                    body=^0={
+                        lambda %0:f32[] .
+                        let %1:f32[] = neg %0
+                        in (%1)
+                    },
+                ]
+                    %2:f32[] = rematerialize [policy=\"save_nothing\"] %1 [
+                        body=^0,
+                    ]
+                in (%2)"},
+        );
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[TestValue::Array(Array::scalar(2f32).unwrap())]),
+            Ok(vec![TestValue::Array(Array::scalar(2f32).unwrap())]),
+        );
+    }
+
+    #[test]
     fn test_partial_evaluation_context_residualize() {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         let inputs = [
@@ -3338,8 +3410,8 @@ mod tests {
                 in (%1, %2)"},
         );
         assert_eq!(
-            evaluation.interpret(&EagerContext::new(), &[TestValue::Array(Array::scalar(2f32).unwrap())]),
-            Ok(vec![TestValue::Array(Array::scalar(2f32).unwrap()), TestValue::Array(Array::scalar(-2f32).unwrap())])
+            evaluation.interpret(&EagerContext::new(), &[]),
+            Ok(vec![TestValue::Array(Array::scalar(2f32).unwrap()), TestValue::Array(Array::scalar(-2f32).unwrap())]),
         );
     }
 
@@ -3423,8 +3495,8 @@ mod tests {
             vec![
                 TestValue::Array(Array::scalar(-2f32).unwrap()),
                 TestValue::Array(Array::scalar(-3f32).unwrap()),
-                TestValue::Array(Array::scalar(3f32).unwrap())
-            ]
+                TestValue::Array(Array::scalar(3f32).unwrap()),
+            ],
         );
         assert_eq!(partition.residual_program().interpret(vec![known[2].clone()]), Ok(vec![known[1].clone()]));
     }
