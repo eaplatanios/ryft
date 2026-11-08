@@ -17,10 +17,11 @@ use ryft_core::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, ProgramBatchingOutputAxesPolicy, ProgramError, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot,
-    RematerializationOptimizationBarrier, ShardMapOperation, StagedCallOperation, Tracer as CoreTracer, TracingContext,
-    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming,
-    TypeRefinements, Typed, TypedProgram, Value as CoreValue, ValueProjection, ValueResolution, Zero,
+    Region as CoreRegion, RegionDataFlow, RegionId, RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot,
+    RematerializationOptimizationBarrier, ResidualInputSource, ResidualPolicyReference, ShardMapOperation,
+    StagedCallOperation, Tracer as CoreTracer, TracingContext, Transform, TransformArtifact, TransposableOperation,
+    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
+    TypedProgram, Value as CoreValue, ValueProjection, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -1208,15 +1209,20 @@ where
 // sides.
 //
 // The split fires whenever the known-ness of the call inputs is mixed (i.e., some inputs are known and some are not).
-// All-unknown calls preserve the original boundary. All-known calls normally do too, except that a residual policy
-// can inline a pure callee into a live known-side trace. This exposes its intermediate producers to demand-driven
-// residual placement, so a policy can save a compact intermediate rather than the callee's expanded output. Eager
-// calls and callees with references, captures, or nominal type identities keep their boundary. Whether the mixed
-// call's known inputs are concrete values of an eager known-side context or tracers into a live
-// outer trace does not matter, as in JAX's call partial-evaluation rules, which always bind the known call: the known
-// side is bound through the default fold-or-residualize policy, which compiles and executes it under an eager context
-// (e.g., [`Domain`](crate::Domain)) and stages it into the outer program under a staging context. The `shard_map`
-// rule follows the same policy.
+// All-known and all-unknown calls preserve the original boundary, and a callee interned as a shared region stays
+// shared, so that repeated calls of one callee keep sharing one region on either side. Under a residual policy, the
+// outputs of a pure all-known call that only forward call inputs resolve to those inputs, and a residual planner that
+// demands an output of such a call whose callee saves interior values asks this rule to split the call on residual
+// demand (refer to `PartialEvaluationDriver::residual_demand` and `split_jit_call_on_residual_demand`). The split binds
+// a known call that also returns those values and a replay call that recomputes the demanded outputs from them, as
+// JAX's `_pjit_partial_eval_custom` does. Its two callees are shared regions retained by the region transform cache of
+// the callee, so repeated and nested calls of one callee reuse one split instead of inlining its body at every call
+// site. Callees with effects, references, captures, or nominal type identities keep their boundary. Whether the mixed
+// call's known inputs are concrete values of an eager known-side context or tracers into a live outer trace does not
+// matter, as in JAX's call partial-evaluation rules, which always bind the known call: the known side is bound through
+// the default fold-or-residualize policy, which compiles and executes it under an eager context (e.g.,
+// [`Domain`](crate::Domain)) and stages it into the outer program under a staging context. The `shard_map` rule follows
+// the same policy.
 //
 // When the split fires, the callee is split through the shared
 // [`PartitionedProgram`](ryft_core::partial::PartitionedProgram) machinery: the known side is bound into the
@@ -1241,21 +1247,16 @@ where
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         let all_known = inputs.iter().all(PartialEvaluationValue::is_known);
-        // Inlining an all-known callee exposes its producers to the policy only when they can be staged into the
-        // known-side trace. Keep eager calls whole instead of replacing one compiled call with per-operation dispatch.
-        let inline_known = all_known
-            && context.residual_policy().is_some()
-            && inputs.iter().any(|input| {
-                input
-                    .as_known()
-                    .is_some_and(|value| matches!(context.parent().resolve(value), ValueResolution::Staged(_)))
-            });
-        if (all_known && !inline_known) || inputs.iter().all(PartialEvaluationValue::is_unknown) {
-            return context.fold_or_residualize(
-                Operation::JitCall(self.clone()),
-                driver.regions().map(|region| region.to_program()).collect(),
-                inputs,
-            );
+        if all_known && let Some(demanded_outputs) = driver.residual_demand() {
+            return split_jit_call_on_residual_demand(self, context, driver, inputs, demanded_outputs);
+        }
+        if all_known || inputs.iter().all(PartialEvaluationValue::is_unknown) {
+            let outputs = fold_or_residualize_jit_call(self, context, driver, inputs)?;
+            let callee = driver.region(0)?;
+            if all_known && context.residual_policy().is_some() && !keeps_jit_call_boundary(callee, inputs) {
+                return Ok(forward_jit_call_inputs(callee, inputs, outputs));
+            }
+            return Ok(outputs);
         }
         // Split the callee through the shared online boundary machinery, bind the known side into the enclosing
         // known-side context wrapped in a fresh `jit_call` over the original known call inputs, emit the residual
@@ -1275,7 +1276,7 @@ where
                 .instructions_in_closure()
                 .any(|(_, instruction)| instruction.operation().effects().has_accesses());
         if accesses_references {
-            return context.fold_or_residualize(Operation::JitCall(self.clone()), vec![callee.to_program()], inputs);
+            return fold_or_residualize_jit_call(self, context, driver, inputs);
         }
         // Partitioning does not remap the absolute indices of capture constants retained in attached regions, so a
         // split boundary would leave them naming a compacted or absent capture prefix — failing lowering at best and
@@ -1284,23 +1285,7 @@ where
         if callee.contains_atom_in_closure(|atom| {
             atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
         }) {
-            return context.fold_or_residualize(Operation::JitCall(self.clone()), vec![callee.to_program()], inputs);
-        }
-        if all_known {
-            // Keep effectful work and nominally scoped types behind their validated call boundary. The pure,
-            // identity-free case can replay into this context directly; placement still happens only when residual
-            // work actually demands a value, so unused outputs cannot trigger policy decisions or rejections.
-            if !callee.effects().classes().is_empty()
-                || inputs.iter().any(|input| input.r#type().identities().next().is_some())
-                || callee.contains_atom_type_in_closure(|r#type| r#type.identities().next().is_some())
-            {
-                return context.fold_or_residualize(
-                    Operation::JitCall(self.clone()),
-                    vec![callee.to_program()],
-                    inputs,
-                );
-            }
-            return driver.partially_evaluate_region(context, 0, inputs.to_vec());
+            return fold_or_residualize_jit_call(self, context, driver, inputs);
         }
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
         let partition = driver.partition_program(context, callee, input_known.as_slice())?;
@@ -1308,7 +1293,7 @@ where
         // can only forward known inputs as residual edges), so keep the original boundary and let the default
         // materialize those knowns directly as residual feeders.
         if partition.known_program().instructions().is_empty() {
-            return context.fold_or_residualize(Operation::JitCall(self.clone()), vec![callee.to_program()], inputs);
+            return fold_or_residualize_jit_call(self, context, driver, inputs);
         }
         // Feed the residual call directly from the known call inputs and known call outputs that residual edges would
         // merely repeat (JAX's `in_fwd` and `out_fwd`), so that the known-side call returns each value once.
@@ -1865,6 +1850,213 @@ impl LowerableOperation for JitCallOperation<ArrayIrType> {
     }
 }
 
+/// [`Region`](CoreRegion) [`Transform`] marker for the splits of a `jit_call` callee on residual demand that
+/// [`split_jit_call_on_residual_demand`] binds. Such a split partitions the callee with every input a fresh known
+/// input of a fresh trace, so, unlike a split by knownness, it depends on no value of a live context and is a
+/// structural function of the callee and of its [`JitCallResidualDemandArguments`].
+struct JitCallResidualDemandTransform;
+
+impl<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>> Transform<CoreRegion<V, O>>
+    for JitCallResidualDemandTransform
+{
+    type Arguments = JitCallResidualDemandArguments;
+    type Artifact = TransformArtifact<V, O, JitCallResidualDemandSplit>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = 4;
+}
+
+/// Argument key for one retained [`JitCallResidualDemandTransform`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct JitCallResidualDemandArguments {
+    /// Outputs of the callee that the residual planner demands, marked in output order.
+    demanded_outputs: Vec<bool>,
+
+    /// Residual policy that decides which interior values the known callee saves, compared by definition identity.
+    policy: ResidualPolicyReference<ArrayIrType>,
+
+    /// Whether effectful operations with known inputs may fold into the known callee (refer to
+    /// [`PartialEvaluationContext::allow_effect_folding`]).
+    allow_effect_folding: bool,
+}
+
+/// Boundary wiring of a retained [`JitCallResidualDemandTransform`] artifact, whose programs are the known callee and
+/// the replay callee, in that order. The known callee returns the outputs of the original callee followed by the values
+/// that the replay callee reads from it, and the replay callee returns the demanded outputs, in output order.
+#[derive(Clone, Debug, PartialEq)]
+struct JitCallResidualDemandSplit {
+    /// Index of the call input feeding each input of the known callee, in order.
+    known_input_indices: Vec<usize>,
+
+    /// Source of each input of the replay callee, which is a call input, an output of the known callee, or a value
+    /// that the known callee saves.
+    residual_inputs: Vec<ResidualInputSource>,
+}
+
+/// Folds or residualizes `operation` as one whole call (refer to [`PartialEvaluationContext::fold_or_residualize`]).
+/// A callee interned as a shared region is bound by reference, so that repeated calls of one callee keep sharing one
+/// region in the known-side context and in the residual program.
+fn fold_or_residualize_jit_call<V, C, D>(
+    operation: &JitCallOperation<ArrayIrType>,
+    context: &PartialEvaluationContext<C>,
+    driver: &D,
+    inputs: &[PartialEvaluationValue<C::Value>],
+) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
+where
+    V: CoreValue<Type = ArrayIrType>
+        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
+        + CaptureConstant,
+    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>>,
+    D: PartialEvaluationDriver<C>,
+{
+    let callee = driver.region(0)?;
+    match callee.interned_callee() {
+        Some(callee) => context.fold_or_residualize_using_attached_regions(
+            Operation::JitCall(operation.clone()),
+            AttachedRegions::Callees(std::slice::from_ref(callee)),
+            inputs,
+        ),
+        None => context.fold_or_residualize(Operation::JitCall(operation.clone()), vec![callee.to_program()], inputs),
+    }
+}
+
+/// Returns whether an all-known call of `callee` with `inputs` keeps its boundary under a residual policy, which is the
+/// case when `callee` has effects, references, nominal type identities, or capture constants. Splitting such a call on
+/// residual demand, or forwarding its outputs, would move effects, reference accesses, nominally scoped types, or
+/// captures that name its capture prefix across the boundary that validates them.
+fn keeps_jit_call_boundary<V: CoreValue<Type = ArrayIrType> + CaptureConstant, O, W: CoreValue>(
+    callee: RegionRef<'_, V, O>,
+    inputs: &[PartialEvaluationValue<W>],
+) -> bool
+where
+    O: CoreOperation<Type = ArrayIrType>,
+{
+    !callee.effects().classes().is_empty()
+        || inputs
+            .iter()
+            .any(|input| input.r#type().is_reference() || input.r#type().identities().next().is_some())
+        || callee.contains_atom_type_in_closure(|r#type| r#type.is_reference() || r#type.identities().next().is_some())
+        || callee.contains_atom_in_closure(|atom| {
+            atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
+        })
+}
+
+/// Returns `outputs`, the outputs of a call of `callee` with `inputs`, with every output that `callee` returns by
+/// forwarding one of its inputs replaced by that call input, like the input forwarding of JAX's `pjit` staging rule. An
+/// all-known call that partial evaluation keeps whole under a residual policy uses this, so that the residual planner
+/// sees such an output as the call input that it is, rather than as an output of the call that it would save separately
+/// (e.g., a primal input that the primal call of a linearized callee returns as a residual).
+fn forward_jit_call_inputs<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>, W: CoreValue>(
+    callee: RegionRef<'_, V, O>,
+    inputs: &[PartialEvaluationValue<W>],
+    outputs: Vec<PartialEvaluationValue<W>>,
+) -> Vec<PartialEvaluationValue<W>> {
+    outputs
+        .into_iter()
+        .zip(callee.output_ids())
+        .map(|(output, atom)| {
+            match callee.input_ids().iter().position(|input| input == atom).map(|position| &inputs[position]) {
+                Some(input) if input.r#type() == output.r#type() => input.clone(),
+                _ => output,
+            }
+        })
+        .collect()
+}
+
+/// Splits the all-known `operation` on residual demand for the outputs that `demanded_outputs` marks (refer to
+/// [`PartialEvaluationDriver::residual_demand`]), and returns the outputs of its known call followed by the outputs of
+/// its replay call. The known call binds a known callee in the known-side context, which computes every output of the
+/// callee together with the interior values that the residual policy of `context` saves, and the replay call is
+/// emitted into the residual program, where it recomputes the demanded outputs from those values and from the call
+/// inputs that it reads, which are forwarded rather than returned by the known call.
+///
+/// The two callees are retained by the region transform cache of the callee (refer to
+/// [`JitCallResidualDemandTransform`]) and bound as shared regions. Every call of one callee, including the calls
+/// nested in the callees of an enclosing split, therefore shares one known callee and one replay callee for each set
+/// of demanded outputs and each policy, so the programs grow with the number of calls rather than with the size of
+/// their inlined bodies. A callee with effects, references, captures, or nominal type identities keeps the call whole,
+/// and the residual planner then saves its demanded outputs.
+fn split_jit_call_on_residual_demand<V, C, D>(
+    operation: &JitCallOperation<ArrayIrType>,
+    context: &PartialEvaluationContext<C>,
+    driver: &D,
+    inputs: &[PartialEvaluationValue<C::Value>],
+    demanded_outputs: &[bool],
+) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
+where
+    V: CoreValue<Type = ArrayIrType>
+        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
+        + CaptureConstant,
+    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>>,
+    D: PartialEvaluationDriver<C>,
+{
+    let callee = driver.region(0)?;
+    let Some(policy) = context.residual_policy() else {
+        return fold_or_residualize_jit_call(operation, context, driver, inputs);
+    };
+    if keeps_jit_call_boundary(callee, inputs) {
+        return fold_or_residualize_jit_call(operation, context, driver, inputs);
+    }
+
+    let arguments = JitCallResidualDemandArguments {
+        demanded_outputs: demanded_outputs.to_vec(),
+        policy: policy.clone(),
+        allow_effect_folding: context.allow_effect_folding(),
+    };
+    let artifact =
+        callee.transform::<JitCallResidualDemandTransform, _, ProgramError>(arguments, |callee, arguments| {
+            // The replay callee reads the call inputs and the known outputs that its residual edges would merely repeat
+            // directly (JAX's `in_fwd` and `out_fwd`), so that the known callee returns each value once and the
+            // residual planner plans those inputs like any other demanded value.
+            let partition = driver
+                .partition_residual_demand(context, callee, &arguments.demanded_outputs)?
+                .forward_residuals()?;
+            let (known_program, replay_program, known_input_indices, residual_inputs, _) = partition.into_parts();
+            Ok(TransformArtifact::new(
+                vec![Arc::new(known_program), Arc::new(replay_program)],
+                JitCallResidualDemandSplit { known_input_indices, residual_inputs },
+            ))
+        })?;
+    let [known_callee, replay_callee] = artifact.programs() else {
+        unreachable!("`jit_call` residual demand splits retain a known callee and a replay callee");
+    };
+    let split = artifact.metadata();
+
+    // The known callee keeps the members of the lifted capture prefix that it uses as its leading inputs, in order.
+    // The replay callee reads no capture prefix, and neither callee holds a capture constant.
+    let known_capture_count =
+        split.known_input_indices.iter().filter(|index| **index < operation.capture_count()).count();
+    let known_call = JitCallOperation::new(known_capture_count)
+        .with_callee_type_signature(&known_callee.input_types(), &known_callee.output_types())?;
+    let replay_call = JitCallOperation::new(0)
+        .with_callee_type_signature(&replay_callee.input_types(), &replay_callee.output_types())?;
+    let known_inputs = split.known_input_indices.iter().map(|index| inputs[*index].clone()).collect::<Vec<_>>();
+    let known_outputs = context.fold_or_residualize_using_attached_regions(
+        Operation::JitCall(known_call),
+        AttachedRegions::Callees(std::slice::from_ref(known_callee)),
+        &known_inputs,
+    )?;
+    let known_outputs = forward_jit_call_inputs(known_callee.entry_region_ref(), &known_inputs, known_outputs);
+    let output_count = demanded_outputs.len();
+    let replay_inputs = split
+        .residual_inputs
+        .iter()
+        .map(|source| match *source {
+            ResidualInputSource::KnownInput(index) => Ok(inputs[index].clone()),
+            ResidualInputSource::KnownOutput(index) => Ok(known_outputs[index].clone()),
+            ResidualInputSource::ResidualEdge(edge) => Ok(known_outputs[output_count + edge].clone()),
+            ResidualInputSource::UnknownInput(_) => Err(ProgramError::MalformedProgram(
+                "a `jit_call` split on residual demand reads an unknown input".to_string(),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let replayed_outputs = context.residualize_using_attached_regions(
+        Operation::JitCall(replay_call),
+        AttachedRegions::Callees(std::slice::from_ref(replay_callee)),
+        &replay_inputs,
+    )?;
+    Ok(known_outputs[..output_count].iter().cloned().chain(replayed_outputs).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1877,15 +2069,15 @@ mod tests {
         CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context, CosOperation,
         CotangentDestinationKind, CotangentDestinations, CustomCallOperation, DataType, DifferentiableType,
         DifferentiationError, Dimension as CoreDimension, DimensionBounds, DimensionFromScalarOperation, DimensionType,
-        DimensionValue, DimensionVariable, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation, EffectClasses,
-        InputRegionProvenance, IotaOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, NoStorage,
-        NothingSavable, Operation as CoreOperation, OutputRegionProvenance, PartialValue, Placeholder, PrintOperation,
-        ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver, ReferenceAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
-        ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface, RegionRef,
-        RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyReference,
-        ResidualRejection, ScanOperation, Shape, Sharding, ShardingDimension, SinOperation, StagingContext,
-        TagOperation, Tracer as CoreTracer, TracingContext, TransposeOperation, TransposedProgram,
+        DimensionValue, DimensionVariable, DotDimensionNumbers, DotOperation, DotsSavable, DynamicBroadcastOperation,
+        EffectClasses, InputRegionProvenance, IotaOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
+        MulOperation, NoStorage, NothingSavable, Operation as CoreOperation, OutputRegionProvenance, PartialValue,
+        Placeholder, PrintOperation, ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface,
+        RegionRef, RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy,
+        ResidualPolicyReference, ResidualRejection, ScanOperation, Shape, Sharding, ShardingDimension, SinOperation,
+        StagingContext, TagOperation, Tracer as CoreTracer, TracingContext, TransposeOperation, TransposedProgram,
         TransposedProgramCotangent, TranspositionDriver, TypeError, TypeIdentity, Typed, TypedProgram,
         Value as CoreValue, ZeroLikeOperation, ZeroOperation,
     };
@@ -2043,6 +2235,121 @@ mod tests {
             .iter()
             .map(|output| values_from_bytes::<f32>(&output.copy_to_host(None).unwrap().r#await().unwrap()))
             .collect()
+    }
+
+    /// Returns the `f32[2, 2]` matrix type of the residual demand workloads.
+    fn residual_demand_matrix_type() -> ArrayIrType {
+        ArrayIrType::from(ArrayType::new_static(DataType::F32, [2, 2]))
+    }
+
+    /// Returns `(a, b) ↦ sin(a · b) ⊙ cos(a · b) + a`, the shared callee of the residual demand workloads, whose matrix
+    /// product `DotsSavable` saves while it recomputes the rest of the callee.
+    fn residual_demand_leaf_callee() -> Arc<FlatProgram> {
+        let mut builder = ArrayIrProgramBuilder::new();
+        let left = builder.add_input(residual_demand_matrix_type());
+        let right = builder.add_input(residual_demand_matrix_type());
+        let dot = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]));
+        let product = builder.add_instruction(dot, Vec::new(), vec![left, right], None).unwrap()[0];
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![product], None).unwrap()[0];
+        let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![product], None).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, cosine], None).unwrap()[0];
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, left], None).unwrap()[0];
+        Arc::new(
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap(),
+        )
+    }
+
+    /// Returns the nested diamond `g_k(a, b) = g_{k-1}(a, b) + g_{k-1}(sin a, b)` of `depth` levels over the shared
+    /// residual demand callee `g_0`, where each level calls the previous level twice through one shared callee.
+    fn residual_demand_diamond_callee(depth: usize) -> Arc<FlatProgram> {
+        let mut callee = residual_demand_leaf_callee();
+        for _ in 0..depth {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let left = builder.add_input(residual_demand_matrix_type());
+            let right = builder.add_input(residual_demand_matrix_type());
+            let first = add_jit_call(&mut builder, &callee, vec![left, right]);
+            let shifted = builder.add_instruction(SinOperation::new(), Vec::new(), vec![left], None).unwrap()[0];
+            let second = add_jit_call(&mut builder, &callee, vec![shifted, right]);
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![first, second], None).unwrap()[0];
+            callee = Arc::new(
+                builder
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                    .unwrap(),
+            );
+        }
+        callee
+    }
+
+    /// Returns `(x, w, b) ↦ x ⊙ y`, where `body` stages the all-known calls that compute `y` from `w` and `b`, and,
+    /// when `policy` is provided, wraps that function in a rematerialization under `policy`. Differentiating only `x`
+    /// makes `y` the only value that the tangent needs, so every call stays all-known.
+    fn residual_demand_program(
+        policy: Option<ResidualPolicyReference<ArrayIrType>>,
+        body: impl Fn(&mut ArrayIrProgramBuilder, AtomId, AtomId) -> AtomId,
+    ) -> FlatProgram {
+        let mut builder = ArrayIrProgramBuilder::new();
+        let inputs = (0..3).map(|_| builder.add_input(residual_demand_matrix_type())).collect::<Vec<_>>();
+        let called = body(&mut builder, inputs[1], inputs[2]);
+        let output =
+            builder.add_instruction(MulOperation::new(), Vec::new(), vec![inputs[0], called], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let Some(policy) = policy else {
+            return program;
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let inputs = (0..3).map(|_| builder.add_input(residual_demand_matrix_type())).collect::<Vec<_>>();
+        let body = builder.import_program(program);
+        let output = builder.add_instruction(RematerializeOperation::new(policy), vec![body], inputs, None).unwrap()[0];
+        builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap()
+    }
+
+    /// Returns the residual count of the linearization of `program` with respect to its first input, followed by the
+    /// numbers of instructions in the complete region closures of its primal and tangent programs, which count every
+    /// shared callee once.
+    fn residual_demand_statistics(program: &FlatProgram) -> [usize; 3] {
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let closure_size = |program: &FlatProgram| program.entry_region_ref().instructions_in_closure().count();
+        [linearization.residual_count(), closure_size(linearization.primal()), closure_size(linearization.tangent())]
+    }
+
+    /// Asserts that the linearizations of `rematerialized` and `plain` with respect to their first inputs compute the
+    /// same primal output, tangent, and cotangent on fixed inputs, up to the rounding differences that recomputing
+    /// transcendental functions in differently fused XLA kernels introduces.
+    fn assert_residual_demand_linearizations_match(
+        client: &ryft_pjrt::Client<'_>,
+        rematerialized: &FlatProgram,
+        plain: &FlatProgram,
+    ) {
+        let execute = |program: &FlatProgram| {
+            let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+            let inputs =
+                vec![vec![0.5f32, -1.0, 0.25, 2.0], vec![0.3f32, 0.1, -0.2, 0.4], vec![0.7f32, -0.6, 0.2, 0.9]];
+            let mut primal = execute_f32_program(client, linearization.primal(), inputs);
+            let value = primal.remove(0);
+            let tangent_inputs = std::iter::once(vec![1.0f32, 0.5, -0.5, 0.25]).chain(primal.clone()).collect();
+            let tangent = execute_f32_program(client, linearization.tangent(), tangent_inputs);
+            let pullback_inputs = std::iter::once(vec![-1.5f32, 0.75, 2.0, 1.0]).chain(primal).collect();
+            let pullback =
+                execute_f32_program(client, &linearization.pullback().unwrap().into_program(), pullback_inputs);
+            [value, tangent[0].clone(), pullback[0].clone()].concat()
+        };
+        let actual = execute(rematerialized);
+        let expected = execute(plain);
+        assert_eq!(actual.len(), expected.len());
+        assert!(
+            actual
+                .iter()
+                .zip(&expected)
+                .all(|(actual, expected)| (actual - expected).abs() <= 1e-5 * expected.abs().max(1.0)),
+            "{actual:?} != {expected:?}",
+        );
     }
 
     #[test]
@@ -4766,7 +5073,8 @@ mod tests {
         use crate::tests::execution_client;
 
         // Only the expanded activation is needed by the tangent. Its all-known call must expose the compact tagged
-        // scale to the policy, saving 4 KiB instead of 256 KiB and replaying only the broadcast.
+        // scale to the policy, saving 4 KiB instead of 256 KiB, so the call is split on residual demand into a known
+        // call that also returns the scale and a replay call that recomputes only the broadcast.
         let compact_type = ArrayType::new_static(DataType::F32, [1024]);
         let expanded_type = ArrayType::new_static(DataType::F32, [64, 1024]);
         let mut builder = ArrayIrProgramBuilder::new();
@@ -4813,13 +5121,25 @@ mod tests {
                 ]
                 known={
                     lambda %0:f32[1024] .
-                    let %1:f32[1024] = sin %0
-                        %2:f32[1024] = tag [key=scale] %1
-                    in (%2)
+                    let %1:f32[1024] = jit_call %0 [
+                        callee={
+                            lambda %0:f32[1024] .
+                            let %1:f32[1024] = sin %0
+                                %2:f32[1024] = tag [key=scale] %1
+                            in (%2)
+                        },
+                    ]
+                    in (%1)
                 }
                 residual={
                     lambda %0:f32[64, 1024], %1:f32[1024] .
-                    let %2:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %1
+                    let %2:f32[64, 1024] = jit_call %1 [
+                        callee={
+                            lambda %0:f32[1024] .
+                            let %1:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %0
+                            in (%1)
+                        },
+                    ]
                         %3:f32[64, 1024] = mul %0 %2
                     in (%3)
                 }"},
@@ -4848,16 +5168,28 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f32[64, 1024], %1:f32[1024] .
-                let %2:f32[1024] = sin %1
-                    %3:f32[1024] = tag [key=scale] %2
-                    %4:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %3
-                    %5:f32[64, 1024] = mul %0 %4
-                in (%5, %3)
+                let %2:f32[64, 1024], %3:f32[1024] = jit_call %1 [
+                    callee={
+                        lambda %0:f32[1024] .
+                        let %1:f32[1024] = sin %0
+                            %2:f32[1024] = tag [key=scale] %1
+                            %3:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %2
+                        in (%3, %2)
+                    },
+                ]
+                    %4:f32[64, 1024] = mul %0 %2
+                in (%4, %3)
                 lambda %0:f32[64, 1024], %1:f32[1024] .
                 let %2:f32[64, 1024] = rematerialize [policy=\"save_only_these_names\", differentiated=true] %0 %1 [
                     body={
                         lambda %0:f32[64, 1024], %1:f32[1024] .
-                        let %2:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %1
+                        let %2:f32[64, 1024] = jit_call %1 [
+                            callee={
+                                lambda %0:f32[1024] .
+                                let %1:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %0
+                                in (%1)
+                            },
+                        ]
                             %3:f32[64, 1024] = mul %2 %0
                         in (%3)
                     },
@@ -4932,7 +5264,8 @@ mod tests {
                 }
             }));
 
-        // The second call output remains a primal result. Its presence must not classify it as a residual.
+        // The second call output remains a primal result. Its presence must not classify it as a residual. The call
+        // keeps its boundary, and the policy saves its first output, which it classifies through the callee.
         let primal_only = program.with_outputs(&[0, 2]).unwrap();
         let placed = primal_only.partition_with_residual_policy(&[true, false], &policy).unwrap();
         assert_eq!(placed.known_program().output_types(), vec![scalar_type.clone(), scalar_type]);
@@ -4946,11 +5279,17 @@ mod tests {
                 ]
                 known={
                     lambda %0:f32[] .
-                    let %1:f32[] = cos %0
-                        %2:f32[] = tag [key=unused] %1
-                        %3:f32[] = sin %0
-                        %4:f32[] = tag [key=needed] %3
-                    in (%2, %4)
+                    let %1:f32[], %2:f32[] = jit_call %0 [
+                        callee={
+                            lambda %0:f32[] .
+                            let %1:f32[] = sin %0
+                                %2:f32[] = tag [key=needed] %1
+                                %3:f32[] = cos %0
+                                %4:f32[] = tag [key=unused] %3
+                            in (%2, %4)
+                        },
+                    ]
+                    in (%2, %1)
                 }
                 residual={
                     lambda %0:f32[], %1:f32[] .
@@ -5065,6 +5404,296 @@ mod tests {
         context.bind(Operation::JitCall(JitCallOperation::new(0)), vec![callee], &[input]).unwrap();
         assert_eq!(outer.builder().borrow().instructions().len(), 1);
         assert!(matches!(outer.builder().borrow().instructions()[0].operation(), Operation::JitCall(_)));
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_splits_repeated_all_known_calls_on_residual_demand() {
+        let callee = residual_demand_leaf_callee();
+        let repeated = |count: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
+            residual_demand_program(policy, |builder, weights, bias| {
+                (0..count).fold(weights, |hidden, _| add_jit_call(builder, &callee, vec![hidden, bias]))
+            })
+        };
+
+        // Every call is split into a known call that also returns its matrix product and a replay call that recomputes
+        // its output from that product. All calls share one known callee and one replay callee, so the residual count
+        // and the programs grow by one per call (i.e., the saved product and the call itself) rather than by the size
+        // of the inlined callee, which made them grow by five and four instructions per call.
+        let policy = ResidualPolicyReference::new(DotsSavable);
+        assert_eq!(
+            [1, 2, 4, 8].map(|count| residual_demand_statistics(&repeated(count, Some(policy.clone())))),
+            [[2, 7, 7], [3, 8, 8], [5, 10, 10], [9, 14, 14]],
+        );
+        let linearization = repeated(2, Some(policy.clone())).linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                let %3:f32[2, 2], %4:f32[2, 2] = jit_call %1 %2 [
+                    callee=^0={
+                        lambda %0:f32[2, 2], %1:f32[2, 2] .
+                        let %2:f32[2, 2] = dot [
+                            dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        ] %0 %1
+                            %3:f32[2, 2] = sin %2
+                            %4:f32[2, 2] = cos %2
+                            %5:f32[2, 2] = mul %3 %4
+                            %6:f32[2, 2] = add %5 %0
+                        in (%6, %2)
+                    },
+                ]
+                    %5:f32[2, 2], %6:f32[2, 2] = jit_call %3 %2 [
+                        callee=^0,
+                    ]
+                    %7:f32[2, 2] = mul %0 %5
+                in (%7, %1, %4, %6)
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2] .
+                let %4:f32[2, 2] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 %2 %3 [
+                    body={
+                        lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2] .
+                        let %4:f32[2, 2] = jit_call %1 %2 [
+                            callee=^0={
+                                lambda %0:f32[2, 2], %1:f32[2, 2] .
+                                let %2:f32[2, 2] = sin %1
+                                    %3:f32[2, 2] = cos %1
+                                    %4:f32[2, 2] = mul %2 %3
+                                    %5:f32[2, 2] = add %4 %0
+                                in (%5)
+                            },
+                        ]
+                            %5:f32[2, 2] = jit_call %4 %3 [
+                                callee=^0,
+                            ]
+                            %6:f32[2, 2] = mul %5 %0
+                        in (%6)
+                    },
+                ]
+                in (%4)"},
+        );
+
+        // Rematerialization changes neither the primal value nor the derivatives.
+        let client = execution_client();
+        assert_residual_demand_linearizations_match(&client, &repeated(4, Some(policy)), &repeated(4, None));
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_splits_nested_all_known_calls_on_residual_demand() {
+        let nested = |depth: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
+            let callee = residual_demand_diamond_callee(depth);
+            residual_demand_program(policy, |builder, weights, bias| {
+                add_jit_call(builder, &callee, vec![weights, bias])
+            })
+        };
+
+        // The split of each level contains the shared splits of the level below it, so the programs grow by four
+        // instructions per level (i.e., one known or replay call, the second call that shares its callee, and the
+        // shifted input and sum of the level) while the saved matrix products double, as in JAX. Inlining the calls
+        // instead doubled the programs with every level.
+        let policy = ResidualPolicyReference::new(DotsSavable);
+        assert_eq!(
+            [1, 2, 3, 4].map(|depth| residual_demand_statistics(&nested(depth, Some(policy.clone())))),
+            [[3, 11, 11], [5, 15, 15], [9, 19, 19], [17, 23, 23]],
+        );
+        let linearization = nested(1, Some(policy.clone())).linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                let %3:f32[2, 2], %4:f32[2, 2], %5:f32[2, 2] = jit_call %1 %2 [
+                    callee={
+                        lambda %0:f32[2, 2], %1:f32[2, 2] .
+                        let %2:f32[2, 2], %3:f32[2, 2] = jit_call %0 %1 [
+                            callee=^0={
+                                lambda %0:f32[2, 2], %1:f32[2, 2] .
+                                let %2:f32[2, 2] = dot [
+                                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                                ] %0 %1
+                                    %3:f32[2, 2] = sin %2
+                                    %4:f32[2, 2] = cos %2
+                                    %5:f32[2, 2] = mul %3 %4
+                                    %6:f32[2, 2] = add %5 %0
+                                in (%6, %2)
+                            },
+                        ]
+                            %4:f32[2, 2] = sin %0
+                            %5:f32[2, 2], %6:f32[2, 2] = jit_call %4 %1 [
+                                callee=^0,
+                            ]
+                            %7:f32[2, 2] = add %2 %5
+                        in (%7, %3, %6)
+                    },
+                ]
+                    %6:f32[2, 2] = mul %0 %3
+                in (%6, %1, %4, %5)
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2] .
+                let %4:f32[2, 2] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 %2 %3 [
+                    body={
+                        lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2], %3:f32[2, 2] .
+                        let %4:f32[2, 2] = jit_call %1 %2 %3 [
+                            callee={
+                                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                                let %3:f32[2, 2] = jit_call %0 %1 [
+                                    callee=^0={
+                                        lambda %0:f32[2, 2], %1:f32[2, 2] .
+                                        let %2:f32[2, 2] = sin %1
+                                            %3:f32[2, 2] = cos %1
+                                            %4:f32[2, 2] = mul %2 %3
+                                            %5:f32[2, 2] = add %4 %0
+                                        in (%5)
+                                    },
+                                ]
+                                    %4:f32[2, 2] = sin %0
+                                    %5:f32[2, 2] = jit_call %4 %2 [
+                                        callee=^0,
+                                    ]
+                                    %6:f32[2, 2] = add %3 %5
+                                in (%6)
+                            },
+                        ]
+                            %5:f32[2, 2] = mul %4 %0
+                        in (%5)
+                    },
+                ]
+                in (%4)"},
+        );
+
+        let client = execution_client();
+        assert_residual_demand_linearizations_match(&client, &nested(3, Some(policy)), &nested(3, None));
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_replays_all_known_calls_without_saved_interior_values() {
+        let callee = residual_demand_leaf_callee();
+        let repeated = |count: usize, policy: Option<ResidualPolicyReference<ArrayIrType>>| {
+            residual_demand_program(policy, |builder, weights, bias| {
+                (0..count).fold(weights, |hidden, _| add_jit_call(builder, &callee, vec![hidden, bias]))
+            })
+        };
+
+        // A policy that saves nothing splits no call. The tangent replays every call whole from the saved weights and
+        // bias, which it saves no matter how many calls there are, and the calls keep sharing one callee.
+        let policy = ResidualPolicyReference::new(NothingSavable);
+        assert_eq!(
+            [1, 2, 4, 8].map(|count| residual_demand_statistics(&repeated(count, Some(policy.clone())))),
+            [[2, 7, 8], [2, 8, 9], [2, 10, 11], [2, 14, 15]],
+        );
+        let linearization = repeated(2, Some(policy.clone())).linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                let %3:f32[2, 2] = jit_call %1 %2 [
+                    callee=^0={
+                        lambda %0:f32[2, 2], %1:f32[2, 2] .
+                        let %2:f32[2, 2] = dot [
+                            dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        ] %0 %1
+                            %3:f32[2, 2] = sin %2
+                            %4:f32[2, 2] = cos %2
+                            %5:f32[2, 2] = mul %3 %4
+                            %6:f32[2, 2] = add %5 %0
+                        in (%6)
+                    },
+                ]
+                    %4:f32[2, 2] = jit_call %3 %2 [
+                        callee=^0,
+                    ]
+                    %5:f32[2, 2] = mul %0 %4
+                in (%5, %1, %2)
+                lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                let %3:f32[2, 2] = rematerialize [differentiated=true] %0 %1 %2 [
+                    body={
+                        lambda %0:f32[2, 2], %1:f32[2, 2], %2:f32[2, 2] .
+                        let %3:f32[2, 2] = jit_call %1 %2 [
+                            callee=^0={
+                                lambda %0:f32[2, 2], %1:f32[2, 2] .
+                                let %2:f32[2, 2] = dot [
+                                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                                ] %0 %1
+                                    %3:f32[2, 2] = sin %2
+                                    %4:f32[2, 2] = cos %2
+                                    %5:f32[2, 2] = mul %3 %4
+                                    %6:f32[2, 2] = add %5 %0
+                                in (%6)
+                            },
+                        ]
+                            %4:f32[2, 2] = jit_call %3 %2 [
+                                callee=^0,
+                            ]
+                            %5:f32[2, 2] = mul %4 %0
+                        in (%5)
+                    },
+                ]
+                in (%3)"},
+        );
+
+        let client = execution_client();
+        assert_residual_demand_linearizations_match(&client, &repeated(4, Some(policy)), &repeated(4, None));
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_saves_guarded_known_callee_outputs_on_residual_demand() {
+        // Each callee computes a matrix product that `DotsSavable` saves, so replaying its call would recompute a saved
+        // value. An ordered assertion and a capture constant keep the boundary of the call, so the residual planner
+        // saves the demanded output of the call instead of splitting it.
+        let matrix_type = residual_demand_matrix_type();
+        let predicate_type = ArrayIrType::from(ArrayType::scalar(DataType::Boolean));
+        let dot = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]));
+        let check_saved_output = |callee: FlatProgram, capture_count: usize| {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let inputs = callee
+                .input_types()
+                .into_owned()
+                .into_iter()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
+            let tangent = builder.add_input(matrix_type.clone());
+            let input_count = inputs.len() + 1;
+            let callee = builder.import_program(callee);
+            let called = builder
+                .add_instruction(Operation::JitCall(JitCallOperation::new(capture_count)), vec![callee], inputs, None)
+                .unwrap()[0];
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![called, tangent], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; input_count], vec![Placeholder])
+                .unwrap();
+            let input_known = (0..input_count).map(|index| index + 1 < input_count).collect::<Vec<_>>();
+            let partition = program
+                .partition_with_residual_policy(&input_known, &ResidualPolicyReference::new(DotsSavable))
+                .unwrap();
+            assert_eq!(partition.known_program().instructions().len(), 1);
+            assert!(matches!(partition.known_program().instructions()[0].operation(), Operation::JitCall(_)));
+            assert_eq!(partition.known_program().output_ids(), partition.known_program().instructions()[0].outputs());
+        };
+
+        let mut builder = ArrayIrProgramBuilder::new();
+        let predicate = builder.add_input(predicate_type.clone());
+        let input = builder.add_input(matrix_type.clone());
+        builder
+            .add_instruction(AssertOperation::<ArrayType>::new("required predicate"), Vec::new(), vec![predicate], None)
+            .unwrap();
+        let product = builder.add_instruction(dot.clone(), Vec::new(), vec![input, input], None).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![product], None).unwrap()[0];
+        check_saved_output(
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap(),
+            0,
+        );
+
+        let mut builder = ArrayIrProgramBuilder::new();
+        builder.add_input(matrix_type.clone());
+        let input = builder.add_input(matrix_type.clone());
+        let captured = builder.add_constant(Constant::Captured(CaptureReference::new(0, matrix_type.clone())));
+        let product = builder.add_instruction(dot, Vec::new(), vec![input, captured], None).unwrap()[0];
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![product], None).unwrap()[0];
+        check_saved_output(
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap(),
+            1,
+        );
     }
 
     #[test]

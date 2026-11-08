@@ -19,14 +19,15 @@ def primitive_counts(program):
     counts = {}
 
     def visit(value):
-        if hasattr(value, "jaxpr"):
-            visit(value.jaxpr)
-        elif hasattr(value, "eqns"):
+        # A JAX 0.12 `Jaxpr` has a `jaxpr` attribute that is itself, so check `eqns` first to avoid infinite recursion.
+        if hasattr(value, "eqns"):
             for equation in value.eqns:
                 name = equation.primitive.name
                 counts[name] = counts.get(name, 0) + 1
                 for parameter in equation.params.values():
                     visit(parameter)
+        elif hasattr(value, "jaxpr"):
+            visit(value.jaxpr)
         elif isinstance(value, (list, tuple)):
             for item in value:
                 visit(item)

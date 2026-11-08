@@ -41,6 +41,12 @@ from ryft.jax.ragged_collective_testing import (
     ragged_reference,
     validate_ragged_observation,
 )
+from ryft.jax.rematerialization_testing import (
+    REMATERIALIZATION_CASES,
+    STABLEHLO_PATTERNS as REMATERIALIZATION_STABLEHLO_PATTERNS,
+    build_rematerialization_jax,
+    rematerialization_reference,
+)
 
 
 @dataclass(frozen=True)
@@ -622,6 +628,22 @@ def _collective_cases() -> tuple[DifferentialCase, ...]:
     )
 
 
+def _rematerialization_cases() -> tuple[DifferentialCase, ...]:
+    """Registers checkpoint policy workloads whose values and saved residuals have analytic references."""
+
+    return tuple(
+        DifferentialCase(
+            case.case_id,
+            "parity",
+            partial(build_rematerialization_jax, case),
+            stablehlo_patterns=REMATERIALIZATION_STABLEHLO_PATTERNS,
+            reference=partial(rematerialization_reference, case),
+            suite="rematerialization",
+        )
+        for case in REMATERIALIZATION_CASES
+    )
+
+
 def _ragged_cases() -> tuple[DifferentialCase, ...]:
     """Registers optional native CUDA ragged execution separately from the CPU matrix."""
 
@@ -660,7 +682,7 @@ DIFFERENTIAL_CASES = tuple(
     replace(case, suite="collectives", reference=partial(legacy_collective_reference, case.case_id))
     if index < 3 else case
     for index, case in enumerate(DIFFERENTIAL_CASES)
-) + _collective_cases() + _ragged_cases() + _distributed_cases()
+) + _collective_cases() + _rematerialization_cases() + _ragged_cases() + _distributed_cases()
 
 
 def build_jax_observations(

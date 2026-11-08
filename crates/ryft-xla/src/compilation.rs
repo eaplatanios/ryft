@@ -2329,16 +2329,19 @@ pub(crate) mod tests {
         CustomCallOperation, DataType, Device, DeviceMesh, DifferentiableType, Differentiate,
         Dimension as CoreDimension, DimensionBounds, DimensionSize, DimensionSizeOperation, DimensionVariable, Div,
         DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext,
-        Error as CoreError, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogicalMesh, Logistic,
-        MaybeZero, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, ParallelVaryOperation, Placeholder,
-        ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedValue, Random, Reduce, ReductionKind,
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion as CoreReferenceCompletion,
-        ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, Reshard, ScanOperation,
-        ScanOptions, Select, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax,
-        StagedFunction as CoreStagedFunction, StopGradient, StopGradientOperation, Sub, Tanh, TopK, Trace, Tracer,
-        TracingContext, TransferToMemory, Typed, TypedProgram, Value as CoreValue, ValueProjection, WhileOperation,
-        ZeroLike, batch, batch_in_parent, composite, differentiate_at, differentiate_in_parent_at, rematerialize, scan,
+        ErasedOperation, Error as CoreError, Exp, Fill, ForwardModeDifferentiate, Hessian, ImportingContext, Iota,
+        Jacobian, LogicalMesh, Logistic, MaybeZero, Memory, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike,
+        ParallelVaryOperation, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedValue, Random,
+        Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceCompletion as CoreReferenceCompletion, ReferenceCompletionBackend, ReferenceError, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceType, Reshape, ReshapeOperation, Reshard, ResidualCandidate, ResidualDecision, ResidualPolicy,
+        ResidualPolicyError, ResidualRejection, ResidualStorage, ScanOperation, ScanOptions, Select, Shape,
+        ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, Softmax,
+        StagedFunction as CoreStagedFunction, StopGradient, StopGradientOperation, Sub, Tag, TagOperation, Tanh, TopK,
+        Trace, Tracer, TracingContext, TransferToMemory, Typed, TypedProgram, Value as CoreValue, ValueProjection,
+        WhileOperation, ZeroLike, batch, batch_in_parent, composite, differentiate_at, differentiate_in_parent_at,
+        rematerialize, scan,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -2353,7 +2356,7 @@ pub(crate) mod tests {
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
     use crate::{
         AdaptiveProfileGuidedOptions, Array, ArrayError, CompilationError, Domain, Error, ExecutionError, FromPjrt,
-        Options, RaggedDotLoweringStrategy, Reference, Session, Value,
+        Options, RaggedDotLoweringStrategy, Reference, Session, ThroughSession, Value,
     };
 
     /// Deterministic completion gate used by stateful asynchronous integration tests.
@@ -3587,6 +3590,119 @@ pub(crate) mod tests {
             assert_close(value, vec![dot.sin()]);
             assert_close(gradient, values.iter().map(|value| 2.0 * dot.cos() * value).collect());
         }
+    }
+
+    #[test]
+    fn test_rematerialized_function_rounds_residuals_saved_through_custom_storage() {
+        /// [`ResidualStorage`] that stores a residual of shape `[8]` with shape `[8, 1]` and restores it by reshaping
+        /// it back, which reproduces the stored value exactly.
+        #[derive(Clone, Debug)]
+        struct ReshapeStorage;
+
+        impl ResidualStorage<ArrayIrType> for ReshapeStorage {
+            fn name(&self) -> String {
+                "reshape".to_owned()
+            }
+
+            fn store_payloads(
+                &self,
+                _residual_type: &ArrayIrType,
+            ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
+                Ok(vec![ErasedOperation::new(ReshapeOperation::new(vec![8, 1]))])
+            }
+
+            fn restore_payloads(
+                &self,
+                _stored_type: &ArrayIrType,
+                _residual_type: &ArrayIrType,
+            ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
+                Ok(vec![ErasedOperation::new(ReshapeOperation::new(vec![8]))])
+            }
+        }
+
+        /// [`ResidualPolicy`] that saves the value tagged `y` through a [`ReshapeStorage`] and recomputes everything
+        /// else.
+        #[derive(Clone)]
+        struct SaveTaggedThroughReshape;
+
+        impl ResidualPolicy<ArrayIrType> for SaveTaggedThroughReshape {
+            type Storage = ReshapeStorage;
+
+            fn name(&self) -> &str {
+                "save_tagged_through_reshape"
+            }
+
+            fn classify(
+                &self,
+                candidate: &ResidualCandidate<'_, ArrayIrType>,
+            ) -> Result<ResidualDecision<ReshapeStorage>, ResidualRejection> {
+                let saved = candidate
+                    .producers()
+                    .iter()
+                    .any(|producer| producer.payload::<TagOperation<ArrayType>>().is_some_and(|tag| tag.key() == "y"));
+                Ok(if saved { ResidualDecision::SaveWith(ReshapeStorage) } else { ResidualDecision::Recompute })
+            }
+        }
+
+        // `(x, s) ↦ f32(y) · s` with `y = tag(bf16(x) · bf16(x), "y")` and `x` excluded from differentiation saves `y`
+        // through a `ReshapeStorage`, while the forward computation also converts `y` to `f32`. XLA may compute `y` in
+        // `f32`, so `y` must be rounded to `bf16` before it is stored. With `s` and the seed set to one, the forward
+        // output is the value of `y` that the forward computation uses, and the gradient with respect to `s` is the
+        // value of `y` that the backward computation restores, so the two must agree bit for bit. Three of the squares
+        // below are not representable in `bf16`.
+        type Body = Tracer<TracingContext<Constant, Operation>>;
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = Session::new(&client).domain();
+        let vector_type = ArrayType::new_static(DataType::F32, [8])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let array = |values: &[f32]| {
+            Array::from_host_buffer(
+                &engine,
+                vector_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(values).as_slice(),
+            )
+            .unwrap()
+        };
+        let function = rematerialize(|(x, s): (Body, Body)| {
+            let x = ValueProjection::<ArrayType>::into_projected(x)?
+                .stop_gradient()?
+                .convert_element_type(DataType::BF16)?;
+            let y = x.mul(&x)?.tag("y")?.convert_element_type(DataType::F32)?;
+            Ok(y.mul(&ValueProjection::<ArrayType>::into_projected(s)?)?.into_value())
+        })
+        .with_policy(SaveTaggedThroughReshape);
+        let outer: CompiledFunction<'_, (ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+            |(x, s, seed)| {
+                let x = x.into_value();
+                let context = x.context().clone();
+                let (output, pullback) =
+                    context.differentiate_at((x, s.into_value())).vjp(|(x, s)| function.call((x, s))).unwrap();
+                let (_, s_gradient) = pullback.apply_materialized(seed.into_value()).unwrap();
+                (
+                    ValueProjection::<ArrayType>::into_projected(output).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(s_gradient).unwrap(),
+                )
+            },
+            (vector_type.clone(), vector_type.clone(), vector_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let ones = [1f32; 8];
+        let (output, s_gradient) = outer
+            .executable()
+            .execute(
+                &engine,
+                (array(&[1.0078125, 1.125, 1.375, 1.1015625, 3.25, 2.75, 1.5, 1.0625]), array(&ones), array(&ones)),
+            )
+            .unwrap();
+        let bits = |values: Vec<f32>| values.into_iter().map(f32::to_bits).collect::<Vec<_>>();
+        let expected = bits(vec![1.015625, 1.265625, 1.890625, 1.2109375, 10.5625, 7.5625, 2.25, 1.125]);
+        assert_eq!(bits(read_f32_array(&client, &output)), expected);
+        assert_eq!(bits(read_f32_array(&client, &s_gradient)), expected);
     }
 
     #[test]
@@ -8610,6 +8726,85 @@ pub(crate) mod tests {
             |value: Value<'_>| read_f32_array(client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
         assert_eq!(read(rematerialized.call(Value::Array(array(&[1.0, 2.0, 3.0]))).unwrap()), vec![2.0, -2.0, 1.5]);
         assert_eq!(read(composed.call(Value::Array(array(&[1.0, 2.0, 3.0]))).unwrap()), vec![2.0, -2.0, 1.5]);
+    }
+
+    #[test]
+    fn test_rematerialized_function_call_with_imported_session_constants() {
+        type Body = Tracer<TracingContext<Constant, Operation>>;
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let engine = Session::new(&client).domain();
+        let vector_type = ArrayType::new_static(DataType::F32, [3])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let scalar_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let array = |r#type: &ArrayType, values: &[f32]| {
+            Array::from_host_buffer(&engine, r#type.clone(), mesh.clone(), values_to_bytes::<f32>(values).as_slice())
+                .unwrap()
+        };
+        let read =
+            |value: Value<'_>| read_f32_array(&client, &ValueProjection::<ArrayType>::into_projected(value).unwrap());
+
+        // XLA's elementary functions may differ from the host ones in the last bit.
+        let assert_close = |actual: Vec<f32>, expected: Vec<f32>| {
+            assert_eq!(actual.len(), expected.len());
+            assert!(
+                actual.iter().zip(&expected).all(|(actual, expected)| (actual - expected).abs() < 1e-6),
+                "expected {expected:?} but got {actual:?}",
+            );
+        };
+
+        // `x ↦ sin(x · w)` closes over the runtime array `w`, which every trace of its body imports as a session
+        // constant through `ThroughSession`. The constant is not differentiated, so the gradient is `cos(x · w) w`.
+        let x = [0.1f32, 0.2, 0.3];
+        let w = [2.0f32, -1.0, 0.5];
+        let dot = x.iter().zip(&w).map(|(x, w)| x * w).sum::<f32>();
+        let gradient = w.iter().map(|w| dot.cos() * w).collect::<Vec<_>>();
+        let weights = array(&vector_type, &w);
+        let function = rematerialize(|x: Body| {
+            let w = ImportingContext::<Domain<'_>, ThroughSession>::import(x.context(), Value::Array(weights.clone()))?;
+            let x = ValueProjection::<ArrayType>::into_projected(x)?;
+            let w = ValueProjection::<ArrayType>::into_projected(w)?;
+            Ok(x.dot(&w, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?.sin()?.into_value())
+        });
+
+        // Eager calls and eager differentiation resolve the session constant on the eager domain.
+        assert_close(read(function.call(Value::Array(array(&vector_type, &x))).unwrap()), vec![dot.sin()]);
+        let (value, eager_gradient) = engine
+            .differentiate_at(Value::Array(array(&vector_type, &x)))
+            .value_and_gradient(|x| function.call(x))
+            .unwrap();
+        assert_close(read(value), vec![dot.sin()]);
+        assert_close(read(eager_gradient), gradient.clone());
+
+        // A compiled pullback receives the session constant as a hidden argument of its executable.
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+            |(x, cotangent)| {
+                let x = x.into_value();
+                let context = x.context().clone();
+                let (output, pullback) = context.differentiate_at(x).vjp(|x| function.call(x)).unwrap();
+                let gradient = pullback.apply_materialized(cotangent.into_value()).unwrap();
+                (
+                    ValueProjection::<ArrayType>::into_projected(output).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(gradient).unwrap(),
+                )
+            },
+            (vector_type.clone(), scalar_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let (output, compiled_gradient) = compiled
+            .executable()
+            .execute(&engine, (array(&vector_type, &x), array(&scalar_type, &[2.0])))
+            .unwrap();
+        assert_close(read_f32_array(&client, &output), vec![dot.sin()]);
+        assert_close(
+            read_f32_array(&client, &compiled_gradient),
+            gradient.iter().map(|gradient| 2.0 * gradient).collect(),
+        );
     }
 
     #[test]

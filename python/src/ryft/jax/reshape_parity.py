@@ -17,10 +17,16 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from ryft.jax.extraction import ProgramCase, lower_to_stablehlo
 
 ROOT = Path(__file__).resolve().parents[4]
-RESHAPE_RS = ROOT / "crates/ryft-xla/src/experimental/operations/reshape.rs"
+RESHAPE_TEST_SOURCES = (
+    ROOT / "crates/ryft-xla/src/operations/manipulation/reshaping.rs",
+    ROOT / "crates/ryft-xla/src/experimental/tracing.rs",
+)
+# Matches a test that asserts that a rendered module (i.e., a `module` binding or a traced program's
+# `to_mlir_module("main")` rendering) equals an `indoc!` literal, without crossing into the next function.
 FUNCTION_MLIR_PATTERN = re.compile(
-    r"fn (?P<name>test_[^(]+)\(\) \{.*?assert_eq!\(\s*traced\.to_mlir_module\(\"main\"\)\.unwrap\(\),\s*"
-    r"indoc! \{r#\"\n(?P<mlir>.*?)\n\s*\"#\}\s*\);",
+    r"fn (?P<name>test_[^(]+)\(\) \{(?:(?!\n    fn ).)*?assert_eq!\(\s*"
+    r"(?:module|traced\.to_mlir_module\(\"main\"\)\.unwrap\(\)),\s*"
+    r"indoc! \{r#\"\n(?P<mlir>.*?)\n\s*\"#\},?\s*\);",
     re.DOTALL,
 )
 
@@ -39,16 +45,16 @@ class ComparisonResult:
 def load_expected_mlir() -> dict[str, str]:
     """Loads the current Rust-side reshape MLIR expectations from `ryft-xla`."""
 
-    source = RESHAPE_RS.read_text()
     expected_mlir = {
         match.group("name"): textwrap.dedent(match.group("mlir")).strip() + "\n"
-        for match in FUNCTION_MLIR_PATTERN.finditer(source)
+        for path in RESHAPE_TEST_SOURCES
+        for match in FUNCTION_MLIR_PATTERN.finditer(path.read_text())
     }
     required_cases = {
-        "test_trace_reshape_and_reshard_render_stablehlo_and_shardy",
-        "test_shard_map_reshape_renders_singleton_axis_sharding_propagation",
-        "test_shard_map_reshape_renders_replicated_merge_sharding_propagation",
-        "test_shard_map_reshape_renders_replicated_split_sharding_propagation",
+        "test_trace_reshard_then_reshape_renders_mlir",
+        "test_to_mlir_module_for_program_renders_reshape_singleton_axis_sharding_propagation",
+        "test_to_mlir_module_for_program_renders_reshape_replicated_merge_sharding_propagation",
+        "test_to_mlir_module_for_program_renders_reshape_replicated_split_sharding_propagation",
     }
     missing_case_names = sorted(required_cases - expected_mlir.keys())
     if missing_case_names:
@@ -64,6 +70,13 @@ def normalize_mlir(mlir: str) -> str:
     normalized_mlir = re.sub(
         r"^module @\S+ attributes \{[^\n]*\} \{$",
         "module {",
+        normalized_mlir,
+        flags=re.MULTILINE,
+    )
+    # JAX 0.12 repeats each Shardy mesh as a `stablehlo.mesh` attribute that Ryft does not emit.
+    normalized_mlir = re.sub(
+        r"^(\s*sdy\.mesh @\S+ = <[^\n]*?>) \{stablehlo\.mesh = [^\n]*\}$",
+        r"\1",
         normalized_mlir,
         flags=re.MULTILINE,
     )
@@ -93,13 +106,13 @@ def build_reshape_cases(mesh: Mesh) -> list[ProgramCase]:
     sharding = NamedSharding(mesh, P("x"))
     return [
         ProgramCase(
-            name="test_trace_reshape_and_reshard_render_stablehlo_and_shardy",
+            name="test_trace_reshard_then_reshape_renders_mlir",
             description="Plain reshape with a Shardy sharding constraint.",
             function=lambda x: jnp.reshape(jax.lax.with_sharding_constraint(x, sharding), (1, 8, 1)),
             abstract_args=(jax.ShapeDtypeStruct((8,), jnp.float32),),
         ),
         ProgramCase(
-            name="test_shard_map_reshape_renders_singleton_axis_sharding_propagation",
+            name="test_to_mlir_module_for_program_renders_reshape_singleton_axis_sharding_propagation",
             description="`shard_map` reshape that adds singleton axes.",
             function=jax.shard_map(
                 lambda x: jnp.reshape(x, (1, 2, 1)),
@@ -115,7 +128,7 @@ def build_reshape_cases(mesh: Mesh) -> list[ProgramCase]:
             },
         ),
         ProgramCase(
-            name="test_shard_map_reshape_renders_replicated_merge_sharding_propagation",
+            name="test_to_mlir_module_for_program_renders_reshape_replicated_merge_sharding_propagation",
             description="`shard_map` reshape that merges replicated axes.",
             function=jax.shard_map(
                 lambda x: jnp.reshape(x, (2, 6)),
@@ -131,7 +144,7 @@ def build_reshape_cases(mesh: Mesh) -> list[ProgramCase]:
             },
         ),
         ProgramCase(
-            name="test_shard_map_reshape_renders_replicated_split_sharding_propagation",
+            name="test_to_mlir_module_for_program_renders_reshape_replicated_split_sharding_propagation",
             description="`shard_map` reshape that splits a replicated axis.",
             function=jax.shard_map(
                 lambda x: jnp.reshape(x, (2, 2, 3)),

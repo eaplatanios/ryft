@@ -9,14 +9,19 @@
 //!     gradients of a model whose layers are called one after the other (i.e., repeated calls) and of a single layer
 //!     nested in up to three rematerialized calls, against the same functions without rematerialization.
 //!   - **Runtime:** the memory that the compiled gradient of a model that scans over its layers requires (i.e., the
-//!     temporary memory and the peak memory from the memory statistics of the compiled executable) and its execution
-//!     time, without rematerialization and with rematerialized layers under several policies.
+//!     temporary device memory, the peak device memory, and the temporary host memory from the memory statistics of
+//!     the compiled executable) and its execution time, without rematerialization and with rematerialized layers under
+//!     several policies. Two of these policies offload the output of the first dot product of each layer to pinned
+//!     host memory, one by matching dot products ([`OffloadDotsWithNoBatchDimensions`]) and one by matching the names
+//!     that the layer tags its dot products with ([`SaveAndOffloadOnlyTheseNames`]).
 //!
 //! Every rematerialized gradient is checked against the gradient without rematerialization. Deterministic centered
 //! weights have variance `1 / fan_in`, and every parameter matrix must have a finite, nonzero gradient norm.
 //!
 //! Run it with `cargo run --release -p ryft-xla --features performance-benchmarking --bin rematerialization_benchmark`.
-//! Append `-- --smoke` to use small dimensions and two timed executions while retaining every benchmark variant.
+//! Append `-- --smoke` to use small dimensions and two timed executions while retaining every benchmark variant, or
+//! `-- --dimensions <batch size>,<width>,<expanded width>,<layer count>` to use the provided model dimensions (e.g., to
+//! make the offloaded activations large on an accelerator).
 
 use std::env;
 use std::time::{Duration, Instant};
@@ -26,9 +31,9 @@ use ryft_core::{
     ArrayIrType, ArrayType, Compile, CompiledFunction as CoreCompiledFunction, Context, DataType, Device, DeviceMesh,
     Dimension as CoreDimension, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, LogicalMesh,
     Memory, MeshAxis, MeshAxisType, NothingSavable, OffloadDotsWithNoBatchDimensions, ProgramError, Reduce,
-    ReductionKind, RematerializationOptimizationBarrier, ResidualPolicy, ScanOperation, Shape, Sharding,
-    StagedFunction as CoreStagedFunction, Tanh, Typed, Value as CoreValue, ValueProjection, differentiate_at,
-    rematerialize,
+    ReductionKind, RematerializationOptimizationBarrier, ResidualPolicy, SaveAndOffloadOnlyTheseNames, ScanOperation,
+    Shape, Sharding, StagedFunction as CoreStagedFunction, Tag, Tanh, Typed, Value as CoreValue, ValueProjection,
+    differentiate_at, rematerialize,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::experimental::ops::Operation;
@@ -54,6 +59,10 @@ enum Checkpointing {
 
     /// The layer is rematerialized and offloads its dot products to pinned host memory.
     OffloadDots,
+
+    /// The layer tags its dot products with [`UP_PROJECTION_NAME`] and [`DOWN_PROJECTION_NAME`], and is rematerialized
+    /// and offloads the values tagged with these names to pinned host memory.
+    OffloadNames,
 }
 
 impl Checkpointing {
@@ -64,9 +73,16 @@ impl Checkpointing {
             Self::NothingSavable => "nothing_savable",
             Self::DotsSavable => "dots_savable",
             Self::OffloadDots => "offload_dots_with_no_batch_dimensions",
+            Self::OffloadNames => "save_and_offload_only_these_names",
         }
     }
 }
+
+/// Name of the tag of the first dot product of a layer, `h · w₁`, under [`Checkpointing::OffloadNames`].
+const UP_PROJECTION_NAME: &str = "up_projection";
+
+/// Name of the tag of the second dot product of a layer, `tanh(h · w₁) · w₂`, under [`Checkpointing::OffloadNames`].
+const DOWN_PROJECTION_NAME: &str = "down_projection";
 
 /// Shape of a benchmarked multilayer perceptron.
 #[derive(Copy, Clone, Debug)]
@@ -104,6 +120,9 @@ struct Measurement<'c> {
     /// Peak device memory of the compiled executable, in bytes.
     peak_bytes: Option<usize>,
 
+    /// Temporary host memory of the compiled executable, in bytes.
+    host_temporary_bytes: Option<usize>,
+
     /// Median execution time.
     execution: Duration,
 
@@ -116,27 +135,33 @@ fn matrix_multiplication() -> DotDimensionNumbers {
     DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![])
 }
 
-/// Applies one layer, `h ↦ tanh(h · w₁) · w₂`, to the hidden state `h`.
-fn layer<'c>(hidden: Tracer<'c>, up: Tracer<'c>, down: Tracer<'c>) -> Result<Tracer<'c>, ProgramError> {
+/// Applies one layer, `h ↦ tanh(h · w₁) · w₂`, to the hidden state `h`, tagging its dot products with
+/// [`UP_PROJECTION_NAME`] and [`DOWN_PROJECTION_NAME`] when `tagged` is `true`.
+fn layer<'c>(tagged: bool, hidden: Tracer<'c>, up: Tracer<'c>, down: Tracer<'c>) -> Result<Tracer<'c>, ProgramError> {
     let hidden = ValueProjection::<ArrayType>::into_projected(hidden)?;
     let up = ValueProjection::<ArrayType>::into_projected(up)?;
     let down = ValueProjection::<ArrayType>::into_projected(down)?;
-    Ok(hidden
-        .dot(&up, &matrix_multiplication())?
-        .tanh()?
-        .dot(&down, &matrix_multiplication())?
-        .into_value())
+    let mut up_projection = hidden.dot(&up, &matrix_multiplication())?;
+    if tagged {
+        up_projection = up_projection.tag(UP_PROJECTION_NAME)?;
+    }
+    let mut down_projection = up_projection.tanh()?.dot(&down, &matrix_multiplication())?;
+    if tagged {
+        down_projection = down_projection.tag(DOWN_PROJECTION_NAME)?;
+    }
+    Ok(down_projection.into_value())
 }
 
-/// Applies [`layer`] rematerialized with `policy` and the provided optimization-barrier flag.
+/// Applies [`layer`] rematerialized with `policy` and the provided optimization-barrier and tagging flags.
 fn rematerialized_layer<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
     policy: P,
     optimization_barrier: bool,
+    tagged: bool,
     hidden: Tracer<'c>,
     up: Tracer<'c>,
     down: Tracer<'c>,
 ) -> Result<Tracer<'c>, ProgramError> {
-    rematerialize(|(hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>)| layer(hidden, up, down))
+    rematerialize(move |(hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>)| layer(tagged, hidden, up, down))
         .with_policy(policy)
         .with_optimization_barrier(match optimization_barrier {
             true => RematerializationOptimizationBarrier::All,
@@ -154,12 +179,19 @@ fn checkpointed_layer<'c>(
     down: Tracer<'c>,
 ) -> Result<Tracer<'c>, ProgramError> {
     match checkpointing {
-        Checkpointing::None => layer(hidden, up, down),
-        Checkpointing::NothingSavable => rematerialized_layer(NothingSavable, optimization_barrier, hidden, up, down),
-        Checkpointing::DotsSavable => rematerialized_layer(DotsSavable, optimization_barrier, hidden, up, down),
+        Checkpointing::None => layer(false, hidden, up, down),
+        Checkpointing::NothingSavable => {
+            rematerialized_layer(NothingSavable, optimization_barrier, false, hidden, up, down)
+        }
+        Checkpointing::DotsSavable => rematerialized_layer(DotsSavable, optimization_barrier, false, hidden, up, down),
         Checkpointing::OffloadDots => {
             let policy = OffloadDotsWithNoBatchDimensions::new(Memory::Host { pinned: true });
-            rematerialized_layer(policy, optimization_barrier, hidden, up, down)
+            rematerialized_layer(policy, optimization_barrier, false, hidden, up, down)
+        }
+        Checkpointing::OffloadNames => {
+            let names = [UP_PROJECTION_NAME, DOWN_PROJECTION_NAME];
+            let policy = SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), names, Memory::Host { pinned: true })?;
+            rematerialized_layer(policy, optimization_barrier, true, hidden, up, down)
         }
     }
 }
@@ -172,7 +204,7 @@ fn nested_layer<'c>(
     down: Tracer<'c>,
 ) -> Result<Tracer<'c>, ProgramError> {
     if depth == 0 {
-        return layer(hidden, up, down);
+        return layer(false, hidden, up, down);
     }
     rematerialize(move |(hidden, up, down): (Tracer<'c>, Tracer<'c>, Tracer<'c>)| {
         nested_layer(depth - 1, hidden, up, down)
@@ -345,6 +377,7 @@ fn measure<'c>(
         operation_count,
         temporary_bytes: memory.map(|memory| memory.device_temporary_size_in_bytes),
         peak_bytes: memory.map(|memory| memory.device_peak_memory_in_bytes),
+        host_temporary_bytes: memory.map(|memory| memory.host_temporary_size_in_bytes),
         execution: executions[execution_count / 2],
         gradients: gradients.into(),
     }
@@ -454,13 +487,14 @@ fn report(
     };
     let difference = validate_gradients(&read(measurement), &read(reference), parameter_layer_count)?;
     println!(
-        "| {name} | {:.1} | {:.1} | {:.1} | {} | {} | {} | {:.2} | {difference:.1e} |",
+        "| {name} | {:.1} | {:.1} | {:.1} | {} | {} | {} | {} | {:.2} | {difference:.1e} |",
         measurement.trace.as_secs_f64() * 1e3,
         measurement.lower.as_secs_f64() * 1e3,
         measurement.compile.as_secs_f64() * 1e3,
         measurement.operation_count,
         mebibytes(measurement.temporary_bytes),
         mebibytes(measurement.peak_bytes),
+        mebibytes(measurement.host_temporary_bytes),
         measurement.execution.as_secs_f64() * 1e3,
     );
     Ok(())
@@ -471,9 +505,9 @@ fn print_header(title: &str) {
     println!("\n{title}\n");
     println!(
         "| Variant | Trace (ms) | Lower (ms) | Compile (ms) | StableHLO operations | Temporary (MiB) | Peak (MiB) \
-         | Execution (ms) | Maximum absolute gradient difference |",
+         | Host temporary (MiB) | Execution (ms) | Maximum absolute gradient difference |",
     );
-    println!("|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|");
 }
 
 /// Returns a client for the benchmarked platform.
@@ -496,21 +530,38 @@ fn client() -> Client<'static> {
     }
 }
 
-/// Runs every benchmark variant with full or smoke dimensions.
+/// Returns the model that `--dimensions <batch size>,<width>,<expanded width>,<layer count>` selects, given the
+/// argument of that flag.
+fn parse_dimensions(argument: &str) -> Result<Model, ProgramError> {
+    let error = || ProgramError::InvalidArgument {
+        message: format!("expected four positive comma-separated `--dimensions`, got `{argument}`"),
+    };
+    let dimensions = argument
+        .split(',')
+        .map(|dimension| dimension.parse::<usize>().ok().filter(|dimension| *dimension > 0).ok_or_else(error))
+        .collect::<Result<Vec<_>, _>>()?;
+    let [batch_size, width, expanded_width, layer_count] = dimensions.as_slice() else {
+        return Err(error());
+    };
+    Ok(Model { batch_size: *batch_size, width: *width, expanded_width: *expanded_width, layer_count: *layer_count })
+}
+
+/// Runs every benchmark variant with full, smoke, or provided dimensions.
 fn main() -> Result<(), ProgramError> {
     let arguments = env::args().skip(1).collect::<Vec<_>>();
-    let smoke = match arguments.as_slice() {
-        [] => false,
-        [argument] if argument == "--smoke" => true,
-        _ => {
-            return Err(ProgramError::InvalidArgument { message: "expected no arguments or `--smoke`".to_owned() });
+    let (model, execution_count) = match arguments.as_slice() {
+        [] => (Model { batch_size: 512, width: 256, expanded_width: 1024, layer_count: 16 }, 10),
+        [argument] if argument == "--smoke" => {
+            (Model { batch_size: 4, width: 8, expanded_width: 16, layer_count: 3 }, 2)
         }
-    };
-    let execution_count = if smoke { 2 } else { 10 };
-    let model = if smoke {
-        Model { batch_size: 4, width: 8, expanded_width: 16, layer_count: 3 }
-    } else {
-        Model { batch_size: 512, width: 256, expanded_width: 1024, layer_count: 16 }
+        [flag, dimensions] if flag == "--dimensions" => (parse_dimensions(dimensions)?, 10),
+        _ => {
+            return Err(ProgramError::InvalidArgument {
+                message: "expected no arguments, `--smoke`, or `--dimensions <batch size>,<width>,<expanded width>,\
+                          <layer count>`"
+                    .to_owned(),
+            });
+        }
     };
     let client = Box::leak(Box::new(client()));
     let device = Device::from_pjrt(&client.addressable_devices().unwrap().remove(0)).unwrap();
@@ -529,9 +580,13 @@ fn main() -> Result<(), ProgramError> {
     };
     print_header(&format!("Scan over layers ({model:?})"));
     let mut reference = None;
-    for checkpointing in
-        [Checkpointing::None, Checkpointing::NothingSavable, Checkpointing::DotsSavable, Checkpointing::OffloadDots]
-    {
+    for checkpointing in [
+        Checkpointing::None,
+        Checkpointing::NothingSavable,
+        Checkpointing::DotsSavable,
+        Checkpointing::OffloadDots,
+        Checkpointing::OffloadNames,
+    ] {
         let start = Instant::now();
         let staged = stage_scanned_gradient(&domain, &mesh, model, checkpointing);
         let measurement = measure(&domain, staged, start.elapsed(), inputs(), execution_count);
@@ -563,6 +618,7 @@ fn main() -> Result<(), ProgramError> {
         (Checkpointing::NothingSavable, false),
         (Checkpointing::DotsSavable, true),
         (Checkpointing::OffloadDots, true),
+        (Checkpointing::OffloadNames, true),
     ] {
         let start = Instant::now();
         let staged = stage_gradient(&domain, &mesh, model, &up_shape, &down_shape, |hidden, up, down| {

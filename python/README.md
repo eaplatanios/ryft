@@ -44,6 +44,32 @@ their StableHLO (collective family, ordered groups, and axis attributes). It als
 differences: the bounded data-dependent prefix case must execute eagerly in both frameworks, stage in Ryft, and fail
 JAX staging with concretization. Use `--list` to show the case registry and repeat `--case CASE_ID` to run a subset.
 
+### Rematerialization parity
+
+The `rematerialization` suite compares Ryft's `rematerialize` with `jax.checkpoint` on CPU. Its twelve cases cover
+`nothing_saveable`, `everything_saveable`, `dots_saveable`, `dots_with_no_batch_dims_saveable`,
+`save_only_these_names`, `save_any_names_but_these`, `save_from_both_policies`, and
+`save_and_offload_only_these_names`, plus `dots_saveable` around a call (a Ryft composite and a `jax.jit` function), a
+condition, and a scan, and a nested checkpoint with a different inner policy. JAX's
+`save_anything_except_these_names` is excluded because JAX 0.12.0.1 saves every value under it.
+
+Each function multiplies and adds small integers, so values are exact in `f32` and must match exactly. Every case
+records its output, its JVP, and its input gradients, which both frameworks must reproduce from an independent NumPy
+oracle in [`rematerialization_testing.py`](src/ryft/jax/rematerialization_testing.py). It also records the values that
+reverse mode differentiation saves, as their count, element counts, and bit widths, sorted by element count. JAX reports
+them through the private `jax._src.ad_checkpoint.saved_residuals` and Ryft through `ryft_core::saved_residuals`. Their
+source descriptions are never compared. Both StableHLO modules of the staged gradient must contain an optimization
+barrier and a `dot_general`.
+
+```bash
+# From the repository root:
+timeout 300 cargo build -p ryft-xla --features differential-testing --bin differential_testing
+
+# From python/:
+timeout 300 uv run python scripts/compare_behavior_with_jax.py \
+  --suite rematerialization --ryft-binary ../target/debug/differential_testing
+```
+
 ### Collective correctness on one host
 
 The collective suite runs real compiled XLA programs across logical CPU PJRT devices in a single process. It works

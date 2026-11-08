@@ -820,7 +820,9 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
 
     parser = argparse.ArgumentParser(description="Differentially test Ryft behavior and StableHLO against pinned JAX.")
     parser.add_argument("--case", action="append", default=[], help="select one case ID; may be repeated")
-    parser.add_argument("--suite", choices=("collectives", *CUDA_SUITES), help="select a correctness suite")
+    parser.add_argument(
+        "--suite", choices=("collectives", "rematerialization", *CUDA_SUITES), help="select a correctness suite",
+    )
     parser.add_argument(
         "--timeout", type=int, default=SUBPROCESS_TIMEOUT_SECONDS,
         help="maximum seconds for each framework subprocess (default: 300)",

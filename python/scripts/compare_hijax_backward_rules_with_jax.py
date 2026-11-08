@@ -1,8 +1,7 @@
 """Probe the pinned, internal JAX accumulator-taking high-level primitive interface.
 
-Run with `uv run --isolated --with jax==0.10.0 --with numpy python scripts/compare_hijax_backward_rules_with_jax.py`
-from the `python` directory. This uses JAX 0.10.0's private VJPHiPrimitive, which JAX 0.12 removed, rather than the
-repository's pinned JAX or upstream's evolving HiPrim API.
+Run with `python/.venv/bin/python python/scripts/compare_hijax_backward_rules_with_jax.py`. This uses the private
+`HiPrim` interface of the repository's pinned JAX, which upstream may still change.
 Python callback counters demonstrate tracing behavior, not performance measurements.
 The indexed probe uses in-bounds indices and nonzero output seeds; it is not a
 complete general-purpose primitive implementation.
@@ -24,7 +23,7 @@ from compare_cotangent_accumulation_with_jax import primitive_counts
 CALLS = []
 
 
-class IndexedRead(hijax.VJPHiPrimitive):
+class IndexedRead(hijax.HiPrim):
     """One backward definition supporting ignored, value, and buffer cotangents."""
 
     def __init__(self):
@@ -50,7 +49,7 @@ class IndexedRead(hijax.VJPHiPrimitive):
             values.accum(jnp.zeros((8,), dtype=jnp.float32).at[index].add(seed))
 
 
-class Square(hijax.VJPHiPrimitive):
+class Square(hijax.HiPrim):
     """A nonlinear rule whose backward consists of ordinary differentiable work."""
 
     def __init__(self):
@@ -65,8 +64,8 @@ class Square(hijax.VJPHiPrimitive):
     def vjp_fwd(self, nonzeros, value):
         return self.expand(value), value
 
-    def batch_dim_rule(self, axis_data, dimensions):
-        return dimensions[0]
+    def batch(self, axis_data, arguments, dimensions):
+        return self.expand(*arguments), dimensions[0]
 
     def jvp(self, primals, tangents):
         return self.expand(primals[0]), 2 * primals[0] * tangents[0]

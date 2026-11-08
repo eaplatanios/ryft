@@ -96,8 +96,33 @@ class DifferentialTestingTest(unittest.TestCase):
         self.assertEqual(len({case.case_id for case in cases}), len(cases))
         self.assertTrue(cases[9:])
         self.assertTrue(all(
-            case.reference is not None and case.suite in ("collectives", *differential_testing.CUDA_SUITES)
+            case.reference is not None
+            and case.suite in ("collectives", "rematerialization", *differential_testing.CUDA_SUITES)
             for case in cases[9:]
+        ))
+        rematerialization_cases = [case for case in cases if case.suite == "rematerialization"]
+        self.assertEqual(
+            [case.case_id for case in rematerialization_cases],
+            [
+                "rematerialization_nothing_saveable",
+                "rematerialization_everything_saveable",
+                "rematerialization_dots_saveable",
+                "rematerialization_dots_with_no_batch_dims_saveable",
+                "rematerialization_save_only_these_names",
+                "rematerialization_save_any_names_but_these",
+                "rematerialization_save_from_both_policies",
+                "rematerialization_save_and_offload_only_these_names",
+                "rematerialization_dots_saveable_call",
+                "rematerialization_dots_saveable_condition",
+                "rematerialization_dots_saveable_scan",
+                "rematerialization_dots_saveable_known_condition",
+                "rematerialization_dots_saveable_known_scan",
+                "rematerialization_nested_policies",
+            ],
+        )
+        self.assertTrue(all(
+            case.relationship == "parity" and case.stablehlo_patterns and not case.collectives
+            for case in rematerialization_cases
         ))
 
     def test_observation_schema(self) -> None:
@@ -412,6 +437,19 @@ class DifferentialTestingTest(unittest.TestCase):
         with redirect_stderr(errors):
             self.assertEqual(main(("--suite", "collectives", "--case", "scaled_dot_and_matmul", "--list")), 2)
         self.assertEqual(errors.getvalue(), "case 'scaled_dot_and_matmul' is not in suite 'collectives'\n")
+
+    def test_main_rematerialization_suite_selection(self) -> None:
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(main(("--suite", "rematerialization", "--list")), 0)
+        expected = [case.case_id for case in differential_cases() if case.suite == "rematerialization"]
+        self.assertEqual(output.getvalue().splitlines(), expected)
+        self.assertIn("rematerialization_dots_saveable", expected)
+
+        errors = StringIO()
+        with redirect_stderr(errors):
+            self.assertEqual(main(("--suite", "rematerialization", "--case", "pshuffle", "--list")), 2)
+        self.assertEqual(errors.getvalue(), "case 'pshuffle' is not in suite 'rematerialization'\n")
 
     def test_main_cuda_suite_selection(self) -> None:
         cuda_ids = [case.case_id for case in differential_cases() if case.suite == "cuda-collectives"]

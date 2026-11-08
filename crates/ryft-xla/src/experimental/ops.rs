@@ -1709,7 +1709,7 @@ pub(crate) mod tests {
 
         // A rematerialized body squares its input inside a `jit_call` operation and squares the result of the call outside of
         // it. Linearizing it with the default policy, which saves nothing, saves only the input. Its pure all-known
-        // call is inlined into the policy walk; the differentiated call recomputes that multiplication.
+        // primal call keeps its boundary, and the residual body replays that call to recompute the multiplication.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
         let callee = {
             let mut builder = ProgramBuilder::new();
@@ -1734,14 +1734,26 @@ pub(crate) mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = mul %0 %0
+                let %1:f64[] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                        in (%1)
+                    },
+                ]
                     %2:f64[] = mul %1 %1
                 in (%2, %0)
                 lambda %0:f64[], %1:f64[] .
                 let %2:f64[] = rematerialize [differentiated=true] %0 %1 [
                     body={
                         lambda %0:f64[], %1:f64[] .
-                        let %2:f64[] = mul %1 %1
+                        let %2:f64[] = jit_call %1 [
+                            callee={
+                                lambda %0:f64[] .
+                                let %1:f64[] = mul %0 %0
+                                in (%1)
+                            },
+                        ]
                             %3:f64[] = jit_call %0 %1 [
                                 callee={
                                     lambda %0:f64[], %1:f64[] .
@@ -1765,9 +1777,11 @@ pub(crate) mod tests {
     fn test_rematerialize_rejects_captures_registered_in_its_body() {
         use ryft_core::rematerialize;
 
-        // The rematerialized body is traced through a fresh-root context whose capture table is discarded, so a
-        // capturing body is rejected at trace time; refer to `TracingContext::trace_with_named_axes` for the full
-        // silent-aliasing rationale.
+        // This guards an unowned capture reference rather than a legitimate closed-over array, which enters the body as
+        // a session constant through `ThroughSession` instead. The rematerialized body is traced through a fresh root
+        // context whose capture table is discarded, so a body that registers a capture is rejected at trace time
+        // rather than leaving a reference that a later capture-owning scope would resolve against an unrelated value.
+        // Refer to `TracingContext::trace_with_named_axes` for the full rationale.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
         let captured_value = Constant::Captured(CaptureReference::new(0, scalar_type.clone()));
         let function = rematerialize(move |x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {

@@ -64,13 +64,35 @@ class JaxToolsTest(unittest.TestCase):
 
         self.assertEqual(normalize_mlir(jax_mlir), normalize_mlir(rust_mlir))
 
+    def test_normalize_mlir_removes_stablehlo_mesh_attribute(self) -> None:
+        jax_mlir = """
+        module {
+          sdy.mesh @mesh = <["x"=4]> {stablehlo.mesh = {axes = [{name = "x", size = 4 : i64}]}}
+        }
+        """
+        rust_mlir = """
+        module {
+          sdy.mesh @mesh = <["x"=4]>
+        }
+        """
+
+        self.assertEqual(normalize_mlir(jax_mlir), normalize_mlir(rust_mlir))
+
     def test_load_expected_mlir_reads_current_reshape_expectations(self) -> None:
         expected_mlir = load_expected_mlir()
 
-        self.assertIn("test_trace_reshape_and_reshard_render_stablehlo_and_shardy", expected_mlir)
+        self.assertEqual(
+            sorted(expected_mlir),
+            [
+                "test_to_mlir_module_for_program_renders_reshape_replicated_merge_sharding_propagation",
+                "test_to_mlir_module_for_program_renders_reshape_replicated_split_sharding_propagation",
+                "test_to_mlir_module_for_program_renders_reshape_singleton_axis_sharding_propagation",
+                "test_trace_reshard_then_reshape_renders_mlir",
+            ],
+        )
         self.assertIn(
-            "test_shard_map_reshape_renders_replicated_split_sharding_propagation",
-            expected_mlir,
+            "%1 = stablehlo.reshape %0 : (tensor<8xf32>) -> tensor<1x8x1xf32>",
+            expected_mlir["test_trace_reshard_then_reshape_renders_mlir"],
         )
 
 

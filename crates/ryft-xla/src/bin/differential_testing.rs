@@ -39,6 +39,9 @@ mod ragged;
 #[path = "differential_testing/distributed_collectives.rs"]
 mod distributed_collectives;
 
+#[path = "differential_testing/rematerialization.rs"]
+mod rematerialization;
+
 /// Schema version emitted by this binary and accepted by the Python comparison harness.
 const SCHEMA: &str = "ryft-jax-differential-v1";
 
@@ -71,6 +74,30 @@ struct DifferentialObservation {
     stablehlo: Option<String>,
 }
 
+/// Correctness suite of a fixed Ryft observation case, which selects the cases that `--suite` runs.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Suite {
+    /// Cases that run only when no suite is selected.
+    General,
+
+    /// Legacy collective cases, which run with the collective manifest under suite `collectives`.
+    Collectives,
+
+    /// Rematerialization (i.e., gradient checkpointing) cases, which run under suite `rematerialization`.
+    Rematerialization,
+}
+
+impl Suite {
+    /// Returns the name that `--suite` uses to select this suite, if any.
+    fn name(self) -> Option<&'static str> {
+        match self {
+            Self::General => None,
+            Self::Collectives => Some("collectives"),
+            Self::Rematerialization => Some("rematerialization"),
+        }
+    }
+}
+
 /// Descriptor for one fixed Ryft observation case.
 #[derive(Copy, Clone)]
 struct DifferentialCase {
@@ -80,35 +107,44 @@ struct DifferentialCase {
     /// Callback that executes and records the case.
     emit: fn() -> Result<DifferentialObservation, Box<dyn Error>>,
 
-    /// Whether this legacy case belongs to the collective suite.
-    collective: bool,
+    /// Suite that the case belongs to.
+    suite: Suite,
 }
 
 /// Returns the fixed case registry and verifies that case IDs are unique.
 fn registry() -> Vec<DifferentialCase> {
-    let cases = vec![
+    let mut cases = vec![
         DifferentialCase {
             case_id: "grouped_shape_changing_collectives",
             emit: emit_grouped_collectives,
-            collective: true,
+            suite: Suite::Collectives,
         },
-        DifferentialCase { case_id: "pshuffle", emit: emit_parallel_shuffle, collective: true },
-        DifferentialCase { case_id: "pswapaxes", emit: emit_parallel_swap_axes, collective: true },
+        DifferentialCase { case_id: "pshuffle", emit: emit_parallel_shuffle, suite: Suite::Collectives },
+        DifferentialCase { case_id: "pswapaxes", emit: emit_parallel_swap_axes, suite: Suite::Collectives },
         DifferentialCase {
             case_id: "data_dependent_prefix_take",
             emit: emit_data_dependent_prefix_take,
-            collective: false,
+            suite: Suite::General,
         },
-        DifferentialCase { case_id: "scaled_dot_and_matmul", emit: emit_scaled_dot_and_matmul, collective: false },
-        DifferentialCase { case_id: "block_scaled_dot", emit: emit_block_scaled_dot, collective: false },
-        DifferentialCase { case_id: "dot_product_attention", emit: emit_dot_product_attention, collective: false },
-        DifferentialCase { case_id: "negative_dynamic_slice", emit: emit_negative_dynamic_slice, collective: false },
+        DifferentialCase { case_id: "scaled_dot_and_matmul", emit: emit_scaled_dot_and_matmul, suite: Suite::General },
+        DifferentialCase { case_id: "block_scaled_dot", emit: emit_block_scaled_dot, suite: Suite::General },
+        DifferentialCase { case_id: "dot_product_attention", emit: emit_dot_product_attention, suite: Suite::General },
+        DifferentialCase {
+            case_id: "negative_dynamic_slice",
+            emit: emit_negative_dynamic_slice,
+            suite: Suite::General,
+        },
         DifferentialCase {
             case_id: "condition_varying_predicate_gradient",
             emit: emit_condition_varying_predicate_gradient,
-            collective: false,
+            suite: Suite::General,
         },
     ];
+    cases.extend(rematerialization::CASES.map(|(case_id, emit)| DifferentialCase {
+        case_id,
+        emit,
+        suite: Suite::Rematerialization,
+    }));
     for (index, case) in cases.iter().enumerate() {
         assert!(
             cases[..index].iter().all(|previous| previous.case_id != case.case_id),
@@ -944,7 +980,7 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 if index + 1 < arguments.len()
                     && matches!(
                         arguments[index + 1].as_str(),
-                        "collectives" | "cuda-collectives" | "cuda-distributed-collectives"
+                        "collectives" | "rematerialization" | "cuda-collectives" | "cuda-distributed-collectives"
                     ) =>
             {
                 suite = Some(arguments[index + 1].as_str());
@@ -974,7 +1010,7 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         if !requested.is_empty() || worker_rank.is_some() || coordinator.is_some() {
             return Err("`--list` cannot be combined with `--case` or distributed worker options".into());
         }
-        for case in cases.iter().filter(|case| suite.is_none() || (suite == Some("collectives") && case.collective)) {
+        for case in cases.iter().filter(|case| suite.is_none() || suite == case.suite.name()) {
             println!("{}", case.case_id);
         }
         if suite.is_none() || suite == Some("collectives") {
@@ -1018,9 +1054,14 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let requested = if requested.is_empty() {
         cases
             .iter()
-            .filter(|case| suite.is_none() || (suite == Some("collectives") && case.collective))
+            .filter(|case| suite.is_none() || suite == case.suite.name())
             .map(|case| case.case_id)
-            .chain(collective_cases.iter().filter(|_| suite != Some("cuda-collectives")).map(|case| case.id.as_str()))
+            .chain(
+                collective_cases
+                    .iter()
+                    .filter(|_| suite.is_none() || suite == Some("collectives"))
+                    .map(|case| case.id.as_str()),
+            )
             .chain(ragged_cases.iter().filter(|_| suite == Some("cuda-collectives")).map(|case| case.id.as_str()))
             .collect()
     } else {
@@ -1029,18 +1070,18 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut records = Vec::new();
     for case_id in requested {
         if let Some(case) = cases.iter().find(|case| case.case_id == case_id) {
-            if suite == Some("cuda-collectives") || (suite == Some("collectives") && !case.collective) {
-                return Err(format!("case `{case_id}` is not in suite `{}`", suite.unwrap()).into());
+            if let Some(suite) = suite.filter(|suite| Some(*suite) != case.suite.name()) {
+                return Err(format!("case `{case_id}` is not in suite `{suite}`").into());
             }
             records.push((case.emit)()?);
         } else if let Some(case) = collective_cases.iter().find(|case| case.id == case_id) {
-            if suite == Some("cuda-collectives") {
-                return Err(format!("case `{case_id}` is not in suite `cuda-collectives`").into());
+            if let Some(suite) = suite.filter(|suite| *suite != "collectives") {
+                return Err(format!("case `{case_id}` is not in suite `{suite}`").into());
             }
             records.push(case.emit().map_err(|error| format!("collective case `{case_id}` failed: {error}"))?);
         } else if let Some(case) = ragged_cases.iter().find(|case| case.id == case_id) {
-            if suite == Some("collectives") {
-                return Err(format!("case `{case_id}` is not in suite `collectives`").into());
+            if let Some(suite) = suite.filter(|suite| *suite != "cuda-collectives") {
+                return Err(format!("case `{case_id}` is not in suite `{suite}`").into());
             }
             records.push(case.emit().map_err(|error| format!("CUDA collective case `{case_id}` failed: {error}"))?);
         } else {
@@ -1079,7 +1120,41 @@ mod tests {
                 "dot_product_attention",
                 "negative_dynamic_slice",
                 "condition_varying_predicate_gradient",
+                "rematerialization_nothing_saveable",
+                "rematerialization_everything_saveable",
+                "rematerialization_dots_saveable",
+                "rematerialization_dots_with_no_batch_dims_saveable",
+                "rematerialization_save_only_these_names",
+                "rematerialization_save_any_names_but_these",
+                "rematerialization_save_from_both_policies",
+                "rematerialization_save_and_offload_only_these_names",
+                "rematerialization_dots_saveable_call",
+                "rematerialization_dots_saveable_condition",
+                "rematerialization_dots_saveable_scan",
+                "rematerialization_dots_saveable_known_condition",
+                "rematerialization_dots_saveable_known_scan",
+                "rematerialization_nested_policies",
             ],
+        );
+        assert_eq!(
+            registry().into_iter().map(|case| case.suite.name()).collect::<Vec<_>>(),
+            [[Some("collectives"); 3].as_slice(), &[None; 6], &[Some("rematerialization"); 14]].concat(),
+        );
+    }
+
+    #[test]
+    fn test_run_rejects_case_outside_rematerialization_suite() {
+        assert_eq!(
+            run(&["--suite".into(), "rematerialization".into(), "--case".into(), "pshuffle".into()])
+                .unwrap_err()
+                .to_string(),
+            "case `pshuffle` is not in suite `rematerialization`",
+        );
+        assert_eq!(
+            run(&["--suite".into(), "rematerialization".into(), "--case".into(), "collective_gather_1_untiled".into()])
+                .unwrap_err()
+                .to_string(),
+            "case `collective_gather_1_untiled` is not in suite `rematerialization`",
         );
     }
 

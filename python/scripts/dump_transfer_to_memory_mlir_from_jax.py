@@ -2,8 +2,8 @@
 
 This is the JAX side of the parity check for ryft's `TransferToMemoryOperation` lowering: the
 program below mirrors `test_transfer_to_memory_lowers_to_device_placement_annotations` in
-`crates/ryft-xla/src/experimental/lowering.rs`, and the `annotate_device_placement` custom calls
-it prints are asserted byte-for-byte in that test.
+`crates/ryft-xla/src/operations/manipulation/memory.rs`, and the `annotate_device_placement`
+custom calls it prints are asserted byte-for-byte in that test.
 
 Two JAX-specific wrinkles make the dump non-obvious:
 
@@ -17,14 +17,13 @@ Two JAX-specific wrinkles make the dump non-obvious:
 
 import jax
 import jax.numpy as jnp
-from jax._src.sharding_impls import TransferToMemoryKind
 
 
 def f(x):
-    y = x * 2.0
-    y_host = jax.device_put(y, TransferToMemoryKind("pinned_host"))
-    y_back = jax.device_put(y_host, TransferToMemoryKind("device"))
-    return y_back * 3.0
+    y = x * x
+    y_host = jax.device_put(y, jax.memory.Space.Host)
+    y_back = jax.device_put(y_host, jax.memory.Space.Device)
+    return y_back * y_back
 
 
 def main() -> int:
