@@ -369,7 +369,7 @@ impl<V: Typed + Parameter, O> ErasedTransformArtifact<V, O> {
 
     /// Reconstructs a typed [`TransformArtifact`] from this [`ErasedTransformArtifact`], panicking only if a marker
     /// violated its coherent artifact layout.
-    fn typed<Metadata: Clone + Send + Sync + 'static>(&self) -> TransformArtifact<V, O, Metadata> {
+    fn typed<Metadata: Clone + Send + Sync + 'static>(self) -> TransformArtifact<V, O, Metadata> {
         let metadata = self.metadata.downcast_ref::<Metadata>().unwrap_or_else(|| {
             panic!(
                 "region transform cache metadata type mismatch: retained `{}` but requested `{}`",
@@ -377,7 +377,7 @@ impl<V: Typed + Parameter, O> ErasedTransformArtifact<V, O> {
                 std::any::type_name::<Metadata>(),
             )
         });
-        TransformArtifact::new(self.programs.clone(), metadata.clone())
+        TransformArtifact::new(self.programs, metadata.clone())
     }
 }
 
@@ -734,7 +734,11 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         mut artifact: TransformArtifact<V, O, Metadata>,
     ) -> TransformArtifact<V, O, Metadata> {
         for program in &mut artifact.programs {
-            Arc::make_mut(program).detach_transform_cache(self.transform_cache());
+            // A shared program needs no writable copy when its complete arena carries no source cache. Inspect all
+            // regions, including dormant rule bodies, before asking `Arc::make_mut` to clone an otherwise shared arena.
+            if program.regions().iter().any(|region| region.transform_cache().ptr_eq(self.transform_cache())) {
+                Arc::make_mut(program).detach_transform_cache(self.transform_cache());
+            }
         }
         artifact
     }
@@ -750,6 +754,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::{Arc, Barrier};
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayType, DataType};
@@ -883,7 +888,9 @@ mod tests {
         ));
         assert_eq!(format!("{erased:?}"), "ErasedTransformArtifact { program_count: 1, metadata_type: \"usize\" }",);
         let cloned = erased.clone();
+        let program_storage = cloned.programs.as_ptr();
         let typed = cloned.typed::<usize>();
+        assert_eq!(typed.programs().as_ptr(), program_storage);
         assert_eq!(typed.programs().len(), 1);
         assert!(Arc::ptr_eq(&typed.programs()[0], &program));
         assert_eq!(typed.metadata(), &7);
@@ -1240,6 +1247,73 @@ mod tests {
             format!("{:?}", program.entry_region().transform_cache()),
             "RegionTransformCache { namespace_count: 1, artifact_count: 2 }",
         );
+    }
+
+    #[test]
+    fn test_region_ref_sanitize_transform_artifact_reuses_unrelated_shared_programs() {
+        let source = identity_program();
+        let program = Arc::new(identity_program());
+        let sanitized = source
+            .entry_region_ref()
+            .sanitize_transform_artifact(TransformArtifact::new(vec![Arc::clone(&program)], ()));
+        assert!(Arc::ptr_eq(&sanitized.programs()[0], &program));
+        assert_eq!(
+            sanitized.programs()[0].to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                in (%0)"},
+        );
+    }
+
+    #[test]
+    fn test_region_ref_sanitize_transform_artifact_detaches_dormant_source_caches() {
+        let source = identity_program();
+        let source_cache = source.entry_region().transform_cache().downgrade();
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let rule = builder.import_region(source.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::rule("rule")] }),
+                vec![rule],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        let sanitized = source
+            .entry_region_ref()
+            .sanitize_transform_artifact(TransformArtifact::new(vec![Arc::clone(&program)], ()));
+        assert!(!Arc::ptr_eq(&sanitized.programs()[0], &program));
+        assert_eq!(
+            sanitized.programs()[0].to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = with_regions %0 [
+                    rule=^0={
+                        lambda %0:f64[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
+        assert!(
+            source
+                .entry_region()
+                .transform_cache()
+                .ptr_eq(program.regions().get(rule).unwrap().transform_cache())
+        );
+        assert!(
+            !source
+                .entry_region()
+                .transform_cache()
+                .ptr_eq(sanitized.programs()[0].regions().get(rule).unwrap().transform_cache())
+        );
+        drop(program);
+        drop(source);
+        assert!(!source_cache.is_alive());
     }
 
     #[test]
