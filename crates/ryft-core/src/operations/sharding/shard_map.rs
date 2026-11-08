@@ -1721,14 +1721,12 @@ pub struct ShardMapOperation {
     output_forwarding: Vec<Option<usize>>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ShardMapOperation {
-    /// Creates a new [`ShardMapOperation`] for an already traced local `body`, including reference inputs and
-    /// forwarded reference outputs. The operation is bound with the body afterwards. Global output types are derived
-    /// from the body's output types through the output shardings, and reference forwarding is derived from the body's
-    /// canonical reference analysis. Body outputs must explicitly vary along each manual axis that their output
-    /// shardings tile, which may require `parallel_vary` for invariant outputs.
+    /// Creates a new [`ShardMapOperation`] for an already traced local `body`, including reference inputs and forwarded
+    /// reference outputs. The operation is bound with the body afterwards. Global output types are derived from the
+    /// body's output types through the output shardings, and reference forwarding is derived from the body's canonical
+    /// reference analysis. Body outputs must explicitly vary along each manual axis that their output shardings tile,
+    /// which may require [`ParallelVaryOperation`] for invariant outputs.
     ///
     /// # Parameters
     ///
@@ -1747,8 +1745,8 @@ impl ShardMapOperation {
     ///
     /// # Errors
     ///
-    /// Returns [`ShardMapError::InputTypeCountMismatch`] or [`ShardMapError::OutputTypeCountMismatch`] when the number
-    /// of global input types or body outputs differs from the number of input or output shardings,
+    /// Returns [`ShardMapError::InputTypeCountMismatch`] or [`ShardMapError::OutputTypeCountMismatch`]
+    /// when the number of global input types or body outputs differs from the number of input or output shardings,
     /// [`ShardMapError::InputMeshMismatch`] when a global input type carries a sharding over a mesh whose axes differ
     /// from those of the mesh of `shard_map`, [`ShardMapError::ReductionStateMismatch`] when the reduction state of a
     /// global input type along the axes that its input sharding governs differs from that of the input sharding,
@@ -1758,11 +1756,10 @@ impl ShardMapOperation {
     /// output derivation errors for the body outputs (i.e., [`ShardMapError::OutputNotVaryingAlongTiledManualAxis`],
     /// [`ShardMapError::OutputVaryingAlongUntiledManualAxis`], [`ShardMapError::ReductionStateMismatch`],
     /// [`ShardMapError::ShardingRankMismatch`], [`ShardMapError::DynamicShapeNotSupported`], or
-    /// [`ShardMapError::ArithmeticOverflow`]),
-    /// [`ShardMapError::OrderedIoNotSupported`] for a body with the [`EffectClass::OrderedIo`] effect, and
-    /// [`ShardMapError::Program`] when the body's arity or input types do not match the local shards of the declared
-    /// global input types, or when the body violates the reference contract (e.g., a reference output that does not
-    /// forward a reference input).
+    /// [`ShardMapError::ArithmeticOverflow`]), [`ShardMapError::OrderedIoNotSupported`] for a body with the
+    /// [`EffectClass::OrderedIo`] effect, and [`ShardMapError::Program`] when the body's arity or input types do not
+    /// match the local shards of the declared global input types, or when the body violates the reference contract
+    /// (e.g., a reference output that does not forward a reference input).
     pub fn from_program<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType> + OperationPayloadProjection>(
         body: &Program<V, O, Vec<V>, Vec<V>>,
         global_input_types: Vec<ArrayIrType>,
@@ -1774,6 +1771,7 @@ impl ShardMapOperation {
                 actual: global_input_types.len(),
             });
         }
+
         let global_input_types = global_input_types
             .iter()
             .enumerate()
@@ -1793,14 +1791,18 @@ impl ShardMapOperation {
             {
                 return Err(ProgramError::InvalidArgument {
                     message: format!(
-                        "`{SHARD_MAP_OPERATION_NAME}` body input #{index} has type `{local}`, but its global input \
-                         requires local {} `{expected}`",
+                        "`{}` body input #{} has type `{}`, but its global input requires local {} `{}`",
+                        SHARD_MAP_OPERATION_NAME,
+                        index,
+                        local,
                         if global.is_reference() { "reference referent" } else { "array type" },
+                        expected,
                     ),
                 }
                 .into());
             }
         }
+
         let local_output_types = body.output_types();
         let referents = local_output_types
             .iter()
@@ -1813,12 +1815,15 @@ impl ShardMapOperation {
                 actual: referents.len(),
             });
         }
+
         let mut global_outputs = referents
             .iter()
             .enumerate()
             .map(|(output_index, local_output_type)| boundary.global_output_type(output_index, local_output_type))
             .collect::<Result<Vec<_>, _>>()?;
-        // References retain their ownership and replicated-state contract even when array output replication is trusted.
+
+        // References retain their ownership and replicated-state contract even
+        // when array output replication is trusted.
         if boundary.checks_manual_variation()
             && !boundary.checks_output_replication()
             && local_output_types.iter().any(Type::is_reference)
@@ -1828,6 +1833,7 @@ impl ShardMapOperation {
                 global_outputs[index] = checked_boundary.global_output_type(index, &referents[index])?;
             }
         }
+
         let output_types = local_output_types
             .iter()
             .zip(global_outputs)
@@ -1839,7 +1845,9 @@ impl ShardMapOperation {
                 }
             })
             .collect::<Vec<_>>();
+
         Self::validate_body_effects(body.effects().classes())?;
+
         let analysis = body.entry_region_ref().reference_analysis(0).map_err(ProgramError::from)?;
         let output_forwarding = analysis
             .output_roots()
@@ -1851,8 +1859,10 @@ impl ShardMapOperation {
                 _ => None,
             })
             .collect();
+
         let operation = Self::from_boundary(boundary, global_input_types.clone(), output_types)
             .with_output_forwarding(output_forwarding)?;
+
         // The reference contract is validated first, so that a reference output that does not forward a reference input
         // (e.g., one allocated inside the body) is reported with its precise cause rather than as an undeclared output
         // forwarding by type inference.
@@ -1862,6 +1872,8 @@ impl ShardMapOperation {
             .map_err(ProgramError::from)?;
         Ok(operation)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Creates a new [`ShardMapOperation`] directly from its boundary parts, skipping the validation of
     /// [`Self::from_program`] and declaring every output as a value output. Transform rules use it to rebuild a
