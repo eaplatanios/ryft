@@ -584,39 +584,28 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///
     ///   - `operation`: [`Operation`] to fold into the known-side context when all inputs are known, or to emit into
     ///     the residual [`Program`] otherwise.
-    ///   - `regions`: Owned [`Program`]s whose entry [`Region`](crate::Region)s are attached to `operation`, in
-    ///     the order defined by [`Operation::region_slots`]. Folding binds these regions with the operation, while
-    ///     residualization imports them into the residual [`Program`].
+    ///   - `regions`: Attached regions in the order defined by [`Operation::region_slots`], accepting the same
+    ///     representations as [`Context::bind`]. Owned programs are moved when imported, shared callees are interned
+    ///     by [`Arc`](std::sync::Arc) identity, and replay attachments preserve their source mappings. Folding borrows
+    ///     shared callees directly. Regions are materialized only when replay mappings belong to another builder or
+    ///     when eager execution must be retried with owned programs.
     ///   - `inputs`: Partially evaluated inputs supplied to `operation`, in [`Operation`]-defined order. Their
     ///     known-ness determines whether the operation is folded or residualized.
     #[inline]
-    pub fn fold_or_residualize<P: Into<C::Operation>>(
+    pub fn fold_or_residualize<'r, P: Into<C::Operation>, R: Into<AttachedRegions<'r, C::Constant, C::Operation>>>(
         &self,
         operation: P,
-        regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        regions: R,
         inputs: &[PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
+    where
+        C::Constant: 'r,
+        C::Operation: 'r,
+    {
         if let Some(error) = self.error() {
             return Err(error);
         }
-        self.fold_or_residualize_operation(operation.into(), AttachedRegions::from(regions), inputs)
-    }
-
-    /// Folds or residualizes `operation` like [`Self::fold_or_residualize`], except that its regions are provided as
-    /// [`AttachedRegions`], so that shared callee regions (i.e., [`AttachedRegions::Callees`]) are folded by reference
-    /// instead of being materialized as owned [`Program`]s first. The regions are materialized only on the paths that
-    /// need owned programs (i.e., residualization and the eager retry of unsupported work).
-    #[inline]
-    pub fn fold_or_residualize_using_attached_regions<P: Into<C::Operation>>(
-        &self,
-        operation: P,
-        regions: AttachedRegions<'_, C::Constant, C::Operation>,
-        inputs: &[PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        if let Some(error) = self.error() {
-            return Err(error);
-        }
-        self.fold_or_residualize_operation(operation.into(), regions, inputs)
+        self.fold_or_residualize_operation(operation.into(), regions.into(), inputs)
     }
 
     /// Internal helper that folds or residualizes an already converted [`Operation`]. This is the body of
@@ -769,8 +758,9 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// # Parameters
     ///
     ///   - `operation`: [`Operation`] to emit into the residual [`Program`].
-    ///   - `regions`: Owned [`Program`]s whose entry [`Region`](crate::Region)s are attached to `operation`, in the
-    ///     order defined by [`Operation::region_slots`]. Regions are specialized when materialized input types refine
+    ///   - `regions`: Attached regions in the order defined by [`Operation::region_slots`], accepting the same
+    ///     representations as [`Context::bind`]. Shared callees are interned by [`Arc`](std::sync::Arc) identity
+    ///     rather than copied into the residual program. Regions are specialized when materialized input types refine
     ///     their declared inputs and the operation requests specialization. If preparation or replay fails, or the
     ///     operation rejects the specialized signatures, the declared programs are used when ordinary validation
     ///     accepts them.
@@ -778,40 +768,25 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///     are materialized as residual program inputs or constants, while unknown inputs reuse their existing residual
     ///     atoms.
     #[inline]
-    pub fn residualize<P: Into<C::Operation>>(
+    pub fn residualize<'r, P: Into<C::Operation>, R: Into<AttachedRegions<'r, C::Constant, C::Operation>>>(
         &self,
         operation: P,
-        regions: Vec<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>,
+        regions: R,
         inputs: &[PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
+    where
+        C::Constant: 'r,
+        C::Operation: 'r,
+    {
         if let Some(error) = self.error() {
             return Err(error);
         }
-        self.residualize_attached_regions(operation.into(), AttachedRegions::from(regions), inputs)
-    }
-
-    /// Residualizes `operation` like [`Self::residualize`], except that its regions are provided as
-    /// [`AttachedRegions`], so that shared callee regions (i.e., [`AttachedRegions::Callees`]) are interned into the
-    /// residual [`Program`] by [`Arc`](std::sync::Arc) identity instead of being copied into it as owned [`Program`]s.
-    /// Rules that emit the same shared callee from several applications (e.g., the replay half of a `jit_call` split
-    /// on residual demand) use this so that every residual application shares one region.
-    #[inline]
-    pub fn residualize_using_attached_regions<P: Into<C::Operation>>(
-        &self,
-        operation: P,
-        regions: AttachedRegions<'_, C::Constant, C::Operation>,
-        inputs: &[PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        if let Some(error) = self.error() {
-            return Err(error);
-        }
-        self.residualize_attached_regions(operation.into(), regions, inputs)
+        self.residualize_attached_regions(operation.into(), regions.into(), inputs)
     }
 
     /// Internal helper that residualizes an already converted [`Operation`] with its [`AttachedRegions`].
-    /// This is the body of [`residualize`](Self::residualize) and
-    /// [`residualize_using_attached_regions`](Self::residualize_using_attached_regions), which only convert their input
-    /// operation and regions, so that this body is compiled once per context rather than once per input operation type.
+    /// This is the body of [`residualize`](Self::residualize), which only converts its operation and regions,
+    /// so this body is compiled once per context rather than once per input operation or region representation.
     fn residualize_attached_regions(
         &self,
         operation: C::Operation,
@@ -2337,6 +2312,25 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_with_rounded_residual_policy() {
+        let policy = save_nothing();
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let configured = context.clone().with_rounded_residual_policy(&policy, |_: &ArrayIrType| None);
+        assert!(context.residual_policy().is_none());
+        assert_eq!(configured.residual_policy(), Some(&policy));
+        assert!(configured.residual_placement().unwrap().rounds_residuals());
+        assert!(configured.clone().residual_placement().unwrap().rounds_residuals());
+        let sibling = configured.deferred_sibling();
+        assert_eq!(sibling.residual_policy(), Some(&policy));
+        assert!(sibling.residual_placement().unwrap().rounds_residuals());
+
+        // Replacing a rounded placement with an ordinary policy affects only the returned context.
+        let plain = configured.clone().with_residual_policy(&policy);
+        assert!(!plain.residual_placement().unwrap().rounds_residuals());
+        assert!(configured.residual_placement().unwrap().rounds_residuals());
+    }
+
+    #[test]
     fn test_partial_evaluation_context_without_residual_policy() {
         let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
             .with_residual_policy(&save_nothing());
@@ -3221,7 +3215,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_evaluation_context_residualize_using_attached_regions() {
+    fn test_partial_evaluation_context_residualize_preserves_shared_callees() {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let mut body = ProgramBuilder::<TestValue, TestOperation>::new();
         let input = body.add_input(scalar_type.clone().into());
@@ -3239,19 +3233,11 @@ mod tests {
         let input = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2f32).unwrap()));
         let operation = RematerializeOperation::new(save_nothing());
         let first = context
-            .residualize_using_attached_regions(
-                operation.clone(),
-                AttachedRegions::Callees(std::slice::from_ref(&body)),
-                &[input],
-            )
+            .residualize(operation.clone(), AttachedRegions::Callees(std::slice::from_ref(&body)), &[input])
             .unwrap();
         assert!(first[0].is_unknown());
         let second = context
-            .residualize_using_attached_regions(
-                operation,
-                AttachedRegions::Callees(std::slice::from_ref(&body)),
-                &first,
-            )
+            .residualize(operation, AttachedRegions::Callees(std::slice::from_ref(&body)), &first)
             .unwrap();
         let evaluation = context.into_evaluation(second).unwrap();
         let instructions = evaluation.program.instructions();
@@ -3280,6 +3266,82 @@ mod tests {
                     ]
                 in (%2)"},
         );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_partition_residual_demand() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let second = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let first = builder
+            .add_instruction(ArrayOperation::from(NegOperation::new()), Vec::new(), vec![first], None)
+            .unwrap()[0];
+        let second = builder
+            .add_instruction(ArrayOperation::from(NegOperation::new()), Vec::new(), vec![second], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![first, second], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new())
+            .with_residual_policy(&save_nothing())
+            .with_defer_ordered_effects(true);
+        let partition = context.partition_residual_demand(program.entry_region_ref(), &[false, true]).unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[ResidualEdge(0)],
+                    outputs=[Known(0), Known(1), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f32[], %1:f32[] .
+                    let %2:f32[] = neg %0
+                        %3:f32[] = neg %1
+                    in (%2, %3, %1)
+                }
+                residual={
+                    lambda %0:f32[] .
+                    let %1:f32[] = neg %0
+                    in (%1)
+                }"},
+        );
+        assert!(context.defer_ordered_effects());
+        assert!(context.builder.borrow().instructions().is_empty());
+        assert!(context.inputs.borrow().is_empty());
+        assert_eq!(context.error(), None);
+        let known = partition
+            .known_program()
+            .interpret(vec![
+                TestValue::Array(Array::scalar(2f32).unwrap()),
+                TestValue::Array(Array::scalar(3f32).unwrap()),
+            ])
+            .unwrap();
+        assert_eq!(
+            known,
+            vec![
+                TestValue::Array(Array::scalar(-2f32).unwrap()),
+                TestValue::Array(Array::scalar(-3f32).unwrap()),
+                TestValue::Array(Array::scalar(3f32).unwrap())
+            ]
+        );
+        assert_eq!(partition.residual_program().interpret(vec![known[2].clone()]), Ok(vec![known[1].clone()]));
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_partition_residual_demand_requires_policy() {
+        let program = ProgramBuilder::<TestValue, TestOperation>::new()
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::<AtomId>::new(), Vec::new(), Vec::new())
+            .unwrap();
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        assert_eq!(
+            context.partition_residual_demand(program.entry_region_ref(), &[]).map(|_| ()),
+            Err(ProgramError::InvalidArgument {
+                message: "partitioning a region on residual demand requires a residual policy".to_string(),
+            }),
+        );
+        assert!(context.builder.borrow().instructions().is_empty());
+        assert!(!context.defer_ordered_effects());
     }
 
     #[test]
