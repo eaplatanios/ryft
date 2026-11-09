@@ -1355,8 +1355,8 @@ where
         let demanded_types = output_types
             .iter()
             .zip(demanded_outputs)
-            .filter(|&(output_type, &demanded)| demanded)
-            .map(|(output_type, &demanded)| output_type.clone())
+            .filter(|&(_, &demanded)| demanded)
+            .map(|(output_type, _)| output_type.clone())
             .collect::<Vec<_>>();
         let reproduces = |values: &[PartialEvaluationValue<Tracer<TracingContext<V, O>>>], types: &[V::Type]| {
             values.len() == types.len()
@@ -1435,6 +1435,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::cell::Cell;
     use std::collections::HashSet;
 
     use indoc::indoc;
@@ -1449,6 +1450,7 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::Context;
     use crate::differentiation::NothingSavable;
+    use crate::macros::impl_guardless_operation;
     use crate::operations::{
         AddOperation, ConditionOperation, CosOperation, DotDimensionNumbers, DotOperation, GuardOperation,
         MulOperation, NegOperation, PrintOperation, ReferenceAddUpdateOperation, ReferenceNewOperation,
@@ -1467,6 +1469,7 @@ mod tests {
         EffectClass, EffectClasses, Effects, EffectsSummary, InstructionId, Operation, OperationProvider,
         ProgramBuilder, ProgramError, ReferenceType, RegionInterface, TypeError,
     };
+    use crate::tracing::TracerState;
 
     use super::*;
 
@@ -2341,11 +2344,6 @@ mod tests {
 
     #[test]
     fn test_partitioned_program_from_evaluation() {
-        use std::cell::Cell;
-
-        use crate::macros::impl_guardless_operation;
-        use crate::tracing::TracerState;
-
         /// Identity whose clone count distinguishes moving an unshared builder from cloning a retained one.
         #[derive(Debug)]
         struct CloneCountingOperation {
@@ -2451,8 +2449,6 @@ mod tests {
 
     #[test]
     fn test_partitioned_program_from_evaluation_preserves_capture_constants() {
-        use crate::tracing::TracerState;
-
         // The assembler preserves capture constants already staged by its caller. Unlike a standalone trace, it
         // neither owns nor discards a runtime capture table, and taking its builder must not add such a rejection.
         for retain_context in [false, true] {
@@ -2487,8 +2483,6 @@ mod tests {
 
     #[test]
     fn test_partitioned_program_from_evaluation_preserves_errors() {
-        use crate::tracing::TracerState;
-
         for retain_context in [false, true] {
             for (state, stored_error, expected_error) in [
                 (TracerState::Live(AtomId::new(0)), None, ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
