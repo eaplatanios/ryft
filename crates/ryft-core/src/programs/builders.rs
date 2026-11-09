@@ -1523,7 +1523,7 @@ mod tests {
         // The region-aware rebuild paths preserve regions. Simplification keeps the live region-carrying instruction
         // and its region, filtering projects the entry boundary while passing regions through, and relocation imports
         // the referenced regions into the destination builder.
-        let simplified = program.into_simplified().unwrap();
+        let simplified = program.clone().into_simplified().unwrap();
         assert_eq!(simplified.regions().len(), 2);
         assert_eq!(simplified.instructions()[0].regions(), &[sealed]);
         let (filtered, live_inputs) = program.clone().into_filtered(&[input], program.output_ids(), &[]).unwrap();

@@ -16,7 +16,7 @@ use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::{Operation, OperationBoundaryPruning};
 use crate::programs::regions::{
     InputRegionProvenance, Region, RegionArena, RegionDataFlowRegionBoundary, RegionId, RegionInterface,
-    RegionLiveness, RegionRef, reachable_region_mask,
+    RegionLiveness, RegionRef, RegionSimplificationShape, reachable_region_mask,
 };
 use crate::programs::types::{Type, Typed, TypedProgram, type_identities_needing_runtime_checks};
 use crate::programs::values::{Value, ValueId, ValueProjection};
@@ -902,8 +902,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// Pruning is separate from [`Self::into_simplified`] because it changes the interfaces of region-carrying
     /// instructions and unshares their regions, which most transforms rely on staying as traced (e.g., a shared callee
     /// that is linearized once for every program that calls it). Consumers opt in where unused work matters, such as
-    /// the placement of residuals by
-    /// [`with_top_level_residual_policy`](crate::PartitionedProgram::with_top_level_residual_policy).
+    /// the placement of residuals by [`with_residual_policy`](crate::PartitionedProgram::with_residual_policy).
     ///
     /// # Errors
     ///
@@ -1861,171 +1860,6 @@ struct ProgramLivenessAnalysis {
 
     /// Indices of effectful entry-[`Region`] [`Instruction`]s, retained in original [`Program`] order.
     effectful_instruction_indices: Vec<usize>,
-}
-
-/// Contents shape of a [`Region`], captured before [`Program`] simplification rebuilds it so that the rebuild can be
-/// recognized as the identity on that region's contents. This type exists to keep [`Region`] transform caches alive
-/// across simplification. Every content-changing region construction must mint a fresh [`RegionTransformCache`],
-/// because that cache retains pure functions of the region's contents. Simplification, however, runs on essentially
-/// every built [`Program`] (i.e., the standard pipeline is [`ProgramBuilder::build`](crate::ProgramBuilder::build)
-/// followed by [`Program::into_simplified`]), and it usually rebuilds regions _without changing them_. If those
-/// identity rebuilds also minted fresh caches, transform caching would be severed at the one pipeline every program
-/// flows through, and a callee's retained linearization or transposition could never be shared with any program that
-/// imports it. Simplification therefore captures this shape before rebuilding a region and asks
-/// [`Self::is_identity_rebuild`] afterward whether the rebuild was the identity. If so, the rebuilt region adopts the
-/// source region's cache, and otherwise it keeps its fresh one. Note that the recognition is deliberately conservative.
-/// A false negative merely misses a cache share and costs repeated transform work. A false positive would share cached
-/// transforms across regions with different contents and produce wrong programs. Every field and check below is
-/// therefore chosen so that recognition can only fail toward the safe side.
-struct RegionSimplificationShape {
-    /// Number of [`Atom`]s in the source [`Region`].
-    atom_count: usize,
-
-    /// Number of [`Instruction`]s in the source [`Region`].
-    instruction_count: usize,
-
-    /// Boolean indicating whether every source [`Instruction`] is pinned to its position by at least one output
-    /// [`Atom`]. The only per-instruction evidence [`Self::is_identity_rebuild`] receives is the source-to-rebuilt
-    /// [`Atom`] identifier mapping, so an instruction can be proven preserved only _through the atoms it produces_:
-    /// an identity mapping over every source atom pins the producing instruction of each atom to its original position.
-    /// An instruction with no outputs (i.e., a purely effectful one, such as a print) is invisible to that evidence
-    /// (i.e., the mapping cannot show whether it survived or where it ended up) so when this is `false`, identity
-    /// recognition is refused outright rather than risking a cache share that no atom can attest to.
-    atoms_pin_every_instruction: bool,
-
-    /// Boolean indicating whether the source [`Instruction`]s' first output [`Atom`] identifiers strictly increase
-    /// with instruction order. Atom evidence pins each instruction to the atoms it produces, but the rebuild emits
-    /// instructions in the order in which their outputs are reached, not in source instruction order. Those two
-    /// orders agree exactly when the source [`Region`] numbers its atoms in instruction order, which every
-    /// [`ProgramBuilder`](crate::ProgramBuilder) region does because each instruction appends its outputs to the
-    /// atom table as it is added. A hand-built region that numbers its atoms against its instruction order can instead
-    /// be rebuilt with a permuted, data-independent, instruction sequence that the mapping alone cannot distinguish
-    /// from the identity, so when this is `false`, identity recognition is refused.
-    atoms_are_instruction_ordered: bool,
-}
-
-impl RegionSimplificationShape {
-    /// Captures the [`RegionSimplificationShape`] of `region`.
-    fn of<V: Typed + Parameter, O>(region: &Region<V, O>) -> Self {
-        let mut atoms_pin_every_instruction = true;
-        let mut atoms_are_instruction_ordered = true;
-        let mut previous_first_output = None;
-        for instruction in region.instructions() {
-            let Some(first_output) = instruction.outputs().first().copied() else {
-                atoms_pin_every_instruction = false;
-                continue;
-            };
-            if previous_first_output.is_some_and(|previous| first_output <= previous) {
-                atoms_are_instruction_ordered = false;
-            }
-            previous_first_output = Some(first_output);
-        }
-        Self {
-            atom_count: region.atoms().len(),
-            instruction_count: region.instructions().len(),
-            atoms_pin_every_instruction,
-            atoms_are_instruction_ordered,
-        }
-    }
-
-    /// Returns whether simplification rebuilt this region with exactly its original contents, which is the precondition
-    /// for `rebuilt` to share the source region's [`RegionTransformCache`]. [`Program`] simplification copies surviving
-    /// [`Atom`]s and [`Instruction`]s unchanged and only renumbers atom identifiers, so the rebuild is the identity
-    /// exactly when no atom was dropped, none was renumbered, and no instruction was dropped or reordered. Equal atom
-    /// and instruction counts together with an identity mapping over every source atom establish all of that, provided
-    /// both shape flags hold: (1) an output-free instruction's survival and position are invisible to the mapping
-    /// (i.e., [`Self::atoms_pin_every_instruction`]), and (2) atom evidence pins instruction order only when the source
-    /// numbers its atoms in instruction order (i.e., [`Self::atoms_are_instruction_ordered`]). The rebuilt region's
-    /// instructions may still have their attached [`RegionId`]s renumbered afterward by [`compact_regions`],
-    /// so the recognized identity is an identity _up to region-identifier renumbering_. That is sound for cache sharing
-    /// for the same reason [`RegionArena::append`] keeps derived metadata valid: renumbering preserves the complete
-    /// reachable region graph's topology and changes no region boundary, [`Operation`], or [`Atom`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `atom_id_mapping`: Source-to-rebuilt [`AtomId`] mapping indexed by source atom position, with one slot
-    ///     per source atom.
-    ///   - `rebuilt`: [`Region`] that simplification rebuilt from this shape's source region.
-    fn is_identity_rebuild<V: Typed + Parameter, O>(
-        &self,
-        atom_id_mapping: &[Option<AtomId>],
-        rebuilt: &Region<V, O>,
-    ) -> bool {
-        self.atoms_pin_every_instruction
-            && self.atoms_are_instruction_ordered
-            && rebuilt.instructions().len() == self.instruction_count
-            && atom_id_mapping.len() == self.atom_count
-            && rebuilt.atoms().len() == self.atom_count
-            && atom_id_mapping.iter().enumerate().all(|(index, mapped)| *mapped == Some(AtomId::new(index)))
-    }
-}
-
-impl<V: Value, O> Region<V, O> {
-    /// Returns whether output-rooted simplification emits every atom and instruction in this region in its original
-    /// position. This region must already be sealed and have no instruction retained when unused. Matching the next
-    /// expected source index proves that the emitted atom mapping and instruction order are both the identity,
-    /// without rebuilding either.
-    pub(super) fn simplification_is_identity(&self) -> bool {
-        /// A source dependency visit or instruction emission in simplification's post-order walk.
-        enum Step {
-            /// Visits the next source atom, reusing any already emitted prefix atom.
-            Visit(AtomId),
-
-            /// Checks one instruction after every input has been emitted.
-            Emit(usize),
-        }
-
-        let shape = RegionSimplificationShape::of(self);
-        if !shape.atoms_pin_every_instruction
-            || !shape.atoms_are_instruction_ordered
-            || self.input_ids().iter().enumerate().any(|(index, input)| input.index() != index)
-        {
-            return false;
-        }
-
-        let instruction_by_output = self.instruction_by_output();
-        let mut pending = Vec::new();
-        let mut next_atom = self.input_ids().len();
-        let mut next_instruction = 0;
-        for output in self.output_ids().iter().copied() {
-            pending.push(Step::Visit(output));
-            while let Some(step) = pending.pop() {
-                match step {
-                    Step::Visit(atom) if atom.index() < next_atom => {}
-                    Step::Visit(atom) => match &self.atoms()[atom.index()] {
-                        Atom::Constant(_) => {
-                            if atom.index() != next_atom {
-                                return false;
-                            }
-                            next_atom += 1;
-                        }
-                        Atom::Variable(_) => {
-                            let Some(instruction) = instruction_by_output[atom.index()] else {
-                                return false;
-                            };
-                            pending.push(Step::Emit(instruction));
-                            pending.extend(
-                                self.instructions()[instruction].inputs().iter().rev().copied().map(Step::Visit),
-                            );
-                        }
-                    },
-                    Step::Emit(instruction) => {
-                        if instruction != next_instruction {
-                            return false;
-                        }
-                        for output in self.instructions()[instruction].outputs() {
-                            if output.index() != next_atom {
-                                return false;
-                            }
-                            next_atom += 1;
-                        }
-                        next_instruction += 1;
-                    }
-                }
-            }
-        }
-        next_atom == self.atoms().len() && next_instruction == self.instructions().len()
-    }
 }
 
 /// Moves the [`Atom`] that corresponds to `atom_id` (and its transitive producers) out of `atoms`/`instructions`
@@ -4370,9 +4204,6 @@ mod tests {
                 ),
             ],
         );
-        let shape = RegionSimplificationShape::of(&region);
-        assert!(!shape.atoms_are_instruction_ordered);
-
         let program = Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
             vec![Placeholder],
             vec![Placeholder, Placeholder],
@@ -5162,7 +4993,7 @@ mod tests {
         let output = builder.add_instruction(NegOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder.add_instruction(PrintOperation::new("x"), Vec::new(), vec![input], None).unwrap();
         let effectful = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let (filtered, live) = effectful.clone().into_filtered(&[input], &[output], &[]).unwrap();
+        let (filtered, live) = effectful.into_filtered(&[input], &[output], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 2);
         assert_eq!(filtered.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
@@ -6053,27 +5884,6 @@ mod tests {
             &effectful_analysis.prunings[key.0.index()][&key.1]
         ));
         assert_eq!(pure_analysis.live_sets(pure.entry(), &[0]), Ok(pure_live));
-    }
-
-    #[test]
-    fn test_region_simplification_shape_refuses_output_free_instructions() {
-        // An instruction with no outputs produces no atom, so the source-to-rebuilt atom mapping cannot attest to its
-        // survival or its position. Even the strongest possible evidence (i.e., the region rebuilt as itself under an
-        // identity mapping) must therefore be refused.
-        let scalar = ArrayType::scalar(DataType::F64);
-        let region: Region<Array, ArrayOperation<Array>> = Region::new(
-            vec![Atom::Variable(scalar.clone()), Atom::Variable(scalar)],
-            vec![AtomId::new(0)],
-            vec![AtomId::new(1)],
-            vec![
-                Instruction::new(NegOperation::new().into(), vec![AtomId::new(0)], vec![AtomId::new(1)], Vec::new()),
-                Instruction::new(PrintOperation::new("effect").into(), vec![AtomId::new(0)], Vec::new(), Vec::new()),
-            ],
-        );
-        let identity_mapping = (0..region.atoms().len()).map(|index| Some(AtomId::new(index))).collect::<Vec<_>>();
-        let shape = RegionSimplificationShape::of(&region);
-        assert!(!shape.atoms_pin_every_instruction);
-        assert!(!shape.is_identity_rebuild(&identity_mapping, &region));
     }
 
     #[test]
