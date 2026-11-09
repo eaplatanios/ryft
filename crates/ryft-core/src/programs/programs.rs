@@ -18,7 +18,6 @@ use crate::programs::regions::{
     InputRegionProvenance, Region, RegionArena, RegionDataFlowRegionBoundary, RegionId, RegionInterface,
     RegionLiveness, RegionRef, reachable_region_mask,
 };
-use crate::programs::transforms::RegionTransformCache;
 use crate::programs::types::{Type, Typed, TypedProgram, type_identities_needing_runtime_checks};
 use crate::programs::values::{Value, ValueId, ValueProjection};
 
@@ -1440,26 +1439,6 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                 })
             })
             .collect()
-    }
-
-    /// Detaches every contained [`Region`] whose [`RegionTransformCache`] is pointer-identical to `source` by minting
-    /// that region a fresh empty cache, while preserving every unrelated cache (in particular, descendants' caches,
-    /// whose retained transforms remain reusable inside the published artifact).
-    ///
-    /// This is the publish-time sanitization step of [`RegionRef::transform`]. Cache cells ride region copies by strong
-    /// [`Arc`], and copy paths such as [`RegionRef::to_program`] deliberately adopt the source's cell to preserve
-    /// sharing. A derived program that legitimately contains a copy of its source region therefore carries the very
-    /// cell the artifact is about to be stored in, and publishing it unsanitized would close a strong reference cycle
-    /// (i.e., `cache -> artifact -> program -> region copy -> cache`) that leaks both once every public handle drops.
-    /// Detaching only the pointer-identical cells removes exactly the one self-edge a contract-abiding derivation can
-    /// create. Refer to the ownership-cycle discussion in the documentation of
-    /// [`transforms`](crate::programs::transforms) for why that is sufficient.
-    ///
-    /// This delegates to [`RegionArena::detach_transform_cache`] across the complete arena, so the entry region
-    /// is covered too. This function is private to this crate deliberately as it is sound only as part of the
-    /// sanitize-then-publish sequence, and external transforms must never manipulate cache provenance directly.
-    pub(crate) fn detach_transform_cache(&mut self, source: &RegionTransformCache<V, O>) {
-        self.regions.detach_transform_cache(source);
     }
 
     /// Analyzes entry-region liveness for a filtered program boundary. `inputs` must be a deduplicated collection of
@@ -3940,11 +3919,10 @@ mod tests {
             in (%2)
         "}
         .trim_end();
-        assert_eq!(effectful.clone().into_simplified().unwrap().to_string(), expected);
-        assert_eq!(build().into_simplified().unwrap().to_string(), expected);
+        assert_eq!(effectful.into_simplified().unwrap().to_string(), expected);
 
         // An effectful instruction with no outputs must still render with an empty binding and remain rooted as
-        // there is no output atom from which rendering or either simplification implementation could discover it.
+        // there is no output atom from which rendering or simplification could discover it.
         let build_zero_output_effect = || {
             let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -3967,7 +3945,6 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(zero_output_effect.into_simplified().unwrap().instructions().len(), 1);
-        assert_eq!(build_zero_output_effect().into_simplified().unwrap().instructions().len(), 1);
     }
 
     #[test]
@@ -3982,7 +3959,6 @@ mod tests {
             .unwrap();
         let expected = program.to_string();
         assert!(program.simplification_is_identity());
-        assert_eq!(program.clone().into_simplified().unwrap().to_string(), expected);
         assert_eq!(program.into_simplified().unwrap().to_string(), expected);
     }
 
@@ -4027,14 +4003,10 @@ mod tests {
         assert_eq!(program.regions.simplification_is_identity(RegionId::new(0)), Some(true));
         assert_eq!(program.regions.simplification_is_identity(program.entry), Some(true));
         assert!(!program.simplification_is_identity());
-        let borrowed = program.clone().into_simplified().unwrap();
-        assert_eq!(borrowed.regions().len(), 1);
-        assert_eq!(borrowed.entry(), RegionId::new(0));
-        assert_eq!(borrowed.to_string(), expected);
-        let owned = program.into_simplified().unwrap();
-        assert_eq!(owned.regions().len(), 1);
-        assert_eq!(owned.entry(), RegionId::new(0));
-        assert_eq!(owned.to_string(), expected);
+        let simplified = program.into_simplified().unwrap();
+        assert_eq!(simplified.regions().len(), 1);
+        assert_eq!(simplified.entry(), RegionId::new(0));
+        assert_eq!(simplified.to_string(), expected);
     }
 
     #[test]
@@ -4046,16 +4018,8 @@ mod tests {
             program.clone().into_simplified(),
             Err(ProgramError::InvalidInputCount { actual: 1, expected: 2 }),
         ));
-        assert!(matches!(
-            program.clone().into_simplified(),
-            Err(ProgramError::InvalidInputCount { actual: 1, expected: 2 }),
-        ));
 
         program.input_structure.pop();
-        assert!(matches!(
-            program.clone().into_simplified(),
-            Err(ProgramError::InvalidOutputCount { actual: 128, expected: 129 }),
-        ));
         assert!(matches!(
             program.into_simplified(),
             Err(ProgramError::InvalidOutputCount { actual: 128, expected: 129 }),
@@ -4075,18 +4039,8 @@ mod tests {
         };
 
         // Both state results are dead and the pure instruction between them is dead. The state effect alone retains
-        // both accesses, and their ordinals prove that borrowing and consuming simplification preserve source order.
+        // both accesses, and their ordinals prove that simplification preserves source order.
         let expected = vec![TestOrderedStateOperation::State(0), TestOrderedStateOperation::State(1)];
-        assert_eq!(
-            build()
-                .simplified()
-                .unwrap()
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().clone())
-                .collect::<Vec<_>>(),
-            expected,
-        );
         assert_eq!(
             build()
                 .into_simplified()
@@ -4121,7 +4075,6 @@ mod tests {
             in (%0)
         "}
         .trim_end();
-        assert_eq!(build_program().simplified().unwrap().to_string(), expected);
         assert_eq!(build_program().into_simplified().unwrap().to_string(), expected);
     }
 
@@ -4155,7 +4108,6 @@ mod tests {
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>()
         };
         let expected = vec!["reference_new", "reference_read", "reference_new", "reference_write", "reference_new"];
-        assert_eq!(names(build_program().simplified().unwrap()), expected);
         assert_eq!(names(build_program().into_simplified().unwrap()), expected);
     }
 
@@ -4242,10 +4194,9 @@ mod tests {
                 let program = builder
                     .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
                     .unwrap();
-                let simplified = program.clone().into_simplified().unwrap();
-                let into_simplified = program.into_simplified().unwrap();
-                assert_eq!(simplified.to_string(), into_simplified.to_string());
-                simplified
+                program
+                    .into_simplified()
+                    .unwrap()
                     .instructions()
                     .iter()
                     .map(|instruction| instruction.operation().name())
@@ -4346,7 +4297,7 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(program.regions().len(), 3);
-        let simplified = program.clone().into_simplified().unwrap();
+        let simplified = program.into_simplified().unwrap();
         assert_eq!(simplified.regions().len(), 2);
         assert_eq!(simplified.instructions().len(), 2);
         assert_eq!(
@@ -4356,10 +4307,6 @@ mod tests {
         assert_eq!(simplified.instructions()[0].regions(), &[RegionId::new(0)]);
         assert_eq!(simplified.instructions()[1].operation(), &TestRegionOperation::Add);
         assert!(!simplified.region(RegionId::new(0)).unwrap().instructions()[0].operation().effects().is_pure());
-        let simplified = program.into_simplified().unwrap();
-        assert_eq!(simplified.regions().len(), 2);
-        assert_eq!(simplified.instructions().len(), 2);
-        assert_eq!(simplified.instructions()[0].regions(), &[RegionId::new(0)]);
     }
 
     #[test]
@@ -4464,17 +4411,6 @@ mod tests {
             ),
             ("add", Provenance::unknown()),
         ];
-        assert_eq!(
-            provenance_preservation_fixture()
-                .0
-                .simplified()
-                .unwrap()
-                .instructions()
-                .iter()
-                .map(|instruction| (instruction.operation().name(), instruction.provenance().clone()))
-                .collect::<Vec<_>>(),
-            expected,
-        );
         assert_eq!(
             provenance_preservation_fixture()
                 .0
@@ -5245,7 +5181,7 @@ mod tests {
     fn test_program_into_filtered_removes_unused_reference_new_but_keeps_reference_read() {
         // Liveness analysis roots the same instructions as simplification: an allocation that nothing accesses has no
         // observable consequence when unused and is pruned, while an unused read does and is retained together with the
-        // allocation it reads, for both the borrowing and the consuming projection.
+        // allocation it reads.
         let build_program = || {
             let mut builder = ProgramBuilder::<TestValue, TestIrOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
@@ -5264,10 +5200,6 @@ mod tests {
             in (%0)
         "}
         .trim_end();
-        let (program, input) = build_program();
-        let (filtered, live) = program.clone().into_filtered(&[input], &[input], &[]).unwrap();
-        assert_eq!(live, vec![0]);
-        assert_eq!(filtered.to_string(), expected);
         let (program, input) = build_program();
         let (filtered, live) = program.into_filtered(&[input], &[input], &[]).unwrap();
         assert_eq!(live, vec![0]);
@@ -5301,8 +5233,8 @@ mod tests {
             }
         }
 
-        // Deferred work is an implicit liveness root for both the borrowing and the consuming projection,
-        // which keep the input it consumes live even though no requested output depends on it.
+        // Deferred work is an implicit liveness root for the projection, which keeps the input it consumes live even
+        // though no requested output depends on it.
         let build_program = || {
             let mut builder = ProgramBuilder::<Array, DeferredOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -5318,10 +5250,6 @@ mod tests {
         .trim_end();
         let (program, input) = build_program();
         assert_eq!(program.clone().into_simplified().unwrap().to_string(), expected);
-        let (filtered, live) = program.clone().into_filtered(&[input], &[], &[]).unwrap();
-        assert_eq!(live, vec![0]);
-        assert_eq!(filtered.to_string(), expected);
-        let (program, input) = build_program();
         let (filtered, live) = program.into_filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.to_string(), expected);
@@ -5400,7 +5328,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            program.with_boundary(&[2, 0, 1], &[1, 0]).unwrap().to_string(),
+            program.clone().with_boundary(&[2, 0, 1], &[1, 0]).unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:i64[], %2:f64[] .
                 let %3:f64[] = div %2 %0
@@ -5411,7 +5339,7 @@ mod tests {
 
         // Selected inputs remain even when unused, while omitted unused inputs disappear and outputs may repeat.
         assert_eq!(
-            program.with_boundary(&[2, 0, 1], &[0]).unwrap().to_string(),
+            program.clone().with_boundary(&[2, 0, 1], &[0]).unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:i64[], %2:f64[] .
                 let %3:f64[] = div %2 %0
@@ -5458,17 +5386,17 @@ mod tests {
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         let program = builder.build::<Array, Array>(vec![input], Placeholder, Placeholder).unwrap();
         assert!(matches!(
-            program.with_boundary(&[1], &[0]),
+            program.clone().with_boundary(&[1], &[0]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "input index 1 is out of range for a program with 1 inputs",
         ));
         assert!(matches!(
-            program.with_boundary(&[0], &[1]),
+            program.clone().with_boundary(&[0], &[1]),
             Err(ProgramError::InvalidArgument { message })
                 if message == "output index 1 is out of range for a program with 1 outputs",
         ));
         assert!(matches!(
-            program.with_boundary(&[0, 0], &[0]),
+            program.clone().with_boundary(&[0, 0], &[0]),
             Err(ProgramError::MalformedProgram(message))
                 if message == "filter input atom %0 was provided more than once",
         ));
@@ -5487,7 +5415,7 @@ mod tests {
         builder.add_instruction(ZeroOutputEffectOperation, Vec::new(), vec![input], None).unwrap();
         let program = builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder; 2], Vec::new()).unwrap();
         assert_eq!(
-            program.with_boundary(&[1, 0], &[]).unwrap().to_string(),
+            program.clone().with_boundary(&[1, 0], &[]).unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[], %1:f64[] .
                 let () = zero_output_effect %1
@@ -5519,9 +5447,9 @@ mod tests {
                 (Placeholder, Placeholder, Placeholder),
             )
             .unwrap();
-        assert_eq!(program.with_outputs(&[0, 1, 2]).unwrap().to_string(), program.to_string());
+        assert_eq!(program.clone().with_outputs(&[0, 1, 2]).unwrap().to_string(), program.to_string());
         assert_eq!(
-            program.with_outputs(&[1]).unwrap().to_string(),
+            program.clone().with_outputs(&[1]).unwrap().to_string(),
             indoc! {"
                 lambda %0:i64[], %1:f64[], %2:f64[] .
                 let %3:f64[] = mul %1 %1
@@ -5530,7 +5458,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            program.with_outputs(&[2, 0]).unwrap().to_string(),
+            program.clone().with_outputs(&[2, 0]).unwrap().to_string(),
             indoc! {"
                 lambda %0:i64[], %1:f64[], %2:f64[] .
                 let %3:f64[] = add %1 %2
@@ -5539,7 +5467,7 @@ mod tests {
             .trim_end(),
         );
         assert_eq!(
-            program.with_outputs(&[]).unwrap().to_string(),
+            program.clone().with_outputs(&[]).unwrap().to_string(),
             indoc! {"
                 lambda %0:i64[], %1:f64[], %2:f64[] .
                 in ()
@@ -5571,23 +5499,18 @@ mod tests {
             (program, input, value)
         };
 
-        // The borrowing variants exercise the clone-based rebuild and the consuming variants exercise the move-based
-        // rebuild. The interpretation checks pin the chain's data flow (each step adds the original input once).
+        // The interpretation checks pin the chain's data flow (each step adds the original input once).
         let (program, _, _) = build();
-        let simplified = program.clone().into_simplified().unwrap();
+        let simplified = program.into_simplified().unwrap();
         assert_eq!(simplified.instructions().len(), CHAIN_LENGTH);
         assert_eq!(
             simplified.interpret(Array::scalar(1.0f64).unwrap()),
             Ok(Array::scalar(1.0 + CHAIN_LENGTH as f64).unwrap())
         );
-        assert_eq!(build().0.into_simplified().unwrap().instructions().len(), CHAIN_LENGTH);
-        let (program, input, output) = build();
-        let (filtered, live) = program.clone().into_filtered(&[input], &[output], &[]).unwrap();
-        assert_eq!(live, vec![0]);
-        assert_eq!(filtered.instructions().len(), CHAIN_LENGTH);
         let (program, input, output) = build();
         let (filtered, live) = program.into_filtered(&[input], &[output], &[]).unwrap();
         assert_eq!(live, vec![0]);
+        assert_eq!(filtered.instructions().len(), CHAIN_LENGTH);
         assert_eq!(
             filtered.interpret(vec![Array::scalar(1.0f64).unwrap()]),
             Ok(vec![Array::scalar(1.0 + CHAIN_LENGTH as f64).unwrap()])
@@ -5989,7 +5912,7 @@ mod tests {
         );
         assert_eq!(live.instructions(), &[false, true, true]);
         assert_eq!(
-            program.with_outputs(&[0]).unwrap().into_pruned().unwrap().to_string(),
+            program.clone().with_outputs(&[0]).unwrap().into_pruned().unwrap().to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f64[], %2:f64[], %3:f64[] .
                 let %4:f64[] = print [label=effect] %3

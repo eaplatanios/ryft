@@ -719,12 +719,22 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
         self.get(id).map(Region::transform_cache)
     }
 
-    /// Detaches every [`Region`] whose [`RegionTransformCache`] is pointer-identical to `source` by minting
-    /// a fresh empty cache for it, preserving every unrelated cache. This is the arena-level worker behind
-    /// [`Program::detach_transform_cache`], which documents the publish-time cycle-prevention purpose and why
-    /// pointer-identical detachment is both necessary and sufficient. It iterates every region (including the entry
-    /// region) so no copy of the source can smuggle the storing cell into a published artifact. This function is
-    /// private to this crate deliberately as cache provenance must never be manipulated externally.
+    /// Detaches every [`Region`] whose [`RegionTransformCache`] is pointer-identical to `source` by minting a fresh
+    /// empty cache for it, while preserving every unrelated cache (in particular, the caches of descendants, whose
+    /// retained transforms remain reusable inside the published artifact). It iterates every region, including the
+    /// entry region, so no copy of the source can smuggle the storing cell into a published artifact.
+    ///
+    /// This is the publish-time sanitization step of [`RegionRef::transform`]. Cache cells ride region copies by strong
+    /// [`Arc`], and copy paths such as [`RegionRef::to_program`] deliberately adopt the source's cell to preserve
+    /// sharing. A derived program that legitimately contains a copy of its source region therefore carries the very
+    /// cell the artifact is about to be stored in, and publishing it unsanitized would close a strong reference cycle
+    /// (i.e., `cache -> artifact -> program -> region copy -> cache`) that leaks both once every public handle drops.
+    /// Detaching only the pointer-identical cells removes exactly the one self-edge a contract-abiding derivation can
+    /// create. Refer to the ownership-cycle discussion in the documentation of
+    /// [`transforms`](crate::programs::transforms) for why that is sufficient.
+    ///
+    /// This function is private to this crate deliberately as it is sound only as part of the sanitize-then-publish
+    /// sequence, and external transforms must never manipulate cache provenance directly.
     #[inline]
     pub(crate) fn detach_transform_cache(&mut self, source: &RegionTransformCache<V, O>) {
         for region in &mut self.regions {

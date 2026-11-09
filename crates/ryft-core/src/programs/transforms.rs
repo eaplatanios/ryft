@@ -737,7 +737,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
             // A shared program needs no writable copy when its complete arena carries no source cache. Inspect all
             // regions, including dormant rule bodies, before asking `Arc::make_mut` to clone an otherwise shared arena.
             if program.regions().iter().any(|region| region.transform_cache().ptr_eq(self.transform_cache())) {
-                Arc::make_mut(program).detach_transform_cache(self.transform_cache());
+                Arc::make_mut(program).regions.detach_transform_cache(self.transform_cache());
             }
         }
         artifact
