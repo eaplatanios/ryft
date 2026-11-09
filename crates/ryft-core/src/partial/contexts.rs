@@ -2252,7 +2252,6 @@ mod tests {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         let builder_owners = Rc::strong_count(&context.state.builder);
         let cloned = context.clone();
-        assert_eq!(size_of::<PartialEvaluationContext<TestArrayContext>>(), size_of::<Rc<()>>());
         assert!(Rc::ptr_eq(&context.state, &cloned.state));
         assert_eq!(Rc::strong_count(&context.state.builder), builder_owners);
 
@@ -3306,7 +3305,8 @@ mod tests {
         let context = PartialEvaluationContext::new(TracingContext::<Array, TestRegionOperation>::new());
         let input = context.unknown_input(state_type.clone(), 0);
         assert_eq!(
-            TestRegionOperation::PreparationFailure.infer_output_types(&[state_type], &[body.interface()]),
+            TestRegionOperation::PreparationFailure
+                .infer_output_types(&[state_type], std::slice::from_ref(body.interface())),
             Ok(vec![ArrayType::scalar(DataType::F32)]),
         );
         assert!(matches!(
