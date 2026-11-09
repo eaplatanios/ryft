@@ -779,17 +779,6 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
         Some(Arc::unwrap_or_clone(region).region)
     }
 
-    /// Seals and appends the provided [`Region`] exactly like [`Self::push`], except that it keeps the transforms
-    /// already derived from its contents. Refer to [`Region::adopt_transform_cache`] for the closure-preservation
-    /// precondition every caller must guarantee.
-    #[inline]
-    fn push_preserving_transform_cache(&mut self, region: Region<V, O>) -> Result<RegionId, ProgramError> {
-        let id = RegionId::new(self.regions.len());
-        self.regions
-            .push(Arc::new(RegionWithMetadata::new_preserving_transform_cache(region, self.regions.as_slice())?));
-        Ok(id)
-    }
-
     /// Appends a faithful relocation of the sealed `source`, retaining its already validated recursive metadata.
     /// Every attached source identifier must have a destination in `remapping` naming a faithful copy of the same
     /// descendant. Source contents remain shared when their attached identifiers already name those destinations.
@@ -808,26 +797,22 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
 
     /// Returns every interned callee root of this arena together with the shared callee [`Program`] whose entry region
     /// it is, in recording order.
-    #[inline]
     pub(super) fn callee_entries(&self) -> impl '_ + Iterator<Item = (RegionId, &Arc<Program<V, O, Vec<V>, Vec<V>>>)> {
         self.callees.entries.iter().map(|(id, callee)| (*id, callee))
     }
 
     /// Returns the shared callee [`Program`] whose entry region is the root `id` of this arena, if `id` is an interned
     /// callee root. Refer to the documentation of [`RegionArenaCallees`] for more information.
-    #[inline]
     pub(super) fn callee(&self, id: RegionId) -> Option<&Arc<Program<V, O, Vec<V>, Vec<V>>>> {
         self.callees.entries.iter().find_map(|(region, callee)| (*region == id).then_some(callee))
     }
 
     /// Returns `true` if this arena holds any interned callee root.
-    #[inline]
     pub(super) fn has_callees(&self) -> bool {
         !self.callees.entries.is_empty()
     }
 
     /// Records that the root `id` of this arena is the entry region of the shared `callee`.
-    #[inline]
     pub(super) fn record_callee(&mut self, id: RegionId, callee: Arc<Program<V, O, Vec<V>, Vec<V>>>) {
         self.callees.entries.push((id, callee));
     }
@@ -926,6 +911,16 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
             }
         }
         Ok((arena, remapping[entry.index()].unwrap(), preserved, remapping))
+    }
+
+    /// Seals and appends the provided [`Region`] exactly like [`Self::push`], except that it keeps the transforms
+    /// already derived from its contents. Refer to [`Region::adopt_transform_cache`] for the closure-preservation
+    /// precondition every caller must guarantee.
+    fn push_preserving_transform_cache(&mut self, region: Region<V, O>) -> Result<RegionId, ProgramError> {
+        let id = RegionId::new(self.regions.len());
+        self.regions
+            .push(Arc::new(RegionWithMetadata::new_preserving_transform_cache(region, self.regions.as_slice())?));
+        Ok(id)
     }
 }
 
