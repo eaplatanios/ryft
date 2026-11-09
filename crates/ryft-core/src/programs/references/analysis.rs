@@ -1458,7 +1458,7 @@ impl<
 > Program<V, O, Input, Output>
 {
     /// Returns this [`Program`] without the unobserved lifecycles of the local references that its entry region
-    /// allocates at `allocations`, followed by dead code elimination (refer to [`Program::simplified`] for more
+    /// allocates at `allocations`, followed by dead code elimination (refer to [`Program::into_simplified`] for more
     /// information on that). The lifecycle of such a reference is its allocation together with every instruction that
     /// accesses it (refer to [`LocalReferenceLifecycles`] for more information on reference lifecycles). Its state is
     /// private to the program, so when no value that its instructions produce reaches a program output or an

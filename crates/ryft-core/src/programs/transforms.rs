@@ -112,11 +112,11 @@
 //! faithful whole-arena rebuilds in
 //! [`ClosedProgram::without_unused_captures`](crate::ClosedProgram::without_unused_captures) and
 //! [`ClosedProgram::to_program_with_lifted_captures`](crate::ClosedProgram::to_program_with_lifted_captures), the
-//! entry-boundary projections [`Program::filtered`] and [`Program::into_filtered`], which carry the descendant closure
-//! over verbatim, and program simplification, which additionally re-adopts each source cache in the one case where the
-//! rebuild is provably the identity on the region's contents. [`RegionRef::to_program`] re-adopts the promoted entry's
-//! cache the same way. Renumbering attached identifiers is always tolerated as long as the renumbering preserves the
-//! complete reachable graph's topology, which is why importing and compaction keep retained transforms valid.
+//! entry-boundary projection [`Program::into_filtered`], which carries the descendant closure over verbatim, and
+//! program simplification, which additionally re-adopts each source cache in the one case where the rebuild is provably
+//! the identity on the region's contents. [`RegionRef::to_program`] re-adopts the promoted entry's cache the same way.
+//! Renumbering attached identifiers is always tolerated as long as the renumbering preserves the complete reachable
+//! graph's topology, which is why importing and compaction keep retained transforms valid.
 //!
 //! ## Namespace Storage And Thread Safety
 //!

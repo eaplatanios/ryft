@@ -109,9 +109,8 @@ impl Display for EffectClass {
 /// classification, instead of hardcoding operation lists, before folding, eliminating, or reordering
 /// [`Instruction`](crate::Instruction)s. For example:
 ///
-///   - Dead-code elimination ([`Program::simplified`](crate::Program::simplified) and
-///     [`Program::into_simplified`](crate::Program::into_simplified)) keeps instructions with observable effects alive
-///     even when no program output consumes their results.
+///   - Dead-code elimination ([`Program::into_simplified`](crate::Program::into_simplified)) keeps instructions with
+///     observable effects alive even when no program output consumes their results.
 ///   - [Ordered](Self::is_ordered) effect classes additionally promise that the relative execution order of same-class
 ///     instructions is preserved. Transforms that would interleave or reorder such instructions with respect to each
 ///     other must keep them on one side of any split they introduce. For example, XLA lowering threads StableHLO token

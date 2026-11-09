@@ -70,10 +70,10 @@
 //! module provides the reference model, validation, and conversion of mutable state into explicit value data flow.
 //!
 //! [`Program::live_sets`] computes dependencies of the program outputs; [`Program::live_sets_for_atoms`] accepts other
-//! roots. [`Program::simplified`] removes unused work while retaining instructions with observable consequences even
-//! when their results are unused, in their original relative order. For example, an unused reference allocation and its
-//! dead aliases can disappear, but a reference write remains observable. [`Program::filtered`] restricts the entry
-//! boundary and accepts explicit keep-alive atoms for computations needed beyond the selected outputs.
+//! roots. [`Program::into_simplified`] removes unused work while retaining instructions with observable consequences
+//! even when their results are unused, in their original relative order. For example, an unused reference allocation
+//! and its dead aliases can disappear, but a reference write remains observable. [`Program::into_filtered`] restricts
+//! the entry boundary and accepts explicit keep-alive atoms for computations needed beyond the selected outputs.
 //!
 //! [`Program::statistics`] describes the stored graph, including dead instructions and dormant rule regions, without
 //! simplifying it. [`ProgramStatistics`] provides counts, operation histograms, dependency depths, and attachment
