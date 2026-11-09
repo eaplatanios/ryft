@@ -721,7 +721,9 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
             return Ok(Self::from_programs_and_metadata(known_program, residual_program, metadata));
         }
 
-        let (known_program, live_input_positions) = known_program.filtered(known_input_ids, &kept_output_ids, &[])?;
+        let known_input_ids = known_input_ids.to_vec();
+        let (known_program, live_input_positions) =
+            known_program.into_filtered(&known_input_ids, &kept_output_ids, &[])?;
         let known_input_indices =
             live_input_positions.into_iter().map(|position| metadata.known_input_indices[position]).collect();
 

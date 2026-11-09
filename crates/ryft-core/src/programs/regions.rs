@@ -821,16 +821,13 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
     /// [`Region::new`], and may return the separate source cache only for an exact body identity rebuild. That handle
     /// is the only permission to reuse a source cache; it is adopted only when every descendant is also preserved.
     /// Reachability and compaction run after every body is decided, so unreferenced rebuilt regions are dropped before
-    /// sealing. An optional entry replacement must also have a fresh cache; it replaces the source entry directly,
-    /// without cloning that entry or invoking the callback for it. The returned preservation mask and identifier
-    /// mapping support faithful callee-record retention.
+    /// sealing. The returned preservation mask and identifier mapping support faithful callee-record retention.
     pub(super) fn try_rebuild_regions<
         F: FnMut(RegionId, Region<V, O>) -> Result<(Region<V, O>, Option<RegionTransformCache<V, O>>), ProgramError>,
     >(
         self,
         identity_bodies: &[bool],
         entry: RegionId,
-        mut entry_replacement: Option<Region<V, O>>,
         mut rebuild_fn: F,
     ) -> Result<(Self, RegionId, Vec<bool>, Vec<Option<RegionId>>), ProgramError> {
         /// A retained sealed entry or a changed body awaiting reachability and compaction before sealing.
@@ -852,22 +849,17 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
                     .flat_map(|instruction| instruction.regions())
                     .all(|attached| preserved.get(attached.index()).copied().unwrap_or(false))
             };
-            let replacement = if index == entry.index() { entry_replacement.take() } else { None };
-            if replacement.is_none() && identity_bodies[index] && descendants_preserved(&source.region) {
+            if identity_bodies[index] && descendants_preserved(&source.region) {
                 bodies.push(Rebuild::Sealed(source));
                 preserved.push(true);
                 continue;
             }
 
-            let (mut region, source_cache) = if let Some(replacement) = replacement {
-                (replacement, None)
-            } else {
-                let source = match Arc::try_unwrap(source) {
-                    Ok(source) => source.region,
-                    Err(source) => source.region.clone(),
-                };
-                rebuild_fn(RegionId::new(index), source)?
+            let source = match Arc::try_unwrap(source) {
+                Ok(source) => source.region,
+                Err(source) => source.region.clone(),
             };
+            let (mut region, source_cache) = rebuild_fn(RegionId::new(index), source)?;
 
             // Transforms of a region consume its attached descendants too, so a body whose descendant changed no
             // longer has the contents that its retained transforms were derived from.
@@ -3972,7 +3964,7 @@ pub(crate) mod tests {
         let original = source.clone();
         let source_cache = original[2].transform_cache().clone();
         let (rebuilt, entry, preserved, remapping) = source
-            .try_rebuild_regions(&[false, true, false], RegionId::new(2), None, |id, region| {
+            .try_rebuild_regions(&[false, true, false], RegionId::new(2), |id, region| {
                 if id == RegionId::new(0) {
                     // This changed body is deliberately malformed. It is orphaned, so compaction must remove it
                     // before sealing, as in the original rebuild-then-compact simplification pipeline.
@@ -3999,38 +3991,6 @@ pub(crate) mod tests {
         assert_eq!(original[2].instructions()[0].regions(), &[RegionId::new(1)]);
         assert!(rebuilt[1].transform_cache().ptr_eq(&source_cache));
         assert_eq!(RegionRef::new(&rebuilt, entry).unwrap().to_program().to_string(), program.to_string());
-    }
-
-    #[test]
-    fn test_region_arena_try_rebuild_regions_entry_replacement() {
-        let program = program_with_reused_region();
-        let source_cache = program.entry_region().transform_cache().clone();
-        let replacement = Region::new(
-            vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
-            vec![AtomId::new(0)],
-            vec![AtomId::new(0)],
-            Vec::new(),
-        );
-        let (rebuilt, entry, preserved, remapping) = program
-            .regions()
-            .clone()
-            .try_rebuild_regions(&[true, true], program.entry(), Some(replacement), |_, _| {
-                panic!("an entry replacement must not invoke the rebuild callback")
-            })
-            .unwrap();
-        assert_eq!(preserved, vec![true, false]);
-        assert_eq!(remapping, vec![None, Some(RegionId::new(0))]);
-        assert_eq!(entry, RegionId::new(0));
-        assert_eq!(rebuilt.len(), 1);
-        assert!(!rebuilt[0].transform_cache().ptr_eq(&source_cache));
-        assert_eq!(
-            RegionRef::new(&rebuilt, entry).unwrap().to_program().to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                in (%0)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
