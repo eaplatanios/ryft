@@ -210,12 +210,12 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// The split rules of region-carrying operations (e.g., `scan` and `condition`) partition their bodies through
     /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program), which then
     /// places the residuals of each such partition according to `policy` and carries `policy` into the partitions
-    /// nested within it. Refer to [`PartitionedProgram::with_top_level_residual_policy`] for how a policy places known
-    /// values. This has implications for various region-carrying operation types. For example, it means that decisions
-    /// apply per iteration of a `scan` operation and per branch of a `condition` operation, and that a `scan` operation
+    /// nested within it. Refer to [`PartitionedProgram::with_residual_policy`] for how a policy places known values.
+    /// This has implications for various region-carrying operation types. For example, it means that decisions apply
+    /// per iteration of a `scan` operation and per branch of a `condition` operation, and that a `scan` operation
     /// recomputes the changing known carries that its residual work reads from their initial values instead of saving
-    /// them on every iteration (refer to [`PartitionedProgram::with_top_level_residual_policy`]). When the residuals of
-    /// an enclosing partition are placed, the policy first classifies each demanded output. Replaying a region-carrying
+    /// them on every iteration (refer to [`PartitionedProgram::with_residual_policy`]). When the residuals of an
+    /// enclosing partition are placed, the policy first classifies each demanded output. Replaying a region-carrying
     /// operation also requires recomputation of every live value needed for that output, so that decisions of a split
     /// rule that already placed the body's residuals are never undone. Unused sibling outputs and dormant derivative
     /// regions do not contribute residual demand. An all-known operation whose selected region work is entirely

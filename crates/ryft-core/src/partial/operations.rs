@@ -65,8 +65,8 @@ pub trait PartialEvaluationDriver<C: Context>: RegionDriver<C::Constant, C::Oper
     /// outputs, in output order. Operations use this when they plan residual work over a known program of their own
     /// (e.g., the carry recomputation of a `scan` under a residual policy), so that the instructions of that program
     /// are split like those of a partition whose residuals are placed (refer to
-    /// [`PartitionedProgram::with_top_level_residual_policy`] for more information). This is a driver function rather
-    /// than a function of [`PartialEvaluationContext`] because such rules run in
+    /// [`PartitionedProgram::with_residual_policy`] for more information). This is a driver
+    /// function rather than a function of [`PartialEvaluationContext`] because such rules run in
     /// [`partially_evaluate`](PartiallyEvaluatableOperation::partially_evaluate), whose bounds do not include the
     /// partial evaluation of the operation family in a [`TracingContext`]. The driver carries that capability from
     /// where it was constructed.
@@ -501,10 +501,10 @@ pub trait PartiallyEvaluatableOperation<C: Context>: Clone + Into<C::Operation> 
     /// the outputs that `demanded_outputs` marks, or returns [`None`] to keep the application whole, which is what the
     /// default implementation does. The residual planner asks for such a split when the residual program of a partition
     /// demands an output of an all-known region-carrying application whose regions hold work that the residual policy
-    /// saves (refer to [`PartitionedProgram::with_top_level_residual_policy`] for more information). Replaying the
-    /// application whole would recompute that work, and saving its demanded outputs would save more than the policy
-    /// asks for, so a split saves only the interior values that the policy saves, as JAX's `partial_eval_jaxpr_custom`
-    /// rules for `cond`, `scan`, and `pjit` do.
+    /// saves (refer to [`PartitionedProgram::with_residual_policy`] for more information). Replaying the application
+    /// whole would recompute that work, and saving its demanded outputs would save more than the policy asks for, so
+    /// a split saves only the interior values that the policy saves, as JAX's `partial_eval_jaxpr_custom` rules for
+    /// `cond`, `scan`, and `pjit` do.
     ///
     /// A rule that supports such a split binds a known part in the known-side context and emits a replay part into the
     /// residual program (refer to [`ResidualDemandSplit`]). [`PartialEvaluationContext::partition_residual_demand`]

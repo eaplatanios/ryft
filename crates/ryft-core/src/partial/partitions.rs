@@ -161,26 +161,25 @@ pub struct PartitionMetadata {
     /// `i` describes output `known_output_count + i` of the known program, whose first `known_output_count` outputs are
     /// the fully known original outputs. A nonempty vector has exactly one entry per residual edge. A zero entry means
     /// the edge directly carries its saved value, and an empty vector means every edge has count zero. Residual
-    /// placement (refer to [`PartitionedProgram::with_top_level_residual_policy`]) records these counts so that
-    /// precision rounding can find the saved value behind the stored representation of an edge,whatever
-    /// operations its storage uses.
+    /// placement (refer to [`PartitionedProgram::with_residual_policy`]) records these counts so that precision
+    /// rounding can find the saved value behind the stored representation of an edge,whatever operations its
+    /// storage uses.
     edge_store_counts: Vec<usize>,
 }
 
 impl PartitionMetadata {
     /// Returns this [`PartitionMetadata`] with its residual inputs replaced by `residual_inputs`,
     /// keeping its original input count, known inputs, outputs, and effect-ordering constraints.
-    /// [`PartitionedProgram::with_top_level_residual_policy`] uses this after it rewrites which
-    /// residual edges the residual program consumes.
+    /// [`PartitionedProgram::with_residual_policy`] uses this after it rewrites which residual
+    /// edges the residual program consumes.
     pub(super) fn with_residual_inputs(mut self, residual_inputs: Vec<ResidualInputSource>) -> Self {
         self.residual_inputs = residual_inputs;
         self
     }
 
     /// Returns this [`PartitionMetadata`] with the number of store operations that produce each residual edge replaced
-    /// by `edge_store_counts`, in edge ordinal order. [`PartitionedProgram::with_top_level_residual_policy`] uses this
-    /// after it stages the store operations of the edges that it saves through a
-    /// [`ResidualStorage`](crate::ResidualStorage).
+    /// by `edge_store_counts`, in edge ordinal order. [`PartitionedProgram::with_residual_policy`] uses this after it
+    /// stages the store operations of the edges that it saves through a [`ResidualStorage`](crate::ResidualStorage).
     pub(super) fn with_edge_store_counts(mut self, edge_store_counts: Vec<usize>) -> Self {
         self.edge_store_counts = edge_store_counts;
         self
@@ -665,15 +664,15 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedProgram<V, O> {
     ///
     /// Forwarding is a separate step, rather than part of [`Program::partition`], because an edge and the value it
     /// repeats are interchangeable only at the boundary of a single invocation. Residual placement (refer to
-    /// [`with_top_level_residual_policy`](Self::with_top_level_residual_policy)), precision rounding, and the split
-    /// rules of `condition` and `scan` require known feeders to pass through explicit residual edges. They reject
-    /// forwarded `KnownInput` and `KnownOutput` sources because those sources bypass the edges on which their storage,
-    /// rounding, and boundary rewrites operate. Retained edges still form a contiguous suffix of the outputs of `K`
-    /// after forwarding. In a `scan` body, for example, an edge that repeats a body input carries the value of one
-    /// iteration rather than the input of the enclosing `scan`. Boundary operations whose two halves become separate
-    /// operations (e.g., through [`PartialEvaluationContext::inline_partitioned_program`]) and rematerialized calls
-    /// forward residuals after placing and rounding them, so that their known half does not return the same value twice
-    /// and does not route its own inputs back out.
+    /// [`with_residual_policy`](Self::with_residual_policy)), precision rounding, and the split rules of `condition`
+    /// and `scan` require known feeders to pass through explicit residual edges. They reject forwarded `KnownInput`
+    /// and `KnownOutput` sources because those sources bypass the edges on which their storage, rounding, and boundary
+    /// rewrites operate. Retained edges still form a contiguous suffix of the outputs of `K` after forwarding. In a
+    /// `scan` body, for example, an edge that repeats a body input carries the value of one iteration rather than the
+    /// input of the enclosing `scan`. Boundary operations whose two halves become separate operations (e.g., through
+    /// [`PartialEvaluationContext::inline_partitioned_program`]) and rematerialized calls forward residuals after
+    /// placing and rounding them, so that their known half does not return the same value twice and does not route
+    /// its own inputs back out.
     ///
     /// # Errors
     ///
@@ -1408,12 +1407,12 @@ where
     }
 
     /// Partitions this [`Program`] like [`partition`](Self::partition) while placing the known values that its residual
-    /// program consumes according to `policy` (refer to [`PartitionedProgram::with_top_level_residual_policy`] for how
-    /// a policy places them). Unlike placing the residuals of the result of [`partition`](Self::partition), the policy
-    /// also places the residuals of the partitions that the split rules of region-carrying operations construct for
-    /// their bodies (refer to [`PartialEvaluationContext::with_residual_policy`]), so that, for example, a policy that
-    /// saves only the outputs of dot products saves the per-iteration dot products of a `scan` body and recomputes the
-    /// rest of the body in the residual `scan`.
+    /// program consumes according to `policy` (refer to [`PartitionedProgram::with_residual_policy`] for how a policy
+    /// places them). Unlike placing the residuals of the result of [`partition`](Self::partition), the policy also
+    /// places the residuals of the partitions that the split rules of region-carrying operations construct for their
+    /// bodies (refer to [`PartialEvaluationContext::with_residual_policy`]), so that, for example, a policy that saves
+    /// only the outputs of dot products saves the per-iteration dot products of a `scan` body and recomputes the rest
+    /// of the body in the residual `scan`.
     ///
     /// # Parameters
     ///
@@ -2222,7 +2221,8 @@ mod tests {
             .unwrap();
         let residual_rendering = residual.to_string();
         let expected_outputs = known.output_ids().iter().rev().copied().collect::<Vec<_>>();
-        let expected_known = known.filtered(known.input_ids(), &expected_outputs, &[]).unwrap().0.to_string();
+        let expected_known =
+            known.clone().into_filtered(known.input_ids(), &expected_outputs, &[]).unwrap().0.to_string();
         let forwarded = PartitionedProgram::from_parts(
             known,
             residual,
@@ -2543,12 +2543,7 @@ mod tests {
         let partition = program.entry_region_ref().partition_with_residual_policy(&[true, false], &policy).unwrap();
         assert_eq!(
             partition.to_string(),
-            program
-                .partition(&[true, false])
-                .unwrap()
-                .with_top_level_residual_policy(&policy)
-                .unwrap()
-                .to_string()
+            program.partition(&[true, false]).unwrap().with_residual_policy(&policy).unwrap().to_string(),
         );
         assert_eq!(
             partition.to_string(),
