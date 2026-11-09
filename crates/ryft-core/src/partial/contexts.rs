@@ -340,14 +340,20 @@ impl<C: Context> PartialEvaluationContext<C> {
         self.state.residual_placement.as_ref().map(|placement| placement.policy())
     }
 
-    /// Returns the [`TypeId`] of the rounding with which the partitions whose residuals the
-    /// [residual policy](Self::residual_policy) of this context places also round the values that they save right after
-    /// their producers, or [`None`] when they keep those values unrounded. The partial evaluation and differentiation
-    /// rules of [`RematerializeOperation`](crate::RematerializeOperation) configure such a rounding, so that known work
-    /// and residual work observe the same values even when a backend computes them at a higher precision than their
-    /// types. Rules that retain the partitions of their regions across calls (e.g., backend call rules that share the
-    /// splits of a callee) key them on this type together with the policy, because the rounding changes the known
-    /// programs of those partitions and a rounding is identified by its type.
+    /// Returns an opaque [`TypeId`] identifying the configured residual rounding implementation, or [`None`] when no
+    /// rounding is configured. For an implementation of Rust type `R`, this returns `Some(TypeId::of::<R>())`. Every
+    /// instance of `R` must have identical rounding behavior for each residual type. The implementation selects
+    /// operations based on that residual type, so `Some(id)` is returned even when the current residuals need no
+    /// rounding operations.
+    ///
+    /// Backend call rules include this identifier alongside the [residual policy](Self::residual_policy) and other
+    /// partition arguments in cache keys, so partitions built with different rounding implementations are cached
+    /// separately. Use the identifier for equality comparisons and hashing in memory. [`TypeId`] values are not
+    /// guaranteed to be stable across builds and must not be used as persistent cache identifiers.
+    ///
+    /// The partial evaluation and differentiation rules of [`RematerializeOperation`](crate::RematerializeOperation)
+    /// configure rounding immediately after saved values' producers in the known program. This makes known work and
+    /// residual work observe the same values even when a backend computes them at a higher precision than their types.
     #[inline]
     pub fn residual_rounding(&self) -> Option<TypeId> {
         self.state.residual_placement.as_ref().and_then(|placement| placement.rounding())
