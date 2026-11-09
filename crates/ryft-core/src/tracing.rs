@@ -82,8 +82,8 @@ use crate::operations::GuardOperation;
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
     AtomId, AttachedRegions, Operation, OperationProvider, Program, ProgramBuilder, ProgramError, ProjectedValue,
-    Provenance, ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionRef, Type, TypeError, TypeIdentityRenaming,
-    TypeRefinements, Typed, TypedProgram, Value, ValueDomainDispatch, ValueProjection,
+    Provenance, ProvenanceScope, ProvenanceState, ReferenceIdentity, RegionInterface, RegionRef, Type, TypeError,
+    TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram, Value, ValueDomainDispatch, ValueProjection,
 };
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -379,57 +379,9 @@ impl TracingScope {
 /// nested path expresses its program in the parent's type, constant, and operation universe and delegates capture
 /// registration to that parent.
 pub struct TracingContext<V: Value, O: Operation<Type = V::Type>, C = V> {
-    /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced. The builder is held behind
-    /// an [`Rc`] rather than being outright owned because a single trace shares one builder across many contexts.
-    /// A [`Tracer`] holds its [`Context`] by value, and tracing freely clones tracers (and hence their contexts) as
-    /// values flow through the traced function, and so a cloned [`TracingContext`] must keep pointing at the *same*
-    /// accumulating builder. Cloning the [`Rc`] does exactly that. An owned [`ProgramBuilder`] would instead be
-    /// *forked* on every context clone, and so [`Tracer`]s created at different points in the trace would accumulate
-    /// into divergent programs rather than the one program the trace is building. Furthermore, the nested [`RefCell`]
-    /// supplies the interior mutability that staging needs.
-    builder: Rc<RefCell<ProgramBuilder<V, O>>>,
-
-    /// Capture table of closed-over runtime values, referenced symbolically from the staged [`Program`] via
-    /// [`CaptureReference`](crate::CaptureReference)s. It stays empty for ordinary (i.e., non-capturing) tracing and
-    /// is filled only when tracing a captured [`Program`] (e.g., when just-in-time-compiling a function that closes
-    /// over device buffers), in which case those values are passed to the compiled program as runtime arguments rather
-    /// than being baked into it. Capturing is gated at the type level: [`capture`](crate::CapturingContext::capture)
-    /// is implemented only when the staged constant type can embed a [`CaptureReference`](crate::CaptureReference),
-    /// and so an ordinary trace over plain runtime constants can never push into this table. Capture-owning traces
-    /// construct their context directly and read this table back out through [`captures`](Self::captures). The
-    /// [`trace`](Self::trace) entry points instead discard it and therefore reject traces that registered captures.
-    /// Refer to the documentation of [`CaptureReference`](crate::CaptureReference) for more information.
-    ///
-    /// Like the [`builder`](Self::builder), the table is held behind an [`Rc`] and a [`RefCell`] for the same reason:
-    /// one capturing trace shares a single table across its many cloned contexts, so the [`Rc`] keeps every clone
-    /// pushing into the *same* accumulating table (which is what keeps [`CaptureReference`](crate::CaptureReference)
-    /// indices consistent) instead of forking it, and the [`RefCell`] supplies the interior mutability
-    /// [`capture`](crate::CapturingContext::capture) needs to push through a shared `&self`.
-    captures: Rc<RefCell<Vec<C>>>,
-
-    /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation. An ordinary
-    /// trace binds no named axes and this stays empty. Traces that run inside a manual parallelism region (e.g., a
-    /// `shard_map` body) are seeded with that region's device mesh axes so that named axis readers (e.g., collectives)
-    /// can validate and resolve them. The list is immutable for the [`TracingContext`]'s lifetime and shared across
-    /// cloned contexts.
-    named_axes: Rc<Vec<(String, NamedAxis)>>,
-
-    /// Default [`LogicalMesh`] this [`TracingContext`] was seeded with, resolved by its [`MeshContext`] implementation.
-    /// It is owned explicitly rather than derived from [`Self::named_axes`] (refer to [`MeshContext`] for the
-    /// rationale). Ordinary traces are seeded with none, and traces of a `shard_map` body are seeded with the
-    /// mesh of that map.
-    default_mesh: Option<Rc<LogicalMesh>>,
-
-    /// Mesh retypings that are active in this trace (added via [`MeshContext::with_retyped_mesh`]), which its
-    /// [`NamedAxes`] and [`MeshContext`] implementations apply to the bindings and the default mesh that they report.
-    /// They are shared across cloned contexts.
-    mesh_retypings: MeshRetypings,
-
-    /// Active [`ProvenanceState`] recording the non-semantic provenance scopes and origins that staged
-    /// [`Instruction`](crate::Instruction)s snapshot. It is shared behind an [`Rc`] (separately from [`Self::builder`]
-    /// so that [`ProvenanceScope`] transitions never hold a builder borrow) so that every cloned context observes the
-    /// same active scopes, while independent traces own independent states.
-    provenance: Rc<ProvenanceState>,
+    /// Shared trace resources and immutable configuration. Cloning a context copies only this handle; seeding a
+    /// different scope uses copy-on-write configuration while preserving the underlying mutable trace resources.
+    state: Rc<TracingContextState<V, O, C>>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
@@ -442,12 +394,14 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     #[inline]
     pub fn new() -> Self {
         Self {
-            builder: Rc::new(RefCell::new(ProgramBuilder::<V, O>::new())),
-            captures: Rc::new(RefCell::new(Vec::new())),
-            named_axes: Rc::new(Vec::new()),
-            default_mesh: None,
-            mesh_retypings: MeshRetypings::default(),
-            provenance: Rc::new(ProvenanceState::new()),
+            state: Rc::new(TracingContextState {
+                builder: Rc::new(RefCell::new(ProgramBuilder::<V, O>::new())),
+                captures: Rc::new(RefCell::new(Vec::new())),
+                named_axes: Rc::new(Vec::new()),
+                default_mesh: None,
+                mesh_retypings: MeshRetypings::default(),
+                provenance: Rc::new(ProvenanceState::new()),
+            }),
         }
     }
 
@@ -459,15 +413,16 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     #[inline]
     pub(crate) fn with_scope(mut self, scope: TracingScope) -> Self {
         let TracingScope { named_axes, default_mesh } = scope;
-        self.named_axes = Rc::new(named_axes);
-        self.default_mesh = default_mesh.map(Rc::new);
+        let state = Rc::make_mut(&mut self.state);
+        state.named_axes = Rc::new(named_axes);
+        state.default_mesh = default_mesh.map(Rc::new);
         self
     }
 
     /// Returns the [`ProgramBuilder`] that this [`TracingContext`] stages into.
     #[inline]
     pub fn builder(&self) -> &Rc<RefCell<ProgramBuilder<V, O>>> {
-        &self.builder
+        &self.state.builder
     }
 
     /// Returns the shared capture table that [`capture`](crate::CapturingContext::capture) fills while tracing. That
@@ -475,26 +430,26 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     /// when the staged constant type is [`CaptureReference`](crate::CaptureReference).
     #[inline]
     pub fn captures(&self) -> &Rc<RefCell<Vec<C>>> {
-        &self.captures
+        &self.state.captures
     }
 
     /// Returns the named axes this trace was seeded with, resolved by its [`NamedAxes`] implementation.
     /// Ordinary traces are seeded with no axes.
     #[inline]
     pub(crate) fn local_named_axes(&self) -> &[(String, NamedAxis)] {
-        self.named_axes.as_slice()
+        self.state.named_axes.as_slice()
     }
 
     /// Returns the default [`LogicalMesh`] this trace was seeded with, if any.
     #[inline]
     pub(crate) fn local_default_mesh(&self) -> Option<&LogicalMesh> {
-        self.default_mesh.as_deref()
+        self.state.default_mesh.as_deref()
     }
 
     /// Returns this trace's own mesh retyping stack, shared across its clones.
     #[inline]
     pub(crate) fn local_mesh_retypings(&self) -> &MeshRetypings {
-        &self.mesh_retypings
+        &self.state.mesh_retypings
     }
 }
 
@@ -711,12 +666,14 @@ where
 
             let (output_types, outputs, output_structure) = {
                 let context = TracingContext {
-                    builder: builder.clone(),
-                    captures: captures.clone(),
-                    named_axes: Rc::new(named_axes),
-                    default_mesh: default_mesh.map(Rc::new),
-                    mesh_retypings: MeshRetypings::default(),
-                    provenance: Rc::new(ProvenanceState::new()),
+                    state: Rc::new(TracingContextState {
+                        builder: builder.clone(),
+                        captures: captures.clone(),
+                        named_axes: Rc::new(named_axes),
+                        default_mesh: default_mesh.map(Rc::new),
+                        mesh_retypings: MeshRetypings::default(),
+                        provenance: Rc::new(ProvenanceState::new()),
+                    }),
                 };
                 let input = input_type.map_parameters(|t| context.input(t)).map_err(ProgramError::from)?;
                 let output = function(&context, input).map_err(|e| builder.borrow_mut().error.take().unwrap_or(e))?;
@@ -753,14 +710,7 @@ where
 impl<V: Value, O: Operation<Type = V::Type>, C> Clone for TracingContext<V, O, C> {
     #[inline]
     fn clone(&self) -> Self {
-        Self {
-            builder: self.builder.clone(),
-            captures: self.captures.clone(),
-            named_axes: self.named_axes.clone(),
-            default_mesh: self.default_mesh.clone(),
-            mesh_retypings: self.mesh_retypings.clone(),
-            provenance: self.provenance.clone(),
-        }
+        Self { state: self.state.clone() }
     }
 }
 
@@ -825,7 +775,7 @@ impl<V: Value, O: Operation<Type = V::Type> + OperationProvider<V::Type, GuardOp
     fn provenance(&self) -> Provenance {
         // A `TracingContext` is a staging boundary. It owns the builder that instructions are emitted into, and so it
         // also owns the shared provenance state those instructions snapshot.
-        self.provenance.current()
+        self.state.provenance.current()
     }
 
     #[inline]
@@ -852,12 +802,12 @@ impl<V: Value, O: Operation<Type = V::Type> + OperationProvider<V::Type, GuardOp
 
     #[inline]
     fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
-        self.provenance.invoke_with_origin(origin, function)
+        self.state.provenance.invoke_with_origin(origin, function)
     }
 
     #[inline]
     fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
-        self.provenance.invoke_with_scope(scope, function)
+        self.state.provenance.invoke_with_scope(scope, function)
     }
 }
 
@@ -866,7 +816,77 @@ impl<V: Value, O: Operation<Type = V::Type> + OperationProvider<V::Type, GuardOp
 {
     #[inline]
     fn builder(&self) -> &Rc<RefCell<ProgramBuilder<Self::Constant, Self::Operation>>> {
-        &self.builder
+        &self.state.builder
+    }
+}
+
+/// Resources and scope metadata shared through a compact [`TracingContext`] handle. Separate configuration copies
+/// retain the same builder, captures, mesh retyping stack, and provenance state, as ordinary context clones do.
+struct TracingContextState<V: Value, O: Operation<Type = V::Type>, C> {
+    /// [`ProgramBuilder`] that owns the staged [`Program`] that is currently being traced. The builder is held behind
+    /// an [`Rc`] rather than being outright owned because a single trace shares one builder across many contexts.
+    /// A [`Tracer`] holds its [`Context`] by value, and tracing freely clones tracers (and hence their contexts) as
+    /// values flow through the traced function, and so a cloned [`TracingContext`] must keep pointing at the *same*
+    /// accumulating builder. Cloning the [`Rc`] does exactly that. An owned [`ProgramBuilder`] would instead be
+    /// *forked* on every context clone, and so [`Tracer`]s created at different points in the trace would accumulate
+    /// into divergent programs rather than the one program the trace is building. Furthermore, the nested [`RefCell`]
+    /// supplies the interior mutability that staging needs.
+    builder: Rc<RefCell<ProgramBuilder<V, O>>>,
+
+    /// Capture table of closed-over runtime values, referenced symbolically from the staged [`Program`] via
+    /// [`CaptureReference`](crate::CaptureReference)s. It stays empty for ordinary (i.e., non-capturing) tracing and
+    /// is filled only when tracing a captured [`Program`] (e.g., when just-in-time-compiling a function that closes
+    /// over device buffers), in which case those values are passed to the compiled program as runtime arguments rather
+    /// than being baked into it. Capturing is gated at the type level: [`capture`](crate::CapturingContext::capture)
+    /// is implemented only when the staged constant type can embed a [`CaptureReference`](crate::CaptureReference),
+    /// and so an ordinary trace over plain runtime constants can never push into this table. Capture-owning traces
+    /// construct their context directly and read this table back out through [`captures`](TracingContext::captures).
+    /// The [`trace`](TracingContext::trace) entry points instead discard it and therefore reject traces that registered
+    /// captures. Refer to the documentation of [`CaptureReference`](crate::CaptureReference) for more information.
+    ///
+    /// Like the [`builder`](TracingContext::builder), the table is held behind an [`Rc`] and a [`RefCell`] because one
+    /// capturing trace shares a single table across its many cloned contexts, so the [`Rc`] keeps every clone
+    /// pushing into the *same* accumulating table (which is what keeps [`CaptureReference`](crate::CaptureReference)
+    /// indices consistent) instead of forking it, and the [`RefCell`] supplies the interior mutability
+    /// [`capture`](crate::CapturingContext::capture) needs to push through a shared `&self`.
+    captures: Rc<RefCell<Vec<C>>>,
+
+    /// Named axes this [`TracingContext`] was seeded with, resolved by its [`NamedAxes`] implementation. An ordinary
+    /// trace binds no named axes and this stays empty. Traces that run inside a manual parallelism region (e.g., a
+    /// `shard_map` body) are seeded with that region's device mesh axes so that named axis readers (e.g., collectives)
+    /// can validate and resolve them. The list is immutable for the [`TracingContext`]'s lifetime and shared across
+    /// cloned contexts.
+    named_axes: Rc<Vec<(String, NamedAxis)>>,
+
+    /// Default [`LogicalMesh`] this [`TracingContext`] was seeded with, resolved by its [`MeshContext`] implementation.
+    /// It is owned explicitly rather than derived from [`Self::named_axes`] (refer to [`MeshContext`] for the
+    /// rationale). Ordinary traces are seeded with none, and traces of a `shard_map` body are seeded with the
+    /// mesh of that map.
+    default_mesh: Option<Rc<LogicalMesh>>,
+
+    /// Mesh retypings that are active in this trace (added via [`MeshContext::with_retyped_mesh`]), which its
+    /// [`NamedAxes`] and [`MeshContext`] implementations apply to the bindings and the default mesh that they report.
+    /// They are shared across cloned contexts.
+    mesh_retypings: MeshRetypings,
+
+    /// Active [`ProvenanceState`] recording the non-semantic provenance scopes and origins that staged
+    /// [`Instruction`](crate::Instruction)s snapshot. It is shared behind an [`Rc`] separately from the builder so
+    /// [`ProvenanceScope`] transitions never hold a builder borrow. Every clone observes the same active scopes,
+    /// while independent traces own independent states.
+    provenance: Rc<ProvenanceState>,
+}
+
+impl<V: Value, O: Operation<Type = V::Type>, C> Clone for TracingContextState<V, O, C> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            builder: self.builder.clone(),
+            captures: self.captures.clone(),
+            named_axes: self.named_axes.clone(),
+            default_mesh: self.default_mesh.clone(),
+            mesh_retypings: self.mesh_retypings.clone(),
+            provenance: self.provenance.clone(),
+        }
     }
 }
 
@@ -1453,7 +1473,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
     {
         let regions = regions.collect::<Vec<_>>();
-        let mut interfaces = regions.iter().map(|region| region.interface()).collect::<Vec<_>>();
+        let mut interfaces = RegionInterface::collect(regions.iter().map(|region| region.interface()));
         let mut region_input_types = operation.infer_region_input_types(input_types, &interfaces)?;
         let mut programs: Option<Vec<Self>> = None;
         for index in 0..regions.len() {
@@ -1478,7 +1498,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 return Ok(None);
             };
 
-            interfaces[index] = specialized.interface();
+            interfaces.to_mut()[index] = specialized.interface().clone();
             programs[index] = specialized;
             if index + 1 < regions.len() {
                 region_input_types = operation.infer_region_input_types(input_types, &interfaces)?;
@@ -2095,6 +2115,59 @@ mod tests {
     }
 
     #[test]
+    fn test_tracing_context_clone_retains_resources_when_scope_changes() {
+        /// A capture whose table can be shared and whose payload must never need cloning.
+        struct NonCloneCapture;
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let retyped = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let original_scope =
+            TracingScope::new(vec![("items".to_owned(), NamedAxis::Batched { size: Some(3) })], Some(mesh.clone()));
+        let new_scope = TracingScope::new(
+            vec![("other_items".to_owned(), NamedAxis::Batched { size: Some(7) })],
+            Some(mesh.clone()),
+        );
+        let context =
+            TracingContext::<Array, ArrayOperation<Array>, NonCloneCapture>::new().with_scope(original_scope.clone());
+        let cloned = context.clone();
+        let scoped = cloned.with_scope(new_scope.clone());
+        assert_eq!(TracingScope::from_context(&context), original_scope);
+        assert_eq!(TracingScope::from_context(&scoped), new_scope);
+        assert!(Rc::ptr_eq(context.builder(), scoped.builder()));
+        assert!(Rc::ptr_eq(context.captures(), scoped.captures()));
+        context.captures().borrow_mut().push(NonCloneCapture);
+        assert_eq!(scoped.captures().borrow().len(), 1);
+
+        // Replacing a clone's default mesh preserves the original configuration while all clones continue to share
+        // dynamically scoped mesh retypings and provenance state.
+        let different_mesh = context.clone().with_scope(TracingScope::new(Vec::new(), Some(retyped.clone())));
+        assert_eq!(different_mesh.local_default_mesh(), Some(&retyped));
+        assert_eq!(context.local_default_mesh(), Some(&mesh));
+        context.with_retyped_mesh(&mesh, &retyped, || {
+            assert_eq!(context.default_mesh(), Some(retyped.clone()));
+            assert_eq!(scoped.default_mesh(), Some(retyped.clone()));
+        });
+        assert_eq!(context.default_mesh(), Some(mesh.clone()));
+        assert_eq!(scoped.default_mesh(), Some(mesh));
+        let scope = ProvenanceScope::new("shared");
+        context.invoke_with_provenance_scope(scope.clone(), || {
+            let expected = Provenance::scope(scope.clone(), Provenance::unknown());
+            assert_eq!(scoped.provenance(), expected);
+            assert_eq!(different_mesh.provenance(), expected);
+        });
+        assert_eq!(context.provenance(), Provenance::unknown());
+        assert_eq!(scoped.provenance(), Provenance::unknown());
+
+        // Scope configuration never forks the mutable builder or the first recorded failure.
+        let first = ProgramError::InvalidInputCount { expected: 1, actual: 0 };
+        let later = ProgramError::InvalidOutputCount { expected: 1, actual: 0 };
+        scoped.error(first.clone());
+        different_mesh.error(later);
+        assert_eq!(context.builder().borrow().error(), Some(&first));
+        assert_eq!(scoped.builder().borrow().error(), Some(&first));
+    }
+
+    #[test]
     fn test_tracing_context_reference_identity() {
         let context = DomainTracingContext::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::new();
         let root = context.input(ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))));
@@ -2311,6 +2384,21 @@ mod tests {
         let result = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
             |context, ()| {
                 escaped_context = Some(context.clone());
+                context.lift(Array::scalar(3f32).unwrap())
+            },
+            (),
+            Vec::new(),
+        );
+        assert!(escaped_context.is_some());
+        assert!(matches!(result, Err(ProgramError::EscapedProgramBuilder)));
+    }
+
+    #[test]
+    fn test_tracing_context_trace_with_context_and_named_axes_rejects_escaped_scope_clone() {
+        let mut escaped_context = None;
+        let result = TracingContext::<Array, ArrayOperation<Array>>::trace_with_context_and_named_axes(
+            |context, ()| {
+                escaped_context = Some(context.clone().with_scope(TracingScope::default()));
                 context.lift(Array::scalar(3f32).unwrap())
             },
             (),
@@ -2800,7 +2888,7 @@ mod tests {
                 // A reference input refines its region input by its referent like an array input,
                 // so both members report the same conflict.
                 assert_eq!(
-                    operation.infer_output_types(&input_types, &[body.interface(), body.interface()]),
+                    operation.infer_output_types(&input_types, &[body.interface().clone(), body.interface().clone()]),
                     Err(error),
                 );
             }
