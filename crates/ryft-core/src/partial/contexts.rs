@@ -148,80 +148,9 @@ pub enum ReferencePlacement {
 /// to the same residual program, input descriptors, staged-feeder table, and ordering state, and lets rules re-enter
 /// the context (e.g., to inline a selected condition branch through [`inline_program`](Self::inline_program)).
 pub struct PartialEvaluationContext<C: Context> {
-    /// Parent context in which known operations are evaluated or staged. An `Rc` shares the exact parent object across
-    /// clones and deferred siblings instead of cloning `C`, whose `Clone` implementation need not preserve object
-    /// identity. Imports compare these shared allocations to verify that a value comes from the same parent, even
-    /// when the parent cannot resolve the value's identity. Independently constructed contexts have distinct parent
-    /// allocations, while deferred siblings share the parent but build separate residual programs.
-    parent: Rc<C>,
-
-    /// [`ProgramBuilder`] accumulating the residual program's [`Atom`](crate::Atom)s and
-    /// [`Instruction`](crate::Instruction)s. Shared across clones of this context (and held behind a [`RefCell`] for
-    /// interior mutability) for the same reason that [`TracingContext`] shares its builder (i.e., values stamped with
-    /// cloned contexts must keep accumulating into the _same_ residual program).
-    builder: Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>>,
-
-    /// Describes where each residual program input comes from, in input order, and is shared alongside the builder.
-    inputs: Rc<RefCell<Vec<PartialEvaluationInput<C::Value>>>>,
-
-    /// Map that is used for deduplication of residual _input_ feeders by the known value's _staged_ identity
-    /// (i.e., the outer program [`Atom`](crate::Atom) a known value names when it [`resolve`](Context::resolve)s as a
-    /// [`Staged`](ValueResolution::Staged) instance in a staging known-side context), mapping the staged atom to the
-    /// residual input already created for it. This complements the per-value shared [`PartialValueMaterialization`]
-    /// slots along the axis that value-identity deduplication cannot reach: two _distinct_ known values (with distinct
-    /// slots) naming the same outer atom collapse to one residual input, even when rule-produced. It holds only under a
-    /// _staging_ known-side context because an eager context resolves knowns as [`Constant`](ValueResolution::Constant)
-    /// rather than [`Staged`](ValueResolution::Staged), and so nothing is ever recorded in that case, and inline
-    /// constants are excluded because they carry no staged identity.
-    staged_feeders: Rc<RefCell<HashMap<AtomId, AtomId>>>,
-
-    /// Cache containing known values imported from sibling contexts keyed by the address of their source
-    /// materialization slot. Each import needs a slot in this context because source atom identifiers belong to a
-    /// different residual builder; repeated imports reuse that slot. Retaining the source slot prevents its address
-    /// from being reused for another value while the cache entry exists. Clones share the cache alongside the builder.
-    imported_known_values:
-        Rc<RefCell<HashMap<usize, (Rc<Cell<PartialValueMaterialization>>, PartialEvaluationValue<C::Value>)>>>,
-
-    /// Maps materialized reference constants to their identities in the parent context. Residual uses of those
-    /// constants must retain the same allocation identity, but constants have no entry in the input descriptors from
-    /// which to recover it. A stored [`None`] value records that the parent identity is unresolved, preventing fallback
-    /// to a misleading identity in the residual builder. Clones share this map alongside the builder.
-    constant_reference_identities: Rc<RefCell<HashMap<AtomId, Option<ReferenceIdentity>>>>,
-
-    /// Active [`ProvenanceState`] that residual [`Instruction`](crate::Instruction)s snapshot.
-    /// [`PartialEvaluationContext`]s are staging boundaries (i.e., they own the residual [`ProgramBuilder`] and emit
-    /// into it directly), and so they own provenance state exactly like tracing contexts instead of delegating reads
-    /// to their known-side parents, which are often terminal eager contexts that would erase source provenance from
-    /// every residual program. The state is seeded from the parent context's current provenance at construction and
-    /// shared across clones.
-    provenance: Rc<ProvenanceState>,
-
-    /// Specifies whether known reference operations execute or remain residual when the parent is eager.
-    /// Specialization retains these operations so they observe state when the specialized program is called.
-    reference_placement: ReferencePlacement,
-
-    /// Specifies whether effectful operations with known inputs may run in the parent context. Deferred sibling
-    /// contexts disable this so that every residual call performs its own effects, including allocations with known
-    /// initial values. Pure known work can still fold; reference placement and previously deferred ordered effects
-    /// can further restrict folding.
-    allow_effect_folding: bool,
-
-    /// Specifies whether ordered effects must remain residual to preserve execution order. Clones share this flag so
-    /// that nested operations cannot move effects ahead of already deferred work. During replay with per-reference
-    /// ordering, each instruction receives a separate flag initialized from its conflicts with earlier deferred work;
-    /// the reference sets themselves remain local to that replay.
-    defer_ordered_effects: Rc<Cell<bool>>,
-
-    /// Residual placement with which the partitions that split rules construct through
-    /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program) place their
-    /// residuals, if a residual policy was set. Refer to [`with_residual_policy`](Self::with_residual_policy) and
-    /// [`with_rounded_residual_policy`](Self::with_rounded_residual_policy) for how to do that.
-    residual_placement: Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>>,
-
-    /// First binding error retained for finalization, even if the failed operation has no outputs or its poisoned
-    /// outputs are discarded. Once set, later binds propagate poison without executing operations. Clones share the
-    /// error so a failure in nested work cannot be lost when returning to the enclosing computation.
-    error: Rc<RefCell<Option<ProgramError>>>,
+    /// Shared configuration and residual state. Configuration updates detach this handle while preserving the
+    /// identities of the shared parent, builder, and residual bookkeeping.
+    state: Rc<PartialEvaluationState<C>>,
 }
 
 impl<C: Context> PartialEvaluationContext<C> {
@@ -237,18 +166,20 @@ impl<C: Context> PartialEvaluationContext<C> {
     fn from_shared_parent(parent: Rc<C>) -> Self {
         let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
         Self {
-            parent,
-            builder: Rc::new(RefCell::new(ProgramBuilder::new())),
-            inputs: Rc::new(RefCell::new(Vec::new())),
-            staged_feeders: Rc::new(RefCell::new(HashMap::new())),
-            imported_known_values: Rc::new(RefCell::new(HashMap::new())),
-            constant_reference_identities: Rc::new(RefCell::new(HashMap::new())),
-            provenance,
-            reference_placement: ReferencePlacement::Execute,
-            allow_effect_folding: true,
-            defer_ordered_effects: Rc::new(Cell::new(false)),
-            residual_placement: None,
-            error: Rc::new(RefCell::new(None)),
+            state: Rc::new(PartialEvaluationState {
+                parent,
+                builder: Rc::new(RefCell::new(ProgramBuilder::new())),
+                inputs: Rc::new(RefCell::new(Vec::new())),
+                staged_feeders: Rc::new(RefCell::new(HashMap::new())),
+                imported_known_values: Rc::new(RefCell::new(HashMap::new())),
+                constant_reference_identities: Rc::new(RefCell::new(HashMap::new())),
+                provenance,
+                reference_placement: ReferencePlacement::Execute,
+                allow_effect_folding: true,
+                defer_ordered_effects: Rc::new(Cell::new(false)),
+                residual_placement: None,
+                error: Rc::new(RefCell::new(None)),
+            }),
         }
     }
 
@@ -261,7 +192,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// program or changing previously emitted work. Existing clones retain their own placement setting.
     #[inline]
     pub fn with_reference_placement(mut self, reference_placement: ReferencePlacement) -> Self {
-        self.reference_placement = reference_placement;
+        Rc::make_mut(&mut self.state).reference_placement = reference_placement;
         self
     }
 
@@ -273,7 +204,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// changing previously emitted work. Existing clones retain their own effect-folding setting.
     #[inline]
     pub fn with_allow_effect_folding(mut self, allow_effect_folding: bool) -> Self {
-        self.allow_effect_folding = allow_effect_folding;
+        Rc::make_mut(&mut self.state).allow_effect_folding = allow_effect_folding;
         self
     }
 
@@ -346,7 +277,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// conflict with earlier deferred work.
     #[inline]
     pub(super) fn with_defer_ordered_effects(mut self, defer_ordered_effects: bool) -> Self {
-        self.defer_ordered_effects = Rc::new(Cell::new(defer_ordered_effects));
+        Rc::make_mut(&mut self.state).defer_ordered_effects = Rc::new(Cell::new(defer_ordered_effects));
         self
     }
 
@@ -357,7 +288,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         mut self,
         residual_placement: Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>>,
     ) -> Self {
-        self.residual_placement = residual_placement;
+        Rc::make_mut(&mut self.state).residual_placement = residual_placement;
         self
     }
 
@@ -369,17 +300,17 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// an eager parent.
     #[inline]
     pub fn deferred_sibling(&self) -> Self {
-        Self::from_shared_parent(self.parent.clone())
-            .with_reference_placement(self.reference_placement)
+        Self::from_shared_parent(self.state.parent.clone())
+            .with_reference_placement(self.state.reference_placement)
             .with_allow_effect_folding(false)
-            .with_residual_placement(self.residual_placement.clone())
+            .with_residual_placement(self.state.residual_placement.clone())
     }
 
     /// Returns the known-side parent [`Context`] of this [`PartialEvaluationContext`] which is used
     /// to fold known subcomputations.
     #[inline]
     pub fn parent(&self) -> &C {
-        &self.parent
+        &self.state.parent
     }
 
     /// Returns the [`ReferencePlacement`] of known reference operations under an eager known-side parent for this
@@ -388,7 +319,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// specialized program is called.
     #[inline]
     pub fn reference_placement(&self) -> ReferencePlacement {
-        self.reference_placement
+        self.state.reference_placement
     }
 
     /// Returns whether effectful operations with known inputs may run in the parent [`Context`] of this
@@ -396,7 +327,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// for more information.
     #[inline]
     pub fn allow_effect_folding(&self) -> bool {
-        self.allow_effect_folding
+        self.state.allow_effect_folding
     }
 
     /// Returns the [`ResidualPolicyReference`] configured by [`with_residual_policy`](Self::with_residual_policy),
@@ -408,7 +339,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// inlined. Rules must still preserve effects, references, captures, and type identities.
     #[inline]
     pub fn residual_policy(&self) -> Option<&ResidualPolicyReference<C::Type>> {
-        self.residual_placement.as_ref().map(|placement| placement.policy())
+        self.state.residual_placement.as_ref().map(|placement| placement.policy())
     }
 
     /// Returns whether the partitions whose residuals the [residual policy](Self::residual_policy) of this context
@@ -420,21 +351,21 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// known programs of those partitions.
     #[inline]
     pub fn rounds_residuals(&self) -> bool {
-        self.residual_placement.as_ref().is_some_and(|placement| placement.rounds_residuals())
+        self.state.residual_placement.as_ref().is_some_and(|placement| placement.rounds_residuals())
     }
 
     /// Returns whether ordered effects must currently remain residual to preserve execution order, which is the case
     /// once an ordered operation has been staged (or has failed) in this context or in a clone that shares its flag.
     #[inline]
     pub(super) fn defer_ordered_effects(&self) -> bool {
-        self.defer_ordered_effects.get()
+        self.state.defer_ordered_effects.get()
     }
 
     /// Returns the residual placement of this [`PartialEvaluationContext`], if a residual policy was set (refer to
     /// [`with_residual_policy`](Self::with_residual_policy)).
     #[inline]
     pub(crate) fn residual_placement(&self) -> Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>> {
-        self.residual_placement.clone()
+        self.state.residual_placement.clone()
     }
 
     /// Returns the first binding error that this [`PartialEvaluationContext`] retained for finalization, if any (refer
@@ -443,7 +374,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// as binding through the context does.
     #[inline]
     pub(crate) fn error(&self) -> Option<ProgramError> {
-        self.error.borrow().clone()
+        self.state.error.borrow().clone()
     }
 
     /// Imports a known value from another [`PartialEvaluationContext`] sharing this context's parent. The first import
@@ -455,20 +386,21 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// contents.
     pub fn import_known(&self, value: &PartialTracer<C>) -> Result<PartialTracer<C>, ProgramError> {
         let error = self
+            .state
             .error
             .borrow()
             .clone()
-            .or_else(|| value.context.error.borrow().clone())
+            .or_else(|| value.context.state.error.borrow().clone())
             .or_else(|| value.value().err());
         if let Some(error) = error {
-            self.error.borrow_mut().get_or_insert_with(|| error.clone());
+            self.state.error.borrow_mut().get_or_insert_with(|| error.clone());
             return Ok(PartialTracer::poisoned(self.clone(), error, value.r#type().into_owned()));
         }
         let partial = value.value()?;
-        if Rc::ptr_eq(&self.builder, &value.context.builder) {
+        if Rc::ptr_eq(&self.state.builder, &value.context.state.builder) {
             return Ok(value.clone());
         }
-        if !Rc::ptr_eq(&self.parent, &value.context.parent) {
+        if !Rc::ptr_eq(&self.state.parent, &value.context.state.parent) {
             return Err(ProgramError::MalformedProgram(
                 "cannot import a value from a partial-evaluation context with a different parent context".to_string(),
             ));
@@ -479,7 +411,7 @@ impl<C: Context> PartialEvaluationContext<C> {
             )
         })?;
         let source_key = Rc::as_ptr(&partial.materialization) as usize;
-        if let Some((_, imported)) = self.imported_known_values.borrow().get(&source_key) {
+        if let Some((_, imported)) = self.state.imported_known_values.borrow().get(&source_key) {
             return Ok(PartialTracer::new(self.clone(), imported.clone()));
         }
         let imported = match partial.materialization() {
@@ -488,7 +420,8 @@ impl<C: Context> PartialEvaluationContext<C> {
             PartialValueMaterialization::Undecided => PartialEvaluationValue::known(known.clone()),
             PartialValueMaterialization::Variable { .. } => unreachable!("known values never name residual variables"),
         };
-        self.imported_known_values
+        self.state
+            .imported_known_values
             .borrow_mut()
             .insert(source_key, (partial.materialization.clone(), imported.clone()));
         Ok(PartialTracer::new(self.clone(), imported))
@@ -507,8 +440,8 @@ impl<C: Context> PartialEvaluationContext<C> {
     ///     [`PartialEvaluation::interpret`] uses to align runtime values with unknown feeders.
     #[inline]
     pub fn unknown_input(&self, r#type: C::Type, index: usize) -> PartialEvaluationValue<C::Value> {
-        let atom = self.builder.borrow_mut().add_input(r#type.clone());
-        self.inputs.borrow_mut().push(PartialEvaluationInput::Unknown(index));
+        let atom = self.state.builder.borrow_mut().add_input(r#type.clone());
+        self.state.inputs.borrow_mut().push(PartialEvaluationInput::Unknown(index));
         PartialEvaluationValue::variable(r#type, atom)
     }
 
@@ -528,7 +461,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         let r#type = value.r#type();
         let defines_identity = r#type.identities().any(|(position, _)| position == TypeIdentityPosition::Definition);
         let determined_by_type = C::Value::singleton(r#type.as_ref()).is_some();
-        if (defines_identity || determined_by_type) && self.parent.resolve(&value).is_constant() {
+        if (defines_identity || determined_by_type) && self.state.parent.resolve(&value).is_constant() {
             PartialEvaluationValue::known_constant(value)
         } else {
             PartialEvaluationValue::known(value)
@@ -539,8 +472,8 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// and input knowledge impose additional constraints in [`Self::fold_or_residualize`].
     #[inline]
     pub fn can_fold_effects(&self, effects: EffectClasses) -> bool {
-        (self.allow_effect_folding || effects.is_empty())
-            && (!effects.is_ordered() || !self.defer_ordered_effects.get())
+        (self.state.allow_effect_folding || effects.is_empty())
+            && (!effects.is_ordered() || !self.state.defer_ordered_effects.get())
     }
 
     /// Applies the default partial evaluation policy to the provided `operation`. When all inputs are known, the
@@ -649,7 +582,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                 .inspect_err(|_| {
                     // A failed ordered application must not let later known effects run ahead of the failed work.
                     if operation.effects().classes().is_ordered() {
-                        self.defer_ordered_effects.set(true);
+                        self.state.defer_ordered_effects.set(true);
                     }
                 })?;
                 if let Some(replacements) = replacements {
@@ -658,7 +591,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                         .map(|replacement| match replacement {
                             OperationFoldReplacement::Input(index) => Ok(inputs[index].clone()),
                             OperationFoldReplacement::Constant(constant) => {
-                                Ok(PartialEvaluationValue::known_constant(self.parent.lift(constant)?))
+                                Ok(PartialEvaluationValue::known_constant(self.state.parent.lift(constant)?))
                             }
                         })
                         .collect();
@@ -677,8 +610,10 @@ impl<C: Context> PartialEvaluationContext<C> {
 
         // A region-carrying operation can be deferred like a regionless one (e.g., a loop whose body contains work that
         // the eager parent cannot execute) when neither its boundary nor any of its executable computation regions
-        // involves references. Its effect summary above already includes those regions.
-        if regions.region_count() > 0 {
+        // involves references. Its effect summary above already includes those regions. Note that only pure eager
+        // execution can use this fallback. Staging and effectful execution perform their ordinary validation when
+        // binding below, without the discarded output inference and closure scan of this probe.
+        if self.state.parent.is_eager() && effects.is_empty() && regions.region_count() > 0 {
             let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             let region_interfaces = regions.region_interfaces();
             can_defer_unsupported = !input_types.iter().any(Type::is_reference)
@@ -698,8 +633,8 @@ impl<C: Context> PartialEvaluationContext<C> {
         // Under eager specialization, reference accesses and root forwarding must remain residual so they do not
         // observe live state before the specialized program runs. Dormant rule regions do not execute here.
         let must_defer_references = || {
-            self.reference_placement == ReferencePlacement::Stage
-                && self.parent.is_eager()
+            self.state.reference_placement == ReferencePlacement::Stage
+                && self.state.parent.is_eager()
                 && (inputs.iter().any(|input| input.r#type().is_reference())
                     || operation.effects().has_reference_declarations()
                     || regions.regions().enumerate().any(|(index, region)| {
@@ -722,17 +657,17 @@ impl<C: Context> PartialEvaluationContext<C> {
         }
 
         let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
-        let outputs = if self.parent.is_eager() && can_defer_unsupported && effects.is_empty() {
+        let outputs = if self.state.parent.is_eager() && can_defer_unsupported && effects.is_empty() {
             // Unsupported pure work can remain residual without repeating observable work. The validation above
             // excludes references; execution errors other than unsupported kernels remain failures.
-            match self.parent.bind(operation.clone(), regions.region_programs(), &known) {
+            match self.state.parent.bind(operation.clone(), regions.region_programs(), &known) {
                 Err(ProgramError::UnsupportedOperation { .. }) => {
                     return self.residualize_with_effects(operation, regions, inputs, effects);
                 }
                 outputs => outputs?,
             }
         } else {
-            self.parent.bind(operation, regions, &known)?
+            self.state.parent.bind(operation, regions, &known)?
         };
 
         Ok(outputs.into_iter().map(|value| self.known_value(value)).collect())
@@ -827,7 +762,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         // failure as poisoned outputs, later ordered operations must not execute ahead of the failed work. Retaining
         // the restriction without an emitted instruction can only defer additional ordered operations.
         if effects.is_ordered() {
-            self.defer_ordered_effects.set(true);
+            self.state.defer_ordered_effects.set(true);
         }
 
         // Replayed regions import through mappings that belong to their replay's destination builder, so they are
@@ -851,10 +786,10 @@ impl<C: Context> PartialEvaluationContext<C> {
         let specialized = if regions.region_count() == 0 {
             None
         } else {
-            let interfaces = regions.regions().map(|region| region.interface()).collect::<Vec<_>>();
+            let interfaces = regions.region_interfaces();
             operation.validate_region_interfaces(&interfaces)?;
             let input_types = {
-                let builder = self.builder.borrow();
+                let builder = self.state.builder.borrow();
                 input_atoms
                     .iter()
                     .map(|atom| {
@@ -881,27 +816,28 @@ impl<C: Context> PartialEvaluationContext<C> {
             }),
         };
         if specialized_effects_are_ordered {
-            self.defer_ordered_effects.set(true);
+            self.state.defer_ordered_effects.set(true);
         }
 
         // Residualized regions splice into the residual builder's arena in region order.
         let region_ids = match specialized {
             Some(specialized) => {
-                let mut builder = self.builder.borrow_mut();
+                let mut builder = self.state.builder.borrow_mut();
                 specialized.into_iter().map(|region| builder.import_program(region)).collect::<Vec<_>>()
             }
             None => {
                 let region_count = regions.region_count();
-                regions.import_into(&self.builder, &vec![None; region_count])?
+                regions.import_into(&self.state.builder, &vec![None; region_count])?
             }
         };
         let output_atoms = self
+            .state
             .builder
             .borrow_mut()
-            .add_instruction(operation, region_ids, input_atoms, Some(self.provenance.current()))?
+            .add_instruction(operation, region_ids, input_atoms, Some(self.state.provenance.current()))?
             .to_vec();
 
-        let builder = self.builder.borrow();
+        let builder = self.state.builder.borrow();
         Ok(output_atoms
             .into_iter()
             .map(|atom| {
@@ -1041,14 +977,14 @@ impl<C: Context> PartialEvaluationContext<C> {
             inputs,
             |_, constant| {
                 Ok(PartialEvaluationValue::known_constant(
-                    self.parent.lift(type_identities.rename_constant(constant)?)?,
+                    self.state.parent.lift(type_identities.rename_constant(constant)?)?,
                 ))
             },
             |instruction, inputs| {
                 // Preparation and the consuming rule belong to the same source instruction. Count any emitted
                 // check before dispatch so an otherwise known result still records its deferred assertion.
                 let residual_instruction_count =
-                    residual_instructions.map(|_| self.builder.borrow().instructions().len());
+                    residual_instructions.map(|_| self.state.builder.borrow().instructions().len());
                 let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                 let prepared = if let Some((guard, members)) =
                     type_identities.instruction_guard(region, instruction, &input_types)?
@@ -1129,7 +1065,7 @@ impl<C: Context> PartialEvaluationContext<C> {
                 // values. The initial count exists whenever observations are requested, so the `unwrap` is safe.
                 if let Some(residual_instructions) = residual_instructions
                     && (outputs.iter().any(PartialEvaluationValue::is_unknown)
-                        || self.builder.borrow().instructions().len() > residual_instruction_count.unwrap())
+                        || self.state.builder.borrow().instructions().len() > residual_instruction_count.unwrap())
                 {
                     residual_instructions.borrow_mut().push(InstructionId::new(region.id(), index));
                 }
@@ -1257,7 +1193,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// to a conservative alternative.
     #[inline]
     pub fn known_constant(&self, value: &C::Value) -> Result<C::Constant, ProgramError> {
-        self.parent.resolve(value).into_constant().ok_or_else(|| {
+        self.state.parent.resolve(value).into_constant().ok_or_else(|| {
             ProgramError::MalformedProgram(
                 "a known value crossing into a nested residual program does not resolve to a constant in the active \
                  known-side context"
@@ -1276,10 +1212,10 @@ impl<C: Context> PartialEvaluationContext<C> {
     #[inline]
     pub fn all_knowns_are_constants(&self, evaluation: &PartialEvaluation<C>) -> bool {
         evaluation.inputs.iter().all(|input| match input {
-            PartialEvaluationInput::Known(value) => self.parent.resolve(value).is_constant(),
+            PartialEvaluationInput::Known(value) => self.state.parent.resolve(value).is_constant(),
             PartialEvaluationInput::Unknown(_) => true,
         }) && evaluation.outputs.iter().all(|output| match output {
-            PartialEvaluationOutput::Known(value) => self.parent.resolve(value).is_constant(),
+            PartialEvaluationOutput::Known(value) => self.state.parent.resolve(value).is_constant(),
             PartialEvaluationOutput::Unknown(_) => true,
         })
     }
@@ -1324,8 +1260,9 @@ impl<C: Context> PartialEvaluationContext<C> {
         }
 
         let output_count = residual_output_atoms.len();
-        let inputs = Rc::try_unwrap(self.inputs).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let builder = Rc::try_unwrap(self.builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let state = Rc::try_unwrap(self.state).map_err(|_| ProgramError::EscapedProgramBuilder)?;
+        let inputs = Rc::try_unwrap(state.inputs).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let builder = Rc::try_unwrap(state.builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
         let program = builder
             .build::<Vec<C::Constant>, Vec<C::Constant>>(
                 residual_output_atoms,
@@ -1711,7 +1648,7 @@ impl<C: Context> PartialEvaluationContext<C> {
         })?;
 
         let atom = if constant {
-            let constant = self.parent.resolve(known).into_constant().ok_or_else(|| {
+            let constant = self.state.parent.resolve(known).into_constant().ok_or_else(|| {
                 ProgramError::MalformedProgram(
                     "residual materialization required a constant payload for a known value that is \
                      not resolvable to a constant in the active known-side context"
@@ -1719,26 +1656,26 @@ impl<C: Context> PartialEvaluationContext<C> {
                 )
             })?;
             let reference_identity =
-                known.r#type().is_reference().then(|| self.parent.reference_identity(known)).transpose()?;
-            let atom = self.builder.borrow_mut().add_constant(constant);
+                known.r#type().is_reference().then(|| self.state.parent.reference_identity(known)).transpose()?;
+            let atom = self.state.builder.borrow_mut().add_constant(constant);
             if let Some(key) = reference_identity {
-                self.constant_reference_identities.borrow_mut().insert(atom, key);
+                self.state.constant_reference_identities.borrow_mut().insert(atom, key);
             }
             atom
         } else {
             // Only input feeders deduplicate across distinct values naming the same known-side staged atom.
-            let staged_atom = match self.parent.resolve(known) {
+            let staged_atom = match self.state.parent.resolve(known) {
                 ValueResolution::Staged(atom) => Some(atom),
                 _ => None,
             };
-            let existing = staged_atom.and_then(|staged| self.staged_feeders.borrow().get(&staged).copied());
+            let existing = staged_atom.and_then(|staged| self.state.staged_feeders.borrow().get(&staged).copied());
             if let Some(atom) = existing {
                 atom
             } else {
-                let atom = self.builder.borrow_mut().add_input(known.r#type().into_owned());
-                self.inputs.borrow_mut().push(PartialEvaluationInput::Known(known.clone()));
+                let atom = self.state.builder.borrow_mut().add_input(known.r#type().into_owned());
+                self.state.inputs.borrow_mut().push(PartialEvaluationInput::Known(known.clone()));
                 if let Some(staged_atom) = staged_atom {
-                    self.staged_feeders.borrow_mut().insert(staged_atom, atom);
+                    self.state.staged_feeders.borrow_mut().insert(staged_atom, atom);
                 }
                 atom
             }
@@ -1773,12 +1710,12 @@ where
         // evaluation rule against those, and rewrap the produced values with this context, mirroring how
         // `DifferentiationContext::bind` unwraps to `DifferentiationDual`s and rewraps.
         operation.validate_region_interfaces(&regions.region_interfaces())?;
-        let input_values = match self.error.borrow().clone() {
+        let input_values = match self.state.error.borrow().clone() {
             Some(error) => Err(error),
             None => inputs
                 .iter()
                 .map(|input| {
-                    if !Rc::ptr_eq(&self.builder, &input.context.builder) {
+                    if !Rc::ptr_eq(&self.state.builder, &input.context.state.builder) {
                         return Err(ProgramError::MalformedProgram(
                             "cannot bind a value belonging to another partial-evaluation context; \
                          import known values explicitly"
@@ -1808,11 +1745,10 @@ where
         // Retain the first error even when this operation has no outputs or its outputs are discarded. Poison lets
         // infallible operator syntax finish the closure without executing subsequent operations. If output inference
         // also fails, the output arity is unknowable and the error surfaces immediately instead.
-        self.error.borrow_mut().get_or_insert_with(|| error.clone());
+        self.state.error.borrow_mut().get_or_insert_with(|| error.clone());
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let region_interfaces = regions.region_interfaces();
-        let Ok(output_types) = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())
-        else {
+        let Ok(output_types) = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_ref()) else {
             return Err(error);
         };
 
@@ -1823,7 +1759,7 @@ where
     }
 }
 
-impl<C: Context> Clone for PartialEvaluationContext<C> {
+impl<C: Context> Clone for PartialEvaluationState<C> {
     #[inline]
     fn clone(&self) -> Self {
         Self {
@@ -1843,6 +1779,13 @@ impl<C: Context> Clone for PartialEvaluationContext<C> {
     }
 }
 
+impl<C: Context> Clone for PartialEvaluationContext<C> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { state: Rc::clone(&self.state) }
+    }
+}
+
 impl<C: Context> Domain for PartialEvaluationContext<C> {
     type Type = C::Type;
     type Value = PartialTracer<C>;
@@ -1859,7 +1802,7 @@ where
     fn lift(&self, constant: C::Constant) -> Result<PartialTracer<C>, ProgramError> {
         // Lifting a staged constant produces a known value carrying an inline-constant materialization, so that
         // residual work consuming it rebuilds it as a residual-program constant rather than a residual input.
-        Ok(PartialTracer::new(self.clone(), PartialEvaluationValue::known_constant(self.parent.lift(constant)?)))
+        Ok(PartialTracer::new(self.clone(), PartialEvaluationValue::known_constant(self.state.parent.lift(constant)?)))
     }
 
     #[inline]
@@ -1881,14 +1824,14 @@ where
         // A partial-evaluation context is eager exactly when its known-side inner context is: known values are then
         // concrete, so concretizing extractions (e.g., branching on a known predicate) succeed on the known side,
         // while unknown (residual) values never concretize regardless of the inner context.
-        self.parent.is_eager()
+        self.state.parent.is_eager()
     }
 
     #[inline]
     fn provenance(&self) -> Provenance {
         // A `PartialEvaluationContext` is a staging boundary for the residual program. It owns provenance state seeded
         // from its parent instead of delegating reads to the (often terminal eager context) known side.
-        self.provenance.current()
+        self.state.provenance.current()
     }
 
     #[inline]
@@ -1898,7 +1841,7 @@ where
         // names a residual program variable whose value does not exist until the residual program runs.
         match &value.state {
             PartialTracerState::Live(value) => match value.value() {
-                PartialValue::Known(known) => self.parent.resolve(known),
+                PartialValue::Known(known) => self.state.parent.resolve(known),
                 PartialValue::Unknown(_) => ValueResolution::Opaque,
             },
             PartialTracerState::Poison { .. } => ValueResolution::Opaque,
@@ -1911,7 +1854,7 @@ where
         // residual builder's allocation identities for unknown references, which resolve as opaque values. This
         // override follows those identities through aliases and checks that the tracer belongs to the correct
         // underlying residual builder.
-        if !Rc::ptr_eq(&self.builder, &value.context().builder) {
+        if !Rc::ptr_eq(&self.state.builder, &value.context().state.builder) {
             return Ok(None);
         }
 
@@ -1923,14 +1866,14 @@ where
             return Ok(None);
         }
         match value.value() {
-            PartialValue::Known(known) => self.parent.reference_identity(known),
+            PartialValue::Known(known) => self.state.parent.reference_identity(known),
             PartialValue::Unknown(_) => {
                 let PartialValueMaterialization::Variable { residual_atom } = value.materialization() else {
                     unreachable!("unknown values always carry a residual variable")
                 };
-                let builder = self.builder.borrow();
+                let builder = self.state.builder.borrow();
                 let (root, constant) = builder.resolve_reference(residual_atom)?;
-                if let Some(key) = self.constant_reference_identities.borrow().get(&root) {
+                if let Some(key) = self.state.constant_reference_identities.borrow().get(&root) {
                     return Ok(*key);
                 }
                 if let Some(constant) = constant {
@@ -1941,24 +1884,102 @@ where
                     });
                 }
                 if let Some(index) = builder.input_ids().iter().position(|input| *input == root)
-                    && let PartialEvaluationInput::Known(known) = &self.inputs.borrow()[index]
+                    && let PartialEvaluationInput::Known(known) = &self.state.inputs.borrow()[index]
                 {
-                    return self.parent.reference_identity(known);
+                    return self.state.parent.reference_identity(known);
                 }
-                builder.reference_identity(residual_atom, Rc::as_ptr(&self.builder) as usize)
+                builder.reference_identity(residual_atom, Rc::as_ptr(&self.state.builder) as usize)
             }
         }
     }
 
     #[inline]
     fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
-        self.provenance.invoke_with_origin(origin, function)
+        self.state.provenance.invoke_with_origin(origin, function)
     }
 
     #[inline]
     fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
-        self.provenance.invoke_with_scope(scope, function)
+        self.state.provenance.invoke_with_scope(scope, function)
     }
+}
+
+/// State held by [`PartialEvaluationContext`], shallowly copied only when one clone changes its configuration.
+struct PartialEvaluationState<C: Context> {
+    /// Parent context in which known operations are evaluated or staged. An `Rc` shares the exact parent object across
+    /// clones and deferred siblings instead of cloning `C`, whose `Clone` implementation need not preserve object
+    /// identity. Imports compare these shared allocations to verify that a value comes from the same parent, even
+    /// when the parent cannot resolve the value's identity. Independently constructed contexts have distinct parent
+    /// allocations, while deferred siblings share the parent but build separate residual programs.
+    parent: Rc<C>,
+
+    /// [`ProgramBuilder`] accumulating the residual program's [`Atom`](crate::Atom)s and
+    /// [`Instruction`](crate::Instruction)s. Shared across clones of this context (and held behind a [`RefCell`] for
+    /// interior mutability) for the same reason that [`TracingContext`] shares its builder (i.e., values stamped with
+    /// cloned contexts must keep accumulating into the _same_ residual program).
+    builder: Rc<RefCell<ProgramBuilder<C::Constant, C::Operation>>>,
+
+    /// Describes where each residual program input comes from, in input order, and is shared alongside the builder.
+    inputs: Rc<RefCell<Vec<PartialEvaluationInput<C::Value>>>>,
+
+    /// Map that is used for deduplication of residual _input_ feeders by the known value's _staged_ identity
+    /// (i.e., the outer program [`Atom`](crate::Atom) a known value names when it [`resolve`](Context::resolve)s as a
+    /// [`Staged`](ValueResolution::Staged) instance in a staging known-side context), mapping the staged atom to the
+    /// residual input already created for it. This complements the per-value shared [`PartialValueMaterialization`]
+    /// slots along the axis that value-identity deduplication cannot reach: two _distinct_ known values (with distinct
+    /// slots) naming the same outer atom collapse to one residual input, even when rule-produced. It holds only under a
+    /// _staging_ known-side context because an eager context resolves knowns as [`Constant`](ValueResolution::Constant)
+    /// rather than [`Staged`](ValueResolution::Staged), and so nothing is ever recorded in that case, and inline
+    /// constants are excluded because they carry no staged identity.
+    staged_feeders: Rc<RefCell<HashMap<AtomId, AtomId>>>,
+
+    /// Cache containing known values imported from sibling contexts keyed by the address of their source
+    /// materialization slot. Each import needs a slot in this context because source atom identifiers belong to a
+    /// different residual builder; repeated imports reuse that slot. Retaining the source slot prevents its address
+    /// from being reused for another value while the cache entry exists. Clones share the cache alongside the builder.
+    imported_known_values:
+        Rc<RefCell<HashMap<usize, (Rc<Cell<PartialValueMaterialization>>, PartialEvaluationValue<C::Value>)>>>,
+
+    /// Maps materialized reference constants to their identities in the parent context. Residual uses of those
+    /// constants must retain the same allocation identity, but constants have no entry in the input descriptors from
+    /// which to recover it. A stored [`None`] value records that the parent identity is unresolved, preventing fallback
+    /// to a misleading identity in the residual builder. Clones share this map alongside the builder.
+    constant_reference_identities: Rc<RefCell<HashMap<AtomId, Option<ReferenceIdentity>>>>,
+
+    /// Active [`ProvenanceState`] that residual [`Instruction`](crate::Instruction)s snapshot.
+    /// [`PartialEvaluationContext`]s are staging boundaries (i.e., they own the residual [`ProgramBuilder`] and emit
+    /// into it directly), and so they own provenance state exactly like tracing contexts instead of delegating reads
+    /// to their known-side parents, which are often terminal eager contexts that would erase source provenance from
+    /// every residual program. The state is seeded from the parent context's current provenance at construction and
+    /// shared across clones.
+    provenance: Rc<ProvenanceState>,
+
+    /// Specifies whether known reference operations execute or remain residual when the parent is eager.
+    /// Specialization retains these operations so they observe state when the specialized program is called.
+    reference_placement: ReferencePlacement,
+
+    /// Specifies whether effectful operations with known inputs may run in the parent context. Deferred sibling
+    /// contexts disable this so that every residual call performs its own effects, including allocations with known
+    /// initial values. Pure known work can still fold; reference placement and previously deferred ordered effects
+    /// can further restrict folding.
+    allow_effect_folding: bool,
+
+    /// Specifies whether ordered effects must remain residual to preserve execution order. Clones share this flag so
+    /// that nested operations cannot move effects ahead of already deferred work. During replay with per-reference
+    /// ordering, each instruction receives a separate flag initialized from its conflicts with earlier deferred work;
+    /// the reference sets themselves remain local to that replay.
+    defer_ordered_effects: Rc<Cell<bool>>,
+
+    /// Residual placement applied by partitions that split rules construct through
+    /// [`PartialEvaluationDriver::partition_program`](crate::PartialEvaluationDriver::partition_program), if a policy
+    /// was set. Use [`PartialEvaluationContext::with_residual_policy`] or
+    /// [`PartialEvaluationContext::with_rounded_residual_policy`] to configure it.
+    residual_placement: Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>>,
+
+    /// First binding error retained for finalization, even if the failed operation has no outputs or its poisoned
+    /// outputs are discarded. Once set, later binds propagate poison without executing operations. Clones share the
+    /// error so a failure in nested work cannot be lost when returning to the enclosing computation.
+    error: Rc<RefCell<Option<ProgramError>>>,
 }
 
 /// State carried by a [`PartialTracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -2149,7 +2170,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::HashSet;
     use std::fmt::Debug;
     use std::rc::Rc;
@@ -2165,6 +2186,7 @@ mod tests {
     };
     use crate::captures::CaptureReference;
     use crate::contexts::{Context, EagerContext, StagingContext, ValueResolution};
+    use crate::macros::impl_guardless_operation;
     use crate::operations::{
         AddOperation, ConditionOperation, CustomCallOperation, DimensionAddOperation, DimensionSizeOperation,
         DimensionSubOperation, LinearCallOperation, MulOperation, NegOperation, PrintOperation,
@@ -2187,7 +2209,7 @@ mod tests {
     use crate::programs::{
         AtomId, Concretizable, EffectClass, EffectClasses, Effects, InstructionId, Operation, ProgramBuilder,
         ProgramError, Provenance, ProvenanceScope, ReferenceError, ReferenceIdentity, ReferenceType, RegionInterface,
-        TypeError, Typed, TypedProgram,
+        RegionSlot, TypeError, Typed, TypedProgram,
     };
     use crate::tests::{TestArrayContext, TestArrayTracingContext, TestOrderedStateOperation, TestRegionOperation};
     use crate::tracing::TracingContext;
@@ -2221,8 +2243,35 @@ mod tests {
         let context = PartialEvaluationContext::new(TestArrayContext::new());
         assert_eq!(context.reference_placement(), ReferencePlacement::Execute);
         assert!(context.allow_effect_folding());
-        assert!(context.builder.borrow().instructions().is_empty());
-        assert!(context.inputs.borrow().is_empty());
+        assert!(context.state.builder.borrow().instructions().is_empty());
+        assert!(context.state.inputs.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_clone() {
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        let builder_owners = Rc::strong_count(&context.state.builder);
+        let cloned = context.clone();
+        assert_eq!(size_of::<PartialEvaluationContext<TestArrayContext>>(), size_of::<Rc<()>>());
+        assert!(Rc::ptr_eq(&context.state, &cloned.state));
+        assert_eq!(Rc::strong_count(&context.state.builder), builder_owners);
+
+        let configured = cloned.with_reference_placement(ReferencePlacement::Stage);
+        assert!(!Rc::ptr_eq(&context.state, &configured.state));
+        assert_eq!(context.reference_placement(), ReferencePlacement::Execute);
+        assert_eq!(configured.reference_placement(), ReferencePlacement::Stage);
+        assert!(Rc::ptr_eq(&context.state.parent, &configured.state.parent));
+        assert!(Rc::ptr_eq(&context.state.builder, &configured.state.builder));
+        assert!(Rc::ptr_eq(&context.state.inputs, &configured.state.inputs));
+        assert!(Rc::ptr_eq(&context.state.staged_feeders, &configured.state.staged_feeders));
+        assert!(Rc::ptr_eq(&context.state.imported_known_values, &configured.state.imported_known_values));
+        assert!(Rc::ptr_eq(
+            &context.state.constant_reference_identities,
+            &configured.state.constant_reference_identities
+        ));
+        assert!(Rc::ptr_eq(&context.state.provenance, &configured.state.provenance));
+        assert!(Rc::ptr_eq(&context.state.defer_ordered_effects, &configured.state.defer_ordered_effects));
+        assert!(Rc::ptr_eq(&context.state.error, &configured.state.error));
     }
 
     #[test]
@@ -2357,7 +2406,7 @@ mod tests {
         let detached = context.clone().with_defer_ordered_effects(true);
         assert!(!context.defer_ordered_effects());
         assert!(detached.defer_ordered_effects());
-        context.clone().defer_ordered_effects.set(true);
+        context.clone().state.defer_ordered_effects.set(true);
         assert!(context.defer_ordered_effects());
         let detached = context.clone().with_defer_ordered_effects(false);
         assert!(!detached.defer_ordered_effects());
@@ -2369,10 +2418,10 @@ mod tests {
         let parent = TracingContext::<TestValue, TestOperation>::new();
         let source = PartialEvaluationContext::new(parent.clone());
         let context = source.deferred_sibling();
-        assert!(Rc::ptr_eq(&source.parent, &context.parent));
-        assert!(Rc::ptr_eq(&context.parent, &context.clone().parent));
-        assert!(!Rc::ptr_eq(&source.builder, &context.builder));
-        assert!(!Rc::ptr_eq(&source.parent, &PartialEvaluationContext::new(parent.clone()).parent));
+        assert!(Rc::ptr_eq(&source.state.parent, &context.state.parent));
+        assert!(Rc::ptr_eq(&context.state.parent, &context.clone().state.parent));
+        assert!(!Rc::ptr_eq(&source.state.builder, &context.state.builder));
+        assert!(!Rc::ptr_eq(&source.state.parent, &PartialEvaluationContext::new(parent.clone()).state.parent));
         let zero = context.lift(TestValue::Array(Array::scalar(0.0_f32).unwrap())).unwrap();
         let allocated = context.bind(ReferenceNewOperation::new(), Vec::new(), &[zero.clone()]).unwrap();
         assert!(allocated[0].value().unwrap().is_unknown());
@@ -2382,7 +2431,7 @@ mod tests {
         let folded = context.clone().bind(AddOperation::new(), Vec::new(), &[zero.clone(), zero]).unwrap();
         assert!(folded[0].value().unwrap().is_known());
         assert_eq!(parent.builder().borrow().instructions().len(), 1);
-        assert_eq!(context.builder.borrow().instructions().len(), 1);
+        assert_eq!(context.state.builder.borrow().instructions().len(), 1);
     }
 
     #[test]
@@ -2405,7 +2454,7 @@ mod tests {
             )
             .unwrap();
         assert!(viewed[0].value().unwrap().is_unknown());
-        assert_eq!(target.builder.borrow().instructions().len(), 1);
+        assert_eq!(target.state.builder.borrow().instructions().len(), 1);
     }
 
     #[test]
@@ -2477,6 +2526,13 @@ mod tests {
         );
         assert_eq!(target.import_known(&imported).unwrap(), imported);
 
+        let configured = target.clone().with_reference_placement(ReferencePlacement::Stage);
+        let imported_again = configured.import_known(&known).unwrap();
+        assert!(Rc::ptr_eq(
+            &imported.value().unwrap().materialization,
+            &imported_again.value().unwrap().materialization,
+        ));
+
         let reference = parent.input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
         let known_reference = PartialTracer::new(source.clone(), PartialEvaluationValue::known(reference));
         let imported_reference = target.import_known(&known_reference).unwrap();
@@ -2498,7 +2554,7 @@ mod tests {
             target.bind(ArrayOperation::Add(AddOperation::new()), Vec::new(), &[known.clone(), known]).unwrap();
         assert!(matches!(poisoned[0].value(), Err(ProgramError::MalformedProgram(message))
             if message == "cannot bind a value belonging to another partial-evaluation context; import known values explicitly",),);
-        assert!(target.builder.borrow().instructions().is_empty());
+        assert!(target.state.builder.borrow().instructions().is_empty());
     }
 
     #[test]
@@ -2611,6 +2667,86 @@ mod tests {
             evaluation.interpret(&EagerContext::new(), &[Array::scalar(7.0).unwrap()]),
             Ok(vec![Array::scalar(-7.0).unwrap()])
         );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_fold_or_residualize_stages_regions_without_eager_probe() {
+        /// Checked region application whose output-inference count exposes an eager-only fallback probe.
+        #[derive(Clone, Debug)]
+        struct CountedRegionOperation {
+            /// Number of complete hypothetical application checks performed so far.
+            queries: Rc<Cell<usize>>,
+        }
+
+        impl Operation for CountedRegionOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "counted_region"
+            }
+
+            fn region_slots(&self) -> &'static [crate::programs::RegionSlot] {
+                const { &[crate::programs::RegionSlot::computation("body")] }
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                regions: &[RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                self.queries.set(self.queries.get() + 1);
+                check_count!("input", input_types, 1, TypeError);
+                check_count!("region", regions, 1, TypeError);
+                Ok(regions[0].output_types().to_vec())
+            }
+        }
+
+        impl_guardless_operation!(CountedRegionOperation);
+
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<Array, CountedRegionOperation>::new();
+        let input = builder.add_input(scalar_type.clone());
+        let body = builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let queries = Rc::new(Cell::new(0));
+        let parent = TracingContext::<Array, CountedRegionOperation>::new();
+        let input = PartialEvaluationValue::known(parent.input(scalar_type));
+        let context = PartialEvaluationContext::new(parent);
+        let outputs = context
+            .fold_or_residualize(CountedRegionOperation { queries: Rc::clone(&queries) }, vec![body.clone()], &[input])
+            .unwrap();
+        assert_eq!(queries.get(), 1);
+        let output = outputs[0].as_known().unwrap().atom_id().unwrap();
+        let program = context
+            .parent()
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = counted_region %0 [
+                    body={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
+        );
+
+        // Staging still rejects malformed applications through the checked builder, with the original error.
+        let parent = TracingContext::<Array, CountedRegionOperation>::new();
+        let context = PartialEvaluationContext::new(parent);
+        queries.set(0);
+        assert_eq!(
+            context
+                .fold_or_residualize(CountedRegionOperation { queries: Rc::clone(&queries) }, vec![body], &[])
+                .unwrap_err(),
+            ProgramError::Type(TypeError::invalid("expected 1 input but got 0")),
+        );
+        assert_eq!(queries.get(), 1);
     }
 
     #[test]
@@ -2821,8 +2957,6 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize_preserves_reference_failure_order() {
-        use crate::programs::ReferenceError;
-
         // An unused read can fail, so later I/O must not execute during specialization ahead of that failure.
         let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         frozen.freeze().unwrap();
@@ -2852,8 +2986,6 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize_preserves_order_across_reference_roots() {
-        use crate::programs::ReferenceError;
-
         // The default execution policy must also preserve order when the earlier reference is an unknown input.
         // Its failure prevents a later write to another root, including when that write has entirely known inputs.
         let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
@@ -2878,8 +3010,6 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize_excludes_dormant_effects() {
-        use crate::programs::RegionSlot;
-
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32));
         let output = builder
@@ -2901,8 +3031,6 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_fold_or_residualize_residualizes_deferred_work() {
-        use crate::programs::RegionSlot;
-
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F32));
         let output = builder.add_instruction(TestRegionOperation::Deferred, Vec::new(), vec![input], None).unwrap()[0];
@@ -2918,7 +3046,7 @@ mod tests {
         let computation = TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] });
         let computation = context.fold_or_residualize(computation, vec![body.clone()], &[known.clone()]).unwrap();
         assert!(computation[0].is_unknown());
-        assert_eq!(context.builder.borrow().instructions().len(), 2);
+        assert_eq!(context.state.builder.borrow().instructions().len(), 2);
         assert!(outer.builder().borrow().instructions().is_empty());
 
         // A dormant rule region (i.e., a registered but unselected derivative) creates no obligation,
@@ -2926,7 +3054,7 @@ mod tests {
         let rule = TestRegionOperation::WithRegions(const { &[RegionSlot::rule("derivative")] });
         let rule = context.fold_or_residualize(rule, vec![body], &[known]).unwrap();
         assert!(rule[0].is_known());
-        assert_eq!(context.builder.borrow().instructions().len(), 2);
+        assert_eq!(context.state.builder.borrow().instructions().len(), 2);
         assert_eq!(outer.builder().borrow().instructions().len(), 1);
     }
 
@@ -2952,7 +3080,7 @@ mod tests {
                 .is_empty(),
         );
         assert_eq!(live.read(), Ok(Array::scalar(3.0_f32).unwrap()));
-        assert!(context.builder.borrow().instructions().is_empty());
+        assert!(context.state.builder.borrow().instructions().is_empty());
 
         // A write of the unknown value stages and prevents later ordered effects from folding: later known reads stage
         // even on a different allocation, preserving failure and synchronization order.
@@ -3007,8 +3135,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(folded[0].as_known(), Some(&TestValue::Array(Array::scalar(-2f32).unwrap())));
-        assert!(context.builder.borrow().instructions().is_empty());
-        assert_eq!(context.builder.borrow().regions.len(), 0);
+        assert!(context.state.builder.borrow().instructions().is_empty());
+        assert_eq!(context.state.builder.borrow().regions.len(), 0);
 
         let input = context.unknown_input(ArrayType::scalar(DataType::F32).into(), 0);
         let first = context
@@ -3084,7 +3212,7 @@ mod tests {
             PartialValueMaterialization::Input { residual_atom: Some(AtomId::new(4)) },
         );
         assert!(first[0].is_unknown() && second[0].is_unknown());
-        assert_eq!(context.inputs.borrow().len(), 3);
+        assert_eq!(context.state.inputs.borrow().len(), 3);
     }
 
     #[test]
@@ -3185,8 +3313,8 @@ mod tests {
             context.residualize(TestRegionOperation::PreparationFailure, AttachedRegions::Callees(&[Arc::new(body)]), &[input]),
             Err(ProgramError::Type(TypeError::Invalid { message })) if message == "region preparation failed",
         ));
-        assert!(context.builder.borrow().instructions().is_empty());
-        assert_eq!(context.builder.borrow().regions.len(), 0);
+        assert!(context.state.builder.borrow().instructions().is_empty());
+        assert_eq!(context.state.builder.borrow().regions.len(), 0);
     }
 
     #[test]
@@ -3273,7 +3401,7 @@ mod tests {
 
         // Narrowing the right input to zero folds checked subtraction away. Its original assertion classification
         // conservatively keeps subsequent ordered work residual even though the specialized region is pure.
-        assert!(context.defer_ordered_effects.get());
+        assert!(context.state.defer_ordered_effects.get());
         let target = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
         let replacement = PartialEvaluationValue::known(TestValue::Array(Array::scalar(7f32).unwrap()));
         assert!(
@@ -3437,8 +3565,8 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-        assert!(context.builder.borrow().instructions().is_empty());
-        assert_eq!(context.builder.borrow().regions.len(), 0);
+        assert!(context.state.builder.borrow().instructions().is_empty());
+        assert_eq!(context.state.builder.borrow().regions.len(), 0);
     }
 
     #[test]
@@ -3480,8 +3608,8 @@ mod tests {
                 }"},
         );
         assert!(context.defer_ordered_effects());
-        assert!(context.builder.borrow().instructions().is_empty());
-        assert!(context.inputs.borrow().is_empty());
+        assert!(context.state.builder.borrow().instructions().is_empty());
+        assert!(context.state.inputs.borrow().is_empty());
         assert_eq!(context.error(), None);
         let known = partition
             .known_program()
@@ -3513,7 +3641,7 @@ mod tests {
                 message: "partitioning a region on residual demand requires a residual policy".to_string(),
             }),
         );
-        assert!(context.builder.borrow().instructions().is_empty());
+        assert!(context.state.builder.borrow().instructions().is_empty());
         assert!(!context.defer_ordered_effects());
     }
 
@@ -3690,7 +3818,7 @@ mod tests {
                     .to_string(),
             }),
         );
-        assert!(context.builder.borrow().instructions().is_empty());
+        assert!(context.state.builder.borrow().instructions().is_empty());
     }
 
     #[test]
@@ -4338,6 +4466,46 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_into_evaluation() {
+        // A retained binding error wins over ownership errors, including when another context clone is still live.
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        let retained = context.clone();
+        let expected_error = ProgramError::Type(TypeError::invalid("expected 1 input but got 0"));
+        assert_eq!(context.bind(NegOperation::new(), Vec::new(), &[]).unwrap_err(), expected_error);
+        assert_eq!(context.into_evaluation(Vec::new()).map(|_| ()), Err(expected_error));
+        drop(retained);
+
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        let retained = context.clone();
+        assert_eq!(context.into_evaluation(Vec::new()).map(|_| ()), Err(ProgramError::EscapedProgramBuilder),);
+        drop(retained);
+
+        // Detaching configuration keeps the original residual handles, so either configuration still detects the
+        // other owner even though their outer state handles are distinct.
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        let retained = context.clone().with_allow_effect_folding(false);
+        assert!(!Rc::ptr_eq(&context.state, &retained.state));
+        assert_eq!(context.into_evaluation(Vec::new()).map(|_| ()), Err(ProgramError::EscapedProgramBuilder),);
+        drop(retained);
+
+        let context = PartialEvaluationContext::new(TestArrayContext::new());
+        let configured = context.clone().with_allow_effect_folding(false);
+        drop(context);
+        let input = configured.unknown_input(ArrayType::scalar(DataType::F32), 0);
+        let outputs = configured.residualize(NegOperation::new(), Vec::new(), &[input]).unwrap();
+        let evaluation = configured.into_evaluation(outputs).unwrap();
+        assert_eq!(evaluation.inputs(), &[PartialEvaluationInput::Unknown(0)]);
+        assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = neg %0
+                in (%1)"},
+        );
+    }
+
+    #[test]
     fn test_partial_evaluation_context_prepare_root_inputs_rejects_unguardable_entries() {
         // An operation family without an entry guard cannot preserve an unproven entry relationship, so preparing a
         // mixed signature is rejected instead of dropping its entry check.
@@ -4365,9 +4533,9 @@ mod tests {
         );
 
         // Family validation must precede residual-header allocation, leaving a rejected preparation reusable.
-        assert!(context.builder.borrow().input_ids().is_empty());
-        assert!(context.builder.borrow().instructions().is_empty());
-        assert!(context.inputs.borrow().is_empty());
+        assert!(context.state.builder.borrow().input_ids().is_empty());
+        assert!(context.state.builder.borrow().instructions().is_empty());
+        assert!(context.state.inputs.borrow().is_empty());
     }
 
     #[test]
@@ -4603,8 +4771,8 @@ mod tests {
             }),
         );
         assert!(outer.builder().borrow().instructions().is_empty());
-        assert!(context.builder.borrow().instructions().is_empty());
-        assert_eq!(context.inputs.borrow().len(), 1);
+        assert!(context.state.builder.borrow().instructions().is_empty());
+        assert_eq!(context.state.inputs.borrow().len(), 1);
     }
 
     #[test]
@@ -4714,8 +4882,6 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_bind_retains_zero_output_failure() {
-        use crate::programs::ReferenceError;
-
         let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         assert_eq!(frozen.freeze(), Ok(Array::scalar(1.0_f32).unwrap()));
         let live = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
@@ -4736,8 +4902,6 @@ mod tests {
 
     #[test]
     fn test_partial_evaluation_context_bind_retains_discarded_output_failure() {
-        use crate::programs::ReferenceError;
-
         let frozen = ArrayReference::new(Array::scalar(1.0_f32).unwrap());
         assert_eq!(frozen.freeze(), Ok(Array::scalar(1.0_f32).unwrap()));
         let live = ArrayReference::new(Array::scalar(2.0_f32).unwrap());
@@ -4885,7 +5049,8 @@ mod tests {
 
         // Inherited constants enter the residual builder without being materialized through the parent context.
         // Seed that state directly: no parent identity has been recorded for this symbolic capture.
-        let captured = context.builder.borrow_mut().add_constant(CaptureReference::new(0, reference_type.clone()));
+        let captured =
+            context.state.builder.borrow_mut().add_constant(CaptureReference::new(0, reference_type.clone()));
         let captured = PartialTracer::new(context.clone(), PartialEvaluationValue::variable(reference_type, captured));
         assert_eq!(context.reference_identity(&captured), Ok(None));
         assert!(outer.builder().borrow().atoms().is_empty());
