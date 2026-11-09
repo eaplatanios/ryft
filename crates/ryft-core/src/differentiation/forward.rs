@@ -1400,17 +1400,17 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     /// Partitions an existing fused Jacobian-Vector Product (JVP) [`Region`] like
     /// [`partition_jvp_program`](Self::partition_jvp_program) while placing the known values that its residual tangent
     /// program consumes according to `policy`, deciding which primal values the tangent program receives as residuals
-    /// and which it recomputes (refer to [`PartitionedProgram::with_top_level_residual_policy`] for more information).
-    /// The policy also places the residuals of the partitions that the split rules of region-carrying operations in the
-    /// region construct (refer to [`PartialEvaluationContext::with_residual_policy`]), so its decisions apply per
-    /// iteration and per branch. Rules that let users control the residuals of their linearization use this. The
-    /// resulting partition is not retained in the region's transform cache, so the policy never affects other requests.
+    /// and which it recomputes (refer to [`PartitionedProgram::with_residual_policy`] for more information). The policy
+    /// also places the residuals of the partitions that the split rules of region-carrying operations in the region
+    /// construct (refer to [`PartialEvaluationContext::with_residual_policy`]), so its decisions apply per iteration
+    /// and per branch. Rules that let users control the residuals of their linearization use this. The resulting
+    /// partition is not retained in the region's transform cache, so the policy never affects other requests.
     ///
-    /// Like [`PartitionedProgram::with_top_level_residual_policy`], this places residuals without rounding them.
-    /// Backends may compute narrow floating-point values at a higher precision than their types, so the known consumers
-    /// of a saved value and its residual consumers can observe different values unless the values are rounded at their
-    /// producers. [`rematerialize`](crate::rematerialize) does that rounding for its own partitions, as JAX's `remat`
-    /// does, and rules that need the same consistency must round the values that their partitions save themselves.
+    /// Like [`PartitionedProgram::with_residual_policy`], this places residuals without rounding them. Backends may
+    /// compute narrow floating-point values at a higher precision than their types, so the known consumers of a saved
+    /// value and its residual consumers can observe different values unless the values are rounded at their producers.
+    /// [`rematerialize`](crate::rematerialize) does that rounding for its own partitions, as JAX's `remat` does, and
+    /// rules that need the same consistency must round the values that their partitions save themselves.
     ///
     /// # Parameters
     ///
@@ -6517,7 +6517,7 @@ pub(crate) mod tests {
         let with_dead_work =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let before = with_dead_work.entry_region_ref().jvp_shared(&[0]).unwrap();
-        let simplified = with_dead_work.simplified().unwrap();
+        let simplified = with_dead_work.into_simplified().unwrap();
         let after = simplified.entry_region_ref().jvp_shared(&[0]).unwrap();
         assert!(!Arc::ptr_eq(&after, &before));
         assert_eq!(after.to_string(), retained.to_string());
@@ -6826,7 +6826,7 @@ pub(crate) mod tests {
 
         // Simplification rebuilds every region, so it keeps the retained linearization only when the rebuild left the
         // region's contents untouched. A program carrying dead work is genuinely rewritten and must not reuse it.
-        let simplified = callee.simplified().unwrap();
+        let simplified = callee.as_ref().clone().into_simplified().unwrap();
         assert!(Arc::ptr_eq(simplified.entry_region_ref().linearize_shared(&[0]).unwrap().primal(), &primal));
 
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -6836,7 +6836,7 @@ pub(crate) mod tests {
         let with_dead_work =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let before = with_dead_work.entry_region_ref().linearize_shared(&[0]).unwrap();
-        let after = with_dead_work.simplified().unwrap();
+        let after = with_dead_work.into_simplified().unwrap();
         let after = after.entry_region_ref().linearize_shared(&[0]).unwrap();
         assert!(!Arc::ptr_eq(after.primal(), before.primal()));
         assert_eq!(after.primal().to_string(), primal.to_string());
