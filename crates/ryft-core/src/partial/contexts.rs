@@ -1,3 +1,4 @@
+use std::any::TypeId;
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -29,12 +30,9 @@ use crate::programs::{
 };
 use crate::tracing::TracingContext;
 
-#[cfg(doc)]
-use crate::contexts::StagingContext;
-
 /// Placement of _known_ reference operations when the known-side [`Context`] of a [`PartialEvaluationContext`] is
-/// eager. Under a [`StagingContext`] known side the two placements coincide, because folding stages an operation into
-/// the outer program instead of executing it, and both follow the ordering rules on
+/// eager. Under a [`StagingContext`](crate::StagingContext) known side the two placements coincide, because folding
+/// stages an operation into the outer program instead of executing it, and both follow the ordering rules on
 /// [`PartialEvaluationContext`]: once an ordered effect is deferred, later ordered effects remain residual too.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ReferencePlacement {
@@ -150,7 +148,7 @@ pub enum ReferencePlacement {
 pub struct PartialEvaluationContext<C: Context> {
     /// Shared configuration and residual state. Configuration updates detach this handle while preserving the
     /// identities of the shared parent, builder, and residual bookkeeping.
-    state: Rc<PartialEvaluationState<C>>,
+    state: Rc<PartialEvaluationContextState<C>>,
 }
 
 impl<C: Context> PartialEvaluationContext<C> {
@@ -166,7 +164,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     fn from_shared_parent(parent: Rc<C>) -> Self {
         let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
         Self {
-            state: Rc::new(PartialEvaluationState {
+            state: Rc::new(PartialEvaluationContextState {
                 parent,
                 builder: Rc::new(RefCell::new(ProgramBuilder::new())),
                 inputs: Rc::new(RefCell::new(Vec::new())),
@@ -231,7 +229,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// This function changes only the returned context's configuration, without creating a new residual program
     /// or changing previously emitted work. Existing clones retain their own residual policy. The resulting partitions
     /// keep the values that they save unrounded, unlike the partitions of the rematerialization rules. Refer to
-    /// [`rounds_residuals`](Self::rounds_residuals) for more information on the latter.
+    /// [`residual_rounding`](Self::residual_rounding) for more information on the latter.
     #[inline]
     pub fn with_residual_policy(self, policy: &ResidualPolicyReference<C::Type>) -> Self
     where
@@ -342,16 +340,17 @@ impl<C: Context> PartialEvaluationContext<C> {
         self.state.residual_placement.as_ref().map(|placement| placement.policy())
     }
 
-    /// Returns whether the partitions whose residuals the [residual policy](Self::residual_policy) of this context
-    /// places also round the values that they save right after their producers, as the partial evaluation and
-    /// differentiation rules of [`RematerializeOperation`](crate::RematerializeOperation) configure them to, so that
-    /// known work and residual work observe the same values even when a backend computes them at a higher precision
-    /// than their types. Rules that retain the partitions of their regions across calls (e.g., backend call rules that
-    /// share the splits of a callee) key them on this configuration together with the policy, because it changes the
-    /// known programs of those partitions.
+    /// Returns the [`TypeId`] of the rounding with which the partitions whose residuals the
+    /// [residual policy](Self::residual_policy) of this context places also round the values that they save right after
+    /// their producers, or [`None`] when they keep those values unrounded. The partial evaluation and differentiation
+    /// rules of [`RematerializeOperation`](crate::RematerializeOperation) configure such a rounding, so that known work
+    /// and residual work observe the same values even when a backend computes them at a higher precision than their
+    /// types. Rules that retain the partitions of their regions across calls (e.g., backend call rules that share the
+    /// splits of a callee) key them on this type together with the policy, because the rounding changes the known
+    /// programs of those partitions and a rounding is identified by its type.
     #[inline]
-    pub fn rounds_residuals(&self) -> bool {
-        self.state.residual_placement.as_ref().is_some_and(|placement| placement.rounds_residuals())
+    pub fn residual_rounding(&self) -> Option<TypeId> {
+        self.state.residual_placement.as_ref().and_then(|placement| placement.rounding())
     }
 
     /// Returns whether ordered effects must currently remain residual to preserve execution order, which is the case
@@ -478,9 +477,9 @@ impl<C: Context> PartialEvaluationContext<C> {
 
     /// Applies the default partial evaluation policy to the provided `operation`. When all inputs are known, the
     /// operation is [`bind`](Context::bind)ed in the known-side [`Context`] (i.e., interpreting it under an eager
-    /// context and staging it into the outer program under a [`StagingContext`]), and its outputs become known trace
-    /// values. When any input is residual, all inputs are materialized into the residual program and the operation is
-    /// emitted unchanged.
+    /// context and staging it into the outer program under a [`StagingContext`](crate::StagingContext)), and its
+    /// outputs become known trace values. When any input is residual, all inputs are materialized into the residual
+    /// program and the operation is emitted unchanged.
     ///
     /// Before that execution policy, regionless operations without references can use [`Operation::fold`] to return
     /// existing inputs, even when unknown, or known constants determined by their inferred output types. Those
@@ -608,27 +607,6 @@ impl<C: Context> PartialEvaluationContext<C> {
             .fold(operation.effects().summary(), |effects, (_, region)| effects.union(region.effects()));
         let effects = summary.classes();
 
-        // A region-carrying operation can be deferred like a regionless one (e.g., a loop whose body contains work that
-        // the eager parent cannot execute) when neither its boundary nor any of its executable computation regions
-        // involves references. Its effect summary above already includes those regions. Note that only pure eager
-        // execution can use this fallback. Staging and effectful execution perform their ordinary validation when
-        // binding below, without the discarded output inference and closure scan of this probe.
-        if self.state.parent.is_eager() && effects.is_empty() && regions.region_count() > 0 {
-            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-            let region_interfaces = regions.region_interfaces();
-            can_defer_unsupported = !input_types.iter().any(Type::is_reference)
-                && !operation.effects().has_reference_declarations()
-                && operation
-                    .infer_output_types(&input_types, &region_interfaces)
-                    .is_ok_and(|output_types| !output_types.iter().any(Type::is_reference))
-                && !regions.regions().enumerate().any(|(index, region)| {
-                    operation.region_role(index) == Some(RegionRole::Computation)
-                        && region
-                            .computation_regions()
-                            .any(|region| region.atoms().iter().any(|atom| atom.r#type().is_reference()))
-                });
-        }
-
         // Check reference placement only if the cheaper conditions have not already required residual execution.
         // Under eager specialization, reference accesses and root forwarding must remain residual so they do not
         // observe live state before the specialized program runs. Dormant rule regions do not execute here.
@@ -654,6 +632,27 @@ impl<C: Context> PartialEvaluationContext<C> {
             || must_defer_references()
         {
             return self.residualize_with_effects(operation, regions, inputs, effects);
+        }
+
+        // A region-carrying operation can be deferred like a regionless one (e.g., a loop whose body contains work that
+        // the eager parent cannot execute) when neither its boundary nor any of its executable computation regions
+        // involves references. Its effect summary above already includes those regions. Note that only pure eager
+        // execution can use this fallback. Residual, staged, and effectful applications perform their ordinary
+        // validation when they are bound, without the discarded output inference and closure scan of this probe.
+        if self.state.parent.is_eager() && effects.is_empty() && regions.region_count() > 0 {
+            let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+            let region_interfaces = regions.region_interfaces();
+            can_defer_unsupported = !input_types.iter().any(Type::is_reference)
+                && !operation.effects().has_reference_declarations()
+                && operation
+                    .infer_output_types(&input_types, &region_interfaces)
+                    .is_ok_and(|output_types| !output_types.iter().any(Type::is_reference))
+                && !regions.regions().enumerate().any(|(index, region)| {
+                    operation.region_role(index) == Some(RegionRole::Computation)
+                        && region
+                            .computation_regions()
+                            .any(|region| region.atoms().iter().any(|atom| atom.r#type().is_reference()))
+                });
         }
 
         let known = inputs.iter().map(|value| value.as_known().cloned().unwrap()).collect::<Vec<_>>();
@@ -1188,9 +1187,9 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Higher-order rules use this when they must embed a known value *inside* a nested residual program (e.g., a
     /// folded loop-invariant carry spliced into a rebuilt `scan` body), where only a program constant can represent
     /// it (nested programs cannot reference atoms of the enclosing residual program or of the outer known-side
-    /// program). Under an eager known-side context this always succeeds. Under a [`StagingContext`] it succeeds only
-    /// for literal-backed values, and the caller must treat the error as "this rewrite is not available" and fall back
-    /// to a conservative alternative.
+    /// program). Under an eager known-side context this always succeeds. Under a
+    /// [`StagingContext`](crate::StagingContext) it succeeds only for literal-backed values, and the caller must treat
+    /// the error as "this rewrite is not available" and fall back to a conservative alternative.
     #[inline]
     pub fn known_constant(&self, value: &C::Value) -> Result<C::Constant, ProgramError> {
         self.state.parent.resolve(value).into_constant().ok_or_else(|| {
@@ -1759,7 +1758,7 @@ where
     }
 }
 
-impl<C: Context> Clone for PartialEvaluationState<C> {
+impl<C: Context> Clone for PartialEvaluationContextState<C> {
     #[inline]
     fn clone(&self) -> Self {
         Self {
@@ -1905,7 +1904,7 @@ where
 }
 
 /// State held by [`PartialEvaluationContext`], shallowly copied only when one clone changes its configuration.
-struct PartialEvaluationState<C: Context> {
+struct PartialEvaluationContextState<C: Context> {
     /// Parent context in which known operations are evaluated or staged. An `Rc` shares the exact parent object across
     /// clones and deferred siblings instead of cloning `C`, whose `Clone` implementation need not preserve object
     /// identity. Imports compare these shared allocations to verify that a value comes from the same parent, even
@@ -2376,16 +2375,16 @@ mod tests {
         let configured = context.clone().with_rounded_residual_policy(&policy, |_: &ArrayIrType| None);
         assert!(context.residual_policy().is_none());
         assert_eq!(configured.residual_policy(), Some(&policy));
-        assert!(configured.residual_placement().unwrap().rounds_residuals());
-        assert!(configured.clone().residual_placement().unwrap().rounds_residuals());
+        assert!(configured.residual_rounding().is_some());
+        assert!(configured.clone().residual_rounding().is_some());
         let sibling = configured.deferred_sibling();
         assert_eq!(sibling.residual_policy(), Some(&policy));
-        assert!(sibling.residual_placement().unwrap().rounds_residuals());
+        assert_eq!(sibling.residual_rounding(), configured.residual_rounding());
 
         // Replacing a rounded placement with an ordinary policy affects only the returned context.
         let plain = configured.clone().with_residual_policy(&policy);
-        assert!(!plain.residual_placement().unwrap().rounds_residuals());
-        assert!(configured.residual_placement().unwrap().rounds_residuals());
+        assert_eq!(plain.residual_rounding(), None);
+        assert!(configured.residual_rounding().is_some());
     }
 
     #[test]

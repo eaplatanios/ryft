@@ -731,21 +731,8 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let region_interfaces: Cow<'_, [RegionInterface<V::Type>]> = match regions {
-            [] => Cow::Borrowed(&[]),
-            [region] => Cow::Borrowed(std::slice::from_ref(self.regions.interface(*region).unwrap())),
-            _ => Cow::Owned(
-                regions
-                    .iter()
-                    .map(|region_id| {
-                        let region = &self.regions[region_id.index()];
-                        let effects = self.regions.effects(*region_id).unwrap();
-                        RegionInterface::new(region.input_types(), region.output_types(), effects.classes())
-                            .with_deferred_work(effects.has_deferred_work())
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-        };
+        let region_interfaces =
+            RegionInterface::collect(regions.iter().map(|region| self.regions.interface(*region).unwrap()));
 
         operation.validate_region_interfaces(region_interfaces.as_ref())?;
         let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_ref())?;
