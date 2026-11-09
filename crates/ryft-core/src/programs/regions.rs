@@ -28,7 +28,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
-use std::marker::PhantomData;
 use std::ops::Index;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, OnceLock};
@@ -869,10 +868,14 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
                 };
                 rebuild_fn(RegionId::new(index), source)?
             };
+
+            // Transforms of a region consume its attached descendants too, so a body whose descendant changed no
+            // longer has the contents that its retained transforms were derived from.
             let keep_cache = source_cache.is_some() && descendants_preserved(&region);
             if keep_cache {
                 region.adopt_transform_cache(source_cache.unwrap());
             }
+
             bodies.push(Rebuild::Unsealed(region));
             preserved.push(keep_cache);
         }
@@ -1437,20 +1440,20 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// and space proportional to the size of the complete reachable region graph.
     pub fn to_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
         // Importing copies only the reachable closure, appends its root last, and preserves the source's already
-        // validated atoms and boundaries. The imported root can therefore become the public entry directly.
+        // validated atoms and boundaries. The imported root can therefore become the public entry directly, so the
+        // `unwrap` is safe.
         let mut builder = ProgramBuilder::<V, O>::new();
         let entry = builder.import_region(self);
-        debug_assert_eq!(entry.index() + 1, builder.regions.len());
         for (callee, region) in builder.callees {
             builder.regions.record_callee(region, callee);
         }
-        Program {
-            input_structure: vec![Placeholder; self.input_ids().len()],
-            output_structure: vec![Placeholder; self.output_ids().len()],
-            regions: builder.regions,
+        Program::from_sealed_regions(
+            vec![Placeholder; self.input_ids().len()],
+            vec![Placeholder; self.output_ids().len()],
+            builder.regions,
             entry,
-            marker: PhantomData,
-        }
+        )
+        .unwrap()
     }
 }
 
@@ -1582,6 +1585,20 @@ impl<T: Type> RegionInterface<T> {
     pub fn has_deferred_work(&self) -> bool {
         self.has_deferred_work
     }
+
+    /// Returns `interfaces` as one slice, in order (e.g., for [`Operation::infer_output_types`]). An empty list and a
+    /// single interface are borrowed, while several interfaces are cloned into an owned list, because a slice stores
+    /// its elements contiguously.
+    pub(crate) fn collect<'r, I: IntoIterator<Item = &'r Self>>(interfaces: I) -> Cow<'r, [Self]> {
+        let mut interfaces = interfaces.into_iter();
+        let Some(first) = interfaces.next() else {
+            return Cow::Borrowed(&[]);
+        };
+        let Some(second) = interfaces.next() else {
+            return Cow::Borrowed(std::slice::from_ref(first));
+        };
+        Cow::Owned([first, second].into_iter().chain(interfaces).cloned().collect())
+    }
 }
 
 /// Owned cache key that identifies a [`Region`], together with every [`Region`] reachable from it through attached
@@ -1688,14 +1705,7 @@ pub trait RegionDriver<V: Value, O: Operation<Type = V::Type>> {
         V: 'r,
         O: 'r,
     {
-        let mut regions = self.regions();
-        let Some(first) = regions.next() else {
-            return Cow::Borrowed(&[]);
-        };
-        let Some(second) = regions.next() else {
-            return Cow::Borrowed(std::slice::from_ref(first.interface()));
-        };
-        Cow::Owned([first, second].into_iter().chain(regions).map(|region| region.interface().clone()).collect())
+        RegionInterface::collect(self.regions().map(RegionRef::interface))
     }
 
     /// Returns an owned [`Program`] representing each attached [`Region`], in order. Rules that forward their regions
