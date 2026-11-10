@@ -1,7 +1,8 @@
 //! Rematerialization (i.e., gradient checkpointing), which trades computation for memory under differentiation.
 //! A rematerialized function computes what its body computes, but differentiation saves only the values of the body
-//! that its [`ResidualPolicy`] selects and recomputes the others from the saved values when the derivative computation
-//! needs them, instead of keeping every value of the body alive until then. This is the Ryft analogue of JAX's
+//! that its [`ResidualPolicy`] selects, together with the values that cannot be recomputed safely, and recomputes the
+//! others from the saved values when the derivative computation needs them, instead of keeping every value of the body
+//! alive until then. This is the Ryft analogue of JAX's
 //! [`jax.checkpoint`/`jax.remat`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html).
 //!
 //! [`rematerialize`] creates a rematerialized function from a closure, [`RematerializedFunction::with_policy`]
@@ -12,16 +13,26 @@
 //! the policy saves, and a _differentiated_ call that recomputes everything else from the saved values when the
 //! backward computation runs. [`saved_residuals`] reports which values a function saves.
 //!
+//! A policy decides only for the values that the backward computation can recompute. Work that cannot be replayed
+//! safely (e.g., reads of references that the function shares with its caller, or operations with other observable
+//! effects) is saved under every policy, including [`NothingSavable`], so that it runs exactly once. Refer to
+//! [`with_residual_policy`](crate::PartitionedProgram::with_residual_policy) for the complete contract of the
+//! planner that applies the policies.
+//!
 //! The built-in [`ResidualPolicy`]s of [`rematerialize`] are Ryft analogues of the
 //! [JAX checkpoint policies](https://docs.jax.dev/en/latest/gradient-checkpointing.html#list-of-policies)
 //! together with [`RematerializationPolicyFn`] for policies defined by closures and [`MemoryTransferStorage`]
 //! for policies that offload the residuals that they save.
 //!
 //! Every built-in policy recognizes the producers of a residual by their payload operations (i.e.,
-//! [`ResidualProducer::payload`](crate::ResidualProducer::payload)) rather than by their operation family, so the same
-//! policy works for every family, including array IR and backend families that hold array operations through projected
-//! members. A residual that several producers may produce (e.g., the corresponding outputs of the two branches of a
-//! `condition` operation) matches a policy when any of its producers does.
+//! [`ResidualProducer::payload`]) rather than by their operation family, so the same policy works for every family,
+//! including array IR and backend families that hold array operations through projected members. A residual that
+//! several producers may produce (e.g., the corresponding outputs of the two branches of a `condition` operation)
+//! matches a policy when any of its producers does. A [`composite`](crate::composite) call that differentiation leaves
+//! intact (e.g., a call whose inputs are all known) is instead the only producer of its outputs, as JAX's policies
+//! treat `custom_jvp_call` and `custom_vjp_call`. A policy therefore never sees the work or the tags inside such a
+//! call (e.g., [`DotsSavable`] does not save a call that computes a dot product), and the backward computation replays
+//! the whole call when its policy does not save its outputs.
 //!
 //! The concrete built-in policies are generic over the type universe and declare their instantiations for the array
 //! universes [`ArrayType`] and [`ArrayIrType`] (refer to [`ResidualPolicy::native_instantiations`]), so that promoting
@@ -34,9 +45,9 @@
 //! ## Gradients
 //!
 //! A rematerialized function is differentiated like any other function. Its closure annotates its tracer input, which
-//! determines the type universe that the function is traced in. By default, it saves nothing but its inputs, so the
-//! backward computation of `x ↦ sin(x · x)` recomputes the dot product and its cosine from `x`, while saving dot
-//! products saves the dot product and recomputes only the cosine:
+//! determines the type universe that the function is traced in. By default, its policy saves nothing, so the backward
+//! computation of `x ↦ sin(x · x)` keeps only `x` and recomputes the dot product and its cosine from it, while saving
+//! dot products saves the dot product and recomputes only the cosine:
 //!
 //! ```rust
 //! # use ryft_core::{
@@ -215,14 +226,14 @@ use crate::differentiation::forward::DifferentiableOperation;
 use crate::differentiation::types::DifferentiableType;
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::operations::{
-    DotOperation, ReducePrecisionOperation, RematerializationOptimizationBarrier, RematerializeOperation, TagOperation,
-    TransferToMemoryOperation,
+    DotOperation, ReducePrecisionOperation, RematerializationOptimizationBarrier, RematerializeOperation,
+    ScaledDotOperation, TagOperation, TransferToMemoryOperation,
 };
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::{
     ErasedResidualStorage, NativeResidualPolicies, NoStorage, PartialEvaluationContext, PartiallyEvaluatableOperation,
     ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyError, ResidualPolicyReference,
-    ResidualRejection, ResidualStorage,
+    ResidualProducer, ResidualRejection, ResidualStorage,
 };
 use crate::programs::{
     ErasedOperation, Operation, OperationPayloadProjection, ProgramError, Type, TypeError, Typed, Value,
@@ -449,10 +460,52 @@ impl<Input, Output, Body, Policy: Debug> Debug for RematerializedFunction<Input,
     }
 }
 
-/// Creates a [`RematerializedFunction`] from a closure `x ↦ y = f(x)` over [`DomainTracer`]s, which saves nothing under
-/// differentiation (i.e., it uses the [`NothingSavable`] policy) and places an optimization barrier on its inputs when
-/// it is differentiated. The closure must annotate the type of its tracer input, which determines the context that its
-/// body is traced in, and nothing is traced until the function is called.
+/// Creates a [`RematerializedFunction`] from a closure `x ↦ y = f(x)` over [`DomainTracer`]s, which uses the
+/// [`NothingSavable`] policy (i.e., differentiation saves its inputs and recomputes every value of its body that can be
+/// replayed) and places an optimization barrier on its inputs when it is differentiated. The closure must annotate the
+/// type of its tracer input, which determines the context that its body is traced in, and nothing is traced until the
+/// function is called.
+///
+/// # Closed-Over Values
+///
+/// Each call traces the body in a fresh trace, so every value that the body uses must belong to that trace. A concrete
+/// value that the closure closes over enters the body as a constant, which is not differentiated. For example, a core
+/// [`Array`](crate::Array) enters through [`Context::lift`], and a backend array enters through the import path of its
+/// backend (e.g., `ryft-xla` imports an XLA array through `ThroughSession`, which retains the array in its session and
+/// passes it to compiled executables as a hidden argument). A value that must be differentiated, including a tracer of
+/// an enclosing trace (e.g., an input of an enclosing rematerialized body), is passed to the function as an explicit
+/// input instead, which is what JAX's closure conversion of `jax.checkpoint` functions does implicitly. Using a tracer
+/// of another trace in the body fails with [`ProgramError::MismatchedProgramBuilders`]. Explicit inputs that the
+/// recomputation need not wait for (e.g., the parameters of a layer, as opposed to its activations) can be excluded
+/// from the optimization barrier with [`RematerializationOptimizationBarrier::Inputs`]:
+///
+/// ```rust
+/// # use ryft_core::{
+/// #     Array, ArrayOperation, Context, Mul, ProgramError, RematerializationOptimizationBarrier, Sin, TracingContext,
+/// #     differentiate_at, rematerialize,
+/// # };
+/// # fn main() -> Result<(), ProgramError> {
+/// # type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+///
+/// // `w` is a constant of the body of `x ↦ sin(x · w)`, so only `x` is differentiated.
+/// let w = Array::scalar(3.0f64)?;
+/// let function = rematerialize(|x: Tracer| {
+///     let w = x.context().lift(w.clone())?;
+///     Ok(x.mul(&w)?.sin()?)
+/// });
+/// let gradient = differentiate_at(Array::scalar(0.5f64)?).gradient(|x| function.call(x))?;
+/// assert_eq!(gradient, Array::scalar(1.5f64.cos() * 3.0)?);
+///
+/// // Passing `w` as an explicit input differentiates it too, and this function keeps it out of the barrier.
+/// let function = rematerialize(|(x, w): (Tracer, Tracer)| Ok(x.mul(&w)?.sin()?))
+///     .with_optimization_barrier(RematerializationOptimizationBarrier::Inputs(vec![true, false]));
+/// let (x_gradient, w_gradient) =
+///     differentiate_at((Array::scalar(0.5f64)?, w.clone())).gradient(|inputs| function.call(inputs))?;
+/// assert_eq!(x_gradient, Array::scalar(1.5f64.cos() * 3.0)?);
+/// assert_eq!(w_gradient, Array::scalar(1.5f64.cos() * 0.5)?);
+/// # Ok(())
+/// # }
+/// ```
 #[inline]
 pub fn rematerialize<Input, Output, Body: Fn(Input) -> Result<Output, ProgramError>>(
     body: Body,
@@ -699,9 +752,9 @@ impl<Policy> PolicyReferences<Policy> {
 /// Canonical policy name for [`NothingSavable`].
 pub const NOTHING_SAVABLE_POLICY_NAME: &str = "nothing_savable";
 
-/// [`ResidualPolicy`] that saves nothing, so that differentiation recomputes every residual from the inputs of the
-/// rematerialized function. This is the default policy of [`rematerialize`]. This is the Ryft
-/// analogue of JAX's
+/// [`ResidualPolicy`] that saves nothing, so that differentiation recomputes every residual that it can replay from the
+/// inputs of the rematerialized function. Values that cannot be recomputed safely (e.g., reads of references shared
+/// with the caller) are still saved. This is the default policy of [`rematerialize`] and the Ryft analogue of JAX's
 /// [`nothing_saveable`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.nothing_saveable.html).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct NothingSavable;
@@ -762,9 +815,10 @@ impl<T: 'static + Type> ResidualPolicy<T> for EverythingSavable {
 /// Canonical policy name for [`DotsSavable`].
 pub const DOTS_SAVABLE_POLICY_NAME: &str = "dots_savable";
 
-/// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s produce and recomputes every other residual.
-/// This is the Ryft analogue of JAX's
-/// [`dots_saveable`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.dots_saveable.html).
+/// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s and [`ScaledDotOperation`]s
+/// produce and recomputes every other residual. This is the Ryft analogue of JAX's
+/// [`dots_saveable`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.dots_saveable.html),
+/// which likewise saves the outputs of its `scaled_matmul_wrapper` primitive.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotsSavable;
 
@@ -777,7 +831,9 @@ impl<T: 'static + Type> ResidualPolicy<T> for DotsSavable {
     }
 
     fn classify(&self, candidate: &ResidualCandidate<'_, T>) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
-        let saved = candidate.producers().iter().any(|producer| producer.payload::<DotOperation>().is_some());
+        let saved = candidate.producers().iter().any(|producer| {
+            producer.payload::<DotOperation>().is_some() || producer.payload::<ScaledDotOperation>().is_some()
+        });
         Ok(match saved {
             true => ResidualDecision::Save,
             false => ResidualDecision::Recompute,
@@ -793,13 +849,23 @@ impl<T: 'static + Type> ResidualPolicy<T> for DotsSavable {
 /// Canonical policy name for [`DotsWithNoBatchDimensionsSavable`].
 pub const DOTS_WITH_NO_BATCH_DIMENSIONS_SAVABLE_POLICY_NAME: &str = "dots_with_no_batch_dimensions_savable";
 
-/// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s without batching dimensions (e.g., matrix
+/// [`ResidualPolicy`] that saves the residuals that dot products without batching dimensions (e.g., matrix
 /// multiplications) produce and recomputes every other residual. This is the Ryft analogue of JAX's
 /// [`dots_with_no_batch_dims_saveable`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.dots_with_no_batch_dims_saveable.html).
+///
+/// It saves the outputs of [`DotOperation`]s that have no batching dimensions and of [`ScaledDotOperation`]s whose
+/// batching dimensions all have the static extent 1, which includes scaled dots without batching dimensions. The
+/// extents are those of the left-hand side input at the application site of the producer, which match those of the
+/// right-hand side input, and a dynamic extent is recomputed because it is not known to be `1`. This follows the rule
+/// of JAX's policy for its `scaled_matmul_wrapper` primitive, whose inputs always have one leading batching dimension
+/// and whose outputs it saves only when that dimension has extent `1`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotsWithNoBatchDimensionsSavable;
 
-impl<T: 'static + Type> ResidualPolicy<T> for DotsWithNoBatchDimensionsSavable {
+impl<T: 'static + Type> ResidualPolicy<T> for DotsWithNoBatchDimensionsSavable
+where
+    for<'t> &'t ArrayType: TryFrom<&'t T>,
+{
     type Storage = NoStorage;
 
     #[inline]
@@ -808,9 +874,8 @@ impl<T: 'static + Type> ResidualPolicy<T> for DotsWithNoBatchDimensionsSavable {
     }
 
     fn classify(&self, candidate: &ResidualCandidate<'_, T>) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
-        let saved = candidate.producers().iter().filter_map(|producer| producer.payload::<DotOperation>()).any(|dot| {
-            let dimensions = dot.dimensions();
-            dimensions.lhs_batching_dimensions().is_empty() && dimensions.rhs_batching_dimensions().is_empty()
+        let saved = candidate.producers().iter().any(|producer| {
+            is_dot_without_batching_dimensions(producer) || is_scaled_dot_with_unit_batching_extents(producer)
         });
         Ok(match saved {
             true => ResidualDecision::Save,
@@ -827,8 +892,10 @@ impl<T: 'static + Type> ResidualPolicy<T> for DotsWithNoBatchDimensionsSavable {
 /// Canonical policy name for [`OffloadDotsWithNoBatchDimensions`].
 pub const OFFLOAD_DOTS_WITH_NO_BATCH_DIMENSIONS_POLICY_NAME: &str = "offload_dots_with_no_batch_dimensions";
 
-/// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s without batching dimensions produce by offloading
-/// them to the provided [`Memory`] and recomputes every other residual. This is the Ryft analogue of JAX's
+/// [`ResidualPolicy`] that saves the residuals that [`DotOperation`]s without batching dimensions produce by
+/// offloading them to the provided [`Memory`] and recomputes every other residual. Like JAX's policy, and unlike
+/// [`DotsWithNoBatchDimensionsSavable`], it matches ordinary dot products only and recomputes the outputs of
+/// [`ScaledDotOperation`]s. This is the Ryft analogue of JAX's
 /// [`offload_dot_with_no_batch_dims`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.offload_dot_with_no_batch_dims.html).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct OffloadDotsWithNoBatchDimensions {
@@ -866,10 +933,7 @@ where
         &self,
         candidate: &ResidualCandidate<'_, T>,
     ) -> Result<ResidualDecision<MemoryTransferStorage>, ResidualRejection> {
-        let saved = candidate.producers().iter().filter_map(|producer| producer.payload::<DotOperation>()).any(|dot| {
-            let dimensions = dot.dimensions();
-            dimensions.lhs_batching_dimensions().is_empty() && dimensions.rhs_batching_dimensions().is_empty()
-        });
+        let saved = candidate.producers().iter().any(is_dot_without_batching_dimensions);
         Ok(match saved {
             true => ResidualDecision::SaveWith(MemoryTransferStorage::new(self.destination)),
             false => ResidualDecision::Recompute,
@@ -880,6 +944,36 @@ where
     fn native_instantiations(&self) -> NativeResidualPolicies {
         NativeResidualPolicies::default().with::<ArrayType, _>(*self).with::<ArrayIrType, _>(*self)
     }
+}
+
+/// Returns whether `producer` is a [`DotOperation`] without batching dimensions.
+fn is_dot_without_batching_dimensions<T: Type>(producer: &ResidualProducer<'_, T>) -> bool {
+    producer.payload::<DotOperation>().is_some_and(|dot| {
+        let dimensions = dot.dimensions();
+        dimensions.lhs_batching_dimensions().is_empty() && dimensions.rhs_batching_dimensions().is_empty()
+    })
+}
+
+/// Returns whether `producer` is a [`ScaledDotOperation`] whose left-hand side batching dimensions all have the static
+/// extent 1 at its application site. A producer without input types (or whose left-hand side input type does not
+/// project into [`ArrayType`]) has unknown extents, so it matches only when it has no batching dimensions.
+fn is_scaled_dot_with_unit_batching_extents<T: Type>(producer: &ResidualProducer<'_, T>) -> bool
+where
+    for<'t> &'t ArrayType: TryFrom<&'t T>,
+{
+    let Some(scaled_dot) = producer.payload::<ScaledDotOperation>() else {
+        return false;
+    };
+    let batching_dimensions = scaled_dot.dimensions().lhs_batching_dimensions();
+    if batching_dimensions.is_empty() {
+        return true;
+    }
+    let Some(lhs_type) = producer.input_types().first().and_then(|r#type| <&ArrayType>::try_from(r#type).ok()) else {
+        return false;
+    };
+    batching_dimensions.iter().all(|dimension| {
+        lhs_type.shape().dimensions().get(*dimension).and_then(|dimension| dimension.value()) == Some(1)
+    })
 }
 
 /// Canonical policy name for [`SaveOnlyTheseNames`].
@@ -989,6 +1083,12 @@ pub const SAVE_ANYTHING_EXCEPT_THESE_NAMES_POLICY_NAME: &str = "save_anything_ex
 
 /// [`ResidualPolicy`] that saves every residual except the ones that are tagged (using [`Tag`](crate::Tag)) with
 /// one of the provided names. Unlike [`SaveAnyNamesButThese`], it also saves untagged residuals.
+///
+/// This is the intended semantics of JAX's
+/// [`save_anything_except_these_names`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint_policies.save_anything_except_these_names.html).
+/// JAX 0.12.0.1 implements that policy incorrectly, because it saves every residual including the named ones (its
+/// source notes that the policy probably does not work), while this policy recomputes the residuals with the provided
+/// names.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SaveAnythingExceptTheseNames {
     /// Names of the tags whose values are not saved.
@@ -1342,6 +1442,7 @@ where
         "memory_transfer".to_owned()
     }
 
+    #[inline]
     fn store_payloads(&self, residual_type: &T) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
         <&ArrayType>::try_from(residual_type).map_err(|_| ResidualPolicyError::UnsupportedStorage {
             storage: ResidualStorage::<T>::name(self),
@@ -1351,6 +1452,7 @@ where
         Ok(vec![ErasedOperation::new(TransferToMemoryOperation::new(self.destination))])
     }
 
+    #[inline]
     fn restore_payloads(
         &self,
         _stored_type: &T,
@@ -1364,6 +1466,21 @@ where
             })?;
         Ok(vec![ErasedOperation::new(TransferToMemoryOperation::new(residual_array_type.memory()))])
     }
+
+    #[inline]
+    fn matches_store_operation(
+        &self,
+        residual_type: &T,
+        index: usize,
+        operation: &dyn OperationPayloadProjection,
+    ) -> bool {
+        index == 0
+            && <&ArrayType>::try_from(residual_type).is_ok()
+            && operation
+                .project_payload(TypeId::of::<TransferToMemoryOperation>())
+                .and_then(|payload| payload.downcast_ref::<TransferToMemoryOperation>())
+                .is_some_and(|transfer| transfer.destination() == self.destination)
+    }
 }
 
 #[cfg(test)]
@@ -1375,15 +1492,18 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
-        DimensionBounds, DimensionType, Memory, ShardingDimension,
+        Dimension, DimensionBounds, DimensionType, DimensionVariable, Memory, Shape, ShardingDimension, StaticShape,
     };
     use crate::axes::AxisError;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
+    use crate::macros::checks;
     use crate::operations::{
-        AxisIndex, ConvertElementType, Cos, DimensionSizeOperation, Dot, DotDimensionNumbers, Exp, MulOperation,
-        ReducePrecision, ReferenceRead, Sin, SinOperation, Tag, composite,
+        Add, AxisIndex, Broadcast, COMPOSITE_OPERATION_NAME, Compare, ComparisonDirection, Condition,
+        ConvertElementType, Cos, DimensionSizeOperation, Dot, DotDimensionNumbers, Exp, Mul, MulOperation, Reduce,
+        ReducePrecision, ReductionKind, ReferenceRead, ScanOptions, Sin, SinOperation, StopGradient, Tag, ZeroLike,
+        composite, scan,
     };
     use crate::partial::ResidualProducer;
     use crate::programs::{Program, ReferenceType};
@@ -1438,8 +1558,33 @@ mod tests {
         ArrayOperation::<Array>::from(SinOperation::<ArrayType>::new()).into()
     }
 
-    /// Returns a scalar candidate that output 0 of any of `operations` may produce. The built-in policies classify
-    /// candidates by the payloads of their producers only, so the producers carry no input types.
+    /// Returns a scaled dot product of rank-`rank` element arrays without scales, whose default dimension numbers batch
+    /// every dimension except the last two.
+    fn scaled_dot(rank: usize) -> TestIrOperation {
+        let dimensions = ScaledDotOperation::default_dimensions(rank).unwrap();
+        ArrayOperation::<Array>::from(ScaledDotOperation::new(dimensions, DataType::F32, false, false)).into()
+    }
+
+    /// Returns the candidate that output 0 of the scaled dot product `operation` produces at an application site whose
+    /// element arrays have the provided leading batching dimensions, followed by the matrix shapes `[2, 4]` and
+    /// `[4, 3]`. Unlike [`candidate`], its producer carries the input and output types of that site.
+    fn scaled_dot_candidate<'o>(
+        operation: &'o TestIrOperation,
+        batching_dimensions: &[Dimension],
+    ) -> ResidualCandidate<'o, ArrayIrType> {
+        let element_type = |matrix_dimensions: [usize; 2]| {
+            let dimensions = batching_dimensions.iter().cloned().chain(matrix_dimensions.map(Dimension::Static));
+            ArrayIrType::from(ArrayType::new(DataType::F8E4M3FN, Shape::new(dimensions.collect())))
+        };
+        let input_types = vec![element_type([2, 4]), element_type([4, 3])];
+        let output_types = operation.infer_output_types(&input_types, &[]).unwrap();
+        let output_type = output_types[0].clone();
+        ResidualCandidate::new(vec![ResidualProducer::new(operation, 0, input_types, output_types)], output_type)
+    }
+
+    /// Returns a scalar candidate that output 0 of any of `operations` may produce. Its producers carry no input types,
+    /// because the built-in policies classify candidates by the payloads of their producers, apart from the batching
+    /// extents of scaled dot products (refer to [`scaled_dot_candidate`]).
     fn candidate(operations: &[TestIrOperation]) -> ResidualCandidate<'_, ArrayIrType> {
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
         let producers = operations
@@ -1470,6 +1615,74 @@ mod tests {
         );
         let producer = ResidualProducer::new(&dimension_size, 0, Vec::new(), vec![dimension_type.clone()]);
         policy.lift::<ArrayIrType>().classify(&ResidualCandidate::new(vec![producer], dimension_type))
+    }
+
+    /// Evaluates `f(x, w, u, us) = sum(x ⊙ e)`, a small version of the workload of gate G1 in
+    /// `plan_rematerialization_jax_parity.md`, where only `x` is differentiated and an all-known `region` computes the
+    /// compact value `c = tag(w · u, "compact")` of type `f64[4, 1]` and expands it into `e: f64[4, 8]`. A `condition`
+    /// over the sign of `sum(w)` returns `e` or `e + e`, and a `scan` over the rows `u_k` of `us` adds the expansion
+    /// of `w · u_k` to a carry that starts from `broadcast(sum(u))`. A `nested` region is that `scan` with the
+    /// `condition` over the sign of `sum(u_k)` in its body, and a `composite` region is a call of a composite that
+    /// computes `e` from `w` and `u`. A `carried` region is that `nested` scan with a carry that starts from `x` and
+    /// becomes `sin(h) + e_k` on every iteration, so that the residual work of differentiating `x` reads the carry of
+    /// every iteration rather than only the output of an all-known region.
+    fn compact_expansion(
+        region: &str,
+        (x, w, u, us): (TestTracer, TestTracer, TestTracer, TestTracer),
+    ) -> Result<TestTracer, ProgramError> {
+        fn expand<V: Dot + Tag + Broadcast + Typed<Type = ArrayType>>(w: V, u: V) -> Result<V, ProgramError> {
+            let dimensions = DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]);
+            Ok(w.dot(&u, &dimensions)?.tag("compact")?.broadcast_to(StaticShape::new(vec![4, 8]))?)
+        }
+
+        let (w, u, us) = (w.stop_gradient()?, u.stop_gradient()?, us.stop_gradient()?);
+        let e = if region == "condition" {
+            let total = w.reduce(&[0, 1], ReductionKind::Sum)?;
+            let predicate = total.compare(&total.zero_like()?, ComparisonDirection::GreaterThan)?;
+            predicate.condition(
+                |(w, u)| expand(w, u),
+                |(w, u)| {
+                    let e = expand(w, u)?;
+                    Ok(e.add(&e)?)
+                },
+                (w, u),
+            )?
+        } else if region == "composite" {
+            composite(|(w, u): (TestTracer, TestTracer)| expand(w, u)).call((w, u))?
+        } else {
+            let carried = region == "carried";
+            let nested = carried || region == "nested";
+            let initial = if carried {
+                x.clone()
+            } else {
+                u.reduce(&[0, 1], ReductionKind::Sum)?.broadcast_to(StaticShape::new(vec![4, 8]))?
+            };
+            let ((e, _), ()) = scan(
+                |_, (h, w), u| {
+                    let e = if nested {
+                        let total = u.reduce(&[0, 1], ReductionKind::Sum)?;
+                        let predicate = total.compare(&total.zero_like()?, ComparisonDirection::GreaterThan)?;
+                        predicate.condition(
+                            |(w, u)| expand(w, u),
+                            |(w, u)| {
+                                let e = expand(w, u)?;
+                                Ok(e.add(&e)?)
+                            },
+                            (w.clone(), u),
+                        )?
+                    } else {
+                        expand(w.clone(), u)?
+                    };
+                    let h = if carried { h.sin()? } else { h };
+                    Ok(((h.add(&e)?, w), ()))
+                },
+                (initial, w),
+                us,
+                ScanOptions::new(),
+            )?;
+            e
+        };
+        Ok(x.mul(&e)?.reduce(&[0, 1], ReductionKind::Sum)?)
     }
 
     #[test]
@@ -1693,6 +1906,16 @@ mod tests {
         let (_, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
         assert_eq!(pushforward.residuals(), &[x.clone()]);
         assert_eq!(pullback.residuals(), &[x]);
+
+        // A zero that `zero_like` produces from a value without a tangent contributes no tangent term, so
+        // `(x, u) ↦ x · zero_like(stop_gradient(u))` does not save the `x` of a dead `x · 0` term. Its static type
+        // also determines the zero without `u`, from which the backward computation therefore recomputes nothing, so
+        // nothing is saved, as in JAX.
+        let x = Array::vector(vec![1.0f64, 2.0]).unwrap();
+        let u = Array::vector(vec![3.0f64, 4.0]).unwrap();
+        let function = rematerialize(|(x, u): (TestTracer, TestTracer)| Ok(x * u.stop_gradient()?.zero_like()?));
+        let (_, pullback) = differentiate_at((x, u)).vjp(|(x, u)| function.call((x, u))).unwrap();
+        assert_eq!(pullback.residuals(), &[] as &[Array]);
     }
 
     #[test]
@@ -1811,6 +2034,44 @@ mod tests {
             ArrayType::scalar(DataType::F64),
         );
         assert_eq!(traced.map(|_| ()), Err(ProgramError::InvalidArgument { message: "the body failed".to_string() }));
+    }
+
+    #[test]
+    fn test_rematerialized_function_call_with_closed_over_constants() {
+        // A concrete array that the body closes over enters each trace of the body as a constant through `lift`, so
+        // the gradient of `x ↦ sin(x · w)` is `cos(x · w) w` and `w` is not differentiated.
+        let w = Array::scalar(3.0f64).unwrap();
+        let function = rematerialize(|x: TestTracer| {
+            let w = x.context().lift(w.clone())?;
+            Ok(x.mul(&w)?.sin()?)
+        });
+        let x = Array::scalar(0.5f64).unwrap();
+        assert_eq!(function.call(x.clone()), Ok(Array::scalar(1.5f64.sin()).unwrap()));
+        assert_eq!(
+            differentiate_at(x.clone()).gradient(|x| function.call(x)),
+            Ok(Array::scalar(1.5f64.cos() * 3.0).unwrap()),
+        );
+        let (_, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
+        assert_eq!(pullback.residuals(), &[x]);
+    }
+
+    #[test]
+    fn test_rematerialized_function_call_with_outer_values() {
+        // A rematerialized function nested in another one receives the outer value `w` as an explicit input, so the
+        // gradient of `(x, w) ↦ sin(x · w)` covers both `x` and `w`.
+        let inner = rematerialize(|(x, w): (TestTracer, TestTracer)| Ok(x.mul(&w)?.sin()?));
+        let outer = rematerialize(|(x, w): (TestTracer, TestTracer)| inner.call((x, w)));
+        let inputs = (Array::scalar(0.5f64).unwrap(), Array::scalar(3.0f64).unwrap());
+        assert_eq!(
+            differentiate_at(inputs.clone()).gradient(|inputs| outer.call(inputs)),
+            Ok((Array::scalar(1.5f64.cos() * 3.0).unwrap(), Array::scalar(1.5f64.cos() * 0.5).unwrap())),
+        );
+
+        // Closing over the tracer `w` of the outer body instead mixes the traces of the two bodies, which is rejected.
+        let outer = rematerialize(|(x, w): (TestTracer, TestTracer)| {
+            rematerialize(move |x: TestTracer| Ok(x.mul(&w)?.sin()?)).call(x)
+        });
+        assert_eq!(outer.call(inputs).map(|_| ()), Err(ProgramError::MismatchedProgramBuilders));
     }
 
     #[test]
@@ -2073,6 +2334,236 @@ mod tests {
     }
 
     #[test]
+    fn test_saved_residuals_of_all_known_regions() {
+        // In `compact_expansion`, the residual work of differentiating `x` needs only `e`, the output of an all-known
+        // region. Under policies that save the compact value, replaying the region whole would recompute that value, so
+        // the region is split on residual demand and its compact interior values are saved instead of `e`, as JAX does.
+        // The condition saves the compact value of the branch that runs, together with `w`, from which the residual
+        // program recomputes the predicate, and the scan saves the compact values of its two iterations, together with
+        // `u`, from which the residual program recomputes the initial carry. The saved interior values are outputs of
+        // the known part of the split region, which is how they are reported, as in JAX. Saving nothing recomputes the
+        // whole region from the inputs, and every policy computes the gradient that finite differences estimate.
+        //
+        // A condition nested in the scan is split too while the residual program recomputes the carry of the scan
+        // (refer to `ResidualPlacement::plan_recomputation`), so the known scan stacks the compact values of the
+        // branches that run instead of the expanded outputs of the condition, and the residual program recomputes the
+        // predicates from the saved `us`, as JAX does. The same holds when the residual work reads the carry of every
+        // iteration (i.e., for the `carried` scan, whose carry starts from `x`), where the residual program recomputes
+        // those carries from `x` and the saved values. A composite call is instead one opaque producer, which neither
+        // policy saves, so it is replayed whole from `w` and `u`, recomputing its compact value, as JAX replays
+        // `custom_jvp_call` and `custom_vjp_call`.
+        let types = (
+            ArrayType::new_static(DataType::F64, [4, 8]),
+            ArrayType::new_static(DataType::F64, [4, 3]),
+            ArrayType::new_static(DataType::F64, [3, 1]),
+            ArrayType::new_static(DataType::F64, [2, 3, 1]),
+        );
+        let array = |r#type: &ArrayType, scale: f64| {
+            let count = r#type.element_count().unwrap().unwrap();
+            let values = (0..count).map(|index| (index as f64 - 2.0) * scale).flat_map(f64::to_ne_bytes);
+            Array::new(r#type.clone(), values.collect()).unwrap()
+        };
+        let (x, w, u, us) = (array(&types.0, 0.25), array(&types.1, 0.5), array(&types.2, 1.5), array(&types.3, 0.75));
+        let host = Memory::Host { pinned: true };
+        let saved = |shape: &[usize], source: ResidualSource| {
+            SavedResidual::new(ArrayType::new_static(DataType::F64, shape.to_vec()), source)
+        };
+        let input = |index: usize| ResidualSource::Input { index };
+        let operation = |name: &'static str| ResidualSource::Operation { name };
+        for (region, saved_compact_values) in [
+            ("condition", vec![saved(&[4, 3], input(1)), saved(&[4, 1], operation("condition"))]),
+            ("scan", vec![saved(&[3, 1], input(2)), saved(&[2, 4, 1], operation("scan"))]),
+            (
+                "nested",
+                vec![saved(&[3, 1], input(2)), saved(&[2, 3, 1], input(3)), saved(&[2, 4, 1], operation("scan"))],
+            ),
+            (
+                "carried",
+                vec![saved(&[4, 8], input(0)), saved(&[2, 4, 1], operation("scan")), saved(&[2, 3, 1], input(3))],
+            ),
+            ("composite", vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2))]),
+        ] {
+            let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |inputs| compact_expansion(region, inputs),
+                types.clone(),
+            )
+            .unwrap();
+            let evaluate = |x: Array| program.interpret((x, w.clone(), u.clone(), us.clone()));
+            macro_rules! check {
+                ($policy:expr, $expected:expr $(,)?) => {{
+                    let function = rematerialize(move |inputs| compact_expansion(region, inputs)).with_policy($policy);
+                    let residuals = saved_residuals(|inputs| function.call(inputs), types.clone());
+                    assert_eq!(residuals, Ok($expected), "region `{region}`");
+                    let gradient = differentiate_at((x.clone(), w.clone(), u.clone(), us.clone()))
+                        .gradient(|inputs| function.call(inputs))
+                        .unwrap();
+                    checks::check_gradient(gradient.0, &evaluate, x.clone(), 1e-6, 1e-6);
+                }};
+            }
+            check!(DotsSavable, saved_compact_values.clone());
+            check!(SaveOnlyTheseNames::new(["compact"]), saved_compact_values);
+            if region == "composite" {
+                // Policies see the call itself as the producer of its output, which they can save by its name.
+                let policy = RematerializationPolicyFn::new::<ArrayType>(|candidate| {
+                    let saved =
+                        candidate.producers().iter().all(|producer| producer.name() == COMPOSITE_OPERATION_NAME);
+                    let decision =
+                        if saved { ResidualDecision::<NoStorage>::Save } else { ResidualDecision::Recompute };
+                    Ok::<_, ResidualRejection>(decision)
+                });
+                check!(policy, vec![saved(&[4, 8], operation("composite"))]);
+            }
+            let saved_inputs = match region {
+                "condition" | "composite" => vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2))],
+                "carried" => vec![saved(&[4, 8], input(0)), saved(&[4, 3], input(1)), saved(&[2, 3, 1], input(3))],
+                _ => vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2)), saved(&[2, 3, 1], input(3))],
+            };
+            check!(NothingSavable, saved_inputs);
+            // Offloading the compact values stores them through a storage, which the carry recomputation restores on
+            // every iteration. Splitting the `carried` scan again to recompute its final carry reuses the identical
+            // store chain of its existing compact output, so the known scan stacks that stored value once. The name
+            // of the compact value of a composite call is invisible to the policy, so that call is replayed whole.
+            let offloaded = |shape: &[usize], source: ResidualSource| {
+                SavedResidual::new(ArrayType::new_static(DataType::F64, shape.to_vec()).with_memory(host), source)
+            };
+            let saved_offloaded_values = match region {
+                "condition" => vec![saved(&[4, 3], input(1)), offloaded(&[4, 1], operation("condition"))],
+                "scan" => vec![saved(&[3, 1], input(2)), offloaded(&[2, 4, 1], operation("scan"))],
+                "nested" => vec![
+                    saved(&[3, 1], input(2)),
+                    saved(&[2, 3, 1], input(3)),
+                    offloaded(&[2, 4, 1], operation("scan")),
+                ],
+                "carried" => vec![
+                    saved(&[4, 8], input(0)),
+                    saved(&[2, 3, 1], input(3)),
+                    offloaded(&[2, 4, 1], operation("scan")),
+                ],
+                _ => vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2))],
+            };
+            check!(
+                SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["compact"], host).unwrap(),
+                saved_offloaded_values
+            );
+        }
+    }
+
+    #[test]
+    fn test_saved_residuals_of_stored_scan_carries() {
+        // Saving the next carry itself through a storage makes the carry-recompute scan restore that saved value on
+        // every iteration, rather than replaying its producer or stacking the unencoded carries as extra residuals.
+        fn function((h, xs): (TestTracer, TestTracer)) -> Result<TestTracer, ProgramError> {
+            Ok(scan(|_, h, x| Ok((h.sin()?.add(&x)?.tag("carry")?, ())), h, xs, ScanOptions::new())?.0)
+        }
+
+        let types = (ArrayType::scalar(DataType::F64), ArrayType::new_static(DataType::F64, [3]));
+        let host = Memory::Host { pinned: true };
+        let rematerialized = rematerialize(function)
+            .with_policy(SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["carry"], host).unwrap());
+        assert_eq!(
+            saved_residuals(|inputs| rematerialized.call(inputs), types.clone()),
+            Ok(vec![
+                SavedResidual::new(types.0.clone(), ResidualSource::Input { index: 0 }),
+                SavedResidual::new(types.1.clone().with_memory(host), ResidualSource::Operation { name: "scan" }),
+            ]),
+        );
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(function, types).unwrap();
+        let h = Array::scalar(0.5f64).unwrap();
+        let xs = Array::vector(vec![0.1f64, -0.2, 0.3]).unwrap();
+        let gradient =
+            differentiate_at((h.clone(), xs.clone())).gradient(|inputs| rematerialized.call(inputs)).unwrap();
+        checks::check_gradient(gradient.0, &|h| program.interpret((h, xs.clone())), h, 1e-6, 1e-6);
+    }
+
+    #[test]
+    fn test_saved_residuals_of_nested_scans() {
+        // The scans apply `h ↦ sin(dot(h, x)) + h` over the elements `x` of `xs`, and the `nested` scan applies such a
+        // scan to every row of `xs` in turn. Under `DotsSavable`, they save their dot products and recompute their
+        // carries from the initial carry `h`, as JAX does. The carry chain of the outer `nested` scan splits the inner
+        // scan on residual demand (refer to `ResidualPlacement::plan_recomputation`), so it neither stacks the final
+        // carries of the inner scan nor saves the carries that it recomputes, and it saves `h`, `xs`, and the dot
+        // products, as JAX does. A scan without iterations saves its empty stacks rather than `h`, which none of its
+        // iterations reads, where JAX saves `h` and one empty stack. Every policy computes the gradient that finite
+        // differences estimate.
+        fn step<V: Dot + Sin + Add>(h: V, x: V) -> Result<V, ProgramError> {
+            let t = h.dot(&x, &DotDimensionNumbers::new(vec![], vec![], vec![], vec![]))?;
+            t.sin()?.add(&h)
+        }
+
+        fn single((h, xs): (TestTracer, TestTracer)) -> Result<TestTracer, ProgramError> {
+            Ok(scan(|_, h, x| Ok((step(h, x)?, ())), h, xs, ScanOptions::new())?.0)
+        }
+
+        fn nested((h, xs): (TestTracer, TestTracer)) -> Result<TestTracer, ProgramError> {
+            let row = |_, h, row| Ok((scan(|_, h, x| Ok((step(h, x)?, ())), h, row, ScanOptions::new())?.0, ()));
+            Ok(scan(row, h, xs, ScanOptions::new())?.0)
+        }
+
+        let saved = |shape: &[usize], source: ResidualSource| {
+            SavedResidual::new(ArrayType::new_static(DataType::F64, shape.to_vec()), source)
+        };
+        let (h, xs) = (ResidualSource::Input { index: 0 }, ResidualSource::Input { index: 1 });
+        let dots = ResidualSource::Operation { name: "scan" };
+        let cases = [
+            (single as fn(_) -> _, vec![0.25f64, -1.5, 2.0], vec![3]),
+            (nested as fn(_) -> _, vec![0.25f64, -1.5, 2.0, 1.0, 0.5, -0.75], vec![2, 3]),
+            (single as fn(_) -> _, Vec::new(), vec![0]),
+        ];
+        for (function, elements, shape) in cases {
+            let (saved_dots, saved_inputs) = if shape == [0] {
+                (
+                    vec![saved(&shape, xs.clone()), saved(&shape, dots.clone()), saved(&shape, dots.clone())],
+                    vec![saved(&shape, xs.clone()), saved(&shape, dots.clone())],
+                )
+            } else {
+                (
+                    vec![saved(&shape, xs.clone()), saved(&shape, dots.clone()), saved(&[], h.clone())],
+                    vec![saved(&shape, xs.clone()), saved(&[], h.clone())],
+                )
+            };
+            let xs_type = ArrayType::new_static(DataType::F64, shape.clone());
+            let xs_value =
+                Array::new(xs_type.clone(), elements.into_iter().flat_map(f64::to_ne_bytes).collect()).unwrap();
+            let h_value = Array::scalar(0.5f64).unwrap();
+            let types = (ArrayType::scalar(DataType::F64), xs_type);
+            let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(function, types.clone()).unwrap();
+            let evaluate = |h: Array| program.interpret((h, xs_value.clone()));
+            macro_rules! check {
+                ($policy:expr, $expected:expr $(,)?) => {{
+                    let function = rematerialize(function).with_policy($policy);
+                    let residuals = saved_residuals(|inputs| function.call(inputs), types.clone());
+                    assert_eq!(residuals, Ok($expected), "scan over `{shape:?}`");
+                    let gradient = differentiate_at((h_value.clone(), xs_value.clone()))
+                        .gradient(|inputs| function.call(inputs))
+                        .unwrap();
+                    checks::check_gradient(gradient.0, &evaluate, h_value.clone(), 1e-6, 1e-6);
+                }};
+            }
+            check!(DotsSavable, saved_dots);
+            check!(NothingSavable, saved_inputs);
+        }
+    }
+
+    #[test]
+    fn test_saved_residuals_of_static_zero_like() {
+        // Staging `zero_like` of a type without runtime extents binds the nullary `zero` of that type, which, like
+        // JAX's `zeros_like`, does not depend on its exemplar. The backward computation of a rematerialized body
+        // therefore recomputes such a zero from nothing instead of saving the exemplar `u`. As in JAX,
+        // `(x, u) ↦ x · zero_like(u)` saves nothing and `(x, u) ↦ sin(x) · zero_like(u)` saves only `x` under the
+        // default policy and `DotsSavable`.
+        let r#type = ArrayType::new_static(DataType::F64, [4, 8]);
+        let types = (r#type.clone(), r#type.clone());
+        let x = SavedResidual::new(r#type, ResidualSource::Input { index: 0 });
+        let product = rematerialize(|(x, u): (TestTracer, TestTracer)| Ok(x * u.zero_like()?));
+        assert_eq!(saved_residuals(|inputs| product.call(inputs), types.clone()), Ok(Vec::new()));
+        let sine = rematerialize(|(x, u): (TestTracer, TestTracer)| Ok(x.sin()? * u.zero_like()?));
+        assert_eq!(saved_residuals(|inputs| sine.call(inputs), types.clone()), Ok(vec![x.clone()]));
+        let sine =
+            rematerialize(|(x, u): (TestTracer, TestTracer)| Ok(x.sin()? * u.zero_like()?)).with_policy(DotsSavable);
+        assert_eq!(saved_residuals(|inputs| sine.call(inputs), types), Ok(vec![x]));
+    }
+
+    #[test]
     fn test_nothing_savable() {
         assert_eq!(ResidualPolicy::<ArrayIrType>::name(&NothingSavable), NOTHING_SAVABLE_POLICY_NAME);
         assert_eq!(NothingSavable.classify(&candidate(&[dot()])), Ok(ResidualDecision::Recompute));
@@ -2101,6 +2592,22 @@ mod tests {
 
         // A residual that several producers may produce is saved when any of them is a dot product.
         assert_eq!(DotsSavable.classify(&candidate(&[sine(), dot()])), Ok(ResidualDecision::Save));
+
+        // Scaled dot products are saved regardless of their batching extents, as JAX saves `scaled_matmul_wrapper`
+        // outputs.
+        let unbatched = scaled_dot(2);
+        let batched = scaled_dot(3);
+        let dynamic = Dimension::from(DimensionVariable::new("batch", DimensionBounds::new(1, Some(4)).unwrap()));
+        assert_eq!(DotsSavable.classify(&scaled_dot_candidate(&unbatched, &[])), Ok(ResidualDecision::Save));
+        assert_eq!(
+            DotsSavable.classify(&scaled_dot_candidate(&batched, &[Dimension::Static(1)])),
+            Ok(ResidualDecision::Save),
+        );
+        assert_eq!(
+            DotsSavable.classify(&scaled_dot_candidate(&batched, &[Dimension::Static(2)])),
+            Ok(ResidualDecision::Save),
+        );
+        assert_eq!(DotsSavable.classify(&scaled_dot_candidate(&batched, &[dynamic])), Ok(ResidualDecision::Save));
 
         // Dot products are recognized in the array operation family itself too.
         let dot = ArrayOperation::<Array>::from(DotOperation::new(DotDimensionNumbers::new(
@@ -2133,6 +2640,36 @@ mod tests {
         // dimensions.
         assert_eq!(policy.classify(&candidate(&[batched_dot(), dot()])), Ok(ResidualDecision::Save));
 
+        // Scaled dot products are saved when every batching extent of their application site is statically 1, as JAX
+        // saves `scaled_matmul_wrapper` outputs only when the leading extent of their left-hand side input is 1. A
+        // dynamic extent is not known to be 1, and neither is the extent of a producer that carries no input types.
+        let unbatched = scaled_dot(2);
+        let batched = scaled_dot(3);
+        let dynamic = Dimension::from(DimensionVariable::new("batch", DimensionBounds::new(1, Some(4)).unwrap()));
+        assert_eq!(policy.classify(&scaled_dot_candidate(&unbatched, &[])), Ok(ResidualDecision::Save));
+        assert_eq!(
+            policy.classify(&scaled_dot_candidate(&batched, &[Dimension::Static(1)])),
+            Ok(ResidualDecision::Save),
+        );
+        assert_eq!(
+            policy.classify(&scaled_dot_candidate(&batched, &[Dimension::Static(2)])),
+            Ok(ResidualDecision::Recompute),
+        );
+        assert_eq!(policy.classify(&scaled_dot_candidate(&batched, &[dynamic])), Ok(ResidualDecision::Recompute));
+        assert_eq!(policy.classify(&candidate(&[unbatched])), Ok(ResidualDecision::Save));
+        assert_eq!(policy.classify(&candidate(&[batched])), Ok(ResidualDecision::Recompute));
+
+        // Every batching extent must be 1, and not only the leading one.
+        let doubly_batched = scaled_dot(4);
+        assert_eq!(
+            policy.classify(&scaled_dot_candidate(&doubly_batched, &[Dimension::Static(1), Dimension::Static(1)])),
+            Ok(ResidualDecision::Save),
+        );
+        assert_eq!(
+            policy.classify(&scaled_dot_candidate(&doubly_batched, &[Dimension::Static(1), Dimension::Static(2)])),
+            Ok(ResidualDecision::Recompute),
+        );
+
         // Lifting a reference to the policy into `ArrayIrType` uses its native instantiation.
         assert!(matches!(classify_lifted_dimension(policy), Ok(ResidualDecision::Recompute)));
     }
@@ -2156,6 +2693,22 @@ mod tests {
             policy.classify(&candidate(&[batched_dot(), dot()])),
             Ok(ResidualDecision::SaveWith(MemoryTransferStorage::new(host))),
         );
+
+        // Scaled dot products are recomputed regardless of their batching extents, as JAX's policy matches only
+        // ordinary dot products.
+        let unbatched = scaled_dot(2);
+        let batched = scaled_dot(3);
+        let dynamic = Dimension::from(DimensionVariable::new("batch", DimensionBounds::new(1, Some(4)).unwrap()));
+        assert_eq!(policy.classify(&scaled_dot_candidate(&unbatched, &[])), Ok(ResidualDecision::Recompute));
+        assert_eq!(
+            policy.classify(&scaled_dot_candidate(&batched, &[Dimension::Static(1)])),
+            Ok(ResidualDecision::Recompute),
+        );
+        assert_eq!(
+            policy.classify(&scaled_dot_candidate(&batched, &[Dimension::Static(2)])),
+            Ok(ResidualDecision::Recompute),
+        );
+        assert_eq!(policy.classify(&scaled_dot_candidate(&batched, &[dynamic])), Ok(ResidualDecision::Recompute));
 
         // Policies compare and hash by their destination.
         let policies = HashSet::from([policy]);
@@ -2399,5 +2952,28 @@ mod tests {
         let storages = HashSet::from([storage]);
         assert!(storages.contains(&MemoryTransferStorage::new(host)));
         assert!(!storages.contains(&MemoryTransferStorage::new(Memory::Device)));
+    }
+
+    #[test]
+    fn test_memory_transfer_storage_matches_store_operation() {
+        let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new("n", DimensionBounds::non_negative(None).unwrap()));
+        let host = Memory::Host { pinned: true };
+        let storage = MemoryTransferStorage::new(host);
+        let direct = ArrayOperation::<Array>::from(TransferToMemoryOperation::new(host));
+        let projected = ArrayIrOperation::<Array>::from(direct.clone());
+        let other_memory = ArrayOperation::<Array>::from(TransferToMemoryOperation::new(Memory::Device));
+        let other_pinning =
+            ArrayOperation::<Array>::from(TransferToMemoryOperation::new(Memory::Host { pinned: false }));
+        let sine = ArrayOperation::<Array>::from(SinOperation::<ArrayType>::new());
+
+        assert!(storage.matches_store_operation(&scalar_type, 0, &direct));
+        assert!(storage.matches_store_operation(&scalar_type, 0, &projected));
+        assert!(!storage.matches_store_operation(&scalar_type, 1, &direct));
+        assert!(!storage.matches_store_operation(&scalar_type, 0, &other_memory));
+        assert!(!storage.matches_store_operation(&scalar_type, 0, &other_pinning));
+        assert!(!storage.matches_store_operation(&scalar_type, 0, &sine));
+        assert!(!storage.matches_store_operation(&dimension_type, 0, &direct));
     }
 }
