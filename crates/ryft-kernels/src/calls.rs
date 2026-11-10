@@ -517,7 +517,7 @@ impl KernelCallOperation {
         }) {
             return Err(KernelError::UnsupportedOperation { operation, instruction });
         }
-        self.infer_output_types(&self.input_types(), &[region.interface()])?;
+        self.infer_output_types(&self.input_types(), std::slice::from_ref(region.interface()))?;
         let references = validate_kernel_body(region, &self.boundary_contract())?;
         for (parameter, summary) in references.parameters().iter().enumerate() {
             if let Some(summary) = summary {
@@ -811,7 +811,7 @@ where
     /// Observable effects and their relative order survive, including reference writes whose results are unused.
     /// This returns a new definition; any previous executable verification applies only to the original definition.
     pub fn simplified(&self) -> Result<Self, KernelError> {
-        Self::new(self.operation.clone(), self.body.simplified()?)
+        Self::new(self.operation.clone(), self.body.clone().into_simplified()?)
     }
 }
 
@@ -1909,7 +1909,7 @@ mod tests {
         let definition = copy_definition();
         let operation = definition.operation();
         assert_eq!(
-            operation.infer_output_types(&operation.input_types(), &[definition.body().interface()]),
+            operation.infer_output_types(&operation.input_types(), std::slice::from_ref(definition.body().interface())),
             Ok(operation.output_types())
         );
         assert_eq!(
@@ -1917,7 +1917,7 @@ mod tests {
             Err(TypeError::invalid("`kernel_call` requires exactly one body region"))
         );
         assert_eq!(
-            operation.infer_output_types(&[], &[definition.body().interface()]),
+            operation.infer_output_types(&[], std::slice::from_ref(definition.body().interface())),
             Err(TypeError::invalid("`kernel_call` input types do not match its logical signature"))
         );
         let interface = RegionInterface::new(vec![], vec![], EffectClasses::NONE);

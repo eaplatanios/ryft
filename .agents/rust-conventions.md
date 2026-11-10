@@ -15,6 +15,8 @@ ownership, and synchronization. These shared rules also apply to test code; deta
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - Use the narrowest visibility that reaches actual callers; keep module-internal helpers private.
+- Give trait function arguments descriptive names without a leading underscore. When a default implementation does
+  not use them, start its body with `let _ = (...);` to mark the unused arguments explicitly.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
 - For a function that queries or validates a particular instance, including a type descriptor, use a receiver such as
   `&self` rather than a named first argument of type `&Self`. Prefer normal method-call syntax for receiver-based calls
@@ -83,6 +85,12 @@ ownership, and synchronization. These shared rules also apply to test code; deta
 ## Formatting & Naming
 
 - Follow workspace formatting (i.e., `rustfmt.toml`): `max_width = 120`.
+- Name a context or callable handle's shared implementation `<Owner>State`, using the owner's full type name
+  (e.g., `PartialEvaluationContextState`), and use `state` for a named field holding it. State may include immutable
+  configuration as well as mutable resources and execution bookkeeping. Use `<Owner>Payload` for the shared backing
+  data of a value or descriptor (e.g., `ArrayTypePayload`) and `payload` for a named field holding it. Payloads may use
+  copy-on-write updates while preserving value semantics. Status enums such as `TracerState` also appropriately use
+  `State`.
 - Write numeric type suffixes without a separating underscore (e.g., `0f32`, `1.0f64`, and `2usize`, instead of `0_f32`,
   `1.0_f64`, or `2_usize`). Keep underscores used as digit separators where useful.
 - Use import grouping in this order:

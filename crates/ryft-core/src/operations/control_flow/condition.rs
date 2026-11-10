@@ -53,6 +53,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::assertions::GuardOperation;
 use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::ZeroOperation;
@@ -71,7 +72,7 @@ use crate::operations::references::ReferenceNewOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, PartitionedProgram, ResidualInputSource,
+    PartiallyEvaluatableOperation, PartitionedProgram, ResidualDemandSplit, ResidualInputSource,
 };
 use crate::programs::{
     AtomId, AttachedRegions, Concretizable, EmptyRegionDriver, InputRegionProvenance, MaybeZero, Operation,
@@ -257,7 +258,7 @@ impl<T: ConditionType> ConditionOperation<T> {
         input_types: &[T],
         branches: [RegionRef<'_, V, O>; 2],
     ) -> Result<Vec<T>, ProgramError> {
-        let output_types = self.infer_output_types(input_types, &branches.map(|branch| branch.interface()))?;
+        let output_types = self.infer_output_types(input_types, &branches.map(|branch| branch.interface().clone()))?;
         self.validate_reference_output_roots(branches)?;
         self.validate_reference_mutations(&input_types[0], branches, |_| Ok(true))?;
         Ok(output_types)
@@ -452,8 +453,13 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
         // specialize only when both refined branch signatures agree and their outputs satisfy the predicate's manual
         // variation requirements. Compare inputs after refinement because these interfaces may be partially reconciled
         // (one branch already specialized and its peer not yet), and refine reference outputs too, so that specializing
-        // the first branch does not prevent specializing its peer. `Operation::validate_region_interfaces` separately
-        // requires the original branches to declare the same input types.
+        // the first branch does not prevent specializing its peer. The facts that the inputs establish do not include
+        // metadata such as shardings, which only replay propagates, so a branch already specialized at the inputs can
+        // carry metadata that its pending peer lacks (e.g., `f32[4]` replayed at a sharded input). The pending peer
+        // then only needs to be refined by the specialized branch, and the final inference of the specialized condition
+        // rejects branches that still disagree after both are replayed. Original branches must agree exactly.
+        // `Operation::validate_region_interfaces` separately requires them to declare the same input types,
+        // so exactly one branch declaring the requested input types identifies a partially reconciled pair.
         let refined_signatures = region_interfaces
             .iter()
             .map(|interface| {
@@ -484,9 +490,28 @@ impl<T: ConditionType> Operation for ConditionOperation<T> {
             })
             .collect::<Result<Vec<_>, _>>();
 
+        let is_specialized = |index: usize| region_interfaces[index].input_types() == &input_types[1..];
+        let pending = match (is_specialized(0), is_specialized(1)) {
+            (true, false) => Some((1, 0)),
+            (false, true) => Some((0, 1)),
+            _ => None,
+        };
         if !refined_signatures.is_ok_and(|signatures| {
-            signatures[0] == signatures[1]
-                && signatures[0].1.iter().all(|output| output.validate_condition_output(&input_types[0]).is_ok())
+            let (agree, signature) = match pending {
+                Some((pending, specialized)) => {
+                    let (declared_inputs, declared_outputs) = &signatures[pending];
+                    let (actual_inputs, actual_outputs) = &signatures[specialized];
+                    let agree = [(declared_inputs, actual_inputs), (declared_outputs, actual_outputs)].into_iter().all(
+                        |(declared, actual)| {
+                            declared.len() == actual.len()
+                                && declared.iter().zip(actual).all(|(declared, actual)| declared.is_refined_by(actual))
+                        },
+                    );
+                    (agree, &signatures[specialized])
+                }
+                None => (signatures[0] == signatures[1], &signatures[0]),
+            };
+            agree && signature.1.iter().all(|output| output.validate_condition_output(&input_types[0]).is_ok())
         }) {
             return Ok(vec![None, None]);
         }
@@ -663,6 +688,7 @@ impl<
     C: Context<Type: ConditionType, Constant: Concretizable<bool>, Operation = O>,
     O: Operation<Type = C::Type>
         + OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = O>
+        + OperationProvider<C::Type, GuardOperation<C::Type>, Operation = O>
         + From<ConditionOperation<C::Type>>,
 > PartiallyEvaluatableOperation<C> for ConditionOperation<C::Type>
 {
@@ -737,9 +763,10 @@ impl<
             let false_partition = driver.partition_program(context, false_branch, &input_known)?;
 
             // An output is known only if both branches fold it. A value that only one branch folds crosses to the
-            // residual condition as an edge. Both known branches return the shared signature `[known outputs, true
-            // edges, false edges]`, and both residual branches receive `[unknown inputs, true edges, false edges]`,
-            // reading only their own edges. The peer's unused edge slots need placeholders of the same types.
+            // residual condition as an edge. The edges of both branches share residual slots wherever their types are
+            // equal. Both known branches return the shared signature `[known outputs, slots]`, and both residual
+            // branches receive `[unknown inputs, slots]`, reading only the slots of their own edges. Slots that only
+            // the peer fills need placeholders of the same types.
             if let Ok(outputs) = reconstruct_partitioned_condition(
                 guarded_inputs[0].r#type().as_ref(),
                 &branch_input_types,
@@ -748,19 +775,7 @@ impl<
                 &input_known,
                 [true_partition, false_partition],
                 |builder: &mut ProgramBuilder<_, _>, edge_type: &C::Type, _known_inputs: &[AtomId]| {
-                    // Only identity-free types that admit zero can supply a placeholder. Inventing a reference or
-                    // a dimension identity here would change the residual program's contract, so reject the split.
-                    if edge_type.identities().next().is_some() || edge_type.validate_zero().is_err() {
-                        return Ok(None);
-                    }
-                    let zeros = builder.add_instruction(
-                        O::provide(ZeroOperation::new(edge_type.clone()), &[])?,
-                        Vec::new(),
-                        Vec::new(),
-                        None,
-                    )?;
-                    check_count!("output", zeros, 1, ProgramError);
-                    Ok(Some(zeros[0]))
+                    zero_placeholder(builder, edge_type)
                 },
                 |operation, programs, inputs: &[_]| context.fold_or_residualize(operation, programs, inputs),
                 |operation, programs, inputs: &[_]| context.residualize(operation, programs, inputs),
@@ -774,6 +789,61 @@ impl<
         }
 
         context.fold_or_residualize(O::from(*self), driver.region_programs(), &inputs)
+    }
+
+    fn split_on_residual_demand<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+        demanded_outputs: &[bool],
+    ) -> Result<Option<ResidualDemandSplit<C::Value>>, ProgramError>
+    where
+        C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    {
+        // A split on residual demand partitions both branches with every input known and with the demanded outputs
+        // recomputed by their residual programs, and joins them like a split by knownness. The known condition then
+        // also returns, in shared residual slots, the values that the residual policy saves in the branch that runs,
+        // and a residual condition over the predicate recomputes the demanded outputs from them, as JAX's
+        // `_cond_partial_eval_custom` does. Every input is known here, so no entry relationship involves an unknown
+        // input and no guard is needed. A predicate that selects a branch keeps the condition whole, because partial
+        // evaluation inlines that branch instead (refer to `partially_evaluate`).
+        let branches = driver.condition_branches(inputs.len())?;
+        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        self.validate_application(&input_types, branches)?;
+        let selects_branch = inputs[0]
+            .as_known()
+            .and_then(|predicate| context.parent().resolve(predicate).into_constant())
+            .is_some_and(|predicate| predicate.concretize().is_ok());
+        if selects_branch || !inputs.iter().all(PartialEvaluationValue::is_known) {
+            return Ok(None);
+        }
+
+        let [true_branch, false_branch] = branches;
+        let output_count = true_branch.output_types().len();
+        let demanded_count = demanded_outputs.iter().filter(|&&demanded| demanded).count();
+        let partitions = [
+            context.partition_residual_demand(true_branch, demanded_outputs)?,
+            context.partition_residual_demand(false_branch, demanded_outputs)?,
+        ];
+        let Ok(mut outputs) = reconstruct_partitioned_condition(
+            inputs[0].r#type().as_ref(),
+            &true_branch.input_types(),
+            output_count + demanded_count,
+            inputs,
+            &vec![true; inputs.len() - 1],
+            partitions,
+            |builder: &mut ProgramBuilder<_, _>, edge_type: &C::Type, _known_inputs: &[AtomId]| {
+                zero_placeholder(builder, edge_type)
+            },
+            |operation, programs, inputs: &[_]| context.fold_or_residualize(operation, programs, inputs),
+            |operation, programs, inputs: &[_]| context.residualize(operation, programs, inputs),
+        )?
+        else {
+            return Ok(None);
+        };
+        let replayed_outputs = outputs.split_off(output_count);
+        Ok(Some(ResidualDemandSplit::new(outputs, replayed_outputs)?))
     }
 }
 
@@ -1021,9 +1091,9 @@ where
         // instruction-scoped differentiation driver. A shared primal/tangent context stages one fused condition.
         // Separate contexts stage a primal condition that records the selected branch's residuals and a tangent
         // condition that consumes them, joining the two branch linearizations over one shared residual boundary as the
-        // known/residual split of partial evaluation does. Placeholders for the peer branch's residual slots use live
-        // input extents or forward a known input of the identical type, and a residual that admits no placeholder makes
-        // separate-context linearization fail.
+        // known/residual split of partial evaluation does, with residuals of equal types sharing slots. Placeholders
+        // for the slots that only the peer branch fills use live input extents or forward a known input of the
+        // identical type, and a residual that admits no placeholder makes separate-context linearization fail.
 
         // Direct differentiated binds can reach this rule before the original operation's output inference.
         // Validate the complete primal application before analyzing tangent slots or deriving either branch program;
@@ -1065,7 +1135,7 @@ where
                     if jvp_outputs.iter().copied().eq(0..program.output_count()) {
                         Ok(program.clone())
                     } else {
-                        program.with_outputs(&jvp_outputs).map(Arc::new)
+                        program.as_ref().clone().with_outputs(&jvp_outputs).map(Arc::new)
                     }
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
@@ -1085,7 +1155,7 @@ where
                 let (primal, tangent, residual_count, _) = linearization.into_parts();
                 partitions.push(PartitionedProgram::from_parts(
                     Arc::unwrap_or_clone(primal),
-                    tangent.with_outputs(&branch_tangent_slots)?,
+                    Arc::unwrap_or_clone(tangent).with_outputs(&branch_tangent_slots)?,
                     primal_input_count + live_input_count,
                     (0..primal_input_count).collect(),
                     (primal_input_count..primal_input_count + live_input_count)
@@ -1127,8 +1197,8 @@ where
             };
 
             // Join both branch linearizations over one residual signature. Each known branch supplies placeholders
-            // for the peer's unused edges; a reference residual, invalid variation, or missing placeholder rejects
-            // the join.
+            // for the slots that only the peer fills, and a reference residual, invalid variation, or missing
+            // placeholder rejects the join.
             let outputs = reconstruct_partitioned_condition(
                 &input_types[0],
                 &branch_input_types,
@@ -1139,9 +1209,9 @@ where
                 |builder: &mut ProgramBuilder<C::Constant, C::Operation>,
                  edge_type: &C::Type,
                  known_inputs: &[AtomId]| {
-                    // This value fills an unused residual slot of the peer branch. Its type and runtime identities
-                    // must still match: construct a zero using live extents when possible, or forward/capture a
-                    // known value instead.
+                    // This value fills a residual slot that only the peer branch uses. Its type and runtime
+                    // identities must still match, so construct a zero using live extents when possible, or
+                    // forward or capture a known value instead.
                     let placeholder_context = TracingContext::<C::Constant, C::Operation>::new();
                     let sources = known_inputs
                         .iter()
@@ -1915,14 +1985,16 @@ impl<C: Context<Type: ConditionType>, P: BatchingPolicy<C>> BatchingContext<C, P
 
 /// Contains the known and residual programs of one condition branch, together with the values passed between them.
 /// Specifically, this struct stores the [`PartitionedProgram`] produced by partial evaluation or linearization
-/// alongside a list of residual edges. The list contains the partition's own edges, followed by outputs known in this
-/// branch but residual in the other branch. Those outputs must still be returned by the residual condition, so their
-/// known values become extra inputs to the residual branch. [`reconstruct_partitioned_condition`] creates one instance
-/// per branch and combines their edges into a shared boundary. The known condition produces those edges; each residual
-/// branch reads only its own branch's edges. Known branches fill unused slots for the other branch's edges with
-/// placeholders.
+/// alongside a list of residual edges. The list contains the partition's own edges that its residual program reads,
+/// followed by outputs known in this branch but residual in the other branch. Those outputs must still be returned by
+/// the residual condition, so their known values become extra inputs to the residual branch.
+/// [`reconstruct_partitioned_condition`] creates one instance per branch and merges the edges of both branches into
+/// one shared list of residual slots (refer to [`merge_condition_edges`]), so that edges of equal types share a slot.
+/// The known condition produces those slots, and each residual branch reads only the slots of its own edges. Known
+/// branches fill the slots that only the other branch uses with placeholders.
 struct PartitionedConditionBranch<V: Value, O: Operation<Type = V::Type>> {
-    /// Original branch partition, including its known and residual programs and their boundary wiring.
+    /// Branch partition, including its known and residual programs and their boundary wiring, without the residual
+    /// edges that its residual program does not read.
     partition: PartitionedProgram<V, O>,
 
     /// Type and known-program output index of each value carried into the residual condition. Entries follow the
@@ -1934,7 +2006,8 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
     /// Creates a new [`PartitionedConditionBranch`] by validating `partition` against its input knownness mask
     /// `input_known` and preparing the residual edges for the condition's output knownness mask `output_known`.
     /// An output is known to the condition only when it is known in both branches. A result known only in this branch
-    /// must be carried through an extra residual edge so the residual branch can return it.
+    /// must be carried through an extra residual edge so the residual branch can return it. Residual edges that the
+    /// residual program of `partition` does not read are dropped from both of its programs.
     ///
     /// # Errors
     ///
@@ -1957,6 +2030,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
             )));
         }
         partition.validate_canonical_residual_edges()?;
+        let partition = Self::without_unread_residual_edges(partition)?;
         let mut edges = partition.residual_edges();
         let known_program_output_types = partition.known_program().output_types();
         check_count!("output", partition.outputs(), output_known.len(), ProgramError);
@@ -1971,17 +2045,17 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
 
     /// Builds the branch [`Program`] of the known condition that corresponds to this branch. Its inputs are the known
     /// condition inputs, and its outputs are the condition's known outputs (i.e., those that `output_known` selects)
-    /// followed by the residual edges of the `true` branch and then those of the `false` branch, where `is_true_branch`
-    /// says which of the two this branch is. The slots of the edges of `peer` hold placeholders staged by
-    /// `build_placeholder_fn` into this branch's detached builder using its known input atoms. They are dead outputs,
-    /// because the residual branch that the same predicate selects reads only this branch's edges. Returns a rejection
-    /// message in the inner result when `build_placeholder_fn` cannot construct a placeholder for one of the edges of
-    /// `peer`.
+    /// followed by one value of each type in `slot_types`, the residual slots that the known condition returns. This
+    /// branch's edges fill the slots that `own_slots` assigns to them, in edge order, and an edge without a slot is
+    /// returned through a known output instead. Every other slot holds a placeholder staged by `build_placeholder_fn`
+    /// into this branch's detached builder using its known input atoms. Placeholders are dead outputs, because the
+    /// residual branch that the same predicate selects reads only this branch's slots. Returns a rejection message
+    /// in the inner result when `build_placeholder_fn` cannot construct a placeholder for one of those slots.
     #[allow(clippy::type_complexity)]
     fn known_branch(
         &self,
-        peer: &Self,
-        is_true_branch: bool,
+        slot_types: &[V::Type],
+        own_slots: &[Option<usize>],
         output_known: &[bool],
         build_placeholder_fn: &mut dyn FnMut(
             &mut ProgramBuilder<V, O>,
@@ -2017,29 +2091,29 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
             }
         }
 
-        // Reserve slots for the peer's edges so both known branches have identical signatures. These slots are dead
-        // for this predicate choice: the residual condition selects this branch again and reads only its own edges.
-        // If a typed placeholder cannot be built, reject the split before binding any work in the caller's context.
-        let mut placeholder_atoms = Vec::with_capacity(peer.edges.len());
-        for (edge_type, _) in &peer.edges {
-            let Some(placeholder) = build_placeholder_fn(&mut builder, edge_type, &known_inputs)? else {
-                return Ok(Err(format!(
-                    "no known input determines a placeholder of type `{edge_type}` for a residual of the other branch",
-                )));
-            };
-            placeholder_atoms.push(placeholder);
+        // Place this branch's edges at their slots, which include both original residual feeders and outputs that are
+        // known only in this branch. Fill the remaining slots, which only the peer's edges use, with placeholders so
+        // that both known branches have identical signatures. Those slots are dead for this predicate choice, because
+        // the residual condition selects this branch again and reads only its own slots. If a typed placeholder cannot
+        // be built, reject the split before binding any work in the caller's context.
+        let mut slot_atoms = vec![None; slot_types.len()];
+        for ((_, output), slot) in self.edges.iter().zip(own_slots) {
+            if let Some(slot) = slot {
+                slot_atoms[*slot] = Some(known_outputs[*output]);
+            }
         }
-
-        // Append real residual values and peer placeholders in a fixed `true`-then-`false` branch order.
-        // The edge list includes both original residual feeders and outputs that are known only in this branch.
-        let edge_atoms = self.edges.iter().map(|(_, output)| known_outputs[*output]).collect::<Vec<_>>();
-        if is_true_branch {
-            output_atoms.extend(edge_atoms);
-            output_atoms.extend(placeholder_atoms);
-        } else {
-            output_atoms.extend(placeholder_atoms);
-            output_atoms.extend(edge_atoms);
+        for (slot_type, slot_atom) in slot_types.iter().zip(&mut slot_atoms) {
+            if slot_atom.is_none() {
+                let Some(placeholder) = build_placeholder_fn(&mut builder, slot_type, &known_inputs)? else {
+                    return Ok(Err(format!(
+                        "no known input determines a placeholder of type `{slot_type}` for a residual of the other \
+                         branch",
+                    )));
+                };
+                *slot_atom = Some(placeholder);
+            }
         }
+        output_atoms.extend(slot_atoms.into_iter().map(Option::unwrap));
 
         // Seal and simplify the detached program, removing unused pure computations while preserving effects.
         // The inner result accepts the split; builder and simplification errors propagate through the outer result.
@@ -2055,18 +2129,17 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
     }
 
     /// Builds the branch [`Program`] of the residual condition that corresponds to this branch. Its inputs are the
-    /// unknown branch inputs (i.e., the `branch_input_types` that `input_known` does not select), followed by the
-    /// residual edges of the `true` branch and then those of the `false` branch, with the types from each branch's
-    /// `edges` in that order, where `is_true_branch` says which of the two this branch is. Its outputs are the
-    /// condition outputs that `output_known` leaves residual. The branch reads only its own edges, and returns
-    /// an output that it folded from that output's instantiated edge.
+    /// unknown branch inputs (i.e., the `branch_input_types` that `input_known` does not select), followed by one input
+    /// of each type in `slot_types`, the merged residual slots of both branches. Its outputs are the condition outputs
+    /// that `output_known` leaves residual. The branch reads only the slots that `own_slots` assigns to its edges, in
+    /// edge order, and returns an output that it folded from that output's instantiated edge.
     fn residual_branch(
         &self,
-        is_true_branch: bool,
+        slot_types: &[V::Type],
+        own_slots: &[usize],
         branch_input_types: &[V::Type],
         input_known: &[bool],
         output_known: &[bool],
-        edges: [&[(V::Type, usize)]; 2],
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
         // Declare only unknown branch inputs, but retain an entry at every original input position. This keeps the
         // partition's input indices valid while known inputs have no slot in the residual branch signature.
@@ -2077,15 +2150,13 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
             .map(|(input_type, &known)| (!known).then(|| builder.add_input(input_type.clone())))
             .collect::<Vec<_>>();
 
-        // Both residual branches accept the shared edge boundary in `true`-then-`false` order. Keep the peer's slots
-        // in the signature even though this branch reads only its own edges; the peer's slots hold placeholders here.
-        let [true_edge_atoms, false_edge_atoms] = edges
-            .map(|edges| edges.iter().map(|(edge_type, _)| builder.add_input(edge_type.clone())).collect::<Vec<_>>());
-        let own_edge_atoms = if is_true_branch { &true_edge_atoms } else { &false_edge_atoms };
+        // Both residual branches accept the shared slot boundary. Keep the slots that only the peer's edges use in the
+        // signature even though this branch never reads them, because they hold placeholders when this branch runs.
+        let slot_atoms = slot_types.iter().map(|slot_type| builder.add_input(slot_type.clone())).collect::<Vec<_>>();
 
-        // Canonical partition wiring consumes the original edges in order; appended known outputs follow them.
+        // Canonical partition wiring consumes the original edges in order, and appended known outputs follow them.
         // `from_partition` validated that layout, so one cursor can serve the original program and then extra outputs.
-        let mut edge_atoms = own_edge_atoms.iter().copied();
+        let mut edge_atoms = own_slots.iter().map(|&slot| slot_atoms[slot]);
 
         // Rebuild the partition's residual input order from original unknown inputs and this branch's edges. Direct
         // known feeders are invalid here: all known values must cross the condition split through its residual edges.
@@ -2129,18 +2200,113 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
             }
         }
 
-        // Seal the region over the compact unknown inputs and both edge sets, including the unused peer slots.
+        // Seal the region over the compact unknown inputs and every slot, including those that only the peer uses.
         // Retain residual effects and deferred work even when there are no residual output values.
-        let input_count = unknown_input_atoms.iter().flatten().count() + true_edge_atoms.len() + false_edge_atoms.len();
+        let input_count = unknown_input_atoms.iter().flatten().count() + slot_atoms.len();
         let output_count = output_atoms.len();
         builder.build::<Vec<V>, Vec<V>>(output_atoms, vec![Placeholder; input_count], vec![Placeholder; output_count])
     }
+
+    /// Returns `partition` without the residual edges that its residual program does not read, which become neither
+    /// inputs of the residual program nor outputs of the known program. Known work that only those edges used is
+    /// removed unless it has observable effects or deferred work. `partition` must follow the canonical edge layout
+    /// that [`PartitionedProgram::validate_canonical_residual_edges`] validates, which the result keeps.
+    ///
+    /// Splits drop these edges before [`merge_condition_edges`] lets edges of both branches share slots, because a
+    /// shared slot can no longer be removed for one branch alone. Such edges arise, for example, when a
+    /// differentiation driver returns a dense linearization of a branch. Separate-context linearization then restricts
+    /// its tangent program to the tangent outputs that the condition needs, which keeps every residual input of that
+    /// program, including those that only size the structural zero tangents of the other outputs.
+    fn without_unread_residual_edges(
+        partition: PartitionedProgram<V, O>,
+    ) -> Result<PartitionedProgram<V, O>, ProgramError> {
+        // Region bodies cannot refer to atoms of their parent regions, so a residual input is read when an entry
+        // instruction consumes it or the entry region returns it. Counting the inputs of every instruction, live or
+        // not, can only keep an edge that is not needed, never drop one that is.
+        let residual_program = partition.residual_program();
+        let mut input_positions = vec![None; residual_program.atoms().len()];
+        for (position, input) in residual_program.input_ids().iter().enumerate() {
+            input_positions[input.index()] = Some(position);
+        }
+        let mut input_read = vec![false; residual_program.input_ids().len()];
+        let reads = residual_program.instructions().iter().flat_map(|instruction| instruction.inputs());
+        for atom in reads.chain(residual_program.output_ids()) {
+            if let Some(position) = input_positions[atom.index()] {
+                input_read[position] = true;
+            }
+        }
+        let unread_edge = partition
+            .residual_inputs()
+            .iter()
+            .zip(&input_read)
+            .any(|(source, &read)| matches!(source, ResidualInputSource::ResidualEdge(_)) && !read);
+        if !unread_edge {
+            return Ok(partition);
+        }
+
+        // Keep every unknown input and every read edge, renumbering the kept edges in order. The canonical layout
+        // consumes edge `e` exactly once, so its known-program output follows the known outputs at position `k + e`.
+        let original_input_count = partition.original_input_count();
+        let (known_program, residual_program, known_input_indices, residual_inputs, outputs) = partition.into_parts();
+        let known_output_count = outputs.iter().filter(|output| output.is_known()).count();
+        let mut kept_inputs = Vec::with_capacity(residual_inputs.len());
+        let mut kept_known_outputs = (0..known_output_count).collect::<Vec<_>>();
+        let mut kept_residual_inputs = Vec::with_capacity(residual_inputs.len());
+        for (position, (source, read)) in residual_inputs.into_iter().zip(input_read).enumerate() {
+            match source {
+                ResidualInputSource::ResidualEdge(_) if !read => continue,
+                ResidualInputSource::ResidualEdge(edge) => {
+                    let kept_edge = kept_known_outputs.len() - known_output_count;
+                    kept_known_outputs.push(known_output_count + edge);
+                    kept_residual_inputs.push(ResidualInputSource::ResidualEdge(kept_edge));
+                }
+                source => kept_residual_inputs.push(source),
+            }
+            kept_inputs.push(position);
+        }
+        let residual_output_count = residual_program.output_ids().len();
+        PartitionedProgram::from_parts(
+            known_program.with_outputs(&kept_known_outputs)?,
+            residual_program.with_boundary(&kept_inputs, &(0..residual_output_count).collect::<Vec<_>>())?,
+            original_input_count,
+            known_input_indices,
+            kept_residual_inputs,
+            outputs,
+        )
+    }
+}
+
+/// Stages a zero of type `edge_type` into `builder` as the placeholder of a residual slot that only the other branch of
+/// a split condition fills, for the split rules of partial evaluation (refer to [`reconstruct_partitioned_condition`]).
+/// Returns [`None`] for a type that has identities or admits no zero, because inventing a reference or a dimension
+/// identity would change the contract of the residual program, which rejects the split.
+fn zero_placeholder<
+    V: Value<Type: ConditionType>,
+    O: Operation<Type = V::Type> + OperationProvider<V::Type, ZeroOperation<V::Type>, Operation = O>,
+>(
+    builder: &mut ProgramBuilder<V, O>,
+    edge_type: &V::Type,
+) -> Result<Option<AtomId>, ProgramError> {
+    if edge_type.identities().next().is_some() || edge_type.validate_zero().is_err() {
+        return Ok(None);
+    }
+    let zeros = builder.add_instruction(
+        O::provide(ZeroOperation::new(edge_type.clone()), &[])?,
+        Vec::new(),
+        Vec::new(),
+        None,
+    )?;
+    check_count!("output", zeros, 1, ProgramError);
+    Ok(Some(zeros[0]))
 }
 
 /// Rebuilds both halves of a conditional over one shared residual signature (i.e., a known condition bound through
 /// `bind_known_fn` and a residual condition bound through `bind_residual_fn`) and returns the outputs of the original
-/// condition in order. Unit-returning splits retain residual effects and deferred work without binding an empty known
-/// condition.
+/// condition in order. The signature consists of residual slots that the residual edges of both branches share
+/// wherever their types are equal (refer to [`merge_condition_edges`]), after dropping the edges that a branch's
+/// residual program does not read. The known condition does not return a slot whose edges are, in every branch that
+/// fills it, the value of the same known output, and the residual condition reads that known output in its place.
+/// Unit-returning splits retain residual effects and deferred work without binding an empty known condition.
 ///
 /// Returns a rejection message in the inner result when the split would expose a reference, mistype a residual edge,
 /// fold nothing, or require a placeholder that `build_placeholder_fn` cannot construct. Partial evaluation then keeps
@@ -2156,13 +2322,13 @@ impl<V: Value, O: Operation<Type = V::Type>> PartitionedConditionBranch<V, O> {
 ///   - `inputs`: Condition inputs, starting with the predicate, in the caller's value representation.
 ///   - `input_known`: Knownness mask over the branch inputs, which both partitions were split with.
 ///   - `partitions`: Partitions of the `true` and `false` branches into their known and residual programs.
-///   - `build_placeholder_fn`: Stages a placeholder of the given edge type for a residual edge of the peer branch into
-///     a detached known-branch builder, given that branch's known input atoms. Returning `None` rejects the split with
-///     a message identifying the missing placeholder's type.
+///   - `build_placeholder_fn`: Stages a placeholder of the given slot type for a residual slot that only the peer
+///     branch fills into a detached known-branch builder, given that branch's known input atoms. Returning `None`
+///     rejects the split with a message identifying the missing placeholder's type.
 ///   - `bind_known_fn`: Binds the known condition over the predicate and the known inputs into the caller's known-side
-///     context and returns its outputs: the known outputs followed by both branches' residual edges.
-///   - `bind_residual_fn`: Binds the residual condition over the predicate, the unknown inputs, and both branches'
-///     residual edges, and returns the residual outputs.
+///     context and returns its outputs, which are the known outputs followed by the residual slots.
+///   - `bind_residual_fn`: Binds the residual condition over the predicate, the unknown inputs, and the residual
+///     slots, and returns the residual outputs.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 fn reconstruct_partitioned_condition<
@@ -2286,17 +2452,90 @@ fn reconstruct_partitioned_condition<
         // placeholders: partial evaluation accepts only identity-free typed zeros, while differentiation can obtain
         // runtime extents from the known branch inputs or forward a known input of the identical type. A unit-returning
         // condition with no known work still needs its residual branch effects, but binding an empty pure known
-        // condition serves no purpose.
+        // condition serves no purpose. Edges of equal types share residual slots across the two branches, so that
+        // a known branch needs placeholders only for the slots that it does not fill itself.
         let known_output_count = output_known.iter().filter(|&&known| known).count();
-        let edge_count = true_split.edges.len() + false_split.edges.len();
+        let (slot_types, [true_slots, false_slots]) = merge_condition_edges([&true_split.edges, &false_split.edges]);
+
+        // A slot whose edges are, in every branch that fills it, the value of the same known output of the condition
+        // reads that known output instead, so that the known condition does not return one value twice. This happens,
+        // for example, when a condition that an earlier split on residual demand already made return a saved value is
+        // split on residual demand again and saves that value once more. The known output must have the type of the
+        // slot in both branches, so that the condition returns it at that type.
+        let known_output_type = |split: &PartitionedConditionBranch<V, O>, known_output: usize| {
+            let index = (0..output_count).filter(|&index| output_known[index]).nth(known_output)?;
+            match split.partition.outputs()[index] {
+                PartialEvaluationOutput::Known(output) => {
+                    Some(split.partition.known_program().output_types()[output].clone())
+                }
+                PartialEvaluationOutput::Unknown(_) => None,
+            }
+        };
+        let mut slot_aliases = vec![None; slot_types.len()];
+        for (split, own_slots) in [(&true_split, &true_slots), (&false_split, &false_slots)] {
+            let known_program = split.partition.known_program();
+            for ((_, edge), &slot) in split.edges.iter().zip(own_slots) {
+                let known_output = (0..output_count).filter(|&index| output_known[index]).position(|index| {
+                    matches!(
+                        split.partition.outputs()[index],
+                        PartialEvaluationOutput::Known(output)
+                            if known_program.output_ids()[output] == known_program.output_ids()[*edge]
+                    )
+                });
+                slot_aliases[slot] = match (slot_aliases[slot], known_output) {
+                    (None, Some(known_output)) => Some(Some(known_output)),
+                    (Some(Some(previous)), Some(known_output)) if previous == known_output => slot_aliases[slot],
+                    _ => Some(None),
+                };
+            }
+        }
+        let slot_aliases = slot_aliases
+            .into_iter()
+            .zip(&slot_types)
+            .map(|(alias, slot_type)| {
+                alias.flatten().filter(|&known_output| {
+                    splits.iter().all(|split| known_output_type(split, known_output).as_ref() == Some(slot_type))
+                })
+            })
+            .collect::<Vec<_>>();
+        let known_slot_types = slot_types
+            .iter()
+            .zip(&slot_aliases)
+            .filter(|(_, alias)| alias.is_none())
+            .map(|(slot_type, _)| slot_type.clone())
+            .collect::<Vec<_>>();
+        let mut known_slot_count = 0;
+        let known_slot_indices = slot_aliases
+            .iter()
+            .map(|alias| {
+                alias.is_none().then(|| {
+                    known_slot_count += 1;
+                    known_slot_count - 1
+                })
+            })
+            .collect::<Vec<_>>();
+        let known_slots =
+            |own_slots: &[usize]| own_slots.iter().map(|&slot| known_slot_indices[slot]).collect::<Vec<_>>();
         let known_outputs = if known_side_is_empty {
             Vec::new()
         } else {
-            let known_true = match true_split.known_branch(&false_split, true, &output_known, build_placeholder_fn)? {
+            let true_known_slots = known_slots(&true_slots);
+            let known_true = match true_split.known_branch(
+                &known_slot_types,
+                &true_known_slots,
+                &output_known,
+                build_placeholder_fn,
+            )? {
                 Ok(branch) => branch,
                 Err(rejection) => return Ok(Err(rejection)),
             };
-            let known_false = match false_split.known_branch(&true_split, false, &output_known, build_placeholder_fn)? {
+            let false_known_slots = known_slots(&false_slots);
+            let known_false = match false_split.known_branch(
+                &known_slot_types,
+                &false_known_slots,
+                &output_known,
+                build_placeholder_fn,
+            )? {
                 Ok(branch) => branch,
                 Err(rejection) => return Ok(Err(rejection)),
             };
@@ -2309,29 +2548,34 @@ fn reconstruct_partitioned_condition<
                 vec![known_true, known_false],
                 known_condition_inputs.as_slice(),
             )?;
-            check_count!("output", known_outputs, known_output_count + edge_count, ProgramError);
+            check_count!("output", known_outputs, known_output_count + known_slot_types.len(), ProgramError);
             known_outputs
         };
 
         // A branch residual with effects or deferred work must survive even when the condition returns no residual
         // values, because simplification retains that work and dropping the condition would discard it. The known
-        // condition returns the `true` branch's edges and then the `false` branch's edges after its known outputs,
-        // which is the order in which the residual condition receives them after the unknown inputs.
+        // condition returns the merged residual slots after its known outputs, which is the order in which the residual
+        // condition receives them after the unknown inputs.
         let needs_residual_condition = output_known.contains(&false)
             || splits.iter().any(|split| !split.partition.residual_program().effects().is_pure());
         let residual_outputs = if needs_residual_condition {
-            let edges = [true_split.edges.as_slice(), false_split.edges.as_slice()];
-            let residual_branches = [(&true_split, true), (&false_split, false)]
+            let residual_branches = [(&true_split, &true_slots), (&false_split, &false_slots)]
                 .into_iter()
-                .map(|(split, is_true_branch)| {
-                    split.residual_branch(is_true_branch, branch_input_types, input_known, &output_known, edges)
+                .map(|(split, own_slots)| {
+                    split.residual_branch(&slot_types, own_slots, branch_input_types, input_known, &output_known)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let mut residual_condition_inputs = vec![predicate.clone()];
             residual_condition_inputs.extend(
                 branch_inputs.iter().zip(input_known).filter(|(_, known)| !**known).map(|(input, _)| input.clone()),
             );
-            residual_condition_inputs.extend(known_outputs[known_output_count..].iter().cloned());
+            let mut known_slot_values = known_outputs[known_output_count..].iter();
+            for alias in &slot_aliases {
+                residual_condition_inputs.push(match alias {
+                    Some(known_output) => known_outputs[*known_output].clone(),
+                    None => known_slot_values.next().unwrap().clone(),
+                });
+            }
             bind_residual_fn(
                 O::from(ConditionOperation::new()),
                 residual_branches,
@@ -2364,11 +2608,59 @@ fn reconstruct_partitioned_condition<
     )
 }
 
+/// Merges the residual edges of the `true` and `false` branches of a condition, given by their types in `edges`,
+/// into one shared list of residual slots, and returns the type of each slot together with the slot of each edge of
+/// each branch, in edge order. Because one predicate selects both the known and the residual branch, a slot only ever
+/// carries an edge of the branch that runs, so edges of different branches can share a slot whenever their types are
+/// equal. Sharing is decided by complete type equality, which for an [`ArrayType`] includes its data type, its shape
+/// and type identities, its layout, its sharding (including its manual variation), and its memory kind.
+///
+/// This follows `_merge_branch_residuals` in JAX's
+/// [`conditionals.py`](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/control_flow/conditionals.py). Each edge
+/// is tagged with its type and the number of earlier edges of the same branch with an equal type, and the slots are
+/// the distinct tags in order of first appearance, visiting the `true` branch's edges and then the `false` branch's.
+/// The `i`-th edge of a type in one branch therefore shares a slot with the `i`-th edge of that type in the other,
+/// the number of slots of each type is the larger of the two branches' counts of that type, and no two edges of one
+/// branch share a slot. For example, edge types `[x]` and `[x, x]` merge into the slots `[x, x]`, with the `true`
+/// edge at slot `0` and the `false` edges at slots `0` and `1`, and edge types `[x, y]` and `[y, z]` merge into the
+/// slots `[x, y, z]`.
+fn merge_condition_edges<T: Type>(edges: [&[(T, usize)]; 2]) -> (Vec<T>, [Vec<usize>; 2]) {
+    // Types need not be hashable, so the slots are grouped by distinct type, which keeps the number of type
+    // comparisons proportional to the number of edges even when a branch has many edges of few types (e.g., the
+    // residuals of a linearization). Each group lists the slots of its type in order of occurrence.
+    let mut slot_types = Vec::new();
+    let mut slots_by_type = Vec::<(&T, Vec<usize>)>::new();
+    let own_slots = edges.map(|edges| {
+        let mut occurrences = Vec::new();
+        edges
+            .iter()
+            .map(|(edge_type, _)| {
+                let group = slots_by_type.iter().position(|(slot_type, _)| *slot_type == edge_type);
+                let group = group.unwrap_or_else(|| {
+                    slots_by_type.push((edge_type, Vec::new()));
+                    slots_by_type.len() - 1
+                });
+                if occurrences.len() <= group {
+                    occurrences.resize(group + 1, 0);
+                }
+                let slots = &mut slots_by_type[group].1;
+                if occurrences[group] == slots.len() {
+                    slots.push(slot_types.len());
+                    slot_types.push(edge_type.clone());
+                }
+                occurrences[group] += 1;
+                slots[occurrences[group] - 1]
+            })
+            .collect()
+    });
+    (slot_types, own_slots)
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
@@ -2376,8 +2668,8 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
         ArrayReference, ArrayReferenceTransform, ArrayReferenceTransformIndex, DataType, Dimension, DimensionBounds,
-        DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
-        MeshAxisType, Shape, Sharding, ShardingDimension,
+        DimensionError, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, RecursiveBatchingDriver, batch};
@@ -2385,7 +2677,8 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::reverse::tests::{run_transposed_with_destinations, transposition_statistics};
     use crate::differentiation::{
-        ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, TransposedProgram, differentiate_at,
+        DotsSavable, ForwardModeDifferentiate, LinearizationTracer, NothingSavable, ReverseModeDifferentiate,
+        TransposedProgram, differentiate_at,
     };
     use crate::macros::{check_gradient, check_operation_batching};
     use crate::operations::GuardOperation;
@@ -2402,20 +2695,22 @@ mod tests {
         dimension, resolve_captures,
     };
     use crate::operations::control_flow::r#while::WhileOperation;
-    use crate::operations::debugging::PrintOperation;
+    use crate::operations::debugging::{Print, PrintOperation};
     use crate::operations::differentiation::stop_gradient::StopGradientOperation;
     use crate::operations::dimensions::DimensionAddOperation;
     use crate::operations::dimensions::dimension_from_scalar::{DimensionFromScalar, DimensionFromScalarOperation};
+    use crate::operations::dot::{DOT_OPERATION_NAME, DotDimensionNumbers, DotOperation};
     use crate::operations::manipulation::conversions::Cast;
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
     };
-    use crate::operations::trigonometric::{Sin, SinOperation};
+    use crate::operations::trigonometric::{Cos, CosOperation, SIN_OPERATION_NAME, Sin, SinOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::{
-        PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialTracer, PartialValue,
-        ReferencePlacement,
+        NoStorage, PartialEvaluation, PartialEvaluationInput, PartialEvaluationOutput, PartialTracer, PartialValue,
+        ReferencePlacement, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyReference,
+        ResidualProducer, ResidualRejection,
     };
     use crate::programs::{
         EffectClasses, ExternalReferenceBinding, ProgramBuilder, ReferenceAccessOperation, ReferenceAnalysisError,
@@ -3046,6 +3341,54 @@ mod tests {
         Ok(outputs)
     }
 
+    /// Builds the program `f(p, w, y) = condition(p, w) * y` whose `true` branch expands the dot product `dot(w, w)` of
+    /// `w: f64[2]` into `e = broadcast(dot(w, w)): f64[4]` and whose `false` branch returns `e + e`. When `p` and `w`
+    /// are known, the whole condition is known and only its `f64[4]` output crosses into residual work. When
+    /// `returns_dot` is set, both branches also return `dot(w, w)`, which the program returns as its second output.
+    /// When `doubles_false_dot` is set too, the `false` branch returns `dot(w, w) + dot(w, w)` in its place.
+    fn compact_expansion_condition_program(
+        returns_dot: bool,
+        doubles_false_dot: bool,
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let vector_type = ArrayType::new_static(DataType::F64, [4]);
+        let branch = |double: bool| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let w = builder.add_input(ArrayType::new_static(DataType::F64, [2]));
+            let dot = DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]));
+            let t = builder.add_instruction(dot, Vec::new(), vec![w, w], None).unwrap()[0];
+            let broadcast = BroadcastOperation::new(vector_type.clone(), Vec::new());
+            let mut e = builder.add_instruction(broadcast, Vec::new(), vec![t], None).unwrap()[0];
+            if double {
+                e = builder.add_instruction(AddOperation::new(), Vec::new(), vec![e, e], None).unwrap()[0];
+            }
+            let mut outputs = vec![e];
+            if returns_dot && double && doubles_false_dot {
+                outputs.push(builder.add_instruction(AddOperation::new(), Vec::new(), vec![t, t], None).unwrap()[0]);
+            } else if returns_dot {
+                outputs.push(t);
+            }
+            let output_count = outputs.len();
+            builder
+                .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder; output_count])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let w = builder.add_input(ArrayType::new_static(DataType::F64, [2]));
+        let y = builder.add_input(vector_type.clone());
+        let branches = vec![builder.import_program(branch(false)), builder.import_program(branch(true))];
+        let outputs = builder
+            .add_instruction(ConditionOperation::new(), branches, vec![predicate, w], None)
+            .unwrap()
+            .to_vec();
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![outputs[0], y], None).unwrap()[0];
+        let outputs = if returns_dot { vec![output, outputs[1]] } else { vec![output] };
+        let output_count = outputs.len();
+        builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 3], vec![Placeholder; output_count])
+            .unwrap()
+    }
+
     #[test]
     fn test_condition_type_is_condition_predicate() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -3175,7 +3518,7 @@ mod tests {
         let operation = ConditionOperation::<ArrayType>::new();
         let true_branch = scalar_branch(ArrayOperation::Add(AddOperation::new()));
         let false_branch = scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation::new()));
-        let interfaces = vec![true_branch.interface(), false_branch.interface()];
+        let interfaces = vec![true_branch.interface().clone(), false_branch.interface().clone()];
 
         // Type inference validates the branch interfaces, the predicate, and the input types, and returns the
         // branch output types.
@@ -3231,7 +3574,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[predicate_type.clone(), branch_input_type.clone()],
-                &[true_branch.interface(), mismatched_interface],
+                &[true_branch.interface().clone(), mismatched_interface],
             ),
             Err(TypeError::invalid(
                 "`condition` branch input type signature mismatch: expected [f64[]] but got [f64[2]]",
@@ -3256,7 +3599,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[predicate_type.clone(), branch_input_type.clone()],
-                &[true_branch.interface(), boolean_branch.interface()],
+                &[true_branch.interface().clone(), boolean_branch.interface().clone()],
             ),
             Err(TypeError::invalid(
                 "`condition` branch output type signature mismatch: expected [f64[]] but got [bool[]]",
@@ -3303,15 +3646,15 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[ArrayType::scalar(DataType::Boolean), ArrayType::scalar(DataType::F64)],
-                &[identity_branch.interface(), identity_branch.interface()],
+                &[identity_branch.interface().clone(), identity_branch.interface().clone()],
             ),
             Ok(vec![ArrayType::scalar(DataType::F64)]),
         );
         let branches = refinable_dynamic_branches();
-        let interfaces = branches.each_ref().map(Program::interface);
+        let interfaces = branches.each_ref().map(|program| program.interface().clone());
         let array_ir_branches =
             branches.map(|branch| branch.into_unprojected::<TestIrValue, TestIrOperation>().unwrap());
-        let array_ir_interfaces = array_ir_branches.each_ref().map(Program::interface);
+        let array_ir_interfaces = array_ir_branches.each_ref().map(|program| program.interface().clone());
         let refined_input_types = [ArrayType::scalar(DataType::Boolean), ArrayType::new_static(DataType::F64, [3])];
         let refined_array_ir_input_types = refined_input_types.clone().map(ArrayIrType::Array);
         let mismatched_input_types = [ArrayType::scalar(DataType::Boolean), ArrayType::new_static(DataType::F64, [4])];
@@ -3364,7 +3707,7 @@ mod tests {
             let %1:f64[3] = const [2.0, 2.0, 2.0]
             in (%1)"},
         );
-        let interfaces = branches.each_ref().map(Program::interface);
+        let interfaces = branches.each_ref().map(|program| program.interface().clone());
 
         // An `f64[3]` input refines the `true` branch's output to the `false` branch's `f64[3]`, so the refined
         // branch outputs agree. An `f64[4]` input refines it to `f64[4]`, which the `false` branch does not produce.
@@ -3494,8 +3837,8 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharded_type = branch_input_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
         let interfaces = vec![
-            scalar_branch(ArrayOperation::Add(AddOperation::new())).interface(),
-            scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation::new())).interface(),
+            scalar_branch(ArrayOperation::Add(AddOperation::new())).interface().clone(),
+            scalar_branch(ArrayOperation::ZeroLike(ZeroLikeOperation::new())).interface().clone(),
         ];
         assert_eq!(
             ConditionOperation::<ArrayType>::new()
@@ -3504,8 +3847,37 @@ mod tests {
         );
         assert_eq!(
             ConditionOperation::<ArrayType>::new()
-                .infer_region_input_types(&[predicate_type, sharded_type.clone()], interfaces.as_slice()),
+                .infer_region_input_types(&[predicate_type.clone(), sharded_type.clone()], interfaces.as_slice()),
+            Ok(vec![Some(vec![sharded_type.clone()]), Some(vec![sharded_type.clone()])]),
+        );
+
+        // A partially reconciled pair, with one branch already specialized at the sharded input and its peer still
+        // pending, specializes both branches when the specialized signature refines the pending one. The specialized
+        // branch was replayed, so its output carries the sharding that the pending output lacks.
+        let input_types = [predicate_type, sharded_type.clone()];
+        let pending = interfaces[0].clone();
+        let specialized =
+            RegionInterface::new(vec![sharded_type.clone()], vec![sharded_type.clone()], EffectClasses::NONE);
+        assert_eq!(
+            ConditionOperation::<ArrayType>::new()
+                .infer_region_input_types(&input_types, &[specialized.clone(), pending.clone()]),
+            Ok(vec![Some(vec![sharded_type.clone()]), Some(vec![sharded_type.clone()])]),
+        );
+        assert_eq!(
+            ConditionOperation::<ArrayType>::new()
+                .infer_region_input_types(&input_types, &[pending, specialized.clone()]),
             Ok(vec![Some(vec![sharded_type.clone()]), Some(vec![sharded_type])]),
+        );
+
+        // A pending peer whose signature the specialized branch does not refine keeps both branches as they are.
+        let mismatched = RegionInterface::new(
+            vec![branch_input_type.clone()],
+            vec![ArrayType::scalar(DataType::F32)],
+            EffectClasses::NONE,
+        );
+        assert_eq!(
+            ConditionOperation::<ArrayType>::new().infer_region_input_types(&input_types, &[specialized, mismatched]),
+            Ok(vec![None, None]),
         );
 
         // A static extent within the bounds of a dynamic branch input dimension refines it, and the outputs take the
@@ -3760,7 +4132,7 @@ mod tests {
         let false_branch =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         let branches = [true_branch, false_branch];
-        let interfaces = branches.each_ref().map(Program::interface);
+        let interfaces = branches.each_ref().map(|program| program.interface().clone());
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_types = [predicate_type.clone(), varying_type.clone()];
         let operation = ConditionOperation::new();
@@ -3834,7 +4206,7 @@ mod tests {
         );
         assert_eq!(
             ConditionOperation::<ArrayIrType>::new()
-                .infer_output_types(&input_types, &[branch.interface(), branch.interface()]),
+                .infer_output_types(&input_types, &[branch.interface().clone(), branch.interface().clone()]),
             Err(expected.clone()),
         );
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
@@ -3851,7 +4223,7 @@ mod tests {
     #[test]
     fn test_condition_validate_region_interfaces() {
         let branches = mismatched_input_branches();
-        let interfaces = branches.each_ref().map(Program::interface);
+        let interfaces = branches.each_ref().map(|program| program.interface().clone());
         let expected = Err(ProgramError::Type(TypeError::invalid(
             "`condition` branch input type signature mismatch: expected [f64[extent]] but got [f64[3]]",
         )));
@@ -3913,7 +4285,7 @@ mod tests {
         );
         let array_ir_branches =
             branches.map(|branch| branch.into_unprojected::<TestIrValue, TestIrOperation>().unwrap());
-        let interfaces = array_ir_branches.each_ref().map(Program::interface);
+        let interfaces = array_ir_branches.each_ref().map(|program| program.interface().clone());
         assert_eq!(
             TestIrOperation::Condition(ConditionOperation::new()).validate_region_interfaces(&interfaces),
             expected,
@@ -6519,7 +6891,7 @@ mod tests {
             false_evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[] .
-                let %1:f64[] = zero_like %0
+                let %1:f64[] = zero [type=f64[]]
                 in (%1)"},
         );
         assert_eq!(
@@ -6585,7 +6957,7 @@ mod tests {
                     },
                     false={
                         lambda %0:f64[] .
-                        let %1:f64[] = zero_like %0
+                        let %1:f64[] = zero [type=f64[]]
                         in (%1)
                     },
                 ]
@@ -7236,7 +7608,7 @@ mod tests {
 
             // Discharge requires value-only public outputs. Retain the conditional effects while omitting its
             // forwarded handle; specialization and discharge must leave both live allocations untouched.
-            let discharged = evaluation.program().with_outputs(&[]).unwrap().discharge_references(0).unwrap();
+            let discharged = evaluation.program().clone().with_outputs(&[]).unwrap().discharge_references(0).unwrap();
             assert_eq!(
                 discharged.external_reference_bindings(),
                 &[
@@ -7883,7 +8255,9 @@ mod tests {
     fn test_condition_partial_evaluation_instantiates_asymmetric_known_outputs() {
         // The true branch returns `(sin(known), sin(known) * unknown, known * known, sin(unknown))`, and the false
         // branch returns `(unknown, known * unknown, unknown, unknown)`. The true branch's two instantiated outputs
-        // follow its original `sin(known)` feeder edge and are interleaved with unknown outputs in the result.
+        // follow its original `sin(known)` feeder edge and are interleaved with unknown outputs in the result. All
+        // edges have type `f64[]`, so the false branch's `known` feeder edge shares the first of the true branch's
+        // three residual slots, and the false branch needs placeholders only for the other two.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let mut true_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -7961,42 +8335,40 @@ mod tests {
             known_program.to_string(),
             indoc! {"
                 lambda %0:bool[], %1:f64[] .
-                let %2:f64[], %3:f64[], %4:f64[], %5:f64[] = condition %0 %1 [
+                let %2:f64[], %3:f64[], %4:f64[] = condition %0 %1 [
                     true={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
                             %2:f64[] = mul %0 %0
-                            %3:f64[] = zero [type=f64[]]
-                        in (%1, %1, %2, %3)
+                        in (%1, %1, %2)
                     },
                     false={
                         lambda %0:f64[] .
                         let %1:f64[] = zero [type=f64[]]
                             %2:f64[] = zero [type=f64[]]
-                            %3:f64[] = zero [type=f64[]]
-                        in (%1, %2, %3, %0)
+                        in (%0, %1, %2)
                     },
                 ]
-                in (%0, %2, %3, %4, %5)"},
+                in (%0, %2, %3, %4)"},
         );
         assert_eq!(
             evaluation.program.to_string(),
             indoc! {"
-                lambda %0:f64[], %1:bool[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
-                let %6:f64[], %7:f64[], %8:f64[], %9:f64[] = condition %1 %0 %2 %3 %4 %5 [
+                lambda %0:f64[], %1:bool[], %2:f64[], %3:f64[], %4:f64[] .
+                let %5:f64[], %6:f64[], %7:f64[], %8:f64[] = condition %1 %0 %2 %3 %4 [
                     true={
-                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
-                        let %5:f64[] = mul %1 %0
-                            %6:f64[] = sin %0
-                        in (%2, %5, %3, %6)
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[] = mul %1 %0
+                            %5:f64[] = sin %0
+                        in (%2, %4, %3, %5)
                     },
                     false={
-                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[] .
-                        let %5:f64[] = mul %4 %0
-                        in (%0, %5, %0, %0)
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[] = mul %1 %0
+                        in (%0, %4, %0, %0)
                     },
                 ]
-                in (%6, %7, %8, %9)"},
+                in (%5, %6, %7, %8)"},
         );
 
         // Compose the two programs through the reported residual boundary for each runtime predicate. The inactive
@@ -8009,6 +8381,615 @@ mod tests {
             let expected = expected.into_iter().map(|value| Array::scalar(value).unwrap()).collect::<Vec<_>>();
             assert_eq!(program.interpret(arguments.clone()), Ok(expected.clone()));
             assert_eq!(interpret_known_side_and_residual(&known_program, &evaluation, arguments, 2), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_shares_residual_slots_of_equal_types() {
+        // `f(p, k, u) = if p { sin(k) * u } else { cos(k) * u }` with a symbolic known `p`, a known `k`, and an unknown
+        // `u`. Each branch saves one `f64[]` residual. Only one branch runs, so both residuals share one residual slot
+        // of the known condition, and neither known branch needs a placeholder.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(predicate, k, u): (ArrayTracer, ArrayTracer, ArrayTracer)| {
+                predicate.condition(|(k, u)| Ok(k.sin()? * u), |(k, u)| Ok(k.cos()? * u), (k, u))
+            },
+            (predicate_type.clone(), scalar_type.clone(), scalar_type.clone()),
+        )
+        .unwrap();
+        let program = program.into_flat_program();
+
+        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &outer,
+                &[
+                    PartialValue::Known(outer.input(predicate_type)),
+                    PartialValue::Known(outer.input(scalar_type.clone())),
+                    PartialValue::Unknown(scalar_type),
+                ],
+            )
+            .unwrap();
+        let known_program = known_side_program(&outer, &evaluation, 2);
+        assert_eq!(
+            known_program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[] .
+                let %2:f64[] = condition %0 %1 [
+                    true={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:f64[] .
+                        let %1:f64[] = cos %0
+                        in (%1)
+                    },
+                ]
+                in (%0, %2)"},
+        );
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[], %2:f64[] .
+                let %3:f64[] = condition %1 %0 %2 [
+                    true={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                    false={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%3)"},
+        );
+        for (predicate, expected) in [(true, 3.0f64.sin() * 4.0), (false, 3.0f64.cos() * 4.0)] {
+            let arguments =
+                vec![Array::scalar(predicate).unwrap(), Array::scalar(3.0f64).unwrap(), Array::scalar(4.0f64).unwrap()];
+            let expected = vec![Array::scalar(expected).unwrap()];
+            assert_eq!(program.interpret(arguments.clone()), Ok(expected.clone()));
+            assert_eq!(interpret_known_side_and_residual(&known_program, &evaluation, arguments, 2), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_shares_repeated_residual_slots() {
+        // `f(p, k, u) = if p { sin(k) * u } else { sin(k) * u + cos(k) * u }` saves one `f64[]` residual in the `true`
+        // branch and two in the `false` branch. The `true` branch's residual shares the first slot with the first
+        // residual of the `false` branch, the second residual of the `false` branch needs a second slot of the same
+        // type, and the `true` branch fills that slot with a placeholder.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(predicate, k, u): (ArrayTracer, ArrayTracer, ArrayTracer)| {
+                predicate.condition(|(k, u)| Ok(k.sin()? * u), |(k, u)| Ok(k.sin()? * u.clone() + k.cos()? * u), (k, u))
+            },
+            (predicate_type.clone(), scalar_type.clone(), scalar_type.clone()),
+        )
+        .unwrap();
+        let program = program.into_flat_program();
+
+        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &outer,
+                &[
+                    PartialValue::Known(outer.input(predicate_type)),
+                    PartialValue::Known(outer.input(scalar_type.clone())),
+                    PartialValue::Unknown(scalar_type),
+                ],
+            )
+            .unwrap();
+        let known_program = known_side_program(&outer, &evaluation, 2);
+        assert_eq!(
+            known_program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[] .
+                let %2:f64[], %3:f64[] = condition %0 %1 [
+                    true={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = zero [type=f64[]]
+                        in (%1, %2)
+                    },
+                    false={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = cos %0
+                        in (%1, %2)
+                    },
+                ]
+                in (%0, %2, %3)"},
+        );
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[], %2:f64[], %3:f64[] .
+                let %4:f64[] = condition %1 %0 %2 %3 [
+                    true={
+                        lambda %0:f64[], %1:f64[], %2:f64[] .
+                        let %3:f64[] = mul %1 %0
+                        in (%3)
+                    },
+                    false={
+                        lambda %0:f64[], %1:f64[], %2:f64[] .
+                        let %3:f64[] = mul %1 %0
+                            %4:f64[] = mul %2 %0
+                            %5:f64[] = add %3 %4
+                        in (%5)
+                    },
+                ]
+                in (%4)"},
+        );
+        for (predicate, expected) in [(true, 3.0f64.sin() * 4.0), (false, 3.0f64.sin() * 4.0 + 3.0f64.cos() * 4.0)] {
+            let arguments =
+                vec![Array::scalar(predicate).unwrap(), Array::scalar(3.0f64).unwrap(), Array::scalar(4.0f64).unwrap()];
+            let expected = vec![Array::scalar(expected).unwrap()];
+            assert_eq!(program.interpret(arguments.clone()), Ok(expected.clone()));
+            assert_eq!(interpret_known_side_and_residual(&known_program, &evaluation, arguments, 2), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_shares_residual_slots_of_effect_only_branches() {
+        // `f(p, k, u) = if p { print(sin(k) * u) } else { print(cos(k) * u) }` returns no values, so only the effects
+        // of its residual branches keep the residual condition alive. Their `f64[]` residuals still share one slot.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(predicate, k, u): (ArrayTracer, ArrayTracer, ArrayTracer)| {
+                predicate.condition(
+                    |(k, u)| {
+                        (k.sin()? * u).print("true")?;
+                        Ok(Vec::<Tracer<NestedTracingContext<TracingContext<Array, ArrayOperation<Array>>>>>::new())
+                    },
+                    |(k, u)| {
+                        (k.cos()? * u).print("false")?;
+                        Ok(Vec::<Tracer<NestedTracingContext<TracingContext<Array, ArrayOperation<Array>>>>>::new())
+                    },
+                    (k, u),
+                )
+            },
+            (predicate_type.clone(), scalar_type.clone(), scalar_type.clone()),
+        )
+        .unwrap();
+        let program = program.into_flat_program();
+
+        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &outer,
+                &[
+                    PartialValue::Known(outer.input(predicate_type)),
+                    PartialValue::Known(outer.input(scalar_type.clone())),
+                    PartialValue::Unknown(scalar_type),
+                ],
+            )
+            .unwrap();
+        assert_eq!(evaluation.outputs, Vec::new());
+        assert!(evaluation.program.effects().classes().is_ordered());
+        let known_program = known_side_program(&outer, &evaluation, 2);
+        assert_eq!(
+            known_program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[] .
+                let %2:f64[] = condition %0 %1 [
+                    true={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:f64[] .
+                        let %1:f64[] = cos %0
+                        in (%1)
+                    },
+                ]
+                in (%0, %2)"},
+        );
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[], %2:f64[] .
+                let () = condition %1 %0 %2 [
+                    true={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                            %3:f64[] = print [label=true] %2
+                        in ()
+                    },
+                    false={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                            %3:f64[] = print [label=false] %2
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        for predicate in [true, false] {
+            let arguments =
+                vec![Array::scalar(predicate).unwrap(), Array::scalar(3.0f64).unwrap(), Array::scalar(4.0f64).unwrap()];
+            assert_eq!(program.interpret(arguments.clone()), Ok(Vec::new()));
+            assert_eq!(interpret_known_side_and_residual(&known_program, &evaluation, arguments, 2), Ok(Vec::new()));
+        }
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_shares_residual_slots_under_a_residual_policy() {
+        // `f(p, k, u) = if p { dot(k, k) * u } else { sin(k) * u }` saves the `f64[]` outputs of a dot product and of a
+        // sine, which share one residual slot of the known condition. A residual policy that places the residuals of
+        // the partition therefore classifies one candidate whose producers are the dot product and the sine, and makes
+        // one decision for both, rather than classifying each producer next to the other branch's placeholder.
+        struct RecordingPolicy(Arc<Mutex<Vec<Vec<&'static str>>>>);
+
+        impl ResidualPolicy<ArrayType> for RecordingPolicy {
+            type Storage = NoStorage;
+
+            fn name(&self) -> &str {
+                "recording"
+            }
+
+            fn classify(
+                &self,
+                candidate: &ResidualCandidate<'_, ArrayType>,
+            ) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
+                let producers = candidate.producers().iter().map(ResidualProducer::name).collect();
+                self.0.lock().unwrap().push(producers);
+                Ok(ResidualDecision::Save)
+            }
+        }
+
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let mut true_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let k = true_builder.add_input(scalar_type.clone());
+        let u = true_builder.add_input(scalar_type.clone());
+        let dot = DotOperation::new(DotDimensionNumbers::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+        let product = true_builder.add_instruction(dot, Vec::new(), vec![k, k], None).unwrap()[0];
+        let output = true_builder.add_instruction(MulOperation::new(), Vec::new(), vec![product, u], None).unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut false_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let k = false_builder.add_input(scalar_type.clone());
+        let u = false_builder.add_input(scalar_type.clone());
+        let sine = false_builder.add_instruction(SinOperation::new(), Vec::new(), vec![k], None).unwrap()[0];
+        let output = false_builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, u], None).unwrap()[0];
+        let false_branch = false_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let predicate = builder.add_input(predicate_type);
+        let k = builder.add_input(scalar_type.clone());
+        let u = builder.add_input(scalar_type);
+        let true_region = builder.import_program(true_branch);
+        let false_region = builder.import_program(false_branch);
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![true_region, false_region], vec![predicate, k, u], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        let candidates = Arc::new(Mutex::new(Vec::new()));
+        let policy = ResidualPolicyReference::new(RecordingPolicy(candidates.clone()));
+        let partition = program.partition(&[true, true, false]).unwrap().with_residual_policy(&policy).unwrap();
+        assert_eq!(*candidates.lock().unwrap(), vec![vec![DOT_OPERATION_NAME, SIN_OPERATION_NAME]]);
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[] .
+                    let %2:f64[] = condition %0 %1 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[] = sin %0
+                            in (%1)
+                        },
+                    ]
+                    in (%0, %2)
+                }
+                residual={
+                    lambda %0:f64[], %1:bool[], %2:f64[] .
+                    let %3:f64[] = condition %1 %0 %2 [
+                        true={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = mul %1 %0
+                            in (%2)
+                        },
+                        false={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = mul %1 %0
+                            in (%2)
+                        },
+                    ]
+                    in (%3)
+                }"},
+        );
+        for (predicate, expected) in [(true, 9.0 * 4.0), (false, 3.0f64.sin() * 4.0)] {
+            let mut known_outputs = partition
+                .known_program()
+                .interpret(vec![Array::scalar(predicate).unwrap(), Array::scalar(3.0f64).unwrap()])
+                .unwrap();
+            known_outputs.insert(0, Array::scalar(4.0f64).unwrap());
+            assert_eq!(
+                partition.residual_program().interpret(known_outputs),
+                Ok(vec![Array::scalar(expected).unwrap()])
+            );
+        }
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_splits_all_known_conditions_on_residual_demand() {
+        // Under a policy that saves dot products, the residual work of `compact_expansion_condition_program` needs the
+        // output of a condition whose branches save their dot products. Replaying the condition whole would recompute
+        // them, so the planner splits the condition on residual demand, as JAX does. The known condition also returns
+        // the dot product of the branch that runs in a shared residual slot, and a residual condition over the
+        // predicate recomputes the output from that slot, instead of the partition saving the whole `f64[4]` output.
+        let program = compact_expansion_condition_program(false, false);
+        let partition = program
+            .partition_with_residual_policy(&[true, true, false], &ResidualPolicyReference::new(DotsSavable))
+            .unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[2] .
+                    let %2:f64[] = condition %0 %1 [
+                        true={
+                            lambda %0:f64[2] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f64[2] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                            in (%1)
+                        },
+                    ]
+                    in (%0, %2)
+                }
+                residual={
+                    lambda %0:f64[4], %1:bool[], %2:f64[] .
+                    let %3:f64[4] = condition %1 %2 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[4] = broadcast [output_type=f64[4], output_axes=[]] %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[4] = broadcast [output_type=f64[4], output_axes=[]] %0
+                                %2:f64[4] = add %1 %1
+                            in (%2)
+                        },
+                    ]
+                        %4:f64[4] = mul %3 %0
+                    in (%4)
+                }"},
+        );
+
+        // Running the known program and then the residual program reproduces the original output for both predicates.
+        let w = Array::vector(vec![1f64, 2.0]).unwrap();
+        let y = Array::vector(vec![1f64, -1.0, 2.0, 0.5]).unwrap();
+        for predicate in [true, false] {
+            let predicate = Array::scalar(predicate).unwrap();
+            let mut residual_inputs = vec![y.clone()];
+            residual_inputs.extend(partition.known_program().interpret(vec![predicate.clone(), w.clone()]).unwrap());
+            assert_eq!(
+                partition.residual_program().interpret(residual_inputs),
+                program.interpret(vec![predicate, w.clone(), y.clone()]),
+            );
+        }
+
+        // Saving nothing replays the whole condition in the residual program.
+        let partition = program
+            .partition_with_residual_policy(&[true, true, false], &ResidualPolicyReference::new(NothingSavable))
+            .unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[2] .
+                    in (%0, %1)
+                }
+                residual={
+                    lambda %0:f64[4], %1:bool[], %2:f64[2] .
+                    let %3:f64[4] = condition %1 %2 [
+                        true={
+                            lambda %0:f64[2] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                                %2:f64[4] = broadcast [output_type=f64[4], output_axes=[]] %1
+                            in (%2)
+                        },
+                        false={
+                            lambda %0:f64[2] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                                %2:f64[4] = broadcast [output_type=f64[4], output_axes=[]] %1
+                                %3:f64[4] = add %2 %2
+                            in (%3)
+                        },
+                    ]
+                        %4:f64[4] = mul %3 %0
+                    in (%4)
+                }"},
+        );
+    }
+
+    #[test]
+    fn test_condition_partial_evaluation_splits_on_residual_demand_without_repeating_known_outputs() {
+        // When the condition of `compact_expansion_condition_program` also returns the dot product that the split on
+        // residual demand saves (e.g., because an earlier split already made it return that value), the residual
+        // condition reads that known output instead of a residual slot, so the known condition returns the dot product
+        // once.
+        let program = compact_expansion_condition_program(true, false);
+        let partition = program
+            .partition_with_residual_policy(&[true, true, false], &ResidualPolicyReference::new(DotsSavable))
+            .unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Unknown(0), Known(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[2] .
+                    let %2:f64[] = condition %0 %1 [
+                        true={
+                            lambda %0:f64[2] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f64[2] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                            in (%1)
+                        },
+                    ]
+                    in (%2, %0, %2)
+                }
+                residual={
+                    lambda %0:f64[4], %1:bool[], %2:f64[] .
+                    let %3:f64[4] = condition %1 %2 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[4] = broadcast [output_type=f64[4], output_axes=[]] %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[4] = broadcast [output_type=f64[4], output_axes=[]] %0
+                                %2:f64[4] = add %1 %1
+                            in (%2)
+                        },
+                    ]
+                        %4:f64[4] = mul %3 %0
+                    in (%4)
+                }"},
+        );
+
+        // Running the known program and then the residual program reproduces the original outputs for both predicates.
+        let w = Array::vector(vec![1f64, 2.0]).unwrap();
+        let y = Array::vector(vec![1f64, -1.0, 2.0, 0.5]).unwrap();
+        for predicate in [true, false] {
+            let predicate = Array::scalar(predicate).unwrap();
+            let known_outputs = partition.known_program().interpret(vec![predicate.clone(), w.clone()]).unwrap();
+            let mut residual_inputs = vec![y.clone()];
+            residual_inputs.extend(known_outputs[1..].iter().cloned());
+            let residual_outputs = partition.residual_program().interpret(residual_inputs).unwrap();
+            assert_eq!(
+                Ok(vec![residual_outputs[0].clone(), known_outputs[0].clone()]),
+                program.interpret(vec![predicate, w.clone(), y.clone()]),
+            );
+        }
+
+        // A known output stands in for a residual slot only when it is the saved value in every branch that fills the
+        // slot. When the `false` branch returns `dot(w, w) + dot(w, w)` in place of its dot product, the known
+        // condition keeps returning the saved dot product of the branch that runs in a slot of its own.
+        let program = compact_expansion_condition_program(true, true);
+        let partition = program
+            .partition_with_residual_policy(&[true, true, false], &ResidualPolicyReference::new(DotsSavable))
+            .unwrap();
+        assert_eq!(
+            partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Unknown(0), Known(0)],
+                ]
+                known={
+                    lambda %0:bool[], %1:f64[2] .
+                    let %2:f64[], %3:f64[] = condition %0 %1 [
+                        true={
+                            lambda %0:f64[2] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                            in (%1, %1)
+                        },
+                        false={
+                            lambda %0:f64[2] .
+                            let %1:f64[] = dot [
+                                dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            ] %0 %0
+                                %2:f64[] = add %1 %1
+                            in (%2, %1)
+                        },
+                    ]
+                    in (%2, %0, %3)
+                }
+                residual={
+                    lambda %0:f64[4], %1:bool[], %2:f64[] .
+                    let %3:f64[4] = condition %1 %2 [
+                        true={
+                            lambda %0:f64[] .
+                            let %1:f64[4] = broadcast [output_type=f64[4], output_axes=[]] %0
+                            in (%1)
+                        },
+                        false={
+                            lambda %0:f64[] .
+                            let %1:f64[4] = broadcast [output_type=f64[4], output_axes=[]] %0
+                                %2:f64[4] = add %1 %1
+                            in (%2)
+                        },
+                    ]
+                        %4:f64[4] = mul %3 %0
+                    in (%4)
+                }"},
+        );
+        for predicate in [true, false] {
+            let predicate = Array::scalar(predicate).unwrap();
+            let known_outputs = partition.known_program().interpret(vec![predicate.clone(), w.clone()]).unwrap();
+            let mut residual_inputs = vec![y.clone()];
+            residual_inputs.extend(known_outputs[1..].iter().cloned());
+            let residual_outputs = partition.residual_program().interpret(residual_inputs).unwrap();
+            assert_eq!(
+                Ok(vec![residual_outputs[0].clone(), known_outputs[0].clone()]),
+                program.interpret(vec![predicate, w.clone(), y.clone()]),
+            );
         }
     }
 
@@ -9136,9 +10117,10 @@ mod tests {
             assert_eq!(evaluation.interpret(&TestEagerContext::new(), &unknown_arguments), Ok(expected.clone()));
         }
 
-        // A symbolic known predicate cannot select a branch. Partitioning the original symbolic branches produces an
-        // identity-bearing residual edge `x * x`, for which no peer-branch placeholder is invented. The condition
-        // remains whole; emission specializes its residual branches without hoisting arithmetic into the known side.
+        // A symbolic known predicate cannot select a branch. Partitioning the original symbolic branches produces the
+        // residual edge `x * x` in the `true` branch and the residual edge `x` in the `false` branch, both of the
+        // identity-bearing type `f64[rows]`. The two edges share one residual slot, so neither branch needs a
+        // placeholder, which could not be invented for that type, and the condition is split.
         let outer = TracingContext::<TestIrValue, TestIrOperation>::new();
         let evaluation = program
             .partially_evaluate_in_context(
@@ -9150,27 +10132,51 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert!(outer.builder().borrow().instructions().is_empty());
+        let known_program = known_side_program(&outer, &evaluation, 2);
+        assert_eq!(
+            known_program.to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[3] .
+                let %2:f64[3] = condition %0 %1 [
+                    true={
+                        lambda %0:f64[3] .
+                        let %1:f64[3] = mul %0 %0
+                        in (%1)
+                    },
+                    false={
+                        lambda %0:f64[3] .
+                        in (%0)
+                    },
+                ]
+                in (%0, %2)"},
+        );
         assert_eq!(
             evaluation.program.to_string(),
             indoc! {"
                 lambda %0:f64[3], %1:bool[], %2:f64[3] .
-                let %3:f64[3] = condition %1 %2 %0 [
+                let %3:f64[3] = condition %1 %0 %2 [
                     true={
                         lambda %0:f64[3], %1:f64[3] .
-                        let %2:f64[3] = mul %0 %0
-                            %3:f64[3] = add %2 %1
-                        in (%3)
+                        let %2:f64[3] = add %1 %0
+                        in (%2)
                     },
                     false={
                         lambda %0:f64[3], %1:f64[3] .
-                        let %2:f64[3] = add %0 %1
+                        let %2:f64[3] = add %1 %0
                         in (%2)
                     },
                 ]
                 in (%3)"},
         );
         assert_eq!(evaluation.program.output_types(), vec![vector_type]);
+        for (predicate, expected) in [(true, vec![11.0, 24.0, 39.0]), (false, vec![11.0, 22.0, 33.0])] {
+            let mut arguments = arguments.to_vec();
+            arguments[0] = array(Array::scalar(predicate).unwrap());
+            assert_eq!(
+                interpret_known_side_and_residual(&known_program, &evaluation, arguments, 2),
+                Ok(vec![array(Array::vector(expected).unwrap())]),
+            );
+        }
     }
 
     #[test]
@@ -10536,7 +11542,7 @@ mod tests {
         assert_eq!(
             ConditionOperation::<ArrayIrType>::new().infer_output_types(
                 &[ArrayType::scalar(DataType::Boolean).into()],
-                &[true_branch.interface(), false_branch.interface()],
+                &[true_branch.interface().clone(), false_branch.interface().clone()],
             ),
             Err(expected.clone()),
         );
@@ -10564,7 +11570,7 @@ mod tests {
         assert_eq!(
             ConditionOperation::<ArrayIrType>::new().infer_output_types(
                 &[ArrayType::scalar(DataType::Boolean).into()],
-                &[branch.interface(), branch.interface()],
+                &[branch.interface().clone(), branch.interface().clone()],
             ),
             Ok(vec![expected.r#type().into_owned()]),
         );
@@ -10594,7 +11600,7 @@ mod tests {
         assert_eq!(
             ConditionOperation::<ArrayIrType>::new().infer_output_types(
                 &[ArrayType::scalar(DataType::Boolean).into(), dimension_type.clone().into()],
-                &[branch.interface(), branch.interface()],
+                &[branch.interface().clone(), branch.interface().clone()],
             ),
             Ok(vec![dimension_type.clone().into()]),
         );
@@ -11850,6 +12856,182 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_differentiation_linearization_shares_residual_slots() {
+        // `f(p, x) = if p { sin(x) } else { cos(x) }` saves `cos(x)` in the `true` branch and `sin(x)` in the `false`
+        // branch, both of type `f64[]`, so the primal condition returns one residual slot that each branch fills with
+        // its own residual and that the tangent and pullback conditions read in either branch.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(predicate, x): (ArrayTracer, ArrayTracer)| predicate.condition(|x| x.sin(), |x| x.cos(), x),
+            (ArrayType::scalar(DataType::Boolean), scalar_type),
+        )
+        .unwrap();
+        let linearization = program.into_flat_program().linearize_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[] .
+                let %2:f64[], %3:f64[] = condition %0 %1 [
+                    true={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = cos %0
+                        in (%1, %2)
+                    },
+                    false={
+                        lambda %0:f64[] .
+                        let %1:f64[] = cos %0
+                            %2:f64[] = sin %0
+                        in (%1, %2)
+                    },
+                ]
+                in (%2, %0, %3)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[], %2:f64[] .
+                let %3:f64[] = condition %1 %0 %2 [
+                    true={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                    false={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                            %3:f64[] = neg %2
+                        in (%3)
+                    },
+                ]
+                in (%3)"},
+        );
+        let pullback = linearization.pullback().unwrap().into_program();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:bool[], %2:f64[] .
+                let %3:f64[] = condition %1 %0 %2 [
+                    true={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                    false={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = neg %0
+                            %3:f64[] = mul %1 %2
+                        in (%3)
+                    },
+                ]
+                in (%3)"},
+        );
+
+        // Both predicate values produce the selected branch's primal value, tangent, and cotangent.
+        for (predicate, expected_value, expected_derivative) in
+            [(true, 0.7f64.sin(), 0.7f64.cos()), (false, 0.7f64.cos(), -0.7f64.sin())]
+        {
+            let mut outputs = linearization
+                .primal()
+                .interpret(vec![Array::scalar(predicate).unwrap(), Array::scalar(0.7f64).unwrap()])
+                .unwrap();
+            let residuals = outputs.split_off(1);
+            assert_eq!(outputs, vec![Array::scalar(expected_value).unwrap()]);
+            let mut tangent_inputs = vec![Array::scalar(1.5f64).unwrap()];
+            tangent_inputs.extend(residuals.clone());
+            assert_eq!(
+                linearization.tangent().interpret(tangent_inputs),
+                Ok(vec![Array::scalar(expected_derivative * 1.5).unwrap()]),
+            );
+            let mut pullback_inputs = vec![Array::scalar(2.5f64).unwrap()];
+            pullback_inputs.extend(residuals);
+            assert_eq!(
+                pullback.interpret(pullback_inputs),
+                Ok(vec![Array::scalar(expected_derivative * 2.5).unwrap()])
+            );
+        }
+    }
+
+    #[test]
+    fn test_condition_differentiation_linearization_shares_dynamic_residual_slots() {
+        // `f(p, x) = if p { x * x } else { sin(x) }` over `x: f64[n]` saves `x` in the `true` branch and `cos(x)` in
+        // the `false` branch. Both residuals have the dynamic type `f64[n]`, so they share one slot and neither branch
+        // needs a placeholder that would otherwise have to recover the runtime extent of `x`.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![n.dimension().clone()]));
+        let (_, program) = TracingContext::<TestIrValue, TestIrOperation>::trace(
+            |(predicate, x): (TestTracer, TestTracer)| predicate.condition(|x| Ok(x.clone() * x), |x| x.sin(), x),
+            (ArrayIrType::from(ArrayType::scalar(DataType::Boolean)), ArrayIrType::from(vector_type)),
+        )
+        .unwrap();
+        let linearization = program.into_flat_program().linearize_with_respect_to(&[1]).unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f64[n] .
+                let %2:f64[n], %3:f64[n] = condition %0 %1 [
+                    true={
+                        lambda %0:f64[n] .
+                        let %1:f64[n] = mul %0 %0
+                        in (%1, %0)
+                    },
+                    false={
+                        lambda %0:f64[n] .
+                        let %1:f64[n] = sin %0
+                            %2:f64[n] = cos %0
+                        in (%1, %2)
+                    },
+                ]
+                in (%2, %0, %3)"},
+        );
+        let pullback = linearization.pullback().unwrap().into_program();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[n], %1:bool[], %2:f64[n] .
+                let %3:f64[n] = condition %1 %0 %2 [
+                    true={
+                        lambda %0:f64[n], %1:f64[n] .
+                        let %2:f64[n] = mul %1 %0
+                            %3:f64[n] = mul %1 %0
+                            %4:f64[n] = add %2 %3
+                        in (%4)
+                    },
+                    false={
+                        lambda %0:f64[n], %1:f64[n] .
+                        let %2:f64[n] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%3)"},
+        );
+
+        // Both predicate values produce the selected branch's primal value and gradient at two extents of `n`.
+        for (predicate, input) in [
+            (true, vec![2f64, 3.0]),
+            (false, vec![2f64, 3.0]),
+            (true, vec![0.5f64, 1.0, 1.5]),
+            (false, vec![0.5f64, 1.0, 1.5]),
+        ] {
+            let extent = input.len();
+            let (expected_value, expected_gradient) = if predicate {
+                (input.iter().map(|x| x * x).collect::<Vec<_>>(), input.iter().map(|x| 2.0 * x).collect::<Vec<_>>())
+            } else {
+                (input.iter().map(|&x| f64::sin(x)).collect(), input.iter().map(|&x| f64::cos(x)).collect())
+            };
+            let mut outputs = linearization
+                .primal()
+                .interpret(vec![array(Array::scalar(predicate).unwrap()), array(Array::vector(input).unwrap())])
+                .unwrap();
+            let residuals = outputs.split_off(1);
+            assert_eq!(outputs, vec![array(Array::vector(expected_value).unwrap())]);
+            let mut pullback_inputs = vec![array(Array::vector(vec![1f64; extent]).unwrap())];
+            pullback_inputs.extend(residuals);
+            assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![array(Array::vector(expected_gradient).unwrap())]));
+        }
+    }
+
+    #[test]
     fn test_condition_differentiation_linearization_rejects_invariant_residuals_under_varying_predicates() {
         // The `true` branch varies `sin(w)` of an invariant weight `w` before using it, so its linearization saves the
         // invariant residual `cos(w)`. Every residual is an output of the primal condition, whose outputs must vary
@@ -12920,6 +14102,46 @@ mod tests {
                 array(Array::vector(vec![1.0, 1.0, 1.0]).unwrap()),
             ]),
         );
+    }
+
+    #[test]
+    fn test_condition_differentiation_specializes_branches_at_sharded_inputs() {
+        // Branches traced over unannotated types (e.g., a function traced once and replayed inside the gradient of
+        // sharded inputs) are specialized at the sharded input before they are differentiated, so the tangent and
+        // cotangent types carry its sharding. Specializing the true branch propagates the sharding to its output while
+        // the unspecialized false branch still declares none, and this must not prevent specializing the false branch.
+        // Otherwise, the cotangent of the input would be unannotated and its accumulator would reject it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
+        let unannotated_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
+        let sharded_type = ArrayIrType::Array(
+            ArrayType::new_static(DataType::F64, [3]).with_sharding(Sharding::replicated(mesh, 1)).unwrap(),
+        );
+        let branch = |operation| {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let input = builder.add_input(unannotated_type.clone());
+            let output = builder
+                .add_instruction(TestIrOperation::Array(operation), Vec::new(), vec![input, input], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(sharded_type.clone());
+        let true_region = builder.import_program(branch(ArrayOperation::Mul(MulOperation::new())));
+        let false_region = builder.import_program(branch(ArrayOperation::Add(AddOperation::new())));
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![true_region, false_region], vec![predicate, input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.tangent().output_types(), vec![sharded_type.clone()]);
+        let pullback = linearization.pullback().unwrap().into_program();
+        assert_eq!(pullback.output_types(), vec![sharded_type]);
     }
 
     #[test]
@@ -14534,7 +15756,7 @@ mod tests {
                 ]
                 in ()"},
         );
-        let simplified = transposed.program().simplified().unwrap();
+        let simplified = transposed.program().as_ref().clone().into_simplified().unwrap();
         assert_eq!(
             simplified.to_string(),
             indoc! {"
@@ -16043,5 +17265,114 @@ mod tests {
             in (%3)"};
         assert_eq!(linearization.tangent().to_string(), tangent);
         assert_eq!(linearization.pullback().unwrap().program().to_string(), tangent);
+    }
+
+    #[test]
+    fn test_partitioned_condition_branch_from_partition_drops_unread_residual_edges() {
+        // The known program returns the known output `-k` and saves `sin(k)` and `cos(k)` as residual edges after it,
+        // but the residual program reads only the second edge. The unread edge must not reach the merged residual
+        // slots, so it is removed from both programs, and the known work that only it used goes with it.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut known_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let k = known_builder.add_input(scalar_type.clone());
+        let negated = known_builder.add_instruction(NegOperation::new(), Vec::new(), vec![k], None).unwrap()[0];
+        let sine = known_builder.add_instruction(SinOperation::new(), Vec::new(), vec![k], None).unwrap()[0];
+        let cosine = known_builder.add_instruction(CosOperation::new(), Vec::new(), vec![k], None).unwrap()[0];
+        let known_program = known_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![negated, sine, cosine], vec![Placeholder], vec![Placeholder; 3])
+            .unwrap();
+        let mut residual_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let u = residual_builder.add_input(scalar_type.clone());
+        residual_builder.add_input(scalar_type.clone());
+        let cosine = residual_builder.add_input(scalar_type.clone());
+        let output =
+            residual_builder.add_instruction(MulOperation::new(), Vec::new(), vec![cosine, u], None).unwrap()[0];
+        let residual_program = residual_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let partition = PartitionedProgram::from_parts(
+            known_program,
+            residual_program,
+            2,
+            vec![0],
+            vec![
+                ResidualInputSource::UnknownInput(1),
+                ResidualInputSource::ResidualEdge(0),
+                ResidualInputSource::ResidualEdge(1),
+            ],
+            vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)],
+        )
+        .unwrap();
+
+        let branch = PartitionedConditionBranch::from_partition(partition, &[true, false], &[true, false]).unwrap();
+        assert_eq!(branch.edges, vec![(scalar_type, 1)]);
+        assert_eq!(
+            branch.partition.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0],
+                    residual_inputs=[UnknownInput(1), ResidualEdge(0)],
+                    outputs=[Known(0), Unknown(0)],
+                ]
+                known={
+                    lambda %0:f64[] .
+                    let %1:f64[] = neg %0
+                        %2:f64[] = cos %0
+                    in (%1, %2)
+                }
+                residual={
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = mul %1 %0
+                    in (%2)
+                }"},
+        );
+    }
+
+    #[test]
+    fn test_merge_condition_edges() {
+        let x = ArrayType::scalar(DataType::F64);
+        let y = ArrayType::scalar(DataType::F32);
+        let z = ArrayType::new_static(DataType::F64, [3]);
+        let edges = |types: &[&ArrayType]| types.iter().map(|&edge_type| (edge_type.clone(), 0)).collect::<Vec<_>>();
+
+        // Equal types share slots, in order of first appearance across the `true` and then the `false` branch.
+        assert_eq!(merge_condition_edges([&edges(&[&x]), &edges(&[&x])]), (vec![x.clone()], [vec![0], vec![0]]));
+        assert_eq!(
+            merge_condition_edges([&edges(&[&x, &y]), &edges(&[&y, &z])]),
+            (vec![x.clone(), y.clone(), z.clone()], [vec![0, 1], vec![1, 2]]),
+        );
+        assert_eq!(
+            merge_condition_edges([&edges(&[&y, &x, &x]), &edges(&[&x, &z, &y])]),
+            (vec![y.clone(), x.clone(), x.clone(), z.clone()], [vec![0, 1, 2], vec![1, 3, 0]]),
+        );
+        assert_eq!(merge_condition_edges([&edges(&[]), &edges(&[&x])]), (vec![x.clone()], [vec![], vec![0]]));
+
+        // Repeated types need as many slots as the branch that repeats them most, and a branch never puts two of its
+        // edges in one slot.
+        assert_eq!(
+            merge_condition_edges([&edges(&[&x]), &edges(&[&x, &x])]),
+            (vec![x.clone(), x.clone()], [vec![0], vec![0, 1]]),
+        );
+        assert_eq!(
+            merge_condition_edges([&edges(&[&x, &x]), &edges(&[&y])]),
+            (vec![x.clone(), x.clone(), y.clone()], [vec![0, 1], vec![2]]),
+        );
+
+        // Types that differ only in their memory kind, their sharding, or their manual variation stay separate.
+        let host = x.clone().with_memory(Memory::Host { pinned: true });
+        assert_eq!(
+            merge_condition_edges([&edges(&[&x]), &edges(&[&host])]),
+            (vec![x.clone(), host], [vec![0], vec![1]])
+        );
+        let (_, invariant, varying) = devices_varying_predicate_types();
+        let unsharded = ArrayType::scalar(DataType::F32);
+        assert_eq!(
+            merge_condition_edges([&edges(&[&unsharded]), &edges(&[&invariant])]),
+            (vec![unsharded, invariant.clone()], [vec![0], vec![1]]),
+        );
+        assert_eq!(
+            merge_condition_edges([&edges(&[&invariant]), &edges(&[&varying])]),
+            (vec![invariant, varying], [vec![0], vec![1]]),
+        );
     }
 }

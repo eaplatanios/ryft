@@ -120,7 +120,7 @@ where
             .map_err(ProgramError::from)?,
     )?;
     let program = program
-        .simplified()?
+        .into_simplified()?
         .restructured::<Input::To<Constant>, Output::To<Constant>>(input_structure, output_structure)?;
     Ok(TracedProgram { global_input_types, global_output_types, program })
 }
@@ -148,11 +148,11 @@ where
 {
     /// Returns backend-neutral structural statistics for the staged traced XLA program backing this handle. The
     /// statistics describe the program as [`trace`] stores it, which it has already simplified (refer to
-    /// [`Program::simplified`](ryft_core::Program::simplified)): instructions that reach no program output are not
-    /// counted unless they have observable effects, while the boundary pruning of operations with attached regions
-    /// (refer to [`Program::into_pruned`](ryft_core::Program::into_pruned)), which lowering applies, is not reflected
-    /// in the counts. Refer to the documentation of [`Program::statistics`](ryft_core::Program::statistics) for the
-    /// precise semantics of the reported statistics.
+    /// [`Program::into_simplified`](ryft_core::Program::into_simplified)): instructions that reach no program output
+    /// are not counted unless they have observable effects, while the boundary pruning of operations with attached
+    /// regions (refer to [`Program::into_pruned`](ryft_core::Program::into_pruned)), which lowering applies, is not
+    /// reflected in the counts. Refer to the documentation of [`Program::statistics`](ryft_core::Program::statistics)
+    /// for the precise semantics of the reported statistics.
     pub fn statistics(&self) -> ProgramStatistics {
         self.program.statistics()
     }
@@ -228,7 +228,7 @@ where
             }
         }
 
-        let simplified_program = self.program.clone().into_pruned()?.simplified()?;
+        let simplified_program = self.program.clone().into_pruned()?.into_simplified()?;
         Ok(super::lowering::lower_mlir_module_for_program_with_value_shardings(
             &simplified_program,
             &[],

@@ -4448,7 +4448,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
-        let program = program.simplified().unwrap();
+        let program = program.into_simplified().unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"

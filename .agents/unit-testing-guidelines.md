@@ -42,7 +42,8 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - Use `TestRegionOperation` for tests that specifically isolate region-carrying program machinery.
 - Keep test-only instrumentation out of production types and functions. Prefer observing existing behavior through
   test fixtures (e.g., counting operation queries) and inspecting actual caches in colocated tests instead of adding
-  conditional counter fields or increments to production analysis. Define shared test-only types, state, and injection
+  conditional counter fields or increments to production analysis. Do not add `cfg(test)` execution hooks solely to
+  count function calls, allocations, or internal work. Define shared test-only types, state, and injection
   setters directly in the owning inline `tests` module, and let any required `cfg(test)` execution hooks call those
   helpers. Keep test support out of production facade re-exports and inherent APIs.
 
@@ -70,8 +71,8 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 
 ## Imports
 
-- Preserve normal import grouping inside test modules:
-  `std`, third-party crates, `crate::...`, then `super::...` when needed.
+- Place imports at the top of the owning `tests` module, never inside individual tests or test helpers. Preserve normal
+  import grouping there: `std`, third-party crates, `crate::...`, then `super::...` when needed.
 - Import only the helpers and types needed by the test module.
 - Import `pretty_assertions::assert_eq` in tests that compare strings, rendered IR, maps, vectors, or larger structs.
 - Import `indoc::indoc` for multiline expected strings instead of concatenating or manually managing indentation.

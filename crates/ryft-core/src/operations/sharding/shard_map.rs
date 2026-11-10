@@ -1869,7 +1869,7 @@ impl ShardMapOperation {
         // forwarding by type inference.
         operation.validate_body(body.entry_region_ref())?;
         operation
-            .infer_output_types(&global_input_types, &[body.entry_region_ref().interface()])
+            .infer_output_types(&global_input_types, std::slice::from_ref(body.interface()))
             .map_err(ProgramError::from)?;
         Ok(operation)
     }
@@ -2794,8 +2794,10 @@ where
             .batch_program(&body_context, body, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?
             .into_parts();
         check_count!("output", batched_body.output_ids(), output_axes.len() + 1, ProgramError);
-        let (live_body, live_inputs) =
-            batched_body.filtered(batched_body.input_ids(), &batched_body.output_ids()[1..], &[])?;
+        let body_input_types = batched_body.input_types()[1..].to_vec();
+        let body_input_ids = batched_body.input_ids().to_vec();
+        let body_output_ids = batched_body.output_ids()[1..].to_vec();
+        let (live_body, live_inputs) = batched_body.into_filtered(&body_input_ids, &body_output_ids, &[])?;
         let batched_body = {
             let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
             let body_extent = if live_inputs.contains(&0) {
@@ -2804,11 +2806,7 @@ where
             } else {
                 None
             };
-            let body_inputs = batched_body.input_types()[1..]
-                .iter()
-                .cloned()
-                .map(|r#type| builder.add_input(r#type))
-                .collect::<Vec<_>>();
+            let body_inputs = body_input_types.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
             let live_body_inputs = live_inputs
                 .iter()
                 .map(|&index| if index == 0 { body_extent.unwrap() } else { body_inputs[index - 1] })
@@ -2820,7 +2818,7 @@ where
                     vec![Placeholder; body_inputs.len()],
                     vec![Placeholder; output_axes.len()],
                 )?
-                .simplified()?
+                .into_simplified()?
         };
 
         // The batched body reports the logical batch axis of each output, which `normalize_batch_axis` resolves to the
@@ -4231,7 +4229,8 @@ where
 
         // The regions of the instruction communicate across the emulated devices, so they must run in lockstep.
         let regions = instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
-        operation.validate_region_interfaces(&regions.iter().map(|region| region.interface()).collect::<Vec<_>>())?;
+        operation
+            .validate_region_interfaces(&regions.iter().map(|region| region.interface().clone()).collect::<Vec<_>>())?;
         if let Some(operation) = operation.projected_payload::<WhileOperation<ArrayIrType>>() {
             return self.run_lockstep(operation, &regions, inputs);
         }
@@ -6021,7 +6020,7 @@ where
     let output_count = outputs.len();
     builder
         .build::<Vec<V>, Vec<V>>(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])?
-        .simplified()
+        .into_simplified()
 }
 
 /// Linearizes a `shard_map` body capture-free under the inputs' activity mask into a primal body and a tangent body
@@ -6108,7 +6107,7 @@ where
     let tangent_program = if live_tangent_slots.len() == tangent_program.output_count() {
         Arc::unwrap_or_clone(tangent_program)
     } else {
-        tangent_program.with_outputs(&live_tangent_slots)?
+        Arc::unwrap_or_clone(tangent_program).with_outputs(&live_tangent_slots)?
     };
 
     // A tangent body without live outputs is linear and computes nothing observable unless it has effects (e.g., a
@@ -6222,7 +6221,8 @@ where
     // allocation usable, so the snapshot stays valid even when the read is later scheduled ahead of uses of the
     // reference that do not access it (e.g., passing it to an opaque call), while the declared read effect keeps it
     // ordered after every access.
-    let primal_program = primal_program.with_outputs(&(0..output_count).chain(edge_positions).collect::<Vec<_>>())?;
+    let primal_program = Arc::unwrap_or_clone(primal_program)
+        .with_outputs(&(0..output_count).chain(edge_positions).collect::<Vec<_>>())?;
     let primal_program = if edge_roots.iter().any(Option::is_some) {
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
         let inputs = primal_program
@@ -6395,8 +6395,8 @@ where
 /// is live, in which case nothing is bound. The fused body is the fused JVP program of `body` with respect to the
 /// inputs that `activity` marks as active, which maps `[inputs..., active(input_tangents)...]` to
 /// `[outputs..., output_tangents...]`, projected onto the outputs followed by the live output tangents with its dead
-/// work removed (refer to [`Program::with_outputs`] and [`Program::simplified`]). An output tangent is live when it
-/// depends on some active input tangent (JAX's `which_nz_out`), and every other output receives a structurally zero
+/// work removed (refer to [`Program::with_outputs`] and [`Program::into_simplified`]). An output tangent is live when
+/// it depends on some active input tangent (JAX's `which_nz_out`), and every other output receives a structurally zero
 /// tangent. Each input tangent crosses the boundary under the input sharding of its primal, and each output tangent
 /// under the output sharding of its primal, as in JAX's `_shard_map_jvp`.
 fn fused_shard_map_jvp<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -6438,8 +6438,8 @@ where
         .enumerate()
         .filter_map(|(index, &live)| live.then_some(index))
         .collect::<Vec<_>>();
-    let fused_body = fused_body.with_outputs(&output_indices)?;
-    let simplified_body = fused_body.simplified()?;
+    let fused_body = Arc::unwrap_or_clone(fused_body).with_outputs(&output_indices)?;
+    let simplified_body = fused_body.clone().into_simplified()?;
 
     // A no-op cleanup keeps the staged order and existing transform caches instead of adopting the instruction order
     // that simplification derives from the outputs. Removing instructions remains necessary even when every output is
@@ -7079,7 +7079,7 @@ where
         transposed_program = Arc::new(
             builder
                 .build(rebuilt_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])?
-                .simplified()?,
+                .into_simplified()?,
         );
     }
 
@@ -7282,7 +7282,7 @@ where
         transposed_program = Arc::new(
             builder
                 .build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])?
-                .simplified()?,
+                .into_simplified()?,
         );
     }
     let operation = ShardMapOperation::from_boundary(boundary, global_input_types, global_output_types)
@@ -7665,7 +7665,7 @@ where
             TracingScope::new(outer_named_axes, Some(mesh.clone())),
         )?;
         let boundary = rebuilt_boundary.into_inner().unwrap_or(boundary);
-        let body = body.simplified()?;
+        let body = body.into_simplified()?;
         let operation = ShardMapOperation::from_program(
             &body,
             global_input_types.iter().cloned().map(ArrayIrType::Array).collect(),
@@ -10724,7 +10724,8 @@ mod tests {
             .unwrap();
         let expected = ShardMapError::InputVariesAlongManualAxis { input_index: 0, axis_name: "x".to_string() };
         assert_eq!(
-            operation.infer_output_types(&[varying_type.into()], &[body.entry_region_ref().interface()]),
+            operation
+                .infer_output_types(&[varying_type.into()], std::slice::from_ref(body.entry_region_ref().interface())),
             Err(TypeError::custom(expected.clone())),
         );
         assert_eq!(
@@ -10794,7 +10795,10 @@ mod tests {
             .unwrap();
         let expected = ShardMapError::InputMeshMismatch { input_index: 0, expected: manual_mesh(), actual: other_mesh };
         assert_eq!(
-            operation.infer_output_types(&[input_type.clone().into()], &[body.entry_region_ref().interface()]),
+            operation.infer_output_types(
+                &[input_type.clone().into()],
+                std::slice::from_ref(body.entry_region_ref().interface())
+            ),
             Err(TypeError::custom(expected.clone())),
         );
 
@@ -10805,7 +10809,8 @@ mod tests {
             .with_sharding(Sharding::new(explicit_mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
             .unwrap();
         assert_eq!(
-            operation.infer_output_types(&[explicit_type.into()], &[body.entry_region_ref().interface()]),
+            operation
+                .infer_output_types(&[explicit_type.into()], std::slice::from_ref(body.entry_region_ref().interface())),
             Ok(vec![f32_vector_type(8).with_sharding(sharded_along_x()).unwrap().into()]),
         );
 
@@ -10853,8 +10858,10 @@ mod tests {
             .unwrap();
         let declared_type = f32_vector_type(8).with_sharding(sharding.clone()).unwrap();
         assert_eq!(
-            invariant_operation
-                .infer_output_types(&[varying_type.clone().into()], &[invariant_body.entry_region_ref().interface()]),
+            invariant_operation.infer_output_types(
+                &[varying_type.clone().into()],
+                std::slice::from_ref(invariant_body.entry_region_ref().interface())
+            ),
             Err(TypeError::invalid(format!(
                 "`shard_map` input #0 has type `{varying_type}` but its declared global input type is \
                  `{declared_type}`",
@@ -10870,13 +10877,17 @@ mod tests {
             ShardMapOperation::from_program(&varying_body, vec![varying_type.clone().into()], boundary).unwrap();
         assert_eq!(varying_operation.global_input_types(), &[varying_declared_type.clone().into()]);
         assert_eq!(
-            varying_operation
-                .infer_output_types(&[varying_type.clone().into()], &[varying_body.entry_region_ref().interface()]),
+            varying_operation.infer_output_types(
+                &[varying_type.clone().into()],
+                std::slice::from_ref(varying_body.entry_region_ref().interface())
+            ),
             Ok(vec![varying_declared_type.clone().into()]),
         );
         assert_eq!(
-            varying_operation
-                .infer_output_types(&[f32_vector_type(8).into()], &[varying_body.entry_region_ref().interface()]),
+            varying_operation.infer_output_types(
+                &[f32_vector_type(8).into()],
+                std::slice::from_ref(varying_body.entry_region_ref().interface())
+            ),
             Err(TypeError::invalid(format!(
                 "`shard_map` input #0 has type `f32[8]` but its declared global input type is \
                  `{varying_declared_type}`",
@@ -10895,7 +10906,10 @@ mod tests {
             ShardMapOperation::from_program(&body, vec![f32_vector_type(8).into()], boundary.clone()).unwrap();
         let expected = ShardMapError::InputMeshMismatch { input_index: 0, expected: mesh, actual: other_mesh };
         assert_eq!(
-            operation.infer_output_types(&[varying_type.clone().into()], &[body.entry_region_ref().interface()]),
+            operation.infer_output_types(
+                &[varying_type.clone().into()],
+                std::slice::from_ref(body.entry_region_ref().interface())
+            ),
             Err(TypeError::custom(expected.clone())),
         );
         assert_eq!(ShardMapOperation::from_program(&body, vec![varying_type.into()], boundary), Err(expected));
@@ -11481,7 +11495,7 @@ mod tests {
         );
         let jvp = program.jvp().unwrap();
         let tangent_outputs = jvp.output_ids()[2..].to_vec();
-        let program = jvp.filtered(jvp.input_ids(), &tangent_outputs, &[]).unwrap().0;
+        let program = jvp.clone().into_filtered(jvp.input_ids(), &tangent_outputs, &[]).unwrap().0;
         let scalar = f32_scalar_type().with_sharding(replicated.clone()).unwrap();
         assert_eq!(
             program.into_pruned().unwrap().to_string(),
@@ -11649,7 +11663,7 @@ mod tests {
         let partition = program
             .partition(&[true, false])
             .unwrap()
-            .with_top_level_residual_policy(&ResidualPolicyReference::new(NothingSavable))
+            .with_residual_policy(&ResidualPolicyReference::new(NothingSavable))
             .unwrap();
         assert_eq!(
             partition.to_string(),
@@ -15251,7 +15265,7 @@ mod tests {
         let discharged = program.discharge_references(0).unwrap();
         assert_eq!(discharged.external_reference_bindings().len(), 1);
         assert!(discharged.external_reference_bindings()[0].is_mutated());
-        let discharged_program = discharged.program().simplified().unwrap();
+        let discharged_program = discharged.program().clone().into_simplified().unwrap();
         assert_eq!(
             discharged_program.to_string(),
             formatdoc! {"

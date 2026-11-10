@@ -361,7 +361,7 @@ impl LowerableOperation for ShardMapOperation {
                 lowerer.regions.len()
             ))));
         };
-        let simplified_body = body.simplified()?;
+        let simplified_body = body.clone().into_simplified()?;
         let local_input_types = simplified_body
             .input_types()
             .iter()

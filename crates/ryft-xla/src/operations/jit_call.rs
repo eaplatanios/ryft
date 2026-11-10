@@ -1,3 +1,4 @@
+use std::any::TypeId;
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -20,9 +21,9 @@ use ryft_core::{
     ReferenceDischargeValue, ReferenceDischargeableOperation, Region as CoreRegion, RegionDataFlow, RegionId,
     RegionInterface, RegionLiveness, RegionRef, RegionRole, RegionSlot, RematerializationOptimizationBarrier,
     ResidualDemandSplit, ResidualInputSource, ResidualPolicyReference, ShardMapOperation, StagedCallOperation,
-    Tracer as CoreTracer, TracingContext, Transform, TransformArtifact, TransposableOperation, TranspositionContext,
-    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed, TypedProgram,
-    Value as CoreValue, ValueProjection, Zero,
+    TangentActivity, Tracer as CoreTracer, TracingContext, Transform, TransformArtifact, TransposableOperation,
+    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, TypeRefinements, Typed,
+    TypedProgram, Value as CoreValue, ValueProjection, Zero,
 };
 use ryft_mlir::dialects::func;
 use ryft_mlir::{
@@ -1419,7 +1420,8 @@ where
         let (callee, axes) = driver
             .batch_program(context, driver.region(0)?, &axes, ProgramBatchingOutputAxesPolicy::Natural)?
             .into_parts();
-        let callee = callee.with_outputs(&(1..callee.output_count()).collect::<Vec<_>>())?;
+        let kept_outputs = (1..callee.output_count()).collect::<Vec<_>>();
+        let callee = callee.with_outputs(&kept_outputs)?;
         let mut values = vec![context.axis_extent().clone()];
         values.extend(inputs.iter().map(|input| input.value().clone()));
         let operation = Self::new(self.capture_count() + 1).with_callee_region(callee.entry_region_ref())?;
@@ -1488,18 +1490,21 @@ where
     }
 }
 
-// Capture-free forward-mode (JVP) rule for [`JitCallOperation`], binding a primal `jit_call` and a tangent
-// `jit_call` as ordinary XLA-enum operations through the active context: a staging context stages both calls over
-// its shared builder, while an eager context (e.g. a client-backed [`Domain`](crate::Domain)) compiles and
-// executes them immediately, which is what powers top-level `jvp` over concrete arrays.
+// Capture-free forward-mode (JVP) rule for [`JitCallOperation`]. When the primal and tangent contexts are shared
+// (e.g., for `jvp` and for the fused program that a `rematerialize` rule partitions), the rule binds one fused
+// `jit_call` over the callee's forward mode program, projected onto the primal outputs and the live output tangents,
+// as JAX's `_pjit_jvp` does. An enclosing partial evaluation then splits that call with its own residual policy.
+// Otherwise, it binds a primal `jit_call` and a tangent `jit_call` as ordinary XLA-enum operations through the active
+// context: a staging context stages both calls over its shared builder, while an eager context (e.g. a client-backed
+// [`Domain`](crate::Domain)) compiles and executes them immediately.
 //
-// This realizes the identity `jvp(jit(f)) = jit(jvp f)`: rather than capturing the primal inputs as residual factors
-// and staging a linear `jit_call`, the rule keeps the compilation boundary and threads every residual as a plain
-// primal operand edge between two `jit_call`s, so no symbolic capture is ever introduced. The enclosing
+// Both forms realize the identity `jvp(jit(f)) = jit(jvp f)`: rather than capturing the primal inputs as residual
+// factors and staging a linear `jit_call`, the separate form keeps the compilation boundary and threads every residual
+// as a plain primal operand edge between two `jit_call`s, so no symbolic capture is ever introduced. The enclosing
 // partial-evaluation split then discovers the residual operand edges structurally, exactly as it does for the
 // condition and rematerialize rules.
 //
-// The rule linearizes the callee program capture-free through
+// For separate contexts, the rule linearizes the callee program capture-free through
 // [`Program::linearize`](ryft_core::Program::linearize) under the operands' activity mask (an operand with a live
 // tangent is active, while the capture prefix, an operand with a structurally zero tangent, and a plumbing reference
 // operand that receives no tangent reference are not, as under JAX's `which_nz`), giving a primal sub-program
@@ -1570,6 +1575,51 @@ where
             .enumerate()
             .filter_map(|(index, &active)| active.then_some(index))
             .collect::<Vec<_>>();
+        // A shared primal/tangent destination binds one fused call over the callee's forward mode program, projected
+        // onto its primal outputs and live output tangents (JAX's `_pjit_jvp`). An enclosing partial evaluation then
+        // splits that call with its own residual policy, instead of reusing a linearization boundary chosen here.
+        if std::ptr::eq(context.primal(), context.tangent()) {
+            self.validate_capture_prefix(input_types.len())?;
+            let activity = TangentActivity::new(driver, callee, &activity)?;
+            let output_activity = activity.output_tangent_liveness();
+            let live_tangent_slots = activity.live_tangent_slots(output_activity);
+            let program = activity.jvp_program();
+            let mut operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            if live_tangent_slots.is_empty() && !program.effects().is_retained_when_unused() {
+                let callee = shared_jit_call_callee(callee)?;
+                return context
+                    .primal()
+                    .bind(Operation::JitCall(self.clone()), AttachedRegions::Callees(&[callee]), &operands)?
+                    .into_iter()
+                    .map(DifferentiationDual::new_with_zero_tangent)
+                    .collect();
+            }
+            let outputs = (0..output_count).chain(live_tangent_slots.iter().map(|&slot| output_count + slot));
+            let program = if outputs.clone().eq(0..program.output_count()) {
+                program.clone()
+            } else {
+                Arc::new(program.as_ref().clone().with_outputs(&outputs.collect::<Vec<_>>())?)
+            };
+            operands.extend(
+                activity.input_indices().iter().map(|&index| inputs[index].tangent().as_value().unwrap().clone()),
+            );
+
+            // The primal operands come first, so the lifted-capture prefix of the source call carries over unchanged.
+            let operation = Operation::JitCall(
+                JitCallOperation::new(capture_count).with_callee_region(program.entry_region_ref())?,
+            );
+            let mut outputs = context.primal().bind(operation, AttachedRegions::Callees(&[program]), &operands)?;
+            check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
+            let mut tangents = outputs.split_off(output_count).into_iter();
+            return Ok(outputs
+                .into_iter()
+                .zip(output_activity)
+                .map(|(primal, &live)| match live {
+                    true => DifferentiationDual::new(primal, tangents.next().unwrap()),
+                    false => DifferentiationDual::new_with_zero_tangent(primal),
+                })
+                .collect::<Result<Vec<_>, _>>()?);
+        }
         let linearization = driver.linearize_program(callee, &input_indices, Some(&[]))?;
 
         // An output tangent that depends on no active input tangent (e.g., the tangent of a constant output or of an
@@ -1604,7 +1654,7 @@ where
         let tangent_program = if live_tangent_slots.len() == tangent_program.output_count() {
             tangent_program.clone()
         } else {
-            Arc::new(tangent_program.with_outputs(&live_tangent_slots)?)
+            Arc::new(tangent_program.as_ref().clone().with_outputs(&live_tangent_slots)?)
         };
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         if !output_activity.contains(&true) && !tangent_program.effects().is_retained_when_unused() {
@@ -1952,9 +2002,10 @@ struct JitCallSplitArguments {
     /// definition identity, or [`None`] when partial evaluation has no residual policy.
     policy: Option<ResidualPolicyReference<ArrayIrType>>,
 
-    /// Whether the placement of the residuals of the split also rounds the values that the known callee saves (refer to
-    /// [`PartialEvaluationContext::rounds_residuals`]), which stages rounding operations in the known callee.
-    rounds_residuals: bool,
+    /// Type of the rounding with which the placement of the residuals of the split also rounds the values that the
+    /// known callee saves (refer to [`PartialEvaluationContext::residual_rounding_type`]), which stages rounding
+    /// operations in the known callee, or [`None`] when the placement keeps those values unrounded.
+    residual_rounding_type: Option<TypeId>,
 
     /// Whether effectful operations with known inputs may fold into the known callee (refer to
     /// [`PartialEvaluationContext::allow_effect_folding`]).
@@ -2099,8 +2150,8 @@ fn forward_jit_call_inputs<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Ty
 /// calls nested in the callees of an enclosing split, therefore shares one known callee and one residual callee for
 /// each kind of split and each policy, so the programs grow with the number of calls rather than with the size of
 /// their callees, and each callee is partitioned once rather than once per call. Calls whose partial evaluations round
-/// the saved values (refer to [`PartialEvaluationContext::rounds_residuals`]) share a split of their own, whose known
-/// callee rounds the values that it saves right after their producers, before its own known work consumes them.
+/// the saved values (refer to [`PartialEvaluationContext::residual_rounding_type`]) share a split of their own, whose
+/// known callee rounds the values that it saves right after their producers, before its own known work consumes them.
 /// Mixed splits may contain effects, with the driver's repeated-residual mode included in the key. All-known splits
 /// exclude effects, and both kinds exclude references, captures, and nominal identities (refer to
 /// [`keeps_jit_call_boundary`] and [`can_cache_jit_call_split`]).
@@ -2128,7 +2179,7 @@ where
     let arguments = JitCallSplitArguments {
         kind,
         policy: context.residual_policy().cloned(),
-        rounds_residuals: context.rounds_residuals(),
+        residual_rounding_type: context.residual_rounding_type(),
         allow_effect_folding: context.allow_effect_folding(),
         repeated_residual: keeps_trivial_splits_whole
             && !callee.effects().classes().is_empty()
@@ -3262,7 +3313,7 @@ mod tests {
         program
             .partition(&[true, false])
             .unwrap()
-            .with_top_level_residual_policy(&ResidualPolicyReference::new(policy))
+            .with_residual_policy(&ResidualPolicyReference::new(policy))
             .unwrap();
         assert_eq!(names.lock().unwrap().clone(), vec!["mul".to_string()]);
     }
@@ -3444,8 +3495,8 @@ mod tests {
     #[test]
     fn test_jit_call_jvp_keeps_capture_prefix_inactive() {
         // The callee's leading input is its lifted capture (`capture_count = 1`). The call's activity mask starts
-        // inactive over that prefix, numeric captures included, so the tangent callee consumes only the live operand
-        // tangent followed by the residuals, and the primal callee keeps the capture prefix verbatim.
+        // inactive over that prefix, numeric captures included, so the fused callee consumes the primal operands,
+        // capture prefix first, followed only by the live operand tangent.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
@@ -3474,16 +3525,11 @@ mod tests {
             .iter()
             .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
             .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 2);
-        let primal_callee = jvp.region_ref(calls[0].regions()[0]).unwrap();
+        assert_eq!(calls.len(), 1);
         assert!(matches!(calls[0].operation(), Operation::JitCall(operation) if operation.capture_count() == 1));
-        assert_eq!(primal_callee.input_types().len(), 2);
-        let residual_count = primal_callee.output_types().len() - 1;
-        assert!(residual_count >= 1);
-        let tangent_callee = jvp.region_ref(calls[1].regions()[0]).unwrap();
-        assert!(matches!(calls[1].operation(), Operation::JitCall(operation) if operation.capture_count() == 0));
-        assert_eq!(tangent_callee.input_types().len(), 1 + residual_count);
-        assert_eq!(calls[1].inputs().len(), 1 + residual_count);
+        let inputs = jvp.input_ids();
+        assert_eq!(calls[0].inputs(), &[inputs[0], inputs[1], inputs[3]]);
+        assert_eq!(calls[0].outputs().len(), 2);
     }
 
     #[test]
@@ -3544,8 +3590,7 @@ mod tests {
             .unwrap();
 
         // The plumbing capture is inactive and the active reference receives a tangent reference input, so the fused
-        // program consumes `[captured, r, x, ṫr, ẋ]`: the primal call keeps the capture prefix verbatim, while the
-        // tangent call consumes the tangent reference and the tangent value followed by the residuals.
+        // program and its one fused call consume `[captured, r, x, ṫr, ẋ]`, keeping the capture prefix verbatim.
         let jvp = program.entry_region_ref().jvp(&[1, 2]).unwrap();
         assert_eq!(
             jvp.input_types(),
@@ -3563,20 +3608,10 @@ mod tests {
             .iter()
             .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
             .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 1);
         assert!(matches!(calls[0].operation(), Operation::JitCall(operation) if operation.capture_count() == 1));
-        assert_eq!(&calls[0].inputs()[..3], &jvp.input_ids()[..3]);
-        let primal_callee = jvp.region_ref(calls[0].regions()[0]).unwrap();
-        assert_eq!(
-            primal_callee.input_types(),
-            vec![reference_type.clone(), reference_type.clone(), scalar_type.clone()]
-        );
-        let residual_count = primal_callee.output_types().len() - 1;
-        assert!(matches!(calls[1].operation(), Operation::JitCall(operation) if operation.capture_count() == 0));
-        assert_eq!(&calls[1].inputs()[..2], &jvp.input_ids()[3..]);
-        assert_eq!(calls[1].inputs().len(), 2 + residual_count);
-        let tangent_callee = jvp.region_ref(calls[1].regions()[0]).unwrap();
-        assert_eq!(&tangent_callee.input_types()[..2], &[reference_type, scalar_type]);
+        assert_eq!(calls[0].inputs(), jvp.input_ids());
+        assert_eq!(jvp.input_types(), jvp.region_ref(calls[0].regions()[0]).unwrap().input_types());
     }
 
     #[test]
@@ -3610,15 +3645,15 @@ mod tests {
             .iter()
             .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
             .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(jvp.region_ref(calls[1].regions()[0]).unwrap().output_types().len(), 1);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(jvp.region_ref(calls[0].regions()[0]).unwrap().output_types().len(), 3);
     }
 
     #[test]
     fn test_jit_call_jvp_treats_structurally_zero_tangents_as_inactive() {
         // `f(x, y) = (sin(x), cos(y))` differentiated with respect to `x` only: the structurally zero tangent of `y`
-        // gets no tangent callee slot, and the tangent of `cos(y)`, which then depends on no tangent input, is a
-        // structural zero that the tangent call does not return.
+        // gets no fused callee slot, and the tangent of `cos(y)`, which then depends on no tangent input, is a
+        // structural zero that the fused call does not return.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -3644,31 +3679,25 @@ mod tests {
             program.entry_region_ref().jvp(&[0]).unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[4], %2:f64[4] .
-                let %3:f64[4], %4:f64[4], %5:f64[4] = jit_call %0 %1 [
+                let %3:f64[4], %4:f64[4], %5:f64[4] = jit_call %0 %1 %2 [
                     callee={
-                        lambda %0:f64[4], %1:f64[4] .
-                        let %2:f64[4] = sin %0
-                            %3:f64[4] = cos %1
-                            %4:f64[4] = cos %0
-                        in (%2, %3, %4)
+                        lambda %0:f64[4], %1:f64[4], %2:f64[4] .
+                        let %3:f64[4] = sin %0
+                            %4:f64[4] = cos %1
+                            %5:f64[4] = cos %0
+                            %6:f64[4] = mul %5 %2
+                        in (%3, %4, %6)
                     },
                 ]
-                    %6:f64[4] = jit_call %2 %5 [
-                        callee={
-                            lambda %0:f64[4], %1:f64[4] .
-                            let %2:f64[4] = mul %1 %0
-                            in (%2)
-                        },
-                    ]
-                    %7:f64[4] = zero [type=f64[4]]
-                in (%3, %4, %6, %7)"},
+                    %6:f64[4] = zero [type=f64[4]]
+                in (%3, %4, %5, %6)"},
         );
     }
 
     #[test]
     fn test_jit_call_jvp_omits_independent_output_tangents() {
         // `f(x) = (sin(x), 0)`: the tangent of the constant output depends on no tangent input, so it is a structural
-        // zero that the tangent call does not return.
+        // zero that the fused call does not return.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -3694,24 +3723,18 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda %0:f64[4], %1:f64[4] .
-                let %2:f64[4], %3:f64[4], %4:f64[4] = jit_call %0 [
+                let %2:f64[4], %3:f64[4], %4:f64[4] = jit_call %0 %1 [
                     callee={
-                        lambda %0:f64[4] .
-                        let %1:f64[4] = sin %0
-                            %2:f64[4] = zero [type=f64[4]]
-                            %3:f64[4] = cos %0
-                        in (%1, %2, %3)
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = sin %0
+                            %3:f64[4] = zero [type=f64[4]]
+                            %4:f64[4] = cos %0
+                            %5:f64[4] = mul %4 %1
+                        in (%2, %3, %5)
                     },
                 ]
-                    %5:f64[4] = jit_call %1 %4 [
-                        callee={
-                            lambda %0:f64[4], %1:f64[4] .
-                            let %2:f64[4] = mul %1 %0
-                            in (%2)
-                        },
-                    ]
-                    %6:f64[4] = zero [type=f64[4]]
-                in (%2, %3, %5, %6)"},
+                    %5:f64[4] = zero [type=f64[4]]
+                in (%2, %3, %4, %5)"},
         );
     }
 
@@ -3748,10 +3771,10 @@ mod tests {
             .iter()
             .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
             .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].outputs().len(), 2);
-        assert_eq!(jvp.output_ids()[3], calls[1].outputs()[0]);
-        assert_eq!(jvp.output_ids()[5], calls[1].outputs()[1]);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].outputs().len(), 5);
+        assert_eq!(jvp.output_ids()[3], calls[0].outputs()[3]);
+        assert_eq!(jvp.output_ids()[5], calls[0].outputs()[4]);
         assert!(jvp.instructions().iter().any(|instruction| {
             instruction.outputs().contains(&jvp.output_ids()[4]) && instruction.operation().is_zero(0)
         }));
@@ -4225,7 +4248,7 @@ mod tests {
 
         // Projecting onto the second output keeps the two-output call, so its first seed reaches the call's transpose
         // rule as a structural zero rather than being pruned away beforehand.
-        let projected = program.with_outputs(&[1]).unwrap();
+        let projected = program.clone().with_outputs(&[1]).unwrap();
         assert_eq!(
             projected.to_string(),
             indoc! {"
@@ -5479,7 +5502,7 @@ mod tests {
 
         // The second call output remains a primal result. Its presence must not classify it as a residual. The call
         // keeps its boundary, and the policy saves its first output, which it classifies through the callee.
-        let primal_only = program.with_outputs(&[0, 2]).unwrap();
+        let primal_only = program.clone().with_outputs(&[0, 2]).unwrap();
         let placed = primal_only.partition_with_residual_policy(&[true, false], &policy).unwrap();
         assert_eq!(placed.known_program().output_types(), vec![scalar_type.clone(), scalar_type]);
         assert_eq!(
@@ -6085,7 +6108,7 @@ mod tests {
         let arguments = JitCallSplitArguments {
             kind: JitCallSplitKind::Knownness(vec![true]),
             policy: None,
-            rounds_residuals: false,
+            residual_rounding_type: None,
             allow_effect_folding: true,
             repeated_residual: false,
         };
@@ -6617,7 +6640,7 @@ mod tests {
         let policy = ResidualPolicyReference::new(DotsSavable);
         assert_eq!(
             [1, 2, 4, 8].map(|count| residual_demand_statistics(&repeated(count, Some(policy.clone())), &[0, 1])),
-            [[4, 7, 20], [5, 8, 22], [7, 10, 26], [11, 14, 34]],
+            [[4, 7, 22], [5, 8, 24], [7, 10, 28], [11, 14, 36]],
         );
         let linearization = repeated(2, None).linearize_with_respect_to(&[0, 1]).unwrap();
         assert_eq!(
@@ -6701,7 +6724,7 @@ mod tests {
         let policy = ResidualPolicyReference::new(DotsSavable);
         assert_eq!(
             [1, 2, 3, 4].map(|depth| residual_demand_statistics(&nested(depth, Some(policy.clone())), &[0, 1])),
-            [[5, 11, 30], [7, 15, 42], [11, 19, 54], [19, 23, 66]],
+            [[5, 11, 31], [7, 15, 41], [11, 19, 51], [19, 23, 61]],
         );
 
         let client = execution_client();
@@ -7088,7 +7111,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[] .
                 let %1:f32[] = jit_call [capture_count=1] %0 [
-                    callee=^0={
+                    callee={
                         lambda %0:f32[] .
                         let %1:f32[] = sin %0
                         in (%1)
@@ -7125,15 +7148,16 @@ mod tests {
         );
         let interface = identity_callee.entry_region_ref().interface();
         let first_outputs =
-            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(&interface)).unwrap();
+            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(interface)).unwrap();
         let repeated_outputs =
-            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(&interface)).unwrap();
+            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(interface)).unwrap();
         assert_eq!(first_outputs, repeated_outputs);
         assert_ne!(first_outputs, identity_callee.output_types().into_owned());
         assert_eq!(
-            first.infer_output_types(&identity_callee.input_types(), &[interface]).unwrap()[0].to_string(),
+            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(interface)).unwrap()[0]
+                .to_string(),
             original
-                .infer_output_types(&identity_callee.input_types(), &[identity_callee.entry_region_ref().interface()])
+                .infer_output_types(&identity_callee.input_types(), std::slice::from_ref(identity_callee.interface()))
                 .unwrap()[0]
                 .to_string(),
         );

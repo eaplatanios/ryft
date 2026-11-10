@@ -2686,7 +2686,7 @@ mod tests {
                 PartialValue::Unknown(right.clone().into()),
             ])
             .unwrap();
-        let simplified = residual.program().simplified().unwrap();
+        let simplified = residual.program().clone().into_simplified().unwrap();
         assert_eq!(
             simplified.to_string(),
             indoc! {r#"
@@ -3907,7 +3907,7 @@ mod tests {
         );
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
-            program.simplified().unwrap().to_string(),
+            program.into_simplified().unwrap().to_string(),
             indoc! {r#"
                 lambda %0:bool[] .
                 let () = assert [message="condition must hold", labels=[]] %0

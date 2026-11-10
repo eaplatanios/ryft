@@ -1669,7 +1669,7 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(program.output_count(), 0);
         assert!(program.effects().classes().contains(EffectClass::OrderedAssertion));
-        let simplified = program.simplified().unwrap();
+        let simplified = program.into_simplified().unwrap();
         assert_eq!(simplified.output_count(), 0);
         assert_eq!(simplified.instructions().len(), 1);
         assert!(matches!(simplified.instructions()[0].operation(), Operation::Kernel(_)));

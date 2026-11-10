@@ -588,7 +588,8 @@ impl<T: WhileType> WhileOperation<T> {
         condition: RegionRef<'_, V, O>,
         body: RegionRef<'_, V, O>,
     ) -> Result<Vec<T>, ProgramError> {
-        let output_types = self.infer_output_types(input_types, &[condition.interface(), body.interface()])?;
+        let output_types =
+            self.infer_output_types(input_types, &[condition.interface().clone(), body.interface().clone()])?;
 
         // The body must return every reference carry as its own body input. This is checked even when no iteration
         // runs, so that whether a loop is accepted does not depend on the transform that reaches it or on how its
@@ -2615,7 +2616,7 @@ where
         let linearization = driver.linearize_program(body, input_indices, Some(activity.output_tangent_liveness()))?;
         let live_tangent_slots = linearization.tangent_output_positions(activity.output_tangent_liveness())?;
         let (primal_program, tangent_program, residual_count, _) = linearization.into_parts();
-        let tangent_program = tangent_program.with_outputs(&live_tangent_slots)?;
+        let tangent_program = Arc::unwrap_or_clone(tangent_program).with_outputs(&live_tangent_slots)?;
         let residual_types = primal_program.output_types().into_owned().split_off(state_count);
         check_count!("output", residual_types, residual_count, ProgramError);
 
@@ -3189,7 +3190,7 @@ where
         let fused_body = if fused_outputs.iter().copied().eq(0..fused_body.output_count()) {
             fused_body
         } else {
-            Arc::new(fused_body.with_outputs(&fused_outputs)?)
+            Arc::new(Arc::unwrap_or_clone(fused_body).with_outputs(&fused_outputs)?)
         };
         let fused_state_types = fused_body.input_types().into_owned();
         check_count!("input", fused_state_types, fused_state_count, ProgramError);
@@ -4727,7 +4728,7 @@ mod tests {
         // that maps `f64[extent]` to `f64[3]` is rejected, including through an operation family's derived dispatch
         // (the derive tests own the delegation of the other wrappers).
         let regions = refinement_only_while_regions();
-        let interfaces = regions.each_ref().map(Program::interface);
+        let interfaces = regions.each_ref().map(|program| program.interface().clone());
         let expected = Err(ProgramError::Type(TypeError::invalid(format!(
             "`{WHILE_OPERATION_NAME}` body output type signature mismatch: expected [f64[extent]] but got [f64[3]]",
         ))));
@@ -4791,7 +4792,10 @@ mod tests {
         let state_type = ArrayType::scalar(DataType::F64);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharded_type = state_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
-        let interfaces = countdown_while_regions(state_type.clone()).iter().map(Program::interface).collect::<Vec<_>>();
+        let interfaces = countdown_while_regions(state_type.clone())
+            .iter()
+            .map(|program| program.interface().clone())
+            .collect::<Vec<_>>();
         let operation = WhileOperation::<ArrayType>::new();
         assert_eq!(
             operation.infer_region_input_types(std::slice::from_ref(&state_type), &interfaces),
@@ -4813,7 +4817,7 @@ mod tests {
         let state_type = ArrayType::scalar(DataType::F64);
         let operation = WhileOperation::<ArrayType>::new();
         let regions = countdown_while_regions(state_type.clone());
-        let condition = regions[0].interface();
+        let condition = regions[0].interface().clone();
         let body = regions[1].interface();
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&state_type), &[condition.clone(), body.clone()]),
@@ -4843,8 +4847,10 @@ mod tests {
         let vector_body =
             builder.build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            operation
-                .infer_output_types(std::slice::from_ref(&state_type), &[condition.clone(), vector_body.interface()]),
+            operation.infer_output_types(
+                std::slice::from_ref(&state_type),
+                &[condition.clone(), vector_body.interface().clone()]
+            ),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition/body input type signature mismatch: expected [f64[2]] but got \
                  [f64[]]",
@@ -4864,7 +4870,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 std::slice::from_ref(&state_type),
-                &[multi_output_condition.interface(), body.clone()],
+                &[multi_output_condition.interface().clone(), body.clone()],
             ),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition must return exactly one predicate leaf but returned 2",
@@ -5024,7 +5030,7 @@ mod tests {
         assert_eq!(
             WhileOperation::new().infer_output_types(
                 std::slice::from_ref(&state_type),
-                &[condition.interface(), effectful_body.interface()],
+                &[condition.interface().clone(), effectful_body.interface().clone()],
             ),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` loop with a batched predicate must be pure because observable effects cannot \
@@ -5037,8 +5043,10 @@ mod tests {
             EffectClasses::NONE,
         );
         assert_eq!(
-            WhileOperation::new()
-                .infer_output_types(std::slice::from_ref(&state_type), &[scalar_condition, effectful_body.interface()]),
+            WhileOperation::new().infer_output_types(
+                std::slice::from_ref(&state_type),
+                &[scalar_condition, effectful_body.interface().clone()]
+            ),
             Ok(vec![state_type.clone()]),
         );
     }
@@ -5103,8 +5111,10 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![state], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         assert_eq!(
-            WhileOperation::new()
-                .infer_output_types(std::slice::from_ref(&state_type), &[condition.interface(), body.interface()]),
+            WhileOperation::new().infer_output_types(
+                std::slice::from_ref(&state_type),
+                &[condition.interface().clone(), body.interface().clone()]
+            ),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, but \
                  predicate `bool[3]` is not a prefix of state `f64[2]`",
@@ -5183,7 +5193,10 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharded_type = state_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
         let operation = WhileOperation::new();
-        let interfaces = countdown_while_regions(state_type.clone()).iter().map(Program::interface).collect::<Vec<_>>();
+        let interfaces = countdown_while_regions(state_type.clone())
+            .iter()
+            .map(|program| program.interface().clone())
+            .collect::<Vec<_>>();
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&sharded_type), interfaces.as_slice()),
             Ok(vec![state_type.clone()]),
@@ -7849,7 +7862,7 @@ mod tests {
                 let %3:f64[], %4:f64[], %5:f64[] = while [iteration_bound=8] %0 %1 %2 [
                     condition={
                         lambda %0:f64[], %1:f64[], %2:f64[] .
-                        let %3:f64[] = zero_like %0
+                        let %3:f64[] = zero [type=f64[]]
                             %4:bool[] = compare [direction=GreaterThan] %0 %3
                         in (%4)
                     },
@@ -8313,7 +8326,7 @@ mod tests {
                 let %2:i32[], %3:i32[] = while %0 %1 [
                     condition={
                         lambda %0:i32[], %1:i32[] .
-                        let %2:i32[] = zero_like %0
+                        let %2:i32[] = zero [type=i32[]]
                             %3:bool[] = compare [direction=GreaterThan] %0 %2
                         in (%3)
                     },
@@ -9463,7 +9476,7 @@ mod tests {
                 let %2:f64[], %3:f64[3] = while %0 %1 [
                     condition={
                         lambda %0:f64[], %1:f64[3] .
-                        let %2:f64[] = zero_like %0
+                        let %2:f64[] = zero [type=f64[]]
                             %3:bool[] = compare [direction=GreaterThan] %0 %2
                         in (%3)
                     },
@@ -9513,7 +9526,7 @@ mod tests {
                 let %1:f64[3] = while %0 [
                     condition={
                         lambda %0:f64[3] .
-                        let %1:f64[3] = zero_like %0
+                        let %1:f64[3] = zero [type=f64[3]]
                             %2:bool[3] = compare [direction=GreaterThan] %0 %1
                         in (%2)
                     },
@@ -9549,7 +9562,7 @@ mod tests {
                 let %1:f64[3] = while [iteration_bound=2] %0 [
                     condition={
                         lambda %0:f64[3] .
-                        let %1:f64[3] = zero_like %0
+                        let %1:f64[3] = zero [type=f64[3]]
                             %2:bool[3] = compare [direction=GreaterThan] %0 %1
                         in (%2)
                     },
@@ -9600,7 +9613,7 @@ mod tests {
                 let %1:f64[3] = while %0 [
                     condition={
                         lambda %0:f64[3] .
-                        let %1:f64[3] = zero_like %0
+                        let %1:f64[3] = zero [type=f64[3]]
                             %2:bool[3] = compare [direction=GreaterThan] %0 %1
                         in (%2)
                     },
@@ -9822,7 +9835,7 @@ mod tests {
                     %4:dimension<2>, %5:f32[], %6:ref<f32[2]> = while %0 %1 %3 [
                         condition={
                             lambda %0:dimension<2>, %1:f32[], %2:ref<f32[2]> .
-                            let %3:f32[] = zero_like %1
+                            let %3:f32[] = zero [type=f32[]]
                                 %4:bool[] = compare [direction=GreaterThan] %1 %3
                             in (%4)
                         },
@@ -9848,7 +9861,7 @@ mod tests {
                 let %3:dimension<2>, %4:f32[], %5:f32[2] = while %0 %1 %2 [
                     condition={
                         lambda %0:dimension<2>, %1:f32[], %2:f32[2] .
-                        let %3:f32[] = zero_like %1
+                        let %3:f32[] = zero [type=f32[]]
                             %4:bool[] = compare [direction=GreaterThan] %1 %3
                         in (%4)
                     },
@@ -9908,7 +9921,7 @@ mod tests {
         let expected = [
             indoc! {"
                 lambda %0:dimension<3>, %1:f64[3] .
-                let %2:f64[3] = zero_like %1
+                let %2:f64[3] = zero [type=f64[3]]
                     %3:bool[3] = compare [direction=GreaterThan] %1 %2
                 in (%0, %3)"},
             indoc! {"

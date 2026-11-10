@@ -1,6 +1,7 @@
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::axes::Axis;
 use crate::batching::{
@@ -1316,7 +1317,7 @@ where
                                 (0..rule_output_count).filter(|&index| kept_outputs[index]).collect::<Vec<_>>();
                             let output_axes =
                                 kept_indices.iter().map(|&index| specialization.output_axes[index]).collect();
-                            (specialization.program.with_outputs(&kept_indices)?, output_axes)
+                            (specialization.program.clone().with_outputs(&kept_indices)?, output_axes)
                         }
                     }
                 } else {
@@ -2279,8 +2280,8 @@ where
             // only valid for a pure primal, because the effects of any other primal (e.g., reference updates, or
             // reference reads that later effects would change) must run once, when the known side runs, so it is
             // linearized inline instead.
-            let pushforward =
-                jvp_program.with_outputs(&(output_count..jvp_program.output_count()).collect::<Vec<_>>())?;
+            let tangent_outputs = (output_count..jvp_program.output_count()).collect::<Vec<_>>();
+            let pushforward = Arc::unwrap_or_clone(jvp_program).with_outputs(&tangent_outputs)?;
             let outputs = context.primal().bind(call.clone(), vec![primal_region.to_program()], primals.as_slice())?;
             let mut tangent_inputs =
                 primals.into_iter().map(|primal| context.primal_to_tangent(primal)).collect::<Result<Vec<_>, _>>()?;
@@ -3154,8 +3155,8 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let vector_type = ArrayType::new_static(DataType::F64, [2]);
         let operation = ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, false);
-        let primal_interface = sin_program(&scalar_type).interface();
-        let jvp_interface = doubled_sin_jvp_program(&scalar_type).interface();
+        let primal_interface = sin_program(&scalar_type).interface().clone();
+        let jvp_interface = doubled_sin_jvp_program(&scalar_type).interface().clone();
 
         // The primal region receives the call inputs, the JVP region receives `(inputs..., input_tangents...)`, and a
         // rule that satisfies the interface contract makes the call produce the primal outputs.
@@ -3336,9 +3337,9 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let vector_type = ArrayType::new_static(DataType::F64, [2]);
         let operation = ArrayComposite::from_rule_regions(CompositeJvpRule::Absent, true);
-        let primal_interface = sin_program(&scalar_type).interface();
-        let forward_interface = sin_forward_program(&scalar_type).interface();
-        let backward_interface = tripled_sin_backward_program(&scalar_type).interface();
+        let primal_interface = sin_program(&scalar_type).interface().clone();
+        let forward_interface = sin_forward_program(&scalar_type).interface().clone();
+        let backward_interface = tripled_sin_backward_program(&scalar_type).interface().clone();
 
         // The primal and forward regions receive the call inputs, the backward region receives the trailing forward
         // residuals followed by one cotangent per primal output, and rules that satisfy the interface contract make the
@@ -8350,7 +8351,7 @@ mod tests {
 
         // Projecting the program onto the first output keeps the two-output call, so its second output's seed reaches
         // the call's transpose rule as a structural zero rather than being pruned away beforehand.
-        let projected = program.with_outputs(&[0]).unwrap();
+        let projected = program.clone().with_outputs(&[0]).unwrap();
         assert_eq!(
             projected.to_string(),
             indoc! {"

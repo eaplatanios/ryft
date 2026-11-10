@@ -178,8 +178,9 @@ where
                         }
                     }
                     let kept_ids = primal_ids.iter().chain(differentiated_tangent_ids).copied().collect::<Vec<_>>();
+                    let output_ids = program.output_ids().to_vec();
                     let (pruned, _) =
-                        program.filtered(kept_ids.as_slice(), program.output_ids(), kept_ids.as_slice())?;
+                        program.into_filtered(kept_ids.as_slice(), output_ids.as_slice(), kept_ids.as_slice())?;
                     pruned
                 }
             };

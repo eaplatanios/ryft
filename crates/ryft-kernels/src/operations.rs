@@ -1163,7 +1163,7 @@ pub(crate) mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let interfaces = [identity_branch.interface(), constant_branch.interface()];
+        let interfaces = [identity_branch.interface().clone(), constant_branch.interface().clone()];
         let refined_input_types = [predicate_type.clone(), three_type.clone()];
         let mismatched_input_types = [predicate_type, four_type];
         let mismatch =
@@ -1185,7 +1185,7 @@ pub(crate) mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        let interfaces = [identity_branch.interface(), static_identity_branch.interface()];
+        let interfaces = [identity_branch.interface().clone(), static_identity_branch.interface().clone()];
         let expected = Err(ProgramError::Type(TypeError::invalid(
             "`condition` branch input type signature mismatch: expected [f64[extent]] but got [f64[3]]",
         )));

@@ -1083,6 +1083,7 @@ where
                 let residual_indices = (rule_output_count..forward.program.output_ids().len()).collect::<Vec<_>>();
                 let residuals = forward
                     .program
+                    .clone()
                     .with_outputs(&residual_indices)?
                     .interpret_in_context(&**context, leading_values[..call_input_count].to_vec())?;
                 let seed_extents = leading_values.split_off(call_input_count);
@@ -2814,7 +2815,7 @@ mod tests {
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
         assert!(program.entry_region_ref().effects().has_deferred_work());
-        for program in [program.clone(), program.simplified().unwrap()] {
+        for program in [program.clone(), program.into_simplified().unwrap()] {
             let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
             assert_eq!(
                 transposed.to_string(),
@@ -3264,7 +3265,7 @@ mod tests {
 
         // Simplification retains the selected obligation even though the carrier's output is unused.
         assert_eq!(
-            program.simplified().unwrap().to_string(),
+            program.clone().into_simplified().unwrap().to_string(),
             indoc! {"
                 lambda %0:ref<f64[]>, %1:f64[] .
                 let %2:f64[] = composite_transpose [name=\"ignored_zero_effect\", leading_input_count=1] %0 %1
@@ -3435,7 +3436,7 @@ mod tests {
             Err(ProgramError::Concretization { message })
                 if message == "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range",
         ));
-        let simplified = program.simplified().unwrap();
+        let simplified = program.clone().into_simplified().unwrap();
         assert_eq!(simplified.to_string(), program.to_string());
         let repeated = simplified.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
         assert_eq!(repeated.to_string(), transposed.to_string());

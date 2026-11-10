@@ -342,7 +342,7 @@ mod tests {
             vec![ArrayIrType::from(boundary_type.clone())],
         )
         .unwrap();
-        let program = program.simplified().unwrap();
+        let program = program.into_simplified().unwrap();
         let key = NamedCompositionKey {
             composite: CompositeKey::new("downstream.example", 1)
                 .with_attribute("enabled", CompositeAttribute::Boolean(true)),

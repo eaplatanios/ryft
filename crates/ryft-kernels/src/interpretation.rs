@@ -358,7 +358,7 @@ impl KernelCallOperation {
         let body = driver.region(0)?;
         self.infer_output_types(
             &inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>(),
-            &[body.interface()],
+            std::slice::from_ref(body.interface()),
         )?;
         if !self.prefetch_types().is_empty() {
             let ordinary_count = inputs.len() - self.prefetch_types().len();

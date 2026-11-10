@@ -85,7 +85,7 @@ where
     ) -> Result<Vec<KernelInterleaving>, ProgramError> {
         self.operation().infer_output_types(
             &inputs.iter().map(|input| ArrayIrType::Array(input.r#type().into_owned())).collect::<Vec<_>>(),
-            &[self.body().entry_region_ref().interface()],
+            std::slice::from_ref(self.body().entry_region_ref().interface()),
         )?;
         let prefetch_count = self.operation().prefetch_types().len();
         if prefetch_count != 0 {

@@ -7283,8 +7283,8 @@ pub(crate) mod tests {
             .filter(|instruction| matches!(instruction.operation(), Operation::Array(ArrayOperation::Sin(_))))
             .count();
         assert_eq!(
-            jit_call_count, 2,
-            "the JVP of a compiled call should stage separate primal and pushforward `jit_call` boundaries",
+            jit_call_count, 1,
+            "the JVP of a compiled call should stage one fused `jit_call` over the callee's forward mode program",
         );
         assert_eq!(inlined_sin_count, 0, "the JVP of a compiled call should not inline the callee body");
 

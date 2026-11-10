@@ -1,4 +1,6 @@
+use std::any::TypeId;
 use std::fmt::Display;
+use std::rc::Rc;
 
 use crate::arrays::{ArrayIrType, ArrayType, DataType};
 use crate::batching::{
@@ -16,8 +18,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::manipulation::conversions::ReducePrecisionOperation;
-use crate::operations::manipulation::memory::TransferToMemoryOperation;
 use crate::operations::references::ReferenceNewOperation;
+use crate::partial::residuals::{ResidualPlacement, ResidualRounding, RoundedResidualPlacement};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PartitionedProgram, ResidualInputSource, ResidualPolicyReference,
@@ -73,9 +75,11 @@ pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
 /// [`Operation`] that represents a rematerialized (i.e., checkpointed) call of its attached `body` region, which is the
 /// analogue of JAX's [`jax.checkpoint`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html) primitive.
 /// Outside of differentiation, the call computes exactly what its body computes, and its outputs are the body's
-/// outputs. Under differentiation, the residual policy of the call decides which of the values that the body computes
-/// are saved for the derivative computation and which are recomputed from the saved values instead (based on a
-/// [`ResidualPolicy`](crate::ResidualPolicy)), which trades computation for the memory that the saved values occupy.
+/// outputs. Under differentiation, the [`ResidualPolicy`](crate::ResidualPolicy) of the call decides which of the
+/// values that the body computes are saved for the derivative computation and which are recomputed from the saved
+/// values instead, which trades computation for the memory that the saved values occupy. Values whose producers cannot
+/// be replayed safely (e.g., reads of references shared with the caller, or operations with other observable effects)
+/// are saved regardless of the policy (refer to [`PartitionedProgram::with_residual_policy`]).
 ///
 /// The instruction inputs of the call map positionally onto the region inputs of its body, and its outputs map
 /// positionally onto the outputs of its body. The call carries no stored derivative regions: the transforms derive the
@@ -210,29 +214,6 @@ impl<T: Type> RematerializeOperation<T> {
                 })
                 .collect()
         })
-    }
-
-    /// Returns the operation that rounds a saved residual of type `r#type` to the precision of its type, which
-    /// [`PartitionedProgram::with_rounded_residuals`] stages in the known program of a rematerialized call so that
-    /// its known and residual consumers observe the same value. This rounding policy targets arrays of IEEE-style
-    /// floating-point types narrower than `f32` (i.e., `bf16`, `f16`, and the `f8` formats with infinities), which
-    /// backends may compute at a higher precision (e.g., in `f32`). [`ReducePrecisionOperation`] simulates their
-    /// formats without changing the array type. The policy leaves `f32` and wider types unchanged. It also excludes
-    /// finite-only formats (e.g., `f8e4m3fn`), because an IEEE-style simulation of their bit widths would map their
-    /// largest finite values to infinities.
-    fn excess_precision_rounding(r#type: &T) -> Option<ErasedOperation>
-    where
-        for<'t> &'t ArrayType: TryFrom<&'t T>,
-    {
-        let (exponent_bits, mantissa_bits) = match <&ArrayType>::try_from(r#type).ok()?.data_type() {
-            DataType::BF16 => (8, 7),
-            DataType::F16 => (5, 10),
-            DataType::F8E5M2 => (5, 2),
-            DataType::F8E4M3 => (4, 3),
-            DataType::F8E3M4 => (3, 4),
-            _ => return None,
-        };
-        Some(ErasedOperation::new(ReducePrecisionOperation::<ArrayType>::new(exponent_bits, mantissa_bits)))
     }
 }
 
@@ -431,15 +412,18 @@ where
 
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
 
-        // Look through memory transfers and round before offloading, so known consumers and derivative consumers use
-        // the same rounded value. Rounding after the transfer would leave known consumers using the value computed with
-        // excess precision. Forwarding comes last: it feeds the residual call the known inputs and outputs that edges
-        // would merely repeat, which rounding and placement must still see as edges.
+        // Round each saved value right after its producer and before the storage of the policy, if any, stores it
+        // (e.g., before offloading it), so known consumers and derivative consumers use the same rounded value.
+        // Rounding its stored representation would leave known consumers using the value computed with excess
+        // precision. The placement rounds the values that each partition computes, including the partitions of nested
+        // regions (e.g., `condition` branches), whose known work consumes their saved values inside those regions, and
+        // the saved known inputs of the body are rounded afterwards. Forwarding comes last, because it feeds the
+        // residual call the known inputs and outputs that edges would merely repeat, which rounding and placement must
+        // still see as edges.
+        let partition_context = context.clone().with_rounded_residual_policy(&self.policy, ExcessPrecisionRounding);
         let partition = driver
-            .partition_program(&context.clone().with_residual_policy(&self.policy), body, &input_known)?
-            .with_rounded_residuals(Self::excess_precision_rounding, |operation| {
-                operation.projected_payload::<TransferToMemoryOperation>().is_some()
-            })?
+            .partition_program(&partition_context, body, &input_known)?
+            .with_rounded_residuals(&ExcessPrecisionRounding, true)?
             .forward_residuals()?;
         let residual_operation = self.with_residual_optimization_barrier(&partition).with_differentiated(true);
         let (known_program, residual_program, known_input_indices, residual_inputs, outputs) = partition.into_parts();
@@ -599,21 +583,23 @@ where
             let mut input_known = vec![true; inputs.len()];
             input_known.resize(fused_inputs.len(), false);
             let required_known_outputs = (0..output_count).collect::<Vec<_>>();
-            let partition = driver.partition_jvp_program_with_residual_policy(
-                fused.entry_region_ref(),
-                input_known.as_slice(),
-                required_known_outputs.as_slice(),
-                &self.policy,
-            )?;
 
-            // Look through memory transfers and round before offloading, so known consumers and derivative consumers
-            // use the same rounded value. Rounding after the transfer would leave known consumers using the value
-            // computed with excess precision. Forwarding comes last, as for partial evaluation.
-            let partition = partition
-                .with_rounded_residuals(Self::excess_precision_rounding, |operation| {
-                    operation.projected_payload::<TransferToMemoryOperation>().is_some()
-                })?
-                .forward_residuals()?;
+            // The fused program is partitioned for repeated residual calls with the residual policy of this call, which
+            // also places the residuals of the partitions that the split rules of region-carrying operations construct
+            // (refer to `PartialEvaluationContext::with_residual_policy`), so its decisions apply per iteration and per
+            // branch. The partition is not retained in the transform cache of the region, so the policy never affects
+            // other requests. Saved values are rounded as for partial evaluation, so known consumers and derivative
+            // consumers use the same rounded value, and forwarding comes last, as for partial evaluation.
+            let placement: Rc<dyn ResidualPlacement<C::Constant, C::Operation>> =
+                Rc::new(RoundedResidualPlacement::new(self.policy.clone(), ExcessPrecisionRounding));
+            let (partition, _) = fused.entry_region_ref().partition_with_configuration(
+                input_known.as_slice(),
+                true,
+                true,
+                Some(required_known_outputs.as_slice()),
+                Some(placement),
+            )?;
+            let partition = partition.with_rounded_residuals(&ExcessPrecisionRounding, true)?.forward_residuals()?;
             let residual_operation =
                 fused_operation.with_residual_optimization_barrier(&partition).with_differentiated(true);
             partition.interpret_in_context_with(context, fused_inputs.as_slice(), output_count, |program, inputs| {
@@ -766,6 +752,57 @@ impl From<RematerializeOperation<ArrayType>> for RematerializeOperation<ArrayIrT
     }
 }
 
+/// [`ResidualRounding`] with which the partial evaluation and differentiation rules of [`RematerializeOperation`] round
+/// the values that a rematerialized call saves to the precision of their types, so that the known consumers of each
+/// such value and its residual consumers observe the same value, as JAX's `remat_partial_eval` does (refer to
+/// [`PartitionedProgram::with_rounded_residuals`] for where those roundings are staged). It rounds arrays of IEEE-style
+/// floating-point types narrower than `f32` (i.e., `bf16`, `f16`, and the `f8` formats with infinities), which
+/// backends may compute at a higher precision (e.g., in `f32`), with a [`ReducePrecisionOperation`] that simulates
+/// their formats without changing the array type. A value that the policy saves through a
+/// [`ResidualStorage`](crate::ResidualStorage) is rounded before its store operations receive it, whatever those
+/// operations are, so the type that this rounding receives is always the type of the saved value rather than that of
+/// its stored representation. It leaves `f32` and wider types unchanged. It also excludes finite-only formats (e.g.,
+/// `f8e4m3fn`), because an IEEE-style simulation of their bit widths would map their largest finite values to
+/// infinities.
+struct ExcessPrecisionRounding;
+
+impl ExcessPrecisionRounding {
+    /// Returns the numbers of exponent bits and mantissa bits to which values of type `r#type` are rounded, or
+    /// [`None`] when they need no rounding.
+    fn bits<T: Type>(r#type: &T) -> Option<(u32, u32)>
+    where
+        for<'t> &'t ArrayType: TryFrom<&'t T>,
+    {
+        match <&ArrayType>::try_from(r#type).ok()?.data_type() {
+            DataType::BF16 => Some((8, 7)),
+            DataType::F16 => Some((5, 10)),
+            DataType::F8E5M2 => Some((5, 2)),
+            DataType::F8E4M3 => Some((4, 3)),
+            DataType::F8E3M4 => Some((3, 4)),
+            _ => None,
+        }
+    }
+}
+
+impl<T: Type> ResidualRounding<T> for ExcessPrecisionRounding
+where
+    for<'t> &'t ArrayType: TryFrom<&'t T>,
+{
+    #[inline]
+    fn rounding_operation(&self, r#type: &T) -> Option<ErasedOperation> {
+        let (exponent_bits, mantissa_bits) = Self::bits(r#type)?;
+        Some(ErasedOperation::new(ReducePrecisionOperation::<ArrayType>::new(exponent_bits, mantissa_bits)))
+    }
+
+    #[inline]
+    fn is_rounding(&self, r#type: &T, operation: &dyn OperationPayloadProjection) -> bool {
+        operation
+            .project_payload(TypeId::of::<ReducePrecisionOperation<ArrayType>>())
+            .and_then(|payload| payload.downcast_ref::<ReducePrecisionOperation<ArrayType>>())
+            .is_some_and(|operation| Self::bits(r#type) == Some((operation.exponent_bits(), operation.mantissa_bits())))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -798,14 +835,17 @@ mod tests {
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::{WHILE_OPERATION_NAME, WhileOperation};
     use crate::operations::debugging::PrintOperation;
+    use crate::operations::differentiation::stop_gradient::StopGradientOperation;
     use crate::operations::dimensions::dimension_add::DimensionAddOperation;
     use crate::operations::dot::{Dot, DotDimensionNumbers, DotOperation};
+    use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
     use crate::operations::manipulation::memory::TransferToMemory;
+    use crate::operations::quantization::ScaledDotOperation;
     use crate::operations::reductions::ReductionKind;
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
     };
-    use crate::operations::tagging::Tag;
+    use crate::operations::tagging::{Tag, TagOperation};
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::parameters::Placeholder;
     use crate::partial::ResidualPolicy;
@@ -872,6 +912,34 @@ mod tests {
         let output = builder.add_instruction(operation, vec![body], vec![x, y], None).unwrap()[0];
         builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap()
+    }
+
+    /// Builds the program `(lhs, rhs, y) ↦ rematerialize(sin(scaled_dot(lhs, rhs)) * y)` over `f8e4m3fn` element arrays
+    /// `lhs` and `rhs` with one leading batching dimension of extent `batch` and an `f32` array `y`, whose call uses
+    /// `policy`.
+    fn scaled_dot_program(batch: usize, policy: ResidualPolicyReference<ArrayType>) -> TestProgram {
+        let lhs_type = ArrayType::new_static(DataType::F8E4M3FN, [batch, 2, 4]);
+        let rhs_type = ArrayType::new_static(DataType::F8E4M3FN, [batch, 4, 3]);
+        let output_type = ArrayType::new_static(DataType::F32, [batch, 2, 3]);
+        let mut body = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let lhs = body.add_input(lhs_type.clone());
+        let rhs = body.add_input(rhs_type.clone());
+        let y = body.add_input(output_type.clone());
+        let scaled_dot =
+            ScaledDotOperation::new(ScaledDotOperation::default_dimensions(3).unwrap(), DataType::F32, false, false);
+        let scaled_dot = body.add_instruction(scaled_dot, Vec::new(), vec![lhs, rhs], None).unwrap()[0];
+        let sine = body.add_instruction(SinOperation::new(), Vec::new(), vec![scaled_dot], None).unwrap()[0];
+        let product = body.add_instruction(MulOperation::new(), Vec::new(), vec![sine, y], None).unwrap()[0];
+        let body = body
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let inputs = [lhs_type, rhs_type, output_type].into_iter().map(|r#type| builder.add_input(r#type)).collect();
+        let output = builder.add_instruction(RematerializeOperation::new(policy), vec![body], inputs, None).unwrap()[0];
+        builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap()
     }
 
@@ -1852,6 +1920,144 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialize_partial_evaluation_scaled_dot_policies() {
+        // In `(lhs, rhs, y) ↦ rematerialize(sin(scaled_dot(lhs, rhs)) * y)` with known element arrays and an unknown
+        // `y`, the scaled dot is a known factor, which the dot policies classify by JAX's rules for the outputs of
+        // `scaled_matmul_wrapper`. Saving dot products hoists it out of the call for any batching extent, while saving
+        // the dot products without batching dimensions recomputes it for a batching extent of 2 and hoists it for a
+        // batching extent of 1. Partial evaluation does not differentiate, so the missing derivative rule of the scaled
+        // dot is never needed.
+        let dots = ResidualPolicyReference::new(DotsSavable);
+        let unbatched_dots = ResidualPolicyReference::new(DotsWithNoBatchDimensionsSavable);
+        assert_eq!(
+            scaled_dot_program(2, dots).partition(&[true, true, false]).unwrap().to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f8e4m3fn[2, 2, 4], %1:f8e4m3fn[2, 4, 3] .
+                    let %2:f32[2, 2, 3] = scaled_dot [
+                        dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                        accumulation_type=f32,
+                        lhs_scale=false,
+                        rhs_scale=false,
+                    ] %0 %1
+                    in (%2)
+                }
+                residual={
+                    lambda %0:f32[2, 2, 3], %1:f32[2, 2, 3] .
+                    let %2:f32[2, 2, 3] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 [
+                        body={
+                            lambda %0:f32[2, 2, 3], %1:f32[2, 2, 3] .
+                            let %2:f32[2, 2, 3] = sin %1
+                                %3:f32[2, 2, 3] = mul %2 %0
+                            in (%3)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
+        assert_eq!(
+            scaled_dot_program(2, unbatched_dots).partition(&[true, true, false]).unwrap().to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0), ResidualEdge(1)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f8e4m3fn[2, 2, 4], %1:f8e4m3fn[2, 4, 3] .
+                    in (%0, %1)
+                }
+                residual={
+                    lambda %0:f32[2, 2, 3], %1:f8e4m3fn[2, 2, 4], %2:f8e4m3fn[2, 4, 3] .
+                    let %3:f32[2, 2, 3] = rematerialize [policy=\"dots_with_no_batch_dimensions_savable\", differentiated=true] %0 %1 %2 [
+                        body={
+                            lambda %0:f32[2, 2, 3], %1:f8e4m3fn[2, 2, 4], %2:f8e4m3fn[2, 4, 3] .
+                            let %3:f32[2, 2, 3] = scaled_dot [
+                                dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                                accumulation_type=f32,
+                                lhs_scale=false,
+                                rhs_scale=false,
+                            ] %1 %2
+                                %4:f32[2, 2, 3] = sin %3
+                                %5:f32[2, 2, 3] = mul %4 %0
+                            in (%5)
+                        },
+                    ]
+                    in (%3)
+                }"},
+        );
+
+        // The array IR universe classifies the scaled dot through its projected array member and reads its batching
+        // extent from the array type of its left-hand side input.
+        let lhs_type = ArrayType::new_static(DataType::F8E4M3FN, [1, 2, 4]);
+        let rhs_type = ArrayType::new_static(DataType::F8E4M3FN, [1, 4, 3]);
+        let output_type = ArrayType::new_static(DataType::F32, [1, 2, 3]);
+        let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let lhs = body.add_input(lhs_type.clone().into());
+        let rhs = body.add_input(rhs_type.clone().into());
+        let y = body.add_input(output_type.clone().into());
+        let scaled_dot =
+            ScaledDotOperation::new(ScaledDotOperation::default_dimensions(3).unwrap(), DataType::F32, false, false);
+        let scaled_dot = ArrayOperation::<Array>::from(scaled_dot);
+        let scaled_dot = body.add_instruction(scaled_dot, Vec::new(), vec![lhs, rhs], None).unwrap()[0];
+        let sine = ArrayOperation::<Array>::from(SinOperation::<ArrayType>::new());
+        let sine = body.add_instruction(sine, Vec::new(), vec![scaled_dot], None).unwrap()[0];
+        let product = ArrayOperation::<Array>::from(MulOperation::<ArrayType>::new());
+        let product = body.add_instruction(product, Vec::new(), vec![sine, y], None).unwrap()[0];
+        let body = body
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![product], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_program(body);
+        let inputs = [lhs_type, rhs_type, output_type]
+            .into_iter()
+            .map(|r#type| builder.add_input(r#type.into()))
+            .collect();
+        let operation =
+            RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(DotsWithNoBatchDimensionsSavable));
+        let output = builder.add_instruction(operation, vec![body], inputs, None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.partition(&[true, true, false]).unwrap().to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[0, 1],
+                    residual_inputs=[UnknownInput(2), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f8e4m3fn[1, 2, 4], %1:f8e4m3fn[1, 4, 3] .
+                    let %2:f32[1, 2, 3] = scaled_dot [
+                        dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                        accumulation_type=f32,
+                        lhs_scale=false,
+                        rhs_scale=false,
+                    ] %0 %1
+                    in (%2)
+                }
+                residual={
+                    lambda %0:f32[1, 2, 3], %1:f32[1, 2, 3] .
+                    let %2:f32[1, 2, 3] = rematerialize [policy=\"dots_with_no_batch_dimensions_savable\", differentiated=true] %0 %1 [
+                        body={
+                            lambda %0:f32[1, 2, 3], %1:f32[1, 2, 3] .
+                            let %2:f32[1, 2, 3] = sin %1
+                                %3:f32[1, 2, 3] = mul %2 %0
+                            in (%3)
+                        },
+                    ]
+                    in (%2)
+                }"},
+        );
+    }
+
+    #[test]
     fn test_rematerialize_batching() {
         // Batching batches the body with its natural output axes and keeps the rematerialization boundary.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2422,35 +2628,21 @@ mod tests {
     #[test]
     fn test_rematerialize_differentiation_call_body_offload() {
         // Differentiating only x makes g(w) an all-known call. Its returned scale still follows the enclosing
-        // checkpoint's storage decision, even though the callee itself needs no partial-evaluation split.
-        let scale = composite(|weight: TestTracer| Ok(weight.sin()?.tag("scale")?)).with_jvp_from_primal();
+        // checkpoint's storage decision when it is tagged after the call, even though the callee itself needs no
+        // partial-evaluation split.
+        let scale = composite(|weight: TestTracer| Ok(weight.sin()?)).with_jvp_from_primal();
         let scalar_type = ArrayType::scalar(DataType::F64);
         let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<TestTracer>| Ok(vec![inputs[0].clone() * scale.call(inputs[1].clone())?]),
+            |inputs: Vec<TestTracer>| Ok(vec![inputs[0].clone() * scale.call(inputs[1].clone())?.tag("scale")?]),
             vec![scalar_type.clone(); 2],
         )
         .unwrap();
-        assert_eq!(
-            body.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = composite [name=\"composite\"] %1 [
-                    primal={
-                        lambda %0:f64[] .
-                        let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=scale] %1
-                        in (%2)
-                    },
-                ]
-                    %3:f64[] = mul %0 %2
-                in (%3)"},
-        );
         let host = Memory::Host { pinned: true };
         let policy = SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["scale"], host).unwrap();
         let program = rematerialized_program(&body, ResidualPolicyReference::new(policy));
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
         assert_eq!(linearization.residual_count(), 1);
-        assert_eq!(&linearization.primal().output_types()[1..], &[scalar_type.with_memory(host)]);
+        assert_eq!(&linearization.primal().output_types()[1..], &[scalar_type.clone().with_memory(host)]);
         assert_eq!(
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
@@ -2459,13 +2651,13 @@ mod tests {
                     primal={
                         lambda %0:f64[] .
                         let %1:f64[] = sin %0
-                            %2:f64[] = tag [key=scale] %1
-                        in (%2)
+                        in (%1)
                     },
                 ]
-                    %3:f64[] = mul %0 %2
-                    %4:f64[]@Host[Pinned] = transfer_to_memory [destination=Host[Pinned]] %2
-                in (%3, %4)
+                    %3:f64[] = tag [key=scale] %2
+                    %4:f64[] = mul %0 %3
+                    %5:f64[]@Host[Pinned] = transfer_to_memory [destination=Host[Pinned]] %3
+                in (%4, %5)
                 lambda %0:f64[], %1:f64[]@Host[Pinned] .
                 let %2:f64[] = rematerialize [policy=\"save_and_offload_only_these_names\", differentiated=true] %0 %1 [
                     body={
@@ -2481,11 +2673,64 @@ mod tests {
             .primal()
             .interpret(vec![Array::scalar(2f64).unwrap(), Array::scalar(0.5f64).unwrap()])
             .unwrap();
-        let scale = Array::scalar(0.5f64.sin()).unwrap();
-        assert_eq!(primal, vec![Array::scalar(2.0 * 0.5f64.sin()).unwrap(), scale.transfer_to_memory(host).unwrap()]);
+        let sine = Array::scalar(0.5f64.sin()).unwrap();
+        assert_eq!(primal, vec![Array::scalar(2.0 * 0.5f64.sin()).unwrap(), sine.transfer_to_memory(host).unwrap()]);
         let inputs = vec![Array::scalar(1f64).unwrap(), primal[1].clone()];
-        assert_eq!(linearization.tangent().interpret(inputs.clone()), Ok(vec![scale.clone()]));
-        assert_eq!(linearization.pullback().unwrap().program().interpret(inputs), Ok(vec![scale]));
+        assert_eq!(linearization.tangent().interpret(inputs.clone()), Ok(vec![sine.clone()]));
+        assert_eq!(linearization.pullback().unwrap().program().interpret(inputs), Ok(vec![sine.clone()]));
+
+        // A tag inside the call is invisible to the policy, which classifies the call itself, as JAX's policies
+        // classify `custom_jvp_call`. The policy therefore recomputes the scale, and the differentiated call replays
+        // the whole call from `w`, which is saved instead.
+        let scale = composite(|weight: TestTracer| Ok(weight.sin()?.tag("scale")?)).with_jvp_from_primal();
+        let (_, body) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<TestTracer>| Ok(vec![inputs[0].clone() * scale.call(inputs[1].clone())?]),
+            vec![scalar_type.clone(); 2],
+        )
+        .unwrap();
+        let policy = SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["scale"], host).unwrap();
+        let program = rematerialized_program(&body, ResidualPolicyReference::new(policy));
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        assert_eq!(&linearization.primal().output_types()[1..], &[scalar_type]);
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = composite [name=\"composite\"] %1 [
+                    primal={
+                        lambda %0:f64[] .
+                        let %1:f64[] = sin %0
+                            %2:f64[] = tag [key=scale] %1
+                        in (%2)
+                    },
+                ]
+                    %3:f64[] = mul %0 %2
+                in (%3, %1)
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = rematerialize [policy=\"save_and_offload_only_these_names\", differentiated=true] %0 %1 [
+                    body={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = composite [name=\"composite\"] %1 [
+                            primal={
+                                lambda %0:f64[] .
+                                let %1:f64[] = sin %0
+                                    %2:f64[] = tag [key=scale] %1
+                                in (%2)
+                            },
+                        ]
+                            %3:f64[] = mul %2 %0
+                        in (%3)
+                    },
+                ]
+                in (%2)"},
+        );
+        let weight = Array::scalar(0.5f64).unwrap();
+        let primal = linearization.primal().interpret(vec![Array::scalar(2f64).unwrap(), weight.clone()]).unwrap();
+        assert_eq!(primal, vec![Array::scalar(2.0 * 0.5f64.sin()).unwrap(), weight]);
+        let inputs = vec![Array::scalar(1f64).unwrap(), primal[1].clone()];
+        assert_eq!(linearization.tangent().interpret(inputs.clone()), Ok(vec![sine.clone()]));
+        assert_eq!(linearization.pullback().unwrap().program().interpret(inputs), Ok(vec![sine]));
     }
 
     #[test]
@@ -3049,6 +3294,8 @@ mod tests {
     fn test_rematerialize_differentiation_scan_body() {
         // The body scans `c * cos(dot(x, x))` over the rows `x` of `xs`. Saving dot products applies to every iteration
         // of the scan: the primal scan stacks the dot products, and the differentiated call recomputes their cosines.
+        // The differentiated call also recomputes the per-iteration accumulators `c` from the initial one and the
+        // saved dot products, instead of the primal scan stacking them, as JAX does.
         let scan_body = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let _index = builder.add_input(ArrayType::scalar(DataType::I64));
@@ -3087,7 +3334,7 @@ mod tests {
             format!("{}\n{}", linearization.primal(), linearization.tangent()),
             indoc! {"
                 lambda %0:f64[], %1:f64[2, 3] .
-                let %2:f64[], %3:f64[2], %4:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
+                let %2:f64[], %3:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 [
                     body={
                         lambda %0:i64[], %1:f64[], %2:f64[3] .
                         let %3:f64[] = dot [
@@ -3095,35 +3342,43 @@ mod tests {
                         ] %2 %2
                             %4:f64[] = cos %3
                             %5:f64[] = mul %1 %4
-                        in (%5, %1, %3)
+                        in (%5, %3)
                     },
                 ]
-                in (%2, %1, %3, %4)
-                lambda %0:f64[], %1:f64[2, 3], %2:f64[2, 3], %3:f64[2], %4:f64[2] .
+                in (%2, %1, %3, %0)
+                lambda %0:f64[], %1:f64[2, 3], %2:f64[2, 3], %3:f64[2], %4:f64[] .
                 let %5:f64[] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 %2 %3 %4 [
                     body={
-                        lambda %0:f64[], %1:f64[2, 3], %2:f64[2, 3], %3:f64[2], %4:f64[2] .
-                        let %5:f64[] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 %2 %3 %4 [
+                        lambda %0:f64[], %1:f64[2, 3], %2:f64[2, 3], %3:f64[2], %4:f64[] .
+                        let %5:f64[], %6:f64[2] = scan [carry_count=1, iteration_count=2, reverse=false] %4 %3 [
                             body={
-                                lambda %0:i64[], %1:f64[], %2:f64[3], %3:f64[3], %4:f64[], %5:f64[] .
-                                let %6:f64[] = cos %5
-                                    %7:f64[] = mul %6 %1
-                                    %8:f64[] = sin %5
-                                    %9:f64[] = dot [
-                                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                                    ] %2 %3
-                                    %10:f64[] = dot [
-                                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                                    ] %3 %2
-                                    %11:f64[] = add %9 %10
-                                    %12:f64[] = mul %8 %11
-                                    %13:f64[] = neg %12
-                                    %14:f64[] = mul %4 %13
-                                    %15:f64[] = add %7 %14
-                                in (%15)
+                                lambda %0:i64[], %1:f64[], %2:f64[] .
+                                let %3:f64[] = cos %2
+                                    %4:f64[] = mul %1 %3
+                                in (%4, %1)
                             },
                         ]
-                        in (%5)
+                            %7:f64[] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 %2 %6 %3 [
+                                body={
+                                    lambda %0:i64[], %1:f64[], %2:f64[3], %3:f64[3], %4:f64[], %5:f64[] .
+                                    let %6:f64[] = cos %5
+                                        %7:f64[] = mul %6 %1
+                                        %8:f64[] = sin %5
+                                        %9:f64[] = dot [
+                                            dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                                        ] %2 %3
+                                        %10:f64[] = dot [
+                                            dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                                        ] %3 %2
+                                        %11:f64[] = add %9 %10
+                                        %12:f64[] = mul %8 %11
+                                        %13:f64[] = neg %12
+                                        %14:f64[] = mul %4 %13
+                                        %15:f64[] = add %7 %14
+                                    in (%15)
+                                },
+                            ]
+                        in (%7)
                     },
                 ]
                 in (%5)"},
@@ -3155,6 +3410,189 @@ mod tests {
         {
             assert!((actual - expected).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_scan_body_recomputes_carries() {
+        // The scans below apply `h ↦ sin(dot(h, x)) + h` over scalar slices `x`, whose linearization reads the carry
+        // `h` of every iteration. Under `DotsSavable`, the differentiated call of a single scan recomputes those
+        // carries from the initial carry and the saved dot products instead of the primal scan stacking them. The
+        // derivatives agree with plain differentiation under several policies and with finite differences for that
+        // scan, for a scan whose body scans the rows of a matrix in turn, and for a scan without iterations.
+        let step_body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let _index = builder.add_input(ArrayType::scalar(DataType::I64));
+            let h = builder.add_input(ArrayType::scalar(DataType::F64));
+            let x = builder.add_input(ArrayType::scalar(DataType::F64));
+            let dot = DotOperation::new(DotDimensionNumbers::new(vec![], vec![], vec![], vec![]));
+            let t = builder.add_instruction(dot, Vec::new(), vec![h, x], None).unwrap()[0];
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![t], None).unwrap()[0];
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sine, h], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap()
+        };
+        let row_body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let step_body = builder.import_program(step_body.clone());
+            let _index = builder.add_input(ArrayType::scalar(DataType::I64));
+            let h = builder.add_input(ArrayType::scalar(DataType::F64));
+            let row = builder.add_input(ArrayType::new_static(DataType::F64, [3]));
+            let scan = ScanOperation::new(1, 3);
+            let next = builder.add_instruction(scan, vec![step_body], vec![h, row], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap()
+        };
+        let scan_program = |body: &TestProgram, iteration_count: usize, slice_shape: &[usize]| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let body = builder.import_program(body.clone());
+            let h = builder.add_input(ArrayType::scalar(DataType::F64));
+            let xs_shape = std::iter::once(iteration_count).chain(slice_shape.iter().copied()).collect::<Vec<_>>();
+            let xs = builder.add_input(ArrayType::new_static(DataType::F64, xs_shape));
+            let scan = ScanOperation::new(1, iteration_count);
+            let output = builder.add_instruction(scan, vec![body], vec![h, xs], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let program = scan_program(&step_body, 3, &[]);
+        let linearization =
+            rematerialized_program(&program, ResidualPolicyReference::new(DotsSavable)).linearize().unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f64[], %1:f64[3] .
+                let %2:f64[], %3:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
+                    body={
+                        lambda %0:i64[], %1:f64[], %2:f64[] .
+                        let %3:f64[] = dot [
+                            dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                        ] %1 %2
+                            %4:f64[] = sin %3
+                            %5:f64[] = add %4 %1
+                        in (%5, %3)
+                    },
+                ]
+                in (%2, %1, %3, %0)
+                lambda %0:f64[], %1:f64[3], %2:f64[3], %3:f64[3], %4:f64[] .
+                let %5:f64[] = rematerialize [policy=\"dots_savable\", differentiated=true] %0 %1 %2 %3 %4 [
+                    body={
+                        lambda %0:f64[], %1:f64[3], %2:f64[3], %3:f64[3], %4:f64[] .
+                        let %5:f64[], %6:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %4 %3 [
+                            body={
+                                lambda %0:i64[], %1:f64[], %2:f64[] .
+                                let %3:f64[] = sin %2
+                                    %4:f64[] = add %3 %1
+                                in (%4, %1)
+                            },
+                        ]
+                            %7:f64[] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 %2 %6 %3 [
+                                body={
+                                    lambda %0:i64[], %1:f64[], %2:f64[], %3:f64[], %4:f64[], %5:f64[] .
+                                    let %6:f64[] = cos %5
+                                        %7:f64[] = dot [
+                                            dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                                        ] %1 %3
+                                        %8:f64[] = dot [
+                                            dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                                        ] %4 %2
+                                        %9:f64[] = add %7 %8
+                                        %10:f64[] = mul %6 %9
+                                        %11:f64[] = add %10 %1
+                                    in (%11)
+                                },
+                            ]
+                        in (%7)
+                    },
+                ]
+                in (%5)"},
+        );
+
+        let h = Array::scalar(0.5f64).unwrap();
+        let cases = [
+            (program, Array::vector(vec![0.25f64, -1.5, 2.0]).unwrap()),
+            (scan_program(&row_body, 2, &[3]), Array::matrix(2, 3, vec![0.25f64, -1.5, 2.0, 1.0, 0.5, -0.75]).unwrap()),
+            (scan_program(&step_body, 0, &[]), Array::vector(Vec::<f64>::new()).unwrap()),
+        ];
+        for (program, xs) in cases {
+            let inputs = [h.clone(), xs.clone()];
+            assert_rematerialized_derivatives(&program, &inputs, ResidualPolicyReference::new(DotsSavable));
+            assert_rematerialized_derivatives(&program, &inputs, ResidualPolicyReference::new(NothingSavable));
+            assert_rematerialized_derivatives(&program, &inputs, ResidualPolicyReference::new(EverythingSavable));
+            let program = &rematerialized_program(&program, ResidualPolicyReference::new(DotsSavable));
+            check_gradient!(
+                |h, xs| program.interpret_in_context(&h.domain(), vec![h, xs]).map(|mut outputs| outputs.remove(0)),
+                at = h.clone(),
+                with = xs.clone(),
+                step = 1e-6,
+                tolerance = 1e-6,
+            );
+            check_gradient!(
+                |xs, h| program.interpret_in_context(&xs.domain(), vec![h, xs]).map(|mut outputs| outputs.remove(0)),
+                at = xs,
+                with = h.clone(),
+                step = 1e-6,
+                tolerance = 1e-6,
+            );
+        }
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_scan_body_stacks_carries_with_effects() {
+        // The body `h ↦ sin(dot(h, x)) + print(h)` prints its carry, so its carry chain has an effect that the
+        // differentiated call must not replay. The primal scan therefore keeps stacking the carries that the
+        // linearization reads, exactly as without a residual policy, and the gradient still agrees with finite
+        // differences.
+        let body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let _index = builder.add_input(ArrayType::scalar(DataType::I64));
+            let h = builder.add_input(ArrayType::scalar(DataType::F64));
+            let x = builder.add_input(ArrayType::scalar(DataType::F64));
+            let dot = DotOperation::new(DotDimensionNumbers::new(vec![], vec![], vec![], vec![]));
+            let t = builder.add_instruction(dot, Vec::new(), vec![h, x], None).unwrap()[0];
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![t], None).unwrap()[0];
+            let printed = builder.add_instruction(PrintOperation::new("h"), Vec::new(), vec![h], None).unwrap()[0];
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sine, printed], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let h = builder.add_input(ArrayType::scalar(DataType::F64));
+        let xs = builder.add_input(ArrayType::new_static(DataType::F64, [3]));
+        let output = builder.add_instruction(ScanOperation::new(1, 3), vec![body], vec![h, xs], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let program = &rematerialized_program(&program, ResidualPolicyReference::new(DotsSavable));
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[3] .
+                let %2:f64[], %3:f64[3], %4:f64[3] = scan [carry_count=1, iteration_count=3, reverse=false] %0 %1 [
+                    body={
+                        lambda %0:i64[], %1:f64[], %2:f64[] .
+                        let %3:f64[] = print [label=h] %1
+                            %4:f64[] = dot [
+                                dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                            ] %1 %2
+                            %5:f64[] = sin %4
+                            %6:f64[] = add %5 %3
+                        in (%6, %1, %4)
+                    },
+                ]
+                in (%2, %1, %3, %4)"},
+        );
+        check_gradient!(
+            |h, xs| program.interpret_in_context(&h.domain(), vec![h, xs]).map(|mut outputs| outputs.remove(0)),
+            at = Array::scalar(0.5f64).unwrap(),
+            with = Array::vector(vec![0.25f64, -1.5, 2.0]).unwrap(),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
     }
 
     #[test]
@@ -3305,6 +3743,405 @@ mod tests {
                     },
                 ]
                 in (%3)"},
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_excess_precision_condition_body() {
+        // The body `(x, s) ↦ w · s` computes `w = f32(t)` for `t = tag(x², "t")` (or `tag(x³, "t")` when `x ≤ 0`) over
+        // `bf16` in a condition on `stop_gradient(x)`, which therefore has no tangent inputs. Saving `t` splits the
+        // all-known condition on residual demand: the primal condition saves `t` from the branch that runs and computes
+        // `w` from it, and the tangent condition recomputes `w` from the saved `t`. Each primal branch rounds `t` right
+        // after its producer, so that `w` and the tangent agree even when a backend computes `t` in a wider type,
+        // rather than only the enclosing primal program receiving a rounded `t`.
+        let branch = |cube: bool| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let x = builder.add_input(ArrayType::scalar(DataType::BF16));
+            let mut t = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, x], None).unwrap()[0];
+            if cube {
+                t = builder.add_instruction(MulOperation::new(), Vec::new(), vec![t, x], None).unwrap()[0];
+            }
+            let t = builder.add_instruction(TagOperation::new("t"), Vec::new(), vec![t], None).unwrap()[0];
+            let to_f32 = ConvertElementTypeOperation::new(DataType::F32, false);
+            let w = builder.add_instruction(to_f32, Vec::new(), vec![t], None).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![w], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let square = builder.import_program(branch(false));
+        let cube = builder.import_program(branch(true));
+        let x = builder.add_input(ArrayType::scalar(DataType::BF16));
+        let s = builder.add_input(ArrayType::scalar(DataType::F32));
+        let x = builder.add_instruction(StopGradientOperation::default(), Vec::new(), vec![x], None).unwrap()[0];
+        let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+        let predicate = CompareOperation::new(ComparisonDirection::GreaterThan);
+        let predicate = builder.add_instruction(predicate, Vec::new(), vec![x, zero], None).unwrap()[0];
+        let condition = ConditionOperation::new();
+        let w = builder.add_instruction(condition, vec![square, cube], vec![predicate, x], None).unwrap()[0];
+        let y = builder.add_instruction(MulOperation::new(), Vec::new(), vec![w, s], None).unwrap()[0];
+        let body = builder.build::<Vec<Array>, Vec<Array>>(vec![y], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let program = rematerialized_program(&body, ResidualPolicyReference::new(SaveOnlyTheseNames::new(["t"])));
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:bf16[], %1:f32[] .
+                let %2:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %0
+                    %3:bf16[] = stop_gradient %2
+                    %4:bf16[] = zero [type=bf16[]]
+                    %5:bool[] = compare [direction=GreaterThan] %3 %4
+                    %6:f32[], %7:bf16[] = condition %5 %3 [
+                        true={
+                            lambda %0:bf16[] .
+                            let %1:bf16[] = mul %0 %0
+                                %2:bf16[] = tag [key=t] %1
+                                %3:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %2
+                                %4:f32[] = convert_element_type [data_type=f32] %3
+                            in (%4, %3)
+                        },
+                        false={
+                            lambda %0:bf16[] .
+                            let %1:bf16[] = mul %0 %0
+                                %2:bf16[] = mul %1 %0
+                                %3:bf16[] = tag [key=t] %2
+                                %4:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %3
+                                %5:f32[] = convert_element_type [data_type=f32] %4
+                            in (%5, %4)
+                        },
+                    ]
+                    %8:f32[] = mul %6 %1
+                in (%8, %2, %7)
+                lambda %0:bf16[], %1:f32[], %2:bf16[], %3:bf16[] .
+                let %4:f32[] = rematerialize [policy=\"save_only_these_names\", differentiated=true] %0 %1 %2 %3 [
+                    body={
+                        lambda %0:bf16[], %1:f32[], %2:bf16[], %3:bf16[] .
+                        let %4:bf16[] = stop_gradient %2
+                            %5:bf16[] = zero [type=bf16[]]
+                            %6:bool[] = compare [direction=GreaterThan] %4 %5
+                            %7:f32[] = condition %6 %3 [
+                                true={
+                                    lambda %0:bf16[] .
+                                    let %1:f32[] = convert_element_type [data_type=f32] %0
+                                    in (%1)
+                                },
+                                false={
+                                    lambda %0:bf16[] .
+                                    let %1:f32[] = convert_element_type [data_type=f32] %0
+                                    in (%1)
+                                },
+                            ]
+                            %8:f32[] = mul %7 %1
+                        in (%8)
+                    },
+                ]
+                in (%4)"},
+        );
+    }
+
+    /// Returns a branch or a scan body that computes `d = tag(sin(x), "save")` and `s = d · d` over `bf16` and returns
+    /// `f32(s)`, so that the saved value `d` has a known consumer inside the region.
+    fn interior_consumer_region(scan: bool) -> TestProgram {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        if scan {
+            builder.add_input(ArrayType::scalar(DataType::I64));
+        }
+        let x = builder.add_input(ArrayType::scalar(DataType::BF16));
+        let d = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+        let d = builder.add_instruction(TagOperation::new("save"), Vec::new(), vec![d], None).unwrap()[0];
+        let s = builder.add_instruction(MulOperation::new(), Vec::new(), vec![d, d], None).unwrap()[0];
+        let to_f32 = ConvertElementTypeOperation::new(DataType::F32, false);
+        let w = builder.add_instruction(to_f32, Vec::new(), vec![s], None).unwrap()[0];
+        let input_count = if scan { 2 } else { 1 };
+        builder
+            .build::<Vec<Array>, Vec<Array>>(vec![w], vec![Placeholder; input_count], vec![Placeholder])
+            .unwrap()
+    }
+
+    #[test]
+    fn test_rematerialize_excess_precision_rounds_split_values_before_their_interior_consumers() {
+        // The body `(x, y) ↦ f32(s) · y` computes `s = d · d` for a saved `d = tag(sin(x), "save")` over `bf16`, in a
+        // condition on `stop_gradient(x)` or in a scan over the elements of `x`. Only `y` is unknown (or differentiated),
+        // so the region is split on residual demand (the condition) or by knownness (the scan), and its known part
+        // returns `d` as an additional result whose only consumer inside the region is `s`. Linearization and partial
+        // evaluation both round `d` right after its producer inside the region, before `s` reads it, so that `s` and
+        // the residual work that recomputes it from the saved `d` agree even when a backend computes `d` in a wider type.
+        let program = |scan: bool| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let shape: &[usize] = if scan { &[2] } else { &[] };
+            let x = builder.add_input(ArrayType::new_static(DataType::BF16, shape.to_vec()));
+            let y = builder.add_input(ArrayType::new_static(DataType::F32, shape.to_vec()));
+            let w = if scan {
+                let body = builder.import_program(interior_consumer_region(true));
+                builder.add_instruction(ScanOperation::new(0, 2), vec![body], vec![x], None).unwrap()[0]
+            } else {
+                let x =
+                    builder.add_instruction(StopGradientOperation::default(), Vec::new(), vec![x], None).unwrap()[0];
+                let zero = builder.add_instruction(ZeroLikeOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+                let predicate = CompareOperation::new(ComparisonDirection::GreaterThan);
+                let predicate = builder.add_instruction(predicate, Vec::new(), vec![x, zero], None).unwrap()[0];
+                let branches = [
+                    builder.import_program(interior_consumer_region(false)),
+                    builder.import_program(interior_consumer_region(false)),
+                ];
+                builder
+                    .add_instruction(ConditionOperation::new(), branches.to_vec(), vec![predicate, x], None)
+                    .unwrap()[0]
+            };
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![w, y], None).unwrap()[0];
+            let body = builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            rematerialized_program(&body, ResidualPolicyReference::new(SaveOnlyTheseNames::new(["save"])))
+        };
+
+        let condition = program(false);
+        assert_eq!(
+            condition.linearize().unwrap().primal().to_string(),
+            indoc! {"
+                lambda %0:bf16[], %1:f32[] .
+                let %2:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %0
+                    %3:bf16[] = stop_gradient %2
+                    %4:bf16[] = zero [type=bf16[]]
+                    %5:bool[] = compare [direction=GreaterThan] %3 %4
+                    %6:f32[], %7:bf16[] = condition %5 %3 [
+                        true={
+                            lambda %0:bf16[] .
+                            let %1:bf16[] = sin %0
+                                %2:bf16[] = tag [key=save] %1
+                                %3:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %2
+                                %4:bf16[] = mul %3 %3
+                                %5:f32[] = convert_element_type [data_type=f32] %4
+                            in (%5, %3)
+                        },
+                        false={
+                            lambda %0:bf16[] .
+                            let %1:bf16[] = sin %0
+                                %2:bf16[] = tag [key=save] %1
+                                %3:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %2
+                                %4:bf16[] = mul %3 %3
+                                %5:f32[] = convert_element_type [data_type=f32] %4
+                            in (%5, %3)
+                        },
+                    ]
+                    %8:f32[] = mul %6 %1
+                in (%8, %2, %7)"},
+        );
+        assert_eq!(
+            condition.partition(&[true, false]).unwrap().known_program().to_string(),
+            indoc! {"
+                lambda %0:bf16[] .
+                let %1:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %0
+                    %2:bf16[] = stop_gradient %1
+                    %3:bf16[] = zero [type=bf16[]]
+                    %4:bool[] = compare [direction=GreaterThan] %2 %3
+                    %5:bf16[] = condition %4 %2 [
+                        true={
+                            lambda %0:bf16[] .
+                            let %1:bf16[] = sin %0
+                                %2:bf16[] = tag [key=save] %1
+                                %3:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %2
+                            in (%3)
+                        },
+                        false={
+                            lambda %0:bf16[] .
+                            let %1:bf16[] = sin %0
+                                %2:bf16[] = tag [key=save] %1
+                                %3:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %2
+                            in (%3)
+                        },
+                    ]
+                in (%1, %5)"},
+        );
+
+        let scan = program(true);
+        assert_eq!(
+            scan.linearize().unwrap().primal().to_string(),
+            indoc! {"
+                lambda %0:bf16[2], %1:f32[2] .
+                let %2:bf16[2] = reduce_precision [exponent_bits=8, mantissa_bits=7] %0
+                    %3:f32[2], %4:bf16[2] = scan [carry_count=0, iteration_count=2, reverse=false] %2 [
+                        body={
+                            lambda %0:i64[], %1:bf16[] .
+                            let %2:bf16[] = sin %1
+                                %3:bf16[] = tag [key=save] %2
+                                %4:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %3
+                                %5:bf16[] = mul %4 %4
+                                %6:f32[] = convert_element_type [data_type=f32] %5
+                            in (%6, %4)
+                        },
+                    ]
+                    %5:f32[2] = mul %3 %1
+                in (%5, %4, %2, %1)"},
+        );
+        assert_eq!(
+            scan.partition(&[true, false]).unwrap().known_program().to_string(),
+            indoc! {"
+                lambda %0:bf16[2] .
+                let %1:bf16[2] = scan [carry_count=0, iteration_count=2, reverse=false] %0 [
+                    body={
+                        lambda %0:i64[], %1:bf16[] .
+                        let %2:bf16[] = sin %1
+                            %3:bf16[] = tag [key=save] %2
+                            %4:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %3
+                        in (%4)
+                    },
+                ]
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_excess_precision_scan_body() {
+        // The body `(xs, s) ↦ ws ⊙ s` scans `w = f32(t)` for `t = tag(x², "t")` over the `bf16` elements `x` of `xs`.
+        // Saving `t` splits the scan by knownness: the primal scan stacks `t` on every iteration and computes `w` from
+        // it. Each iteration of the primal scan rounds `t` right after its producer, so that `w` and the stacked `t`
+        // that the tangent program receives agree even when a backend computes `t` in a wider type.
+        let scan_body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let _index = builder.add_input(ArrayType::scalar(DataType::I64));
+            let x = builder.add_input(ArrayType::scalar(DataType::BF16));
+            let t = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, x], None).unwrap()[0];
+            let t = builder.add_instruction(TagOperation::new("t"), Vec::new(), vec![t], None).unwrap()[0];
+            let to_f32 = ConvertElementTypeOperation::new(DataType::F32, false);
+            let w = builder.add_instruction(to_f32, Vec::new(), vec![t], None).unwrap()[0];
+            builder.build::<Vec<Array>, Vec<Array>>(vec![w], vec![Placeholder; 2], vec![Placeholder]).unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let scan_body = builder.import_program(scan_body);
+        let xs = builder.add_input(ArrayType::new_static(DataType::BF16, [2]));
+        let s = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
+        let ws = builder.add_instruction(ScanOperation::new(0, 2), vec![scan_body], vec![xs], None).unwrap()[0];
+        let y = builder.add_instruction(MulOperation::new(), Vec::new(), vec![ws, s], None).unwrap()[0];
+        let body = builder.build::<Vec<Array>, Vec<Array>>(vec![y], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let program = rematerialized_program(&body, ResidualPolicyReference::new(SaveOnlyTheseNames::new(["t"])));
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:bf16[2], %1:f32[2] .
+                let %2:bf16[2] = reduce_precision [exponent_bits=8, mantissa_bits=7] %0
+                    %3:f32[2], %4:bf16[2] = scan [carry_count=0, iteration_count=2, reverse=false] %2 [
+                        body={
+                            lambda %0:i64[], %1:bf16[] .
+                            let %2:bf16[] = mul %1 %1
+                                %3:bf16[] = tag [key=t] %2
+                                %4:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %3
+                                %5:f32[] = convert_element_type [data_type=f32] %4
+                            in (%5, %4)
+                        },
+                    ]
+                    %5:f32[2] = mul %3 %1
+                in (%5, %2, %1, %4)
+                lambda %0:bf16[2], %1:f32[2], %2:bf16[2], %3:f32[2], %4:bf16[2] .
+                let %5:f32[2] = rematerialize [policy=\"save_only_these_names\", differentiated=true] %0 %1 %2 %3 %4 [
+                    body={
+                        lambda %0:bf16[2], %1:f32[2], %2:bf16[2], %3:f32[2], %4:bf16[2] .
+                        let %5:f32[2] = scan [carry_count=0, iteration_count=2, reverse=false] %0 %2 [
+                            body={
+                                lambda %0:i64[], %1:bf16[], %2:bf16[] .
+                                let %3:bf16[] = mul %2 %1
+                                    %4:bf16[] = mul %2 %1
+                                    %5:bf16[] = add %3 %4
+                                    %6:f32[] = convert_element_type [data_type=f32] %5
+                                in (%6)
+                            },
+                        ]
+                            %6:f32[2] = mul %3 %5
+                            %7:f32[2] = scan [carry_count=0, iteration_count=2, reverse=false] %4 [
+                                body={
+                                    lambda %0:i64[], %1:bf16[] .
+                                    let %2:f32[] = convert_element_type [data_type=f32] %1
+                                    in (%2)
+                                },
+                            ]
+                            %8:f32[2] = mul %7 %1
+                            %9:f32[2] = add %6 %8
+                        in (%9)
+                    },
+                ]
+                in (%5)"},
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_differentiation_excess_precision_scan_carries() {
+        // The body scans `c ↦ sin(c) + f32(t)` for `t = tag(x², "t")` over the `bf16` elements `x` of `xs`. The tangent
+        // program reads the carry `c` of every iteration, which the carry recomputation recomputes from the initial
+        // carry and from the values of `t` that the primal scan stacks, because the policy saves `t`. Each iteration of
+        // the primal scan rounds `t` right after its producer, so that the carries that it computes and the carries
+        // that the recomputation computes agree even when a backend computes `t` in a wider type.
+        let scan_body = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let _index = builder.add_input(ArrayType::scalar(DataType::I64));
+            let c = builder.add_input(ArrayType::scalar(DataType::F32));
+            let x = builder.add_input(ArrayType::scalar(DataType::BF16));
+            let t = builder.add_instruction(MulOperation::new(), Vec::new(), vec![x, x], None).unwrap()[0];
+            let t = builder.add_instruction(TagOperation::new("t"), Vec::new(), vec![t], None).unwrap()[0];
+            let to_f32 = ConvertElementTypeOperation::new(DataType::F32, false);
+            let w = builder.add_instruction(to_f32, Vec::new(), vec![t], None).unwrap()[0];
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![c], None).unwrap()[0];
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![sine, w], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let scan_body = builder.import_program(scan_body);
+        let c = builder.add_input(ArrayType::scalar(DataType::F32));
+        let xs = builder.add_input(ArrayType::new_static(DataType::BF16, [2]));
+        let output = builder.add_instruction(ScanOperation::new(1, 2), vec![scan_body], vec![c, xs], None).unwrap()[0];
+        let body = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let program = rematerialized_program(&body, ResidualPolicyReference::new(SaveOnlyTheseNames::new(["t"])));
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            format!("{}\n{}", linearization.primal(), linearization.tangent()),
+            indoc! {"
+                lambda %0:f32[], %1:bf16[2] .
+                let %2:bf16[2] = reduce_precision [exponent_bits=8, mantissa_bits=7] %1
+                    %3:f32[], %4:bf16[2] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %2 [
+                        body={
+                            lambda %0:i64[], %1:f32[], %2:bf16[] .
+                            let %3:f32[] = sin %1
+                                %4:bf16[] = mul %2 %2
+                                %5:bf16[] = tag [key=t] %4
+                                %6:bf16[] = reduce_precision [exponent_bits=8, mantissa_bits=7] %5
+                                %7:f32[] = convert_element_type [data_type=f32] %6
+                                %8:f32[] = add %3 %7
+                            in (%8, %6)
+                        },
+                    ]
+                in (%3, %2, %0, %4)
+                lambda %0:f32[], %1:bf16[2], %2:bf16[2], %3:f32[], %4:bf16[2] .
+                let %5:f32[] = rematerialize [policy=\"save_only_these_names\", differentiated=true] %0 %1 %2 %3 %4 [
+                    body={
+                        lambda %0:f32[], %1:bf16[2], %2:bf16[2], %3:f32[], %4:bf16[2] .
+                        let %5:f32[], %6:f32[2] = scan [carry_count=1, iteration_count=2, reverse=false] %3 %4 [
+                            body={
+                                lambda %0:i64[], %1:f32[], %2:bf16[] .
+                                let %3:f32[] = sin %1
+                                    %4:f32[] = convert_element_type [data_type=f32] %2
+                                    %5:f32[] = add %3 %4
+                                in (%5, %1)
+                            },
+                        ]
+                            %7:f32[] = scan [carry_count=1, iteration_count=2, reverse=false] %0 %1 %2 %6 [
+                                body={
+                                    lambda %0:i64[], %1:f32[], %2:bf16[], %3:bf16[], %4:f32[] .
+                                    let %5:f32[] = cos %4
+                                        %6:f32[] = mul %5 %1
+                                        %7:bf16[] = mul %3 %2
+                                        %8:bf16[] = mul %3 %2
+                                        %9:bf16[] = add %7 %8
+                                        %10:f32[] = convert_element_type [data_type=f32] %9
+                                        %11:f32[] = add %6 %10
+                                    in (%11)
+                                },
+                            ]
+                        in (%7)
+                    },
+                ]
+                in (%5)"},
         );
     }
 

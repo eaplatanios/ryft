@@ -43,7 +43,7 @@ pub(crate) fn trace_scaled_dot_composition(
         },
         input_types,
     )?;
-    Ok(program.simplified()?)
+    Ok(program.into_simplified()?)
 }
 
 /// Returns the dummy scale type used by JAX's four-operand `xla.scaled_dot` boundary for one absent scale.
@@ -1041,7 +1041,7 @@ mod tests {
                 vec![ArrayIrType::Array(input_type)],
             )
             .unwrap();
-            let program = program.into_flat_program().simplified().unwrap();
+            let program = program.into_flat_program().into_simplified().unwrap();
             let input = CoreArray::vector(vec![3.0f64, 1.5, 0.5, 6.0]).unwrap();
             let BlockQuantizedValue { elements, scales, .. } =
                 input.block_quantize(4, element_type, scale_type).unwrap();
