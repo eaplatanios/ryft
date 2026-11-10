@@ -1494,7 +1494,7 @@ impl ShardMapBoundary {
     }
 
     /// Returns the placement of the batch dimension that batching inserts into the mapped boundary positions of this
-    /// map, for a batch axis placed on the mesh axes `placement_axes` (refer to [`BatchedPlacement`] and to the
+    /// map, for a batch axis placed on the mesh axes `placement_axes` (refer to [`ShardMapBatchPlacement`] and to the
     /// batching rule of [`ShardMapOperation`] for the rationale). Every placement axis must be an axis of the mesh.
     /// [`Auto`](MeshAxisType::Auto) axes are dropped, as the boundary drops them from every sharding, while free axes
     /// (i.e., axes that are not active manual axes) are kept. An active manual placement axis that `body` (the local
@@ -1521,7 +1521,7 @@ impl ShardMapBoundary {
         &self,
         placement_axes: &[String],
         body: RegionRef<'_, V, O>,
-    ) -> Result<BatchedPlacement, ShardMapError> {
+    ) -> Result<ShardMapBatchPlacement, ShardMapError> {
         let mut boundary_axes = Vec::new();
         for axis_name in placement_axes {
             let axis_type = self
@@ -1585,7 +1585,7 @@ impl ShardMapBoundary {
             if axis_names.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(axis_names) }
         };
 
-        Ok(BatchedPlacement {
+        Ok(ShardMapBatchPlacement {
             input_placement: placement(free_axes),
             output_placement: placement(output_axes),
             manual_axes,
@@ -2854,7 +2854,7 @@ where
         let mut output_types = self.output_types.clone();
         let mut batched_body = batched_body;
         if input_positions.iter().chain(&output_positions).any(Option::is_some) {
-            let BatchedPlacement { input_placement, output_placement, manual_axes, gathered_axes } =
+            let ShardMapBatchPlacement { input_placement, output_placement, manual_axes, gathered_axes } =
                 match boundary_placement {
                     Some(boundary_placement) => boundary_placement,
                     None => {
@@ -3729,9 +3729,7 @@ where
     context.shard_map_along(|_, local_inputs| function(local_inputs), inputs, mesh, axis_name, input_axes, output_axes)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Static manual-variation checking policy shared by the boundary and closure options. Its two switches are stored
+/// Static manual variation checking policy shared by the boundary and closure options. Its two switches are stored
 /// independently, so the builders that set them commute. Output replication is proven only when the body's manual
 /// variation is checked as well, because an unchecked body carries no variation from which to prove it, so the policy
 /// compares and hashes by the effective checks only (i.e., every policy without manual-variation checking is equal).
@@ -3780,13 +3778,15 @@ impl Hash for ManualVariationChecks {
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Placement of the batch dimension that batching inserts into the mapped boundary positions of a [`ShardMapOperation`]
 /// (refer to [`ShardMapBoundary::batched_placement`]). Released manual axes and free axes partition the batch dimension
 /// of inputs and outputs alike. Gathered axes (i.e., active manual placement axes that the body uses) stay manual and
 /// do not partition the batch dimension of inputs, so every device along them receives every batch item, which is what
 /// per-item semantics requires, because each batch item needs the body at every coordinate along those axes. They tile
 /// the batch dimension of outputs instead, for which the batched body slices each device's block of the batch.
-struct BatchedPlacement {
+struct ShardMapBatchPlacement {
     /// Placement of the batch dimension of mapped inputs, which names only free axes of the batched map.
     input_placement: ShardingDimension,
 
@@ -4820,19 +4820,16 @@ where
     }
 }
 
-/// Eager array IR context whose scan iteration functions every emulated device applies to its own values.
-type DeviceContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
 // Every device applies the eager array IR iteration functions to its own values, so the manual variation of slices and
 // stacks is reconciled exactly as when the scan binds per device. The devices agree on a dynamic trip count, because
 // they agree on the type of the iteration count (refer to `lockstep_values`), which is its extent.
 impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDomain<O> {
     fn iteration_count(iteration_count: &LockstepValue<O>) -> Result<usize, ProgramError> {
-        DeviceContext::iteration_count(&iteration_count.0[0])
+        EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::iteration_count(&iteration_count.0[0])
     }
 
     fn iteration_index(&self, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
-        let index = DeviceContext::new().iteration_index(iteration)?;
+        let index = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().iteration_index(iteration)?;
         Ok(LockstepValue::new(vec![index; self.device_count]))
     }
 
@@ -4845,7 +4842,11 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDoma
         (0..self.device_count)
             .map(|device| {
                 let inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
-                DeviceContext::new().empty_stack(output_type, body_input_types, &inputs)
+                EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().empty_stack(
+                    output_type,
+                    body_input_types,
+                    &inputs,
+                )
             })
             .collect::<Result<_, _>>()
             .map(LockstepValue::new)
@@ -4855,7 +4856,7 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDoma
         stack
             .0
             .iter()
-            .map(|stack| DeviceContext::read_iteration(stack, iteration))
+            .map(|stack| EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::read_iteration(stack, iteration))
             .collect::<Result<_, _>>()
             .map(LockstepValue::new)
     }
@@ -4877,7 +4878,7 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDoma
             .into_iter()
             .zip(value.0)
             .map(|(stack, value)| {
-                DeviceContext::new().write_iteration(
+                EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().write_iteration(
                     output_index,
                     stack,
                     iteration_count,
@@ -4894,7 +4895,7 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDoma
 /// Residual edge that carries one residual across the `shard_map` boundary between the two bodies that splitting one
 /// body produces (refer to [`residual_edge`]).
 #[derive(Debug, PartialEq)]
-struct ResidualEdge {
+struct ShardMapResidualEdge {
     /// Global type of the edge.
     global_type: ArrayType,
 
@@ -5460,7 +5461,7 @@ fn residual_edge(
     residual_index: usize,
     local_type: &ArrayIrType,
     boundary: &ShardMapBoundary,
-) -> Result<ResidualEdge, ShardMapError> {
+) -> Result<ShardMapResidualEdge, ShardMapError> {
     // The boundary sharding records placement only, like the shardings that `ShardMapBoundary::new` builds, so it
     // drops auto axes, variation, and the reduction state along the manual axes of enclosing manual regions, which the
     // edge carries through the boundary on its global type instead (refer to `ShardMapBoundary::global_input_type`).
@@ -5498,7 +5499,7 @@ fn residual_edge(
             .cloned()
             .unwrap_or_else(|| Sharding::replicated(boundary.mesh().clone(), local_type.rank()));
         let sharding = boundary_sharding(&local_sharding)?;
-        return Ok(ResidualEdge { global_type: local_type.clone(), sharding, local_type });
+        return Ok(ShardMapResidualEdge { global_type: local_type.clone(), sharding, local_type });
     }
     // A varying scalar needs a dimension for its global edge to tile. The inserted dimension preserves its element
     // and variation metadata, and residuals with an existing dimension cross with their local type unchanged.
@@ -5533,7 +5534,7 @@ fn residual_edge(
     })?;
     let shape = Shape::new(shape.into_iter().map(Dimension::Static).collect());
     let global_type = boundary_type.clone().with_shape(shape).with_sharding(global_sharding)?;
-    Ok(ResidualEdge { global_type, sharding, local_type: boundary_type })
+    Ok(ShardMapResidualEdge { global_type, sharding, local_type: boundary_type })
 }
 
 /// Returns the active manual axes along which this residual's local value varies.
@@ -5884,16 +5885,17 @@ where
 }
 
 /// Returns the batched `body` of a `shard_map` whose batch is gathered on entry along `gathered_axes` (refer to
-/// [`BatchedPlacement`]) with every output that has a batch dimension position in `output_positions` sliced to the
-/// block of the batch that the executing device holds along those axes, so that the output sharding can tile the batch
-/// dimension along them. The batch dimension of extent `extent`, whose blocks have extent `extent / device_count`, is
-/// split into one dimension per gathered axis (in order, with the first one major) followed by the block dimension, the
-/// device's coordinates (i.e., one `axis_index` per gathered axis) select its block with a `dynamic_slice`, and the
-/// block is reshaped back into the batch dimension. In a checked body, the output first varies along the gathered axes
-/// through staged `parallel_vary` transitions, whose transposes are the cross-device sums that the cotangents of the
-/// selected blocks need, and the start indices take the variation of the sliced value, as `dynamic_slice` requires.
-/// An unchecked body tracks no variation, so it uses unchecked `axis_index` coordinates and leaves its outputs as they
-/// are. The new operations are lifted into the operation family through [`OperationPayloadProjection::from_payload`].
+/// [`ShardMapBatchPlacement`]) with every output that has a batch dimension position in `output_positions` sliced to
+/// the block of the batch that the executing device holds along those axes, so that the output sharding can tile the
+/// batch dimension along them. The batch dimension of extent `extent`, whose blocks have extent
+/// `extent / device_count`, is split into one dimension per gathered axis (in order, with the first one major) followed
+/// by the block dimension, the device's coordinates (i.e., one `axis_index` per gathered axis) select its block with a
+/// `dynamic_slice`, and the block is reshaped back into the batch dimension. In a checked body, the output first varies
+/// along the gathered axes through staged `parallel_vary` transitions, whose transposes are the cross-device sums that
+/// the cotangents of the selected blocks need, and the start indices take the variation of the sliced value, as
+/// `dynamic_slice` requires. An unchecked body tracks no variation, so it uses unchecked `axis_index` coordinates and
+/// leaves its outputs as they are. The new operations are lifted into the operation family through
+/// [`OperationPayloadProjection::from_payload`].
 ///
 /// # Parameters
 ///
@@ -13053,9 +13055,10 @@ mod tests {
                 let mut outputs = vec![Vec::new(); 2];
                 for device in 0..2 {
                     let device_inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
-                    for (output, value) in
-                        outputs.iter_mut().zip(region.interpret_in_context(&DeviceContext::new(), device_inputs)?)
-                    {
+                    for (output, value) in outputs.iter_mut().zip(region.interpret_in_context(
+                        &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+                        device_inputs,
+                    )?) {
                         output.push(value);
                     }
                 }
@@ -15752,7 +15755,7 @@ mod tests {
             ShardMapBoundary::from_validated_shardings(mesh.clone(), Vec::new(), Vec::new(), vec!["y".to_string()]);
         assert_eq!(
             residual_edge(0, &local_type.clone().into(), &boundary),
-            Ok(ResidualEdge {
+            Ok(ShardMapResidualEdge {
                 global_type: expected_type.clone(),
                 sharding: expected_sharding.clone(),
                 local_type: local_type.clone(),
@@ -15772,7 +15775,7 @@ mod tests {
         let expected_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
         assert_eq!(
             residual_edge(1, &scalar_type.into(), &boundary),
-            Ok(ResidualEdge {
+            Ok(ShardMapResidualEdge {
                 global_type: ArrayType::new_static(DataType::F32, [3])
                     .with_sharding(expected_sharding.clone())
                     .unwrap(),
@@ -15789,7 +15792,7 @@ mod tests {
         let dimension_type = ArrayIrType::Dimension(DimensionType::from(extent));
         assert_eq!(
             residual_edge(2, &dimension_type, &boundary),
-            Ok(ResidualEdge {
+            Ok(ShardMapResidualEdge {
                 global_type: ArrayType::new_static(DIMENSION_DATA_TYPE, [3])
                     .with_sharding(expected_sharding.clone())
                     .unwrap(),
@@ -15809,7 +15812,7 @@ mod tests {
         let edge = residual_edge(5, &pending_type.clone().into(), &boundary).unwrap();
         assert_eq!(
             edge,
-            ResidualEdge {
+            ShardMapResidualEdge {
                 global_type: pending_type.clone(),
                 sharding: Sharding::replicated(mesh.clone(), 1),
                 local_type: pending_type.clone(),
@@ -15826,7 +15829,7 @@ mod tests {
         // A replicated residual crosses as itself, and the edge of a reference residual carries its referent.
         let replicated_sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["z"])]).unwrap();
         let replicated_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(replicated_sharding).unwrap();
-        let expected = ResidualEdge {
+        let expected = ShardMapResidualEdge {
             global_type: replicated_type.clone(),
             sharding: replicated_type.sharding().unwrap().clone(),
             local_type: replicated_type.clone(),
