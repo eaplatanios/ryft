@@ -3244,7 +3244,7 @@ impl Default for ShardMapOptions {
 }
 
 /// Context construction capability for a [`ShardMapOperation`], which runs a local body once per device of a manual
-/// SPMD computation over a mesh. This is the Ryft analogue of JAX's
+/// Single Program Multiple Data (SPMD) computation over a mesh. This is the Ryft analogue of JAX's
 /// [`jax.shard_map`](https://docs.jax.dev/en/latest/_autosummary/jax.shard_map.html). The computation is bound in this
 /// explicit context, which also lets a body without inputs create values. The global [`shard_map()`](fn@shard_map)
 /// function instead recovers its context from the first input.
@@ -3473,17 +3473,15 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
         M: Into<Option<LogicalMesh>>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C> ShardMap for C
 where
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
     C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation> + OperationPayloadProjection>
         + NamedAxes
         + MeshContext,
     C::Value: ValueProjection<ArrayType, Projected: Parameter>,
     ProjectedValue<ArrayType, DomainTracer<C>>: ParallelVary,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     fn shard_map<Input, Output, F, M>(
         &self,
@@ -3580,22 +3578,20 @@ where
     }
 }
 
-/// Invokes a manual SPMD computation over `mesh` on `inputs`, running `function` once per device on the local shards of
-/// the inputs and assembling the global outputs from its local outputs. This is the analogue of
-/// [`jax.shard_map`](https://docs.jax.dev/en/latest/_autosummary/jax.shard_map.html). It binds the computation through
-/// the `shard_map` function of [`ShardMap`] in the context whose values project onto the first input (i.e., the parent
-/// of that input's [`Domain`](Value::Domain)), whose documentation describes the complete semantics, and its body
-/// function receives only its local values. The inputs may therefore be concrete arrays (e.g., the arrays of the XLA
-/// backend, which then executes the map eagerly) as well as tracers. A computation without
-/// inputs has no input to recover a context from, so it is invoked through the `shard_map` function of [`ShardMap`] on
-/// an explicitly provided context instead, whose body function also receives the body context through which it creates
-/// values.
+/// Invokes a manual Single Program Multiple Data (SPMD) computation over `mesh` on `inputs`, running `function` once
+/// per device on the local shards of the inputs and assembling the global outputs from its local outputs. This is the
+/// Ryft analogue of JAX's [`jax.shard_map`](https://docs.jax.dev/en/latest/_autosummary/jax.shard_map.html). It binds
+/// the computation through the `shard_map` function of [`ShardMap`] in the context whose values project onto the first
+/// input (i.e., the parent of that input's [`Domain`](Value::Domain)), whose documentation describes the complete
+/// semantics, and its body function receives only its local values. The inputs may therefore be concrete arrays (e.g.,
+/// the arrays of the XLA backend, which then executes the map eagerly) as well as tracers. A computation without inputs
+/// has no input to recover a context from, so it is invoked through [`ShardMap::shard_map`] on an explicitly provided
+/// context instead, whose body function also receives the body context through which it creates values.
 ///
 /// # Parameters
 ///
 ///   - `function`: Body function traced over the local shards of `inputs`.
-///   - `inputs`: Structured global input values, whose leaves are the array members of one context's values
-///     (refer to [`ValueProjection`]).
+///   - `inputs`: Structured global input values, whose leaves are the array members of one context's values.
 ///   - `mesh`: Logical mesh that the manual computation is defined over, or [`None`] for the mesh of
 ///     the innermost enclosing manual region (refer to [`MeshContext::default_mesh`]), as with JAX's `mesh=None`.
 ///   - `input_shardings`: Shardings of the global inputs (i.e., JAX's `in_specs`), with the same structure as `inputs`.
@@ -3605,12 +3601,13 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of the `shard_map`
-/// function of [`ShardMap`] otherwise.
-pub fn shard_map<V, C, F, Input, Output>(
+/// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of
+/// [`ShardMap::shard_map`] otherwise.
+#[inline]
+pub fn shard_map<V, C, Input, Output, F, M>(
     function: F,
     inputs: Input,
-    mesh: impl Into<Option<LogicalMesh>>,
+    mesh: M,
     input_shardings: Input::To<Sharding>,
     output_shardings: Output::To<Sharding>,
     options: ShardMapOptions,
@@ -3623,6 +3620,7 @@ where
     Output: Parameterized<ProjectedValue<ArrayType, DomainTracer<C>>>,
     Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<V>,
     F: FnOnce(Input::To<ProjectedValue<ArrayType, DomainTracer<C>>>) -> Result<Output, ProgramError>,
+    M: Into<Option<LogicalMesh>>,
 {
     let context = inputs
         .parameters()
@@ -3639,19 +3637,21 @@ where
     )
 }
 
-/// Invokes a manual SPMD computation over `mesh` on `inputs` like [`shard_map`], using the sharding of each input's
-/// type as its input sharding (i.e., JAX's default `in_specs=Infer`). It binds the computation through the
-/// `shard_map_with_inferred_input_shardings` function of [`ShardMap`] in the context whose values project onto the
-/// first input, as [`shard_map`] does, and that function's documentation describes the inference.
+/// Invokes a manual Single Program Multiple Data (SPMD) computation over `mesh` on `inputs` like [`shard_map`],
+/// using the sharding of each input's type as its input sharding (i.e., JAX's default `in_specs=Infer`). It binds the
+/// computation through [`ShardMap::shard_map_with_inferred_input_shardings`] in the context whose
+/// values project onto the first input, as [`shard_map`] does, and that function's documentation describes the
+/// inference.
 ///
 /// # Errors
 ///
-/// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of the
-/// `shard_map_with_inferred_input_shardings` function of [`ShardMap`] otherwise.
-pub fn shard_map_with_inferred_input_shardings<V, C, F, Input, Output>(
+/// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of
+/// [`ShardMap::shard_map_with_inferred_input_shardings`] otherwise.
+#[inline]
+pub fn shard_map_with_inferred_input_shardings<V, C, Input, Output, F, M>(
     function: F,
     inputs: Input,
-    mesh: impl Into<Option<LogicalMesh>>,
+    mesh: M,
     output_shardings: Output::To<Sharding>,
     options: ShardMapOptions,
 ) -> Result<Output::To<V>, ShardMapError>
@@ -3663,6 +3663,7 @@ where
     Output: Parameterized<ProjectedValue<ArrayType, DomainTracer<C>>>,
     Output::Family: ParameterizedFamily<Sharding> + ParameterizedFamily<V>,
     F: FnOnce(Input::To<ProjectedValue<ArrayType, DomainTracer<C>>>) -> Result<Output, ProgramError>,
+    M: Into<Option<LogicalMesh>>,
 {
     let context = inputs
         .parameters()
@@ -3678,11 +3679,11 @@ where
     )
 }
 
-/// Invokes a manual SPMD computation over the single manual axis `axis_name` of `mesh` on `inputs`, placing the
-/// dimensions that `input_axes` and `output_axes` select along that axis. This is the analogue of
-/// [`jax.smap`](https://docs.jax.dev/en/latest/_autosummary/jax.smap.html). It binds the computation through the
-/// `shard_map_along` function of [`ShardMap`] in the context whose values project onto the first input, as
-/// [`shard_map`] does, and that function's documentation describes the complete semantics.
+/// Invokes a manual Single Program Multiple Data (SPMD) computation over the single manual axis `axis_name` of `mesh`
+/// on `inputs`, placing the dimensions that `input_axes` and `output_axes` select along that axis. This is the Ryft
+/// analogue of JAX's [`jax.smap`](https://docs.jax.dev/en/latest/_autosummary/jax.smap.html). It binds the computation
+/// through [`ShardMap::shard_map_along`] in the context whose values project onto the first input, as [`shard_map`]
+/// does, and that function's documentation describes the complete semantics.
 ///
 /// # Parameters
 ///
@@ -3699,12 +3700,13 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of the `shard_map_along`
-/// function of [`ShardMap`] otherwise.
-pub fn shard_map_along<V, C, F, Input, Output>(
+/// Returns [`ShardMapError::MissingInputContext`] when `inputs` has no leaves, and the errors of
+/// [`ShardMap::shard_map_along`] otherwise.
+#[inline]
+pub fn shard_map_along<V, C, Input, Output, F, M>(
     function: F,
     inputs: Input,
-    mesh: impl Into<Option<LogicalMesh>>,
+    mesh: M,
     axis_name: &str,
     input_axes: Input::To<Option<usize>>,
     output_axes: Output::To<Option<usize>>,
@@ -3717,6 +3719,7 @@ where
     Output: Parameterized<ProjectedValue<ArrayType, DomainTracer<C>>>,
     Output::Family: ParameterizedFamily<Option<usize>> + ParameterizedFamily<V>,
     F: FnOnce(Input::To<ProjectedValue<ArrayType, DomainTracer<C>>>) -> Result<Output, ProgramError>,
+    M: Into<Option<LogicalMesh>>,
 {
     let context = inputs
         .parameters()
@@ -3725,6 +3728,8 @@ where
         .ok_or(ShardMapError::MissingInputContext)?;
     context.shard_map_along(|_, local_inputs| function(local_inputs), inputs, mesh, axis_name, input_axes, output_axes)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Static manual-variation checking policy shared by the boundary and closure options. Its two switches are stored
 /// independently, so the builders that set them commute. Output replication is proven only when the body's manual
