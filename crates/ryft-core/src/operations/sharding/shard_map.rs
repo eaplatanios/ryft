@@ -4059,7 +4059,7 @@ where
                         referent = reference.read()?;
                         &referent
                     }
-                    value => array_value(value, SHARD_MAP_OPERATION_NAME)?,
+                    value => ValueProjection::<ArrayType>::projected(value)?,
                 };
                 // The shards are read at the offsets that the declared global type implies, so the value must have
                 // that type's data type and shape.
@@ -4355,7 +4355,7 @@ where
                     .map(|participant| {
                         inputs
                             .iter()
-                            .map(|values| array_value(&values[*participant], name).cloned())
+                            .map(|values| ValueProjection::<ArrayType>::projected(&values[*participant]).cloned())
                             .collect::<Result<Vec<_>, _>>()
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -4420,7 +4420,10 @@ where
         // Every remaining collective consumes one array per device, followed by the result extents of its mixed form.
         let (values, extents) =
             inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-        let arrays = values.iter().map(|value| array_value(value, name)).collect::<Result<Vec<_>, _>>()?;
+        let arrays = values
+            .iter()
+            .map(|value| ValueProjection::<ArrayType>::projected(value))
+            .collect::<Result<Vec<_>, _>>()?;
         let outputs = if let Some(payload) = operation.projected_payload::<ParallelVaryOperation>() {
             // Varying an invariant value along an axis changes only its type, because every device already holds it.
             self.grid.map_devices(|device| {
@@ -4547,7 +4550,8 @@ where
                 // require agreement within this participant group before selecting its source.
                 let mut input_types = vec![arrays[device].r#type().into_owned()];
                 if dynamic {
-                    input_types.push(array_value(&inputs[1][device], name)?.r#type().into_owned());
+                    input_types
+                        .push(ValueProjection::<ArrayType>::projected(&inputs[1][device])?.r#type().into_owned());
                 }
                 let output_type = payload.infer_output_types(&input_types, &[])?.remove(0);
                 let source = match payload.source() {
@@ -4557,7 +4561,7 @@ where
                         let sources = participants
                             .iter()
                             .map(|participant| {
-                                let source = array_value(&inputs[1][*participant], name)?;
+                                let source = ValueProjection::<ArrayType>::projected(&inputs[1][*participant])?;
                                 payload.infer_output_types(
                                     &[arrays[*participant].r#type().into_owned(), source.r#type().into_owned()],
                                     &[],
@@ -4610,7 +4614,28 @@ where
         regions: &[RegionRef<'_, ArrayIrValue<Array>, C::Operation>],
         inputs: &[DeviceValues],
     ) -> Result<Vec<DeviceValues>, ProgramError> {
-        let inputs = lockstep_values(operation.name(), inputs)?;
+        // The input of every device must have the type of the input of device zero. Devices whose inputs differ in
+        // type (e.g., in the extent of the iteration count of a `scan`, which is its trip count) could take different
+        // paths through the operation, while the lockstep emulation requires every device to take the same path, which
+        // is stricter than a device runtime (refer to the `# Reference Backend Emulation` section of the module
+        // documentation).
+        let operation_name = operation.name();
+        let inputs = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, values)| {
+                if values.iter().any(|value| value.r#type() != values[0].r#type()) {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on the type of input {index} of \
+                             a `{operation_name}` whose regions use collectives over the manual axes, but lockstep \
+                             emulation requires every device to take the same path",
+                        ),
+                    });
+                }
+                Ok(LockstepValue::new(values.clone()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let context = LockstepDomain::<C::Operation>::new(self.grid.device_count());
         let driver = LockstepInterpretationDriver {
             regions,
@@ -4628,10 +4653,10 @@ where
 /// Values of one program atom on every emulated device, in device order, as one value of the [`LockstepDomain`]. The
 /// emulator runs the eager rules of the region operations that must run in lockstep (i.e., `while`, `condition`, and
 /// `scan`) over these values, so that every device follows the rule that eager interpretation follows. The type of a
-/// [`LockstepValue`] is that of the value of device zero, which is the type of the value of every device when the
-/// value enters such an operation (refer to [`lockstep_values`]), so that the rules validate each application once for
-/// all devices. The operation family `O` of the regions that the emulator replays only ties these values to their
-/// [`LockstepDomain`].
+/// [`LockstepValue`] is that of the value of device zero, which is the type of the value of every device when the value
+/// enters such an operation (refer to [`ShardMapEmulator::run_lockstep`]), so that the rules validate each application
+/// once for all devices. The operation family `O` of the regions that the emulator replays only ties these values to
+/// their [`LockstepDomain`].
 struct LockstepValue<O>(DeviceValues, PhantomData<fn() -> O>);
 
 impl<O> LockstepValue<O> {
@@ -4685,13 +4710,33 @@ impl<O: Operation<Type = ArrayIrType>> Value for LockstepValue<O> {
 // each device masks its own state with its own predicate (refer to `WhilePredicate`).
 impl<O> Concretizable<bool> for LockstepValue<O> {
     fn concretize(&self) -> Result<bool, ProgramError> {
-        agreed_predicate(self.0.iter().map(Concretizable::concretize), CONDITION_OPERATION_NAME)
+        let values = self.0.iter().map(Concretizable::concretize).collect::<Result<Vec<_>, _>>()?;
+        if values.iter().any(|value| *value != values[0]) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on the predicate of a \
+                     `{CONDITION_OPERATION_NAME}` whose regions use collectives over the manual axes, but lockstep \
+                     emulation requires every device to take the same path",
+                ),
+            });
+        }
+        Ok(values[0])
     }
 }
 
 impl<O: Operation<Type = ArrayIrType>> WhilePredicate for LockstepValue<O> {
     fn any_true(&self) -> Result<bool, ProgramError> {
-        agreed_predicate(self.0.iter().map(WhilePredicate::any_true), WHILE_OPERATION_NAME)
+        let values = self.0.iter().map(WhilePredicate::any_true).collect::<Result<Vec<_>, _>>()?;
+        if values.iter().any(|value| *value != values[0]) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on the predicate of a \
+                     `{WHILE_OPERATION_NAME}` whose regions use collectives over the manual axes, but lockstep \
+                     emulation requires every device to take the same path",
+                ),
+            });
+        }
+        Ok(values[0])
     }
 
     fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
@@ -4779,7 +4824,7 @@ where
 
 // Every device applies the eager array IR iteration functions to its own values, so the manual variation of slices and
 // stacks is reconciled exactly as when the scan binds per device. The devices agree on a dynamic trip count, because
-// they agree on the type of the iteration count (refer to `lockstep_values`), which is its extent.
+// they agree on the type of the iteration count (refer to `ShardMapEmulator::run_lockstep`), which is its extent.
 impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDomain<O> {
     fn iteration_count(iteration_count: &LockstepValue<O>) -> Result<usize, ProgramError> {
         EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::iteration_count(&iteration_count.0[0])
@@ -5137,37 +5182,6 @@ fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
     }
 }
 
-/// Returns the per-device `inputs` of the region operation named `operation_name` that runs in lockstep as
-/// [`LockstepValue`]s, after validating that the input of every device has the type of the input of device zero.
-/// Devices whose inputs differ in type (e.g., in the extent of the iteration count of a `scan`, which is its trip
-/// count) could take different paths through the operation, which the lockstep emulation of its regions does not
-/// support.
-fn lockstep_values<O>(operation_name: &str, inputs: &[DeviceValues]) -> Result<Vec<LockstepValue<O>>, ProgramError> {
-    inputs
-        .iter()
-        .enumerate()
-        .map(|(index, values)| {
-            if values.iter().any(|value| value.r#type() != values[0].r#type()) {
-                return Err(divergent_devices_error(&format!("the type of input {index}"), operation_name));
-            }
-            Ok(LockstepValue::new(values.clone()))
-        })
-        .collect()
-}
-
-/// Returns the predicate on which every device agrees, given the predicate `values` of every device for the region
-/// operation named `operation_name`.
-fn agreed_predicate(
-    values: impl Iterator<Item = Result<bool, ProgramError>>,
-    operation_name: &str,
-) -> Result<bool, ProgramError> {
-    let values = values.collect::<Result<Vec<_>, _>>()?;
-    if values.iter().any(|value| *value != values[0]) {
-        return Err(divergent_devices_error("the predicate", operation_name));
-    }
-    Ok(values[0])
-}
-
 /// Returns the names of the axes that `operation` communicates along when it is a collective (including `axis_index`,
 /// which observes the coordinate along its axis), and [`None`] otherwise.
 fn collective_axes<O: OperationPayloadProjection>(operation: &O) -> Option<CollectiveAxes> {
@@ -5188,31 +5202,6 @@ fn collective_axes<O: OperationPayloadProjection>(operation: &O) -> Option<Colle
                 .projected_payload::<ParallelRaggedAllToAllOperation>()
                 .map(|payload| single(payload.axis_name()))
         })
-}
-
-/// Returns the error reported when devices disagree on the `subject` (e.g., the predicate) of the region operation
-/// named `operation_name` that runs in lockstep, so that they could take different paths through it. The lockstep
-/// emulation requires every device to take the same path, which is stricter than a device runtime (refer to the
-/// `# Reference Backend Emulation` section of the module documentation).
-fn divergent_devices_error(subject: &str, operation_name: &str) -> ProgramError {
-    ProgramError::UnsupportedOperation {
-        message: format!(
-            "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on {subject} of a `{operation_name}` whose \
-             regions use collectives over the manual axes, but lockstep emulation requires every device to take the \
-             same path",
-        ),
-    }
-}
-
-/// Returns the array that `value` holds, rejecting dimensions and references, which no boundary or collective of
-/// `operation_name` accepts.
-fn array_value<'v>(value: &'v ArrayIrValue<Array>, operation_name: &str) -> Result<&'v Array, ProgramError> {
-    match value {
-        ArrayIrValue::Array(array) => Ok(array),
-        _ => Err(ProgramError::InvalidArgument {
-            message: format!("`{operation_name}` expects an array value but got `{}`", value.r#type()),
-        }),
-    }
 }
 
 /// Returns the single output type that `operation` infers for `input_types`.
@@ -5422,7 +5411,7 @@ fn assemble_global_value(
         if !contributes {
             continue;
         }
-        let value = array_value(value, SHARD_MAP_OPERATION_NAME)?;
+        let value = ValueProjection::<ArrayType>::projected(value)?;
         let offsets = manual_block_offsets(sharding, grid, &coordinates, &static_extents(&value.r#type())?);
         match tiles.iter_mut().find(|(tile_offsets, _)| *tile_offsets == offsets) {
             Some((_, summands)) => summands.push(value),
@@ -5504,8 +5493,8 @@ fn replicated_copy_mismatch<'o>(
             }
             let mut first_coordinates = coordinates.clone();
             first_coordinates[axis] = 0;
-            let first = array_value(&values[grid.device(&first_coordinates)], SHARD_MAP_OPERATION_NAME)?;
-            if array_value(value, SHARD_MAP_OPERATION_NAME)?.logical_bytes() != first.logical_bytes() {
+            let first = ValueProjection::<ArrayType>::projected(&values[grid.device(&first_coordinates)])?;
+            if ValueProjection::<ArrayType>::projected(value)?.logical_bytes() != first.logical_bytes() {
                 return Ok(Some(&grid.axes[axis].0));
             }
         }
