@@ -3780,8 +3780,6 @@ impl Hash for ManualVariationChecks {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Active manual axes requested for a [`ShardMapBoundary`].
 enum ManualAxisSelection {
     /// Every manual mesh axis that no enclosing manual region already made manual, which is what an empty list of
@@ -3829,6 +3827,8 @@ impl CarriedReductionState {
 
 /// Values of one program atom on every emulated device, in row-major device order.
 type DeviceValues = Vec<ArrayIrValue<Array>>;
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Devices of one lockstep emulation, identified by their coordinates along the emulated manual axes. Device indices
 /// enumerate these coordinates in row-major order, so a nested grid that appends the axes of an inner manual region
