@@ -3828,8 +3828,6 @@ impl CarriedReductionState {
 /// Values of one program atom on every emulated device, in row-major device order.
 type DeviceValues = Vec<ArrayIrValue<Array>>;
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Lockstep emulator for the devices of a [`LockstepDeviceGrid`]. It replays regions over [`DeviceValues`] and binds
 /// ordinary operations per device through the [`InterpretationDriver`] of the `shard_map` application being
 /// interpreted.
@@ -3843,7 +3841,10 @@ struct ShardMapEmulator<'o, C, D> {
     /// Devices of this emulation.
     grid: LockstepDeviceGrid,
 
-    /// Enclosing manual boundaries, outermost first, which own each axis's physical mesh and checking policy.
+    /// Boundaries of the manual regions that this emulator runs inside (i.e., of the `shard_map` whose body it emulates
+    /// and of every `shard_map` that encloses that one), outermost first. It is empty for the emulator that runs an
+    /// outermost `shard_map` itself. The region that made an axis manual owns the physical mesh and the checking policy
+    /// of that axis.
     manual_regions: Vec<ShardMapBoundary>,
 }
 
@@ -3872,6 +3873,7 @@ where
         {
             operation.validate_body(body)?;
         }
+
         let manual_axes = boundary
             .manual_axes()
             .iter()
@@ -3921,8 +3923,6 @@ where
         let mut body_inputs = Vec::with_capacity(inputs.len());
         let mut reference_inputs = Vec::new();
         for (index, values) in inputs.iter().enumerate() {
-            // An unchecked body observes the physical summands of an input that is unreduced along an active manual
-            // axis, which the logical arrays of this backend do not retain.
             // TODO(eaplatanios): Support unreduced inputs of unchecked maps on the reference backend, which XLA already
             //  supports because its arrays keep one buffer per device. That needs a reference value that owns the
             //  per-device summands of an unreduced array, which `local_input_shard` hands to the devices along its
@@ -3933,6 +3933,9 @@ where
             //  `test_shard_map_interpretation_without_manual_variation_rejects_unreduced_reference_inputs`, and test
             //  reverse mode through reduced outputs of unchecked maps (whose seeds are unreduced) and into mutated
             //  reduced gradient references (whose destinations are unreduced) on this backend.
+
+            // An unchecked body observes the physical summands of an input that is unreduced along an active manual
+            // axis, which the logical arrays of this backend do not retain.
             if !boundary.checks_manual_variation()
                 && let Some(axis_name) = boundary
                     .manual_axes()
@@ -3945,6 +3948,7 @@ where
                 }
                 .into());
             }
+
             let global_type = boundary_array_type(&operation.global_input_types()[index])?;
             let local_type = boundary.local_input_type(index, global_type)?;
             let mut local_values = Vec::with_capacity(values.len() * local_device_count);
@@ -3957,6 +3961,7 @@ where
                     }
                     value => ValueProjection::<ArrayType>::projected(value)?,
                 };
+
                 // The shards are read at the offsets that the declared global type implies, so the value must have
                 // that type's data type and shape.
                 let array_type = array.r#type();
@@ -3967,12 +3972,14 @@ where
                     ))
                     .into());
                 }
+
                 let shards = (0..local_device_count)
                     .map(|local_device| {
                         let coordinates = local_grid.coordinates(local_device);
                         local_input_shard(boundary, index, array, &local_type, &local_grid, &coordinates)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+
                 match value {
                     ArrayIrValue::Reference(reference) => {
                         let roots = shards.into_iter().map(ArrayReference::new).collect::<Vec<_>>();
@@ -3982,6 +3989,7 @@ where
                     _ => local_values.extend(shards.into_iter().map(ArrayIrValue::Array)),
                 }
             }
+
             body_inputs.push(local_values);
         }
 
@@ -4018,9 +4026,8 @@ where
         // Validate and assemble all reference states before writing any of them back to the caller. Along an active
         // manual axis along which a reference is unreduced, the devices hold partial states, which assembling sums.
         // Along an active manual axis along which it is otherwise replicated, every device holds its own copy, which
-        // the reference contract requires identical final copies, so
-        // assembling takes the copy of the device at coordinate zero, after checking that every other copy agrees with
-        // it.
+        // the reference contract requires identical final copies, so assembling takes the copy of the device at
+        // coordinate zero, after checking that every other copy agrees with it.
         let mut reference_updates = Vec::with_capacity(reference_inputs.len());
         for (index, reference, roots) in reference_inputs {
             let shards = roots
@@ -4033,12 +4040,13 @@ where
             let value = assemble_global_value(sharding, reference_type.referent(), &local_grid, &shards)?;
             reference_updates.push((reference, value));
         }
+
         for (reference, value) in reference_updates {
             reference.write(value)?;
         }
 
-        // Assemble every global output of every enclosing device from the body outputs of its local devices. A
-        // reference output forwards a reference input, so it is the caller's reference itself.
+        // Assemble every global output of every enclosing device from the body outputs of its local devices.
+        // A reference output forwards a reference input, so it is the caller's reference itself.
         body_outputs
             .iter()
             .enumerate()
@@ -4074,6 +4082,7 @@ where
         )
     }
 
+    // TODO(eaplatanios): Is there a way to avoid special-casing specific operations by type or name in this function?
     /// Runs one `instruction` of `region` on every device and returns its per-device outputs.
     fn run_instruction(
         &self,
@@ -4095,18 +4104,23 @@ where
         let regions = instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
         operation
             .validate_region_interfaces(&regions.iter().map(|region| region.interface().clone()).collect::<Vec<_>>())?;
+
         if let Some(operation) = operation.projected_payload::<WhileOperation<ArrayIrType>>() {
             return self.run_lockstep(operation, &regions, inputs);
         }
+
         if let Some(operation) = operation.projected_payload::<ConditionOperation<ArrayIrType>>() {
             return self.run_lockstep(operation, &regions, inputs);
         }
+
         if let Some(operation) = operation.projected_payload::<ScanOperation<ArrayIrType>>() {
             return self.run_lockstep(operation, &regions, inputs);
         }
+
         if let Some(operation) = operation.projected_payload::<ShardMapOperation>() {
             return self.run_shard_map(operation, regions[0], inputs.to_vec());
         }
+
         // The eager rules of these operations replay their primal region (i.e., region zero) over all of their inputs.
         if matches!(
             operation.name(),
@@ -4114,10 +4128,12 @@ where
         ) {
             return self.run_region(regions[0], inputs.to_vec());
         }
+
         Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "`{SHARD_MAP_OPERATION_NAME}` interpretation cannot run `{}` in lockstep across devices, which its \
+                "`{}` interpretation cannot run `{}` in lockstep across devices, which its \
                  attached regions require because they use collectives over the manual axes",
+                SHARD_MAP_OPERATION_NAME,
                 operation.name(),
             ),
         })
@@ -4165,7 +4181,7 @@ where
         Ok(false)
     }
 
-    /// Checks that a variation or reduction-state cast belongs to the actual checked manual binding of its axis.
+    /// Checks that a variation or reduction state cast belongs to the actual checked manual binding of its axis.
     /// The operation's inference has already validated the input's mesh and source state. A nested region that binds
     /// other axes does not replace this axis's owning boundary, so ownership is resolved by axis, from the inside out.
     fn validate_tracked_collective(
@@ -4184,16 +4200,19 @@ where
                     "`{operation_name}` manual axis `{axis_name}` has no enclosing manual binding",
                 ))
             })?;
+
         if !input_type.sharding().unwrap().mesh().has_same_manual_axes(boundary.mesh()) {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{operation_name}` operation mesh does not match the enclosing manual axis `{axis_name}` mesh",
             )));
         }
+
         if !boundary.checks_manual_variation() {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{operation_name}` cannot use tracked mesh metadata inside an unchecked manual binding",
             )));
         }
+
         Ok(())
     }
 
@@ -4551,6 +4570,8 @@ where
         Ok(outputs.into_iter().map(|output| output.0).collect())
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Devices of one lockstep emulation, identified by their coordinates along the emulated manual axes. Device indices
 /// enumerate these coordinates in row-major order, so a nested grid that appends the axes of an inner manual region
