@@ -1026,6 +1026,25 @@ mod tests {
         assert_eq!(rematerialized_pullback.apply(cotangents), Ok(expected_gradient), "policy `{name}`",);
     }
 
+    /// Returns a branch or a scan body that computes `d = tag(sin(x), "save")` and `s = d · d` over `bf16` and returns
+    /// `f32(s)`, so that the saved value `d` has a known consumer inside the region.
+    fn interior_consumer_region(scan: bool) -> TestProgram {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        if scan {
+            builder.add_input(ArrayType::scalar(DataType::I64));
+        }
+        let x = builder.add_input(ArrayType::scalar(DataType::BF16));
+        let d = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+        let d = builder.add_instruction(TagOperation::new("save"), Vec::new(), vec![d], None).unwrap()[0];
+        let s = builder.add_instruction(MulOperation::new(), Vec::new(), vec![d, d], None).unwrap()[0];
+        let to_f32 = ConvertElementTypeOperation::new(DataType::F32, false);
+        let w = builder.add_instruction(to_f32, Vec::new(), vec![s], None).unwrap()[0];
+        let input_count = if scan { 2 } else { 1 };
+        builder
+            .build::<Vec<Array>, Vec<Array>>(vec![w], vec![Placeholder; input_count], vec![Placeholder])
+            .unwrap()
+    }
+
     #[test]
     fn test_rematerialization_optimization_barrier_selects() {
         assert!(RematerializationOptimizationBarrier::All.selects(0));
@@ -3837,33 +3856,14 @@ mod tests {
         );
     }
 
-    /// Returns a branch or a scan body that computes `d = tag(sin(x), "save")` and `s = d · d` over `bf16` and returns
-    /// `f32(s)`, so that the saved value `d` has a known consumer inside the region.
-    fn interior_consumer_region(scan: bool) -> TestProgram {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        if scan {
-            builder.add_input(ArrayType::scalar(DataType::I64));
-        }
-        let x = builder.add_input(ArrayType::scalar(DataType::BF16));
-        let d = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
-        let d = builder.add_instruction(TagOperation::new("save"), Vec::new(), vec![d], None).unwrap()[0];
-        let s = builder.add_instruction(MulOperation::new(), Vec::new(), vec![d, d], None).unwrap()[0];
-        let to_f32 = ConvertElementTypeOperation::new(DataType::F32, false);
-        let w = builder.add_instruction(to_f32, Vec::new(), vec![s], None).unwrap()[0];
-        let input_count = if scan { 2 } else { 1 };
-        builder
-            .build::<Vec<Array>, Vec<Array>>(vec![w], vec![Placeholder; input_count], vec![Placeholder])
-            .unwrap()
-    }
-
     #[test]
     fn test_rematerialize_excess_precision_rounds_split_values_before_their_interior_consumers() {
         // The body `(x, y) ↦ f32(s) · y` computes `s = d · d` for a saved `d = tag(sin(x), "save")` over `bf16`, in a
-        // condition on `stop_gradient(x)` or in a scan over the elements of `x`. Only `y` is unknown (or differentiated),
-        // so the region is split on residual demand (the condition) or by knownness (the scan), and its known part
-        // returns `d` as an additional result whose only consumer inside the region is `s`. Linearization and partial
-        // evaluation both round `d` right after its producer inside the region, before `s` reads it, so that `s` and
-        // the residual work that recomputes it from the saved `d` agree even when a backend computes `d` in a wider type.
+        // condition on `stop_gradient(x)` or in a scan over the elements of `x`. The known part of the region returns
+        // `d` as an additional result, rounded right after its producer inside the region. Linearization keeps `s` in
+        // the primal program, where it reads the rounded `d`, so that `s` and the tangent work that receives the saved
+        // `d` agree even when a backend computes `d` in a wider type. Partial evaluation with only `x` known leaves
+        // `s` to the residual program, so its known region only returns the rounded `d`.
         let program = |scan: bool| {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let shape: &[usize] = if scan { &[2] } else { &[] };
@@ -4685,5 +4685,35 @@ mod tests {
         assert_eq!(value, scalar(12.0));
         assert_eq!(pullback.apply(scalar(1.0)), Ok(MaybeZero::Value(scalar(16.0))));
         assert_eq!(pullback.apply(scalar(1.0)), Ok(MaybeZero::Value(scalar(16.0))));
+    }
+
+    #[test]
+    fn test_excess_precision_rounding() {
+        // IEEE-style formats narrower than `f32` are rounded to their own exponent and mantissa widths.
+        let rounding = |data_type: DataType| {
+            ExcessPrecisionRounding
+                .rounding_operation(&ArrayType::scalar(data_type))
+                .map(|operation| operation.downcast::<ReducePrecisionOperation<ArrayType>>().unwrap())
+        };
+        assert_eq!(rounding(DataType::BF16), Some(ReducePrecisionOperation::new(8, 7)));
+        assert_eq!(rounding(DataType::F16), Some(ReducePrecisionOperation::new(5, 10)));
+        assert_eq!(rounding(DataType::F8E5M2), Some(ReducePrecisionOperation::new(5, 2)));
+        assert_eq!(rounding(DataType::F8E4M3), Some(ReducePrecisionOperation::new(4, 3)));
+        assert_eq!(rounding(DataType::F8E3M4), Some(ReducePrecisionOperation::new(3, 4)));
+
+        // Wider types, finite-only formats, and types that are not floating-point are left unchanged.
+        assert_eq!(rounding(DataType::F32), None);
+        assert_eq!(rounding(DataType::F64), None);
+        assert_eq!(rounding(DataType::F8E4M3FN), None);
+        assert_eq!(rounding(DataType::I32), None);
+
+        // Only a reduction to the widths of the type of a value is its rounding.
+        let is_rounding = |data_type: DataType, operation: ArrayOperation<Array>| {
+            ExcessPrecisionRounding.is_rounding(&ArrayType::scalar(data_type), &operation)
+        };
+        assert!(is_rounding(DataType::BF16, ReducePrecisionOperation::new(8, 7).into()));
+        assert!(!is_rounding(DataType::BF16, ReducePrecisionOperation::new(5, 10).into()));
+        assert!(!is_rounding(DataType::BF16, SinOperation::new().into()));
+        assert!(!is_rounding(DataType::F32, ReducePrecisionOperation::new(8, 7).into()));
     }
 }

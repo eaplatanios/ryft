@@ -1519,7 +1519,7 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
         let mut replay_analysis = ResidualReplayAnalysis::new(known_program, policy);
 
         // Plans one demanded known atom, applying the rules listed in the documentation of `with_residual_policy`
-        // in order: constants, known inputs, and fixed edges never consult the policy reference handles are either
+        // in order: constants, known inputs, and fixed edges never consult the policy, reference handles are either
         // original edges or replayed, values whose producers cannot be replayed are saved, and the policy classifies
         // everything else. The provenance of the known program provides the candidates that the policy classifies,
         // and memoizes the provenance of every visited value across calls.
@@ -2050,7 +2050,7 @@ pub(crate) trait ResidualPlacement<V: Value, O: Operation<Type = V::Type>> {
 /// [`ResidualPlacement::place_residuals`] through the partial-evaluation rules of the operations (refer to
 /// [`split_on_residual_demand`](crate::PartiallyEvaluatableOperation::split_on_residual_demand)),
 /// which the planner cannot reach itself.
-pub(crate) type ResidualDemandSplitter<'o, V, O> =
+pub(super) type ResidualDemandSplitter<'o, V, O> =
     dyn 'o + Fn(RegionRef<'_, V, O>, usize, &[bool]) -> Result<Option<PartitionedProgram<V, O>>, ProgramError>;
 
 /// Program that recomputes known values from values that residual work receives, as planned by
@@ -2126,8 +2126,8 @@ impl<V: Value<Type: 'static>, O: Operation<Type = V::Type> + OperationPayloadPro
                 plans
                     .iter()
                     .enumerate()
-                    .filter(|&(index, plan)| matches!(plan, Some(ResidualPlan::Edge(Some(_)))))
-                    .map(|(index, plan)| stored_atoms[&AtomId::new(index)].0),
+                    .filter(|&(_, plan)| matches!(plan, Some(ResidualPlan::Edge(Some(_)))))
+                    .map(|(index, _)| stored_atoms[&AtomId::new(index)].0),
             );
             let input_count = known_program.input_ids().len();
             let output_count = outputs.len();

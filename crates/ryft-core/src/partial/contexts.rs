@@ -11,10 +11,12 @@ use crate::macros::check_count;
 use crate::operations::GuardOperation;
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::evaluations::PartialEvaluation;
-use crate::partial::operations::{PartiallyEvaluatableOperation, RecursivePartialEvaluationDriver};
+use crate::partial::operations::{
+    PartialEvaluationDriver, PartiallyEvaluatableOperation, RecursivePartialEvaluationDriver,
+};
 use crate::partial::partitions::{EffectOrdering, PartitionedProgram};
 use crate::partial::residuals::{
-    ResidualPlacement, ResidualPolicyReference, ResidualRounding, RoundedResidualPlacement,
+    ResidualPlacement, ResidualPolicyReference, ResidualRecomputation, ResidualRounding, RoundedResidualPlacement,
 };
 use crate::partial::values::{
     PartialEvaluationInput, PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartialValueMaterialization,
@@ -229,7 +231,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// This function changes only the returned context's configuration, without creating a new residual program
     /// or changing previously emitted work. Existing clones retain their own residual policy. The resulting partitions
     /// keep the values that they save unrounded, unlike the partitions of the rematerialization rules. Refer to
-    /// [`residual_rounding`](Self::residual_rounding) for more information on the latter.
+    /// [`residual_rounding_type`](Self::residual_rounding_type) for more information on the latter.
     #[inline]
     pub fn with_residual_policy(self, policy: &ResidualPolicyReference<C::Type>) -> Self
     where
@@ -355,8 +357,8 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// configure rounding immediately after saved values' producers in the known program. This makes known work and
     /// residual work observe the same values even when a backend computes them at a higher precision than their types.
     #[inline]
-    pub fn residual_rounding(&self) -> Option<TypeId> {
-        self.state.residual_placement.as_ref().and_then(|placement| placement.rounding())
+    pub fn residual_rounding_type(&self) -> Option<TypeId> {
+        self.state.residual_placement.as_ref().and_then(|placement| placement.rounding_type())
     }
 
     /// Returns whether ordered effects must currently remain residual to preserve execution order, which is the case
@@ -369,7 +371,7 @@ impl<C: Context> PartialEvaluationContext<C> {
     /// Returns the residual placement of this [`PartialEvaluationContext`], if a residual policy was set (refer to
     /// [`with_residual_policy`](Self::with_residual_policy)).
     #[inline]
-    pub(crate) fn residual_placement(&self) -> Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>> {
+    pub(super) fn residual_placement(&self) -> Option<Rc<dyn ResidualPlacement<C::Constant, C::Operation>>> {
         self.state.residual_placement.clone()
     }
 
@@ -886,6 +888,40 @@ impl<C: Context> PartialEvaluationContext<C> {
             });
         };
         region.partition_with_residual_demand(demanded_outputs, self.allow_effect_folding(), residual_placement)
+    }
+
+    /// Plans how residual work recomputes the values of the atoms `values` of `known_program` under the residual
+    /// policy of this context, and returns the program that recomputes them, or [`None`] when this context has no
+    /// residual policy. `known_program` is the known program of a partition whose residuals were already placed and
+    /// whose edges are the atoms `saved`. The inputs of `known_program` and the atoms of `saved` are available without
+    /// consulting the policy, and every other demanded value is planned like a demanded value of the placement, so
+    /// the decisions of the policy apply to the recomputation as well (refer to [`ResidualRecomputation`] for what
+    /// the result contains). When replaying a demanded output of an all-known region-carrying instruction would
+    /// recompute values that the policy saves, that instruction is split on residual demand through `driver` (refer
+    /// to [`PartialEvaluationDriver::split_instruction_on_residual_demand`]). Loop rules use this to recompute the
+    /// changing known carries that their residual bodies read instead of saving them on every iteration.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of classifying values with the policy, of splitting instructions on residual demand,
+    /// and of building the recomputation.
+    pub(crate) fn plan_recomputation<D: PartialEvaluationDriver<C>>(
+        &self,
+        driver: &D,
+        known_program: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
+        saved: &[AtomId],
+        values: &[AtomId],
+    ) -> Result<Option<ResidualRecomputation<C::Constant, C::Operation>>, ProgramError> {
+        let Some(residual_placement) = self.residual_placement() else {
+            return Ok(None);
+        };
+        let demand_splitter =
+            |region: RegionRef<'_, C::Constant, C::Operation>, instruction_index: usize, demanded_outputs: &[bool]| {
+                driver.split_instruction_on_residual_demand(self, region, instruction_index, demanded_outputs)
+            };
+        residual_placement
+            .plan_recomputation(known_program, saved, values, Some(&demand_splitter))
+            .map(Some)
     }
 
     /// Replays the provided [`Program`] through this context using the provided `inputs` bound to its input
@@ -2381,16 +2417,16 @@ mod tests {
         let configured = context.clone().with_rounded_residual_policy(&policy, |_: &ArrayIrType| None);
         assert!(context.residual_policy().is_none());
         assert_eq!(configured.residual_policy(), Some(&policy));
-        assert!(configured.residual_rounding().is_some());
-        assert!(configured.clone().residual_rounding().is_some());
+        assert!(configured.residual_rounding_type().is_some());
+        assert!(configured.clone().residual_rounding_type().is_some());
         let sibling = configured.deferred_sibling();
         assert_eq!(sibling.residual_policy(), Some(&policy));
-        assert_eq!(sibling.residual_rounding(), configured.residual_rounding());
+        assert_eq!(sibling.residual_rounding_type(), configured.residual_rounding_type());
 
         // Replacing a rounded placement with an ordinary policy affects only the returned context.
         let plain = configured.clone().with_residual_policy(&policy);
-        assert_eq!(plain.residual_rounding(), None);
-        assert!(configured.residual_rounding().is_some());
+        assert_eq!(plain.residual_rounding_type(), None);
+        assert!(configured.residual_rounding_type().is_some());
     }
 
     #[test]
