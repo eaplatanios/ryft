@@ -217,9 +217,12 @@
 //!   - **Ordinary operations bind once per device.** They bind in device order through [`InterpretationDriver::bind`]
 //!     with exactly the local values of that device, so effects such as `print` occur per device, in device order.
 //!   - **Collectives communicate across device groups.** A collective over an emulated axis (i.e., `axis_index`,
-//!     `parallel_reduce`, `parallel_vary`, `parallel_all_gather`, `parallel_sum_scatter`, `parallel_all_to_all`,
-//!     `parallel_ragged_all_to_all`, `parallel_permute`, and `parallel_broadcast`) is computed across the participants
-//!     of each device group directly. Every other collective binds per device like an ordinary operation.
+//!     `parallel_reduce`, `parallel_vary`, `parallel_cast`, `parallel_all_gather`, `parallel_sum_scatter`,
+//!     `parallel_all_to_all`, `parallel_ragged_all_to_all`, `parallel_permute`, and `parallel_broadcast`) is computed
+//!     across the participants of each device group directly. Any other operation that its family declares
+//!     as a collective over an emulated axis through [`CollectiveOperation`] is rejected with
+//!     [`ProgramError::UnsupportedOperation`], because the emulator cannot compute it.
+//!     A collective over other axes binds per device like an ordinary operation.
 //!   - **Region operations that communicate run in lockstep.** An operation whose region closure contains no collective
 //!     over an emulated axis binds per device, so its regions run through the ordinary eager rules. Otherwise, its
 //!     regions run in lockstep. `while`, `condition`, and `scan` run their eager rules over values that hold the value
@@ -255,9 +258,9 @@ use thiserror::Error;
 
 use crate::arrays::sharding::meshes::render_mesh_axis_name;
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
-    ArrayOperation, ArrayReference, ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, Dimension,
-    DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxisType, ReductionStateKind, Shape, Sharding,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+    ArrayReference, ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, Dimension, DimensionType,
+    DimensionValue, DimensionVariable, LogicalMesh, MeshAxisType, ReductionStateKind, Shape, Sharding,
     ShardingDimension, ShardingError, UnreducedKind,
 };
 use crate::axes::{MeshContext, NamedAxes, NamedAxis};
@@ -286,7 +289,7 @@ use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAl
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOperation;
 use crate::operations::collectives::parallel_vary::{ParallelVary, ParallelVaryOperation};
-use crate::operations::collectives::{CollectiveAxes, CollectiveMode};
+use crate::operations::collectives::{CollectiveAxes, CollectiveMode, CollectiveOperation};
 use crate::operations::composites::COMPOSITE_OPERATION_NAME;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
@@ -1445,7 +1448,7 @@ impl ShardMapBoundary {
     /// replicated along it), and so only those operations can make the devices along it compute different values.
     fn used_manual_placement_axes<
         V: Value<Type = ArrayIrType>,
-        O: Operation<Type = ArrayIrType> + OperationPayloadProjection,
+        O: Operation<Type = ArrayIrType> + CollectiveOperation,
     >(
         &self,
         placement_axes: &[String],
@@ -1486,9 +1489,8 @@ impl ShardMapBoundary {
         // a permutation of invariant values in the meshless form, which types its output by its input), so the
         // variation check above cannot detect it.
         for (_, instruction) in body.instructions_in_closure() {
-            if let Some(axis_names) = collective_axes(instruction.operation()) {
-                used_axes.extend(candidate_axes.iter().filter(|axis_name| axis_names.contains(axis_name)).cloned());
-            }
+            let axis_names = instruction.operation().axes();
+            used_axes.extend(candidate_axes.iter().filter(|axis_name| axis_names.contains(axis_name)).cloned());
         }
         candidate_axes.into_iter().filter(|axis_name| used_axes.contains(axis_name)).collect()
     }
@@ -1514,10 +1516,7 @@ impl ShardMapBoundary {
     /// [`ShardMapError::BatchPlacementOrderNotSupported`] for a placement axis that precedes a gathered axis, and
     /// [`ShardMapError::BatchAxisPlacedOnManualAxisWithDeviceOrderedIo`] for a released placement axis when `body`
     /// has the [`EffectClass::DeviceOrderedIo`] effect.
-    fn batched_placement<
-        V: Value<Type = ArrayIrType>,
-        O: Operation<Type = ArrayIrType> + OperationPayloadProjection,
-    >(
+    fn batched_placement<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType> + CollectiveOperation>(
         &self,
         placement_axes: &[String],
         body: RegionRef<'_, V, O>,
@@ -2512,7 +2511,7 @@ where
             Type = ArrayIrType,
             Value = ArrayIrValue<Array>,
             Constant = ArrayIrValue<Array>,
-            Operation: OperationPayloadProjection,
+            Operation: OperationPayloadProjection + CollectiveOperation,
         >,
 {
     fn interpret<D: InterpretationDriver<C>>(
@@ -2649,7 +2648,10 @@ impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for ShardMapOperation
 where
     C: Context<
             Type = ArrayIrType,
-            Operation: From<ShardMapOperation> + From<ConstantOperation<DimensionValue>> + OperationPayloadProjection,
+            Operation: From<ShardMapOperation>
+                           + From<ConstantOperation<DimensionValue>>
+                           + OperationPayloadProjection
+                           + CollectiveOperation,
         >,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -3957,7 +3959,7 @@ where
             Type = ArrayIrType,
             Value = ArrayIrValue<Array>,
             Constant = ArrayIrValue<Array>,
-            Operation: OperationPayloadProjection,
+            Operation: OperationPayloadProjection + CollectiveOperation,
         >,
     D: InterpretationDriver<C>,
 {
@@ -4258,10 +4260,11 @@ where
         instruction: &Instruction<C::Operation>,
     ) -> Result<bool, ProgramError> {
         for id in instruction.regions() {
-            if region.with_id(*id)?.instructions_in_closure().any(|(_, nested)| {
-                collective_axes(nested.operation())
-                    .is_some_and(|axis_names| axis_names.names().iter().any(|name| self.grid.axis(name).is_some()))
-            }) {
+            if region
+                .with_id(*id)?
+                .instructions_in_closure()
+                .any(|(_, nested)| nested.operation().axes().names().iter().any(|name| self.grid.axis(name).is_some()))
+            {
                 return Ok(true);
             }
         }
@@ -4308,9 +4311,8 @@ where
         operation: &C::Operation,
         inputs: &[DeviceValues],
     ) -> Result<Option<Vec<DeviceValues>>, ProgramError> {
-        let Some(axis_names) = collective_axes(operation) else {
-            return Ok(None);
-        };
+        // An operation that is not a collective communicates along no axis, so it also returns here.
+        let axis_names = operation.axes();
         let name = operation.name();
         let axes = axis_names.names().iter().map(|axis_name| self.grid.axis(axis_name)).collect::<Vec<_>>();
         if axes.iter().all(Option::is_none) {
@@ -4459,12 +4461,12 @@ where
                 let participant_arrays =
                     participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
                 validate_participant_types(name, &participant_arrays)?;
-                let mut output = blank_array(&output_type)?;
+                let mut output = Array::uninitialized(output_type.clone())?;
                 let concatenation_axis = payload.concatenation_axis();
                 for (position, participant) in participants.iter().enumerate() {
                     let input = arrays[*participant];
                     let input_type = input.r#type();
-                    let mut shape = static_extents(&input_type)?;
+                    let mut shape = input_type.static_shape().unwrap().dimensions().to_vec();
                     let mut offsets = vec![0; shape.len()];
                     match payload.options().mode() {
                         CollectiveMode::Untiled => {
@@ -4489,7 +4491,7 @@ where
                 let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
                 let sum = reduce_participants(name, &participants, ReductionKind::Sum)?;
                 let scatter_axis = payload.scatter_axis();
-                let mut shape = static_extents(&sum.r#type())?;
+                let mut shape = sum.r#type().static_shape().unwrap().dimensions().to_vec();
                 shape[scatter_axis] = match payload.options().mode() {
                     CollectiveMode::Untiled => 1,
                     CollectiveMode::Tiled => shape[scatter_axis] / participant_count,
@@ -4508,12 +4510,12 @@ where
                 let participant_arrays =
                     participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
                 validate_participant_types(name, &participant_arrays)?;
-                let mut output = blank_array(&output_type)?;
+                let mut output = Array::uninitialized(output_type.clone())?;
                 for (sender_position, sender) in participants.iter().enumerate() {
                     // Every sender contributes the chunk of its split axis that belongs to this device's position.
                     let input = arrays[*sender];
                     let input_type = input.r#type();
-                    let mut chunk_shape = static_extents(&input_type)?;
+                    let mut chunk_shape = input_type.static_shape().unwrap().dimensions().to_vec();
                     chunk_shape[split_axis] = match payload.options().mode() {
                         CollectiveMode::Untiled => 1,
                         CollectiveMode::Tiled => chunk_shape[split_axis] / participants.len(),
@@ -4586,9 +4588,7 @@ where
                 };
                 with_array_type(arrays[self.grid.device_at(device, &axes, source)], &output_type)
             })?
-        } else {
-            // `parallel_permute` is the only remaining collective that `collective_axes` recognizes.
-            let payload = operation.projected_payload::<ParallelPermuteOperation>().unwrap();
+        } else if let Some(payload) = operation.projected_payload::<ParallelPermuteOperation>() {
             validate_axis_size(payload.axis_size())?;
             self.grid.map_devices(|device| {
                 // A device that no pair targets receives zeros.
@@ -4601,6 +4601,14 @@ where
                     None => EagerContext::<Array, ArrayOperation<Array>>::new().zero(&output_type),
                 }
             })?
+        } else {
+            // The operation family declares a collective that is not one of the collectives above.
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{SHARD_MAP_OPERATION_NAME}` interpretation cannot emulate `{name}`, which is a collective over \
+                     the manual axes `{axis_names}`",
+                ),
+            });
         };
         Ok(Some(vec![outputs]))
     }
@@ -5182,28 +5190,6 @@ fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
     }
 }
 
-/// Returns the names of the axes that `operation` communicates along when it is a collective (including `axis_index`,
-/// which observes the coordinate along its axis), and [`None`] otherwise.
-fn collective_axes<O: OperationPayloadProjection>(operation: &O) -> Option<CollectiveAxes> {
-    let single = |axis_name: &str| CollectiveAxes::from(axis_name);
-    operation
-        .projected_payload::<AxisIndexOperation>()
-        .map(|payload| single(payload.axis_name()))
-        .or_else(|| operation.projected_payload::<ParallelReduceOperation>().map(|payload| single(payload.axis_name())))
-        .or_else(|| operation.projected_payload::<ParallelVaryOperation>().map(|payload| single(payload.axis_name())))
-        .or_else(|| operation.projected_payload::<ParallelCastOperation>().map(|payload| single(payload.axis_name())))
-        .or_else(|| operation.projected_payload::<ParallelAllGatherOperation>().map(|payload| payload.axes().clone()))
-        .or_else(|| operation.projected_payload::<ParallelSumScatterOperation>().map(|payload| payload.axes().clone()))
-        .or_else(|| operation.projected_payload::<ParallelAllToAllOperation>().map(|payload| payload.axes().clone()))
-        .or_else(|| operation.projected_payload::<ParallelPermuteOperation>().map(|payload| payload.axes().clone()))
-        .or_else(|| operation.projected_payload::<ParallelBroadcastOperation>().map(|payload| payload.axes().clone()))
-        .or_else(|| {
-            operation
-                .projected_payload::<ParallelRaggedAllToAllOperation>()
-                .map(|payload| single(payload.axis_name()))
-        })
-}
-
 /// Returns the single output type that `operation` infers for `input_types`.
 fn single_output_type<O: Operation<Type = ArrayType>>(
     operation: &O,
@@ -5226,7 +5212,7 @@ fn collective_output_type<P: Operation<Type = ArrayType>>(
     if extents.is_empty() {
         return Ok(output_type);
     }
-    let shape = static_extents(&output_type)?;
+    let shape = emulated_extents(&output_type)?;
     if extents.len() != shape.len() {
         return Err(ProgramError::InvalidInputCount { expected: shape.len() + 1, actual: extents.len() + 1 });
     }
@@ -5248,7 +5234,7 @@ fn collective_output_type<P: Operation<Type = ArrayType>>(
 }
 
 /// Returns the static extents of `array_type`, which the emulation requires.
-fn static_extents(array_type: &ArrayType) -> Result<Vec<usize>, ProgramError> {
+fn emulated_extents(array_type: &ArrayType) -> Result<Vec<usize>, ProgramError> {
     array_type
         .static_shape()
         .map(|shape| shape.dimensions().to_vec())
@@ -5286,7 +5272,7 @@ fn reduce_participants(
         let participant_type = participants[0].r#type();
         let data_type = participant_type.data_type();
         let mut stacked_shape = vec![participants.len()];
-        stacked_shape.extend(static_extents(&participant_type)?);
+        stacked_shape.extend(participant_type.static_shape().unwrap().dimensions());
         let stacked_bytes = participants.iter().flat_map(|participant| participant.logical_bytes()).collect::<Vec<_>>();
         let stacked = Array::from_logical_bytes(ArrayType::new_static(data_type, stacked_shape), &stacked_bytes)?;
         let reduced = stacked.reduce(&[0], kind)?;
@@ -5316,15 +5302,6 @@ fn validate_participant_types(operation_name: &str, participants: &[&Array]) -> 
         }
     }
     Ok(())
-}
-
-/// Returns an array of type `array_type` whose element encodings are all zero bytes, which the emulation of a
-/// collective or of a boundary overwrites block by block. Zero bytes need not encode zero, so every element of it must
-/// be overwritten.
-fn blank_array(array_type: &ArrayType) -> Result<Array, ProgramError> {
-    let element_count = static_extents(array_type)?.iter().product::<usize>();
-    let element_width = ArrayAddressing::element_byte_width_for_data_type(array_type.data_type());
-    Array::from_logical_bytes(array_type.clone(), &vec![0; element_count * element_width])
 }
 
 /// Returns the slice axes that select the block of shape `block_shape` that starts at `offsets`.
@@ -5381,7 +5358,7 @@ fn local_input_shard(
     {
         return EagerContext::<Array, ArrayOperation<Array>>::new().zero(local_type);
     }
-    let local_shape = static_extents(local_type)?;
+    let local_shape = emulated_extents(local_type)?;
     let offsets = manual_block_offsets(sharding, grid, coordinates, &local_shape);
     value.copy_block(local_type.clone(), &block_axes(&offsets, &local_shape))
 }
@@ -5412,7 +5389,8 @@ fn assemble_global_value(
             continue;
         }
         let value = ValueProjection::<ArrayType>::projected(value)?;
-        let offsets = manual_block_offsets(sharding, grid, &coordinates, &static_extents(&value.r#type())?);
+        let shape = value.r#type().static_shape().unwrap();
+        let offsets = manual_block_offsets(sharding, grid, &coordinates, shape.dimensions());
         match tiles.iter_mut().find(|(tile_offsets, _)| *tile_offsets == offsets) {
             Some((_, summands)) => summands.push(value),
             None => tiles.push((offsets, vec![value])),
@@ -5423,7 +5401,7 @@ fn assemble_global_value(
         SHARD_MAP_OPERATION_NAME,
         &tiles.iter().flat_map(|(_, summands)| summands.iter().copied()).collect::<Vec<_>>(),
     )?;
-    let mut output = blank_array(global_type)?;
+    let mut output = Array::uninitialized(global_type.clone())?;
     for (offsets, summands) in tiles {
         let tile = if summands.len() == 1 {
             summands[0].clone()

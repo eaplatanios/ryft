@@ -31,8 +31,8 @@ use crate::operations::collectives::parallel_vary::{
     PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation,
 };
 use crate::operations::collectives::{
-    CollectiveAxes, CollectiveOptions, LinearCollectiveOperation, resolve_collective_axes, route_axis_slices,
-    validate_manual_mesh_axes_input,
+    CollectiveAxes, CollectiveOperation, CollectiveOptions, LinearCollectiveOperation, resolve_collective_axes,
+    route_axis_slices, validate_manual_mesh_axes_input,
 };
 use crate::operations::comparisons::{Compare, CompareOperation};
 use crate::operations::constants::constant::ConstantOperation;
@@ -378,13 +378,15 @@ impl Operation for ParallelBroadcastOperation {
     }
 }
 
+impl CollectiveOperation for ParallelBroadcastOperation {
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        Cow::Borrowed(&self.axes)
+    }
+}
+
 impl LinearCollectiveOperation for ParallelBroadcastOperation {
     type Adjoint = ParallelBroadcastOperation;
-
-    #[inline]
-    fn axes(&self) -> &CollectiveAxes {
-        &self.axes
-    }
 
     #[inline]
     fn axis_size(&self) -> usize {

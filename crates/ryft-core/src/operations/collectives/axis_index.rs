@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use crate::arrays::{
@@ -9,7 +10,7 @@ use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, Batch
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::collectives::validate_manual_mesh_axis;
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation, validate_manual_mesh_axis};
 use crate::operations::constants::iota::IotaOperation;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -132,6 +133,13 @@ impl Operation for AxisIndexOperation {
             }
             Ok(())
         })
+    }
+}
+
+impl CollectiveOperation for AxisIndexOperation {
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        Cow::Owned(CollectiveAxes::from(&self.axis_name))
     }
 }
 

@@ -21,6 +21,7 @@ const MEMBERS_ATTRIBUTE: Symbol = Symbol::new("members");
 const DISPATCH_ATTRIBUTE: Symbol = Symbol::new("dispatch");
 const PROJECTED_ATTRIBUTE: Symbol = Symbol::new("projected");
 const MIXED_ATTRIBUTE: Symbol = Symbol::new("mixed");
+const COLLECTIVE_ATTRIBUTE: Symbol = Symbol::new("collective");
 const SKIP_FROM_ATTRIBUTE: Symbol = Symbol::new("skip_from");
 const STRUCTURAL_ROLE: Symbol = Symbol::new("structural");
 
@@ -209,8 +210,9 @@ impl OperationCodeGenerator {
     /// order in which `ryft` places the implementations of an operation: the formatting and identity implementations,
     /// followed by `Operation`, `ReferenceDischargeableOperation`, `InterpretableOperation`,
     /// `PartiallyEvaluatableOperation`, `BatchableOperation`, `DifferentiableOperation`, `TransposableOperation`,
-    /// `OperationProjection`, `OperationPayloadProjection`, `OperationProvider`, and finally the payload conversions.
-    /// Refer to [`OperationCodeGenerator::generate_operation_impl`] for an example of the generated code.
+    /// `OperationProjection`, `OperationPayloadProjection`, `CollectiveOperation`, `OperationProvider`, and finally
+    /// the payload conversions. Refer to [`OperationCodeGenerator::generate_operation_impl`] for an example of the
+    /// generated code.
     fn generate(&self) -> TokenStream {
         let ryft = &self.ryft_crate;
         let self_type = &self.self_type;
@@ -226,6 +228,7 @@ impl OperationCodeGenerator {
         let operation_projections =
             self.variants.iter().filter_map(|variant| self.generate_operation_projection_impl(variant));
         let payload_projection = self.generate_payload_projection_impl();
+        let collective = self.generate_collective_impl();
         let guard_provider = self.generate_guard_provider_impl();
         let conversions = self
             .variants
@@ -259,6 +262,8 @@ impl OperationCodeGenerator {
             #(#operation_projections)*
 
             #payload_projection
+
+            #collective
 
             #guard_provider
 
@@ -1424,6 +1429,46 @@ impl OperationCodeGenerator {
         }
     }
 
+    /// Generates the `CollectiveOperation` implementation, which delegates to the payloads of the variants that declare
+    /// `#[ryft(collective)]` and reports no axes for every other variant, or returns [`None`] when no variant declares
+    /// it. The payload of a marked variant is either a collective or a family that implements `CollectiveOperation`
+    /// itself (e.g., a projected member family or a generic extension), and it is bounded accordingly, so that a family
+    /// with a marked generic payload implements the trait only when that payload does.
+    fn generate_collective_impl(&self) -> Option<TokenStream> {
+        let ryft = &self.ryft_crate;
+        let self_type = &self.self_type;
+        let mut generics = self.generics.clone();
+        let mut arms = Vec::new();
+        for variant in self.variants.iter().filter(|variant| variant.is_collective) {
+            let payload_type = &variant.payload_type;
+            let receiver = variant.receiver();
+            generics
+                .make_where_clause()
+                .predicates
+                .push(syn::parse_quote_spanned!(variant.span => #payload_type: #ryft::CollectiveOperation));
+            arms.push(variant.arm(quote!(<#payload_type as #ryft::CollectiveOperation>::axes(#receiver))));
+        }
+        if arms.is_empty() {
+            return None;
+        }
+        let (impl_generics, _, where_clause) = generics.split_for_impl();
+        Some(quote! {
+            #[automatically_derived]
+            impl #impl_generics #ryft::CollectiveOperation for #self_type #where_clause {
+                #[allow(unreachable_patterns)]
+                #[inline]
+                fn axes(&self) -> ::std::borrow::Cow<'_, #ryft::CollectiveAxes> {
+                    match self {
+                        #(#arms)*
+                        _ => ::std::borrow::Cow::Owned(
+                            <#ryft::CollectiveAxes as ::std::default::Default>::default(),
+                        ),
+                    }
+                }
+            }
+        })
+    }
+
     /// Generates the `OperationProvider` implementation that rejects every `GuardOperation` request of the primary
     /// operation type with `GuardOperation::unsupported_error`, or returns [`None`] when a variant stores a native
     /// guard (refer to [`OperationVariant::is_native_guard`]). Every `Context` requires its operation family to
@@ -1847,7 +1892,7 @@ impl OperationParser {
     ///   - `generics`: [`syn::Generics`] of the enum, which are used to detect bare generic extension payloads.
     ///   - `variant`: [`syn::Variant`] from which to extract an [`OperationVariant`].
     fn extract_variant(&mut self, generics: &syn::Generics, variant: &syn::Variant) -> Option<OperationVariant> {
-        let (class, generate_from) = self.extract_variant_attributes(variant);
+        let (class, generate_from, is_collective) = self.extract_variant_attributes(variant);
         let field = match &variant.fields {
             syn::Fields::Unnamed(fields) if fields.unnamed.len() == 1 => &fields.unnamed[0],
             _ => {
@@ -1897,17 +1942,21 @@ impl OperationParser {
             is_boxed,
             is_generic_extension,
             generate_from,
+            is_collective,
         })
     }
 
-    /// Extracts the [`OperationVariantClass`] and the conversion policy declared for the provided [`syn::Variant`]
-    /// through its `#[ryft(...)]` attributes. Variants without a class marker are family-native. The conversion policy
-    /// is `false` when the variant declares `#[ryft(skip_from)]`, which suppresses only its generated `From<Payload>`
-    /// implementation so that a handwritten normalizing conversion can be used instead. Its borrowed `TryFrom`
-    /// projection is still generated.
-    fn extract_variant_attributes(&mut self, variant: &syn::Variant) -> (OperationVariantClass, bool) {
+    /// Extracts the [`OperationVariantClass`], the conversion policy, and the collective marker declared for
+    /// the provided [`syn::Variant`] through its `#[ryft(...)]` attributes. Variants without a class marker are
+    /// family-native. The conversion policy is `false` when the variant declares `#[ryft(skip_from)]`, which suppresses
+    /// only its generated `From<Payload>` implementation so that a handwritten normalizing conversion can be used
+    /// instead. Its borrowed `TryFrom` projection is still generated. The collective marker is `true` when the variant
+    /// declares `#[ryft(collective)]`, which makes the generated `CollectiveOperation` implementation delegate to its
+    /// payload.
+    fn extract_variant_attributes(&mut self, variant: &syn::Variant) -> (OperationVariantClass, bool, bool) {
         let mut class = None::<OperationVariantClass>;
         let mut generate_from = true;
+        let mut is_collective = false;
         variant.attrs.iter().filter(|attr| attr.path() == &RYFT_ATTRIBUTE).for_each(|attr| {
             attr.parse_nested_meta(|meta| match &meta.path {
                 path if path == &SKIP_FROM_ATTRIBUTE && !generate_from => {
@@ -1915,6 +1964,13 @@ impl OperationParser {
                 }
                 path if path == &SKIP_FROM_ATTRIBUTE => {
                     generate_from = false;
+                    Ok(())
+                }
+                path if path == &COLLECTIVE_ATTRIBUTE && is_collective => {
+                    Err(meta.error("duplicate ryft operation variant attribute `collective`"))
+                }
+                path if path == &COLLECTIVE_ATTRIBUTE => {
+                    is_collective = true;
                     Ok(())
                 }
                 path if path == &PROJECTED_ATTRIBUTE || path == &MIXED_ATTRIBUTE => {
@@ -1940,14 +1996,14 @@ impl OperationParser {
                      role form",
                 )),
                 _ => Err(meta.error(format_args!(
-                    "invalid operation variant `#[ryft(...)]` attribute `{}`; only `projected`, `mixed`, and \
-                     `skip_from` are supported here",
+                    "invalid operation variant `#[ryft(...)]` attribute `{}`; only `projected`, `mixed`, \
+                     `collective`, and `skip_from` are supported here",
                     meta.path.to_compact_string(),
                 ))),
             })
             .unwrap_or_else(|error| self.errors.push(error));
         });
-        (class.unwrap_or(OperationVariantClass::FamilyNative), generate_from)
+        (class.unwrap_or(OperationVariantClass::FamilyNative), generate_from, is_collective)
     }
 
     /// Checks that the provided [`OperationVariant`]s can be told apart by the generated payload conversions and
@@ -2225,6 +2281,10 @@ struct OperationVariant {
 
     /// Boolean flag indicating whether to generate the owned `From<Payload>` conversion for this [`OperationVariant`].
     generate_from: bool,
+
+    /// Boolean flag indicating whether the generated `CollectiveOperation` implementation delegates to the payload of
+    /// this [`OperationVariant`], which is the case when the variant declares `#[ryft(collective)]`.
+    is_collective: bool,
 }
 
 impl OperationVariant {
@@ -2771,7 +2831,7 @@ mod tests {
         let input: syn::DeriveInput = syn::parse_quote! {
             enum Operation<V: Value<Type = DataType>, Extension> {
                 Zero(ZeroOperation<DataType>),
-                #[ryft(projected(ArrayType), skip_from)]
+                #[ryft(projected(ArrayType), collective, skip_from)]
                 Array(std::boxed::Box<ArrayOperation<V>>),
                 Extension(Extension),
                 Unit,
@@ -2795,12 +2855,14 @@ mod tests {
         assert!(!zero.is_boxed);
         assert!(!zero.is_generic_extension);
         assert!(zero.generate_from);
+        assert!(!zero.is_collective);
         let array = variants[1].as_ref().unwrap();
         assert!(matches!(array.class, OperationVariantClass::ProjectedMember { structural: false, .. }));
         assert_eq!(array.payload_type.to_compact_string(), "ArrayOperation<V>");
         assert!(array.is_boxed);
         assert!(!array.is_generic_extension);
         assert!(!array.generate_from);
+        assert!(array.is_collective);
         let extension = variants[2].as_ref().unwrap();
         assert!(!extension.is_boxed);
         assert!(extension.is_generic_extension);
@@ -2824,21 +2886,25 @@ mod tests {
     fn test_operation_parser_extract_variant_attributes() {
         let mut parser = OperationParser::new();
         let variant: syn::Variant = syn::parse_quote!(Zero(ZeroOperation<DataType>));
-        assert!(matches!(parser.extract_variant_attributes(&variant), (OperationVariantClass::FamilyNative, true)));
+        assert!(matches!(
+            parser.extract_variant_attributes(&variant),
+            (OperationVariantClass::FamilyNative, true, false),
+        ));
         let variant: syn::Variant = syn::parse_quote! {
             #[ryft(skip_from)]
-            #[ryft(mixed(ArrayType, structural))]
+            #[ryft(mixed(ArrayType, structural), collective)]
             Zero(ZeroOperation<ArrayType>)
         };
         assert!(matches!(
             parser.extract_variant_attributes(&variant),
-            (OperationVariantClass::MixedMember { structural: true, .. }, false),
+            (OperationVariantClass::MixedMember { structural: true, .. }, false, true),
         ));
         assert_eq!(errors(&parser), Vec::<String>::new());
 
         // Test using invalid variant attributes.
         for (attribute, error) in [
             (quote!(#[ryft(skip_from, skip_from)]), "duplicate ryft operation variant attribute `skip_from`"),
+            (quote!(#[ryft(collective, collective)]), "duplicate ryft operation variant attribute `collective`"),
             (
                 quote!(#[ryft(projected(ArrayType), projected(ArrayType))]),
                 "duplicate ryft operation variant class `projected`",
@@ -2853,8 +2919,8 @@ mod tests {
             ),
             (
                 quote!(#[ryft(transpose = custom)]),
-                "invalid operation variant `#[ryft(...)]` attribute `transpose`; only `projected`, `mixed`, and \
-                 `skip_from` are supported here",
+                "invalid operation variant `#[ryft(...)]` attribute `transpose`; only `projected`, `mixed`, \
+                 `collective`, and `skip_from` are supported here",
             ),
         ] {
             let mut parser = OperationParser::new();
@@ -3088,6 +3154,7 @@ mod tests {
                     TagOperation<DataType>: ::std::cmp::PartialEq,
                     Extension: ::std::cmp::PartialEq,
                 {
+                    #[inline]
                     fn eq(&self, other: &Self) -> bool {
                         match (self, other) {
                             (Self::Zero(left), Self::Zero(right)) => left == right,
@@ -3114,6 +3181,7 @@ mod tests {
                     TagOperation<DataType>: ::std::hash::Hash,
                     Extension: ::std::hash::Hash,
                 {
+                    #[inline]
                     fn hash<__H: ::std::hash::Hasher>(&self, state: &mut __H) {
                         ::std::hash::Hash::hash(&::std::mem::discriminant(self), state);
                         match self {
@@ -3170,6 +3238,7 @@ mod tests {
         assert_eq!(
             function("name"),
             rendering(&quote! {
+                #[inline]
                 fn name(&self) -> &'static str {
                     match self {
                         Self::Add(operation) => { <AddOperation<ArrayIrType> as ryft::Operation>::name(operation) },
@@ -3184,6 +3253,7 @@ mod tests {
         assert_eq!(
             function("infer_output_types"),
             rendering(&quote! {
+                #[inline]
                 fn infer_output_types(
                     &self,
                     input_types: &[ArrayIrType],
@@ -3214,6 +3284,7 @@ mod tests {
         assert_eq!(
             function("defined_type_identities"),
             rendering(&quote! {
+                #[inline]
                 fn defined_type_identities(&self) -> ::std::borrow::Cow<'_, [<ArrayIrType as ryft::Type>::Identity]> {
                     match self {
                         Self::Add(operation) => {
@@ -3236,6 +3307,7 @@ mod tests {
         assert_eq!(
             function("prune_boundary"),
             rendering(&quote! {
+                #[inline]
                 fn prune_boundary(
                     &self,
                     input_types: &[ArrayIrType],
@@ -3288,6 +3360,7 @@ mod tests {
         assert_eq!(
             function("rename_type_identities"),
             rendering(&quote! {
+                #[inline]
                 fn rename_type_identities(
                     &self,
                     renaming: &ryft::TypeIdentityRenaming<<ArrayIrType as ryft::Type>::Identity>,
@@ -3352,6 +3425,7 @@ mod tests {
                         ryft::ReferenceDischargeableOperation<__ParentContext, __ReferenceDischargePolicy>,
                     Extension: ryft::ReferenceDischargeableOperation<__ParentContext, __ReferenceDischargePolicy>,
                 {
+                    #[inline]
                     fn discharge_references<
                         __D: ryft::ReferenceDischargeDriver<__ParentContext, __ReferenceDischargePolicy>,
                     >(
@@ -3430,6 +3504,7 @@ mod tests {
                     >,
                     GatherOperation: ryft::MemberInterpretableOperation<__Context>,
                 {
+                    #[inline]
                     fn interpret<__D: ryft::InterpretationDriver<__Context>>(
                         &self,
                         context: &__Context,
@@ -3643,6 +3718,7 @@ mod tests {
                     GatherOperation: ryft::MemberBatchableOperation<__ParentContext, __BatchingPolicy>,
                     __ParentContext: ryft::Zero<<__ParentContext as ryft::Domain>::Value>,
                 {
+                    #[inline]
                     fn batch<__D: ryft::BatchingDriver<__ParentContext, __BatchingPolicy>>(
                         &self,
                         context: &ryft::BatchingContext<__ParentContext, __BatchingPolicy>,
@@ -3700,6 +3776,7 @@ mod tests {
                     ConstantOperation<V>: ryft::BatchableOperation<__ParentContext, __BatchingPolicy>,
                     __ParentContext: ryft::Zero<<__ParentContext as ryft::Domain>::Value>,
                 {
+                    #[inline]
                     fn batch<__D: ryft::BatchingDriver<__ParentContext, __BatchingPolicy>>(
                         &self,
                         context: &ryft::BatchingContext<__ParentContext, __BatchingPolicy>,
@@ -3771,6 +3848,7 @@ mod tests {
         assert_eq!(
             rendering(&generated.items[0]),
             rendering(&quote! {
+                #[inline]
                 fn jvp<
                     __D: ryft::DifferentiationDriver<__DifferentiationContext>,
                     __Policy: ryft::DifferentiationPolicy<__DifferentiationContext>,
@@ -3874,6 +3952,7 @@ mod tests {
         assert_eq!(
             rendering(&generated.items[0]),
             rendering(&quote! {
+                #[inline]
                 fn jvp<
                     __D: ryft::DifferentiationDriver<__DifferentiationContext>,
                     __Policy: ryft::DifferentiationPolicy<__DifferentiationContext>,
@@ -3969,6 +4048,7 @@ mod tests {
                     ArrayIrType: ::std::convert::From<ArrayType>,
                     for<'__t> &'__t ArrayType: ::std::convert::TryFrom<&'__t ArrayIrType, Error = ryft::TypeError>,
                 {
+                    #[inline]
                     fn transpose<__D: ryft::TranspositionDriver<__TranspositionValue, Operation<A>>>(
                         &self,
                         context: &mut ryft::TranspositionContext<__TranspositionValue, Operation<A>>,
@@ -4081,6 +4161,7 @@ mod tests {
                     ArrayOperation<A>: ryft::OperationPayloadProjection,
                 {
                     #[allow(unreachable_patterns)]
+                    #[inline]
                     fn project_payload(
                         &self,
                         payload: ::std::any::TypeId,
@@ -4105,6 +4186,7 @@ mod tests {
                         }
                     }
 
+                    #[inline]
                     fn from_payload(
                         payload: ryft::ErasedOperation,
                     ) -> ::std::result::Result<Self, ryft::ErasedOperation> {
@@ -4135,6 +4217,64 @@ mod tests {
                 }
             }),
         );
+    }
+
+    #[test]
+    fn test_operation_code_generator_generate_collective_impl() {
+        // Marked variants delegate to their payloads, which may be collectives, member families, or generic extensions,
+        // stored directly or boxed, while every other variant reports no axes.
+        let operation = code_generator(quote! {
+            #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
+            enum Operation<A: Value<Type = ArrayType>, Extension> {
+                #[ryft(projected(ArrayType), collective)]
+                Array(ArrayOperation<A>),
+                #[ryft(mixed(ArrayType), collective)]
+                Gather(Box<ParallelAllGatherOperation>),
+                Dot(DotOperation),
+                #[ryft(collective)]
+                Extension(Extension),
+            }
+        });
+        assert_eq!(
+            rendering(&operation.generate_collective_impl().unwrap()),
+            rendering(&quote! {
+                #[automatically_derived]
+                impl<A: Value<Type = ArrayType>, Extension> ryft::CollectiveOperation for Operation<A, Extension>
+                where
+                    ArrayOperation<A>: ryft::CollectiveOperation,
+                    ParallelAllGatherOperation: ryft::CollectiveOperation,
+                    Extension: ryft::CollectiveOperation,
+                {
+                    #[allow(unreachable_patterns)]
+                    #[inline]
+                    fn axes(&self) -> ::std::borrow::Cow<'_, ryft::CollectiveAxes> {
+                        match self {
+                            Self::Array(operation) => {
+                                <ArrayOperation<A> as ryft::CollectiveOperation>::axes(operation)
+                            },
+                            Self::Gather(operation) => {
+                                <ParallelAllGatherOperation as ryft::CollectiveOperation>::axes(&**operation)
+                            },
+                            Self::Extension(operation) => {
+                                <Extension as ryft::CollectiveOperation>::axes(operation)
+                            },
+                            _ => ::std::borrow::Cow::Owned(
+                                <ryft::CollectiveAxes as ::std::default::Default>::default()
+                            ),
+                        }
+                    }
+                }
+            }),
+        );
+
+        // A family without marked variants gets no implementation.
+        let operation = code_generator(quote! {
+            #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>))]
+            enum Operation<A: Value<Type = ArrayType>> {
+                Dot(DotOperation),
+            }
+        });
+        assert!(operation.generate_collective_impl().is_none());
     }
 
     #[test]
@@ -4207,6 +4347,7 @@ mod tests {
             rendering(&quote! {
                 #[automatically_derived]
                 impl<V: Value<Type = ArrayType>> ::std::convert::From<ConstantOperation<V>> for Operation<V> {
+                    #[inline]
                     fn from(operation: ConstantOperation<V>) -> Self {
                         Self::Constant(::std::boxed::Box::new(operation))
                     }
@@ -4220,6 +4361,7 @@ mod tests {
                 {
                     type Error = ryft::TypeError;
 
+                    #[inline]
                     fn try_from(value: &'__operation Operation<V>) -> ::std::result::Result<Self, ryft::TypeError> {
                         match value {
                             Operation::Constant(operation) => ::std::result::Result::Ok(&**operation),

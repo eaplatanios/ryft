@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use ryft_macros::capability;
@@ -16,7 +17,8 @@ use crate::operations::arithmetic::{Add, DivOperation, Sub};
 use crate::operations::collectives::parallel_cast::{ParallelCastOperation, ParallelCastTarget};
 use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, ParallelVary, ParallelVaryOperation};
 use crate::operations::collectives::{
-    effective_collective_axis_size, resolve_named_axis_size, validate_manual_mesh_input,
+    CollectiveAxes, CollectiveOperation, effective_collective_axis_size, resolve_named_axis_size,
+    validate_manual_mesh_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::complex::{Complex, Real};
@@ -292,6 +294,13 @@ impl Operation for ParallelReduceOperation {
             }
             Ok(())
         })
+    }
+}
+
+impl CollectiveOperation for ParallelReduceOperation {
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        Cow::Owned(CollectiveAxes::from(&self.axis_name))
     }
 }
 

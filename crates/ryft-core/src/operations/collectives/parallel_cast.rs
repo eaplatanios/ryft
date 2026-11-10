@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
@@ -16,6 +17,7 @@ use crate::macros::{check_count, check_types, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::reductions::ReductionKind;
 use crate::partial::PartiallyEvaluatableOperation;
@@ -209,6 +211,13 @@ impl Operation for ParallelCastOperation {
             operation.field("axis_name", format_args!("{:?}", self.axis_name))?;
             operation.field("target", self.target)
         })
+    }
+}
+
+impl CollectiveOperation for ParallelCastOperation {
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        Cow::Owned(CollectiveAxes::from(&self.axis_name))
     }
 }
 

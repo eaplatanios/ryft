@@ -145,6 +145,7 @@
 //! # }
 //! ```
 
+use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
 use crate::arrays::{
@@ -219,9 +220,15 @@ pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, 
 /// Several names must be distinct manual mesh axes of one mesh. A `batch` level that binds any of them rejects the
 /// collective, because a batch level binds a single axis.
 ///
-/// The [`Display`](std::fmt::Display) form names the axes for diagnostics (e.g., `x` or `(x, y)`), and the
-/// [`Debug`] form renders them as they appear in programs (e.g., `"x"` or `("x", "y")`).
-#[derive(Clone, PartialEq, Eq, Hash)]
+/// Note that no collective accepts the empty [`CollectiveAxes`], which is the [`Default`] and selects
+/// no axis. It only appears as the result of [`CollectiveOperation::axes`] for an operation family (e.g.,
+/// [`ArrayOperation`](crate::ArrayOperation)), which implements that trait on behalf of all of its members, when the
+/// member that it holds is not a collective (e.g., an addition operation). Operations that are not collectives do not
+/// implement that trait themselves.
+///
+/// The [`Display`] form names the axes for diagnostics (e.g., `x` or `(x, y)`), and the [`Debug`] form renders them
+/// as they appear in programs (e.g., `"x"` or `("x", "y")`).
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct CollectiveAxes(Vec<String>);
 
 impl CollectiveAxes {
@@ -559,6 +566,33 @@ impl<
 {
 }
 
+/// [`Operation`] that may communicate along named axes. A collective exchanges values over named axes or observes its
+/// position along one (i.e., an [`AxisIndexOperation`]), and this trait reports those axes. Code that inspects the
+/// operations of a program without knowing its operation family uses it to find the axes that an operation
+/// communicates along. For example, the batching rule of [`ShardMapOperation`](crate::ShardMapOperation) uses it to
+/// find the manual axes that a body uses, and the reference backend emulation of that operation uses it to find the
+/// operations that communicate across the emulated devices.
+///
+/// Every collective implements this trait, and no other operation does. An operation family (e.g.,
+/// [`ArrayOperation`](crate::ArrayOperation)) whose programs reach such code must also implement it, because that code
+/// only sees the family and cannot tell which member it holds. A family answers for whichever member it holds, and so
+/// it reports no axes when that member is not a collective (e.g., an addition), which is the only case in which
+/// [`axes`](Self::axes) is empty.
+///
+/// `#[derive(Operation)]` implements this trait for a family in which at least one variant is marked with
+/// `#[ryft(collective)]`, by delegating to the payloads of the marked variants, while every other variant
+/// communicates along no axis. A family must therefore mark every variant whose payload is a collective and every
+/// variant whose payload is itself a family that holds collectives (e.g., the
+/// [`Array`](crate::ArrayIrOperation::Array) variant of [`ArrayIrOperation`](crate::ArrayIrOperation)),
+/// because an unmarked collective is treated as an operation that communicates along no axis.
+pub trait CollectiveOperation {
+    /// Returns the names of the axes that this operation communicates along. A collective names at least one axis, and
+    /// so the result is empty only for a member of an operation family that is not a collective. The result borrows
+    /// the [`CollectiveAxes`] that a collective stores, and it is owned for a collective that stores a single axis
+    /// name instead.
+    fn axes(&self) -> Cow<'_, CollectiveAxes>;
+}
+
 /// Single-input linear collective operation over a named axis (i.e., [`ParallelPermuteOperation`],
 /// [`ParallelBroadcastOperation`], [`ParallelAllGatherOperation`], [`ParallelSumScatterOperation`], or
 /// [`ParallelAllToAllOperation`]). Each carries the referenced axis name, the participant count resolved from the
@@ -571,14 +605,12 @@ impl<
 /// The collectives keep explicit trait implementations that delegate to the provided functions, so that every
 /// operation module reads the same way.
 ///
-/// The hooks named after a public accessor of the operation (e.g., [`axes`](Self::axes)) return the same
+/// The axes that the collective exchanges values over are those of its [`CollectiveOperation`] implementation.
+/// The hooks named after a public accessor of the operation (e.g., [`axis_size`](Self::axis_size)) return the same
 /// values. They are repeated here because this trait is private, while the accessors are part of the public API.
-trait LinearCollectiveOperation: Operation<Type = ArrayType> {
+trait LinearCollectiveOperation: Operation<Type = ArrayType> + CollectiveOperation {
     /// Collective operation type that transposition stages on the output cotangent.
     type Adjoint: Operation<Type = ArrayType>;
-
-    /// Returns the names of the axes that this collective exchanges values over.
-    fn axes(&self) -> &CollectiveAxes;
 
     /// Returns the number of participants along the named axis, resolved when the collective was staged.
     fn axis_size(&self) -> usize;

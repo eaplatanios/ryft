@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use ryft_macros::capability;
@@ -23,10 +24,10 @@ use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveAxes, CollectiveMode, CollectiveOptions, LinearCollectiveOperation,
-    ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation, ShapeChangingCollectiveValue,
-    infer_array_ir_shape_changing_collective_output_type, infer_linear_collective_operation_output_type,
-    resolve_collective_axes, validate_manual_mesh_axes_input,
+    CollectiveArrayExtentBatchingPolicy, CollectiveAxes, CollectiveMode, CollectiveOperation, CollectiveOptions,
+    LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
+    ShapeChangingCollectiveValue, infer_array_ir_shape_changing_collective_output_type,
+    infer_linear_collective_operation_output_type, resolve_collective_axes, validate_manual_mesh_axes_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -318,13 +319,15 @@ impl Operation for ParallelAllToAllOperation {
     }
 }
 
+impl CollectiveOperation for ParallelAllToAllOperation {
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        Cow::Borrowed(&self.axes)
+    }
+}
+
 impl LinearCollectiveOperation for ParallelAllToAllOperation {
     type Adjoint = ParallelAllToAllOperation;
-
-    #[inline]
-    fn axes(&self) -> &CollectiveAxes {
-        &self.axes
-    }
 
     #[inline]
     fn axis_size(&self) -> usize {

@@ -33,9 +33,11 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 /// `InterpretableOperation`, `PartiallyEvaluatableOperation`, and `OperationPayloadProjection` implementations, one
 /// `OperationProjection` implementation per projected member variant, and the owned `From<Payload>` and borrowed
 /// `TryFrom<&Enum>` payload conversions. Unless a variant stores a native `GuardOperation`, it also generates an
-/// `OperationProvider` implementation that rejects guard requests. The payload-delegating `PartialEq`, `Eq`, and
-/// `Hash` implementations, as well as the reference discharge, batching, differentiation, and transposition
-/// dispatchers, are generated only when they are selected through `#[ryft(dispatch(...))]`.
+/// `OperationProvider` implementation that rejects guard requests, and when a variant declares `#[ryft(collective)]`,
+/// it generates a `CollectiveOperation` implementation that delegates to the payloads of the variants that declare it
+/// and reports no axes for every other variant. The payload-delegating `PartialEq`, `Eq`, and `Hash` implementations,
+/// as well as the reference discharge, batching, differentiation, and transposition dispatchers, are generated only
+/// when they are selected through `#[ryft(dispatch(...))]`.
 ///
 /// The macro supports the following optional `#[ryft(...)]` attributes:
 ///
@@ -49,6 +51,7 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 /// // Variant-level attributes:
 /// #[ryft(projected(U [, structural]))]      // Every input and output of the instruction belongs to `U`.
 /// #[ryft(mixed(U [, structural]))]          // The instruction crosses member universes, and `U` may be defaulted.
+/// #[ryft(collective)]                       // `CollectiveOperation` delegates to the payload of the variant.
 /// #[ryft(skip_from)]                        // Skips only the owned `From<Payload>` conversion of the variant.
 /// ```
 ///

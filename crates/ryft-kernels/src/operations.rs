@@ -12,15 +12,15 @@ use std::fmt::{Display, Formatter};
 use ryft_core::macros::impl_guardless_operation;
 use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayType,
-    ConditionOperation, ConstantOperation, Context, DimensionOperation, DimensionSizeOperation, DimensionType,
-    DimensionValue, Domain, DynamicBroadcastOperation, Effects, ErasedOperation, InputRegionProvenance,
-    InterpretableOperation, InterpretationDriver, Operation, OperationBoundaryPruning, OperationPayloadProjection,
-    OperationProjection, OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationValue, PartiallyEvaluatableOperation, ProgramError, ReferenceAccessDescriptor,
-    ReferenceAccessMode, ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation,
-    ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
-    ReferenceWriteOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type, TypeError,
-    TypeIdentityRenaming,
+    CollectiveAxes, CollectiveOperation, ConditionOperation, ConstantOperation, Context, DimensionOperation,
+    DimensionSizeOperation, DimensionType, DimensionValue, Domain, DynamicBroadcastOperation, Effects, ErasedOperation,
+    InputRegionProvenance, InterpretableOperation, InterpretationDriver, Operation, OperationBoundaryPruning,
+    OperationPayloadProjection, OperationProjection, OutputRegionProvenance, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation, ProgramError,
+    ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceAddUpdateOperation,
+    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+    ReferenceSwapOperation, ReferenceWriteOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type,
+    TypeError, TypeIdentityRenaming,
 };
 
 use crate::calls::{KernelCallOperation, KernelDefinition};
@@ -810,6 +810,25 @@ impl<Extension: Operation<Type = ArrayIrType>> OperationPayloadProjection for Ke
             .or_else(|payload| payload.downcast().map(Self::MaskedStore))
             .or_else(|payload| payload.downcast().map(Self::MaskedSwap))
             .or_else(|payload| ArrayIrOperation::<Array>::from_payload(payload).map(Self::Portable))
+    }
+}
+
+impl<Extension: Operation<Type = ArrayIrType>> CollectiveOperation for KernelOperation<Extension> {
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        // Only the portable operations can be collectives. The adapter-owned extension is a generic payload, so it is
+        // not consulted, as in the payload projection.
+        match self {
+            Self::Portable(operation) => operation.axes(),
+            Self::Call(_)
+            | Self::Scratch(_)
+            | Self::TileLoad(_)
+            | Self::AsyncCopy(_)
+            | Self::Wait(_)
+            | Self::MaskedLoad(_)
+            | Self::MaskedStore(_)
+            | Self::MaskedSwap(_)
+            | Self::Extension(_) => Cow::Owned(CollectiveAxes::default()),
+        }
     }
 }
 

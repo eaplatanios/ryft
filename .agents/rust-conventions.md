@@ -12,6 +12,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   consuming functions, then private helpers. Place `with_*` functions immediately after constructors. Keep private
   constructors with constructors, merge adjacent inherent impl blocks with identical bounds, and order the corresponding
   tests by the public functions while keeping edge cases together.
+- Order the private items of a module as the private types (each followed by its implementation blocks), then the
+  private helper functions, at the end of the module and before its tests. Keep both groups in the same order of the
+  areas that they serve (e.g., boundary, interpretation, partial evaluation, batching, differentiation, transposition).
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - Use the narrowest visibility that reaches actual callers; keep module-internal helpers private.

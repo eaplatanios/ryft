@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 
@@ -20,7 +21,7 @@ use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
-    CollectiveAxes, LinearCollectiveOperation, resolve_collective_axes, route_axis_slices,
+    CollectiveAxes, CollectiveOperation, LinearCollectiveOperation, resolve_collective_axes, route_axis_slices,
     validate_manual_mesh_axes_input,
 };
 use crate::operations::constants::zero_like::ZeroLike;
@@ -236,13 +237,15 @@ impl Operation for ParallelPermuteOperation {
     }
 }
 
+impl CollectiveOperation for ParallelPermuteOperation {
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        Cow::Borrowed(&self.axes)
+    }
+}
+
 impl LinearCollectiveOperation for ParallelPermuteOperation {
     type Adjoint = ParallelPermuteOperation;
-
-    #[inline]
-    fn axes(&self) -> &CollectiveAxes {
-        &self.axes
-    }
 
     #[inline]
     fn axis_size(&self) -> usize {

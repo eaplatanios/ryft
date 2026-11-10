@@ -153,6 +153,17 @@ impl Array {
         )
     }
 
+    /// Creates a new [`Array`] of the provided [`ArrayType`] whose elements are unspecified and must all be overwritten
+    /// before they are read (e.g., through [`Array::storage_bytes_mut`]). This is meant for kernels that assemble their
+    /// result piece by piece. The storage is currently filled with zero bytes, which are a valid encoding for every
+    /// data type but need not encode zero, so callers must not rely on the contents. Dynamically shaped types are
+    /// rejected because they cannot describe materialized storage.
+    #[inline]
+    pub fn uninitialized(r#type: ArrayType) -> Result<Self, ProgramError> {
+        let storage_byte_count = ArrayAddressing::new(r#type.clone())?.storage_byte_len();
+        Ok(Self::new_unchecked(r#type, Arc::new(vec![0; storage_byte_count])))
+    }
+
     /// Creates a new [`Array`] with the provided [`ArrayType`] and backed by the provided shared physical storage
     /// without performing any validation for either. The caller guarantees what [`Array::new`] would otherwise check,
     /// namely that `bytes` has the exact layout-derived byte count for `type`, holds a valid encoding for every logical
@@ -1501,6 +1512,24 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == format!("array type `{array_type}` requires more bytes than can be represented"),
         ));
+    }
+
+    #[test]
+    fn test_array_uninitialized() {
+        // The elements are unspecified, so only the type and the storage size are part of the contract. The storage
+        // covers the layout of the type, including its holes.
+        let array_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let array = Array::uninitialized(array_type.clone()).unwrap();
+        assert_eq!(array.r#type().as_ref(), &array_type);
+        assert_eq!(array.storage_bytes().len(), 24);
+        let strided_type =
+            ArrayType::new_static(DataType::U8, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![2])));
+        assert_eq!(Array::uninitialized(strided_type).unwrap().storage_bytes().len(), 3);
+
+        // Types without a static element count cannot describe materialized storage.
+        let dynamic = Dimension::from(DimensionVariable::new("n", DimensionBounds::non_negative(None).unwrap()));
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic]));
+        assert!(matches!(Array::uninitialized(dynamic_type), Err(ProgramError::Type(_))));
     }
 
     #[test]

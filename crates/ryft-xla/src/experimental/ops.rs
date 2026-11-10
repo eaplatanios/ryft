@@ -584,7 +584,7 @@ where
 
     /// Homogeneous array operation. Member zero constructors are promoted to their mixed array IR carrier when an
     /// array operation is lifted into this family.
-    #[ryft(projected(ArrayType), skip_from)]
+    #[ryft(projected(ArrayType), collective, skip_from)]
     Array(ArrayOperation<<Payload as ValueProjection<ArrayType>>::Projected>),
 
     /// Homogeneous first-class-dimension operation.
@@ -657,19 +657,19 @@ where
     RngBitGenerator(RngBitGeneratorOperation<ArrayIrType>),
 
     /// Gathers values with one explicit extent per result axis.
-    #[ryft(mixed)]
+    #[ryft(mixed, collective)]
     ParallelAllGather(ParallelAllGatherOperation),
 
     /// Scatters values with one explicit extent per result axis.
-    #[ryft(mixed)]
+    #[ryft(mixed, collective)]
     ParallelSumScatter(ParallelSumScatterOperation),
 
     /// Exchanges values with one explicit extent per result axis.
-    #[ryft(mixed)]
+    #[ryft(mixed, collective)]
     ParallelAllToAll(ParallelAllToAllOperation),
 
     /// Exchanges variable-length leading-axis slices through an XLA FFI custom call.
-    #[ryft(mixed)]
+    #[ryft(mixed, collective)]
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
 
     /// Backend-owned condition whose attached branch regions can contain XLA operations.

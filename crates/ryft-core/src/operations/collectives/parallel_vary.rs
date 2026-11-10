@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Display;
 
@@ -15,6 +16,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::reductions::ReductionKind;
 use crate::partial::PartiallyEvaluatableOperation;
@@ -117,6 +119,13 @@ impl Operation for ParallelVaryOperation {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("axis_name", format_args!("{:?}", self.axis_name)))
+    }
+}
+
+impl CollectiveOperation for ParallelVaryOperation {
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        Cow::Owned(CollectiveAxes::from(&self.axis_name))
     }
 }
 

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use ryft_macros::capability;
@@ -27,8 +28,8 @@ use crate::operations::collectives::parallel_vary::{
     ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, ParallelVary, ParallelVaryOperation,
 };
 use crate::operations::collectives::{
-    CollectiveArrayExtentBatchingPolicy, CollectiveAxes, CollectiveOptions, effective_collective_axis_size,
-    resolve_named_axis_size, validate_manual_mesh_input,
+    CollectiveArrayExtentBatchingPolicy, CollectiveAxes, CollectiveOperation, CollectiveOptions,
+    effective_collective_axis_size, resolve_named_axis_size, validate_manual_mesh_input,
 };
 use crate::operations::comparisons::{Compare, CompareOperation};
 use crate::operations::constants::one::{One, OneOperation};
@@ -780,6 +781,13 @@ impl Operation for ParallelRaggedAllToAllOperation {
                 Ok(())
             },
         )
+    }
+}
+
+impl CollectiveOperation for ParallelRaggedAllToAllOperation {
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        Cow::Owned(CollectiveAxes::from(&self.axis_name))
     }
 }
 
