@@ -4096,12 +4096,32 @@ where
             return Ok(outputs);
         }
 
-        if !self.uses_emulated_axes(region, instruction)? {
-            return self.bind_per_device(region, mappings, instruction, inputs);
+        // An instruction communicates across the emulated devices when the closure of its regions contains a
+        // collective over an emulated axis. Any other instruction runs on every device independently, so its operation
+        // is bound once per device, in device order, with the inputs of that device and the regions of the instruction.
+        let regions = instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
+        let uses_emulated_axes = regions.iter().any(|region| {
+            region
+                .instructions_in_closure()
+                .any(|(_, nested)| nested.operation().axes().names().iter().any(|name| self.grid.axis(name).is_some()))
+        });
+        if !uses_emulated_axes {
+            let device_count = self.grid.device_count();
+            let mut outputs = vec![Vec::with_capacity(device_count); instruction.outputs().len()];
+            for device in 0..device_count {
+                let device_inputs = inputs.iter().map(|values| values[device].clone()).collect::<Vec<_>>();
+                let regions = AttachedRegions::from(ReplayRegionDriver::new(region, instruction.regions(), mappings)?);
+                let device_outputs =
+                    self.driver.bind(self.context, instruction.operation().clone(), regions, &device_inputs)?;
+                check_count!("output", device_outputs, outputs.len(), ProgramError);
+                for (output, value) in outputs.iter_mut().zip(device_outputs) {
+                    output.push(value);
+                }
+            }
+            return Ok(outputs);
         }
 
         // The regions of the instruction communicate across the emulated devices, so they must run in lockstep.
-        let regions = instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
         operation
             .validate_region_interfaces(&regions.iter().map(|region| region.interface().clone()).collect::<Vec<_>>())?;
 
@@ -4137,48 +4157,6 @@ where
                 operation.name(),
             ),
         })
-    }
-
-    /// Binds the operation of `instruction` once per device, in device order, with that device's inputs and the regions
-    /// of `instruction`.
-    fn bind_per_device(
-        &self,
-        region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
-        mappings: &RegionReplayMappings<ArrayIrValue<Array>, C::Operation>,
-        instruction: &Instruction<C::Operation>,
-        inputs: &[DeviceValues],
-    ) -> Result<Vec<DeviceValues>, ProgramError> {
-        let device_count = self.grid.device_count();
-        let mut outputs = vec![Vec::with_capacity(device_count); instruction.outputs().len()];
-        for device in 0..device_count {
-            let device_inputs = inputs.iter().map(|values| values[device].clone()).collect::<Vec<_>>();
-            let regions = AttachedRegions::from(ReplayRegionDriver::new(region, instruction.regions(), mappings)?);
-            let device_outputs =
-                self.driver.bind(self.context, instruction.operation().clone(), regions, &device_inputs)?;
-            check_count!("output", device_outputs, outputs.len(), ProgramError);
-            for (output, value) in outputs.iter_mut().zip(device_outputs) {
-                output.push(value);
-            }
-        }
-        Ok(outputs)
-    }
-
-    /// Returns `true` when the closure of the regions of `instruction` contains a collective over an emulated axis.
-    fn uses_emulated_axes(
-        &self,
-        region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
-        instruction: &Instruction<C::Operation>,
-    ) -> Result<bool, ProgramError> {
-        for id in instruction.regions() {
-            if region
-                .with_id(*id)?
-                .instructions_in_closure()
-                .any(|(_, nested)| nested.operation().axes().names().iter().any(|name| self.grid.axis(name).is_some()))
-            {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// Checks that a variation or reduction state cast belongs to the actual checked manual binding of its axis.
