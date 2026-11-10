@@ -4079,7 +4079,6 @@ where
         )
     }
 
-    // TODO(eaplatanios): Is there a way to avoid special-casing specific operations by type or name in this function?
     /// Runs one `instruction` of `region` on every device and returns its per-device outputs.
     fn run_instruction(
         &self,
@@ -4122,6 +4121,7 @@ where
         operation
             .validate_region_interfaces(&regions.iter().map(|region| region.interface().clone()).collect::<Vec<_>>())?;
 
+        // TODO(eaplatanios): Is there a way to avoid special-casing specific operations by type here?
         if let Some(operation) = operation.projected_payload::<WhileOperation<ArrayIrType>>() {
             return self.run_lockstep(operation, &regions, inputs);
         }
@@ -4223,11 +4223,13 @@ where
         if axes.iter().all(Option::is_none) {
             return Ok(None);
         }
+
         let Some(axes) = axes.into_iter().collect::<Option<Vec<_>>>() else {
             return Err(ProgramError::MalformedProgram(format!(
                 "`{name}` over manual axes `{axis_names}` combines emulated axes with axes of an enclosing region",
             )));
         };
+
         let axis_size = axes.iter().map(|axis| self.grid.axes[*axis].1).product::<usize>();
         let validate_axis_size = |payload_axis_size: usize| {
             if payload_axis_size == axis_size {
@@ -4239,6 +4241,7 @@ where
                 )))
             }
         };
+
         if let Some(payload) = operation.projected_payload::<AxisIndexOperation>() {
             check_count!("input", inputs, 0, ProgramError);
             let output_type = single_output_type(payload, &[])?;
@@ -4247,6 +4250,7 @@ where
                 with_array_type(&position.converted_to(output_type.data_type())?, &output_type)
             })?]));
         }
+
         if let Some(payload) = operation.projected_payload::<ParallelRaggedAllToAllOperation>() {
             // The devices that differ only along the axis exchange segments in one host-side exchange, whose
             // participants are ordered by their coordinates and whose participant groups select the exchange partners.
@@ -4266,6 +4270,7 @@ where
                             .collect::<Result<Vec<_>, _>>()
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+
                 // Validate each participant at its logical type before packing unplaced physical arrays. The
                 // inferred output types retain its mesh and manual variation for restoration after the exchange.
                 let output_types = participant_inputs
@@ -4296,8 +4301,8 @@ where
                                 || participant_type.shape() != input_type.shape()
                             {
                                 return Err(TypeError::invalid(format!(
-                                    "`{name}` participant inputs {index} must share one static shape and data type but \
-                                     got `{input_type}` and `{participant_type}`",
+                                    "`{name}` participant inputs {index} must share one static shape and data type \
+                                     but got `{input_type}` and `{participant_type}`",
                                 ))
                                 .into());
                             }
@@ -4306,6 +4311,7 @@ where
                         Array::from_logical_bytes(ArrayType::new_static(input_type.data_type(), stacked_shape), &bytes)
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
+
                 let mut stacked_outputs = payload.with_physical_representation(None).interpret(
                     &EagerContext::<Array, ArrayOperation<Array>>::new(),
                     &EmptyRegionDriver,
@@ -4322,15 +4328,16 @@ where
                     outputs[*participant] = Some(ArrayIrValue::Array(output));
                 }
             }
+
             return Ok(Some(vec![outputs.into_iter().map(Option::unwrap).collect()]));
         }
+
         // Every remaining collective consumes one array per device, followed by the result extents of its mixed form.
         let (values, extents) =
             inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-        let arrays = values
-            .iter()
-            .map(|value| ValueProjection::<ArrayType>::projected(value))
-            .collect::<Result<Vec<_>, _>>()?;
+        let arrays = values.iter().map(ValueProjection::<ArrayType>::projected).collect::<Result<Vec<_>, _>>()?;
+
+        // TODO(eaplatanios): Can we avoid the hardcoding of specific operation types in the following branches?
         let outputs = if let Some(payload) = operation.projected_payload::<ParallelVaryOperation>() {
             // Varying an invariant value along an axis changes only its type, because every device already holds it.
             self.grid.map_devices(|device| {
@@ -4515,6 +4522,7 @@ where
                 ),
             });
         };
+
         Ok(Some(vec![outputs]))
     }
 
