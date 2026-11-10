@@ -428,11 +428,6 @@ impl LinearCollectiveOperation for ParallelAllGatherOperation {
     }
 
     #[inline]
-    fn mesh(&self) -> Option<&LogicalMesh> {
-        self.mesh.as_ref()
-    }
-
-    #[inline]
     fn effective_axis_size(&self) -> Result<usize, TypeError> {
         if self.output_variance != ParallelAllGatherOutputVariance::Varying && self.options.axis_index_groups.is_some()
         {
@@ -442,6 +437,11 @@ impl LinearCollectiveOperation for ParallelAllGatherOperation {
             )));
         }
         self.options.effective_axis_size(PARALLEL_ALL_GATHER_OPERATION_NAME, self.axis_size)
+    }
+
+    #[inline]
+    fn mesh(&self) -> Option<&LogicalMesh> {
+        self.mesh.as_ref()
     }
 
     fn adjoint(&self, _input_type: &ArrayType) -> Result<ParallelSumScatterOperation, ProgramError> {

@@ -3830,112 +3830,6 @@ type DeviceValues = Vec<ArrayIrValue<Array>>;
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Devices of one lockstep emulation, identified by their coordinates along the emulated manual axes. Device indices
-/// enumerate these coordinates in row-major order, so a nested grid that appends the axes of an inner manual region
-/// keeps every device of the outer grid as one contiguous block of inner devices.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct LockstepDeviceGrid {
-    /// Names and sizes of the emulated manual axes, outermost first.
-    axes: Vec<(String, usize)>,
-}
-
-impl LockstepDeviceGrid {
-    /// Returns this grid extended by the provided innermost `axes`.
-    fn with_axes(&self, axes: &[(String, usize)]) -> Self {
-        Self { axes: self.axes.iter().chain(axes).cloned().collect() }
-    }
-
-    /// Returns the number of devices of this grid, which is one for a grid without axes.
-    fn device_count(&self) -> usize {
-        self.axes.iter().map(|(_, size)| size).product()
-    }
-
-    /// Returns the position of the emulated axis named `axis_name`, if any.
-    fn axis(&self, axis_name: &str) -> Option<usize> {
-        self.axes.iter().position(|(name, _)| name == axis_name)
-    }
-
-    /// Returns the coordinates of `device` along every axis of this grid.
-    fn coordinates(&self, device: usize) -> Vec<usize> {
-        let mut coordinates = vec![0; self.axes.len()];
-        let mut remainder = device;
-        for (coordinate, (_, size)) in coordinates.iter_mut().zip(&self.axes).rev() {
-            *coordinate = remainder % size;
-            remainder /= size;
-        }
-        coordinates
-    }
-
-    /// Returns the index of the device at `coordinates`.
-    fn device(&self, coordinates: &[usize]) -> usize {
-        coordinates
-            .iter()
-            .zip(&self.axes)
-            .fold(0, |device, (coordinate, (_, size))| device * size + coordinate)
-    }
-
-    /// Returns the values that `function` computes for every device of this grid, in device order.
-    fn map_devices<F: FnMut(usize) -> Result<Array, ProgramError>>(
-        &self,
-        mut function: F,
-    ) -> Result<DeviceValues, ProgramError> {
-        (0..self.device_count()).map(|device| Ok(ArrayIrValue::Array(function(device)?))).collect()
-    }
-
-    /// Returns the position of `device` along the combined axis of the grid axes `axes`, which linearizes their
-    /// coordinates in the given order with the first axis major (refer to [`CollectiveAxes`]).
-    fn position(&self, device: usize, axes: &[usize]) -> usize {
-        let coordinates = self.coordinates(device);
-        axes.iter().fold(0, |position, axis| position * self.axes[*axis].1 + coordinates[*axis])
-    }
-
-    /// Returns the device that shares the coordinates of `device` along every grid axis other than `axes` and has
-    /// `position` along their combined axis (refer to [`position`](Self::position)).
-    fn device_at(&self, device: usize, axes: &[usize], mut position: usize) -> usize {
-        let mut coordinates = self.coordinates(device);
-        for axis in axes.iter().rev() {
-            coordinates[*axis] = position % self.axes[*axis].1;
-            position /= self.axes[*axis].1;
-        }
-        self.device(&coordinates)
-    }
-
-    /// Returns the devices that take part with `device` in a collective over the combined axis of the grid axes
-    /// `axes`, ordered by their positions along it, together with the position of `device` among them. Without
-    /// `axis_index_groups`, they are all devices that share the coordinates of `device` along the other grid axes.
-    /// With them, they are the members of the group that contains the position of `device`, in group order.
-    fn participants(
-        &self,
-        device: usize,
-        axes: &[usize],
-        axis_index_groups: Option<&[Vec<usize>]>,
-    ) -> Result<(Vec<usize>, usize), ProgramError> {
-        let axis_size = axes.iter().map(|axis| self.axes[*axis].1).product::<usize>();
-        let position = self.position(device, axes);
-        let members = match axis_index_groups {
-            None => (0..axis_size).collect::<Vec<_>>(),
-            Some(groups) => groups
-                .iter()
-                .find(|group| group.contains(&position))
-                .filter(|group| group.iter().all(|member| *member < axis_size))
-                .cloned()
-                .ok_or_else(|| {
-                    let axis_names =
-                        CollectiveAxes::from(axes.iter().map(|axis| self.axes[*axis].0.clone()).collect::<Vec<_>>());
-                    ProgramError::InvalidArgument {
-                        message: format!(
-                            "the participant groups `{groups:?}` of a collective over manual axis `{axis_names}` do \
-                             not partition its {axis_size} coordinates",
-                        ),
-                    }
-                })?,
-        };
-        let member_position = members.iter().position(|member| *member == position).unwrap();
-        let devices = members.iter().map(|member| self.device_at(device, axes, *member)).collect();
-        Ok((devices, member_position))
-    }
-}
-
 /// Lockstep emulator for the devices of a [`LockstepDeviceGrid`]. It replays regions over [`DeviceValues`] and binds
 /// ordinary operations per device through the [`InterpretationDriver`] of the `shard_map` application being
 /// interpreted.
@@ -4655,6 +4549,112 @@ where
         };
         let outputs = operation.interpret(&context, &driver, &inputs)?;
         Ok(outputs.into_iter().map(|output| output.0).collect())
+    }
+}
+
+/// Devices of one lockstep emulation, identified by their coordinates along the emulated manual axes. Device indices
+/// enumerate these coordinates in row-major order, so a nested grid that appends the axes of an inner manual region
+/// keeps every device of the outer grid as one contiguous block of inner devices.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LockstepDeviceGrid {
+    /// Names and sizes of the emulated manual axes, outermost first.
+    axes: Vec<(String, usize)>,
+}
+
+impl LockstepDeviceGrid {
+    /// Returns this grid extended by the provided innermost `axes`.
+    fn with_axes(&self, axes: &[(String, usize)]) -> Self {
+        Self { axes: self.axes.iter().chain(axes).cloned().collect() }
+    }
+
+    /// Returns the number of devices of this grid, which is one for a grid without axes.
+    fn device_count(&self) -> usize {
+        self.axes.iter().map(|(_, size)| size).product()
+    }
+
+    /// Returns the position of the emulated axis named `axis_name`, if any.
+    fn axis(&self, axis_name: &str) -> Option<usize> {
+        self.axes.iter().position(|(name, _)| name == axis_name)
+    }
+
+    /// Returns the coordinates of `device` along every axis of this grid.
+    fn coordinates(&self, device: usize) -> Vec<usize> {
+        let mut coordinates = vec![0; self.axes.len()];
+        let mut remainder = device;
+        for (coordinate, (_, size)) in coordinates.iter_mut().zip(&self.axes).rev() {
+            *coordinate = remainder % size;
+            remainder /= size;
+        }
+        coordinates
+    }
+
+    /// Returns the index of the device at `coordinates`.
+    fn device(&self, coordinates: &[usize]) -> usize {
+        coordinates
+            .iter()
+            .zip(&self.axes)
+            .fold(0, |device, (coordinate, (_, size))| device * size + coordinate)
+    }
+
+    /// Returns the values that `function` computes for every device of this grid, in device order.
+    fn map_devices<F: FnMut(usize) -> Result<Array, ProgramError>>(
+        &self,
+        mut function: F,
+    ) -> Result<DeviceValues, ProgramError> {
+        (0..self.device_count()).map(|device| Ok(ArrayIrValue::Array(function(device)?))).collect()
+    }
+
+    /// Returns the position of `device` along the combined axis of the grid axes `axes`, which linearizes their
+    /// coordinates in the given order with the first axis major (refer to [`CollectiveAxes`]).
+    fn position(&self, device: usize, axes: &[usize]) -> usize {
+        let coordinates = self.coordinates(device);
+        axes.iter().fold(0, |position, axis| position * self.axes[*axis].1 + coordinates[*axis])
+    }
+
+    /// Returns the device that shares the coordinates of `device` along every grid axis other than `axes` and has
+    /// `position` along their combined axis (refer to [`position`](Self::position)).
+    fn device_at(&self, device: usize, axes: &[usize], mut position: usize) -> usize {
+        let mut coordinates = self.coordinates(device);
+        for axis in axes.iter().rev() {
+            coordinates[*axis] = position % self.axes[*axis].1;
+            position /= self.axes[*axis].1;
+        }
+        self.device(&coordinates)
+    }
+
+    /// Returns the devices that take part with `device` in a collective over the combined axis of the grid axes
+    /// `axes`, ordered by their positions along it, together with the position of `device` among them. Without
+    /// `axis_index_groups`, they are all devices that share the coordinates of `device` along the other grid axes.
+    /// With them, they are the members of the group that contains the position of `device`, in group order.
+    fn participants(
+        &self,
+        device: usize,
+        axes: &[usize],
+        axis_index_groups: Option<&[Vec<usize>]>,
+    ) -> Result<(Vec<usize>, usize), ProgramError> {
+        let axis_size = axes.iter().map(|axis| self.axes[*axis].1).product::<usize>();
+        let position = self.position(device, axes);
+        let members = match axis_index_groups {
+            None => (0..axis_size).collect::<Vec<_>>(),
+            Some(groups) => groups
+                .iter()
+                .find(|group| group.contains(&position))
+                .filter(|group| group.iter().all(|member| *member < axis_size))
+                .cloned()
+                .ok_or_else(|| {
+                    let axis_names =
+                        CollectiveAxes::from(axes.iter().map(|axis| self.axes[*axis].0.clone()).collect::<Vec<_>>());
+                    ProgramError::InvalidArgument {
+                        message: format!(
+                            "the participant groups `{groups:?}` of a collective over manual axis `{axis_names}` do \
+                             not partition its {axis_size} coordinates",
+                        ),
+                    }
+                })?,
+        };
+        let member_position = members.iter().position(|member| *member == position).unwrap();
+        let devices = members.iter().map(|member| self.device_at(device, axes, *member)).collect();
+        Ok((devices, member_position))
     }
 }
 

@@ -335,13 +335,13 @@ impl LinearCollectiveOperation for ParallelAllToAllOperation {
     }
 
     #[inline]
-    fn mesh(&self) -> Option<&LogicalMesh> {
-        self.mesh.as_ref()
+    fn effective_axis_size(&self) -> Result<usize, TypeError> {
+        self.options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, self.axis_size)
     }
 
     #[inline]
-    fn effective_axis_size(&self) -> Result<usize, TypeError> {
-        self.options.effective_axis_size(PARALLEL_ALL_TO_ALL_OPERATION_NAME, self.axis_size)
+    fn mesh(&self) -> Option<&LogicalMesh> {
+        self.mesh.as_ref()
     }
 
     #[inline]

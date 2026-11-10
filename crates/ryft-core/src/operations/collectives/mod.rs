@@ -615,10 +615,6 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> + CollectiveOperati
     /// Returns the number of participants along the named axis, resolved when the collective was staged.
     fn axis_size(&self) -> usize;
 
-    /// Returns the mesh whose manual axis this collective exchanges values over, or [`None`] for an ordinary
-    /// collective, whose named axis may be bound by any enclosing binder.
-    fn mesh(&self) -> Option<&LogicalMesh>;
-
     /// Returns the number of participants that each instance of this collective combines. Collectives with participant
     /// groups return the common group size while every other collective combines all participants of its axis.
     ///
@@ -629,6 +625,10 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> + CollectiveOperati
     fn effective_axis_size(&self) -> Result<usize, TypeError> {
         Ok(self.axis_size())
     }
+
+    /// Returns the mesh whose manual axis this collective exchanges values over, or [`None`] for an ordinary
+    /// collective, whose named axis may be bound by any enclosing binder.
+    fn mesh(&self) -> Option<&LogicalMesh>;
 
     /// Returns the adjoint collective that transposition stages on the output cotangent of a collective whose array
     /// input has type `input_type`. Most collectives ignore `input_type`, but a sum-scatter that completes a pending
