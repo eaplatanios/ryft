@@ -290,15 +290,12 @@ use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOperation;
 use crate::operations::collectives::parallel_vary::{ParallelVary, ParallelVaryOperation};
 use crate::operations::collectives::{CollectiveAxes, CollectiveMode, CollectiveOperation};
-use crate::operations::composites::COMPOSITE_OPERATION_NAME;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::condition::{CONDITION_OPERATION_NAME, ConditionOperation};
 use crate::operations::control_flow::scan::{ScanInterpretationDomain, ScanOperation};
 use crate::operations::control_flow::r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate};
-use crate::operations::differentiation::linear_call::LINEAR_CALL_OPERATION_NAME;
-use crate::operations::differentiation::rematerialize::REMATERIALIZE_OPERATION_NAME;
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
@@ -324,8 +321,8 @@ use crate::programs::{
     ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
     ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceRoot, ReferenceType, Region, RegionArena, RegionDataFlow, RegionDriver,
-    RegionInterface, RegionLiveness, RegionRef, RegionReplayMappings, RegionSlot, ReplayRegionDriver, Type, TypeError,
-    Typed, TypedProgram, Value, ValueDirectDispatch, ValueProjection,
+    RegionInterface, RegionLiveness, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, ReplayRegionDriver, Type,
+    TypeError, Typed, TypedProgram, Value, ValueDirectDispatch, ValueProjection,
 };
 use crate::tracing::{DomainTracer, DomainTracingContext, Tracer, TracingContext, TracingScope};
 
@@ -4141,12 +4138,29 @@ where
             return self.run_shard_map(operation, regions[0], inputs.to_vec());
         }
 
-        // The eager rules of these operations replay their primal region (i.e., region zero) over all of their inputs.
-        if matches!(
-            operation.name(),
-            COMPOSITE_OPERATION_NAME | LINEAR_CALL_OPERATION_NAME | REMATERIALIZE_OPERATION_NAME,
-        ) {
-            return self.run_region(regions[0], inputs.to_vec());
+        // An operation whose application executes one computation region once, on its inputs and for its outputs,
+        // position by position, behaves like that region on every device, so the region is replayed in its place.
+        // The operation declares this through its region data flow and its region provenance (e.g., composite calls,
+        // linear calls, and rematerialized calls do), so no operation is named here.
+        let mut computation_regions =
+            operation.region_slots().iter().enumerate().filter(|(_, slot)| slot.role == RegionRole::Computation);
+        if let (Some((region_index, _)), None) = (computation_regions.next(), computation_regions.next())
+            && matches!(operation.region_data_flow(), RegionDataFlow::Provenance | RegionDataFlow::Atomic)
+        {
+            let interface = regions[region_index].interface();
+            let output_count = instruction.outputs().len();
+            let forwards_inputs = interface.input_types().len() == inputs.len()
+                && (0..inputs.len()).all(|index| {
+                    operation.input_region_provenance(region_index, index) == InputRegionProvenance::Input { index }
+                });
+            let forwards_outputs = interface.output_types().len() == output_count
+                && (0..output_count).all(|output_index| {
+                    operation.output_region_provenance(output_index)
+                        == [OutputRegionProvenance { region_index, output_index }]
+                });
+            if forwards_inputs && forwards_outputs {
+                return self.run_region(regions[region_index], inputs.to_vec());
+            }
         }
 
         Err(ProgramError::UnsupportedOperation {
