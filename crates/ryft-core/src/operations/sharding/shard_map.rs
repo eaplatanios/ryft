@@ -3163,8 +3163,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Configuration of the `shard_map` function of [`ShardMap`] and of [`shard_map()`](fn@shard_map). By default, every
 /// mesh axis of type [`Manual`](MeshAxisType::Manual) that no enclosing manual region already made manual is active.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3174,12 +3172,6 @@ pub struct ShardMapOptions {
 
     /// Checking policy for the local body and its output replication promises.
     manual_variation_checks: ManualVariationChecks,
-}
-
-impl Default for ShardMapOptions {
-    fn default() -> Self {
-        Self { manual_axes: Vec::new(), manual_variation_checks: ManualVariationChecks::CHECKED }
-    }
 }
 
 impl ShardMapOptions {
@@ -3244,39 +3236,48 @@ impl ShardMapOptions {
     }
 }
 
+impl Default for ShardMapOptions {
+    #[inline]
+    fn default() -> Self {
+        Self { manual_axes: Vec::new(), manual_variation_checks: ManualVariationChecks::CHECKED }
+    }
+}
+
+// TODO(eaplatanios): Review from here onwards.
+
 /// Context construction capability for a [`ShardMapOperation`], which runs a local body once per device of a manual
-/// SPMD computation over a mesh. This is the Ryft analogue of
+/// SPMD computation over a mesh. This is the Ryft analogue of JAX's
 /// [`jax.shard_map`](https://docs.jax.dev/en/latest/_autosummary/jax.shard_map.html). The computation is bound in this
 /// explicit context, which also lets a body without inputs create values. The global [`shard_map()`](fn@shard_map)
 /// function instead recovers its context from the first input.
 ///
 /// The inputs are the array members of values of this context, represented by [`ValueProjection::Projected`] for
 /// [`ArrayType`]. This can be a concrete backend array, such as an array of the XLA backend, or a [`ProjectedValue`]
-/// view of an array IR value. The body function is traced once in a fresh [`DomainTracingContext`] of this context. It
-/// receives the [`ProjectedContext`] array view of that trace together with [`ProjectedValue`] array views of its
+/// view of an array IR value. The body function is traced once in a fresh [`DomainTracingContext`] of this context.
+/// It receives the [`ProjectedContext`] array view of that trace together with [`ProjectedValue`] array views of its
 /// [`DomainTracer`]s, whose types are the local shards of the input types (refer to
 /// [`ShardMapBoundary::local_input_type`]). Values created through the body context have that same projected tracer
 /// representation (e.g., through [`Context::lift`] or `axis_index`), and [`ProjectedContext::parent`] returns the
 /// underlying array IR tracing context. The resulting checked [`ShardMapOperation`] is bound in this context on the
 /// input values with the traced body as its `body` region, and the outputs are array projections of the values that
 /// this binding returns, with the structure of the output shardings. The input and output shardings must have exactly
-/// the structures of the values that they place, unlike JAX's specifications, which may be tree prefixes of them (i.e.,
-/// one specification for a whole subtree). The boundary types are derived as follows:
+/// the structures of the values that they place, unlike JAX's specifications, which may be tree prefixes of them
+/// (i.e., one specification for a whole subtree)> The boundary types are derived as follows:
 ///
-///   - **Inputs.** The type of each input is normalized into its global boundary type (refer to
-///     [`ShardMapBoundary::global_input_type`]). Its memory kind is not part of the boundary type, so the local body
-///     inputs carry no memory kind, unlike the local body types that a caller passes to
-///     [`ShardMapOperation::from_program`], which keep theirs. Every input type must have a static shape that the
-///     manual partition counts of its input sharding divide.
-///   - **Outputs.** A body output that does not yet vary along an active manual axis that its output sharding tiles is
-///     marked as varying along it with `parallel_vary`, so that invariant results (e.g., values computed only from
+///   - **Inputs:** The type of each input is normalized into its global boundary type (refer to
+///     [`ShardMapBoundary::global_input_type`]). Its memory kind is not part of the boundary type,
+///     so the local body inputs carry no memory kind, unlike the local body types that a caller passes to
+///     [`ShardMapOperation::from_program`], which keep theirs. Every input type must have a static shape
+///     that the manual partition counts of its input sharding divide.
+///   - **Outputs:** A body output that does not yet vary along an active manual axis that its output sharding tiles
+///     is marked as varying along it with `parallel_vary`, so that invariant results (e.g., values computed only from
 ///     replicated inputs) can be returned as tiled outputs. [`ShardMapOperation::from_program`], in contrast, rejects
-///     such bodies. A body output that varies along an active manual axis that its output sharding does not mention is
-///     rejected by default, as under JAX's `check_vma=True`. With
-///     [`ShardMapOptions::with_check_output_replication(false)`](ShardMapOptions::with_check_output_replication), the
-///     caller promises that these copies are equal despite their types, under the contract of
-///     [`ShardMapBoundary::with_check_output_replication`]. The global output types are derived through the output
-///     shardings in either mode.
+///     such bodies. A body output that varies along an active manual axis that its output sharding does not mention
+///     is rejected by default, as under JAX's `check_vma=True`. With
+///     [`ShardMapOptions::with_check_output_replication(false)`](ShardMapOptions::with_check_output_replication),
+///     the caller promises that these copies are equal despite their types, under the contract of
+///     [`ShardMapBoundary::with_check_output_replication`]. The global output types are derived
+///     through the output shardings in either mode.
 ///
 /// The body context creates values that derive from no input through its capabilities (e.g., `context.axis_index("x")`
 /// for the coordinate of the executing device along the active manual axis `x`, or [`Context::lift`] for an array
@@ -3316,8 +3317,8 @@ impl ShardMapOptions {
 /// [`CapturingContext::capture`](crate::CapturingContext::capture)) is rejected with
 /// [`ProgramError::DiscardedCaptures`]. Non-constant values that the body uses must therefore be passed as inputs,
 /// while constants may be closed over. The leaves of the inputs and outputs are arrays only. Reference boundaries
-/// require tracing the body explicitly and constructing the operation through [`ShardMapOperation::from_program`], and
-/// first-class dimensions may appear only inside the body, since `shard_map` boundaries are array or reference
+/// require tracing the body explicitly and constructing the operation through [`ShardMapOperation::from_program`],
+/// and first-class dimensions may appear only inside the body, since `shard_map` boundaries are array or reference
 /// positions only.
 pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Parameter>> + NamedAxes + MeshContext {
     /// Traces `function` as the local body of a manual SPMD computation over `mesh` and binds it in this context on
@@ -3342,8 +3343,8 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
     /// [`ShardMapError::Parameter`] when `input_shardings` does not have the structure of `inputs` or the
     /// outputs of `function` do not have the structure of `output_shardings`, the errors of [`ShardMapBoundary::new`]
     /// for invalid mesh, sharding, and manual axis combinations, [`ShardMapError::AllManualAxesAlreadyManual`] when
-    /// every manual mesh axis is already manual in an enclosing manual region, [`ShardMapError::AxisAlreadyManual`] or
-    /// [`ShardMapError::ShardingNamesEnclosingManualAxis`] when the selection of manual axes or a sharding names
+    /// every manual mesh axis is already manual in an enclosing manual region, [`ShardMapError::AxisAlreadyManual`]
+    /// or [`ShardMapError::ShardingNamesEnclosingManualAxis`] when the selection of manual axes or a sharding names
     /// such an axis, [`ShardMapError::EnclosingManualAxisNotManual`] when `mesh` does not type such an axis
     /// [`Manual`](MeshAxisType::Manual), [`ShardMapError::EnclosingManualAxisMeshMismatch`] when such an axis belongs
     /// to another device mesh, the boundary derivation errors (e.g., [`ShardMapError::InputMeshMismatch`],
