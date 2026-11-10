@@ -2530,7 +2530,7 @@ where
         // own `Context::bind` instead (e.g., by compiling the manual computation for their devices).
         self.validate_region_interfaces(&driver.region_interfaces())?;
         let emulator =
-            ShardMapEmulator { context, driver, grid: ManualDeviceGrid::default(), manual_regions: Vec::new() };
+            ShardMapEmulator { context, driver, grid: LockstepDeviceGrid::default(), manual_regions: Vec::new() };
         let outputs = emulator.run_shard_map(
             self,
             driver.region(0)?,
@@ -3875,12 +3875,12 @@ type DeviceValues = Vec<ArrayIrValue<Array>>;
 /// enumerate these coordinates in row-major order, so a nested grid that appends the axes of an inner manual region
 /// keeps every device of the outer grid as one contiguous block of inner devices.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct ManualDeviceGrid {
+struct LockstepDeviceGrid {
     /// Names and sizes of the emulated manual axes, outermost first.
     axes: Vec<(String, usize)>,
 }
 
-impl ManualDeviceGrid {
+impl LockstepDeviceGrid {
     /// Returns this grid extended by the provided innermost `axes`.
     fn with_axes(&self, axes: &[(String, usize)]) -> Self {
         Self { axes: self.axes.iter().chain(axes).cloned().collect() }
@@ -3977,7 +3977,7 @@ impl ManualDeviceGrid {
     }
 }
 
-/// Lockstep emulator for the devices of a [`ManualDeviceGrid`]. It replays regions over [`DeviceValues`] and binds
+/// Lockstep emulator for the devices of a [`LockstepDeviceGrid`]. It replays regions over [`DeviceValues`] and binds
 /// ordinary operations per device through the [`InterpretationDriver`] of the `shard_map` application being
 /// interpreted.
 struct ShardMapEmulator<'o, C, D> {
@@ -3988,7 +3988,7 @@ struct ShardMapEmulator<'o, C, D> {
     driver: &'o D,
 
     /// Devices of this emulation.
-    grid: ManualDeviceGrid,
+    grid: LockstepDeviceGrid,
 
     /// Enclosing manual boundaries, outermost first, which own each axis's physical mesh and checking policy.
     manual_regions: Vec<ShardMapBoundary>,
@@ -4033,7 +4033,7 @@ where
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let local_grid = ManualDeviceGrid { axes: manual_axes.clone() };
+        let local_grid = LockstepDeviceGrid { axes: manual_axes.clone() };
         let local_device_count = local_grid.device_count();
         check_count!("input", inputs, operation.global_input_types().len(), ProgramError);
 
@@ -5240,7 +5240,7 @@ fn block_axes(offsets: &[usize], block_shape: &[usize]) -> Vec<ArraySliceAxis> {
 /// of the dimension. Free axes do not partition the local value, so they do not contribute.
 fn manual_block_offsets(
     sharding: &Sharding,
-    grid: &ManualDeviceGrid,
+    grid: &LockstepDeviceGrid,
     coordinates: &[usize],
     local_shape: &[usize],
 ) -> Vec<usize> {
@@ -5271,7 +5271,7 @@ fn split_global_input(
     input_index: usize,
     value: &Array,
     local_type: &ArrayType,
-    grid: &ManualDeviceGrid,
+    grid: &LockstepDeviceGrid,
     coordinates: &[usize],
 ) -> Result<Array, ProgramError> {
     let sharding = &boundary.input_shardings()[input_index];
@@ -5297,7 +5297,7 @@ fn split_global_input(
 fn assemble_global_value(
     sharding: &Sharding,
     global_type: &ArrayType,
-    grid: &ManualDeviceGrid,
+    grid: &LockstepDeviceGrid,
     values: &[ArrayIrValue<Array>],
 ) -> Result<Array, ProgramError> {
     let tiled_axes = tiled_grid_axes(sharding, grid);
@@ -5338,7 +5338,7 @@ fn assemble_global_value(
 }
 
 /// Returns the positions of the axes of `grid` along which `sharding` tiles a value.
-fn tiled_grid_axes(sharding: &Sharding, grid: &ManualDeviceGrid) -> Vec<usize> {
+fn tiled_grid_axes(sharding: &Sharding, grid: &LockstepDeviceGrid) -> Vec<usize> {
     sharding
         .dimensions()
         .iter()
@@ -5363,7 +5363,7 @@ fn tiled_grid_axes(sharding: &Sharding, grid: &ManualDeviceGrid) -> Vec<usize> {
 /// Returns [`ProgramError::MalformedProgram`] naming the first axis along which two copies differ.
 fn validate_replicated_copies(
     sharding: &Sharding,
-    grid: &ManualDeviceGrid,
+    grid: &LockstepDeviceGrid,
     values: &[ArrayIrValue<Array>],
     input_index: usize,
 ) -> Result<(), ProgramError> {
@@ -5381,7 +5381,7 @@ fn validate_replicated_copies(
 /// guarantee includes floating-point encodings such as signed zeros and NaN payloads.
 fn replicated_copy_mismatch<'o>(
     sharding: &Sharding,
-    grid: &'o ManualDeviceGrid,
+    grid: &'o LockstepDeviceGrid,
     values: &[ArrayIrValue<Array>],
 ) -> Result<Option<&'o str>, ProgramError> {
     let tiled_axes = tiled_grid_axes(sharding, grid);
@@ -8690,7 +8690,7 @@ mod tests {
         let emulator = ShardMapEmulator {
             context: &EagerContext::<TestValue, TestOperation>::new(),
             driver: &EmptyRegionDriver,
-            grid: ManualDeviceGrid { axes: vec![("x".to_string(), axis_size)] },
+            grid: LockstepDeviceGrid { axes: vec![("x".to_string(), axis_size)] },
             manual_regions: vec![ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap()],
         };
         emulator.run_collective(&operation.into(), inputs)
@@ -13512,7 +13512,7 @@ mod tests {
             let emulator = ShardMapEmulator {
                 context: &context,
                 driver: &EmptyRegionDriver,
-                grid: ManualDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 2)] },
+                grid: LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 2)] },
                 manual_regions: vec![boundary("x", outer_checked), boundary("y", inner_checked)],
             };
             for (axis, checked) in [("x", outer_checked), ("y", inner_checked)] {
@@ -14207,7 +14207,7 @@ mod tests {
 
         // The participants of a device are the members of its group, positioned by their order in that group, and
         // groups that leave a coordinate without a group do not partition the axis.
-        let grid = ManualDeviceGrid { axes: vec![("x".to_string(), 4)] };
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 4)] };
         assert_eq!(grid.participants(2, &[0], Some([vec![3, 2], vec![1, 0]].as_slice())), Ok((vec![3, 2], 1)));
         assert_eq!(
             grid.participants(2, &[0], Some([vec![0, 1]].as_slice())),
@@ -14705,7 +14705,7 @@ mod tests {
         // The partial outputs of distinct devices are summed elementwise.
         let boundary = ShardMapBoundary::new(mesh, vec![unreduced.clone()], vec![unreduced], Vec::new()).unwrap();
         let local_type = boundary.local_input_type(0, &unreduced_type).unwrap();
-        let grid = ManualDeviceGrid { axes: vec![("x".to_string(), 2)] };
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
         let partials = [f32_value(local_type.clone(), &[1.0, 2.0]), f32_value(local_type, &[10.0, 20.0])];
         assert_eq!(
             assemble_global_value(&boundary.output_shardings()[0], &unreduced_type, &grid, &partials)
@@ -15558,7 +15558,7 @@ mod tests {
 
     #[test]
     fn test_shard_map_interpretation_output_replication_compares_logical_bytes() {
-        let grid = ManualDeviceGrid { axes: vec![("x".to_string(), 2)] };
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
         let replicated = Sharding::replicated(manual_mesh(), 1);
         let copy = |element: f32| f32_value(f32_vector_type(1), &[element]);
         let nan = f32::from_bits(0x7fc00001);
@@ -15579,7 +15579,7 @@ mod tests {
         // every device holds its own copy of the referent, which the reference contract keeps identical. Copies that
         // differ indicate a body that violates the contract (e.g., one that writes the reference from a branch that the
         // devices select differently), so they are rejected instead of being assembled from the copy of device zero.
-        let grid = ManualDeviceGrid { axes: vec![("x".to_string(), 2)] };
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
         let replicated = Sharding::replicated(manual_mesh(), 1);
         let copy = |elements: &[f32]| f32_value(f32_vector_type(2), elements);
         assert_eq!(validate_replicated_copies(&replicated, &grid, &[copy(&[1.0, 2.0]), copy(&[1.0, 2.0])], 0), Ok(()));
