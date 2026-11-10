@@ -10116,11 +10116,16 @@ mod tests {
             assert_eq!(evaluation.program.output_types(), vec![vector_type.clone()]);
             assert_eq!(evaluation.interpret(&TestEagerContext::new(), &unknown_arguments), Ok(expected.clone()));
         }
+    }
 
+    #[test]
+    fn test_condition_partial_evaluation_shares_residual_slots_under_symbolic_predicates() {
         // A symbolic known predicate cannot select a branch. Partitioning the original symbolic branches produces the
         // residual edge `x * x` in the `true` branch and the residual edge `x` in the `false` branch, both of the
         // identity-bearing type `f64[rows]`. The two edges share one residual slot, so neither branch needs a
         // placeholder, which could not be invented for that type, and the condition is split.
+        let program = refined_vector_condition_program();
+        let vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
         let outer = TracingContext::<TestIrValue, TestIrOperation>::new();
         let evaluation = program
             .partially_evaluate_in_context(
@@ -10170,8 +10175,11 @@ mod tests {
         );
         assert_eq!(evaluation.program.output_types(), vec![vector_type]);
         for (predicate, expected) in [(true, vec![11.0, 24.0, 39.0]), (false, vec![11.0, 22.0, 33.0])] {
-            let mut arguments = arguments.to_vec();
-            arguments[0] = array(Array::scalar(predicate).unwrap());
+            let arguments = vec![
+                array(Array::scalar(predicate).unwrap()),
+                array(Array::vector(vec![1.0, 2.0, 3.0]).unwrap()),
+                array(Array::vector(vec![10.0, 20.0, 30.0]).unwrap()),
+            ];
             assert_eq!(
                 interpret_known_side_and_residual(&known_program, &evaluation, arguments, 2),
                 Ok(vec![array(Array::vector(expected).unwrap())]),

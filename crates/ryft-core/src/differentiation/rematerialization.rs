@@ -1498,7 +1498,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
-    use crate::macros::checks;
+    use crate::macros::{check_gradient, checks};
     use crate::operations::{
         Add, AxisIndex, Broadcast, COMPOSITE_OPERATION_NAME, Compare, ComparisonDirection, Condition,
         ConvertElementType, Cos, DimensionSizeOperation, Dot, DotDimensionNumbers, Exp, Mul, MulOperation, Reduce,
@@ -1617,17 +1617,33 @@ mod tests {
         policy.lift::<ArrayIrType>().classify(&ResidualCandidate::new(vec![producer], dimension_type))
     }
 
+    /// All-known region with which [`compact_expansion`] computes the expansion `e` of a compact value.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CompactExpansionRegion {
+        /// Condition over the sign of `sum(w)` that returns `e` or `e + e`.
+        Condition,
+
+        /// Scan over the rows `u_k` of `us` that adds the expansion of `w · u_k` to a carry that starts from
+        /// `broadcast(sum(u))`.
+        Scan,
+
+        /// [`Scan`](Self::Scan) with a [`Condition`](Self::Condition) over the sign of `sum(u_k)` in its body.
+        NestedScan,
+
+        /// [`NestedScan`](Self::NestedScan) with a carry that starts from `x` and becomes `sin(h) + e_k` on every
+        /// iteration, so that the residual work of differentiating `x` reads the carry of every iteration rather than
+        /// only the output of an all-known region.
+        CarriedScan,
+
+        /// Call of a composite that computes `e` from `w` and `u`.
+        Composite,
+    }
+
     /// Evaluates `f(x, w, u, us) = sum(x ⊙ e)`, a small version of the workload of gate G1 in
     /// `plan_rematerialization_jax_parity.md`, where only `x` is differentiated and an all-known `region` computes the
-    /// compact value `c = tag(w · u, "compact")` of type `f64[4, 1]` and expands it into `e: f64[4, 8]`. A `condition`
-    /// over the sign of `sum(w)` returns `e` or `e + e`, and a `scan` over the rows `u_k` of `us` adds the expansion
-    /// of `w · u_k` to a carry that starts from `broadcast(sum(u))`. A `nested` region is that `scan` with the
-    /// `condition` over the sign of `sum(u_k)` in its body, and a `composite` region is a call of a composite that
-    /// computes `e` from `w` and `u`. A `carried` region is that `nested` scan with a carry that starts from `x` and
-    /// becomes `sin(h) + e_k` on every iteration, so that the residual work of differentiating `x` reads the carry of
-    /// every iteration rather than only the output of an all-known region.
+    /// compact value `c = tag(w · u, "compact")` of type `f64[4, 1]` and expands it into `e: f64[4, 8]`.
     fn compact_expansion(
-        region: &str,
+        region: CompactExpansionRegion,
         (x, w, u, us): (TestTracer, TestTracer, TestTracer, TestTracer),
     ) -> Result<TestTracer, ProgramError> {
         fn expand<V: Dot + Tag + Broadcast + Typed<Type = ArrayType>>(w: V, u: V) -> Result<V, ProgramError> {
@@ -1636,7 +1652,7 @@ mod tests {
         }
 
         let (w, u, us) = (w.stop_gradient()?, u.stop_gradient()?, us.stop_gradient()?);
-        let e = if region == "condition" {
+        let e = if region == CompactExpansionRegion::Condition {
             let total = w.reduce(&[0, 1], ReductionKind::Sum)?;
             let predicate = total.compare(&total.zero_like()?, ComparisonDirection::GreaterThan)?;
             predicate.condition(
@@ -1647,11 +1663,11 @@ mod tests {
                 },
                 (w, u),
             )?
-        } else if region == "composite" {
+        } else if region == CompactExpansionRegion::Composite {
             composite(|(w, u): (TestTracer, TestTracer)| expand(w, u)).call((w, u))?
         } else {
-            let carried = region == "carried";
-            let nested = carried || region == "nested";
+            let carried = region == CompactExpansionRegion::CarriedScan;
+            let nested = carried || region == CompactExpansionRegion::NestedScan;
             let initial = if carried {
                 x.clone()
             } else {
@@ -1683,6 +1699,38 @@ mod tests {
             e
         };
         Ok(x.mul(&e)?.reduce(&[0, 1], ReductionKind::Sum)?)
+    }
+
+    /// Asserts that [`compact_expansion`] over `region`, rematerialized with `policy`, saves the `expected` residuals
+    /// and computes the gradient with respect to `x` that finite differences estimate.
+    #[track_caller]
+    fn assert_compact_expansion_residuals<P: 'static + Clone + ResidualPolicy<ArrayType>>(
+        region: CompactExpansionRegion,
+        policy: P,
+        expected: Vec<SavedResidual<ArrayType>>,
+    ) {
+        let types = (
+            ArrayType::new_static(DataType::F64, [4, 8]),
+            ArrayType::new_static(DataType::F64, [4, 3]),
+            ArrayType::new_static(DataType::F64, [3, 1]),
+            ArrayType::new_static(DataType::F64, [2, 3, 1]),
+        );
+        let array = |r#type: &ArrayType, scale: f64| {
+            let count = r#type.element_count().unwrap().unwrap();
+            let values = (0..count).map(|index| (index as f64 - 2.0) * scale).flat_map(f64::to_ne_bytes);
+            Array::new(r#type.clone(), values.collect()).unwrap()
+        };
+        let (x, w, u, us) = (array(&types.0, 0.25), array(&types.1, 0.5), array(&types.2, 1.5), array(&types.3, 0.75));
+        let function = rematerialize(move |inputs| compact_expansion(region, inputs)).with_policy(policy);
+        assert_eq!(saved_residuals(|inputs| function.call(inputs), types.clone()), Ok(expected));
+        let (_, program) =
+            TracingContext::<Array, ArrayOperation<Array>>::trace(|inputs| compact_expansion(region, inputs), types)
+                .unwrap();
+        let gradient = differentiate_at((x.clone(), w.clone(), u.clone(), us.clone()))
+            .gradient(|inputs| function.call(inputs))
+            .unwrap();
+        let evaluate = |x: Array| program.interpret((x, w.clone(), u.clone(), us.clone()));
+        checks::check_gradient(gradient.0, &evaluate, x.clone(), 1e-6, 1e-6);
     }
 
     #[test]
@@ -2338,114 +2386,110 @@ mod tests {
         // In `compact_expansion`, the residual work of differentiating `x` needs only `e`, the output of an all-known
         // region. Under policies that save the compact value, replaying the region whole would recompute that value, so
         // the region is split on residual demand and its compact interior values are saved instead of `e`, as JAX does.
-        // The condition saves the compact value of the branch that runs, together with `w`, from which the residual
-        // program recomputes the predicate, and the scan saves the compact values of its two iterations, together with
-        // `u`, from which the residual program recomputes the initial carry. The saved interior values are outputs of
-        // the known part of the split region, which is how they are reported, as in JAX. Saving nothing recomputes the
-        // whole region from the inputs, and every policy computes the gradient that finite differences estimate.
-        //
-        // A condition nested in the scan is split too while the residual program recomputes the carry of the scan
-        // (refer to `ResidualPlacement::plan_recomputation`), so the known scan stacks the compact values of the
-        // branches that run instead of the expanded outputs of the condition, and the residual program recomputes the
-        // predicates from the saved `us`, as JAX does. The same holds when the residual work reads the carry of every
-        // iteration (i.e., for the `carried` scan, whose carry starts from `x`), where the residual program recomputes
-        // those carries from `x` and the saved values. A composite call is instead one opaque producer, which neither
-        // policy saves, so it is replayed whole from `w` and `u`, recomputing its compact value, as JAX replays
-        // `custom_jvp_call` and `custom_vjp_call`.
-        let types = (
-            ArrayType::new_static(DataType::F64, [4, 8]),
-            ArrayType::new_static(DataType::F64, [4, 3]),
-            ArrayType::new_static(DataType::F64, [3, 1]),
-            ArrayType::new_static(DataType::F64, [2, 3, 1]),
-        );
-        let array = |r#type: &ArrayType, scale: f64| {
-            let count = r#type.element_count().unwrap().unwrap();
-            let values = (0..count).map(|index| (index as f64 - 2.0) * scale).flat_map(f64::to_ne_bytes);
-            Array::new(r#type.clone(), values.collect()).unwrap()
-        };
-        let (x, w, u, us) = (array(&types.0, 0.25), array(&types.1, 0.5), array(&types.2, 1.5), array(&types.3, 0.75));
+        // The saved interior values are outputs of the known part of the split region, which is how they are reported,
+        // as in JAX. Saving nothing recomputes the whole region from the inputs. Offloading the compact values stores
+        // them through a storage, which the carry recomputation restores on every iteration. Every policy computes the
+        // gradient that finite differences estimate.
         let host = Memory::Host { pinned: true };
         let saved = |shape: &[usize], source: ResidualSource| {
             SavedResidual::new(ArrayType::new_static(DataType::F64, shape.to_vec()), source)
         };
+        let offloaded = |shape: &[usize], source: ResidualSource| {
+            SavedResidual::new(ArrayType::new_static(DataType::F64, shape.to_vec()).with_memory(host), source)
+        };
         let input = |index: usize| ResidualSource::Input { index };
         let operation = |name: &'static str| ResidualSource::Operation { name };
-        for (region, saved_compact_values) in [
-            ("condition", vec![saved(&[4, 3], input(1)), saved(&[4, 1], operation("condition"))]),
-            ("scan", vec![saved(&[3, 1], input(2)), saved(&[2, 4, 1], operation("scan"))]),
-            (
-                "nested",
-                vec![saved(&[3, 1], input(2)), saved(&[2, 3, 1], input(3)), saved(&[2, 4, 1], operation("scan"))],
-            ),
-            (
-                "carried",
-                vec![saved(&[4, 8], input(0)), saved(&[2, 4, 1], operation("scan")), saved(&[2, 3, 1], input(3))],
-            ),
-            ("composite", vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2))]),
-        ] {
-            let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
-                |inputs| compact_expansion(region, inputs),
-                types.clone(),
-            )
-            .unwrap();
-            let evaluate = |x: Array| program.interpret((x, w.clone(), u.clone(), us.clone()));
-            macro_rules! check {
-                ($policy:expr, $expected:expr $(,)?) => {{
-                    let function = rematerialize(move |inputs| compact_expansion(region, inputs)).with_policy($policy);
-                    let residuals = saved_residuals(|inputs| function.call(inputs), types.clone());
-                    assert_eq!(residuals, Ok($expected), "region `{region}`");
-                    let gradient = differentiate_at((x.clone(), w.clone(), u.clone(), us.clone()))
-                        .gradient(|inputs| function.call(inputs))
-                        .unwrap();
-                    checks::check_gradient(gradient.0, &evaluate, x.clone(), 1e-6, 1e-6);
-                }};
-            }
-            check!(DotsSavable, saved_compact_values.clone());
-            check!(SaveOnlyTheseNames::new(["compact"]), saved_compact_values);
-            if region == "composite" {
-                // Policies see the call itself as the producer of its output, which they can save by its name.
-                let policy = RematerializationPolicyFn::new::<ArrayType>(|candidate| {
-                    let saved =
-                        candidate.producers().iter().all(|producer| producer.name() == COMPOSITE_OPERATION_NAME);
-                    let decision =
-                        if saved { ResidualDecision::<NoStorage>::Save } else { ResidualDecision::Recompute };
-                    Ok::<_, ResidualRejection>(decision)
-                });
-                check!(policy, vec![saved(&[4, 8], operation("composite"))]);
-            }
-            let saved_inputs = match region {
-                "condition" | "composite" => vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2))],
-                "carried" => vec![saved(&[4, 8], input(0)), saved(&[4, 3], input(1)), saved(&[2, 3, 1], input(3))],
-                _ => vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2)), saved(&[2, 3, 1], input(3))],
-            };
-            check!(NothingSavable, saved_inputs);
-            // Offloading the compact values stores them through a storage, which the carry recomputation restores on
-            // every iteration. Splitting the `carried` scan again to recompute its final carry reuses the identical
-            // store chain of its existing compact output, so the known scan stacks that stored value once. The name
-            // of the compact value of a composite call is invisible to the policy, so that call is replayed whole.
-            let offloaded = |shape: &[usize], source: ResidualSource| {
-                SavedResidual::new(ArrayType::new_static(DataType::F64, shape.to_vec()).with_memory(host), source)
-            };
-            let saved_offloaded_values = match region {
-                "condition" => vec![saved(&[4, 3], input(1)), offloaded(&[4, 1], operation("condition"))],
-                "scan" => vec![saved(&[3, 1], input(2)), offloaded(&[2, 4, 1], operation("scan"))],
-                "nested" => vec![
-                    saved(&[3, 1], input(2)),
-                    saved(&[2, 3, 1], input(3)),
-                    offloaded(&[2, 4, 1], operation("scan")),
-                ],
-                "carried" => vec![
-                    saved(&[4, 8], input(0)),
-                    saved(&[2, 3, 1], input(3)),
-                    offloaded(&[2, 4, 1], operation("scan")),
-                ],
-                _ => vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2))],
-            };
-            check!(
-                SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["compact"], host).unwrap(),
-                saved_offloaded_values
-            );
-        }
+        let save_compact = || SaveOnlyTheseNames::new(["compact"]);
+        let offload_compact = || SaveAndOffloadOnlyTheseNames::new(Vec::<String>::new(), ["compact"], host).unwrap();
+
+        // The condition saves the compact value of the branch that runs, together with `w`, from which the residual
+        // program recomputes the predicate.
+        let region = CompactExpansionRegion::Condition;
+        let compact = vec![saved(&[4, 3], input(1)), saved(&[4, 1], operation("condition"))];
+        assert_compact_expansion_residuals(region, DotsSavable, compact.clone());
+        assert_compact_expansion_residuals(region, save_compact(), compact);
+        assert_compact_expansion_residuals(
+            region,
+            NothingSavable,
+            vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2))],
+        );
+        assert_compact_expansion_residuals(
+            region,
+            offload_compact(),
+            vec![saved(&[4, 3], input(1)), offloaded(&[4, 1], operation("condition"))],
+        );
+
+        // The scan saves the compact values of its two iterations, together with `u`, from which the residual program
+        // recomputes the initial carry.
+        let region = CompactExpansionRegion::Scan;
+        let compact = vec![saved(&[3, 1], input(2)), saved(&[2, 4, 1], operation("scan"))];
+        assert_compact_expansion_residuals(region, DotsSavable, compact.clone());
+        assert_compact_expansion_residuals(region, save_compact(), compact);
+        assert_compact_expansion_residuals(
+            region,
+            NothingSavable,
+            vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2)), saved(&[2, 3, 1], input(3))],
+        );
+        assert_compact_expansion_residuals(
+            region,
+            offload_compact(),
+            vec![saved(&[3, 1], input(2)), offloaded(&[2, 4, 1], operation("scan"))],
+        );
+
+        // A condition nested in the scan is split too while the residual program recomputes the carry of the scan
+        // (refer to `ResidualPlacement::plan_recomputation`), so the known scan stacks the compact values of the
+        // branches that run instead of the expanded outputs of the condition, and the residual program recomputes the
+        // predicates from the saved `us`, as JAX does.
+        let region = CompactExpansionRegion::NestedScan;
+        let compact = vec![saved(&[3, 1], input(2)), saved(&[2, 3, 1], input(3)), saved(&[2, 4, 1], operation("scan"))];
+        assert_compact_expansion_residuals(region, DotsSavable, compact.clone());
+        assert_compact_expansion_residuals(region, save_compact(), compact);
+        assert_compact_expansion_residuals(
+            region,
+            NothingSavable,
+            vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2)), saved(&[2, 3, 1], input(3))],
+        );
+        assert_compact_expansion_residuals(
+            region,
+            offload_compact(),
+            vec![saved(&[3, 1], input(2)), saved(&[2, 3, 1], input(3)), offloaded(&[2, 4, 1], operation("scan"))],
+        );
+
+        // The same holds when the residual work reads the carry of every iteration (i.e., when the carry starts from
+        // `x`), where the residual program recomputes those carries from `x` and the saved values. Splitting that scan
+        // again to recompute its final carry reuses the identical store chain of its existing compact output, so the
+        // known scan stacks an offloaded value once.
+        let region = CompactExpansionRegion::CarriedScan;
+        let compact = vec![saved(&[4, 8], input(0)), saved(&[2, 4, 1], operation("scan")), saved(&[2, 3, 1], input(3))];
+        assert_compact_expansion_residuals(region, DotsSavable, compact.clone());
+        assert_compact_expansion_residuals(region, save_compact(), compact);
+        assert_compact_expansion_residuals(
+            region,
+            NothingSavable,
+            vec![saved(&[4, 8], input(0)), saved(&[4, 3], input(1)), saved(&[2, 3, 1], input(3))],
+        );
+        assert_compact_expansion_residuals(
+            region,
+            offload_compact(),
+            vec![saved(&[4, 8], input(0)), saved(&[2, 3, 1], input(3)), offloaded(&[2, 4, 1], operation("scan"))],
+        );
+
+        // A composite call is instead one opaque producer, which neither policy saves, so it is replayed whole from `w`
+        // and `u`, recomputing its compact value, as JAX replays `custom_jvp_call` and `custom_vjp_call`. The name of
+        // its compact value is invisible to policies, which see the call itself as the producer of its output and can
+        // save that output by the name of the call.
+        let region = CompactExpansionRegion::Composite;
+        let inputs = vec![saved(&[4, 3], input(1)), saved(&[3, 1], input(2))];
+        assert_compact_expansion_residuals(region, DotsSavable, inputs.clone());
+        assert_compact_expansion_residuals(region, save_compact(), inputs.clone());
+        assert_compact_expansion_residuals(region, NothingSavable, inputs.clone());
+        assert_compact_expansion_residuals(region, offload_compact(), inputs);
+        let save_composite_calls = RematerializationPolicyFn::new::<ArrayType>(|candidate| {
+            let saved = candidate.producers().iter().all(|producer| producer.name() == COMPOSITE_OPERATION_NAME);
+            let decision = if saved { ResidualDecision::<NoStorage>::Save } else { ResidualDecision::Recompute };
+            Ok::<_, ResidualRejection>(decision)
+        });
+        assert_compact_expansion_residuals(region, save_composite_calls, vec![saved(&[4, 8], operation("composite"))]);
     }
 
     #[test]
@@ -2463,16 +2507,17 @@ mod tests {
         assert_eq!(
             saved_residuals(|inputs| rematerialized.call(inputs), types.clone()),
             Ok(vec![
-                SavedResidual::new(types.0.clone(), ResidualSource::Input { index: 0 }),
-                SavedResidual::new(types.1.clone().with_memory(host), ResidualSource::Operation { name: "scan" }),
+                SavedResidual::new(types.0, ResidualSource::Input { index: 0 }),
+                SavedResidual::new(types.1.with_memory(host), ResidualSource::Operation { name: "scan" }),
             ]),
         );
-        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(function, types).unwrap();
-        let h = Array::scalar(0.5f64).unwrap();
-        let xs = Array::vector(vec![0.1f64, -0.2, 0.3]).unwrap();
-        let gradient =
-            differentiate_at((h.clone(), xs.clone())).gradient(|inputs| rematerialized.call(inputs)).unwrap();
-        checks::check_gradient(gradient.0, &|h| program.interpret((h, xs.clone())), h, 1e-6, 1e-6);
+        check_gradient!(
+            |h, xs| rematerialized.call((h, xs)),
+            at = Array::scalar(0.5f64).unwrap(),
+            with = Array::vector(vec![0.1f64, -0.2, 0.3]).unwrap(),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
     }
 
     #[test]
@@ -2482,9 +2527,7 @@ mod tests {
         // carries from the initial carry `h`, as JAX does. The carry chain of the outer `nested` scan splits the inner
         // scan on residual demand (refer to `ResidualPlacement::plan_recomputation`), so it neither stacks the final
         // carries of the inner scan nor saves the carries that it recomputes, and it saves `h`, `xs`, and the dot
-        // products, as JAX does. A scan without iterations saves its empty stacks rather than `h`, which none of its
-        // iterations reads, where JAX saves `h` and one empty stack. Every policy computes the gradient that finite
-        // differences estimate.
+        // products, as JAX does.
         fn step<V: Dot + Sin + Add>(h: V, x: V) -> Result<V, ProgramError> {
             let t = h.dot(&x, &DotDimensionNumbers::new(vec![], vec![], vec![], vec![]))?;
             t.sin()?.add(&h)
@@ -2499,49 +2542,46 @@ mod tests {
             Ok(scan(row, h, xs, ScanOptions::new())?.0)
         }
 
+        let scalar_type = ArrayType::scalar(DataType::F64);
         let saved = |shape: &[usize], source: ResidualSource| {
             SavedResidual::new(ArrayType::new_static(DataType::F64, shape.to_vec()), source)
         };
         let (h, xs) = (ResidualSource::Input { index: 0 }, ResidualSource::Input { index: 1 });
         let dots = ResidualSource::Operation { name: "scan" };
-        let cases = [
-            (single as fn(_) -> _, vec![0.25f64, -1.5, 2.0], vec![3]),
-            (nested as fn(_) -> _, vec![0.25f64, -1.5, 2.0, 1.0, 0.5, -0.75], vec![2, 3]),
-            (single as fn(_) -> _, Vec::new(), vec![0]),
-        ];
-        for (function, elements, shape) in cases {
-            let (saved_dots, saved_inputs) = if shape == [0] {
-                (
-                    vec![saved(&shape, xs.clone()), saved(&shape, dots.clone()), saved(&shape, dots.clone())],
-                    vec![saved(&shape, xs.clone()), saved(&shape, dots.clone())],
-                )
-            } else {
-                (
-                    vec![saved(&shape, xs.clone()), saved(&shape, dots.clone()), saved(&[], h.clone())],
-                    vec![saved(&shape, xs.clone()), saved(&[], h.clone())],
-                )
-            };
-            let xs_type = ArrayType::new_static(DataType::F64, shape.clone());
-            let xs_value =
-                Array::new(xs_type.clone(), elements.into_iter().flat_map(f64::to_ne_bytes).collect()).unwrap();
-            let h_value = Array::scalar(0.5f64).unwrap();
-            let types = (ArrayType::scalar(DataType::F64), xs_type);
-            let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(function, types.clone()).unwrap();
-            let evaluate = |h: Array| program.interpret((h, xs_value.clone()));
-            macro_rules! check {
-                ($policy:expr, $expected:expr $(,)?) => {{
-                    let function = rematerialize(function).with_policy($policy);
-                    let residuals = saved_residuals(|inputs| function.call(inputs), types.clone());
-                    assert_eq!(residuals, Ok($expected), "scan over `{shape:?}`");
-                    let gradient = differentiate_at((h_value.clone(), xs_value.clone()))
-                        .gradient(|inputs| function.call(inputs))
-                        .unwrap();
-                    checks::check_gradient(gradient.0, &evaluate, h_value.clone(), 1e-6, 1e-6);
-                }};
-            }
-            check!(DotsSavable, saved_dots);
-            check!(NothingSavable, saved_inputs);
-        }
+        let single_saving_dots = rematerialize(single).with_policy(DotsSavable);
+        let single_saving_nothing = rematerialize(single).with_policy(NothingSavable);
+        let types = (scalar_type.clone(), ArrayType::new_static(DataType::F64, [3]));
+        assert_eq!(
+            saved_residuals(|inputs| single_saving_dots.call(inputs), types.clone()),
+            Ok(vec![saved(&[3], xs.clone()), saved(&[3], dots.clone()), saved(&[], h.clone())]),
+        );
+        assert_eq!(
+            saved_residuals(|inputs| single_saving_nothing.call(inputs), types),
+            Ok(vec![saved(&[3], xs.clone()), saved(&[], h.clone())]),
+        );
+        let nested_saving_dots = rematerialize(nested).with_policy(DotsSavable);
+        let nested_saving_nothing = rematerialize(nested).with_policy(NothingSavable);
+        let types = (scalar_type.clone(), ArrayType::new_static(DataType::F64, [2, 3]));
+        assert_eq!(
+            saved_residuals(|inputs| nested_saving_dots.call(inputs), types.clone()),
+            Ok(vec![saved(&[2, 3], xs.clone()), saved(&[2, 3], dots.clone()), saved(&[], h.clone())]),
+        );
+        assert_eq!(
+            saved_residuals(|inputs| nested_saving_nothing.call(inputs), types),
+            Ok(vec![saved(&[2, 3], xs.clone()), saved(&[], h)]),
+        );
+
+        // A scan without iterations saves its empty stacks rather than `h`, which none of its iterations reads, where
+        // JAX saves `h` and one empty stack.
+        let types = (scalar_type, ArrayType::new_static(DataType::F64, [0]));
+        assert_eq!(
+            saved_residuals(|inputs| single_saving_dots.call(inputs), types.clone()),
+            Ok(vec![saved(&[0], xs.clone()), saved(&[0], dots.clone()), saved(&[0], dots.clone())]),
+        );
+        assert_eq!(
+            saved_residuals(|inputs| single_saving_nothing.call(inputs), types),
+            Ok(vec![saved(&[0], xs), saved(&[0], dots)]),
+        );
     }
 
     #[test]
