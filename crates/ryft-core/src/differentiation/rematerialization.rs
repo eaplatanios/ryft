@@ -103,8 +103,7 @@
 //! ## Custom Policies
 //!
 //! [`RematerializationPolicyFn`] defines a policy through a closure that classifies each candidate residual (e.g., by
-//! the payloads of the operations that may produce it; refer to
-//! [`ResidualProducer::payload`](crate::ResidualProducer::payload)):
+//! the payloads of the operations that may produce it; refer to [`ResidualProducer::payload`]):
 //!
 //! ```rust
 //! # use ryft_core::{
@@ -135,6 +134,63 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! A policy that deserves a name of its own (e.g., one that other crates reuse) implements [`ResidualPolicy`] for the
+//! type universe that it classifies. The trait is all that a policy needs, so crates that depend on Ryft can define
+//! policies for their own operations in the same way, recognizing them by payload type or by
+//! [name](ResidualProducer::name). A policy must be [`Clone`] for [`RematerializedFunction::call`] to stage
+//! it, and a policy that offloads the values that it saves sets [`ResidualPolicy::Storage`] to its [`ResidualStorage`]
+//! and returns [`ResidualDecision::SaveWith`]. Policies decide which values are saved and how they are stored. Where
+//! the saved values are computed and how regions are split around them is decided by the planner (refer to
+//! [`with_residual_policy`](crate::PartitionedProgram::with_residual_policy)), which policies cannot change:
+//!
+//! ```rust
+//! # use ryft_core::{
+//! #     Array, ArrayOperation, ArrayType, DataType, NoStorage, ProgramError, ResidualCandidate, ResidualDecision,
+//! #     ResidualPolicy, ResidualRejection, ResidualSource, SavedResidual, Sin, SinOperation, TracingContext,
+//! #     rematerialize, saved_residuals,
+//! # };
+//! # fn main() -> Result<(), ProgramError> {
+//! # type Tracer = ryft_core::Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+//!
+//! /// Saves the sines and recomputes everything else.
+//! #[derive(Clone, Copy)]
+//! struct SaveSines;
+//!
+//! impl ResidualPolicy<ArrayType> for SaveSines {
+//!     type Storage = NoStorage;
+//!
+//!     fn name(&self) -> &str {
+//!         "save_sines"
+//!     }
+//!
+//!     fn classify(
+//!         &self,
+//!         candidate: &ResidualCandidate<'_, ArrayType>,
+//!     ) -> Result<ResidualDecision<NoStorage>, ResidualRejection> {
+//!         let producers = candidate.producers();
+//!         let saved = producers.iter().any(|producer| producer.payload::<SinOperation<ArrayType>>().is_some());
+//!         Ok(if saved { ResidualDecision::Save } else { ResidualDecision::Recompute })
+//!     }
+//! }
+//!
+//! let function = rematerialize(|x: Tracer| Ok(x.sin()?.sin()?)).with_policy(SaveSines);
+//! let scalar_type = ArrayType::scalar(DataType::F64);
+//! assert_eq!(
+//!     saved_residuals(|x: Tracer| function.call(x), scalar_type.clone())?,
+//!     vec![
+//!         SavedResidual::new(scalar_type.clone(), ResidualSource::Input { index: 0 }),
+//!         SavedResidual::new(scalar_type, ResidualSource::Operation { name: "sin" }),
+//!     ],
+//! );
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Such a policy classifies candidates of other type universes (e.g., [`ArrayIrType`]) by projecting their types into
+//! its own, and cannot classify candidates whose types do not project (e.g., dimensions). A policy that should work
+//! natively in several universes declares them through [`ResidualPolicy::native_instantiations`], as the built-in
+//! policies do,
 //!
 //! An already registered policy can be installed with [`RematerializedFunction::with_policy_reference`],
 //! preserving its identity and any [native instantiations](ResidualPolicyReference::with_native_instantiation) or

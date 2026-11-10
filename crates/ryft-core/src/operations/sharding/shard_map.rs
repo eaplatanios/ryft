@@ -3243,8 +3243,6 @@ impl Default for ShardMapOptions {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Context construction capability for a [`ShardMapOperation`], which runs a local body once per device of a manual
 /// SPMD computation over a mesh. This is the Ryft analogue of JAX's
 /// [`jax.shard_map`](https://docs.jax.dev/en/latest/_autosummary/jax.shard_map.html). The computation is bound in this
@@ -3352,11 +3350,11 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
     /// [`ShardMapOperation::from_program`] for the traced body (e.g., [`ShardMapError::OrderedIoNotSupported`]), and
     /// [`ShardMapError::Program`] when `function`, tracing the body, or binding the operation fails (e.g., when an
     /// input does not belong to this context, which binding validates where the context tracks value ownership).
-    fn shard_map<F, Input, Output>(
+    fn shard_map<Input, Output, F, M>(
         &self,
         function: F,
         inputs: Input,
-        mesh: impl Into<Option<LogicalMesh>>,
+        mesh: M,
         input_shardings: Input::To<Sharding>,
         output_shardings: Output::To<Sharding>,
         options: ShardMapOptions,
@@ -3371,7 +3369,8 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
         F: FnOnce(
             &ProjectedContext<DomainTracingContext<Self>, ArrayType>,
             Input::To<ProjectedValue<ArrayType, DomainTracer<Self>>>,
-        ) -> Result<Output, ProgramError>;
+        ) -> Result<Output, ProgramError>,
+        M: Into<Option<LogicalMesh>>;
 
     /// Like [`Self::shard_map`], but uses the sharding of each input's type as its input sharding (i.e., JAX's default
     /// `in_specs=Infer`). The type's sharding is re-expressed over `mesh`, whose axes it must share up to their types,
@@ -3385,11 +3384,11 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
     /// JAX's requirement that the manual axes be `Explicit` for the caller), [`ShardMapError::InputMeshMismatch`] for
     /// an input sharded over a mesh whose axes differ from those of `mesh`, and the errors of [`Self::shard_map`]
     /// otherwise.
-    fn shard_map_with_inferred_input_shardings<F, Input, Output>(
+    fn shard_map_with_inferred_input_shardings<Input, Output, F, M>(
         &self,
         function: F,
         inputs: Input,
-        mesh: impl Into<Option<LogicalMesh>>,
+        mesh: M,
         output_shardings: Output::To<Sharding>,
         options: ShardMapOptions,
     ) -> Result<Output::To<<Self::Value as ValueProjection<ArrayType>>::Projected>, ShardMapError>
@@ -3404,6 +3403,7 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
             &ProjectedContext<DomainTracingContext<Self>, ArrayType>,
             Input::To<ProjectedValue<ArrayType, DomainTracer<Self>>>,
         ) -> Result<Output, ProgramError>,
+        M: Into<Option<LogicalMesh>>,
     {
         let mesh = resolve_shard_map_mesh(self, mesh.into())?;
         let input_shardings = inputs
@@ -3441,8 +3441,8 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
     /// replicating every other dimension and every input or output whose axis is [`None`]. This is the analogue of
     /// [`jax.smap`](https://docs.jax.dev/en/latest/_autosummary/jax.smap.html), whose `in_axes` and `out_axes` it
     /// takes as `input_axes` and `output_axes` and whose manual variation it always checks. Like JAX's `smap`, it uses
-    /// the mesh of the innermost enclosing manual region when `mesh` is [`None`]. The output shardings are derived from the output types of the traced
-    /// body, whose ranks are only known once it is traced.
+    /// the mesh of the innermost enclosing manual region when `mesh` is [`None`]. The output shardings are derived from
+    /// the output types of the traced body, whose ranks are only known once it is traced.
     ///
     /// # Errors
     ///
@@ -3450,11 +3450,11 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
     /// `function` do not have the structure of `output_axes`, [`ShardMapError::MappedAxisOutOfBounds`] for an axis
     /// that the rank of its input or output does not have, and the errors of [`Self::shard_map`] otherwise (e.g.,
     /// [`ShardMapError::Sharding`] when `axis_name` is not a manual axis of `mesh`).
-    fn shard_map_along<F, Input, Output>(
+    fn shard_map_along<Input, Output, F, M>(
         &self,
         function: F,
         inputs: Input,
-        mesh: impl Into<Option<LogicalMesh>>,
+        mesh: M,
         axis_name: &str,
         input_axes: Input::To<Option<usize>>,
         output_axes: Output::To<Option<usize>>,
@@ -3469,8 +3469,11 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
         F: FnOnce(
             &ProjectedContext<DomainTracingContext<Self>, ArrayType>,
             Input::To<ProjectedValue<ArrayType, DomainTracer<Self>>>,
-        ) -> Result<Output, ProgramError>;
+        ) -> Result<Output, ProgramError>,
+        M: Into<Option<LogicalMesh>>;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<C> ShardMap for C
 where
@@ -3482,11 +3485,11 @@ where
     C::Value: ValueProjection<ArrayType, Projected: Parameter>,
     ProjectedValue<ArrayType, DomainTracer<C>>: ParallelVary,
 {
-    fn shard_map<F, Input, Output>(
+    fn shard_map<Input, Output, F, M>(
         &self,
         function: F,
         inputs: Input,
-        mesh: impl Into<Option<LogicalMesh>>,
+        mesh: M,
         input_shardings: Input::To<Sharding>,
         output_shardings: Output::To<Sharding>,
         options: ShardMapOptions,
@@ -3502,6 +3505,7 @@ where
             &ProjectedContext<DomainTracingContext<Self>, ArrayType>,
             Input::To<ProjectedValue<ArrayType, DomainTracer<Self>>>,
         ) -> Result<Output, ProgramError>,
+        M: Into<Option<LogicalMesh>>,
     {
         let mesh = resolve_shard_map_mesh(self, mesh.into())?;
         validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
@@ -3522,11 +3526,11 @@ where
         )
     }
 
-    fn shard_map_along<F, Input, Output>(
+    fn shard_map_along<Input, Output, F, M>(
         &self,
         function: F,
         inputs: Input,
-        mesh: impl Into<Option<LogicalMesh>>,
+        mesh: M,
         axis_name: &str,
         input_axes: Input::To<Option<usize>>,
         output_axes: Output::To<Option<usize>>,
@@ -3542,6 +3546,7 @@ where
             &ProjectedContext<DomainTracingContext<Self>, ArrayType>,
             Input::To<ProjectedValue<ArrayType, DomainTracer<Self>>>,
         ) -> Result<Output, ProgramError>,
+        M: Into<Option<LogicalMesh>>,
     {
         let mesh = resolve_shard_map_mesh(self, mesh.into())?;
         validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_axes)?;
