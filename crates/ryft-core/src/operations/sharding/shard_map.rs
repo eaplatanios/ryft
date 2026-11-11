@@ -5811,8 +5811,6 @@ fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns the offset of the block that the device at `coordinates` holds, along every dimension of a boundary value
 /// placed by `sharding`. Along a dimension sharded over active manual axes (which precede every free axis of that
 /// dimension), the offset is the row-major partition index over those axes scaled by the local extent `local_shape`
@@ -5873,11 +5871,13 @@ fn assemble_global_value(
             None => tiles.push((offsets, vec![value])),
         }
     }
+
     // Every tile has the local shape that the boundary derives, so every contribution must have it.
     validate_participant_types(
         SHARD_MAP_OPERATION_NAME,
         &tiles.iter().flat_map(|(_, summands)| summands.iter().copied()).collect::<Vec<_>>(),
     )?;
+
     let mut output = Array::uninitialized(global_type.clone())?;
     for (offsets, summands) in tiles {
         let tile = if summands.len() == 1 {
@@ -5887,8 +5887,11 @@ fn assemble_global_value(
         };
         output = output.replace_block(&tile, &offsets);
     }
+
     Ok(output)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the positions of the axes of `grid` along which `sharding` tiles a value.
 fn tiled_grid_axes(sharding: &Sharding, grid: &LockstepDeviceGrid) -> Vec<usize> {
@@ -24200,6 +24203,107 @@ mod tests {
             Ok(vec![ArrayIrValue::Reference(destination.clone())]),
         );
         assert_eq!(destination.read(), Ok(Array::scalar(12f32).unwrap()));
+    }
+
+    #[test]
+    fn test_shard_map_transposition_selects_local_accumulator_destinations() {
+        // The body forwards its three inputs, so each input cotangent is its output cotangent. A `Reference`
+        // destination accumulates locally (i.e., in a fresh reference inside the transposed body, whose frozen value
+        // is added into the caller's destination once outside the map) only when some manual axis replicates the
+        // input. That holds for the input sharded along `x` only and for the replicated one, while the destination of
+        // the input sharded along both manual axes crosses the transposed boundary by identity.
+        let mesh = manual_mesh_2x2();
+        let x_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let xy_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        let replicated_sharding = Sharding::replicated(mesh.clone(), 1);
+        let shardings = vec![x_sharding.clone(), xy_sharding.clone(), replicated_sharding.clone()];
+        let boundary = ShardMapBoundary::new(mesh, shardings.clone(), shardings, Vec::new()).unwrap();
+        let x_type = f32_vector_type(4).with_sharding(x_sharding.clone()).unwrap();
+        let xy_type = f32_vector_type(4).with_sharding(xy_sharding.clone()).unwrap();
+        let replicated_type = f32_vector_type(4).with_sharding(replicated_sharding.clone()).unwrap();
+        let x_local_type = boundary.local_input_type(0, &f32_vector_type(4)).unwrap();
+        let xy_local_type = boundary.local_input_type(1, &f32_vector_type(4)).unwrap();
+        let local_types = (0..3)
+            .map(|index| ArrayIrType::Array(boundary.local_input_type(index, &f32_vector_type(4)).unwrap()))
+            .collect();
+        let body = build_program(local_types, |_, inputs| inputs.to_vec());
+        let program = caller_typed_shard_map_program(body, vec![f32_vector_type(4).into(); 3], boundary);
+        let transposed =
+            program.transpose_with_respect_to(&[0, 1, 2], &[CotangentDestinationKind::Reference; 3]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            formatdoc! {"
+            lambda %0:{x_type}, %1:{xy_type}, %2:{replicated_type}, %3:ref<f32[4]>, %4:ref<f32[4]>, \
+                %5:ref<f32[4]> .
+                let %6:{x_type}, %7:{replicated_type} = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                    input_shardings=[{x_sharding}, {xy_sharding}, {replicated_sharding}, {xy_sharding}],
+                    output_shardings=[{x_sharding}, {replicated_sharding}],
+                    manual_axes=['x', 'y'],
+                    global_input_types=[{x_type}, {xy_type}, {replicated_type}, ref<{xy_type}>],
+                    global_output_types=[{x_type}, {replicated_type}],
+                ] %0 %1 %2 %4 [
+                    body={{
+                        lambda %0:{x_local_type}, %1:{xy_local_type}, %2:{replicated_type}, %3:ref<{xy_local_type}> .
+                        let %4:{x_local_type} = zero [
+                            type={x_local_type},
+                        ]
+                            %5:ref<{x_local_type}> = reference_new %4
+                            () = reference_add_update %5 %0
+                            () = reference_add_update %3 %1
+                            %6:{replicated_type} = zero [type={replicated_type}]
+                            %7:ref<{replicated_type}> = reference_new %6
+                            () = reference_add_update %7 %2
+                            %8:{x_local_type} = reference_freeze %5
+                            %9:{replicated_type} = reference_freeze %7
+                        in (%8, %9)
+                    }},
+                ]
+                    %8:f32[4] = broadcast [output_type=f32[4], output_axes=[0]] %6
+                    () = reference_add_update %3 %8
+                    %9:f32[4] = broadcast [output_type=f32[4], output_axes=[0]] %7
+                    () = reference_add_update %5 %9
+                in ()"},
+        );
+
+        // Only `Reference` destinations can accumulate locally. A returned cotangent leaves the map as an output, and
+        // an ignored one has no slot.
+        let transposed = program
+            .transpose_with_respect_to(
+                &[0, 1, 2],
+                &[
+                    CotangentDestinationKind::Return,
+                    CotangentDestinationKind::Ignore,
+                    CotangentDestinationKind::Reference,
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            formatdoc! {"
+                lambda %0:{x_type}, %1:{xy_type}, %2:{replicated_type}, %3:ref<f32[4]> .
+                let %4:{x_type}, %5:{replicated_type} = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                    input_shardings=[{x_sharding}, {xy_sharding}, {replicated_sharding}],
+                    output_shardings=[{x_sharding}, {replicated_sharding}],
+                    manual_axes=['x', 'y'],
+                    global_input_types=[{x_type}, {xy_type}, {replicated_type}],
+                    global_output_types=[{x_type}, {replicated_type}],
+                ] %0 %1 %2 [
+                    body={{
+                        lambda %0:{x_local_type}, %1:{xy_local_type}, %2:{replicated_type} .
+                        let %3:{replicated_type} = zero [type={replicated_type}]
+                            %4:ref<{replicated_type}> = reference_new %3
+                            () = reference_add_update %4 %2
+                            %5:{replicated_type} = reference_freeze %4
+                        in (%0, %5)
+                    }},
+                ]
+                    %6:f32[4] = broadcast [output_type=f32[4], output_axes=[0]] %4
+                    %7:f32[4] = broadcast [output_type=f32[4], output_axes=[0]] %5
+                    () = reference_add_update %3 %7
+                in (%6)"},
+        );
     }
 
     #[test]
