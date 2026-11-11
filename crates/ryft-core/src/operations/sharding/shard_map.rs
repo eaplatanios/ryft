@@ -271,7 +271,7 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
+    CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
     ResidualZeroProvider, TransposableOperation, TransposedProgramCotangent, TranspositionContext, TranspositionDriver,
 };
@@ -2883,13 +2883,176 @@ where
                         device_count,
                     }));
                 }
-                batched_body = slice_gathered_shard_map_outputs(
-                    &batched_body,
-                    sliced_positions.as_slice(),
-                    gathered_axes.as_slice(),
-                    extent,
-                    self.boundary.checks_manual_variation(),
-                )?;
+
+                // The batch is gathered on entry along the gathered axes (refer to `ShardMapBatchPlacement`), so every
+                // output with a batch dimension position in `sliced_positions` is sliced to the block of the batch that
+                // the executing device holds along those axes, so that the output sharding can tile the batch dimension
+                // along them. The batch dimension of extent `extent`, whose blocks have extent `extent / device_count`,
+                // is split into one dimension per gathered axis (in order, with the first one major) followed by the
+                // block dimension, the device's coordinates (i.e., one `axis_index` per gathered axis) select its block
+                // with a `dynamic_slice`, and the block is reshaped back into the batch dimension. In a checked body,
+                // the output first varies along the gathered axes through staged `parallel_vary` transitions, whose
+                // transposes are the cross-device sums that the cotangents of the selected blocks need, and the start
+                // indices take the variation of the sliced value, as `dynamic_slice` requires. An unchecked body tracks
+                // no variation, so it uses unchecked `axis_index` coordinates and leaves its outputs as they are. The
+                // new operations are lifted into the operation family through
+                // `OperationPayloadProjection::from_payload`.
+                let check_manual_variation = self.boundary.checks_manual_variation();
+                batched_body = {
+                    let operation = |payload: ErasedOperation| {
+                        C::Operation::from_payload(payload).map_err(|payload| ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "batching a `{}` that gathers its batch along the manual axes that \
+                                 its body uses requires an operation family that holds `{}`",
+                                SHARD_MAP_OPERATION_NAME,
+                                payload.type_name(),
+                            ),
+                        })
+                    };
+                    let block = extent / device_count;
+                    let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+                    let inputs = batched_body
+                        .input_types()
+                        .iter()
+                        .cloned()
+                        .map(|r#type| builder.add_input(r#type))
+                        .collect::<Vec<_>>();
+                    let mut outputs = builder.splice_program(&batched_body, inputs.as_slice())?;
+                    for (output, position) in outputs.iter_mut().zip(&sliced_positions) {
+                        let Some(position) = *position else {
+                            continue;
+                        };
+
+                        let atom_type = |builder: &ProgramBuilder<C::Constant, C::Operation>,
+                                         atom: AtomId|
+                         -> Result<ArrayType, ProgramError> {
+                            Ok(boundary_array_type(builder.atoms()[atom.index()].r#type().as_ref())?.clone())
+                        };
+
+                        // Make the output vary along the gathered axes, because the selected block differs across the
+                        // devices along them. The output does not vary along them already unless its body promised
+                        // replication without checking it.
+                        let mut value = *output;
+                        if check_manual_variation {
+                            for (axis_name, _) in &gathered_axes {
+                                let varies = atom_type(&builder, value)?
+                                    .sharding()
+                                    .is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name));
+                                if !varies {
+                                    let vary =
+                                        operation(ErasedOperation::new(ParallelVaryOperation::new(axis_name.clone())))?;
+                                    value = builder.add_instruction(vary, Vec::new(), vec![value], None)?[0];
+                                }
+                            }
+                        }
+
+                        let value_type = atom_type(&builder, value)?;
+                        let dimensions = ShardMapBoundary::static_extents(&value_type, ShardMapValueKind::Output, 0)
+                            .map_err(ProgramError::from)?;
+
+                        // Split the batch dimension into one dimension per gathered axis followed by the block
+                        // dimension, which keeps the placement of the batch dimension, while the new dimensions are
+                        // replicated.
+                        let mut split_dimensions = dimensions[..position].to_vec();
+                        split_dimensions.extend(gathered_axes.iter().map(|(_, size)| *size));
+                        split_dimensions.push(block);
+                        split_dimensions.extend(&dimensions[position + 1..]);
+                        let split_sharding = value_type
+                            .sharding()
+                            .map(|sharding| {
+                                let mut sharding_dimensions = sharding.dimensions().to_vec();
+                                let batch_sharding = sharding_dimensions[position].clone();
+                                sharding_dimensions.splice(
+                                    position..=position,
+                                    std::iter::repeat_n(ShardingDimension::Replicated, gathered_axes.len())
+                                        .chain(std::iter::once(batch_sharding)),
+                                );
+                                sharding.with_dimensions(sharding_dimensions)
+                            })
+                            .transpose()
+                            .map_err(|error| ProgramError::from(TypeError::from(error)))?;
+                        let split_shape = Shape::new(split_dimensions.iter().copied().map(Dimension::Static).collect());
+                        let split = operation(ErasedOperation::new(
+                            ReshapeOperation::new(split_shape).with_output_sharding(split_sharding),
+                        ))?;
+                        let split = builder.add_instruction(split, Vec::new(), vec![value], None)?[0];
+
+                        // The start indices must vary along the same manual axes as the value that they slice. The
+                        // coordinate along each gathered axis varies along that axis only, so it takes the other axes
+                        // through staged `parallel_vary` transitions, while the zero start indices are
+                        // non-differentiable constants created directly with that variation.
+                        let index_sharding = value_type
+                            .sharding()
+                            .filter(|sharding| check_manual_variation && !sharding.varying_manual_axes().is_empty())
+                            .map(|sharding| {
+                                Sharding::replicated(sharding.mesh().clone(), 0)
+                                    .with_varying_manual_axes(sharding.varying_manual_axes().clone())
+                            })
+                            .transpose()
+                            .map_err(|error| ProgramError::from(TypeError::from(error)))?;
+                        let zero_type = ArrayType::scalar(DataType::U64)
+                            .with_sharding(index_sharding.clone())
+                            .map_err(|error| ProgramError::from(TypeError::from(error)))?;
+                        let zero = builder.add_instruction(
+                            operation(ErasedOperation::new(ZeroOperation::new(zero_type)))?,
+                            Vec::new(),
+                            Vec::new(),
+                            None,
+                        )?[0];
+                        let mut start_indices = vec![zero; split_dimensions.len()];
+                        for (offset, (axis_name, _)) in gathered_axes.iter().enumerate() {
+                            let mut axis_index = AxisIndexOperation::new(axis_name.clone());
+                            if let Some(index_sharding) = &index_sharding {
+                                axis_index = axis_index.with_mesh(index_sharding.mesh().clone());
+                            }
+                            let mut index = builder.add_instruction(
+                                operation(ErasedOperation::new(axis_index))?,
+                                Vec::new(),
+                                Vec::new(),
+                                None,
+                            )?[0];
+                            if let Some(index_sharding) = &index_sharding {
+                                for other_axis in
+                                    index_sharding.varying_manual_axes().iter().filter(|other| *other != axis_name)
+                                {
+                                    let vary = operation(ErasedOperation::new(ParallelVaryOperation::new(
+                                        other_axis.clone(),
+                                    )))?;
+                                    index = builder.add_instruction(vary, Vec::new(), vec![index], None)?[0];
+                                }
+                            }
+                            start_indices[position + offset] = index;
+                        }
+                        let mut sizes = split_dimensions.clone();
+                        sizes[position..position + gathered_axes.len()].fill(1);
+                        let mut slice_inputs = vec![split];
+                        slice_inputs.extend(start_indices);
+                        let slice = operation(ErasedOperation::new(DynamicSliceOperation::new(sizes)))?;
+                        let sliced = builder.add_instruction(slice, Vec::new(), slice_inputs, None)?[0];
+
+                        // Merge the selected block back into the batch dimension, which keeps the placement of the
+                        // original value.
+                        let mut block_dimensions = dimensions;
+                        block_dimensions[position] = block;
+                        let block_shape = Shape::new(block_dimensions.into_iter().map(Dimension::Static).collect());
+                        let merge =
+                            ReshapeOperation::new(block_shape).with_output_sharding(value_type.sharding().cloned());
+                        *output = builder.add_instruction(
+                            operation(ErasedOperation::new(merge))?,
+                            Vec::new(),
+                            vec![sliced],
+                            None,
+                        )?[0];
+                    }
+                    let output_count = outputs.len();
+                    builder
+                        .build::<Vec<_>, Vec<_>>(
+                            outputs,
+                            vec![Placeholder; inputs.len()],
+                            vec![Placeholder; output_count],
+                        )?
+                        .into_simplified()?
+                };
             }
 
             let batch_dimension = Dimension::Static(extent);
@@ -3025,8 +3188,13 @@ where
         // cannot cross the static boundary). A body none of whose output tangents is live also keeps the two-map form,
         // which then binds no tangent map at all.
         let fused = std::ptr::eq(context.primal(), context.tangent()) && !body_has_references(body_program);
+        let has_dynamically_shaped_values = body_program.region_ids_in_closure().into_iter().any(|region_id| {
+            body_program.arena()[region_id.index()].atoms().iter().any(
+                |atom| matches!(atom.r#type().as_ref(), ArrayIrType::Array(r#type) if r#type.static_shape().is_none()),
+            )
+        });
         if fused
-            && !body_has_dynamically_shaped_values(body_program)
+            && !has_dynamically_shaped_values
             && let Some(outputs) = fused_shard_map_jvp(self, context, driver, body_program, inputs, &activity)?
         {
             return Ok(outputs);
@@ -3138,22 +3306,574 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
-        // This rule forwards to `transpose_shard_map` with the cotangent references of the linear reference inputs
-        // resolved (and allocated on first use) through the enclosing `TranspositionContext`. It requests the body
-        // transposition through the instruction-scoped driver, so instantiating it for a closed operation family
-        // introduces no recursive `TransposableOperation` obligation on that family.
+        // This rule resolves the cotangent references of the linear reference inputs (allocating them on first use)
+        // through the enclosing `TranspositionContext`, and requests the body transposition through the
+        // instruction-scoped driver, so instantiating it for a closed operation family introduces no recursive
+        // `TransposableOperation` obligation on that family. It transposes the tangent `shard_map` while retaining
+        // its manual region boundary.
         //
-        // The forward boundary implicitly places each caller input by its input sharding and moves it into device
-        // memory, so the assembled input cotangents are reconciled with the caller's cotangent types (refer to
-        // `reconcile_input_cotangent`). That is why the array projection of `O` must provide `ReshardOperation`,
-        // `BroadcastOperation`, and `TransferToMemoryOperation`. `ResidualZeroProvider` serves the cotangent
-        // destinations, and the reference operations serve the per-device accumulators of the replicated destinations
-        // that are accumulated locally (i.e., those of inputs that the body does not mutate, as
-        // `local_accumulator_destinations` selects them).
+        // The `TranspositionDriver` transposes the body under the linearity of the inputs and the kinds of their
+        // cotangent destinations. Known inputs supply residual values and may appear anywhere in the input boundary.
+        // The reverse boundary dualizes the shardings and boundary types of every cotangent that crosses it, including
+        // the cotangent references that it forwards for the `Reference` destinations that are not accumulated locally.
+        // Reference outputs forward input roots and therefore have no separate output cotangent slot. Structurally zero
+        // output cotangents have no slot either. Like JAX's `_shard_map_transpose`, which binds the transposed map over
+        // the nonzero output cotangents only and propagates the zero ones symbolically through the body's backward
+        // pass, the body is transposed projected onto its other outputs (and its reference outputs), so zero cotangents
+        // are neither materialized as global zeros nor as local ones, and an input that only those outputs depend on
+        // receives a structural zero.
+        //
+        // The reverse contributions to a replicated destination of an input that the body does not mutate (i.e., of a
+        // value input or of a read-only reference input) accumulate in fresh per-device references, which update the
+        // caller's cotangent destination once outside the map. The cotangent reference of a replicated reference input
+        // that the body mutates crosses the transposed boundary by identity instead, like that of a sharded one. Bodies
+        // own replica aggregation through the adjoints of their variation operations, so a checked boundary neither
+        // normalizes output seeds nor sums replicated input contributions. A trusted output restores the variation
+        // forgotten by its boundary and divides its seed by the number of those copies before entering the typed body
+        // transpose. With body variation checks disabled, the boundary divides every output seed over its replicated
+        // axes and explicitly sums input cotangents over theirs. The contributions follow the original input order,
+        // and reference, known, and ignored inputs receive structural zeros, as do the inputs whose cotangents the
+        // transposed body produces as structural zeros, which are not outputs of the transposed map (as in JAX's
+        // `_shard_map_transpose`).
+        //
+        // The transposed map assembles every input cotangent under the cotangent dual of its input sharding and in
+        // device memory, while the forward boundary accepted each caller input in its own placement and memory kind.
+        // Every contributed cotangent, and every frozen accumulator before it is added into a replicated reference
+        // destination, is therefore reconciled with the caller's cotangent type by `reconcile_input_cotangent`,
+        // which is why the array projection of `O` must provide `ReshardOperation`, `BroadcastOperation`, and
+        // `TransferToMemoryOperation`. The cotangent reference of every other `Reference` destination crosses the
+        // transposed boundary by identity instead, exactly like a reference input of the forward boundary, so it
+        // is neither resharded nor transferred.
+        //
+        // `ResidualZeroProvider` serves the cotangent destinations, and the reference operations serve the per-device
+        // accumulators of the replicated destinations that are accumulated locally.
         check_count!("output", outputs, self.output_types.len(), ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
-        let contributions = transpose_shard_map(self, context, driver, inputs, outputs, &cotangents)?;
+        let input_linearity = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
+        check_count!("input", input_linearity, self.input_types.len(), ProgramError);
+        check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
+        let body = driver.region(0)?;
+        self.validate_body(body)?;
+
+        // A `shard_map` with no live output cotangents and no live reference input is a zero linear map, so every input
+        // cotangent is zero. A live reference input keeps the map live, because its accumulated state cotangent flows
+        // through the transposed body even when no ordinary output cotangent does. A body with deferred work or
+        // observable rule effects also keeps it live.
+        if cotangents.can_skip_transposition(outputs, [body]) {
+            for (accumulator, input) in accumulators.iter().zip(inputs) {
+                accumulator.accumulate(context, MaybeZero::Zero(input.r#type().cotangent()?))?;
+            }
+            return Ok(());
+        }
+
+        // The cotangent destination of an input accumulates in a fresh local reference, which updates the caller's
+        // destination once outside the transposed map, when it is a `Reference` destination of an input that is
+        // replicated along an active manual axis, unless the input is a reference that the body mutates. A local
+        // accumulator starts from zero, and its final value is added into the caller's destination once, which is
+        // correct whenever the transposed body only adds into the cotangent of the input, as it does for a value input
+        // or for a reference that the body only reads. It is not correct for a reference that the body mutates, whose
+        // transposed mutations may also overwrite the incoming cotangent (e.g., the transpose of a write zeroes the
+        // cotangent of the overwritten state), which an accumulator that starts from zero cannot express. The cotangent
+        // reference of such an input crosses the transposed boundary by identity instead, like that of a sharded
+        // reference. This is sound because a body mutates a replicated reference with invariant values at invariant
+        // indices only (refer to the "Replicated writes are invariant" bullet of the module documentation), so the
+        // transposed body updates every device's copy of the destination identically.
+        let analysis = body.reference_analysis(0).map_err(ProgramError::from)?;
+        let local_accumulators = cotangents
+            .kinds()
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                let mutated = self.input_types[index].is_reference()
+                    && analysis.is_mutated(ReferenceRoot::RegionInput { region: body.id(), input_index: index });
+                *kind == CotangentDestinationKind::Reference
+                    && self.boundary.manual_axes.iter().any(|axis_name| {
+                        !self.boundary.input_shardings[index].dimensions().iter().any(
+                        |dimension| matches!(dimension, ShardingDimension::Sharded(axes) if axes.contains(axis_name)),
+                    )
+                    })
+                    && !mutated
+            })
+            .collect::<Vec<_>>();
+
+        // A reference output forwards a body input root whose state cotangent lives in that input's cotangent
+        // reference, so it owns no cotangent slot. Every other output cotangent crosses the boundary unless it
+        // is a structural zero.
+        let value_output_cotangents = outputs
+            .iter()
+            .zip(&self.output_types)
+            .filter_map(|(cotangent, output_type)| (!output_type.is_reference()).then_some(cotangent))
+            .collect::<Vec<_>>();
+        let zero_output_cotangents =
+            value_output_cotangents.iter().map(|cotangent| cotangent.is_zero()).collect::<Vec<_>>();
+
+        // The tangent body's flat program is transposed with `TranspositionDriver::transpose_program` using the input
+        // indices selected by `input_linearity` and their corresponding destination kinds, producing a shared program
+        // mapping `[nonzero_output_cotangents..., cotangent_references..., known_input_values...]` to
+        // `[linear_input_cotangents...]`, where the cotangent of an input with a `Reference` destination is its
+        // cotangent reference forwarded by identity and an input with an `Ignore` destination has no cotangent slot.
+        // The transposed boundary permutes and dualizes the original one to match. Its global inputs are the cotangent
+        // descriptors of the original value outputs whose cotangents are not structural zeros under the cotangent duals
+        // of their output shardings, then the cotangent references `ref<cotangent(T)>` of the inputs with `Reference`
+        // destinations that are not accumulated locally under the cotangent duals of those inputs' input shardings, and
+        // then the known inputs' original global inputs. Its global outputs are the cotangent descriptors of the linear
+        // inputs' original global inputs under the cotangent duals of their input shardings, except for the input
+        // cotangents with `Return` destinations that the transposed program produces as structural zeros, which
+        // `zero_input_cotangents` records instead. The destination of a locally accumulated input becomes a fresh local
+        // reference inside the rebuilt body, which is frozen and returned as an array output rather than forwarded.
+        //
+        // When some value output cotangents are structural zeros, the body is transposed with those outputs flagged
+        // (refer to `TranspositionDriver::transpose_program_with_zero_seeds`). Zero output cotangents therefore never
+        // enter the transposed body, and the transposition engine propagates their absence symbolically. An input that
+        // only those outputs depend on (e.g., through `neg` or `add`) receives no cotangent, so transposition records
+        // its cotangent as a structural zero in the result metadata and omits its output without constructing a zero.
+        // Effects and deferred work of the body are kept. This is the analogue of JAX's `_shard_map_transpose`, which
+        // runs the body's backward pass on symbolic zero output cotangents. The built-in recursive driver serves every
+        // mask from the body region's retained transform cache.
+        let destination_kinds = cotangents.kinds();
+        check_count!("input", local_accumulators, self.input_types.len(), ProgramError);
+        if !self.boundary.checks_manual_variation()
+            && let Some(index) = (0..input_linearity.len()).find(|&index| {
+                input_linearity[index]
+                    && self.input_types[index].is_reference()
+                    && destination_kinds[index] == CotangentDestinationKind::Reference
+                    && !local_accumulators[index]
+                    && !self.boundary.cotangent_replication_axes(&self.boundary.input_shardings()[index]).is_empty()
+            })
+        {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{SHARD_MAP_OPERATION_NAME}` with unchecked manual variation cannot transpose mutated reference \
+                     input #{index} replicated along an active manual axis",
+                ),
+            }
+            .into());
+        }
+
+        // The driver takes destinations only for selected inputs, so the full masks are kept below to reconstruct
+        // shardings in the original boundary's input order.
+        let (input_indices, selected_destination_kinds): (Vec<_>, Vec<_>) = input_linearity
+            .iter()
+            .zip(destination_kinds)
+            .enumerate()
+            .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
+            .unzip();
+        let seed_count = self.output_types.iter().filter(|r#type| !r#type.is_reference()).count();
+        check_count!("output", zero_output_cotangents, seed_count, ProgramError);
+
+        // Structural zero output cotangents do not cross the transposed boundary. The driver transposes the body region
+        // itself with those outputs flagged, so the built-in recursive driver serves the request from the region's
+        // retained transform cache and a body shared by several programs is transposed once per mask. The flags follow
+        // the complete body output order, and reference outputs, which own no cotangent slot, are never flagged.
+        let mut seed_flags = zero_output_cotangents.iter();
+        let body_zero_output_cotangents = self
+            .output_types
+            .iter()
+            .map(|output_type| !output_type.is_reference() && *seed_flags.next().unwrap())
+            .collect::<Vec<_>>();
+        let transposed = driver.transpose_program_with_zero_seeds(
+            body,
+            &input_indices,
+            &[],
+            &body_zero_output_cotangents,
+            &selected_destination_kinds,
+        )?;
+        let mut zero_input_cotangents = vec![false; input_linearity.len()];
+        for (&index, slot) in input_indices.iter().zip(transposed.cotangents()) {
+            zero_input_cotangents[index] = *slot == TransposedProgramCotangent::Zero;
+        }
+        let mut transposed_body = transposed.into_program();
+        let nonzero_seed_count = zero_output_cotangents.iter().filter(|zero| !**zero).count();
+        let boundary = self.boundary();
+
+        // The replicated destinations of inputs that the body does not mutate accumulate locally. Each device
+        // accumulates its contribution into fresh local state, and only the enclosing map updates the caller's
+        // destination once. Existing destination contents are neither duplicated nor used as a per-device seed. With
+        // variation checking, the body's variation adjoints aggregate contributions (e.g., `parallel_vary` transposes
+        // to the mesh-form sum `parallel_reduce`), and only trusted output seeds need normalization. Unchecked bodies
+        // instead receive the conservative seed normalization and input aggregation below.
+        if local_accumulators.contains(&true) {
+            let mut builder = ProgramBuilder::new();
+            let local_destinations = destination_kinds
+                .iter()
+                .zip(&local_accumulators)
+                .filter_map(|(kind, local)| (*kind == CotangentDestinationKind::Reference).then_some(*local))
+                .collect::<Vec<_>>();
+
+            // The inputs that still cross the boundary are declared first, so that they keep their relative order and
+            // precede the locally materialized accumulators in the rebuilt body.
+            let input_types = transposed_body.input_types().into_owned();
+            let materialized = (0..input_types.len())
+                .map(|position| {
+                    position
+                        .checked_sub(nonzero_seed_count)
+                        .and_then(|index| local_destinations.get(index))
+                        .copied()
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
+            let mut body_inputs = input_types
+                .iter()
+                .zip(&materialized)
+                .map(|(r#type, materialized)| (!materialized).then(|| builder.add_input(r#type.clone())))
+                .collect::<Vec<_>>();
+            let input_count = body_inputs.iter().flatten().count();
+            for (position, r#type) in input_types.into_iter().enumerate() {
+                if body_inputs[position].is_some() {
+                    continue;
+                }
+                // A fresh local accumulator starts from a zero of the destination referent's local type. The zero is a
+                // non-differentiable constant, so it is created with the manual variation of that type directly rather
+                // than through `parallel_vary`.
+                let referent = <&ReferenceType<ArrayType>>::try_from(&r#type)?.referent().clone();
+                let zero = O::provide(ZeroOperation::new(referent.into()), &[])?;
+                let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None)?[0];
+                let reference = ReferenceNewOperation::<ArrayType, ArrayIrType>::new();
+                body_inputs[position] = Some(builder.add_instruction(reference, Vec::new(), vec![zero], None)?[0]);
+            }
+            let body_inputs = body_inputs.into_iter().flatten().collect::<Vec<_>>();
+            let mut outputs = builder.splice_program(&transposed_body, &body_inputs)?.into_iter();
+            let mut rebuilt_outputs = Vec::new();
+            let mut destination_index = 0;
+            for (index, linear) in input_linearity.iter().enumerate() {
+                let destination = if destination_kinds[index] == CotangentDestinationKind::Reference {
+                    let destination = body_inputs[nonzero_seed_count + destination_index];
+                    destination_index += 1;
+                    Some(destination)
+                } else {
+                    None
+                };
+                if !linear
+                    || zero_input_cotangents[index]
+                    || destination_kinds[index] == CotangentDestinationKind::Ignore
+                    || (destination_kinds[index] == CotangentDestinationKind::Reference
+                        && !self.input_types[index].is_reference()
+                        && !local_accumulators[index])
+                {
+                    continue;
+                }
+                // Ordinary buffers produce no identity output. A replicated local buffer is nevertheless frozen and
+                // returned, and the enclosing rule adds it into the caller's destination once outside the map, so
+                // retrieve its local argument rather than consuming a body output.
+                let mut output = if destination_kinds[index] == CotangentDestinationKind::Reference
+                    && !self.input_types[index].is_reference()
+                {
+                    destination.unwrap()
+                } else {
+                    outputs.next().unwrap()
+                };
+                if local_accumulators[index] {
+                    let freeze = ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new();
+                    output = builder.add_instruction(freeze, Vec::new(), vec![output], None)?[0];
+                }
+                rebuilt_outputs.push(output);
+            }
+            let output_count = rebuilt_outputs.len();
+            transposed_body = Arc::new(
+                builder
+                    .build(rebuilt_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])?
+                    .into_simplified()?,
+            );
+        }
+
+        // The transposed inputs are the cotangents of the value outputs that are not structural zeros, the cotangent
+        // references of the live inputs with `Reference` destinations that are not accumulated locally, and the known
+        // inputs, in that order.
+        let mut input_shardings = Vec::new();
+        let mut global_input_types = Vec::new();
+        let mut zero_output_cotangents = zero_output_cotangents.iter();
+        for (output_type, sharding) in self.output_types.iter().zip(boundary.output_shardings()) {
+            if output_type.is_reference() || *zero_output_cotangents.next().unwrap() {
+                continue;
+            }
+            input_shardings.push(sharding.cotangent().map_err(TypeError::from)?);
+            global_input_types.push(output_type.cotangent()?);
+        }
+        let mut destination_positions = vec![None; input_linearity.len()];
+        for (index, kind) in destination_kinds.iter().enumerate() {
+            if *kind != CotangentDestinationKind::Reference || local_accumulators[index] {
+                continue;
+            }
+            destination_positions[index] = Some(global_input_types.len());
+            input_shardings.push(boundary.input_shardings()[index].cotangent().map_err(TypeError::from)?);
+            let cotangent_type = self.input_types[index].cotangent()?;
+            global_input_types.push(if self.input_types[index].is_reference() {
+                cotangent_type
+            } else {
+                ReferenceType::new(boundary_array_type(&cotangent_type)?.clone()).into()
+            });
+        }
+        for (index, _) in input_linearity.iter().enumerate().filter(|(_, linear)| !**linear) {
+            input_shardings.push(boundary.input_shardings()[index].clone());
+            global_input_types.push(self.input_types[index].clone());
+        }
+
+        // The transposed outputs are one cotangent per linear input in input order, which is a value for a `Return`
+        // destination whose cotangent is not a structural zero, the frozen local accumulator for a `Reference`
+        // destination that is accumulated locally, and the forwarded cotangent reference for any other `Reference`
+        // destination of a reference input. Every other destination (e.g., an `Ignore` destination) has no output.
+        let mut output_shardings = Vec::new();
+        let mut global_output_types = Vec::new();
+        let mut output_forwarding = Vec::new();
+        let mut output_input_indices = Vec::new();
+        for (index, _) in input_linearity.iter().enumerate().filter(|(_, linear)| **linear) {
+            match destination_kinds[index] {
+                CotangentDestinationKind::Return if zero_input_cotangents[index] => {}
+                CotangentDestinationKind::Return => {
+                    output_shardings.push(boundary.input_shardings()[index].cotangent().map_err(TypeError::from)?);
+                    output_input_indices.push(index);
+                    global_output_types.push(self.input_types[index].cotangent()?);
+                    output_forwarding.push(None);
+                }
+                CotangentDestinationKind::Reference
+                    if self.input_types[index].is_reference() || local_accumulators[index] =>
+                {
+                    output_shardings.push(boundary.input_shardings()[index].cotangent().map_err(TypeError::from)?);
+                    output_input_indices.push(index);
+                    let cotangent_type = self.input_types[index].cotangent()?;
+                    if local_accumulators[index] {
+                        global_output_types.push(boundary_array_type(&cotangent_type)?.clone().into());
+                        output_forwarding.push(None);
+                    } else {
+                        global_output_types.push(cotangent_type);
+                        output_forwarding.push(destination_positions[index]);
+                    }
+                }
+                CotangentDestinationKind::Reference | CotangentDestinationKind::Ignore => {}
+            }
+        }
+        let boundary = ShardMapBoundary::from_validated_shardings(
+            boundary.mesh().clone(),
+            input_shardings,
+            output_shardings,
+            boundary.manual_axes().to_vec(),
+        )
+        .with_manual_variation_checks(ManualVariationChecks {
+            manual_variation: self.boundary.checks_manual_variation(),
+            output_replication: true,
+        });
+
+        // A trusted replicated output is the same logical result on several devices, while the typed body transpose
+        // expects a separate seed for each potentially varying copy. Split its seed equally between precisely the axes
+        // whose variation the forward boundary forgot. Checked-body adjoints own input aggregation; an unchecked body
+        // instead needs seed normalization over every replicated axis and explicit input aggregation below.
+        let body_output_types = body.output_types();
+        let seed_axes = body_output_types
+            .iter()
+            .enumerate()
+            .filter(|(index, r#type)| !r#type.is_reference() && !body_zero_output_cotangents[*index])
+            .map(|(index, r#type)| {
+                Ok(if self.boundary.checks_manual_variation() {
+                    self.boundary.unproven_output_replication_axes(index, boundary_array_type(r#type)?)
+                } else {
+                    // The devices along an axis that the output is unreduced along hold separate summands of the
+                    // output, each of which receives the whole cotangent, so only the other untiled axes divide the
+                    // seed.
+                    self.boundary.cotangent_replication_axes(&self.boundary.output_shardings()[index])
+                })
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        if !self.boundary.checks_manual_variation() || seed_axes.iter().any(|axes| !axes.is_empty()) {
+            let mut builder = ProgramBuilder::<V, O>::new();
+            let mut inputs = Vec::with_capacity(transposed_body.input_count());
+            for (index, source) in transposed_body.input_types().iter().enumerate() {
+                let Some(axes) = seed_axes.get(index).filter(|axes| !axes.is_empty()) else {
+                    inputs.push(builder.add_input(source.clone()));
+                    continue;
+                };
+                let target = boundary_array_type(source)?;
+                let local_type = if self.boundary.checks_manual_variation() {
+                    let sharding = target.sharding().unwrap();
+                    let invariant_axes =
+                        sharding.varying_manual_axes().iter().filter(|axis| !axes.contains(axis)).cloned();
+                    target
+                        .clone()
+                        .with_sharding(
+                            sharding.clone().with_varying_manual_axes(invariant_axes).map_err(TypeError::from)?,
+                        )
+                        .map_err(TypeError::from)?
+                } else {
+                    target.clone()
+                };
+                let mut seed = builder.add_input(local_type.into());
+                for axis in axes.iter().filter(|_| self.boundary.checks_manual_variation()) {
+                    let vary: <O as OperationProjection<ArrayType>>::Projected =
+                        ParallelVaryOperation::new(axis.clone()).into();
+                    seed = builder.add_instruction(O::from(vary), Vec::new(), vec![seed], None)?[0];
+                }
+                let divisor = axes.iter().map(|axis| boundary.mesh().axis_size(axis).unwrap() as f64).product::<f64>();
+                // Normalize low-precision cotangents in `f32`, so a device count outside their finite range does not
+                // turn the divisor into infinity, and a small reciprocal does not underflow before multiplying a large
+                // seed.
+                let normalization_data_type =
+                    if target.data_type().is_floating_point() && target.data_type().bit_width() < 32 {
+                        DataType::F32
+                    } else {
+                        target.data_type()
+                    };
+                if normalization_data_type != target.data_type() {
+                    let convert: <O as OperationProjection<ArrayType>>::Projected =
+                        ConvertElementTypeOperation::<ArrayType>::new(normalization_data_type, false).into();
+                    seed = builder.add_instruction(O::from(convert), Vec::new(), vec![seed], None)?[0];
+                }
+                let coefficient_sharding = target
+                    .sharding()
+                    .map(|sharding| {
+                        sharding
+                            .clone()
+                            .with_unreduced_axes(Vec::<String>::new())?
+                            .with_reduced_axes(sharding.unreduced_axes().union(sharding.reduced_axes()).cloned())
+                    })
+                    .transpose()
+                    .map_err(TypeError::from)?;
+                let divisor_sharding = coefficient_sharding
+                    .as_ref()
+                    .map(|sharding| sharding.with_dimensions(Vec::new()))
+                    .transpose()
+                    .map_err(TypeError::from)?;
+                let scalar_type = ArrayType::scalar(normalization_data_type)
+                    .with_memory(target.memory())
+                    .with_sharding(divisor_sharding)
+                    .map_err(TypeError::from)?;
+                // The divisor is a nondifferentiable literal, so its variation is created directly without an adjoint.
+                let divisor = EagerContext::<Array, ArrayOperation<Array>>::new().fill(&scalar_type, divisor)?;
+                let constant: <O as OperationProjection<ArrayType>>::Projected = ConstantOperation::new(divisor).into();
+                let divisor = builder.add_instruction(O::from(constant), Vec::new(), Vec::new(), None)?[0];
+                let divisor_type = target
+                    .clone()
+                    .with_data_type(normalization_data_type)
+                    .with_sharding(coefficient_sharding)
+                    .map_err(TypeError::from)?;
+                let broadcast: <O as OperationProjection<ArrayType>>::Projected =
+                    BroadcastOperation::new(divisor_type, Vec::new()).into();
+                let divisor = builder.add_instruction(O::from(broadcast), Vec::new(), vec![divisor], None)?[0];
+                let divide: <O as OperationProjection<ArrayType>>::Projected = DivOperation::<ArrayType>::new().into();
+                seed = builder.add_instruction(O::from(divide), Vec::new(), vec![seed, divisor], None)?[0];
+                if normalization_data_type != target.data_type() {
+                    let convert: <O as OperationProjection<ArrayType>>::Projected =
+                        ConvertElementTypeOperation::<ArrayType>::new(target.data_type(), false).into();
+                    seed = builder.add_instruction(O::from(convert), Vec::new(), vec![seed], None)?[0];
+                }
+                inputs.push(seed);
+            }
+            let mut outputs = builder.splice_program(&transposed_body, &inputs)?;
+            if !self.boundary.checks_manual_variation() {
+                for (position, output) in outputs.iter_mut().enumerate() {
+                    let axes = boundary.cotangent_replication_axes(&boundary.output_shardings()[position]);
+                    if !axes.is_empty()
+                        && self.input_types[output_input_indices[position]].is_reference()
+                        && !local_accumulators[output_input_indices[position]]
+                    {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "`{SHARD_MAP_OPERATION_NAME}` cannot aggregate a replicated gradient reference"
+                            ),
+                        }
+                        .into());
+                    }
+                    for axis in axes {
+                        let reduce: <O as OperationProjection<ArrayType>>::Projected =
+                            ParallelReduceOperation::new(ReductionKind::Sum, axis).into();
+                        *output = builder.add_instruction(O::from(reduce), Vec::new(), vec![*output], None)?[0];
+                    }
+                }
+            }
+            let output_count = outputs.len();
+            transposed_body = Arc::new(
+                builder
+                    .build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])?
+                    .into_simplified()?,
+            );
+        }
+        let transposed_operation = ShardMapOperation::from_boundary(boundary, global_input_types, global_output_types)
+            .with_output_forwarding(output_forwarding)
+            .map_err(ProgramError::from)?;
+
+        // Stage a fresh `shard_map` over the transposed body on the nonzero output cotangents, followed by the
+        // cotangent references and the known input values (i.e., `[nonzero_output_cotangents..., references...,
+        // known_inputs...]`). Its outputs are the cotangents of the linear inputs.
+        let mut transposed_inputs = value_output_cotangents
+            .into_iter()
+            .filter_map(|cotangent| cotangent.as_value().cloned())
+            .collect::<Vec<_>>();
+        let mut reference_destinations = cotangents.references().iter();
+        for (index, kind) in cotangents.kinds().iter().enumerate() {
+            if *kind == CotangentDestinationKind::Reference {
+                let reference = reference_destinations.next().unwrap();
+                if !local_accumulators[index] {
+                    transposed_inputs.push(reference.clone());
+                }
+            }
+        }
+        transposed_inputs.extend(inputs.iter().filter_map(PartialValue::as_known).cloned());
+
+        // The transposed body is bound as the shared handle the driver returned, so repeated binds of one transposed
+        // body intern by `Arc` identity instead of copying the program into the trace again. A transposed map without
+        // outputs and without observable effects (i.e., one whose input cotangents are all structural zeros) is not
+        // staged.
+        let input_cotangents =
+            if transposed_operation.output_types.is_empty() && !transposed_body.effects().is_retained_when_unused() {
+                Vec::new()
+            } else {
+                context.stage_operation(
+                    transposed_operation,
+                    AttachedRegions::Callees(&[transposed_body]),
+                    transposed_inputs.as_slice(),
+                )?
+            };
+        let output_count = (0..inputs.len())
+            .filter(|&index| {
+                input_linearity[index]
+                    && ((cotangents.returns_cotangent(index) && !zero_input_cotangents[index])
+                        || local_accumulators[index])
+            })
+            .count();
+        check_count!("output", input_cotangents, output_count, ProgramError);
+
+        // Reassemble one cotangent per input. The known inputs and the linear inputs whose cotangents are structural
+        // zeros carry structural zeros, while the other linear input tangents receive the transposed `shard_map`'s
+        // outputs in body input order. A live reference tangent's output is its cotangent reference, whose contents
+        // were accumulated in place, and a dead one has no output, so every reference input receives a structural zero.
+        let mut input_cotangents = input_cotangents.into_iter();
+        let mut reference_destinations = cotangents.references().iter();
+        let contributions = input_linearity
+            .iter()
+            .zip(inputs)
+            .enumerate()
+            .map(|(index, (&linear, input))| match cotangents.kind(index) {
+                CotangentDestinationKind::Return if linear && !zero_input_cotangents[index] => {
+                    let contribution = input_cotangents.next().unwrap();
+                    let target = input.r#type().cotangent()?;
+                    Ok(MaybeZero::Value(reconcile_input_cotangent(context, index, contribution, &target)?))
+                }
+                CotangentDestinationKind::Reference => {
+                    let destination = reference_destinations.next().unwrap();
+                    if cotangents.is_reference_input(index) || local_accumulators[index] {
+                        let cotangent = input_cotangents.next().unwrap();
+
+                        // The frozen local accumulator of a replicated destination leaves the map under the input
+                        // sharding in device memory, like a returned cotangent, so it is reconciled with the referent
+                        // type of the caller's destination before it is added into that destination once.
+                        if local_accumulators[index] {
+                            let destination_type = destination.r#type();
+                            let referent = <&ReferenceType<ArrayType>>::try_from(destination_type.as_ref())?.referent();
+                            let target = ArrayIrType::Array(referent.clone());
+                            let cotangent = reconcile_input_cotangent(context, index, cotangent, &target)?;
+                            context.bind(
+                                ReferenceAddUpdateOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
+                                Vec::new(),
+                                &[destination.clone(), cotangent],
+                            )?;
+                        }
+                    }
+                    input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
+                }
+                CotangentDestinationKind::Return | CotangentDestinationKind::Ignore => {
+                    input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
+                }
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
         check_count!("input", contributions, accumulators.len(), ProgramError);
         for (accumulator, contribution) in accumulators.iter().zip(contributions) {
             accumulator.accumulate(context, contribution)?;
@@ -4450,7 +5170,36 @@ where
                 let shards = (0..local_device_count)
                     .map(|local_device| {
                         let coordinates = local_grid.coordinates(local_device);
-                        local_input_shard(boundary, index, array, &local_type, &local_grid, &coordinates)
+
+                        // Along an active manual axis that the input is unreduced along with kind
+                        // `UnreducedKind::Sum`, a device whose coordinate is non-zero receives zeros,
+                        // so that the shards sum to the logical value that the global array stores. With kind
+                        // `UnreducedKind::Max` or `UnreducedKind::Min`, every device receives its shard of the
+                        // logical value, whose extremum is that value.
+                        let sharding = &boundary.input_shardings()[index];
+                        if sharding.unreduced_kind() == UnreducedKind::Sum
+                            && sharding
+                                .unreduced_axes()
+                                .iter()
+                                .any(|axis_name| local_grid.axis(axis_name).is_some_and(|axis| coordinates[axis] != 0))
+                        {
+                            return EagerContext::<Array, ArrayOperation<Array>>::new().zero(&local_type);
+                        }
+
+                        let local_shape = local_type
+                            .static_shape()
+                            .map(|shape| shape.dimensions().to_vec())
+                            .ok_or_else(|| ProgramError::InvalidArgument {
+                                message: format!(
+                                    "`{SHARD_MAP_OPERATION_NAME}` interpretation requires static types \
+                                     but got `{local_type}`"
+                                ),
+                            })?;
+
+                        let offsets = manual_block_offsets(sharding, &local_grid, &coordinates, &local_shape);
+                        let block =
+                            offsets.iter().zip(&local_shape).map(|(&start, &size)| ArraySliceAxis::new(start, size, 1));
+                        array.copy_block(local_type.clone(), &block.collect::<Vec<_>>())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
@@ -4509,7 +5258,16 @@ where
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             let reference_type = reference.r#type();
             let sharding = &boundary.input_shardings()[index];
-            validate_replicated_copies(sharding, &local_grid, &shards, index)?;
+
+            // Copies that differ indicate a body that violates the reference contract (e.g., one that writes a
+            // reference from a branch that the devices select differently) rather than values that could be assembled.
+            if let Some(axis_name) = replicated_copy_mismatch(sharding, &local_grid, &shards)? {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "`{SHARD_MAP_OPERATION_NAME}` reference input #{index} is replicated along manual axis \
+                     `{axis_name}`, but its devices along that axis finished with different states",
+                )));
+            }
+
             let value = assemble_global_value(sharding, reference_type.referent(), &local_grid, &shards)?;
             reference_updates.push((reference, value));
         }
@@ -4764,18 +5522,17 @@ impl ShardMapResidualEdge {
     /// Creates a new [`ShardMapResidualEdge`] that carries residual `residual_index` of local type `local_type` across
     /// the `shard_map` `boundary`. The local type of the edge is the residual's own type, except that the edge of a
     /// reference residual carries its referent (i.e., a snapshot of its state), that a first-class dimension crosses
-    /// as its integer scalar value (refer to [`residual_edge_type`]), and that a scalar that varies along some active
-    /// manual axes gains a leading dimension of size one. A residual that is replicated along every active manual axis
-    /// crosses as itself, under its local placement. A residual that varies along some active manual axes has one
-    /// distinct value per device along those axes, so its leading dimension is tiled along them (in mesh order and
-    /// ahead of the free axes that already place that dimension), and the global edge concatenates the local values
-    /// along that dimension. This is JAX's residual specification `P(order_wrt_mesh(mesh, vma))` in
-    /// `_shard_map_partial_eval` and `_shard_map_linearize`, and, because the local shard is the residual itself,
-    /// neither body converts a non-scalar residual at the boundary (a varying scalar is promoted to a single-element
-    /// vector first, as by JAX's `_promote_scalar_residuals`). The global type of the edge keeps the variation of the
-    /// residual along the manual axes of enclosing manual regions, as well as its unreduced and reduced axes, layout,
-    /// and memory kind, while its boundary sharding records only its placement, like the shardings that
-    /// [`ShardMapBoundary::new`] builds.
+    /// as its integer scalar value, and that a scalar that varies along some active manual axes gains a leading
+    /// dimension of size one. A residual that is replicated along every active manual axis crosses as itself, under
+    /// its local placement. A residual that varies along some active manual axes has one distinct value per device
+    /// along those axes, so its leading dimension is tiled along them (in mesh order and ahead of the free axes that
+    /// already place that dimension), and the global edge concatenates the local values along that dimension. This is
+    /// JAX's residual specification `P(order_wrt_mesh(mesh, vma))` in `_shard_map_partial_eval` and
+    /// `_shard_map_linearize`, and, because the local shard is the residual itself, neither body converts a non-scalar
+    /// residual at the boundary (a varying scalar is promoted to a single-element vector first, as by JAX's
+    /// `_promote_scalar_residuals`). The global type of the edge keeps the variation of the residual along the manual
+    /// axes of enclosing manual regions, as well as its unreduced and reduced axes, layout, and memory kind, while its
+    /// boundary sharding records only its placement, like the shardings that [`ShardMapBoundary::new`] builds.
     ///
     /// # Errors
     ///
@@ -4803,9 +5560,28 @@ impl ShardMapResidualEdge {
             Ok(sharding.with_unreduced_axes(unreduced_axes)?.with_reduced_axes(reduced_axes)?)
         };
 
+        // An array residual crosses as itself. A first-class dimension residual crosses as its integer scalar value,
+        // typed as varying over every active manual axis because dimension types record no manual variation, so each
+        // device then keeps the value that it computed instead of relying on all devices agreeing. The edge records no
+        // variation along the axes of enclosing manual regions, which the operation cannot name in general (e.g., a
+        // body can derive a dimension from the index of an enclosing axis that no boundary type mentions). That
+        // omission loses no value, because every device of an enclosing manual region runs its own instances of both
+        // maps, so the edge never crosses devices along such an axis, and the value only redefines a dimension, whose
+        // type carries no variation, so no collective or transposition rule consumes the edge's variation along such
+        // an axis. `reshape_program_boundary` converts between the dimension and its edge on either side of the
+        // boundary.
         let local_type = match local_type {
             ArrayIrType::Reference(reference_type) => reference_type.referent().clone(),
-            r#type => residual_edge_type(r#type, boundary)?,
+            ArrayIrType::Dimension(_) => {
+                let manual_axes = boundary.manual_axes().iter().filter(|_| boundary.checks_manual_variation());
+                let sharding = Sharding::replicated(boundary.mesh().clone(), 0)
+                    .with_varying_manual_axes(manual_axes.cloned())
+                    .map_err(|error| ProgramError::from(TypeError::from(error)))?;
+                ArrayType::scalar(DIMENSION_DATA_TYPE)
+                    .with_sharding(sharding)
+                    .map_err(|error| ProgramError::from(TypeError::from(error)))?
+            }
+            r#type => <&ArrayType>::try_from(r#type).map_err(ProgramError::from)?.clone(),
         };
 
         let local_type = if !boundary.checks_manual_variation() && local_type.sharding().is_none() {
@@ -4823,7 +5599,16 @@ impl ShardMapResidualEdge {
             return Err(ShardMapError::DynamicResidualNotSupported { residual_index, dimension });
         }
 
-        let axes = residual_manual_axes(&local_type, boundary);
+        // The active manual axes along which the local value of the residual varies.
+        let axes = boundary
+            .manual_axes()
+            .iter()
+            .filter(|axis| {
+                !boundary.checks_manual_variation()
+                    || local_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
         if axes.is_empty() {
             let local_sharding = local_type
                 .sharding()
@@ -5055,40 +5840,6 @@ fn manual_block_offsets(
         .collect()
 }
 
-/// Returns the shard of global input `input_index` that the device at `coordinates` of the local `grid` (i.e., of the
-/// active manual axes) receives, at type `local_type`. Along an active manual axis that the input is unreduced along
-/// with kind [`UnreducedKind::Sum`], a device whose coordinate is non-zero receives zeros, so that the shards sum to
-/// the logical value that the global [`Array`] stores. With kind [`UnreducedKind::Max`] or [`UnreducedKind::Min`],
-/// every device receives its shard of the logical value, whose extremum is that value.
-fn local_input_shard(
-    boundary: &ShardMapBoundary,
-    input_index: usize,
-    value: &Array,
-    local_type: &ArrayType,
-    grid: &LockstepDeviceGrid,
-    coordinates: &[usize],
-) -> Result<Array, ProgramError> {
-    let sharding = &boundary.input_shardings()[input_index];
-    if sharding.unreduced_kind() == UnreducedKind::Sum
-        && sharding
-            .unreduced_axes()
-            .iter()
-            .any(|axis_name| grid.axis(axis_name).is_some_and(|axis| coordinates[axis] != 0))
-    {
-        return EagerContext::<Array, ArrayOperation<Array>>::new().zero(local_type);
-    }
-    let local_shape = local_type.static_shape().map(|shape| shape.dimensions().to_vec()).ok_or_else(|| {
-        ProgramError::InvalidArgument {
-            message: format!(
-                "`{SHARD_MAP_OPERATION_NAME}` interpretation requires static types but got `{local_type}`"
-            ),
-        }
-    })?;
-    let offsets = manual_block_offsets(sharding, grid, coordinates, &local_shape);
-    let block = offsets.iter().zip(&local_shape).map(|(&start, &size)| ArraySliceAxis::new(start, size, 1));
-    value.copy_block(local_type.clone(), &block.collect::<Vec<_>>())
-}
-
 /// Assembles a global boundary value of type `global_type` (i.e., a global output or the referent of a reference
 /// input) from the local `values` of the devices of `grid` (i.e., of the local grid of one enclosing device), which
 /// `sharding` places. Every device places its value at its tile of `sharding`. Along an active manual axis that
@@ -5152,32 +5903,6 @@ fn tiled_grid_axes(sharding: &Sharding, grid: &LockstepDeviceGrid) -> Vec<usize>
         .collect()
 }
 
-/// Validates that the final local `values` of reference input `input_index`, one per device of `grid`, which
-/// `sharding` places, are identical copies along every axis of `grid` that `sharding` neither tiles nor marks as
-/// unreduced. Each device holds its own copy of the referent along such an axis, and the reference contract of
-/// `shard_map` admits only mutations that keep the copies identical, so copies that differ indicate a body that
-/// violates it (e.g., one that writes a reference from a branch that the devices select differently) rather than
-/// values that could be assembled. Along an unreduced axis, the devices hold partial states (e.g., the logical value
-/// on the device at coordinate zero and zeros elsewhere, as split), which [`assemble_global_value`] sums instead.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::MalformedProgram`] naming the first axis along which two copies differ.
-fn validate_replicated_copies(
-    sharding: &Sharding,
-    grid: &LockstepDeviceGrid,
-    values: &[ArrayIrValue<Array>],
-    input_index: usize,
-) -> Result<(), ProgramError> {
-    if let Some(axis_name) = replicated_copy_mismatch(sharding, grid, values)? {
-        return Err(ProgramError::MalformedProgram(format!(
-            "`{SHARD_MAP_OPERATION_NAME}` reference input #{input_index} is replicated along manual axis \
-             `{axis_name}`, but its devices along that axis finished with different states",
-        )));
-    }
-    Ok(())
-}
-
 /// Returns the first active manual axis along which `values` contain different copies that `sharding` declares
 /// replicated. Tiled and unreduced axes permit distinct values. Copies are compared by their logical bytes, so the
 /// guarantee includes floating-point encodings such as signed zeros and NaN payloads.
@@ -5217,70 +5942,14 @@ fn body_has_references<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIr
         || body.contains_reference_accesses_in_closure()
 }
 
-/// Returns `true` when a value of a `shard_map` body, including the values of its nested regions, has a dynamically
-/// shaped array type. Such a value cannot cross the static boundary between the bodies of a split (refer to
-/// [`ShardMapResidualEdge::new`]), so the partial evaluation rule of [`ShardMapOperation`] cannot split the body across
-/// it, and its forward mode rule fuses such a body only when the two-map form needs a dynamically shaped residual. The
-/// values of nested regions count as well, because splitting a region operation (e.g., a `condition` whose branch
-/// computes `sin` of a dynamically shaped value) moves the residuals of its regions to the body itself, and when those
-/// residuals are dynamically shaped, the region operation (or the whole body) stays on the unknown side of the split,
-/// which would leave the primal outputs that it computes unknown.
-fn body_has_dynamically_shaped_values<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
-    body: RegionRef<'_, V, O>,
-) -> bool {
-    body.region_ids_in_closure().into_iter().any(|region_id| {
-        body.arena()[region_id.index()]
-            .atoms()
-            .iter()
-            .any(|atom| matches!(atom.r#type().as_ref(), ArrayIrType::Array(r#type) if r#type.static_shape().is_none()))
-    })
-}
-
-/// Returns the active manual axes along which this residual's local value varies.
-fn residual_manual_axes(local_type: &ArrayType, boundary: &ShardMapBoundary) -> Vec<String> {
-    boundary
-        .manual_axes()
-        .iter()
-        .filter(|axis| {
-            !boundary.checks_manual_variation()
-                || local_type.sharding().is_some_and(|sharding| sharding.varying_manual_axes().contains(*axis))
-        })
-        .cloned()
-        .collect()
-}
-
-/// Returns the local array type that carries a residual edge of local type `local_type`, which must be an array or a
-/// first-class dimension, across a `shard_map` boundary. An array residual crosses as itself. A first-class dimension
-/// residual crosses as its integer scalar value, typed as varying over every active manual axis because dimension types
-/// record no manual variation, so each device then keeps the value that it computed instead of relying on all devices
-/// agreeing. The edge records no variation along the axes of enclosing manual regions, which the operation cannot name
-/// in general (e.g., a body can derive a dimension from the index of an enclosing axis that no boundary type mentions).
-/// That omission loses no value, because every device of an enclosing manual region runs its own instances of both
-/// maps, so the edge never crosses devices along such an axis, and the value only redefines a dimension, whose type
-/// carries no variation, so no collective or transposition rule consumes the edge's variation along such an axis.
-/// [`reshape_program_boundary`] converts between the dimension and its edge on either side of the boundary.
-fn residual_edge_type(local_type: &ArrayIrType, boundary: &ShardMapBoundary) -> Result<ArrayType, ProgramError> {
-    match local_type {
-        ArrayIrType::Dimension(_) => {
-            let sharding = Sharding::replicated(boundary.mesh().clone(), 0)
-                .with_varying_manual_axes(
-                    boundary.manual_axes().iter().filter(|_| boundary.checks_manual_variation()).cloned(),
-                )
-                .map_err(TypeError::from)?;
-            Ok(ArrayType::scalar(DIMENSION_DATA_TYPE).with_sharding(sharding).map_err(TypeError::from)?)
-        }
-        _ => Ok(<&ArrayType>::try_from(local_type)?.clone()),
-    }
-}
-
 /// Rewraps a body's boundary with element-preserving conversions. Arrays only change their shape (e.g., between a
 /// varying scalar residual and its promoted type), and reference positions must remain unchanged. A first-class
 /// dimension leaves a body as its integer scalar value, placed on the mesh of the target edge and marked
 /// varying over that edge's manual axes before it is promoted, and re-enters a body by recovering that scalar and
-/// redefining the same dimension variable from it (refer to [`residual_edge_type`]). Only the first input edge that
-/// carries a given dimension identity redefines it. Later edges that carry an already defined identity reuse the value
-/// converted from that first edge, since equal identities denote equal extents and a program region rejects defining
-/// the same identity more than once.
+/// redefining the same dimension variable from it (refer to [`ShardMapResidualEdge::new`]). Only the first input edge
+/// that carries a given dimension identity redefines it. Later edges that carry an already defined identity reuse the
+/// value converted from that first edge, since equal identities denote equal extents and a program region rejects
+/// defining the same identity more than once.
 fn reshape_program_boundary<V: Value<Type = ArrayIrType>, O>(
     program: &Program<V, O, Vec<V>, Vec<V>>,
     input_types: Vec<ArrayIrType>,
@@ -5581,158 +6250,6 @@ where
             (staged_operation, vec![residual_body])
         },
     )
-}
-
-/// Returns the batched `body` of a `shard_map` whose batch is gathered on entry along `gathered_axes` (refer to
-/// [`ShardMapBatchPlacement`]) with every output that has a batch dimension position in `output_positions` sliced to
-/// the block of the batch that the executing device holds along those axes, so that the output sharding can tile the
-/// batch dimension along them. The batch dimension of extent `extent`, whose blocks have extent
-/// `extent / device_count`, is split into one dimension per gathered axis (in order, with the first one major) followed
-/// by the block dimension, the device's coordinates (i.e., one `axis_index` per gathered axis) select its block with a
-/// `dynamic_slice`, and the block is reshaped back into the batch dimension. In a checked body, the output first varies
-/// along the gathered axes through staged `parallel_vary` transitions, whose transposes are the cross-device sums that
-/// the cotangents of the selected blocks need, and the start indices take the variation of the sliced value, as
-/// `dynamic_slice` requires. An unchecked body tracks no variation, so it uses unchecked `axis_index` coordinates and
-/// leaves its outputs as they are. The new operations are lifted into the operation family through
-/// [`OperationPayloadProjection::from_payload`].
-///
-/// # Parameters
-///
-///   - `body`: Batched body whose outputs carry their batch dimension at the positions in `output_positions`.
-///   - `output_positions`: Batch dimension position of each output to slice, or `None` to keep the output as it is.
-///   - `gathered_axes`: Names and sizes of the gathered axes, in placement order.
-///   - `extent`: Static batch extent, which the product of the gathered axis sizes must divide.
-///   - `check_manual_variation`: Whether the body tracks manual variation.
-fn slice_gathered_shard_map_outputs<V: Value<Type = ArrayIrType>, O>(
-    body: &Program<V, O, Vec<V>, Vec<V>>,
-    output_positions: &[Option<usize>],
-    gathered_axes: &[(String, usize)],
-    extent: usize,
-    check_manual_variation: bool,
-) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
-where
-    O: Operation<Type = ArrayIrType> + OperationPayloadProjection,
-{
-    let operation = |payload: ErasedOperation| {
-        O::from_payload(payload).map_err(|payload| ProgramError::UnsupportedOperation {
-            message: format!(
-                "batching a `{SHARD_MAP_OPERATION_NAME}` that gathers its batch along the manual axes that its body \
-                 uses requires an operation family that holds `{}`",
-                payload.type_name(),
-            ),
-        })
-    };
-    let device_count = gathered_axes.iter().map(|(_, size)| *size).product::<usize>();
-    let block = extent / device_count;
-    let mut builder = ProgramBuilder::<V, O>::new();
-    let inputs = body.input_types().iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
-    let mut outputs = builder.splice_program(body, inputs.as_slice())?;
-    for (output, position) in outputs.iter_mut().zip(output_positions) {
-        let Some(position) = *position else {
-            continue;
-        };
-        let atom_type = |builder: &ProgramBuilder<V, O>, atom: AtomId| -> Result<ArrayType, TypeError> {
-            Ok(boundary_array_type(builder.atoms()[atom.index()].r#type().as_ref())?.clone())
-        };
-
-        // Make the output vary along the gathered axes, because the selected block differs across the devices along
-        // them. The output does not vary along them already unless its body promised replication without checking it.
-        let mut value = *output;
-        if check_manual_variation {
-            for (axis_name, _) in gathered_axes {
-                let varies = atom_type(&builder, value)?
-                    .sharding()
-                    .is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name));
-                if !varies {
-                    let vary = operation(ErasedOperation::new(ParallelVaryOperation::new(axis_name.clone())))?;
-                    value = builder.add_instruction(vary, Vec::new(), vec![value], None)?[0];
-                }
-            }
-        }
-        let value_type = atom_type(&builder, value)?;
-        let dimensions =
-            ShardMapBoundary::static_extents(&value_type, ShardMapValueKind::Output, 0).map_err(ProgramError::from)?;
-
-        // Split the batch dimension into one dimension per gathered axis followed by the block dimension, which keeps
-        // the placement of the batch dimension, while the new dimensions are replicated.
-        let mut split_dimensions = dimensions[..position].to_vec();
-        split_dimensions.extend(gathered_axes.iter().map(|(_, size)| *size));
-        split_dimensions.push(block);
-        split_dimensions.extend(&dimensions[position + 1..]);
-        let split_sharding = value_type
-            .sharding()
-            .map(|sharding| {
-                let mut sharding_dimensions = sharding.dimensions().to_vec();
-                let batch_sharding = sharding_dimensions[position].clone();
-                sharding_dimensions.splice(
-                    position..=position,
-                    std::iter::repeat_n(ShardingDimension::Replicated, gathered_axes.len())
-                        .chain(std::iter::once(batch_sharding)),
-                );
-                sharding.with_dimensions(sharding_dimensions)
-            })
-            .transpose()
-            .map_err(TypeError::from)?;
-        let split_shape = Shape::new(split_dimensions.iter().copied().map(Dimension::Static).collect());
-        let split =
-            operation(ErasedOperation::new(ReshapeOperation::new(split_shape).with_output_sharding(split_sharding)))?;
-        let split = builder.add_instruction(split, Vec::new(), vec![value], None)?[0];
-
-        // The start indices must vary along the same manual axes as the value that they slice. The coordinate along
-        // each gathered axis varies along that axis only, so it takes the other axes through staged `parallel_vary`
-        // transitions, while the zero start indices are non-differentiable constants created directly with that
-        // variation.
-        let index_sharding = value_type
-            .sharding()
-            .filter(|sharding| check_manual_variation && !sharding.varying_manual_axes().is_empty())
-            .map(|sharding| {
-                Sharding::replicated(sharding.mesh().clone(), 0)
-                    .with_varying_manual_axes(sharding.varying_manual_axes().clone())
-            })
-            .transpose()
-            .map_err(TypeError::from)?;
-        let zero_type =
-            ArrayType::scalar(DataType::U64).with_sharding(index_sharding.clone()).map_err(TypeError::from)?;
-        let zero = builder.add_instruction(
-            operation(ErasedOperation::new(ZeroOperation::new(zero_type)))?,
-            Vec::new(),
-            Vec::new(),
-            None,
-        )?[0];
-        let mut start_indices = vec![zero; split_dimensions.len()];
-        for (offset, (axis_name, _)) in gathered_axes.iter().enumerate() {
-            let mut axis_index = AxisIndexOperation::new(axis_name.clone());
-            if let Some(index_sharding) = &index_sharding {
-                axis_index = axis_index.with_mesh(index_sharding.mesh().clone());
-            }
-            let mut index =
-                builder.add_instruction(operation(ErasedOperation::new(axis_index))?, Vec::new(), Vec::new(), None)?[0];
-            if let Some(index_sharding) = &index_sharding {
-                for other_axis in index_sharding.varying_manual_axes().iter().filter(|other| *other != axis_name) {
-                    let vary = operation(ErasedOperation::new(ParallelVaryOperation::new(other_axis.clone())))?;
-                    index = builder.add_instruction(vary, Vec::new(), vec![index], None)?[0];
-                }
-            }
-            start_indices[position + offset] = index;
-        }
-        let mut sizes = split_dimensions.clone();
-        sizes[position..position + gathered_axes.len()].fill(1);
-        let mut slice_inputs = vec![split];
-        slice_inputs.extend(start_indices);
-        let slice = operation(ErasedOperation::new(DynamicSliceOperation::new(sizes)))?;
-        let sliced = builder.add_instruction(slice, Vec::new(), slice_inputs, None)?[0];
-
-        // Merge the selected block back into the batch dimension, which keeps the placement of the original value.
-        let mut block_dimensions = dimensions;
-        block_dimensions[position] = block;
-        let block_shape = Shape::new(block_dimensions.into_iter().map(Dimension::Static).collect());
-        let merge = ReshapeOperation::new(block_shape).with_output_sharding(value_type.sharding().cloned());
-        *output = builder.add_instruction(operation(ErasedOperation::new(merge))?, Vec::new(), vec![sliced], None)?[0];
-    }
-    let output_count = outputs.len();
-    builder
-        .build::<Vec<V>, Vec<V>>(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])?
-        .into_simplified()
 }
 
 /// Linearizes a `shard_map` body capture-free under the inputs' activity mask into a primal body and a tangent body
@@ -6211,605 +6728,6 @@ where
         .map(Some)
 }
 
-/// Transposes a tangent [`ShardMapOperation`] while retaining its manual region boundary.
-///
-/// The [`TranspositionDriver`] transposes the body under the linearity of the inputs and the kinds of their cotangent
-/// destinations. Known inputs supply residual values and may appear anywhere in the input boundary. The reverse
-/// boundary dualizes the shardings and boundary types of every cotangent that crosses it, including the cotangent
-/// references that it forwards for the `Reference` destinations that are not accumulated locally. Reference outputs
-/// forward input roots and therefore have no separate output cotangent slot. Structurally zero output cotangents have
-/// no slot either. Like JAX's `_shard_map_transpose`, which binds the transposed map over the nonzero output cotangents
-/// only and propagates the zero ones symbolically through the body's backward pass, the body is transposed projected
-/// onto its other outputs (and its reference outputs), so zero cotangents are neither materialized as global zeros nor
-/// as local ones, and an input that only those outputs depend on receives a structural zero.
-///
-/// The reverse contributions to a replicated destination of an input that the body does not mutate (i.e., of a value
-/// input or of a read-only reference input) accumulate in fresh per-device references, which update the caller's
-/// cotangent destination once outside the map. The cotangent reference of a replicated reference input that the body
-/// mutates crosses the transposed boundary by identity instead, like that of a sharded one (refer to
-/// [`local_accumulator_destinations`]). Bodies own replica aggregation through the adjoints of their variation
-/// operations, so a checked boundary neither normalizes output seeds nor sums replicated input contributions. A trusted
-/// output restores the variation forgotten by its boundary and divides its seed by the number of those copies before
-/// entering the typed body transpose. With body variation checks disabled, the boundary divides every output seed
-/// over its replicated axes and explicitly sums input cotangents over theirs. Returned
-/// cotangents follow the original input order, and reference, known, and ignored inputs receive structural zeros, as do
-/// the inputs whose cotangents the transposed body produces as structural zeros, which are not outputs of the
-/// transposed map (as in JAX's `_shard_map_transpose`).
-///
-/// The transposed map assembles every input cotangent under the cotangent dual of its input sharding and in device
-/// memory, while the forward boundary accepted each caller input in its own placement and memory kind. Every returned
-/// cotangent, and every frozen accumulator before it is added into a replicated reference destination, is therefore
-/// reconciled with the caller's cotangent type by [`reconcile_input_cotangent`], which is why the array projection of
-/// `O` must provide [`ReshardOperation`], [`BroadcastOperation`], and [`TransferToMemoryOperation`]. The cotangent
-/// reference of every other `Reference` destination crosses the transposed boundary by identity instead, exactly like a
-/// reference input of the forward boundary, so it is neither resharded nor transferred.
-///
-/// # Parameters
-///
-///   - `operation`: Tangent `shard_map` staged into the tangent program.
-///   - `context`: Active transpose tracing context the pullback is staged into.
-///   - `driver`: Instruction-scoped access to the body region and its recursive transposition machinery.
-///   - `inputs`: Per-input [`PartialValue`] knowledge, mirroring the body's global inputs one-to-one. The
-///     [`Unknown`](PartialValue::Unknown) entries are the input tangents, and the [`Known`](PartialValue::Known)
-///     entries carry the residual tracers the pullback reads.
-///   - `outputs`: Symbolic cotangents for the tangent `shard_map`'s outputs.
-///   - `cotangents`: Cotangent destinations of the inputs (refer to the documentation of
-///     [`TranspositionContext::cotangent_destinations`]). The body is transposed with their destination kinds, so a
-///     live reference input (i.e., one with a `Reference` destination) accumulates into its destination using the
-///     sharded or replicated policy above. A dead reference input (i.e., one with an `Ignore` destination) has no slot
-///     in the transposed body.
-fn transpose_shard_map<V: Value<Type = ArrayIrType>, O, D: TranspositionDriver<V, O>>(
-    operation: &ShardMapOperation,
-    context: &mut TracingContext<V, O>,
-    driver: &D,
-    inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-    outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
-) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
-where
-    O: Operation<Type = ArrayIrType>
-        + From<ShardMapOperation>
-        + OperationPayloadProjection
-        + OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>, Operation = O>
-        + OperationProjection<
-            ArrayType,
-            Projected: From<BroadcastOperation>
-                           + From<ReshardOperation>
-                           + From<TransferToMemoryOperation>
-                           + From<ParallelVaryOperation>
-                           + From<ConstantOperation<Array>>
-                           + From<DivOperation<ArrayType>>
-                           + From<ConvertElementTypeOperation<ArrayType>>
-                           + From<ParallelReduceOperation>,
-        > + From<ReferenceNewOperation<ArrayType, ArrayIrType>>
-        + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>
-        + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
-    TracingContext<V, O>: StagingContext<Type = ArrayIrType, Constant = V, Operation = O>,
-{
-    let input_linearity = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
-    check_count!("input", input_linearity, operation.input_types.len(), ProgramError);
-    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
-    check_count!("output", outputs, operation.output_types.len(), ProgramError);
-    let body = driver.region(0)?;
-    operation.validate_body(body)?;
-
-    // A `shard_map` with no live output cotangents and no live reference input is a zero linear map, so every input
-    // cotangent is zero. A live reference input keeps the map live, because its accumulated state cotangent flows
-    // through the transposed body even when no ordinary output cotangent does. A body with deferred work or observable
-    // rule effects also keeps it live.
-    if cotangents.can_skip_transposition(outputs, [body]) {
-        return inputs
-            .iter()
-            .map(|input| input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from))
-            .collect();
-    }
-    let local_accumulators = local_accumulator_destinations(operation, body, cotangents.kinds())?;
-
-    // A reference output forwards a body input root whose state cotangent lives in that input's cotangent reference,
-    // so it owns no cotangent slot. Every other output cotangent crosses the boundary unless it is a structural zero.
-    let value_output_cotangents = outputs
-        .iter()
-        .zip(&operation.output_types)
-        .filter_map(|(cotangent, output_type)| (!output_type.is_reference()).then_some(cotangent))
-        .collect::<Vec<_>>();
-    let zero_output_cotangents =
-        value_output_cotangents.iter().map(|cotangent| cotangent.is_zero()).collect::<Vec<_>>();
-
-    // The tangent body's flat program is transposed with `TranspositionDriver::transpose_program` using the input
-    // indices selected by `input_linearity` and their corresponding destination kinds, producing a shared program
-    // mapping `[nonzero_output_cotangents..., cotangent_references..., known_input_values...]` to
-    // `[linear_input_cotangents...]`, where the cotangent of an input with a `Reference` destination is its cotangent
-    // reference forwarded by identity and an input with an `Ignore` destination has no cotangent slot. The transposed
-    // boundary permutes and dualizes the original one to match. Its global inputs are the cotangent descriptors of the
-    // original value outputs whose cotangents are not structural zeros under the cotangent duals of their output
-    // shardings, then the cotangent references `ref<cotangent(T)>` of the inputs with `Reference` destinations that are
-    // not accumulated locally (refer to `local_accumulator_destinations`) under the cotangent duals of those inputs'
-    // input shardings, and then the known inputs' original global inputs. Its global outputs are the cotangent
-    // descriptors of the linear inputs' original global inputs under the cotangent duals of their input shardings,
-    // except for the input cotangents with `Return` destinations that the transposed program produces as structural
-    // zeros, which `zero_input_cotangents` records instead. The destination of a locally accumulated input becomes a
-    // fresh local reference inside the rebuilt body, which is frozen and returned as an array output rather than
-    // forwarded.
-    //
-    // When some value output cotangents are structural zeros, the body is transposed with those outputs flagged (refer
-    // to `TranspositionDriver::transpose_program_with_zero_seeds`). Zero output cotangents therefore never enter the
-    // transposed body, and the transposition engine propagates their absence symbolically. An input that only those
-    // outputs depend on (e.g., through `neg` or `add`) receives no cotangent, so transposition records its cotangent as
-    // a structural zero in the result metadata and omits its output without constructing a zero. Effects and deferred
-    // work of the body are kept. This is the analogue of JAX's `_shard_map_transpose`, which runs the body's backward
-    // pass on symbolic zero output cotangents. The built-in recursive driver serves every mask from the body region's
-    // retained transform cache.
-    let destination_kinds = cotangents.kinds();
-    check_count!("input", local_accumulators, operation.input_types.len(), ProgramError);
-    if !operation.boundary.checks_manual_variation()
-        && let Some(index) = (0..input_linearity.len()).find(|&index| {
-            input_linearity[index]
-                && operation.input_types[index].is_reference()
-                && destination_kinds[index] == CotangentDestinationKind::Reference
-                && !local_accumulators[index]
-                && !operation
-                    .boundary
-                    .cotangent_replication_axes(&operation.boundary.input_shardings()[index])
-                    .is_empty()
-        })
-    {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{SHARD_MAP_OPERATION_NAME}` with unchecked manual variation cannot transpose mutated reference \
-                 input #{index} replicated along an active manual axis",
-            ),
-        });
-    }
-    // The driver takes destinations only for selected inputs, so the full masks are kept below to reconstruct
-    // shardings in the original boundary's input order.
-    let (input_indices, selected_destination_kinds): (Vec<_>, Vec<_>) = input_linearity
-        .iter()
-        .zip(destination_kinds)
-        .enumerate()
-        .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
-        .unzip();
-    let seed_count = operation.output_types.iter().filter(|r#type| !r#type.is_reference()).count();
-    check_count!("output", zero_output_cotangents, seed_count, ProgramError);
-
-    // Structural zero output cotangents do not cross the transposed boundary. The driver transposes the body region
-    // itself with those outputs flagged, so the built-in recursive driver serves the request from the region's retained
-    // transform cache and a body shared by several programs is transposed once per mask. The flags follow the complete
-    // body output order, and reference outputs, which own no cotangent slot, are never flagged.
-    let mut seed_flags = zero_output_cotangents.iter();
-    let body_zero_output_cotangents = operation
-        .output_types
-        .iter()
-        .map(|output_type| !output_type.is_reference() && *seed_flags.next().unwrap())
-        .collect::<Vec<_>>();
-    let transposed = driver.transpose_program_with_zero_seeds(
-        body,
-        &input_indices,
-        &[],
-        &body_zero_output_cotangents,
-        &selected_destination_kinds,
-    )?;
-    let mut zero_input_cotangents = vec![false; input_linearity.len()];
-    for (&index, slot) in input_indices.iter().zip(transposed.cotangents()) {
-        zero_input_cotangents[index] = *slot == TransposedProgramCotangent::Zero;
-    }
-    let mut transposed_body = transposed.into_program();
-    let nonzero_seed_count = zero_output_cotangents.iter().filter(|zero| !**zero).count();
-    let boundary = operation.boundary();
-
-    // The replicated destinations of inputs that the body does not mutate accumulate locally. Each device accumulates
-    // its contribution into fresh local state, and only the enclosing map updates the caller's destination once.
-    // Existing destination contents are neither duplicated nor used as a per-device seed. With variation checking,
-    // the body's variation adjoints aggregate contributions (e.g., `parallel_vary` transposes to the mesh-form sum
-    // `parallel_reduce`), and only trusted output seeds need normalization. Unchecked bodies instead receive the
-    // conservative seed normalization and input aggregation below.
-    if local_accumulators.contains(&true) {
-        let mut builder = ProgramBuilder::new();
-        let local_destinations = destination_kinds
-            .iter()
-            .zip(&local_accumulators)
-            .filter_map(|(kind, local)| (*kind == CotangentDestinationKind::Reference).then_some(*local))
-            .collect::<Vec<_>>();
-        // The inputs that still cross the boundary are declared first, so that they keep their relative order and
-        // precede the locally materialized accumulators in the rebuilt body.
-        let input_types = transposed_body.input_types().into_owned();
-        let materialized = (0..input_types.len())
-            .map(|position| {
-                position
-                    .checked_sub(nonzero_seed_count)
-                    .and_then(|index| local_destinations.get(index))
-                    .copied()
-                    .unwrap_or(false)
-            })
-            .collect::<Vec<_>>();
-        let mut body_inputs = input_types
-            .iter()
-            .zip(&materialized)
-            .map(|(r#type, materialized)| (!materialized).then(|| builder.add_input(r#type.clone())))
-            .collect::<Vec<_>>();
-        let input_count = body_inputs.iter().flatten().count();
-        for (position, r#type) in input_types.into_iter().enumerate() {
-            if body_inputs[position].is_some() {
-                continue;
-            }
-            // A fresh local accumulator starts from a zero of the destination referent's local type. The zero is a
-            // non-differentiable constant, so it is created with the manual variation of that type directly rather
-            // than through `parallel_vary`.
-            let referent = <&ReferenceType<ArrayType>>::try_from(&r#type)?.referent().clone();
-            let zero = O::provide(ZeroOperation::new(referent.into()), &[])?;
-            let zero = builder.add_instruction(zero, Vec::new(), Vec::new(), None)?[0];
-            let reference = ReferenceNewOperation::<ArrayType, ArrayIrType>::new();
-            body_inputs[position] = Some(builder.add_instruction(reference, Vec::new(), vec![zero], None)?[0]);
-        }
-        let body_inputs = body_inputs.into_iter().flatten().collect::<Vec<_>>();
-        let mut outputs = builder.splice_program(&transposed_body, &body_inputs)?.into_iter();
-        let mut rebuilt_outputs = Vec::new();
-        let mut destination_index = 0;
-        for (index, linear) in input_linearity.iter().enumerate() {
-            let destination = if destination_kinds[index] == CotangentDestinationKind::Reference {
-                let destination = body_inputs[nonzero_seed_count + destination_index];
-                destination_index += 1;
-                Some(destination)
-            } else {
-                None
-            };
-            if !linear
-                || zero_input_cotangents[index]
-                || destination_kinds[index] == CotangentDestinationKind::Ignore
-                || (destination_kinds[index] == CotangentDestinationKind::Reference
-                    && !operation.input_types[index].is_reference()
-                    && !local_accumulators[index])
-            {
-                continue;
-            }
-            // Ordinary buffers produce no identity output. A replicated local buffer is nevertheless frozen and
-            // returned, and the enclosing rule adds it into the caller's destination once outside the map, so retrieve
-            // its local argument rather than consuming a body output.
-            let mut output = if destination_kinds[index] == CotangentDestinationKind::Reference
-                && !operation.input_types[index].is_reference()
-            {
-                destination.unwrap()
-            } else {
-                outputs.next().unwrap()
-            };
-            if local_accumulators[index] {
-                let freeze = ReferenceFreezeOperation::<ArrayType, ArrayIrType>::new();
-                output = builder.add_instruction(freeze, Vec::new(), vec![output], None)?[0];
-            }
-            rebuilt_outputs.push(output);
-        }
-        let output_count = rebuilt_outputs.len();
-        transposed_body = Arc::new(
-            builder
-                .build(rebuilt_outputs, vec![Placeholder; input_count], vec![Placeholder; output_count])?
-                .into_simplified()?,
-        );
-    }
-
-    // The transposed inputs are the cotangents of the value outputs that are not structural zeros, the cotangent
-    // references of the live inputs with `Reference` destinations that are not accumulated locally, and the known
-    // inputs, in that order.
-    let mut input_shardings = Vec::new();
-    let mut global_input_types = Vec::new();
-    let mut zero_output_cotangents = zero_output_cotangents.iter();
-    for (output_type, sharding) in operation.output_types.iter().zip(boundary.output_shardings()) {
-        if output_type.is_reference() || *zero_output_cotangents.next().unwrap() {
-            continue;
-        }
-        input_shardings.push(sharding.cotangent().map_err(TypeError::from)?);
-        global_input_types.push(output_type.cotangent()?);
-    }
-    let mut destination_positions = vec![None; input_linearity.len()];
-    for (index, kind) in destination_kinds.iter().enumerate() {
-        if *kind != CotangentDestinationKind::Reference || local_accumulators[index] {
-            continue;
-        }
-        destination_positions[index] = Some(global_input_types.len());
-        input_shardings.push(boundary.input_shardings()[index].cotangent().map_err(TypeError::from)?);
-        let cotangent_type = operation.input_types[index].cotangent()?;
-        global_input_types.push(if operation.input_types[index].is_reference() {
-            cotangent_type
-        } else {
-            ReferenceType::new(boundary_array_type(&cotangent_type)?.clone()).into()
-        });
-    }
-    for (index, _) in input_linearity.iter().enumerate().filter(|(_, linear)| !**linear) {
-        input_shardings.push(boundary.input_shardings()[index].clone());
-        global_input_types.push(operation.input_types[index].clone());
-    }
-
-    // The transposed outputs are one cotangent per linear input in input order, which is a value for a `Return`
-    // destination whose cotangent is not a structural zero, the frozen local accumulator for a `Reference` destination
-    // that is accumulated locally, and the forwarded cotangent reference for any other `Reference` destination of a
-    // reference input. Every other destination (e.g., an `Ignore` destination) has no output.
-    let mut output_shardings = Vec::new();
-    let mut global_output_types = Vec::new();
-    let mut output_forwarding = Vec::new();
-    let mut output_input_indices = Vec::new();
-    for (index, _) in input_linearity.iter().enumerate().filter(|(_, linear)| **linear) {
-        match destination_kinds[index] {
-            CotangentDestinationKind::Return if zero_input_cotangents[index] => {}
-            CotangentDestinationKind::Return => {
-                output_shardings.push(boundary.input_shardings()[index].cotangent().map_err(TypeError::from)?);
-                output_input_indices.push(index);
-                global_output_types.push(operation.input_types[index].cotangent()?);
-                output_forwarding.push(None);
-            }
-            CotangentDestinationKind::Reference
-                if operation.input_types[index].is_reference() || local_accumulators[index] =>
-            {
-                output_shardings.push(boundary.input_shardings()[index].cotangent().map_err(TypeError::from)?);
-                output_input_indices.push(index);
-                let cotangent_type = operation.input_types[index].cotangent()?;
-                if local_accumulators[index] {
-                    global_output_types.push(boundary_array_type(&cotangent_type)?.clone().into());
-                    output_forwarding.push(None);
-                } else {
-                    global_output_types.push(cotangent_type);
-                    output_forwarding.push(destination_positions[index]);
-                }
-            }
-            CotangentDestinationKind::Reference | CotangentDestinationKind::Ignore => {}
-        }
-    }
-    let boundary = ShardMapBoundary::from_validated_shardings(
-        boundary.mesh().clone(),
-        input_shardings,
-        output_shardings,
-        boundary.manual_axes().to_vec(),
-    )
-    .with_manual_variation_checks(ManualVariationChecks {
-        manual_variation: operation.boundary.checks_manual_variation(),
-        output_replication: true,
-    });
-    // A trusted replicated output is the same logical result on several devices, while the typed body transpose
-    // expects a separate seed for each potentially varying copy. Split its seed equally between precisely the axes
-    // whose variation the forward boundary forgot. Checked-body adjoints own input aggregation; an unchecked body
-    // instead needs seed normalization over every replicated axis and explicit input aggregation below.
-    let body_output_types = body.output_types();
-    let seed_axes = body_output_types
-        .iter()
-        .enumerate()
-        .filter(|(index, r#type)| !r#type.is_reference() && !body_zero_output_cotangents[*index])
-        .map(|(index, r#type)| {
-            Ok(if operation.boundary.checks_manual_variation() {
-                operation.boundary.unproven_output_replication_axes(index, boundary_array_type(r#type)?)
-            } else {
-                // The devices along an axis that the output is unreduced along hold separate summands of the output,
-                // each of which receives the whole cotangent, so only the other untiled axes divide the seed.
-                operation.boundary.cotangent_replication_axes(&operation.boundary.output_shardings()[index])
-            })
-        })
-        .collect::<Result<Vec<_>, ProgramError>>()?;
-    if !operation.boundary.checks_manual_variation() || seed_axes.iter().any(|axes| !axes.is_empty()) {
-        let mut builder = ProgramBuilder::<V, O>::new();
-        let mut inputs = Vec::with_capacity(transposed_body.input_count());
-        for (index, source) in transposed_body.input_types().iter().enumerate() {
-            let Some(axes) = seed_axes.get(index).filter(|axes| !axes.is_empty()) else {
-                inputs.push(builder.add_input(source.clone()));
-                continue;
-            };
-            let target = boundary_array_type(source)?;
-            let local_type = if operation.boundary.checks_manual_variation() {
-                let sharding = target.sharding().unwrap();
-                let invariant_axes = sharding.varying_manual_axes().iter().filter(|axis| !axes.contains(axis)).cloned();
-                target
-                    .clone()
-                    .with_sharding(sharding.clone().with_varying_manual_axes(invariant_axes).map_err(TypeError::from)?)
-                    .map_err(TypeError::from)?
-            } else {
-                target.clone()
-            };
-            let mut seed = builder.add_input(local_type.into());
-            for axis in axes.iter().filter(|_| operation.boundary.checks_manual_variation()) {
-                let vary: <O as OperationProjection<ArrayType>>::Projected =
-                    ParallelVaryOperation::new(axis.clone()).into();
-                seed = builder.add_instruction(O::from(vary), Vec::new(), vec![seed], None)?[0];
-            }
-            let divisor = axes.iter().map(|axis| boundary.mesh().axis_size(axis).unwrap() as f64).product::<f64>();
-            // Normalize low-precision cotangents in `f32`, so a device count outside their finite range does not turn
-            // the divisor into infinity, and a small reciprocal does not underflow before multiplying a large seed.
-            let normalization_data_type =
-                if target.data_type().is_floating_point() && target.data_type().bit_width() < 32 {
-                    DataType::F32
-                } else {
-                    target.data_type()
-                };
-            if normalization_data_type != target.data_type() {
-                let convert: <O as OperationProjection<ArrayType>>::Projected =
-                    ConvertElementTypeOperation::<ArrayType>::new(normalization_data_type, false).into();
-                seed = builder.add_instruction(O::from(convert), Vec::new(), vec![seed], None)?[0];
-            }
-            let coefficient_sharding = target
-                .sharding()
-                .map(|sharding| {
-                    sharding
-                        .clone()
-                        .with_unreduced_axes(Vec::<String>::new())?
-                        .with_reduced_axes(sharding.unreduced_axes().union(sharding.reduced_axes()).cloned())
-                })
-                .transpose()
-                .map_err(TypeError::from)?;
-            let divisor_sharding = coefficient_sharding
-                .as_ref()
-                .map(|sharding| sharding.with_dimensions(Vec::new()))
-                .transpose()
-                .map_err(TypeError::from)?;
-            let scalar_type = ArrayType::scalar(normalization_data_type)
-                .with_memory(target.memory())
-                .with_sharding(divisor_sharding)
-                .map_err(TypeError::from)?;
-            // The divisor is a nondifferentiable literal, so its variation is created directly without an adjoint.
-            let divisor = EagerContext::<Array, ArrayOperation<Array>>::new().fill(&scalar_type, divisor)?;
-            let constant: <O as OperationProjection<ArrayType>>::Projected = ConstantOperation::new(divisor).into();
-            let divisor = builder.add_instruction(O::from(constant), Vec::new(), Vec::new(), None)?[0];
-            let divisor_type = target
-                .clone()
-                .with_data_type(normalization_data_type)
-                .with_sharding(coefficient_sharding)
-                .map_err(TypeError::from)?;
-            let broadcast: <O as OperationProjection<ArrayType>>::Projected =
-                BroadcastOperation::new(divisor_type, Vec::new()).into();
-            let divisor = builder.add_instruction(O::from(broadcast), Vec::new(), vec![divisor], None)?[0];
-            let divide: <O as OperationProjection<ArrayType>>::Projected = DivOperation::<ArrayType>::new().into();
-            seed = builder.add_instruction(O::from(divide), Vec::new(), vec![seed, divisor], None)?[0];
-            if normalization_data_type != target.data_type() {
-                let convert: <O as OperationProjection<ArrayType>>::Projected =
-                    ConvertElementTypeOperation::<ArrayType>::new(target.data_type(), false).into();
-                seed = builder.add_instruction(O::from(convert), Vec::new(), vec![seed], None)?[0];
-            }
-            inputs.push(seed);
-        }
-        let mut outputs = builder.splice_program(&transposed_body, &inputs)?;
-        if !operation.boundary.checks_manual_variation() {
-            for (position, output) in outputs.iter_mut().enumerate() {
-                let axes = boundary.cotangent_replication_axes(&boundary.output_shardings()[position]);
-                if !axes.is_empty()
-                    && operation.input_types[output_input_indices[position]].is_reference()
-                    && !local_accumulators[output_input_indices[position]]
-                {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "`{SHARD_MAP_OPERATION_NAME}` cannot aggregate a replicated gradient reference"
-                        ),
-                    });
-                }
-                for axis in axes {
-                    let reduce: <O as OperationProjection<ArrayType>>::Projected =
-                        ParallelReduceOperation::new(ReductionKind::Sum, axis).into();
-                    *output = builder.add_instruction(O::from(reduce), Vec::new(), vec![*output], None)?[0];
-                }
-            }
-        }
-        let output_count = outputs.len();
-        transposed_body = Arc::new(
-            builder
-                .build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_count])?
-                .into_simplified()?,
-        );
-    }
-    let transposed_operation = ShardMapOperation::from_boundary(boundary, global_input_types, global_output_types)
-        .with_output_forwarding(output_forwarding)?;
-
-    // Stage a fresh `shard_map` over the transposed body on the nonzero output cotangents, followed by the cotangent
-    // references and the known input values (i.e., `[nonzero_output_cotangents..., references..., known_inputs...]`).
-    // Its outputs are the cotangents of the linear inputs.
-    let mut transposed_inputs = value_output_cotangents
-        .into_iter()
-        .filter_map(|cotangent| cotangent.as_value().cloned())
-        .collect::<Vec<_>>();
-    let mut reference_destinations = cotangents.references().iter();
-    for (index, kind) in cotangents.kinds().iter().enumerate() {
-        if *kind == CotangentDestinationKind::Reference {
-            let reference = reference_destinations.next().unwrap();
-            if !local_accumulators[index] {
-                transposed_inputs.push(reference.clone());
-            }
-        }
-    }
-    transposed_inputs.extend(inputs.iter().filter_map(PartialValue::as_known).cloned());
-
-    // The transposed body is bound as the shared handle the driver returned, so repeated binds of one transposed
-    // body intern by `Arc` identity instead of copying the program into the trace again. A transposed map without
-    // outputs and without observable effects (i.e., one whose input cotangents are all structural zeros) is not staged.
-    let input_cotangents =
-        if transposed_operation.output_types.is_empty() && !transposed_body.effects().is_retained_when_unused() {
-            Vec::new()
-        } else {
-            context.stage_operation(
-                transposed_operation,
-                AttachedRegions::Callees(&[transposed_body]),
-                transposed_inputs.as_slice(),
-            )?
-        };
-    let output_count = (0..inputs.len())
-        .filter(|&index| {
-            input_linearity[index]
-                && ((cotangents.returns_cotangent(index) && !zero_input_cotangents[index]) || local_accumulators[index])
-        })
-        .count();
-    check_count!("output", input_cotangents, output_count, ProgramError);
-
-    // Reassemble one cotangent per input. The known inputs and the linear inputs whose cotangents are structural zeros
-    // carry structural zeros, while the other linear input tangents receive the transposed `shard_map`'s outputs in
-    // body input order. A live reference tangent's output is its cotangent reference, whose contents were accumulated
-    // in place, and a dead one has no output, so every reference input receives a structural zero.
-    let mut input_cotangents = input_cotangents.into_iter();
-    let mut reference_destinations = cotangents.references().iter();
-    input_linearity
-        .iter()
-        .zip(inputs)
-        .enumerate()
-        .map(|(index, (&linear, input))| match cotangents.kind(index) {
-            CotangentDestinationKind::Return if linear && !zero_input_cotangents[index] => {
-                let contribution = input_cotangents.next().unwrap();
-                let target = input.r#type().cotangent()?;
-                Ok(MaybeZero::Value(reconcile_input_cotangent(context, index, contribution, &target)?))
-            }
-            CotangentDestinationKind::Reference => {
-                let destination = reference_destinations.next().unwrap();
-                if cotangents.is_reference_input(index) || local_accumulators[index] {
-                    let cotangent = input_cotangents.next().unwrap();
-                    // The frozen local accumulator of a replicated destination leaves the map under the input sharding
-                    // in device memory, like a returned cotangent, so it is reconciled with the referent type of the
-                    // caller's destination before it is added into that destination once.
-                    if local_accumulators[index] {
-                        let destination_type = destination.r#type();
-                        let referent = <&ReferenceType<ArrayType>>::try_from(destination_type.as_ref())?.referent();
-                        let target = ArrayIrType::Array(referent.clone());
-                        let cotangent = reconcile_input_cotangent(context, index, cotangent, &target)?;
-                        context.bind(
-                            ReferenceAddUpdateOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new(),
-                            Vec::new(),
-                            &[destination.clone(), cotangent],
-                        )?;
-                    }
-                }
-                input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
-            }
-            CotangentDestinationKind::Return | CotangentDestinationKind::Ignore => {
-                input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
-            }
-        })
-        .collect()
-}
-
-/// Returns one entry per input of the tangent `operation` recording whether its cotangent destination accumulates in a
-/// fresh local reference that updates the caller's destination once outside the transposed map (refer to
-/// [`transpose_shard_map`]). That is the case for a [`Reference`](CotangentDestinationKind::Reference)
-/// destination of an input that is replicated along an active manual axis, unless the input is a reference that `body`
-/// mutates. A local accumulator starts from zero, and its final value is added into the caller's destination once,
-/// which is correct whenever the transposed body only adds into the cotangent of the input, as it does for a value
-/// input or for a reference that the body only reads. It is not correct for a reference that the body mutates, whose
-/// transposed mutations may also overwrite the incoming cotangent (e.g., the transpose of a write zeroes the cotangent
-/// of the overwritten state), which an accumulator that starts from zero cannot express. The cotangent reference of
-/// such an input crosses the transposed boundary by identity instead, like that of a sharded reference. This is sound
-/// because a body mutates a replicated reference with invariant values at invariant indices only (refer to the
-/// "Replicated writes are invariant" bullet of the module documentation), so the transposed body updates every device's
-/// copy of the destination identically.
-fn local_accumulator_destinations<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
-    operation: &ShardMapOperation,
-    body: RegionRef<'_, V, O>,
-    destination_kinds: &[CotangentDestinationKind],
-) -> Result<Vec<bool>, ProgramError> {
-    check_count!("input", destination_kinds, operation.input_types.len(), ProgramError);
-    let analysis = body.reference_analysis(0)?;
-    Ok(destination_kinds
-        .iter()
-        .enumerate()
-        .map(|(index, kind)| {
-            let mutated = operation.input_types[index].is_reference()
-                && analysis.is_mutated(ReferenceRoot::RegionInput { region: body.id(), input_index: index });
-            *kind == CotangentDestinationKind::Reference
-                && operation.boundary.manual_axes.iter().any(|axis_name| {
-                    !operation.boundary.input_shardings[index].dimensions().iter().any(
-                        |dimension| matches!(dimension, ShardingDimension::Sharded(axes) if axes.contains(axis_name)),
-                    )
-                })
-                && !mutated
-        })
-        .collect())
-}
-
 /// Reconciles the cotangent `contribution` that a transposed `shard_map` assembled for input `input_index` with the
 /// caller's cotangent type `target`, and returns the reconciled cotangent.
 ///
@@ -7104,9 +7022,11 @@ where
             Ok(boundary.with_caller_mesh(caller_mesh.clone()).with_manual_variation_checks(checks))
         }
     });
-    let (operation, body) = trace_shard_map_body::<C, _>(
-        boundary,
-        |body_context, local_inputs| {
+    // The traced body is compiled once per domain, so its callback is passed with its type erased. The callback is
+    // invoked exactly once.
+    let mut function = Some(
+        |body_context: &ProjectedContext<DomainTracingContext<C>, ArrayType>,
+         local_inputs: Vec<ProjectedValue<ArrayType, DomainTracer<C>>>| {
             let local_inputs = Input::To::<ProjectedValue<ArrayType, DomainTracer<C>>>::from_parameters(
                 input_structure,
                 local_inputs,
@@ -7115,6 +7035,10 @@ where
             validate_parameter_structure(&output_paths, &local_outputs)?;
             Ok(local_outputs.into_parameters().collect())
         },
+    );
+    let (operation, body) = trace_shard_map_body::<C>(
+        boundary,
+        &mut |body_context, local_inputs| function.take().unwrap()(body_context, local_inputs),
         rebuild_boundary.as_ref().map(|rebuild| rebuild as &dyn Fn(&[ArrayType]) -> Result<_, _>),
         global_input_types,
         outer_named_axes,
@@ -7195,151 +7119,117 @@ fn shard_map_within_named_axes(
 /// # Parameters
 ///
 ///   - `boundary`: Boundary metadata of the traced body.
-///   - `function`: Flat body closure over the body context and the local `shard_map` values.
+///   - `function`: Flat body closure over the body context and the local `shard_map` values, which is invoked exactly
+///     once. Its type is erased so that this function is compiled once per domain rather than once per closure type.
 ///   - `rebuild_boundary`: Optional function that rebuilds `boundary` from the local output types of the body, for a
 ///     map whose output shardings depend on its output ranks (refer to the `shard_map_along` function of
 ///     [`ShardMap`]). It replaces `boundary` once `function` returns.
 ///   - `global_input_types`: Caller's global input types, in the order of the input shardings.
 ///   - `outer_named_axes`: Enclosing bindings of named axes that the body inherits.
-#[inline]
-fn trace_shard_map_body<C: Domain<Type = ArrayIrType>, F>(
+fn trace_shard_map_body<C: Domain<Type = ArrayIrType>>(
     boundary: ShardMapBoundary,
-    function: F,
+    function: &mut dyn FnMut(
+        &ProjectedContext<DomainTracingContext<C>, ArrayType>,
+        Vec<ProjectedValue<ArrayType, DomainTracer<C>>>,
+    ) -> Result<Vec<ProjectedValue<ArrayType, DomainTracer<C>>>, ProgramError>,
     rebuild_boundary: Option<&dyn Fn(&[ArrayType]) -> Result<ShardMapBoundary, ShardMapError>>,
     global_input_types: Vec<ArrayType>,
-    outer_named_axes: Vec<(String, NamedAxis)>,
+    mut outer_named_axes: Vec<(String, NamedAxis)>,
 ) -> Result<(ShardMapOperation, FlatProgram<C>), ShardMapError>
 where
     C::Operation: OperationPayloadProjection,
     ProjectedValue<ArrayType, DomainTracer<C>>: ParallelVary,
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
-    F: FnOnce(
-        &ProjectedContext<DomainTracingContext<C>, ArrayType>,
-        Vec<ProjectedValue<ArrayType, DomainTracer<C>>>,
-    ) -> Result<Vec<ProjectedValue<ArrayType, DomainTracer<C>>>, ProgramError>,
 {
-    /// Internal helper that traces like [`trace_shard_map_body`] with the callback type erased. This is the body of
-    /// that function, which only wraps its callback, so that this body is compiled once per domain rather than once per
-    /// callback type. The callback is invoked exactly once.
-    fn inner<C: Domain<Type = ArrayIrType>>(
-        boundary: ShardMapBoundary,
-        function: &mut dyn FnMut(
-            &ProjectedContext<DomainTracingContext<C>, ArrayType>,
-            Vec<ProjectedValue<ArrayType, DomainTracer<C>>>,
-        ) -> Result<Vec<ProjectedValue<ArrayType, DomainTracer<C>>>, ProgramError>,
-        rebuild_boundary: Option<&dyn Fn(&[ArrayType]) -> Result<ShardMapBoundary, ShardMapError>>,
-        global_input_types: Vec<ArrayType>,
-        mut outer_named_axes: Vec<(String, NamedAxis)>,
-    ) -> Result<(ShardMapOperation, FlatProgram<C>), ShardMapError>
-    where
-        C::Operation: OperationPayloadProjection,
-        ProjectedValue<ArrayType, DomainTracer<C>>: ParallelVary,
-        TracingContext<C::Constant, C::Operation>:
-            StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
-    {
-        if global_input_types.len() != boundary.input_shardings().len() {
-            return Err(ShardMapError::InputTypeCountMismatch {
-                expected: boundary.input_shardings().len(),
-                actual: global_input_types.len(),
-            });
-        }
-        let global_input_types = global_input_types
-            .iter()
-            .enumerate()
-            .map(|(index, input_type)| boundary.global_input_type(index, input_type))
-            .collect::<Result<Vec<_>, _>>()?;
-        let local_input_types = global_input_types
-            .iter()
-            .enumerate()
-            .map(|(index, input_type)| boundary.local_input_type(index, input_type))
-            .collect::<Result<Vec<_>, _>>()?;
+    if global_input_types.len() != boundary.input_shardings().len() {
+        return Err(ShardMapError::InputTypeCountMismatch {
+            expected: boundary.input_shardings().len(),
+            actual: global_input_types.len(),
+        });
+    }
+    let global_input_types = global_input_types
+        .iter()
+        .enumerate()
+        .map(|(index, input_type)| boundary.global_input_type(index, input_type))
+        .collect::<Result<Vec<_>, _>>()?;
+    let local_input_types = global_input_types
+        .iter()
+        .enumerate()
+        .map(|(index, input_type)| boundary.local_input_type(index, input_type))
+        .collect::<Result<Vec<_>, _>>()?;
 
-        // The active manual axes of this map shadow the enclosing bindings of the same names, and they come first,
-        // because named axes are enumerated innermost first (refer to `NamedAxes::named_axes`). The body is also seeded
-        // with the mesh of this map as its default mesh (refer to `MeshContext::default_mesh`), which nested maps
-        // without a mesh use regardless of how named batching levels in the body shadow the manual axes.
-        let mesh = boundary.mesh();
-        outer_named_axes.retain(|(name, _)| !boundary.manual_axes().contains(name));
-        let enclosing_named_axes = std::mem::take(&mut outer_named_axes);
-        outer_named_axes.extend(boundary.manual_axes().iter().map(|name| {
-            let axis = mesh.axis_index(name).unwrap();
-            let size = mesh.axis_size(name).unwrap();
-            let binding = NamedAxis::Mesh {
-                mesh: mesh.clone(),
-                axis,
-                size,
-                checks_manual_variation: boundary.checks_manual_variation(),
+    // The active manual axes of this map shadow the enclosing bindings of the same names, and they come first,
+    // because named axes are enumerated innermost first (refer to `NamedAxes::named_axes`). The body is also seeded
+    // with the mesh of this map as its default mesh (refer to `MeshContext::default_mesh`), which nested maps
+    // without a mesh use regardless of how named batching levels in the body shadow the manual axes.
+    let mesh = boundary.mesh();
+    outer_named_axes.retain(|(name, _)| !boundary.manual_axes().contains(name));
+    let enclosing_named_axes = std::mem::take(&mut outer_named_axes);
+    outer_named_axes.extend(boundary.manual_axes().iter().map(|name| {
+        let axis = mesh.axis_index(name).unwrap();
+        let size = mesh.axis_size(name).unwrap();
+        let binding = NamedAxis::Mesh {
+            mesh: mesh.clone(),
+            axis,
+            size,
+            checks_manual_variation: boundary.checks_manual_variation(),
+        };
+        (name.clone(), binding)
+    }));
+    outer_named_axes.extend(enclosing_named_axes);
+
+    // The body's outputs determine the rebuilt boundary, which the checks below then use in place of `boundary`.
+    let rebuilt_boundary = OnceCell::new();
+    let (_, body) = DomainTracingContext::<C>::trace_with_context_in_scope(
+        |context: &DomainTracingContext<C>, local_inputs: Vec<DomainTracer<C>>| {
+            let local_inputs = local_inputs
+                .into_iter()
+                .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
+                .collect::<Result<Vec<_>, _>>()?;
+            let local_outputs =
+                function(&ProjectedContext::<DomainTracingContext<C>, ArrayType>::new(context.clone()), local_inputs)?;
+            let boundary = match rebuild_boundary {
+                Some(rebuild_boundary) => {
+                    let output_types =
+                        local_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
+                    let _ = rebuilt_boundary.set(rebuild_boundary(&output_types)?);
+                    rebuilt_boundary.get().unwrap()
+                }
+                None => &boundary,
             };
-            (name.clone(), binding)
-        }));
-        outer_named_axes.extend(enclosing_named_axes);
 
-        // The body's outputs determine the rebuilt boundary, which the checks below then use in place of `boundary`.
-        let rebuilt_boundary = OnceCell::new();
-        let (_, body) = DomainTracingContext::<C>::trace_with_context_in_scope(
-            |context: &DomainTracingContext<C>, local_inputs: Vec<DomainTracer<C>>| {
-                let local_inputs = local_inputs
-                    .into_iter()
-                    .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let local_outputs = function(
-                    &ProjectedContext::<DomainTracingContext<C>, ArrayType>::new(context.clone()),
-                    local_inputs,
-                )?;
-                let boundary = match rebuild_boundary {
-                    Some(rebuild_boundary) => {
-                        let output_types =
-                            local_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
-                        let _ = rebuilt_boundary.set(rebuild_boundary(&output_types)?);
-                        rebuilt_boundary.get().unwrap()
-                    }
-                    None => &boundary,
-                };
-
-                // Outputs beyond the output shardings are kept as they are, so that `from_program` reports the count
-                // mismatch below.
-                local_outputs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, mut output)| {
-                        if boundary.checks_manual_variation()
-                            && let Some(sharding) = boundary.output_shardings().get(index)
-                        {
-                            for axis in boundary.tiled_manual_axes(sharding) {
-                                let output_sharding = output.r#type().sharding().cloned();
-                                if !output_sharding
-                                    .is_some_and(|sharding| sharding.varying_manual_axes().contains(&axis))
-                                {
-                                    output = output.parallel_vary(&axis)?;
-                                }
+            // Outputs beyond the output shardings are kept as they are, so that `from_program` reports the count
+            // mismatch below.
+            local_outputs
+                .into_iter()
+                .enumerate()
+                .map(|(index, mut output)| {
+                    if boundary.checks_manual_variation()
+                        && let Some(sharding) = boundary.output_shardings().get(index)
+                    {
+                        for axis in boundary.tiled_manual_axes(sharding) {
+                            let output_sharding = output.r#type().sharding().cloned();
+                            if !output_sharding.is_some_and(|sharding| sharding.varying_manual_axes().contains(&axis)) {
+                                output = output.parallel_vary(&axis)?;
                             }
                         }
-                        Ok(output.into_value())
-                    })
-                    .collect::<Result<Vec<_>, ProgramError>>()
-            },
-            local_input_types.iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>(),
-            TracingScope::new(outer_named_axes, Some(mesh.clone())),
-        )?;
-        let boundary = rebuilt_boundary.into_inner().unwrap_or(boundary);
-        let body = body.into_simplified()?;
-        let operation = ShardMapOperation::from_program(
-            &body,
-            global_input_types.iter().cloned().map(ArrayIrType::Array).collect(),
-            boundary,
-        )?;
-        Ok((operation, body))
-    }
-
-    let mut function = Some(function);
-    inner::<C>(
+                    }
+                    Ok(output.into_value())
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()
+        },
+        local_input_types.iter().cloned().map(ArrayIrType::Array).collect::<Vec<_>>(),
+        TracingScope::new(outer_named_axes, Some(mesh.clone())),
+    )?;
+    let boundary = rebuilt_boundary.into_inner().unwrap_or(boundary);
+    let body = body.into_simplified()?;
+    let operation = ShardMapOperation::from_program(
+        &body,
+        global_input_types.iter().cloned().map(ArrayIrType::Array).collect(),
         boundary,
-        &mut |context, inputs| function.take().unwrap()(context, inputs),
-        rebuild_boundary,
-        global_input_types,
-        outer_named_axes,
-    )
+    )?;
+    Ok((operation, body))
 }
 
 #[cfg(test)]
@@ -15264,19 +15154,15 @@ mod tests {
         let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
         let replicated = Sharding::replicated(manual_mesh(), 1);
         let copy = |elements: &[f32]| f32_value(f32_vector_type(2), elements);
-        assert_eq!(validate_replicated_copies(&replicated, &grid, &[copy(&[1.0, 2.0]), copy(&[1.0, 2.0])], 0), Ok(()));
+        assert_eq!(replicated_copy_mismatch(&replicated, &grid, &[copy(&[1.0, 2.0]), copy(&[1.0, 2.0])]), Ok(None));
         assert_eq!(
-            validate_replicated_copies(&replicated, &grid, &[copy(&[1.0, 2.0]), copy(&[1.0, 3.0])], 0),
-            Err(ProgramError::MalformedProgram(
-                "`shard_map` reference input #0 is replicated along manual axis `x`, but its devices along that axis \
-                 finished with different states"
-                    .to_string(),
-            )),
+            replicated_copy_mismatch(&replicated, &grid, &[copy(&[1.0, 2.0]), copy(&[1.0, 3.0])]),
+            Ok(Some("x")),
         );
 
         // Along an unreduced axis, the devices hold partial states, which differ without violating the contract.
         let unreduced = replicated.with_unreduced_axes(["x"]).unwrap();
-        assert_eq!(validate_replicated_copies(&unreduced, &grid, &[copy(&[1.0, 2.0]), copy(&[0.0, 0.0])], 0), Ok(()));
+        assert_eq!(replicated_copy_mismatch(&unreduced, &grid, &[copy(&[1.0, 2.0]), copy(&[0.0, 0.0])]), Ok(None));
     }
 
     #[test]
@@ -23248,65 +23134,6 @@ mod tests {
     }
 
     #[test]
-    fn test_local_accumulator_destinations() {
-        let mesh = manual_mesh_2x2();
-        let boundary = ShardMapBoundary::new(
-            mesh.clone(),
-            vec![
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap(),
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap(),
-                Sharding::replicated(mesh, 1),
-            ],
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
-        let input_types = vec![f32_vector_type(4); 3];
-        let local_types = input_types
-            .iter()
-            .enumerate()
-            .map(|(index, input_type)| ArrayIrType::Array(boundary.local_input_type(index, input_type).unwrap()))
-            .collect();
-        let body = build_program(local_types, |_, _| Vec::new());
-        assert_eq!(
-            body.to_string(),
-            indoc! {"
-                lambda %0:f32[2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x'}}], \
-                %1:f32[1][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}], varying_manual={'x', 'y'}}], \
-                %2:f32[4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}]}] .
-                in ()"
-            },
-        );
-        let operation = ShardMapOperation::from_program(
-            &body,
-            input_types.into_iter().map(ArrayIrType::Array).collect::<Vec<_>>(),
-            boundary,
-        )
-        .unwrap();
-        // Reference destinations can accumulate locally only when some manual axis replicates the input.
-        assert_eq!(
-            local_accumulator_destinations(
-                &operation,
-                body.entry_region_ref(),
-                &[CotangentDestinationKind::Reference; 3]
-            ),
-            Ok(vec![true, false, true]),
-        );
-        assert_eq!(
-            local_accumulator_destinations(
-                &operation,
-                body.entry_region_ref(),
-                &[
-                    CotangentDestinationKind::Return,
-                    CotangentDestinationKind::Ignore,
-                    CotangentDestinationKind::Reference
-                ],
-            ),
-            Ok(vec![false, false, true]),
-        );
-    }
-
-    #[test]
     fn test_shard_map_transposition() {
         // Reverse mode through a `shard_map` reaches the transposition rule through the array IR operation family's
         // derived transposition dispatcher, which stages a transposed `shard_map` instead of reporting the operation as
@@ -24286,17 +24113,23 @@ mod tests {
                 .unwrap();
         let operation =
             ShardMapOperation::from_boundary(boundary, vec![tangent_type.clone()], vec![tangent_type.clone()]);
-        let mut context = TestContext::new();
+        let context = TestContext::new();
         let known = context.input(ArrayIrType::Array(tangent_type.clone()));
-        let cotangents = transpose_shard_map(
-            &operation,
-            &mut context,
-            &driver,
-            &[PartialValue::Known(known)],
-            &[MaybeZero::Zero(ArrayIrType::Array(tangent_type))],
-            &CotangentDestinations::without_references([true]),
-        )
-        .unwrap();
+        let cotangents = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[PartialValue::Known(known)];
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[true]).unwrap();
+            TransposableOperation::transpose(
+                &operation,
+                &mut rule_context,
+                &driver,
+                rule_inputs,
+                &[MaybeZero::Zero(ArrayIrType::Array(tangent_type))],
+                &accumulators,
+            )
+            .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &ArrayIrType::Array(cotangent_type)));
     }
 
@@ -24592,21 +24425,27 @@ mod tests {
             vec![value_type.clone()],
             vec![value_type.clone(), predicate_type.clone()],
         );
-        let mut context = TestContext::new();
+        let context = TestContext::new();
         let value_cotangent = context.input(ArrayIrType::Array(value_type.clone()));
 
-        let contributions = transpose_shard_map(
-            &operation,
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(ArrayIrType::Array(value_type.clone()))],
-            &[
-                MaybeZero::Value(value_cotangent),
-                MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
-            ],
-            &CotangentDestinations::without_references([true]),
-        )
-        .unwrap();
+        let contributions = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[PartialValue::Unknown(ArrayIrType::Array(value_type.clone()))];
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[true]).unwrap();
+            TransposableOperation::transpose(
+                &operation,
+                &mut rule_context,
+                &driver,
+                rule_inputs,
+                &[
+                    MaybeZero::Value(value_cotangent),
+                    MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
+                ],
+                &accumulators,
+            )
+            .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         let [MaybeZero::Value(contribution)] = &contributions[..] else {
             panic!("expected one materialized input cotangent");
         };
@@ -25032,18 +24871,25 @@ mod tests {
             vec![global_type.clone(), global_type.clone()],
             vec![global_type.clone()],
         );
-        let mut context = TestContext::new();
+        let context = TestContext::new();
         let output_cotangent = context.input(ArrayIrType::Array(global_type.cotangent().unwrap()));
         let residual = context.input(ArrayIrType::Array(global_type.clone()));
-        let cotangents = transpose_shard_map(
-            &operation,
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(ArrayIrType::Array(global_type.clone())), PartialValue::Known(residual)],
-            &[MaybeZero::Value(output_cotangent)],
-            &CotangentDestinations::without_references([true, false]),
-        )
-        .unwrap();
+        let cotangents = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs =
+                &[PartialValue::Unknown(ArrayIrType::Array(global_type.clone())), PartialValue::Known(residual)];
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[true, false]).unwrap();
+            TransposableOperation::transpose(
+                &operation,
+                &mut rule_context,
+                &driver,
+                rule_inputs,
+                &[MaybeZero::Value(output_cotangent)],
+                &accumulators,
+            )
+            .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         let [MaybeZero::Value(cotangent), MaybeZero::Zero(_)] = &cotangents[..] else {
             panic!("expected one materialized input cotangent followed by the known residual's zero");
         };
