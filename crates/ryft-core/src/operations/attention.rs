@@ -181,6 +181,11 @@ pub trait AttentionUniverse<V>: Type {
     /// Returns the extent of `value` along `axis`.
     fn extent(value: &V, axis: usize) -> Result<Self::Extent, ProgramError>;
 
+    /// Returns the extent of every axis of `value`, in axis order.
+    fn extents(value: &V) -> Result<Vec<Self::Extent>, ProgramError> {
+        (0..Self::array_type(value)?.rank()).map(|axis| Self::extent(value, axis)).collect()
+    }
+
     /// Returns the constant extent `extent`, constructed next to `value` (i.e., in its context).
     fn constant_extent(value: &V, extent: usize) -> Result<Self::Extent, ProgramError>;
 
@@ -294,7 +299,7 @@ where
             .map(|sharding| sharding.with_broadcasted_dimensions(extents.len(), axes))
             .transpose()
             .map_err(|error| TypeError::invalid(error.to_string()))?;
-        let output_type = ArrayType::new(r#type.data_type(), static_shape(extents))
+        let output_type = ArrayType::new(r#type.data_type(), Shape::from(extents))
             .with_memory(r#type.memory())
             .with_sharding(sharding)
             .map_err(|error| TypeError::invalid(error.to_string()))?;
@@ -303,7 +308,7 @@ where
 
     #[inline]
     fn reshape(value: &A, extents: &[usize]) -> Result<A, ProgramError> {
-        value.reshape(static_shape(extents))
+        value.reshape(extents)
     }
 
     fn iota(target: &A, axis: usize) -> Result<A, ProgramError> {
@@ -669,6 +674,43 @@ impl AttentionKey {
             AttentionDefinitionKind::Backward => (DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, None),
         };
         attention_composite_key(name, self.configuration, self.signature, residual)
+    }
+
+    /// Returns the batching roles of the canonical inputs of this definition. Dropout states never reach batching
+    /// rules, because definitions with dropout are batched structurally.
+    fn batch_input_roles(&self) -> Vec<AttentionBatchInput> {
+        let mut roles = vec![AttentionBatchInput::Tensor; 3];
+        roles.extend(self.signature.has_bias().then_some(AttentionBatchInput::Score));
+        roles.extend(self.signature.has_mask().then_some(AttentionBatchInput::Score));
+        roles.extend(self.signature.has_query_sequence_lengths().then_some(AttentionBatchInput::Length));
+        roles.extend(self.signature.has_key_value_sequence_lengths().then_some(AttentionBatchInput::Length));
+        if self.kind == AttentionDefinitionKind::Backward {
+            roles.extend([AttentionBatchInput::Tensor, AttentionBatchInput::Residual, AttentionBatchInput::Tensor]);
+        }
+        roles
+    }
+
+    /// Returns the batching roles of the `output_count` outputs of this definition. A backward definition returns a
+    /// bias cotangent, whose bias is always the fourth canonical input, only when the bias is present and its
+    /// cotangent space is not zero-dimensional.
+    fn batch_output_roles(&self, output_count: usize) -> Vec<AttentionBatchOutput> {
+        match self.kind {
+            AttentionDefinitionKind::Forward => [AttentionBatchOutput::Tensor(0), AttentionBatchOutput::Residual]
+                .into_iter()
+                .take(output_count)
+                .collect(),
+            AttentionDefinitionKind::Backward => {
+                let mut roles = vec![
+                    AttentionBatchOutput::Tensor(0),
+                    AttentionBatchOutput::Tensor(1),
+                    AttentionBatchOutput::Tensor(2),
+                ];
+                if self.signature.has_bias() && output_count == 4 {
+                    roles.push(AttentionBatchOutput::Score(3));
+                }
+                roles
+            }
+        }
     }
 }
 
@@ -1268,6 +1310,11 @@ where
         Caller: CompositeCallContext<Type = C::Type, Value = X, Constant = C::Constant, Operation = C::Operation>,
         X: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
     {
+        /// Returns the structural zero cotangent of `value`.
+        fn zero_cotangent<V: Value<Type: DifferentiableType>>(value: &V) -> Result<MaybeZero<V>, ProgramError> {
+            Ok(MaybeZero::Zero(value.r#type().cotangent()?))
+        }
+
         let signature = inputs.signature();
         let inputs = align_attention_inputs::<C::Type, DomainTracer<C>, X>(inputs)?;
         let function = self
@@ -1275,7 +1322,99 @@ where
             .lock()
             .expect("attention functions mutex is poisoned")
             .entry(signature)
-            .or_insert_with(|| Arc::new(training_function(self.definitions.clone(), signature)))
+            .or_insert_with(|| {
+                // The named composite of an optional input signature is created on its first call. Its primal and
+                // its rules call the definitions that this function owns.
+                let definitions = self.definitions.clone();
+                let configuration = definitions.configuration();
+                let output_types = move |input_types: AttentionInputs<C::Type>| -> Result<C::Type, ProgramError> {
+                    let input_types = input_types
+                        .into_values()
+                        .iter()
+                        .map(<C::Type as AttentionUniverse<DomainTracer<C>>>::to_array_type)
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut output_types = attention_forward_output_types(
+                        DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                        configuration,
+                        signature,
+                        input_types.as_slice(),
+                    )?;
+                    check_count!("output", output_types, 1, ProgramError);
+                    Ok(<C::Type as AttentionUniverse<DomainTracer<C>>>::from_array_type(output_types.remove(0)))
+                };
+                let primal = {
+                    let definitions = definitions.clone();
+                    move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<DomainTracer<C>, ProgramError> {
+                        let mut outputs = definitions.forward(inputs, false)?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        Ok(outputs.remove(0))
+                    }
+                };
+                let forward = {
+                    let definitions = definitions.clone();
+                    move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<_, ProgramError> {
+                        let mut outputs = definitions.forward(inputs.clone(), true)?;
+                        check_count!("output", outputs, 2, ProgramError);
+                        let residual = outputs.remove(1);
+                        let output = outputs.remove(0);
+                        Ok((output.clone(), AttentionResiduals { inputs, output, residual }))
+                    }
+                };
+                let backward = move |residuals: AttentionResiduals<DomainTracer<C>>,
+                                     output_cotangent: MaybeZero<DomainTracer<C>>|
+                      -> Result<_, ProgramError> {
+                    let AttentionResiduals { inputs, output, residual } = residuals;
+                    let MaybeZero::Value(output_cotangent) = output_cotangent else {
+                        return inputs.try_map_parameters(|input| zero_cotangent(&input));
+                    };
+
+                    // The backward definition returns the cotangents of the query, key, and value, and of a bias
+                    // whose cotangent space is not zero-dimensional, so the cotangents of the other inputs (i.e., of
+                    // the masks, sequence lengths, and dropout states, and of a bias with a zero-dimensional
+                    // cotangent space) are structural zeros, which contribute nothing to their inputs' cotangents.
+                    let zero = |input: &Option<DomainTracer<C>>| input.as_ref().map(zero_cotangent).transpose();
+                    let mask = zero(&inputs.mask)?;
+                    let query_sequence_lengths = zero(&inputs.query_sequence_lengths)?;
+                    let key_value_sequence_lengths = zero(&inputs.key_value_sequence_lengths)?;
+                    let dropout_state = zero(&inputs.dropout_state)?;
+                    let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
+                    let mut outputs =
+                        definitions.backward(AttentionBackwardInputs { inputs, output, residual, output_cotangent })?;
+                    let bias = match bias_cotangent_type {
+                        Some(_) if outputs.len() == 4 => Some(MaybeZero::Value(outputs.remove(3))),
+                        Some(r#type) => Some(MaybeZero::Zero(r#type)),
+                        None => None,
+                    };
+                    check_count!("output", outputs, 3, ProgramError);
+                    let value = MaybeZero::Value(outputs.remove(2));
+                    let key = MaybeZero::Value(outputs.remove(1));
+                    let query = MaybeZero::Value(outputs.remove(0));
+                    Ok(AttentionInputs {
+                        query,
+                        key,
+                        value,
+                        bias,
+                        mask,
+                        query_sequence_lengths,
+                        key_value_sequence_lengths,
+                        dropout_state,
+                    })
+                };
+                Arc::new(
+                    composite(primal)
+                        .with_symbolic_zero_vjp(forward, backward)
+                        .with_name(DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME)
+                        .with_named_composite(
+                            attention_composite_key(
+                                DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME,
+                                configuration,
+                                signature,
+                                None,
+                            ),
+                            output_types,
+                        ),
+                )
+            })
             .clone();
         function.call(inputs)
     }
@@ -1541,7 +1680,7 @@ where
 /// therefore any backend implementation of it) for batched calls. Definitions with dropout are batched structurally
 /// instead, because folding would change the shape of the dropout mask and therefore the mask of every batch item,
 /// except that definitions with dropout and the fused implementation reject batching (refer to
-/// [`fused_dropout_batching_error`]).
+/// [`forward_function`]).
 enum AttentionFunction<Folding, Structural> {
     /// Definition that folds mapped axes into attention's batch axis.
     Folding(Arc<Folding>),
@@ -1634,11 +1773,6 @@ enum AttentionBatchOutput {
 
     /// Bias cotangent restored to the logical bias shape of the input at this index.
     Score(usize),
-}
-
-/// Returns the static [`Shape`] with the provided dimensions.
-fn static_shape(dimensions: &[usize]) -> Shape {
-    Shape::new(dimensions.iter().map(|&size| Dimension::Static(size)).collect())
 }
 
 /// Returns the [`CompositeKey`] named `name` with the attributes of `configuration` and `signature`, including the
@@ -1794,13 +1928,60 @@ fn validate_attention_boundary(
     ArrayType::check_matching_manual_variation(operation_name, &input_types.iter().collect::<Vec<_>>())?;
     let dimensions =
         validate_attention_inputs(operation_name, types.query, types.key, types.value, types.bias, types.mask)?;
-    validate_sequence_length_inputs(
-        operation_name,
-        types.query_sequence_lengths,
-        types.key_value_sequence_lengths,
-        &dimensions.batch,
-    )?;
-    validate_dropout(operation_name, configuration.dropout(), types.dropout_state)?;
+
+    // Each sequence lengths input holds one `i32` length per batch item, so it is a rank-1 array whose extent matches
+    // the batch dimension that the query, key, and value share.
+    for (descriptor, lengths_type) in [
+        ("query sequence lengths", types.query_sequence_lengths),
+        ("key/value sequence lengths", types.key_value_sequence_lengths),
+    ] {
+        let Some(lengths_type) = lengths_type else {
+            continue;
+        };
+        if lengths_type.data_type() != DataType::I32 {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` {descriptor} must have data type `i32` but got `{}`",
+                lengths_type.data_type(),
+            )));
+        }
+        match lengths_type.shape().dimensions() {
+            [size] if size == &dimensions.batch => {}
+            [size] => {
+                return Err(TypeError::invalid(format!(
+                    "`{operation_name}` {descriptor} size ({size}) does not match the batch dimension ({})",
+                    dimensions.batch,
+                )));
+            }
+            ref lengths_dimensions => {
+                return Err(TypeError::invalid(format!(
+                    "`{operation_name}` {descriptor} must have rank 1 but got rank {}",
+                    lengths_dimensions.len(),
+                )));
+            }
+        }
+    }
+
+    // The dropout rate lies in the open interval `(0, 1)`, because a zero rate is expressed by omitting dropout
+    // altogether. The comparison is written so that it also rejects a NaN rate. A random state is only accepted
+    // together with a rate, and it must have the state type of a random algorithm.
+    if let Some(rate) = configuration.dropout()
+        && !(rate > 0.0 && rate < 1.0)
+    {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` dropout rate must lie in the open interval (0, 1) but got {rate}",
+        )));
+    }
+    if let Some(state_type) = types.dropout_state {
+        if configuration.dropout().is_none() {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` received a dropout random state without a dropout rate",
+            )));
+        }
+        RandomAlgorithm::from_state_type(state_type)?;
+    }
+
+    // Softmax and the log-sum-exp residual preserve neither partial sums nor replicas that are filled with zeros, so
+    // reduced and unreduced inputs have no meaningful attention.
     for input_type in input_types {
         if !input_type.reduced_axes().is_empty() {
             return Err(TypeError::invalid(format!("`{operation_name}` does not support reduced inputs")));
@@ -1982,71 +2163,6 @@ fn attention_dimensions(
     }
 }
 
-/// Validates the optional query and key/value sequence lengths that the attention definitions share. Each of them
-/// must be a rank-1 `i32` array whose extent matches the shared batch dimension. Refer to [`DotProductAttention`] for
-/// the padding semantics.
-fn validate_sequence_length_inputs(
-    operation_name: &str,
-    query_lengths_type: Option<&ArrayType>,
-    key_value_lengths_type: Option<&ArrayType>,
-    batch: &Dimension,
-) -> Result<(), TypeError> {
-    for (descriptor, value_type) in
-        [("query sequence lengths", query_lengths_type), ("key/value sequence lengths", key_value_lengths_type)]
-    {
-        let Some(value_type) = value_type else {
-            continue;
-        };
-        if value_type.data_type() != DataType::I32 {
-            return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} must have data type `i32` but got `{}`",
-                value_type.data_type(),
-            )));
-        }
-        match value_type.shape().dimensions() {
-            [size] if size == batch => {}
-            [size] => {
-                return Err(TypeError::invalid(format!(
-                    "`{operation_name}` {descriptor} size ({size}) does not match the batch dimension ({batch})",
-                )));
-            }
-            ref dimensions => {
-                return Err(TypeError::invalid(format!(
-                    "`{operation_name}` {descriptor} must have rank 1 but got rank {}",
-                    dimensions.len(),
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Validates the optional dropout rate and random state shared by the attention definitions. The rate must lie in the
-/// open interval `(0, 1)` (a zero rate is expressed by omitting dropout altogether), a random state is only accepted
-/// together with a rate, and it must have the state type of a [`RandomAlgorithm`].
-fn validate_dropout(
-    operation_name: &str,
-    dropout: Option<f64>,
-    dropout_state_type: Option<&ArrayType>,
-) -> Result<(), TypeError> {
-    if let Some(rate) = dropout
-        && !(rate > 0.0 && rate < 1.0)
-    {
-        return Err(TypeError::invalid(format!(
-            "`{operation_name}` dropout rate must lie in the open interval (0, 1) but got {rate}",
-        )));
-    }
-    if let Some(state_type) = dropout_state_type {
-        if dropout.is_none() {
-            return Err(TypeError::invalid(format!(
-                "`{operation_name}` received a dropout random state without a dropout rate",
-            )));
-        }
-        RandomAlgorithm::from_state_type(state_type)?;
-    }
-    Ok(())
-}
-
 /// Returns the `[batch, query_sequence, heads]` or `[query_sequence, heads]` type of the log-sum-exp residual, which
 /// has the query data type and inherits the query's sharding with only the trailing head dimension removed.
 fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayType) -> Result<ArrayType, TypeError> {
@@ -2066,6 +2182,12 @@ fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayT
 }
 
 /// Returns the named composite of the forward definition with the provided configuration and optional input signature.
+///
+/// The body of the definition evaluates portable scaled dot-product attention with ordinary array operations and
+/// returns the attended output, followed by the log-sum-exp residual when `configuration` requests it. Every
+/// constructor, broadcast, and reshape that depends on a shape takes its extents from the [`AttentionUniverse`] of the
+/// values, so the same body supports static extents in homogeneous array families and static and dynamic extents in
+/// array IR families, and backends need no attention mathematics of their own.
 fn forward_function<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
     signature: AttentionInputSignature,
@@ -2080,10 +2202,20 @@ where
 {
     let key = AttentionKey::new(AttentionDefinitionKind::Forward, configuration, signature);
     let output_types = move |input_types: AttentionInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
+        // Every definition is specialized to the optional input signature that its key records.
         if input_types.signature() != signature {
-            return Err(signature_mismatch(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, signature, input_types.signature()));
+            return Err(TypeError::invalid(format!(
+                "named composite `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` was defined for the optional-input \
+                 signature {signature:?} but was called with {:?}",
+                input_types.signature(),
+            ))
+            .into());
         }
-        let input_types = array_types::<RuleTracer<V, O>>(input_types.into_values())?;
+        let input_types = input_types
+            .into_values()
+            .iter()
+            .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::to_array_type)
+            .collect::<Result<Vec<_>, _>>()?;
         let output_types = attention_forward_output_types(
             DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
             configuration,
@@ -2096,7 +2228,79 @@ where
             .collect())
     };
     let body = move |inputs: AttentionInputs<RuleTracer<V, O>>| -> Result<Vec<RuleTracer<V, O>>, ProgramError> {
-        let (output, residual) = dot_product_attention_forward_body(&inputs, configuration)?;
+        // The output type rule above has already validated this boundary, so the types are only needed for the
+        // validated dimensions and the rank of the query.
+        let input_types = inputs
+            .clone()
+            .into_values()
+            .iter()
+            .map(V::Type::array_type)
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        let query_rank = input_types[0].rank();
+        let dimensions = validate_attention_inputs(
+            DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+            &input_types[0],
+            &input_types[1],
+            &input_types[2],
+            inputs.bias.as_ref().map(|_| &input_types[3]),
+            inputs.mask.as_ref().map(|_| &input_types[3 + usize::from(inputs.bias.is_some())]),
+        )?;
+
+        // The softmax over the key/value axis subtracts the maximum of every row before exponentiating, so that the
+        // exponentials cannot overflow and the largest one is exactly one.
+        let prepared = prepare_attention(&inputs, configuration, &dimensions)?;
+        let logits = V::Type::from_array(prepared.logits.clone());
+        let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
+        let maxima_broadcast = V::Type::into_array(V::Type::broadcast(
+            &V::Type::from_array(maxima.clone()),
+            V::Type::extents(&logits)?.as_slice(),
+            &[0, 1, 2],
+        )?)?;
+        let shifted = prepared.logits.sub(&maxima_broadcast)?;
+        let exponentials = shifted.exp()?;
+        let exponentials_value = V::Type::from_array(exponentials.clone());
+        let sums = exponentials.reduce(&[3], ReductionKind::Sum)?;
+        let sums_broadcast = V::Type::into_array(V::Type::broadcast(
+            &V::Type::from_array(sums.clone()),
+            V::Type::extents(&exponentials_value)?.as_slice(),
+            &[0, 1, 2],
+        )?)?;
+        // Dropout applies to the normalized probabilities in the softmax data type, before they return to the data
+        // type of the query.
+        let weights = apply_dropout(exponentials.div(&sums_broadcast)?, &inputs, configuration)?;
+        let weights = if prepared.data_type == prepared.softmax_type {
+            weights
+        } else {
+            weights.convert_element_type(prepared.data_type)?
+        };
+        // The weights have the `BNTS` score form, and the values have the `BSNH` form with their heads expanded to the
+        // query heads. Contracting the key/value axis for every batch item and head gives `BNTH`, which is transposed
+        // to the `BTNH` form of the query.
+        let attended = weights.dot(
+            &V::Type::into_array(prepared.expanded_value)?,
+            &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]),
+        )?;
+        let mut output = attended.transpose([0, 2, 1, 3])?;
+        // Query rows at or beyond the query length of their batch item are exact zeros.
+        if let Some(query_lengths) = &inputs.query_sequence_lengths {
+            output = zero_query_rows::<RuleTracer<V, O>>(output, query_lengths, 1)?;
+        }
+        let output = denormalize_attention_output::<RuleTracer<V, O>>(output, query_rank)?;
+        // The residual is the logarithm of the sum of the exponentiated logits of every row, which is the row maximum
+        // plus the logarithm of the sum of the shifted exponentials. It is a statistic of the forward pass rather
+        // than a differentiable output, so it stops gradients.
+        let residual = if configuration.return_residual() {
+            let residual = maxima.add(&sums.log()?)?;
+            let residual = if prepared.softmax_type == prepared.data_type {
+                residual
+            } else {
+                residual.convert_element_type(prepared.data_type)?
+            };
+            let residual = residual.transpose([0, 2, 1])?;
+            Some(denormalize_attention_output::<RuleTracer<V, O>>(residual, query_rank)?.stop_gradient()?)
+        } else {
+            None
+        };
         Ok(std::iter::once(output)
             .chain(residual)
             .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::from_array)
@@ -2107,10 +2311,24 @@ where
         .with_named_composite(key.to_composite_key(), output_types);
     if configuration.dropout().is_some() {
         return match configuration.implementation() {
-            AttentionImplementation::Fused => AttentionFunction::Folding(Arc::new(
-                function
-                    .with_batching(|_, _, _| Err(fused_dropout_batching_error(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME))),
-            )),
+            // A batched call loses the identity of its definition (i.e., it lowers its structurally batched body), so
+            // batching a fused call with dropout would silently replace the fused kernels and their dropout mask
+            // with the portable body and its mask. That would both change the requested numerics and break the
+            // agreement between the dropout masks of the forward and backward definitions when only one of them is
+            // batched (e.g., when the pullback of an unbatched call is batched).
+            AttentionImplementation::Fused => {
+                AttentionFunction::Folding(Arc::new(function.with_batching(|_, _, _| {
+                    Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "named composite `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` with dropout cannot be batched \
+                         with the fused implementation, because a batched call cannot use the fused kernels or \
+                         reproduce their dropout mask; use the portable implementation or a dropout state",
+                        ),
+                    })
+                })))
+            }
+            // Folding would change the shape of the dropout mask and therefore the mask of every batch item, so
+            // these definitions keep the structural batching of their bodies.
             AttentionImplementation::Automatic | AttentionImplementation::Portable => {
                 AttentionFunction::Structural(Arc::new(function))
             }
@@ -2118,7 +2336,7 @@ where
     }
     AttentionFunction::Folding(Arc::new_cyclic(|weak: &Weak<ForwardFolding<V, O>>| {
         let weak = weak.clone();
-        let input_roles = attention_batch_input_roles(signature, AttentionDefinitionKind::Forward);
+        let input_roles = key.batch_input_roles();
         function.with_batching(move |inputs, axes: AttentionInputs<BatchAxis>, extent| {
             // A staged call outlives the function that staged it when its program is batched after the function is
             // dropped, in which case the folded call stages an equivalent definition.
@@ -2129,294 +2347,27 @@ where
                     AttentionFunction::Structural(_) => unreachable!("definitions without dropout batch by folding"),
                 },
             };
-            let output_roles =
-                |output_count| attention_batch_output_roles(signature, AttentionDefinitionKind::Forward, output_count);
             batch_attention(
                 inputs.into_values(),
                 axes.into_values(),
                 &extent,
                 input_roles.as_slice(),
-                output_roles,
+                |output_count| key.batch_output_roles(output_count),
                 |inputs| function.call(AttentionInputs::from_values(signature, inputs.as_slice())?),
             )
         })
     }))
 }
 
-/// Returns the named composite of the backward definition with the provided configuration and optional-input
+/// Returns the named composite of the backward definition with the provided configuration and optional input
 /// signature.
-fn backward_function<V: Value, O: Operation<Type = V::Type>>(
-    configuration: AttentionConfiguration,
-    signature: AttentionInputSignature,
-) -> BackwardFunction<V, O>
-where
-    V: 'static,
-    O: 'static,
-    V::Type: AttentionUniverse<RuleTracer<V, O>> + BatchableType,
-    CustomRuleDefinition<V, O>: AttentionRules<V, O>,
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
-        + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
-{
-    let key = AttentionKey::new(AttentionDefinitionKind::Backward, configuration, signature);
-    let configuration = key.configuration();
-    let output_types = move |input_types: AttentionBackwardInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
-        if input_types.inputs.signature() != signature {
-            return Err(signature_mismatch(
-                DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
-                signature,
-                input_types.inputs.signature(),
-            ));
-        }
-        let input_types = array_types::<RuleTracer<V, O>>(input_types.into_values())?;
-        let output_types = attention_backward_output_types(
-            DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
-            configuration,
-            signature,
-            input_types.as_slice(),
-        )?;
-        Ok(output_types
-            .into_iter()
-            .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::from_array_type)
-            .collect())
-    };
-    let body = move |inputs: AttentionBackwardInputs<RuleTracer<V, O>>| -> Result<Vec<RuleTracer<V, O>>, ProgramError> {
-        let outputs = dot_product_attention_backward_body(
-            &inputs.inputs,
-            &inputs.output,
-            &inputs.residual,
-            &inputs.output_cotangent,
-            configuration,
-        )?;
-        Ok(outputs.into_iter().map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::from_array).collect())
-    };
-    let function = composite(body)
-        .with_name(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME)
-        .with_named_composite(key.to_composite_key(), output_types);
-    if configuration.dropout().is_some() {
-        return match configuration.implementation() {
-            AttentionImplementation::Fused => {
-                AttentionFunction::Folding(Arc::new(function.with_batching(|_, _, _| {
-                    Err(fused_dropout_batching_error(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME))
-                })))
-            }
-            AttentionImplementation::Automatic | AttentionImplementation::Portable => {
-                AttentionFunction::Structural(Arc::new(function))
-            }
-        };
-    }
-    AttentionFunction::Folding(Arc::new_cyclic(|weak: &Weak<BackwardFolding<V, O>>| {
-        let weak = weak.clone();
-        let input_roles = attention_batch_input_roles(signature, AttentionDefinitionKind::Backward);
-        function.with_batching(move |inputs, axes: AttentionBackwardInputs<BatchAxis>, extent| {
-            // Refer to the forward rule for when the function may have been dropped.
-            let function = match weak.upgrade() {
-                Some(function) => function,
-                None => match backward_function::<V, O>(configuration, signature) {
-                    AttentionFunction::Folding(function) => function,
-                    AttentionFunction::Structural(_) => unreachable!("definitions without dropout batch by folding"),
-                },
-            };
-            let output_roles =
-                |output_count| attention_batch_output_roles(signature, AttentionDefinitionKind::Backward, output_count);
-            batch_attention(
-                inputs.into_values(),
-                axes.into_values(),
-                &extent,
-                input_roles.as_slice(),
-                output_roles,
-                |inputs| function.call(AttentionBackwardInputs::from_values(signature, inputs.as_slice())?),
-            )
-        })
-    }))
-}
-
-/// Returns the named composite that stages differentiable attention for the provided optional input signature, whose
-/// primal and rules call the definitions in `definitions`.
-fn training_function<V: Value, O: Operation<Type = V::Type>>(
-    definitions: Arc<AttentionDefinitions<V, O>>,
-    signature: AttentionInputSignature,
-) -> TrainingFunction<V, O>
-where
-    V: 'static,
-    O: 'static,
-    V::Type: AttentionUniverse<RuleTracer<V, O>> + BatchableType + DifferentiableType,
-    CustomRuleDefinition<V, O>: AttentionRules<V, O>,
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
-        + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
-{
-    /// Returns the structural zero cotangent of `value`.
-    fn zero_cotangent<X: Value<Type: DifferentiableType>>(value: &X) -> Result<MaybeZero<X>, ProgramError> {
-        Ok(MaybeZero::Zero(value.r#type().cotangent()?))
-    }
-
-    let configuration = definitions.configuration();
-    let output_types = move |input_types: AttentionInputs<V::Type>| -> Result<V::Type, ProgramError> {
-        let input_types = input_types
-            .into_values()
-            .iter()
-            .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::to_array_type)
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut output_types = attention_forward_output_types(
-            DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-            configuration,
-            signature,
-            input_types.as_slice(),
-        )?;
-        check_count!("output", output_types, 1, ProgramError);
-        Ok(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::from_array_type(output_types.remove(0)))
-    };
-    let primal = {
-        let definitions = definitions.clone();
-        move |inputs: AttentionInputs<RuleTracer<V, O>>| -> Result<RuleTracer<V, O>, ProgramError> {
-            let mut outputs = definitions.forward(inputs, false)?;
-            check_count!("output", outputs, 1, ProgramError);
-            Ok(outputs.remove(0))
-        }
-    };
-    let forward = {
-        let definitions = definitions.clone();
-        move |inputs: AttentionInputs<RuleTracer<V, O>>| -> Result<_, ProgramError> {
-            let mut outputs = definitions.forward(inputs.clone(), true)?;
-            check_count!("output", outputs, 2, ProgramError);
-            let residual = outputs.remove(1);
-            let output = outputs.remove(0);
-            Ok((output.clone(), AttentionResiduals { inputs, output, residual }))
-        }
-    };
-    let backward = move |residuals: AttentionResiduals<RuleTracer<V, O>>,
-                         output_cotangent: MaybeZero<RuleTracer<V, O>>|
-          -> Result<_, ProgramError> {
-        let AttentionResiduals { inputs, output, residual } = residuals;
-        let MaybeZero::Value(output_cotangent) = output_cotangent else {
-            return inputs.try_map_parameters(|input| zero_cotangent(&input));
-        };
-
-        // The backward definition returns the cotangents of the query, key, and value, and of a bias whose cotangent
-        // space is not zero-dimensional, so the cotangents of the other inputs (i.e., of the masks, sequence lengths,
-        // and dropout states, and of a bias with a zero-dimensional cotangent space) are structural zeros, which
-        // contribute nothing to their inputs' cotangents.
-        let zero = |input: &Option<RuleTracer<V, O>>| input.as_ref().map(zero_cotangent).transpose();
-        let mask = zero(&inputs.mask)?;
-        let query_sequence_lengths = zero(&inputs.query_sequence_lengths)?;
-        let key_value_sequence_lengths = zero(&inputs.key_value_sequence_lengths)?;
-        let dropout_state = zero(&inputs.dropout_state)?;
-        let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
-        let mut outputs =
-            definitions.backward(AttentionBackwardInputs { inputs, output, residual, output_cotangent })?;
-        let bias = match bias_cotangent_type {
-            Some(_) if outputs.len() == 4 => Some(MaybeZero::Value(outputs.remove(3))),
-            Some(r#type) => Some(MaybeZero::Zero(r#type)),
-            None => None,
-        };
-        check_count!("output", outputs, 3, ProgramError);
-        let value = MaybeZero::Value(outputs.remove(2));
-        let key = MaybeZero::Value(outputs.remove(1));
-        let query = MaybeZero::Value(outputs.remove(0));
-        Ok(AttentionInputs {
-            query,
-            key,
-            value,
-            bias,
-            mask,
-            query_sequence_lengths,
-            key_value_sequence_lengths,
-            dropout_state,
-        })
-    };
-    composite(primal)
-        .with_symbolic_zero_vjp(forward, backward)
-        .with_name(DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME)
-        .with_named_composite(
-            attention_composite_key(DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME, configuration, signature, None),
-            output_types,
-        )
-}
-
-/// Returns the array types of `types`, which belong to the universe of the values `V`.
-fn array_types<V: Value<Type: AttentionUniverse<V>>>(types: Vec<V::Type>) -> Result<Vec<ArrayType>, ProgramError> {
-    Ok(types.iter().map(<V::Type as AttentionUniverse<V>>::to_array_type).collect::<Result<Vec<_>, _>>()?)
-}
-
-/// Returns an error for a call of a definition whose optional input signature is `actual` rather than its own.
-fn signature_mismatch(name: &str, expected: AttentionInputSignature, actual: AttentionInputSignature) -> ProgramError {
-    TypeError::invalid(format!(
-        "named composite `{name}` was defined for the optional-input signature {expected:?} but was called with \
-         {actual:?}",
-    ))
-    .into()
-}
-
-/// Evaluates portable scaled dot-product attention using ordinary array operations, returning the attended output
-/// together with the log-sum-exp residual when `configuration` requests it.
 ///
-/// This is the body of the forward named attention definition (refer to [`AttentionKey`]). Every constructor,
-/// broadcast, and reshape that depends on a shape takes its extents from the value's [`AttentionUniverse`], so the
-/// same body supports static extents in homogeneous array families and static and dynamic extents in array IR
-/// families, and backends need no attention mathematics of their own.
-fn dot_product_attention_forward_body<V: Value<Type: AttentionUniverse<V>>>(
-    inputs: &AttentionInputs<V>,
-    configuration: AttentionConfiguration,
-) -> Result<(ArrayOf<V>, Option<ArrayOf<V>>), ProgramError> {
-    let input_types = attention_input_types(inputs)?;
-    attention_forward_output_types(
-        DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-        configuration,
-        inputs.signature(),
-        input_types.as_slice(),
-    )?;
-    let query_rank = input_types[0].rank();
-    let dimensions = validate_attention_inputs(
-        DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-        &input_types[0],
-        &input_types[1],
-        &input_types[2],
-        inputs.bias.as_ref().map(|_| &input_types[3]),
-        inputs.mask.as_ref().map(|_| &input_types[3 + usize::from(inputs.bias.is_some())]),
-    )?;
-
-    let prepared = prepare_attention(inputs, configuration, &dimensions)?;
-    let logits = value::<V>(prepared.logits.clone());
-    let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
-    let maxima_broadcast = array(broadcast_like::<V>(maxima.clone(), &logits, &[0, 1, 2])?)?;
-    let shifted = prepared.logits.sub(&maxima_broadcast)?;
-    let exponentials = shifted.exp()?;
-    let exponentials_value = value::<V>(exponentials.clone());
-    let sums = exponentials.reduce(&[3], ReductionKind::Sum)?;
-    let sums_broadcast = array(broadcast_like::<V>(sums.clone(), &exponentials_value, &[0, 1, 2])?)?;
-    let weights = apply_dropout(exponentials.div(&sums_broadcast)?, inputs, configuration)?;
-    let weights = if prepared.data_type == prepared.softmax_type {
-        weights
-    } else {
-        weights.convert_element_type(prepared.data_type)?
-    };
-    let attended = weights
-        .dot(&array(prepared.expanded_value)?, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?;
-    let mut output = attended.transpose([0, 2, 1, 3])?;
-    if let Some(query_lengths) = &inputs.query_sequence_lengths {
-        output = zero_query_rows::<V>(output, query_lengths, 1)?;
-    }
-    let output = denormalize_attention_output::<V>(output, query_rank)?;
-    let residual = if configuration.return_residual() {
-        let residual = maxima.add(&sums.log()?)?;
-        let residual = if prepared.softmax_type == prepared.data_type {
-            residual
-        } else {
-            residual.convert_element_type(prepared.data_type)?
-        };
-        let residual = residual.transpose([0, 2, 1])?;
-        Some(denormalize_attention_output::<V>(residual, query_rank)?.stop_gradient()?)
-    } else {
-        None
-    };
-    Ok((output, residual))
-}
-
-/// Evaluates the portable attention backward pass using the same extents and mask construction as
-/// [`dot_product_attention_forward_body`], returning the cotangents of the query, key, and value, followed by that of
-/// a present bias whose cotangent space is not zero-dimensional. This is the body of the backward named attention
-/// definition (refer to [`AttentionKey`]), whose inputs are the forward inputs followed by the attended output, its
-/// `TN` or `BTN` log-sum-exp residual, and the output cotangent. Boolean masks, integer sequence lengths, dropout
-/// states, and a bias whose cotangent space is zero-dimensional have no cotangent outputs.
+/// The body of the definition evaluates the portable attention backward pass using the same extents and mask
+/// construction as the forward body (refer to [`forward_function`]), and returns the cotangents of the query, key, and
+/// value, followed by that of a present bias whose cotangent space is not zero-dimensional. Its inputs are the forward
+/// inputs followed by the attended output, its `TN` or `BTN` log-sum-exp residual, and the output cotangent. Boolean
+/// masks, integer sequence lengths, dropout states, and a bias whose cotangent space is zero-dimensional have no
+/// cotangent outputs.
 ///
 /// The body recomputes the normalized probabilities `P` from the masked logits in `f32`, which avoids the precision
 /// that rounding the output or the residual to a narrower query data type loses, and so the output and the residual
@@ -2436,174 +2387,294 @@ fn dot_product_attention_forward_body<V: Value<Type: AttentionUniverse<V>>>(
 /// reduced back to each key/value head, a broadcast bias cotangent is reduced to the shape of its bias, and padded
 /// query rows are zeroed. With dropout, `P` is the dropped probabilities in `dV`, and the cotangent of the dropped
 /// probabilities is mapped back through the same dropout mask, which the same random state and probability shape
-/// reproduce. Higher-order derivatives differentiate this body directly.
-fn dot_product_attention_backward_body<V: Value<Type: AttentionUniverse<V>>>(
-    inputs: &AttentionInputs<V>,
-    output: &V,
-    residual: &V,
-    output_cotangent: &V,
+/// reproduce.
+fn backward_function<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
-) -> Result<Vec<ArrayOf<V>>, ProgramError> {
-    let mut input_types = attention_input_types(inputs)?;
-    input_types.extend([
-        V::Type::array_type(output)?,
-        V::Type::array_type(residual)?,
-        V::Type::array_type(output_cotangent)?,
-    ]);
-    attention_backward_output_types(
-        DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
-        configuration,
-        inputs.signature(),
-        input_types.as_slice(),
-    )?;
-    let input_ranks = [input_types[0].rank(), input_types[1].rank(), input_types[2].rank()];
-    let dimensions = validate_attention_inputs(
-        DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
-        &input_types[0],
-        &input_types[1],
-        &input_types[2],
-        inputs.bias.as_ref().map(|_| &input_types[3]),
-        inputs.mask.as_ref().map(|_| &input_types[3 + usize::from(inputs.bias.is_some())]),
-    )?;
-    let prepared = prepare_attention(inputs, configuration, &dimensions)?;
-    let output_cotangent = normalize_attention_input(output_cotangent)?;
-    let logits = value::<V>(prepared.logits.clone());
-    // The public residual and output have the query data type, which can lose the normalization correction in
-    // narrow formats. Recompute probabilities in the softmax type instead of recovering them from those values.
-    let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
-    let maxima = array(broadcast_like::<V>(maxima, &logits, &[0, 1, 2])?)?;
-    let exponentials = prepared.logits.sub(&maxima)?.exp()?;
-    let sums = exponentials.reduce(&[3], ReductionKind::Sum)?;
-    let sums = array(broadcast_like::<V>(sums, &logits, &[0, 1, 2])?)?;
-    let weights = exponentials.div(&sums)?;
-
-    // Pick exactly one maximum, including when logits tie. Keeping the pivot out of the final sum avoids
-    // subtracting two nearly equal dominant contributions. The integer constants cannot carry tangents.
-    let columns = V::Type::iota(&logits, 3)?;
-    let column_array = array(columns.clone())?;
-    let sentinel = array(V::Type::fill(&columns, i32::MAX as f64)?)?;
-    let is_maximum = prepared.logits.compare(&maxima, ComparisonDirection::Equal)?;
-    let pivot = is_maximum.select(&column_array, &sentinel)?.reduce(&[3], ReductionKind::Min)?;
-    let pivot = array(broadcast_like::<V>(pivot, &logits, &[0, 1, 2])?)?;
-    let is_pivot = column_array.compare(&pivot, ComparisonDirection::Equal)?;
-
-    let output_cotangent = match &inputs.query_sequence_lengths {
-        None => array(output_cotangent)?,
-        Some(query_lengths) => zero_query_rows::<V>(array(output_cotangent)?, query_lengths, 1)?,
-    };
-    let convert = |array: ArrayOf<V>| -> Result<ArrayOf<V>, ProgramError> {
-        if prepared.data_type == prepared.softmax_type {
-            Ok(array)
-        } else {
-            Ok(array.convert_element_type(prepared.softmax_type)?)
+    signature: AttentionInputSignature,
+) -> BackwardFunction<V, O>
+where
+    V: 'static,
+    O: 'static,
+    V::Type: AttentionUniverse<RuleTracer<V, O>> + BatchableType,
+    CustomRuleDefinition<V, O>: AttentionRules<V, O>,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
+        + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
+{
+    let key = AttentionKey::new(AttentionDefinitionKind::Backward, configuration, signature);
+    let configuration = key.configuration();
+    let output_types = move |input_types: AttentionBackwardInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
+        // Every definition is specialized to the optional input signature that its key records.
+        if input_types.inputs.signature() != signature {
+            return Err(TypeError::invalid(format!(
+                "named composite `{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` was defined for the \
+                 optional-input signature {signature:?} but was called with {:?}",
+                input_types.inputs.signature(),
+            ))
+            .into());
         }
-    };
-    let softmax_query = convert(array(prepared.query.clone())?)?;
-    let softmax_key = convert(array(prepared.expanded_key.clone())?)?;
-    let softmax_value = convert(array(prepared.expanded_value)?)?;
-    let softmax_output_cotangent = convert(output_cotangent)?;
-
-    // With dropout, the output uses the dropped probabilities `D = dropout(P)`, so the value cotangent uses `D` and the
-    // cotangent of `P` is the cotangent of `D` through the same mask.
-    let dropped_weights = apply_dropout(weights.clone(), inputs, configuration)?;
-    let weight_cotangents = apply_dropout(
-        softmax_output_cotangent
-            .dot(&softmax_value, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?,
-        inputs,
-        configuration,
-    )?;
-    let zero = array(V::Type::fill(&logits, 0.0)?)?;
-    let pivot_cotangent = is_pivot.select(&weight_cotangents, &zero)?.reduce(&[3], ReductionKind::Sum)?;
-    let pivot_cotangent = array(broadcast_like::<V>(pivot_cotangent, &logits, &[0, 1, 2])?)?;
-    // Center the incoming weight cotangents before their weighted sum. This preserves a tiny dominant derivative
-    // and gives exact zero when every weight cotangent is equal, even if the rounded probabilities do not sum to one.
-    let centered = weight_cotangents.sub(&pivot_cotangent)?;
-    let delta = weights.mul(&centered)?.reduce(&[3], ReductionKind::Sum)?;
-    let delta = array(broadcast_like::<V>(delta, &logits, &[0, 1, 2])?)?;
-    let logit_cotangents = weights.mul(&centered.sub(&delta)?)?;
-    let other_cotangents = is_pivot.select(&zero, &logit_cotangents)?;
-    let pivot_cotangent = other_cotangents.reduce(&[3], ReductionKind::Sum)?;
-    let pivot_cotangent = array(broadcast_like::<V>(pivot_cotangent, &logits, &[0, 1, 2])?)?;
-    let logit_cotangents = is_pivot.select(&zero.sub(&pivot_cotangent)?, &other_cotangents)?;
-    let logit_cotangents_value = value::<V>(logit_cotangents.clone());
-    let scale_value = array(V::Type::fill(&logit_cotangents_value, prepared.scale)?)?;
-    let scaled_logit_cotangents = logit_cotangents.mul(&scale_value)?;
-    let mut query_cotangent = scaled_logit_cotangents
-        .dot(&softmax_key, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?
-        .transpose([0, 2, 1, 3])?;
-    if let Some(query_lengths) = &inputs.query_sequence_lengths {
-        query_cotangent = zero_query_rows::<V>(query_cotangent, query_lengths, 1)?;
-    }
-    let key_cotangent = scaled_logit_cotangents
-        .dot(&softmax_query, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))?
-        .transpose([0, 2, 1, 3])?;
-    let value_cotangent = dropped_weights
-        .dot(&softmax_output_cotangent, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))?
-        .transpose([0, 2, 1, 3])?;
-
-    let (key_cotangent, value_cotangent) = if dimensions.key_value_heads == dimensions.query_heads {
-        (key_cotangent, value_cotangent)
-    } else {
-        let group = dimensions.query_heads / dimensions.key_value_heads;
-        let key_extents = extents(&prepared.key)?;
-        let key_value_heads = V::Type::constant_extent(&prepared.key, dimensions.key_value_heads)?;
-        let group = V::Type::constant_extent(&prepared.key, group)?;
-        let head_dimension = V::Type::constant_extent(&prepared.key, dimensions.head_dimension)?;
-        let grouped_extents = [key_extents[0].clone(), key_extents[1].clone(), key_value_heads, group, head_dimension];
-        let grouped_key = V::Type::reshape(&value::<V>(key_cotangent), &grouped_extents)?;
-        let grouped_value = V::Type::reshape(&value::<V>(value_cotangent), &grouped_extents)?;
-        (array(grouped_key)?.reduce(&[3], ReductionKind::Sum)?, array(grouped_value)?.reduce(&[3], ReductionKind::Sum)?)
-    };
-    let mut cotangents = [query_cotangent, key_cotangent, value_cotangent]
-        .into_iter()
-        .zip(input_types[..3].iter().zip(input_ranks))
-        .map(|(cotangent, (input_type, rank))| {
-            let cotangent_data_type = input_type.cotangent()?.data_type();
-            let cotangent = if cotangent.r#type().data_type() == cotangent_data_type {
-                cotangent
-            } else {
-                cotangent.convert_element_type(cotangent_data_type)?
-            };
-            denormalize_attention_output::<V>(cotangent, rank)
-        })
-        .collect::<Result<Vec<_>, ProgramError>>()?;
-    if let Some(bias) = &inputs.bias {
-        let bias_type = V::Type::array_type(bias)?;
-        let bias_cotangent_type = bias_type.cotangent()?;
-        if bias_cotangent_type.is_zero_space() {
-            return Ok(cotangents);
-        }
-        let bias_dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - bias_type.rank())
-            .chain(bias_type.shape().dimensions().iter().cloned())
-            .collect::<Vec<_>>();
-        let logit_type = logit_cotangents.r#type().into_owned();
-        let reduce_axes = bias_dimensions
+        let input_types = input_types
+            .into_values()
             .iter()
-            .zip(logit_type.shape().dimensions())
-            .enumerate()
-            .filter_map(|(axis, (bias, logit))| (bias == &Dimension::Static(1) && logit != bias).then_some(axis))
-            .collect::<Vec<_>>();
-        let bias_cotangent = if reduce_axes.is_empty() {
-            logit_cotangents
-        } else {
-            logit_cotangents.reduce(reduce_axes.as_slice(), ReductionKind::Sum)?
-        };
-        let bias_cotangent = array(V::Type::reshape(&value::<V>(bias_cotangent), extents(bias)?.as_slice())?)?;
-        let bias_cotangent = if bias_cotangent_type.data_type() == prepared.softmax_type {
-            bias_cotangent
-        } else {
-            bias_cotangent.convert_element_type(bias_cotangent_type.data_type())?
-        };
-        cotangents.push(bias_cotangent);
-    }
-    Ok(cotangents)
-}
+            .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::to_array_type)
+            .collect::<Result<Vec<_>, _>>()?;
+        let output_types = attention_backward_output_types(
+            DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+            configuration,
+            signature,
+            input_types.as_slice(),
+        )?;
+        Ok(output_types
+            .into_iter()
+            .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::from_array_type)
+            .collect())
+    };
+    let body = move |inputs: AttentionBackwardInputs<RuleTracer<V, O>>| -> Result<Vec<RuleTracer<V, O>>, ProgramError> {
+        // The forward output and its residual are validated inputs for backend implementations of this definition.
+        // The portable body recomputes the probabilities instead of using them, so it only needs the forward inputs
+        // and the output cotangent.
+        let AttentionBackwardInputs { inputs, output_cotangent, .. } = &inputs;
+        // The output type rule above has already validated this boundary, so the types are only needed for the
+        // validated dimensions and the ranks of the query, key, and value.
+        let input_types = inputs
+            .clone()
+            .into_values()
+            .iter()
+            .map(V::Type::array_type)
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        let input_ranks = [input_types[0].rank(), input_types[1].rank(), input_types[2].rank()];
+        let dimensions = validate_attention_inputs(
+            DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+            &input_types[0],
+            &input_types[1],
+            &input_types[2],
+            inputs.bias.as_ref().map(|_| &input_types[3]),
+            inputs.mask.as_ref().map(|_| &input_types[3 + usize::from(inputs.bias.is_some())]),
+        )?;
+        let prepared = prepare_attention(inputs, configuration, &dimensions)?;
+        let output_cotangent = normalize_attention_input(output_cotangent)?;
+        let logits = V::Type::from_array(prepared.logits.clone());
+        // The public residual and output have the query data type, which can lose the normalization correction in
+        // narrow formats. Recompute probabilities in the softmax type instead of recovering them from those values.
+        let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
+        let maxima = V::Type::into_array(V::Type::broadcast(
+            &V::Type::from_array(maxima),
+            V::Type::extents(&logits)?.as_slice(),
+            &[0, 1, 2],
+        )?)?;
+        let exponentials = prepared.logits.sub(&maxima)?.exp()?;
+        let sums = exponentials.reduce(&[3], ReductionKind::Sum)?;
+        let sums = V::Type::into_array(V::Type::broadcast(
+            &V::Type::from_array(sums),
+            V::Type::extents(&logits)?.as_slice(),
+            &[0, 1, 2],
+        )?)?;
+        let weights = exponentials.div(&sums)?;
 
-/// Returns the canonical input types of `inputs`.
-fn attention_input_types<V: Value<Type: AttentionUniverse<V>>>(
-    inputs: &AttentionInputs<V>,
-) -> Result<Vec<ArrayType>, ProgramError> {
-    inputs.clone().into_values().iter().map(V::Type::array_type).collect()
+        // Pick exactly one maximum, including when logits tie. Keeping the pivot out of the final sum avoids
+        // subtracting two nearly equal dominant contributions. The integer constants cannot carry tangents.
+        let columns = V::Type::iota(&logits, 3)?;
+        let column_array = V::Type::into_array(columns.clone())?;
+        let sentinel = V::Type::into_array(V::Type::fill(&columns, i32::MAX as f64)?)?;
+        let is_maximum = prepared.logits.compare(&maxima, ComparisonDirection::Equal)?;
+        let pivot = is_maximum.select(&column_array, &sentinel)?.reduce(&[3], ReductionKind::Min)?;
+        let pivot = V::Type::into_array(V::Type::broadcast(
+            &V::Type::from_array(pivot),
+            V::Type::extents(&logits)?.as_slice(),
+            &[0, 1, 2],
+        )?)?;
+        let is_pivot = column_array.compare(&pivot, ComparisonDirection::Equal)?;
+
+        // Query rows at or beyond the query length of their batch item are zero in the forward output, so their
+        // output cotangents contribute nothing.
+        let output_cotangent = match &inputs.query_sequence_lengths {
+            None => V::Type::into_array(output_cotangent)?,
+            Some(query_lengths) => {
+                zero_query_rows::<RuleTracer<V, O>>(V::Type::into_array(output_cotangent)?, query_lengths, 1)?
+            }
+        };
+        // The backward mathematics runs in the softmax data type, like the recomputed probabilities.
+        let convert = |array: ArrayOf<RuleTracer<V, O>>| -> Result<ArrayOf<RuleTracer<V, O>>, ProgramError> {
+            if prepared.data_type == prepared.softmax_type {
+                Ok(array)
+            } else {
+                Ok(array.convert_element_type(prepared.softmax_type)?)
+            }
+        };
+        let softmax_query = convert(V::Type::into_array(prepared.query.clone())?)?;
+        let softmax_key = convert(V::Type::into_array(prepared.expanded_key.clone())?)?;
+        let softmax_value = convert(V::Type::into_array(prepared.expanded_value)?)?;
+        let softmax_output_cotangent = convert(output_cotangent)?;
+
+        // With dropout, the output uses the dropped probabilities `D = dropout(P)`, so the value cotangent uses `D`
+        // and the cotangent of `P` is the cotangent of `D` through the same mask.
+        let dropped_weights = apply_dropout(weights.clone(), inputs, configuration)?;
+        let weight_cotangents = apply_dropout(
+            softmax_output_cotangent
+                .dot(&softmax_value, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?,
+            inputs,
+            configuration,
+        )?;
+        let zero = V::Type::into_array(V::Type::fill(&logits, 0.0)?)?;
+        let pivot_cotangent = is_pivot.select(&weight_cotangents, &zero)?.reduce(&[3], ReductionKind::Sum)?;
+        let pivot_cotangent = V::Type::into_array(V::Type::broadcast(
+            &V::Type::from_array(pivot_cotangent),
+            V::Type::extents(&logits)?.as_slice(),
+            &[0, 1, 2],
+        )?)?;
+        // Center the incoming weight cotangents before their weighted sum. This preserves a tiny dominant derivative
+        // and gives exact zero when every weight cotangent is equal, even if the rounded probabilities do not sum to
+        // one.
+        let centered = weight_cotangents.sub(&pivot_cotangent)?;
+        let delta = weights.mul(&centered)?.reduce(&[3], ReductionKind::Sum)?;
+        let delta = V::Type::into_array(V::Type::broadcast(
+            &V::Type::from_array(delta),
+            V::Type::extents(&logits)?.as_slice(),
+            &[0, 1, 2],
+        )?)?;
+        let logit_cotangents = weights.mul(&centered.sub(&delta)?)?;
+        // The logit cotangents of every row sum to zero, so the pivot's entry is replaced by the negative sum of the
+        // other entries. That keeps the dominant derivative when the probability of the pivot rounds to one.
+        let other_cotangents = is_pivot.select(&zero, &logit_cotangents)?;
+        let pivot_cotangent = other_cotangents.reduce(&[3], ReductionKind::Sum)?;
+        let pivot_cotangent = V::Type::into_array(V::Type::broadcast(
+            &V::Type::from_array(pivot_cotangent),
+            V::Type::extents(&logits)?.as_slice(),
+            &[0, 1, 2],
+        )?)?;
+        let logit_cotangents = is_pivot.select(&zero.sub(&pivot_cotangent)?, &other_cotangents)?;
+        let logit_cotangents_value = V::Type::from_array(logit_cotangents.clone());
+        // The scores are `scale * Q * transpose(K)`, so the query and key cotangents contract the scaled logit
+        // cotangents with the keys and the queries, and the value cotangent contracts the dropped probabilities with
+        // the output cotangent. Every result is transposed from `BNTH` or `BNSH` to the form of its input.
+        let scale_value = V::Type::into_array(V::Type::fill(&logit_cotangents_value, prepared.scale)?)?;
+        let scaled_logit_cotangents = logit_cotangents.mul(&scale_value)?;
+        let mut query_cotangent = scaled_logit_cotangents
+            .dot(&softmax_key, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?
+            .transpose([0, 2, 1, 3])?;
+        if let Some(query_lengths) = &inputs.query_sequence_lengths {
+            query_cotangent = zero_query_rows::<RuleTracer<V, O>>(query_cotangent, query_lengths, 1)?;
+        }
+        let key_cotangent = scaled_logit_cotangents
+            .dot(&softmax_query, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))?
+            .transpose([0, 2, 1, 3])?;
+        let value_cotangent = dropped_weights
+            .dot(&softmax_output_cotangent, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))?
+            .transpose([0, 2, 1, 3])?;
+
+        // Grouped query heads share one key/value head, so the key and value cotangents of every group are summed
+        // back to that head.
+        let (key_cotangent, value_cotangent) = if dimensions.key_value_heads == dimensions.query_heads {
+            (key_cotangent, value_cotangent)
+        } else {
+            let group = dimensions.query_heads / dimensions.key_value_heads;
+            let key_extents = V::Type::extents(&prepared.key)?;
+            let key_value_heads = V::Type::constant_extent(&prepared.key, dimensions.key_value_heads)?;
+            let group = V::Type::constant_extent(&prepared.key, group)?;
+            let head_dimension = V::Type::constant_extent(&prepared.key, dimensions.head_dimension)?;
+            let grouped_extents =
+                [key_extents[0].clone(), key_extents[1].clone(), key_value_heads, group, head_dimension];
+            let grouped_key = V::Type::reshape(&V::Type::from_array(key_cotangent), &grouped_extents)?;
+            let grouped_value = V::Type::reshape(&V::Type::from_array(value_cotangent), &grouped_extents)?;
+            (
+                V::Type::into_array(grouped_key)?.reduce(&[3], ReductionKind::Sum)?,
+                V::Type::into_array(grouped_value)?.reduce(&[3], ReductionKind::Sum)?,
+            )
+        };
+        // Every cotangent returns to the cotangent data type and to the rank of its input.
+        let mut cotangents = [query_cotangent, key_cotangent, value_cotangent]
+            .into_iter()
+            .zip(input_types[..3].iter().zip(input_ranks))
+            .map(|(cotangent, (input_type, rank))| {
+                let cotangent_data_type = input_type.cotangent()?.data_type();
+                let cotangent = if cotangent.r#type().data_type() == cotangent_data_type {
+                    cotangent
+                } else {
+                    cotangent.convert_element_type(cotangent_data_type)?
+                };
+                denormalize_attention_output::<RuleTracer<V, O>>(cotangent, rank).map(V::Type::from_array)
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+        if let Some(bias) = &inputs.bias {
+            let bias_type = V::Type::array_type(bias)?;
+            let bias_cotangent_type = bias_type.cotangent()?;
+            if bias_cotangent_type.is_zero_space() {
+                return Ok(cotangents);
+            }
+            let bias_dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - bias_type.rank())
+                .chain(bias_type.shape().dimensions().iter().cloned())
+                .collect::<Vec<_>>();
+            let logit_type = logit_cotangents.r#type().into_owned();
+            let reduce_axes = bias_dimensions
+                .iter()
+                .zip(logit_type.shape().dimensions())
+                .enumerate()
+                .filter_map(|(axis, (bias, logit))| (bias == &Dimension::Static(1) && logit != bias).then_some(axis))
+                .collect::<Vec<_>>();
+            let bias_cotangent = if reduce_axes.is_empty() {
+                logit_cotangents
+            } else {
+                logit_cotangents.reduce(reduce_axes.as_slice(), ReductionKind::Sum)?
+            };
+            let bias_cotangent = V::Type::into_array(V::Type::reshape(
+                &V::Type::from_array(bias_cotangent),
+                V::Type::extents(bias)?.as_slice(),
+            )?)?;
+            let bias_cotangent = if bias_cotangent_type.data_type() == prepared.softmax_type {
+                bias_cotangent
+            } else {
+                bias_cotangent.convert_element_type(bias_cotangent_type.data_type())?
+            };
+            cotangents.push(V::Type::from_array(bias_cotangent));
+        }
+        Ok(cotangents)
+    };
+    let function = composite(body)
+        .with_name(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME)
+        .with_named_composite(key.to_composite_key(), output_types);
+    if configuration.dropout().is_some() {
+        return match configuration.implementation() {
+            // Refer to the forward definition for why a batched fused call with dropout is rejected.
+            AttentionImplementation::Fused => {
+                AttentionFunction::Folding(Arc::new(function.with_batching(|_, _, _| {
+                    Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "named composite `{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` with dropout cannot be \
+                         batched with the fused implementation, because a batched call cannot use the fused \
+                         kernels or reproduce their dropout mask; use the portable implementation or a dropout \
+                         state",
+                        ),
+                    })
+                })))
+            }
+            // Folding would change the shape of the dropout mask and therefore the mask of every batch item, so
+            // these definitions keep the structural batching of their bodies.
+            AttentionImplementation::Automatic | AttentionImplementation::Portable => {
+                AttentionFunction::Structural(Arc::new(function))
+            }
+        };
+    }
+    AttentionFunction::Folding(Arc::new_cyclic(|weak: &Weak<BackwardFolding<V, O>>| {
+        let weak = weak.clone();
+        let input_roles = key.batch_input_roles();
+        function.with_batching(move |inputs, axes: AttentionBackwardInputs<BatchAxis>, extent| {
+            // Refer to the forward definition for when the function may have been dropped.
+            let function = match weak.upgrade() {
+                Some(function) => function,
+                None => match backward_function::<V, O>(configuration, signature) {
+                    AttentionFunction::Folding(function) => function,
+                    AttentionFunction::Structural(_) => unreachable!("definitions without dropout batch by folding"),
+                },
+            };
+            batch_attention(
+                inputs.into_values(),
+                axes.into_values(),
+                &extent,
+                input_roles.as_slice(),
+                |output_count| key.batch_output_roles(output_count),
+                |inputs| function.call(AttentionBackwardInputs::from_values(signature, inputs.as_slice())?),
+            )
+        })
+    }))
 }
 
 /// Normalizes attention inputs and constructs the masked score logits shared by the forward and backward bodies.
@@ -2622,28 +2693,107 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
     // The stable softmax itself always runs in `f32`, matching the public attention contract.
     let logits_type = if data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
     let softmax_type = DataType::F32;
-    let scores = array(query.clone())?
-        .dot(&array(expanded_key.clone())?, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?;
+    let scores = V::Type::into_array(query.clone())?.dot(
+        &V::Type::into_array(expanded_key.clone())?,
+        &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]),
+    )?;
     let scores = if data_type == logits_type { scores } else { scores.convert_element_type(logits_type)? };
-    let mut scores = value::<V>(scores);
+    let mut scores = V::Type::from_array(scores);
     let scale = configuration.scale().unwrap_or(1.0 / (dimensions.head_dimension as f64).sqrt());
-    let scale_value = array(V::Type::fill(&scores, scale)?)?;
-    scores = value::<V>(array(scores)?.mul(&scale_value)?);
+    let scale_value = V::Type::into_array(V::Type::fill(&scores, scale)?)?;
+    scores = V::Type::from_array(V::Type::into_array(scores)?.mul(&scale_value)?);
     if let Some(bias) = &inputs.bias {
-        let bias = array(normalize_attention_score_input(bias)?)?;
+        let bias = V::Type::into_array(normalize_attention_score_input(bias)?)?;
         let bias =
             if bias.r#type().data_type() == logits_type { bias } else { bias.convert_element_type(logits_type)? };
-        let bias = array(broadcast_like::<V>(bias, &scores, &[0, 1, 2, 3])?)?;
-        scores = value::<V>(array(scores)?.add(&bias)?);
+        let bias = V::Type::into_array(V::Type::broadcast(
+            &V::Type::from_array(bias),
+            V::Type::extents(&scores)?.as_slice(),
+            &[0, 1, 2, 3],
+        )?)?;
+        scores = V::Type::from_array(V::Type::into_array(scores)?.add(&bias)?);
     }
-    let logits = apply_masks(
-        scores,
-        inputs.mask.as_ref(),
-        configuration,
-        inputs.query_sequence_lengths.as_ref(),
-        inputs.key_value_sequence_lengths.as_ref(),
-    )?;
-    let logits = array(logits)?;
+
+    // Visibility is the conjunction of the explicit mask, causal ordering, the local window, and both sequence
+    // length predicates. Attention without any of them keeps its scores as they are.
+    let logits = if inputs.mask.is_none()
+        && !configuration.causal()
+        && configuration.local_window().is_none()
+        && inputs.query_sequence_lengths.is_none()
+        && inputs.key_value_sequence_lengths.is_none()
+    {
+        scores
+    } else {
+        // The row and column coordinates of the scores are integer constants that cannot carry tangents.
+        let columns = V::Type::iota(&scores, 3)?;
+        let mut visible = match &inputs.mask {
+            None => None,
+            Some(mask) => {
+                let mask = V::Type::into_array(normalize_attention_score_input(mask)?)?;
+                Some(V::Type::into_array(V::Type::broadcast(
+                    &V::Type::from_array(mask),
+                    V::Type::extents(&scores)?.as_slice(),
+                    &[0, 1, 2, 3],
+                )?)?)
+            }
+        };
+        // Causal masking lets query position `i` attend only to key/value positions `j <= i`.
+        if configuration.causal() {
+            let rows = V::Type::into_array(V::Type::iota(&scores, 2)?)?;
+            let causal = V::Type::into_array(columns.clone())?.compare(&rows, ComparisonDirection::LessThanOrEqual)?;
+            visible = Some(match visible {
+                None => causal,
+                Some(visible) => visible.and(&causal)?,
+            });
+        }
+        // The local window keeps the key/value positions `j` with `i - left <= j <= i + right`.
+        if let Some((left, right)) = configuration.local_window() {
+            let rows = V::Type::iota(&scores, 2)?;
+            let columns = V::Type::into_array(columns.clone())?;
+            let left = V::Type::into_array(V::Type::fill(&rows, left as f64)?)?;
+            let right = V::Type::into_array(V::Type::fill(&rows, right as f64)?)?;
+            let rows = V::Type::into_array(rows)?;
+            let lower = rows.sub(&left)?;
+            let upper = rows.add(&right)?;
+            let in_window = columns
+                .compare(&lower, ComparisonDirection::GreaterThanOrEqual)?
+                .and(&columns.compare(&upper, ComparisonDirection::LessThanOrEqual)?)?;
+            visible = Some(match visible {
+                None => in_window,
+                Some(visible) => visible.and(&in_window)?,
+            });
+        }
+        // Query rows at or beyond the query length of their batch item see no key/value position at all.
+        if let Some(lengths) = &inputs.query_sequence_lengths {
+            let rows = V::Type::iota(&scores, 2)?;
+            let bounds = V::Type::broadcast(lengths, V::Type::extents(&rows)?.as_slice(), &[0])?;
+            let in_range =
+                V::Type::into_array(rows)?.compare(&V::Type::into_array(bounds)?, ComparisonDirection::LessThan)?;
+            visible = Some(match visible {
+                None => in_range,
+                Some(visible) => visible.and(&in_range)?,
+            });
+        }
+        // Key/value columns at or beyond the key/value length of their batch item are invisible to every row.
+        if let Some(lengths) = &inputs.key_value_sequence_lengths {
+            let bounds = V::Type::broadcast(lengths, V::Type::extents(&columns)?.as_slice(), &[0])?;
+            let in_range =
+                V::Type::into_array(columns)?.compare(&V::Type::into_array(bounds)?, ComparisonDirection::LessThan)?;
+            visible = Some(match visible {
+                None => in_range,
+                Some(visible) => visible.and(&in_range)?,
+            });
+        }
+        // Invisible scores use a finite large negative value rather than negative infinity, so that a row without
+        // any visible position still has a finite maximum and a finite log-sum-exp residual. At least one of the
+        // masks above is present on this path, so the visibility is known.
+        let score_type = V::Type::into_array(scores.clone())?.r#type().into_owned();
+        let large_negative =
+            if score_type.data_type() == DataType::F64 { -0.7 * f64::MAX } else { -0.7 * f32::MAX as f64 };
+        let masked = V::Type::into_array(V::Type::fill(&scores, large_negative)?)?;
+        V::Type::from_array(visible.unwrap().select(&V::Type::into_array(scores)?, &masked)?)
+    };
+    let logits = V::Type::into_array(logits)?;
     let logits = if logits_type == softmax_type { logits } else { logits.convert_element_type(softmax_type)? };
     Ok(PreparedAttention { query, key, expanded_key, expanded_value, logits, data_type, softmax_type, scale })
 }
@@ -2654,7 +2804,7 @@ fn normalize_attention_input<V: Value<Type: AttentionUniverse<V>>>(input: &V) ->
     if V::Type::array_type(input)?.rank() == 4 {
         return Ok(input.clone());
     }
-    let mut input_extents = extents(input)?;
+    let mut input_extents = V::Type::extents(input)?;
     input_extents.insert(0, V::Type::constant_extent(input, 1)?);
     V::Type::reshape(input, input_extents.as_slice())
 }
@@ -2668,7 +2818,7 @@ fn expand_key_value_heads<V: Value<Type: AttentionUniverse<V>>>(
         return Ok(key_or_value.clone());
     }
     let group = dimensions.query_heads / dimensions.key_value_heads;
-    let key_or_value_extents = extents(key_or_value)?;
+    let key_or_value_extents = V::Type::extents(key_or_value)?;
     let key_value_heads = V::Type::constant_extent(key_or_value, dimensions.key_value_heads)?;
     let group = V::Type::constant_extent(key_or_value, group)?;
     let query_heads = V::Type::constant_extent(key_or_value, dimensions.query_heads)?;
@@ -2702,80 +2852,8 @@ fn normalize_attention_score_input<V: Value<Type: AttentionUniverse<V>>>(input: 
     }
     let singleton = V::Type::constant_extent(input, 1)?;
     let mut input_extents = vec![singleton; 4 - rank];
-    input_extents.extend(extents(input)?);
+    input_extents.extend(V::Type::extents(input)?);
     V::Type::reshape(input, input_extents.as_slice())
-}
-
-/// Applies the explicit mask, the causal and local window masks, and the sequence length masks to the attention
-/// logits.
-fn apply_masks<V: Value<Type: AttentionUniverse<V>>>(
-    scores: V,
-    mask: Option<&V>,
-    configuration: AttentionConfiguration,
-    query_sequence_lengths: Option<&V>,
-    key_value_sequence_lengths: Option<&V>,
-) -> Result<V, ProgramError> {
-    if mask.is_none()
-        && !configuration.causal()
-        && configuration.local_window().is_none()
-        && query_sequence_lengths.is_none()
-        && key_value_sequence_lengths.is_none()
-    {
-        return Ok(scores);
-    }
-    let columns = V::Type::iota(&scores, 3)?;
-    let mut visible = match mask {
-        None => None,
-        Some(mask) => {
-            let mask = array(normalize_attention_score_input(mask)?)?;
-            Some(array(broadcast_like::<V>(mask, &scores, &[0, 1, 2, 3])?)?)
-        }
-    };
-    if configuration.causal() {
-        let rows = array(V::Type::iota(&scores, 2)?)?;
-        let causal = array(columns.clone())?.compare(&rows, ComparisonDirection::LessThanOrEqual)?;
-        visible = Some(match visible {
-            None => causal,
-            Some(visible) => visible.and(&causal)?,
-        });
-    }
-    if let Some((left, right)) = configuration.local_window() {
-        let rows = V::Type::iota(&scores, 2)?;
-        let columns = array(columns.clone())?;
-        let left = array(V::Type::fill(&rows, left as f64)?)?;
-        let right = array(V::Type::fill(&rows, right as f64)?)?;
-        let rows = array(rows)?;
-        let lower = rows.sub(&left)?;
-        let upper = rows.add(&right)?;
-        let in_window = columns
-            .compare(&lower, ComparisonDirection::GreaterThanOrEqual)?
-            .and(&columns.compare(&upper, ComparisonDirection::LessThanOrEqual)?)?;
-        visible = Some(match visible {
-            None => in_window,
-            Some(visible) => visible.and(&in_window)?,
-        });
-    }
-    if let Some(lengths) = query_sequence_lengths {
-        let rows = V::Type::iota(&scores, 2)?;
-        let bounds = V::Type::broadcast(lengths, extents(&rows)?.as_slice(), &[0])?;
-        let in_range = array(rows)?.compare(&array(bounds)?, ComparisonDirection::LessThan)?;
-        visible = Some(match visible {
-            None => in_range,
-            Some(visible) => visible.and(&in_range)?,
-        });
-    }
-    if let Some(lengths) = key_value_sequence_lengths {
-        let bounds = V::Type::broadcast(lengths, extents(&columns)?.as_slice(), &[0])?;
-        let in_range = array(columns)?.compare(&array(bounds)?, ComparisonDirection::LessThan)?;
-        visible = Some(match visible {
-            None => in_range,
-            Some(visible) => visible.and(&in_range)?,
-        });
-    }
-    let score_type = array(scores.clone())?.r#type().into_owned();
-    let large_negative = if score_type.data_type() == DataType::F64 { -0.7 * f64::MAX } else { -0.7 * f32::MAX as f64 };
-    let masked = array(V::Type::fill(&scores, large_negative)?)?;
-    Ok(value::<V>(visible.unwrap().select(&array(scores)?, &masked)?))
 }
 
 /// Applies the configured dropout to `probabilities`, whose shape is the normalized `BNTS` score shape, using the
@@ -2789,7 +2867,7 @@ fn apply_dropout<V: Value<Type: AttentionUniverse<V>>>(
     let Some(rate) = configuration.dropout() else {
         return Ok(probabilities);
     };
-    let state = inputs.dropout_state.clone().map(array).transpose()?;
+    let state = inputs.dropout_state.clone().map(V::Type::into_array).transpose()?;
     Ok(probabilities.dropout(rate, state.as_ref())?.0)
 }
 
@@ -2799,12 +2877,12 @@ fn zero_query_rows<V: Value<Type: AttentionUniverse<V>>>(
     query_lengths: &V,
     row_axis: usize,
 ) -> Result<ArrayOf<V>, ProgramError> {
-    let rows_value = value::<V>(rows_value);
+    let rows_value = V::Type::from_array(rows_value);
     let rows = V::Type::iota(&rows_value, row_axis)?;
-    let lengths = V::Type::broadcast(query_lengths, extents(&rows_value)?.as_slice(), &[0])?;
-    let in_range = array(rows)?.compare(&array(lengths)?, ComparisonDirection::LessThan)?;
-    let zero = array(V::Type::fill(&rows_value, 0.0)?)?;
-    in_range.select(&array(rows_value)?, &zero)
+    let lengths = V::Type::broadcast(query_lengths, V::Type::extents(&rows_value)?.as_slice(), &[0])?;
+    let in_range = V::Type::into_array(rows)?.compare(&V::Type::into_array(lengths)?, ComparisonDirection::LessThan)?;
+    let zero = V::Type::into_array(V::Type::fill(&rows_value, 0.0)?)?;
+    in_range.select(&V::Type::into_array(rows_value)?, &zero)
 }
 
 /// Removes the implicit batch axis after evaluating unbatched attention.
@@ -2815,89 +2893,9 @@ fn denormalize_attention_output<V: Value<Type: AttentionUniverse<V>>>(
     if rank == 4 {
         return Ok(output);
     }
-    let output = value::<V>(output);
-    let output_extents = extents(&output)?;
-    array(V::Type::reshape(&output, &output_extents[1..])?)
-}
-
-/// Broadcasts one array to the exact shape of `target`, where `axes` names the output axis of every input axis.
-fn broadcast_like<V: Value<Type: AttentionUniverse<V>>>(
-    array: ArrayOf<V>,
-    target: &V,
-    axes: &[usize],
-) -> Result<V, ProgramError> {
-    V::Type::broadcast(&value::<V>(array), extents(target)?.as_slice(), axes)
-}
-
-/// Returns the extent of every axis of `value`.
-fn extents<V: Value<Type: AttentionUniverse<V>>>(value: &V) -> Result<Vec<ExtentOf<V>>, ProgramError> {
-    (0..V::Type::array_type(value)?.rank()).map(|axis| V::Type::extent(value, axis)).collect()
-}
-
-/// Returns the array view of `value`.
-fn array<V: Value<Type: AttentionUniverse<V>>>(value: V) -> Result<ArrayOf<V>, ProgramError> {
-    V::Type::into_array(value)
-}
-
-/// Returns the value whose array view is `array`.
-fn value<V: Value<Type: AttentionUniverse<V>>>(array: ArrayOf<V>) -> V {
-    V::Type::from_array(array)
-}
-
-/// Returns the error that rejects batching a call of the definition named `name` with dropout and the fused
-/// implementation. A batched call loses its definition's identity (i.e., it lowers its structurally batched body), so
-/// it would silently replace the fused kernels and their dropout mask with the portable body and its mask. That would
-/// both change the requested numerics and break the agreement between the dropout masks of the forward and backward
-/// definitions when only one of them is batched (e.g., when the pullback of an unbatched call is batched).
-fn fused_dropout_batching_error(name: &str) -> ProgramError {
-    ProgramError::UnsupportedOperation {
-        message: format!(
-            "named composite `{name}` with dropout cannot be batched with the fused implementation, because a batched \
-             call cannot use the fused kernels or reproduce their dropout mask; use the portable implementation or a \
-             dropout state",
-        ),
-    }
-}
-
-/// Returns the batching roles of the canonical inputs of a definition of the provided kind and optional-input
-/// signature. Dropout states never reach batching rules, because definitions with dropout are batched structurally.
-fn attention_batch_input_roles(
-    signature: AttentionInputSignature,
-    kind: AttentionDefinitionKind,
-) -> Vec<AttentionBatchInput> {
-    let mut roles = vec![AttentionBatchInput::Tensor; 3];
-    roles.extend(signature.has_bias().then_some(AttentionBatchInput::Score));
-    roles.extend(signature.has_mask().then_some(AttentionBatchInput::Score));
-    roles.extend(signature.has_query_sequence_lengths().then_some(AttentionBatchInput::Length));
-    roles.extend(signature.has_key_value_sequence_lengths().then_some(AttentionBatchInput::Length));
-    if kind == AttentionDefinitionKind::Backward {
-        roles.extend([AttentionBatchInput::Tensor, AttentionBatchInput::Residual, AttentionBatchInput::Tensor]);
-    }
-    roles
-}
-
-/// Returns the batching roles of the `output_count` outputs of a definition of the provided kind and optional-input
-/// signature. A backward definition returns a bias cotangent, whose bias is always the fourth canonical input, only
-/// when the bias is present and its cotangent space is not zero-dimensional.
-fn attention_batch_output_roles(
-    signature: AttentionInputSignature,
-    kind: AttentionDefinitionKind,
-    output_count: usize,
-) -> Vec<AttentionBatchOutput> {
-    match kind {
-        AttentionDefinitionKind::Forward => [AttentionBatchOutput::Tensor(0), AttentionBatchOutput::Residual]
-            .into_iter()
-            .take(output_count)
-            .collect(),
-        AttentionDefinitionKind::Backward => {
-            let mut roles =
-                vec![AttentionBatchOutput::Tensor(0), AttentionBatchOutput::Tensor(1), AttentionBatchOutput::Tensor(2)];
-            if signature.has_bias() && output_count == 4 {
-                roles.push(AttentionBatchOutput::Score(3));
-            }
-            roles
-        }
-    }
+    let output = V::Type::from_array(output);
+    let output_extents = V::Type::extents(&output)?;
+    V::Type::into_array(V::Type::reshape(&output, &output_extents[1..])?)
 }
 
 /// Batches one attention call by folding its mapped axis into attention's batch axis, staging the definition once at
@@ -2946,7 +2944,7 @@ fn batch_attention<V: Value<Type: AttentionUniverse<V>>>(
                 }
                 None => {
                     let output_extents =
-                        std::iter::once(mapped_extent.clone()).chain(extents(input)?).collect::<Vec<_>>();
+                        std::iter::once(mapped_extent.clone()).chain(V::Type::extents(input)?).collect::<Vec<_>>();
                     V::Type::broadcast(input, output_extents.as_slice(), (1..=rank).collect::<Vec<_>>().as_slice())
                 }
             }
@@ -3060,7 +3058,7 @@ fn batch_attention<V: Value<Type: AttentionUniverse<V>>>(
                     let normalized = V::Type::reshape(&output, &score_extents()?.0)?;
                     let reduced =
                         V::Type::into_array(normalized)?.reduce(reduction_axes.as_slice(), ReductionKind::Sum)?;
-                    V::Type::reshape(&V::Type::from_array(reduced), extents(&aligned[input_index])?.as_slice())
+                    V::Type::reshape(&V::Type::from_array(reduced), V::Type::extents(&aligned[input_index])?.as_slice())
                 }
             }
         })
