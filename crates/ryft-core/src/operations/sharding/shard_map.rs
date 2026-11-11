@@ -24233,8 +24233,7 @@ mod tests {
         assert_eq!(
             transposed.to_string(),
             formatdoc! {"
-            lambda %0:{x_type}, %1:{xy_type}, %2:{replicated_type}, %3:ref<f32[4]>, %4:ref<f32[4]>, \
-                %5:ref<f32[4]> .
+                lambda %0:{x_type}, %1:{xy_type}, %2:{replicated_type}, %3:ref<f32[4]>, %4:ref<f32[4]>, %5:ref<f32[4]> .
                 let %6:{x_type}, %7:{replicated_type} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:manual],
                     input_shardings=[{x_sharding}, {xy_sharding}, {replicated_sharding}, {xy_sharding}],
