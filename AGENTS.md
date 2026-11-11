@@ -63,7 +63,7 @@ and preserve unrelated work, including the user's staged changes.
 - Start with checks scoped to the affected crate and behavior. Include integration tests, doctests, and downstream
   checks when the changed contract warrants them; unit tests alone are not always sufficient. Check the diff before
   deciding what to run or add, and report exactly what passed, failed, or could not run.
-- Start potentially expensive local verification commands with an explicit **300-second timeout per command**, unless
+- Start potentially expensive local verification commands with an explicit **600-second timeout per command**, unless
   the user requests a longer run. Do not leave tests or benchmarks running for many minutes by default.
 - If `rustc` is killed or uses extreme memory, stop broad retries and diagnose the failure. If new generic types or
   trait-solver obligations caused it, reduce that surface before rerunning. Do not assume every kill is a type issue.

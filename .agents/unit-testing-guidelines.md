@@ -30,7 +30,7 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - Keep tests flat and readable; extract helpers only when they encode a repeated semantic testing contract.
 - When testing a later-stage validation error, keep earlier-stage fixtures well-formed unless malformed construction
   is the behavior under test.
-- Run scoped verification for the crate or module touched, using a 300-second timeout for local test commands unless the
+- Run scoped verification for the crate or module touched, using a 600-second timeout for local test commands unless the
   user asks for a longer run.
 - Use `ryft_core::arrays::Array` as the concrete eager value for operation, program, and transform coverage.
   Use rank-zero arrays when testing scalar-shaped behavior. Introduce a narrower test-only value family only when a
@@ -206,4 +206,4 @@ Use this file as the single detailed reference for `ryft` testing conventions.
   crate code has changed. Run the full affected crate `--lib` unit suites so printer-format churn, runtime-attribute
   drift, and environment-sensitive assumptions are caught before handoff.
 - Use enabled backend features only when the changed behavior depends on them.
-- Use a 300-second timeout for local test commands unless the user asks for a longer run.
+- Use a 600-second timeout for local test commands unless the user asks for a longer run.

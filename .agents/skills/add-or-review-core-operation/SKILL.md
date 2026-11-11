@@ -124,7 +124,7 @@ Choose finite-difference oracles only where they express the derivative's intend
 Run source-matched verification appropriate to the change, starting with focused tests and the required affected
 crate suites. Follow the testing guidelines' backend requirement when staged programs change (at least the
 `ryft-xla --lib` suite) and the repository's macro integration requirement when a core contract consumed by derives
-changes. Use the repository's 300-second command limits and memory/concurrency safeguards. Do not substitute a
+changes. Use the repository's 600-second command limits and memory/concurrency safeguards. Do not substitute a
 successful type check or an earlier binary for execution of the final changed behavior.
 
 Finish with the independent review in [Coverage and final review](references/review.md). Report the implemented or
