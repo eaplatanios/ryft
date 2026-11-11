@@ -1847,7 +1847,10 @@ where
 /// an invariant input along a manual mesh axis also makes its output vary along that axis (refer to
 /// [`validate_broadcast_manual_state`]), which treats the one shared input as one copy per device, exactly like
 /// [`ParallelVaryOperation`]. The adjoint of that implicit transition sums the contributions of the devices, so each
-/// such axis is reduced through a mesh-form [`ParallelReduceOperation`], like the transpose of that operation.
+/// such axis is reduced through a mesh-form [`ParallelReduceOperation`], like the transpose of that operation. This
+/// holds for a manual axis that places an output axis which the broadcast adds or stretches from a unit axis, because
+/// every device then holds a whole copy of the input. A manual axis that places a mapped input dimension partitions
+/// that dimension instead, so transposing such a broadcast is rejected.
 fn transpose_broadcast_cotangent<V, O>(
     context: &mut TranspositionContext<V, O>,
     cotangent: &Tracer<TracingContext<V, O>>,
@@ -1873,6 +1876,29 @@ where
         return cotangent.unalign_cotangent_along(input_cotangent_type, output_axes);
     };
 
+    // Summing the contributions of the devices is the adjoint only when every device holds a whole copy of the input,
+    // which does not hold along a manual axis that places a mapped input dimension rather than a replicated one.
+    let partitioned_axis = output_axes.iter().enumerate().find_map(|(input_axis, &output_axis)| {
+        let stretched = input_cotangent_type.dimension(input_axis) == Dimension::Static(1)
+            && cotangent_type.dimension(output_axis) != Dimension::Static(1);
+        match &sharding.dimensions()[output_axis] {
+            ShardingDimension::Sharded(names) if !stretched => {
+                names.iter().find(|name| introduced_axes.contains(name)).cloned()
+            }
+            _ => None,
+        }
+    });
+
+    if let Some(axis_name) = partitioned_axis {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "transposing a broadcast that places an input dimension along manual mesh axis `{axis_name}` is not \
+                 supported, because only added and stretched axes replicate the input on every device",
+            ),
+        }
+        .into());
+    }
+
     // The local contribution of every device still varies along the introduced axes, so it is first unaligned to
     // the input cotangent type with the variation of the output cotangent.
     let local_sharding = input_cotangent_type
@@ -1894,6 +1920,13 @@ where
         let mut contributions = context.bind(reduction, Vec::new(), std::slice::from_ref(&contribution))?;
         check_count!("output", contributions, 1, ProgramError);
         contribution = contributions.remove(0);
+    }
+
+    // The reductions leave the replicated placement on the mesh, which the cotangent type of an input without a
+    // sharding does not have, so the contribution is finally pinned to the input cotangent type.
+    if contribution.r#type().as_ref() != input_cotangent_type {
+        let axes = (0..input_cotangent_type.rank()).collect::<Vec<_>>();
+        contribution = contribution.unalign_cotangent_along(input_cotangent_type, axes.as_slice())?;
     }
 
     Ok(contribution)
@@ -3021,32 +3054,39 @@ mod tests {
 
     #[test]
     fn test_broadcast_transposition_manual_placement() {
+        // The pullback of one `broadcast` instruction with respect to its input.
+        let pullback = |input_type: ArrayType, output_type: ArrayType, output_axes: Vec<usize>| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(input_type);
+            let output = builder
+                .add_instruction(BroadcastOperation::new(output_type, output_axes), Vec::new(), vec![input], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+                .transpose_with_respect_to(&[0], &[])
+                .map(|program| program.to_string())
+        };
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let placed = |r#type: ArrayType, dimensions: Vec<ShardingDimension>| {
+            r#type
+                .with_sharding(
+                    Sharding::new(mesh.clone(), dimensions).unwrap().with_varying_manual_axes(["x"]).unwrap(),
+                )
+                .unwrap()
+        };
+        let output_type = placed(
+            ArrayType::new_static(DataType::F64, [2, 3]),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated],
+        );
+
         // Placing an invariant input along a manual mesh axis makes the output vary along that axis, which treats the
         // shared input as one copy per device, so the pullback also sums the contributions of the devices.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new_static(DataType::F64, [3])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
             .unwrap();
-        let output_type = ArrayType::new_static(DataType::F64, [2, 3])
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated])
-                    .unwrap()
-                    .with_varying_manual_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(input_type);
-        let output = builder
-            .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-            .transpose_with_respect_to(&[0], &[])
-            .map(|program| program.to_string());
         assert_eq!(
-            program,
+            pullback(input_type, output_type.clone(), vec![1]),
             Ok(indoc! {"
                 lambda %0:f64[2, 3][sharding={mesh<['x'=2:manual]>, [{'x'}, {}], varying_manual={'x'}}] .
                 let %1:f64[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
@@ -3057,6 +3097,39 @@ mod tests {
             "}
             .trim_end()
             .to_string()),
+        );
+
+        // An input without a sharding has a cotangent without one, so the summed contribution leaves the mesh again.
+        let program = pullback(ArrayType::new_static(DataType::F64, [3]), output_type, vec![1]);
+        assert_eq!(
+            program,
+            Ok(indoc! {"
+                lambda %0:f64[2, 3][sharding={mesh<['x'=2:manual]>, [{'x'}, {}], varying_manual={'x'}}] .
+                let %1:f64[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    reduce [kind=sum, axes=[0]] %0
+                    %2:f64[3][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %1
+                    %3:f64[3] = broadcast [output_type=f64[3], output_axes=[0]] %2
+                in (%3)
+            "}
+            .trim_end()
+            .to_string()),
+        );
+
+        // A manual axis that places a mapped input dimension partitions that dimension instead of replicating the
+        // input, so its devices do not hold copies whose contributions could be summed.
+        let input_type = ArrayType::new_static(DataType::F64, [4])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let output_type = placed(ArrayType::new_static(DataType::F64, [4]), vec![ShardingDimension::sharded(["x"])]);
+        let program = pullback(input_type, output_type, vec![0]);
+        assert_eq!(
+            program,
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message: "transposing a broadcast that places an input dimension along manual mesh axis `x` is not \
+                          supported, because only added and stretched axes replicate the input on every device"
+                    .to_string(),
+            })),
         );
     }
 

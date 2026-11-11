@@ -8,8 +8,8 @@
 //!   - **Reordering without Changing the Shape:** [`Transpose`] permutes axes and [`Reverse`] flips the order of the
 //!     elements along selected axes.
 //!   - **Changing the shape:** [`Reshape`] reinterprets the element layout, [`Broadcast`] repeats an array along new
-//!     or size-one axes, [`Concatenate`] joins arrays along an axis, and [`Pad`] adds, removes, or interleaves edge
-//!     and interior padding.
+//!     or size-one axes, [`BroadcastLike`] does so up to the runtime shape of another value, [`Concatenate`] joins
+//!     arrays along an axis, and [`Pad`] adds, removes, or interleaves edge and interior padding.
 //!   - **Selecting and Updating Elements:** [`Slice`] and [`UpdateSlice`] take static windows, [`DynamicSlice`] and
 //!     [`DynamicUpdateSlice`] take runtime start indices, [`DynamicSliceWithDimensions`] takes dimension-valued
 //!     windows, [`Gather`] and [`Scatter`] read and write arbitrary coordinates, and [`Indexing`] composes all of
@@ -86,7 +86,8 @@ pub mod slicing;
 pub mod transposition;
 
 pub use broadcasting::{
-    BROADCAST_OPERATION_NAME, Broadcast, BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
+    BROADCAST_LIKE_OPERATION_NAME, BROADCAST_OPERATION_NAME, Broadcast, BroadcastLike, BroadcastLikeOperation,
+    BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
 };
 pub use concatenation::{CONCATENATE_OPERATION_NAME, Concatenate, ConcatenateOperation, DynamicConcatenate};
 pub use conversions::{
@@ -113,10 +114,10 @@ pub use slicing::{
 };
 pub use transposition::{Permutation, TRANSPOSE_OPERATION_NAME, Transpose, TransposeOperation};
 
-/// Group of the array manipulation capabilities: [`Transpose`], [`Reverse`], [`Reshape`], [`Broadcast`], [`Pad`],
-/// [`Concatenate`], [`Gather`], [`Scatter`], [`Slice`], [`UpdateSlice`], [`DynamicSlice`], [`DynamicUpdateSlice`],
-/// [`ConvertElementType`], [`ReducePrecision`], and [`TransferToMemory`]. It is implemented automatically for every
-/// type that implements all of its members.
+/// Group of the array manipulation capabilities: [`Transpose`], [`Reverse`], [`Reshape`], [`Broadcast`],
+/// [`BroadcastLike`], [`Pad`], [`Concatenate`], [`Gather`], [`Scatter`], [`Slice`], [`UpdateSlice`], [`DynamicSlice`],
+/// [`DynamicUpdateSlice`], [`ConvertElementType`], [`ReducePrecision`], and [`TransferToMemory`]. It is implemented
+/// automatically for every type that implements all of its members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that homogeneous array values implement this bundle for [`ArrayType`](crate::ArrayType) and array IR values
@@ -127,6 +128,7 @@ pub trait ManipulationOperations<T = <Self as Capability>::Universe>:
     + Reverse<T>
     + Reshape<T>
     + Broadcast<T>
+    + BroadcastLike<T>
     + Pad<T>
     + Concatenate<T>
     + Gather<Array, T>
@@ -147,6 +149,7 @@ impl<
         + Reverse<T>
         + Reshape<T>
         + Broadcast<T>
+        + BroadcastLike<T>
         + Pad<T>
         + Concatenate<T>
         + Gather<Array, T>
