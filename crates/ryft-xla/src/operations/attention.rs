@@ -9,10 +9,9 @@
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, AttentionConfiguration, AttentionDefinitionKind, AttentionImplementation,
-    AttentionInputSignature, AttentionInputs, AttentionKey, CompositeKey,
-    DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DataType,
-    Dimension as CoreDimension, ProgramError, ReductionKind, Shape,
+    ArrayIrType, ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputSignature, AttentionInputs,
+    AttentionKey, CompositeKey, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+    DataType, Dimension as CoreDimension, ProgramError, ReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -61,9 +60,9 @@ pub(crate) fn select_attention_implementation(
     };
     let input_types = array_types(input_types)?;
     array_types(output_types)?;
-    let name = match key.kind() {
-        AttentionDefinitionKind::Forward => DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-        AttentionDefinitionKind::Backward => DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+    let name = match key {
+        AttentionKey::Forward { .. } => DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+        AttentionKey::Backward { .. } => DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
     };
     let unavailable = |reason: String| match implementation {
         AttentionImplementation::Fused => {
@@ -78,14 +77,16 @@ pub(crate) fn select_attention_implementation(
                 .to_string(),
         );
     }
-    let expected_input_count = 3 + signature.count() + 3 * usize::from(key.kind() == AttentionDefinitionKind::Backward);
+    let expected_input_count = 3 + signature.count() + 3 * usize::from(matches!(key, AttentionKey::Backward { .. }));
     if input_types.len() != expected_input_count {
         return None;
     }
     match fmha_eligibility(configuration, signature, input_types.as_slice(), target_platform) {
-        Ok(FmhaEligibility::Eligible) => Some(match key.kind() {
-            AttentionDefinitionKind::Forward => NamedCompositeImplementation::Attention { configuration, signature },
-            AttentionDefinitionKind::Backward => {
+        Ok(FmhaEligibility::Eligible) => Some(match key {
+            AttentionKey::Forward { return_residual, .. } => {
+                NamedCompositeImplementation::Attention { configuration, signature, return_residual }
+            }
+            AttentionKey::Backward { .. } => {
                 NamedCompositeImplementation::AttentionBackward { configuration, signature }
             }
         }),
@@ -244,15 +245,9 @@ fn fmha_eligibility(
     input_types: &[ArrayType],
     target_platform: Option<&str>,
 ) -> Result<FmhaEligibility, Error> {
-    if configuration.local_window().is_some_and(|(_, right)| {
-        right != 0
-            && (!configuration.causal()
-                || signature.has_query_sequence_lengths()
-                || signature.has_key_value_sequence_lengths())
-    }) {
-        return Ok(FmhaEligibility::Ineligible(
-            "a nonzero right local-window radius requires causal masking without sequence-length padding",
-        ));
+    // The right radius of a configuration with causal masking is always zero.
+    if configuration.local_window().is_some_and(|(_, right)| right != 0) {
+        return Ok(FmhaEligibility::Ineligible("a nonzero right local-window radius requires causal masking"));
     }
     if target_platform != Some("cuda") {
         return Ok(FmhaEligibility::Ineligible("the target platform is not CUDA"));
@@ -430,8 +425,8 @@ fn synthesize_fmha_sequence_lengths<'b, 'c: 'b, 't: 'c>(
     Ok(lengths)
 }
 
-/// Lowers one call of the forward attention definition with the provided configuration and optional-input signature
-/// to cuDNN's fused ABI, for a boundary that [`fmha_eligibility`] accepts.
+/// Lowers one call of the forward attention definition with the provided configuration, optional-input signature, and
+/// residual request to cuDNN's fused ABI, for a boundary that [`fmha_eligibility`] accepts.
 ///
 /// An eligible `bf16`/`f16` CUDA call emits `__cudnn$fmha[ScaleBias]Softmax[Dropout]` with physical `BNTH` inputs and
 /// restores the logical rank and dynamic dimensions of its outputs. Optional bias and sequence-length inputs retain the
@@ -440,6 +435,7 @@ fn synthesize_fmha_sequence_lengths<'b, 'c: 'b, 't: 'c>(
 pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
     configuration: AttentionConfiguration,
     signature: AttentionInputSignature,
+    return_residual: bool,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
@@ -452,7 +448,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
             ProgramError::InvalidInputCount { expected: 3 + signature.count(), actual: input_values.len() }.into()
         );
     }
-    let expected_output_count = if configuration.return_residual() { 2 } else { 1 };
+    let expected_output_count = if return_residual { 2 } else { 1 };
     check_count!("output", output_types, expected_output_count, ProgramError);
     let indices = attention_input_indices(signature);
     let uses_sequence_lengths = signature.has_query_sequence_lengths() || signature.has_key_value_sequence_lengths();
@@ -554,7 +550,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
             attention_array_type(data_type, &[physical_batch, heads, physical_query_sequence, head_dimension]);
         let mut custom_call_output_types = vec![lower_tensor_type(&attended_type, context, location)?];
         let mut result_layouts = vec![vec![3, 1, 2, 0]];
-        if configuration.return_residual() {
+        if return_residual {
             let residual_type = attention_array_type(DataType::F32, &[physical_batch, heads, physical_query_sequence]);
             custom_call_output_types.push(lower_tensor_type(&residual_type, context, location)?);
             result_layouts.push(vec![2, 1, 0]);
@@ -596,7 +592,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
             location,
         )?;
         let mut results = vec![result];
-        if configuration.return_residual() {
+        if return_residual {
             let residual = custom_call
                 .result(1)
                 .expect("stablehlo.custom_call should return the log-sum-exp residual")
@@ -944,6 +940,7 @@ mod tests {
     fn forward_program(
         configuration: AttentionConfiguration,
         signature: AttentionInputSignature,
+        return_residual: bool,
         input_types: Vec<ArrayType>,
         calls: usize,
     ) -> StagedProgram {
@@ -953,9 +950,13 @@ mod tests {
                 let mut inputs = AttentionInputs::from_values(signature, &inputs)?;
                 let mut outputs = Vec::new();
                 for _ in 0..calls {
-                    let (output, residual) = attention.call(inputs.clone())?;
-                    inputs.query = output.clone();
-                    outputs = std::iter::once(output).chain(residual).collect();
+                    outputs = if return_residual {
+                        let (output, residual) = attention.call_with_residual(inputs.clone())?;
+                        vec![output, residual]
+                    } else {
+                        vec![attention.call(inputs.clone())?]
+                    };
+                    inputs.query = outputs[0].clone();
                 }
                 Ok(outputs)
             },
@@ -1041,11 +1042,11 @@ mod tests {
                       signature: AttentionInputSignature,
                       input_types: &[ArrayIrType],
                       target_platform: Option<&str>| {
-            let key = AttentionKey::new(
-                AttentionDefinitionKind::Forward,
-                configuration.with_implementation(implementation),
+            let key = AttentionKey::Forward {
+                configuration: configuration.with_implementation(implementation),
                 signature,
-            );
+                return_residual: false,
+            };
             select_attention_implementation(
                 &key.to_composite_key(),
                 input_types,
@@ -1060,14 +1061,29 @@ mod tests {
         for implementation in [AttentionImplementation::Automatic, AttentionImplementation::Fused] {
             assert!(matches!(
                 select(implementation, configuration, signature, &forward_types, Some("cuda")),
-                Some(NamedCompositeImplementation::Attention { configuration: selected, signature: selected_signature })
-                    if selected == configuration.with_implementation(implementation)
-                        && selected_signature == signature,
+                Some(NamedCompositeImplementation::Attention {
+                    configuration: selected,
+                    signature: selected_signature,
+                    return_residual: false,
+                }) if selected == configuration.with_implementation(implementation)
+                    && selected_signature == signature,
             ));
         }
         assert!(
             select(AttentionImplementation::Portable, configuration, signature, &forward_types, Some("cuda")).is_none()
         );
+
+        // The residual request of a forward key reaches the selected implementation.
+        let residual_key = AttentionKey::Forward { configuration, signature, return_residual: true };
+        assert!(matches!(
+            select_attention_implementation(
+                &residual_key.to_composite_key(),
+                &forward_types,
+                &[operand_type.clone(), ArrayIrType::from(attention_array_type(DataType::BF16, &[1, 4, 2]))],
+                Some("cuda"),
+            ),
+            Some(NamedCompositeImplementation::Attention { return_residual: true, .. }),
+        ));
 
         // Ineligible calls lower their body unless the fused kernels are requested, which reports why they are not.
         let f32_types = vec![f32_operand_type; 3];
@@ -1112,8 +1128,7 @@ mod tests {
                 operand_type.clone(),
             ])
             .collect::<Vec<_>>();
-        let backward_key =
-            AttentionKey::new(AttentionDefinitionKind::Backward, configuration, signature).to_composite_key();
+        let backward_key = AttentionKey::Backward { configuration, signature }.to_composite_key();
         assert!(matches!(
             select_attention_implementation(&backward_key, &backward_types, &forward_types, Some("cuda")),
             Some(NamedCompositeImplementation::AttentionBackward { .. }),
@@ -1150,7 +1165,7 @@ mod tests {
             let configuration = AttentionConfiguration::new().with_scale(0.125).with_causal(causal);
             let input_types = vec![attention_array_type(data_type, &[1, 4, 2, 8]); 3];
             let module = lower(
-                &forward_program(configuration, AttentionInputSignature::default(), input_types, 1),
+                &forward_program(configuration, AttentionInputSignature::default(), false, input_types, 1),
                 Some("cuda"),
             )
             .unwrap();
@@ -1164,16 +1179,14 @@ mod tests {
         // A broadcastable bias is expanded to the physical score shape before entering the `ScaleBias` ABI.
         let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, true, false);
         let configuration = AttentionConfiguration::new().with_scale(0.125).with_causal(true);
-        let module = lower(&forward_program(configuration, signature, input_types, 1), Some("cuda")).unwrap();
+        let module = lower(&forward_program(configuration, signature, false, input_types, 1), Some("cuda")).unwrap();
         assert!(module.contains("stablehlo.broadcast_in_dim %arg3"));
         assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmax("));
         assert!(module.contains("tensor<2x2x4x4xbf16>"));
 
         // Residual attention carries both length vectors and converts the `f32` kernel residual to the query data type.
         let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, false, true);
-        let module =
-            lower(&forward_program(configuration.with_residual(true), signature, input_types, 1), Some("cuda"))
-                .unwrap();
+        let module = lower(&forward_program(configuration, signature, true, input_types, 1), Some("cuda")).unwrap();
         assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmax("));
         assert!(module.contains("PADDING_CAUSAL"));
         assert!(module.contains("tensor<2x2x4xf32>"));
@@ -1183,7 +1196,7 @@ mod tests {
         // records its exclusive length.
         let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, false, false);
         let dropout = configuration.with_local_window((1, 0)).with_dropout(0.5);
-        let module = lower(&forward_program(dropout, signature, input_types, 1), Some("cuda")).unwrap();
+        let module = lower(&forward_program(dropout, signature, false, input_types, 1), Some("cuda")).unwrap();
         assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmaxDropout("));
         assert!(module.contains("\\22dropout_rate\\22:0.5,\\22seed\\22:42,\\22sliding_window_length\\22:2"));
     }
@@ -1232,7 +1245,7 @@ mod tests {
             .with_causal(true)
             .with_implementation(AttentionImplementation::Fused);
         let (signature, input_types) = extended_input_types(DataType::F32, 2, 2, false, false);
-        let program = forward_program(fused, signature, input_types.clone(), 1);
+        let program = forward_program(fused, signature, false, input_types.clone(), 1);
         for (target_platform, reason) in
             [(Some("cuda"), "the operand data type is not `f16` or `bf16`"), (None, "the target platform is not CUDA")]
         {
@@ -1252,22 +1265,23 @@ mod tests {
         let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, false, false);
         let state_type = attention_array_type(DataType::U64, &[2]);
         let stateful_types = input_types.into_iter().chain([state_type]).collect::<Vec<_>>();
-        let program = forward_program(fused.with_dropout(0.5), signature.with_dropout_state(true), stateful_types, 1);
+        let program =
+            forward_program(fused.with_dropout(0.5), signature.with_dropout_state(true), false, stateful_types, 1);
         assert!(matches!(
             lower(&program, Some("cuda")),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason.contains("the fused kernels cannot reproduce the dropout mask of a dropout state"),
         ));
 
-        // The pinned cuDNN ABI supports a nonzero right radius only for the unpadded causal mask kind.
+        // The fused kernels have no right local-window radius. Causal masking makes that radius zero, so only a
+        // configuration without it can request one.
         let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, false, true);
-        let program = forward_program(fused.with_local_window((2, 1)), signature, input_types, 1);
+        let windowed = fused.with_causal(false).with_local_window((2, 1));
+        let program = forward_program(windowed, signature, false, input_types, 1);
         assert!(matches!(
             lower(&program, Some("cuda")),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
-                if reason.contains(
-                    "a nonzero right local-window radius requires causal masking without sequence-length padding",
-                ),
+                if reason.contains("a nonzero right local-window radius requires causal masking"),
         ));
     }
 
@@ -1277,7 +1291,7 @@ mod tests {
         // dot, causal mask, stable softmax, value dot, and final layout restoration.
         let configuration = AttentionConfiguration::new().with_scale(0.125).with_causal(true);
         let input_types = vec![attention_array_type(DataType::F32, &[1, 4, 2, 8]); 3];
-        let program = forward_program(configuration, AttentionInputSignature::default(), input_types.clone(), 2);
+        let program = forward_program(configuration, AttentionInputSignature::default(), false, input_types.clone(), 2);
         let module = to_mlir_module_for_program(&program.0, &[], &program.1, &program.2, "main", None, None).unwrap();
         assert_eq!(module.matches("func.func private @ryft.dot_product_attention.v1(").count(), 1);
         assert_eq!(module.matches("call @ryft.dot_product_attention.v1(").count(), 2);
@@ -1290,7 +1304,7 @@ mod tests {
         // CUDA targets lower the portable body, which converts narrow operands for its `f32` softmax.
         for (data_type, head_dimension) in [(DataType::F32, 8), (DataType::BF16, 4), (DataType::F8E4M3FN, 8)] {
             let input_types = vec![attention_array_type(data_type, &[1, 4, 2, head_dimension]); 3];
-            let program = forward_program(configuration, AttentionInputSignature::default(), input_types, 1);
+            let program = forward_program(configuration, AttentionInputSignature::default(), false, input_types, 1);
             let module = lower(&program, Some("cuda")).unwrap();
             assert!(!module.contains("fmha"));
             assert!(module.contains("stablehlo.dot_general"));
@@ -1298,8 +1312,7 @@ mod tests {
 
         // Grouped-query expansion, a broadcast bias, causal and local masking, and the residual all live in the body.
         let (signature, input_types) = extended_input_types(DataType::F32, 4, 2, true, false);
-        let program =
-            forward_program(configuration.with_local_window((1, 0)).with_residual(true), signature, input_types, 1);
+        let program = forward_program(configuration.with_local_window((1, 0)), signature, true, input_types, 1);
         let module = lower(&program, None).unwrap();
         assert!(module.contains("stablehlo.broadcast_in_dim"));
         assert!(module.contains("stablehlo.reshape"));
@@ -1351,7 +1364,7 @@ mod tests {
             [(2, false, configuration), (2, true, windowed), (1, true, configuration)]
         {
             let (signature, input_types) = boundary(key_value_heads, sequence_lengths);
-            let program = forward_program(configuration, signature, input_types, 1);
+            let program = forward_program(configuration, signature, false, input_types, 1);
             assert_eq!(program.2, vec![operand_type(2)]);
             lower(&program, None).unwrap();
         }
@@ -1365,12 +1378,12 @@ mod tests {
         // Bounded-dynamic fused attention requires sequence lengths, which mask the physical padding.
         let fused = configuration.with_implementation(AttentionImplementation::Fused);
         let (signature, input_types) = boundary(2, true);
-        let module = lower(&forward_program(fused, signature, input_types, 1), Some("cuda")).unwrap();
+        let module = lower(&forward_program(fused, signature, false, input_types, 1), Some("cuda")).unwrap();
         assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmax("));
         assert!(module.contains("PADDING"));
         let (signature, input_types) = boundary(2, false);
         assert!(matches!(
-            lower(&forward_program(fused, signature, input_types, 1), Some("cuda")),
+            lower(&forward_program(fused, signature, false, input_types, 1), Some("cuda")),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
                 if reason.contains("bounded-dynamic operands require query or key/value sequence lengths"),
         ));
@@ -1387,10 +1400,9 @@ mod tests {
         let signature = AttentionInputSignature::new(false, true, true, false);
         let configuration = AttentionConfiguration::new()
             .with_local_window(Some((2, 1)))
-            .with_implementation(AttentionImplementation::Portable)
-            .with_residual(true);
+            .with_implementation(AttentionImplementation::Portable);
         let input_types = vec![query_type.clone(), key_value_type.clone(), key_value_type, mask_type, lengths_type];
-        let program = forward_program(configuration, signature, input_types, 1);
+        let program = forward_program(configuration, signature, true, input_types, 1);
         let module = lower(&program, None).unwrap();
         assert!(module.contains("stablehlo.and"));
         assert!(module.contains("stablehlo.exponential"));
@@ -1412,9 +1424,8 @@ mod tests {
         let configuration = AttentionConfiguration::new()
             .with_causal(true)
             .with_local_window((2, 0))
-            .with_implementation(AttentionImplementation::Fused)
-            .with_residual(true);
-        let program = forward_program(configuration, signature, input_types.clone(), 1);
+            .with_implementation(AttentionImplementation::Fused);
+        let program = forward_program(configuration, signature, true, input_types.clone(), 1);
         let forward = lower(&program, Some("cuda")).unwrap();
         assert!(forward.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmax("));
         assert!(forward.contains("PADDING_CAUSAL"));
@@ -1423,7 +1434,7 @@ mod tests {
         assert!(forward.contains("tensor<4x2x8xf16>"));
         assert_eq!(program.2, vec![query_type.clone(), attention_array_type(DataType::F16, &[4, 2])]);
 
-        let program = training_program(configuration.with_residual(false), signature, input_types);
+        let program = training_program(configuration, signature, input_types);
         let backward = lower(&program, Some("cuda")).unwrap();
         assert!(backward.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmaxBackward("));
         assert_eq!(program.2, vec![query_type.clone(), query_type, key_value_type.clone(), key_value_type]);

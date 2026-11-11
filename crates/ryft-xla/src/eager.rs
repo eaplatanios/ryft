@@ -3911,12 +3911,10 @@ mod tests {
         ] {
             let device_output = dot_product_attention::<ArrayDomain<'_>>(configuration)
                 .call(AttentionInputs::new(device(&query_values), device(&key_values), device(&value_values)))
-                .unwrap()
-                .0;
+                .unwrap();
             let reference_output = dot_product_attention::<ReferenceContext>(configuration)
                 .call(AttentionInputs::new(reference(&query_values), reference(&key_values), reference(&value_values)))
-                .unwrap()
-                .0;
+                .unwrap();
 
             read_f32s(&device_output).iter().zip(reference_output.to_f64s()).for_each(|(actual, expected)| {
                 assert!((f64::from(*actual) - expected).abs() < 1e-5, "expected {expected} but got {actual}");
@@ -3943,8 +3941,7 @@ mod tests {
             )
             .unwrap()
         };
-        let configuration =
-            AttentionConfiguration::new().with_causal(true).with_local_window((2, 1)).with_residual(true);
+        let configuration = AttentionConfiguration::new().with_causal(true).with_local_window((2, 1));
         let device_inputs = AttentionInputs {
             query: device(&query_values),
             key: device(&key_values),
@@ -3966,12 +3963,13 @@ mod tests {
             dropout_state: None,
         };
         let (device_output, device_residual) =
-            dot_product_attention::<ArrayDomain<'_>>(configuration).call(device_inputs).unwrap();
-        let (reference_output, reference_residual) =
-            dot_product_attention::<ReferenceContext>(configuration).call(reference_inputs).unwrap();
+            dot_product_attention::<ArrayDomain<'_>>(configuration).call_with_residual(device_inputs).unwrap();
+        let (reference_output, reference_residual) = dot_product_attention::<ReferenceContext>(configuration)
+            .call_with_residual(reference_inputs)
+            .unwrap();
         for (actual, expected) in [
             (read_f32s(&device_output), reference_output.to_f64s()),
-            (read_f32s(&device_residual.unwrap()), reference_residual.unwrap().to_f64s()),
+            (read_f32s(&device_residual), reference_residual.to_f64s()),
         ] {
             actual.iter().zip(expected).for_each(|(actual, expected)| {
                 assert!((f64::from(*actual) - expected).abs() < 1e-5, "expected {expected} but got {actual}");

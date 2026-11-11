@@ -6180,7 +6180,7 @@ mod tests {
         );
         let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
-                let (output, _) =
+                let output =
                     attention.call(AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone()))?;
                 Ok(vec![output])
             },

@@ -1260,13 +1260,13 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, AttentionConfiguration,
-        AttentionDefinitionKind, AttentionInputSignature, AttentionKey, CompositeAttribute, CompositeJvpRule,
-        CompositeKey, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context,
-        CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionError, DimensionType, DimensionValue,
-        EffectClasses, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite, Placeholder,
-        ProgramBuilder, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceWrite, ReferenceWriteOperation, RegionId, Shape, ShardMapBoundary,
-        ShardMapOperation, Sharding, TiledLayout, TypedProgram, ZeroOperation,
+        AttentionInputSignature, AttentionKey, CompositeAttribute, CompositeJvpRule, CompositeKey, CompositeOperation,
+        CompositeTransposeOperation, ConditionOperation, Context, CustomRuleDefinition, CustomRuleRegistration,
+        DataType, DimensionError, DimensionType, DimensionValue, EffectClasses, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, NamedComposite, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation,
+        ReferenceAtomicAddUpdateOperation, ReferenceRead, ReferenceReadOperation, ReferenceWrite,
+        ReferenceWriteOperation, RegionId, Shape, ShardMapBoundary, ShardMapOperation, Sharding, TiledLayout,
+        TypedProgram, ZeroOperation,
     };
 
     use crate::authoring::whole_array_parameter;
@@ -2428,11 +2428,11 @@ mod tests {
             [AttentionConfiguration::new().with_scale(0.0), AttentionConfiguration::new().with_scale(-0.0)],
         ] {
             let keys = configurations.map(|configuration| {
-                let key = AttentionKey::new(
-                    AttentionDefinitionKind::Forward,
+                let key = AttentionKey::Forward {
                     configuration,
-                    AttentionInputSignature::default(),
-                )
+                    signature: AttentionInputSignature::default(),
+                    return_residual: false,
+                }
                 .to_composite_key();
                 format!("{key:?}")
             });

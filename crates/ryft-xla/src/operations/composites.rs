@@ -52,6 +52,9 @@ pub(crate) enum NamedCompositeImplementation {
 
         /// Optional-input signature of the definition.
         signature: AttentionInputSignature,
+
+        /// Whether the definition also returns the log-sum-exp residual of its softmax.
+        return_residual: bool,
     },
 
     /// cuDNN fused attention backward kernels for a call of the backward attention definition (refer to
@@ -139,9 +142,10 @@ impl NamedCompositeImplementation {
                 .map_err(ProgramError::from)
         };
         match self {
-            Self::Attention { configuration, signature } => lower_fused_attention(
+            Self::Attention { configuration, signature, return_residual } => lower_fused_attention(
                 *configuration,
                 *signature,
+                *return_residual,
                 input_values,
                 array_types(input_types)?.as_slice(),
                 array_types(output_types)?.as_slice(),

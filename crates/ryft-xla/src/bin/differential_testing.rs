@@ -758,11 +758,7 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
     let bias_type = ArrayType::scalar(DataType::F32);
     let mask_type = ArrayType::new_static(DataType::Boolean, [2, 2]);
     let lengths_type = ArrayType::new_static(DataType::I32, [1]);
-    let configuration = AttentionConfiguration::new()
-        .with_scale(1.0)
-        .with_causal(true)
-        .with_local_window((1, 0))
-        .with_residual(true);
+    let configuration = AttentionConfiguration::new().with_scale(1.0).with_causal(true).with_local_window((1, 0));
     let inputs = AttentionInputs {
         query: CoreArray::from_elements::<f32>(query_type.clone(), &[0.0; 4])?,
         key: CoreArray::from_elements::<f32>(key_value_type.clone(), &[0.0; 2])?,
@@ -773,12 +769,12 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         key_value_sequence_lengths: Some(CoreArray::from_elements(lengths_type.clone(), &[2_i32])?),
         dropout_state: None,
     };
-    let (output, residual) =
-        dot_product_attention::<EagerContext<CoreArray, ArrayOperation<CoreArray>>>(configuration).call(inputs)?;
+    let (output, residual) = dot_product_attention::<EagerContext<CoreArray, ArrayOperation<CoreArray>>>(configuration)
+        .call_with_residual(inputs)?;
     let values = |value: CoreArray| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
     let gqa_query_type = ArrayType::new_static(DataType::F32, [1, 2, 4, 1]);
     let gqa_key_value_type = ArrayType::new_static(DataType::F32, [1, 3, 2, 1]);
-    let (gqa_output, _) = dot_product_attention::<EagerContext<CoreArray, ArrayOperation<CoreArray>>>(
+    let gqa_output = dot_product_attention::<EagerContext<CoreArray, ArrayOperation<CoreArray>>>(
         AttentionConfiguration::new()
             .with_local_window((1, 1))
             .with_implementation(AttentionImplementation::Portable),
@@ -795,7 +791,7 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
     })?;
     let observations = BTreeMap::from([
         ("output", values(output)),
-        ("residual", values(residual.expect("the configuration requests a residual"))),
+        ("residual", values(residual)),
         ("rank_four_gqa", values(gqa_output)),
     ]);
     let attention = dot_product_attention::<ProjectedContext<Domain<'static>, ArrayType>>(configuration);
@@ -812,8 +808,8 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
             ArrayTracer,
             ArrayTracer,
         )| {
-            let (output, residual) = attention
-                .call(AttentionInputs {
+            attention
+                .call_with_residual(AttentionInputs {
                     query,
                     key,
                     value,
@@ -823,8 +819,7 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
                     key_value_sequence_lengths: Some(key_value_sequence_lengths),
                     dropout_state: None,
                 })
-                .unwrap();
-            (output, residual.expect("the configuration requests a residual"))
+                .unwrap()
         },
         (query_type, key_value_type.clone(), key_value_type, bias_type, mask_type, lengths_type.clone(), lengths_type),
     )?;
