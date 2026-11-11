@@ -256,12 +256,14 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use ryft_macros::Parameter;
+
 use crate::arrays::sharding::meshes::render_mesh_axis_name;
 use crate::arrays::{
-    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-    ArrayReference, ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, Dimension, DimensionType,
-    DimensionValue, DimensionVariable, LogicalMesh, MeshAxisType, ReductionStateKind, Shape, Sharding,
-    ShardingDimension, ShardingError, UnreducedKind,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
+    ArrayReferenceTransform, ArraySliceAxis, ArrayType, DataType, Dimension, DimensionType, DimensionValue,
+    DimensionVariable, LogicalMesh, MeshAxisType, ReductionStateKind, Shape, Sharding, ShardingDimension,
+    ShardingError, UnreducedKind,
 };
 use crate::axes::{MeshContext, NamedAxes, NamedAxis};
 use crate::batching::{
@@ -276,26 +278,18 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::arithmetic::{AddOperation, DivOperation};
-use crate::operations::assertions::Assert;
 use crate::operations::collectives::axis_index::AxisIndexOperation;
 use crate::operations::collectives::parallel_all_gather::{
     PARALLEL_ALL_GATHER_OPERATION_NAME, ParallelAllGatherOperation, ParallelAllGatherOutputVariance,
 };
-use crate::operations::collectives::parallel_all_to_all::ParallelAllToAllOperation;
-use crate::operations::collectives::parallel_broadcast::{ParallelBroadcastOperation, ParallelBroadcastSource};
-use crate::operations::collectives::parallel_cast::ParallelCastOperation;
-use crate::operations::collectives::parallel_permute::ParallelPermuteOperation;
-use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAllOperation;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
-use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOperation;
 use crate::operations::collectives::parallel_vary::{ParallelVary, ParallelVaryOperation};
-use crate::operations::collectives::{CollectiveAxes, CollectiveMode, CollectiveOperation};
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
-use crate::operations::control_flow::condition::{CONDITION_OPERATION_NAME, ConditionOperation};
-use crate::operations::control_flow::scan::{ScanInterpretationDomain, ScanOperation};
-use crate::operations::control_flow::r#while::{WHILE_OPERATION_NAME, WhileOperation, WhilePredicate};
+use crate::operations::control_flow::condition::CONDITION_OPERATION_NAME;
+use crate::operations::control_flow::r#while::{WHILE_OPERATION_NAME, WhilePredicate};
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
@@ -2510,6 +2504,7 @@ where
             Constant = ArrayIrValue<Array>,
             Operation: OperationPayloadProjection + CollectiveOperation,
         >,
+    C::Operation: LockstepOperation<C::Operation>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -2525,8 +2520,11 @@ where
         // kernel operation families). Backends with a device runtime execute the whole boundary through their
         // own `Context::bind` instead (e.g., by compiling the manual computation for their devices).
         self.validate_region_interfaces(&driver.region_interfaces())?;
-        let emulator =
-            ShardMapEmulator { context, driver, grid: LockstepDeviceGrid::default(), manual_regions: Vec::new() };
+        let emulator = ShardMapEmulator {
+            context,
+            driver,
+            domain: LockstepDomain::new(LockstepDeviceGrid { axes: Vec::new() }, Vec::new()),
+        };
         let outputs = emulator.run_shard_map(
             self,
             driver.region(0)?,
@@ -3728,6 +3726,485 @@ where
     context.shard_map_along(|_, local_inputs| function(local_inputs), inputs, mesh, axis_name, input_axes, output_axes)
 }
 
+/// Devices of one lockstep emulation, identified by their coordinates along the emulated manual axes. Device indices
+/// enumerate these coordinates in row-major order, so a nested grid that appends the axes of an inner manual region
+/// keeps every device of the outer grid as one contiguous block of inner devices. The rule of a collective reaches the
+/// grid through [`LockstepDomain::grid`] and addresses its axes by the positions that
+/// [`LockstepDomain::collective_axes`] returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LockstepDeviceGrid {
+    /// Names and sizes of the emulated manual axes, outermost first.
+    axes: Vec<(String, usize)>,
+}
+
+impl LockstepDeviceGrid {
+    /// Returns this grid extended by the provided innermost `axes`.
+    #[inline]
+    pub fn with_axes(&self, axes: &[(String, usize)]) -> Self {
+        Self { axes: self.axes.iter().chain(axes).cloned().collect() }
+    }
+
+    /// Returns the number of devices along the combined axis of the grid axes `axes`.
+    pub fn axis_size(&self, axes: &[usize]) -> usize {
+        axes.iter().map(|axis| self.axes[*axis].1).product()
+    }
+
+    /// Returns the number of devices of this grid, which is one for a grid without axes.
+    #[inline]
+    pub fn device_count(&self) -> usize {
+        self.axes.iter().map(|(_, size)| size).product()
+    }
+
+    /// Returns the values that `function` computes for every device of this grid, in device order.
+    #[inline]
+    pub fn map_devices<F: FnMut(usize) -> Result<Array, ProgramError>>(
+        &self,
+        mut function: F,
+    ) -> Result<Vec<ArrayIrValue<Array>>, ProgramError> {
+        (0..self.device_count()).map(|device| Ok(ArrayIrValue::Array(function(device)?))).collect()
+    }
+
+    /// Returns the position of `device` along the combined axis of the grid axes `axes`, which linearizes their
+    /// coordinates in the given order with the first axis major (refer to [`CollectiveAxes`]).
+    #[inline]
+    pub fn position(&self, device: usize, axes: &[usize]) -> usize {
+        let coordinates = self.coordinates(device);
+        axes.iter().fold(0, |position, axis| position * self.axes[*axis].1 + coordinates[*axis])
+    }
+
+    /// Returns the device that shares the coordinates of `device` along every grid axis other than `axes` and has
+    /// `position` along their combined axis. Refer to [`position`](Self::position) for more information.
+    #[inline]
+    pub fn device_at(&self, device: usize, axes: &[usize], mut position: usize) -> usize {
+        let mut coordinates = self.coordinates(device);
+        for axis in axes.iter().rev() {
+            coordinates[*axis] = position % self.axes[*axis].1;
+            position /= self.axes[*axis].1;
+        }
+        self.device(&coordinates)
+    }
+
+    /// Returns the devices that take part with `device` in a collective over the combined axis of the grid axes
+    /// `axes`, ordered by their positions along it, together with the position of `device` among them. Without
+    /// `axis_index_groups`, they are all devices that share the coordinates of `device` along the other grid axes.
+    /// With them, they are the members of the group that contains the position of `device`, in group order.
+    pub fn participants(
+        &self,
+        device: usize,
+        axes: &[usize],
+        axis_index_groups: Option<&[Vec<usize>]>,
+    ) -> Result<(Vec<usize>, usize), ProgramError> {
+        let axis_size = self.axis_size(axes);
+        let position = self.position(device, axes);
+        let members = match axis_index_groups {
+            None => (0..axis_size).collect::<Vec<_>>(),
+            Some(groups) => groups
+                .iter()
+                .find(|group| group.contains(&position))
+                .filter(|group| group.iter().all(|member| *member < axis_size))
+                .cloned()
+                .ok_or_else(|| {
+                    let axis_names =
+                        CollectiveAxes::from(axes.iter().map(|axis| self.axes[*axis].0.clone()).collect::<Vec<_>>());
+                    ProgramError::InvalidArgument {
+                        message: format!(
+                            "the participant groups `{groups:?}` of a collective over manual axis `{axis_names}` do \
+                             not partition its {axis_size} coordinates",
+                        ),
+                    }
+                })?,
+        };
+        let member_position = members.iter().position(|member| *member == position).unwrap();
+        let devices = members.iter().map(|member| self.device_at(device, axes, *member)).collect();
+        Ok((devices, member_position))
+    }
+
+    /// Returns the position of the emulated axis named `axis_name`, if any.
+    fn axis(&self, axis_name: &str) -> Option<usize> {
+        self.axes.iter().position(|(name, _)| name == axis_name)
+    }
+
+    /// Returns the coordinates of `device` along every axis of this grid.
+    fn coordinates(&self, device: usize) -> Vec<usize> {
+        let mut coordinates = vec![0; self.axes.len()];
+        let mut remainder = device;
+        for (coordinate, (_, size)) in coordinates.iter_mut().zip(&self.axes).rev() {
+            *coordinate = remainder % size;
+            remainder /= size;
+        }
+        coordinates
+    }
+
+    /// Returns the index of the device at `coordinates`.
+    fn device(&self, coordinates: &[usize]) -> usize {
+        coordinates
+            .iter()
+            .zip(&self.axes)
+            .fold(0, |device, (coordinate, (_, size))| device * size + coordinate)
+    }
+}
+
+/// Emulated devices of one lockstep emulation together with the manual regions that enclose them,
+/// which a [`LockstepDomain`] and its [`LockstepValue`]s share.
+struct LockstepDevices {
+    /// Devices of the emulation.
+    grid: LockstepDeviceGrid,
+
+    /// Boundaries of the manual regions that enclose the emulated devices, outermost first (refer to
+    /// [`LockstepDomain::manual_regions`]).
+    manual_regions: Vec<ShardMapBoundary>,
+}
+
+/// Passive [`Domain`] of the [`LockstepValue`]s of the devices of one lockstep emulation. It holds the emulated devices
+/// and the manual regions that enclose them, which the rules of collectives read (refer to [`LockstepOperation`]), and
+/// every [`LockstepValue`] shares them. Regions retain their ordinary constants and operation family `O`, and the
+/// emulator lifts each constant to one copy per device during replay.
+pub struct LockstepDomain<O: Operation<Type = ArrayIrType>> {
+    /// Emulated devices and the manual regions that enclose them.
+    devices: Arc<LockstepDevices>,
+
+    /// [`PhantomData`] marker tying this [`Domain`] to its stored [`Operation`] family.
+    marker: PhantomData<fn() -> O>,
+}
+
+impl<O: Operation<Type = ArrayIrType>> LockstepDomain<O> {
+    /// Creates a [`LockstepDomain`] for the devices of `grid`, which the provided manual regions enclose.
+    #[inline]
+    pub fn new(grid: LockstepDeviceGrid, manual_regions: Vec<ShardMapBoundary>) -> Self {
+        Self { devices: Arc::new(LockstepDevices { grid, manual_regions }), marker: PhantomData }
+    }
+
+    /// Returns the emulated devices.
+    #[inline]
+    pub fn grid(&self) -> &LockstepDeviceGrid {
+        &self.devices.grid
+    }
+
+    /// Returns the boundaries of the manual regions that enclose the emulated devices (i.e., of the `shard_map` whose
+    /// body is emulated and of every `shard_map` that encloses that one), outermost first. The result is empty for the
+    /// emulator that runs an outermost `shard_map` itself. The region that made an axis manual owns the physical mesh
+    /// and the checking policy of that axis.
+    #[inline]
+    pub fn manual_regions(&self) -> &[ShardMapBoundary] {
+        &self.devices.manual_regions
+    }
+
+    /// Returns the positions in [`Self::grid`] of the axes that the collective `payload` communicates along, in the
+    /// order in which it names them, and returns an error unless every one of those axes is emulated. The emulator
+    /// only runs the rule of a collective that names an emulated axis, and every device runs any other collective
+    /// independently.
+    pub fn collective_axes<P: Operation + CollectiveOperation>(&self, payload: &P) -> Result<Vec<usize>, ProgramError> {
+        let axis_names = payload.axes();
+        let name = payload.name();
+        let grid = self.grid();
+        let axes = axis_names.names().iter().map(|axis_name| grid.axis(axis_name)).collect::<Vec<_>>();
+        if axes.iter().all(Option::is_none) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{name}` over manual axes `{axis_names}` does not communicate along an emulated axis",
+            )));
+        }
+        axes.into_iter().collect::<Option<Vec<_>>>().ok_or_else(|| {
+            ProgramError::MalformedProgram(format!(
+                "`{name}` over manual axes `{axis_names}` combines emulated axes with axes of an enclosing region",
+            ))
+        })
+    }
+
+    /// Returns the arrays of the first of the `inputs` of a collective on every device together with its remaining
+    /// inputs, which are the result extents of the mixed forms of the shape-changing collectives.
+    pub fn collective_arrays<'o>(
+        &self,
+        inputs: &'o [LockstepValue<O>],
+    ) -> Result<(Vec<&'o Array>, &'o [LockstepValue<O>]), ProgramError> {
+        let (values, extents) =
+            inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
+        let arrays =
+            values.values().iter().map(ValueProjection::<ArrayType>::projected).collect::<Result<Vec<_>, _>>()?;
+        Ok((arrays, extents))
+    }
+
+    /// Returns the output type of the collective `payload` on `device`, whose array input is `input`, after validating
+    /// that the trailing first-class dimension inputs of its mixed form, if any, are exactly the extents of that
+    /// output type.
+    ///
+    /// # Parameters
+    ///
+    ///   - `payload`: Collective whose output type to infer.
+    ///   - `input`: Array input of the collective on `device`.
+    ///   - `extents`: Remaining inputs of the collective on every device, as [`Self::collective_arrays`] returns them.
+    ///   - `device`: Index of the device in [`Self::grid`].
+    pub fn collective_output_type<P: Operation<Type = ArrayType>>(
+        &self,
+        payload: &P,
+        input: &Array,
+        extents: &[LockstepValue<O>],
+        device: usize,
+    ) -> Result<ArrayType, ProgramError> {
+        let output_type = single_output_type(payload, &[input.r#type().into_owned()])?;
+        if extents.is_empty() {
+            return Ok(output_type);
+        }
+        let shape = emulated_extents(&output_type)?;
+        if extents.len() != shape.len() {
+            return Err(ProgramError::InvalidInputCount { expected: shape.len() + 1, actual: extents.len() + 1 });
+        }
+        for (axis, (extent, expected)) in extents.iter().map(|extents| &extents.values()[device]).zip(shape).enumerate()
+        {
+            match extent {
+                ArrayIrValue::Dimension(extent) if extent.extent() == expected => {}
+                _ => {
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "`{}` result extent input #{} is `{}`, but result axis #{} has extent {}",
+                            payload.name(),
+                            axis,
+                            extent,
+                            axis,
+                            expected,
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(output_type)
+    }
+
+    /// Validates that the collective `payload` was staged for the number of devices along the combined axis of the
+    /// grid axes `axes`, which [`Self::collective_axes`] returns for it.
+    pub fn validate_collective_axis_size<P: Operation + CollectiveOperation>(
+        &self,
+        payload: &P,
+        axes: &[usize],
+        payload_axis_size: usize,
+    ) -> Result<(), ProgramError> {
+        let axis_size = self.grid().axis_size(axes);
+        if payload_axis_size == axis_size {
+            Ok(())
+        } else {
+            Err(ProgramError::MalformedProgram(format!(
+                "`{}` was staged for {} participants, but manual axis `{}` has {} devices",
+                payload.name(),
+                payload_axis_size,
+                payload.axes(),
+                axis_size,
+            )))
+        }
+    }
+
+    /// Checks that the variation or reduction state cast `payload` belongs to the actual checked manual binding of its
+    /// axis. The operation's inference has already validated the input's mesh and source state. A nested region that
+    /// binds other axes does not replace this axis's owning boundary, so ownership is resolved by axis, from the
+    /// inside out.
+    pub fn validate_tracked_collective<P: Operation>(
+        &self,
+        payload: &P,
+        axis_name: &str,
+        input_type: &ArrayType,
+    ) -> Result<(), ProgramError> {
+        let operation_name = payload.name();
+        let boundary = self
+            .manual_regions()
+            .iter()
+            .rev()
+            .find(|boundary| boundary.manual_axes().iter().any(|axis| axis == axis_name))
+            .ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "`{operation_name}` manual axis `{axis_name}` has no enclosing manual binding",
+                ))
+            })?;
+
+        if !input_type.sharding().unwrap().mesh().has_same_manual_axes(boundary.mesh()) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` operation mesh does not match the enclosing manual axis `{axis_name}` mesh",
+            )));
+        }
+
+        if !boundary.checks_manual_variation() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` cannot use tracked mesh metadata inside an unchecked manual binding",
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> Clone for LockstepDomain<O> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { devices: self.devices.clone(), marker: PhantomData }
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> Domain for LockstepDomain<O> {
+    type Type = ArrayIrType;
+    type Value = LockstepValue<O>;
+    type Constant = ArrayIrValue<Array>;
+    type Operation = O;
+}
+
+/// Values of one program atom on every emulated device, in device order, as one value of the [`LockstepDomain`]. The
+/// emulator runs the eager rules of the region operations that must run in lockstep (i.e., `while`, `condition`, and
+/// `scan`) over these values, so that every device follows the rule that eager interpretation follows. The type of
+/// a [`LockstepValue`] is that of the value of device zero, which is the type of the value of every device when the
+/// value enters such an operation (refer to [`LockstepOperation`]), so that the rules validate each application
+/// once for all devices. The operation family `O` of the regions that the emulator replays only ties these
+/// values to their [`LockstepDomain`].
+#[derive(Parameter)]
+pub struct LockstepValue<O: Operation<Type = ArrayIrType>> {
+    /// Values of every device of [`Self::domain`], in device order.
+    values: Vec<ArrayIrValue<Array>>,
+
+    /// [`LockstepDomain`] of the emulated devices that hold [`Self::values`].
+    domain: LockstepDomain<O>,
+}
+
+impl<O: Operation<Type = ArrayIrType>> LockstepValue<O> {
+    /// Creates a [`LockstepValue`] that holds the `values` of every device of `domain`, in device order, and returns
+    /// an error when `values` does not hold exactly one value per device.
+    pub fn new(values: Vec<ArrayIrValue<Array>>, domain: &LockstepDomain<O>) -> Result<Self, ProgramError> {
+        let device_count = domain.grid().device_count();
+        if values.len() != device_count {
+            return Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "a lockstep value must hold one value per emulated device, but got {} values for {} devices",
+                    values.len(),
+                    device_count,
+                ),
+            });
+        }
+        Ok(Self { values, domain: domain.clone() })
+    }
+
+    /// Returns the values of every device, in device order.
+    #[inline]
+    pub fn values(&self) -> &[ArrayIrValue<Array>] {
+        &self.values
+    }
+
+    /// Consumes this value and returns the values of every device, in device order.
+    #[inline]
+    pub fn into_values(self) -> Vec<ArrayIrValue<Array>> {
+        self.values
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> Clone for LockstepValue<O> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { values: self.values.clone(), domain: self.domain.clone() }
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> Debug for LockstepValue<O> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_tuple("LockstepValue").field(&self.values).finish()
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> Display for LockstepValue<O> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let values = self.values.iter().map(ToString::to_string).collect::<Vec<_>>();
+        write!(formatter, "[{}]", values.join(", "))
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> Typed for LockstepValue<O> {
+    type Type = ArrayIrType;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, ArrayIrType> {
+        self.values[0].r#type()
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> Value for LockstepValue<O> {
+    type Dispatch = ValueDirectDispatch;
+    type Domain = LockstepDomain<O>;
+
+    #[inline]
+    fn domain(&self) -> LockstepDomain<O> {
+        self.domain.clone()
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> Concretizable<bool> for LockstepValue<O> {
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        // The devices must agree on a predicate, because the regions that it selects or repeats communicate across
+        // them, while each device masks its own state with its own predicate (refer to `WhilePredicate`).
+        let values = self.values.iter().map(Concretizable::concretize).collect::<Result<Vec<_>, _>>()?;
+        if values.iter().any(|value| *value != values[0]) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on the predicate of a \
+                     `{CONDITION_OPERATION_NAME}` whose regions use collectives over the manual axes, \
+                     but lockstep emulation requires every device to take the same path",
+                ),
+            });
+        }
+        Ok(values[0])
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> WhilePredicate for LockstepValue<O> {
+    fn any_true(&self) -> Result<bool, ProgramError> {
+        let values = self.values.iter().map(WhilePredicate::any_true).collect::<Result<Vec<_>, _>>()?;
+        if values.iter().any(|value| *value != values[0]) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on the predicate of a \
+                     `{WHILE_OPERATION_NAME}` whose regions use collectives over the manual axes, \
+                     but lockstep emulation requires every device to take the same path",
+                ),
+            });
+        }
+        Ok(values[0])
+    }
+
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        self.values
+            .iter()
+            .zip(on_true.values.iter().zip(&on_false.values))
+            .map(|(predicate, (on_true, on_false))| predicate.select(on_true, on_false))
+            .collect::<Result<_, _>>()
+            .and_then(|values| Self::new(values, &self.domain))
+    }
+}
+
+/// Operation that the reference backend emulation of a `shard_map` runs once for all emulated devices instead of once
+/// per device (refer to the `# Reference Backend Emulation` section of the module documentation). The emulator advances
+/// every device through a body in lockstep (i.e., one instruction at a time for all devices), and an operation needs a
+/// rule over all devices when the devices cannot run it independently, either because it communicates across them
+/// (i.e., it is a collective) or because it sequences regions that do (e.g., a `while` loop whose body reduces over
+/// a manual axis). Every other operation is bound once per device.
+///
+/// The parameter `O` is the operation family of the emulated program, which the [`LockstepDomain`] and its
+/// [`LockstepValue`]s are tied to. An operation family implements this trait by delegating to the member that it
+/// holds, and reports no rule for the members that have none. `#[derive(Operation)]` implements it for a family in
+/// which at least one variant is marked with `#[ryft(lockstep)]`, by delegating to the payloads of the marked variants.
+/// A family must therefore mark every variant whose payload has a rule over all devices and every variant whose payload
+/// is itself a family that holds such operations, because the emulator rejects an unmarked operation whose regions
+/// communicate across devices.
+pub trait LockstepOperation<O: Operation<Type = ArrayIrType>> {
+    /// Interprets this operation once for all emulated devices, given one [`LockstepValue`] per input, and returns one
+    /// [`LockstepValue`] per output, or returns [`None`] when this operation has no rule over all devices.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: [`LockstepDomain`] of the emulated devices.
+    ///   - `driver`: [`InterpretationDriver`] through which the rule executes the regions of its application,
+    ///     which the emulator replays in lockstep.
+    ///   - `inputs`: Input values of every device, in operation-defined order.
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>>;
+}
+
 /// Static manual variation checking policy shared by the boundary and closure options. Its two switches are stored
 /// independently, so the builders that set them commute. Output replication is proven only when the body's manual
 /// variation is checked as well, because an unchecked body carries no variation from which to prove it, so the policy
@@ -3822,27 +4299,18 @@ impl CarriedReductionState {
     }
 }
 
-/// Values of one program atom on every emulated device, in row-major device order.
-type DeviceValues = Vec<ArrayIrValue<Array>>;
-
-/// Lockstep emulator for the devices of a [`LockstepDeviceGrid`]. It replays regions over [`DeviceValues`] and binds
-/// ordinary operations per device through the [`InterpretationDriver`] of the `shard_map` application being
+/// Lockstep emulator for the devices of a [`LockstepDeviceGrid`]. It replays regions over the values of every device
+/// and binds ordinary operations per device through the [`InterpretationDriver`] of the `shard_map` application being
 /// interpreted.
-struct ShardMapEmulator<'o, C, D> {
+struct ShardMapEmulator<'o, C: Domain<Type = ArrayIrType>, D> {
     /// Interpretation [`Domain`] through which ordinary operations are bound.
     context: &'o C,
 
     /// [`InterpretationDriver`] of the interpreted `shard_map` application, which binds ordinary operations.
     driver: &'o D,
 
-    /// Devices of this emulation.
-    grid: LockstepDeviceGrid,
-
-    /// Boundaries of the manual regions that this emulator runs inside (i.e., of the `shard_map` whose body it emulates
-    /// and of every `shard_map` that encloses that one), outermost first. It is empty for the emulator that runs an
-    /// outermost `shard_map` itself. The region that made an axis manual owns the physical mesh and the checking policy
-    /// of that axis.
-    manual_regions: Vec<ShardMapBoundary>,
+    /// Emulated devices and the manual regions that enclose them.
+    domain: LockstepDomain<C::Operation>,
 }
 
 impl<C, D> ShardMapEmulator<'_, C, D>
@@ -3853,6 +4321,7 @@ where
             Constant = ArrayIrValue<Array>,
             Operation: OperationPayloadProjection + CollectiveOperation,
         >,
+    C::Operation: LockstepOperation<C::Operation>,
     D: InterpretationDriver<C>,
 {
     /// Runs `operation` with its `body` over the global `inputs` of every device of this emulation and returns its
@@ -3862,8 +4331,8 @@ where
         &self,
         operation: &ShardMapOperation,
         body: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
-        inputs: Vec<DeviceValues>,
-    ) -> Result<Vec<DeviceValues>, ProgramError> {
+        inputs: Vec<Vec<ArrayIrValue<Array>>>,
+    ) -> Result<Vec<Vec<ArrayIrValue<Array>>>, ProgramError> {
         let boundary = operation.boundary();
         if !boundary.checks_manual_variation()
             || operation.global_input_types().iter().chain(operation.global_output_types()).any(Type::is_reference)
@@ -3876,7 +4345,7 @@ where
             .iter()
             .map(|axis| {
                 let size = boundary.mesh().axis_size(axis).unwrap();
-                match self.grid.axis(axis) {
+                match self.domain.grid().axis(axis) {
                     None => Ok((axis.clone(), size)),
                     Some(_) => Err(ProgramError::MalformedProgram(format!(
                         "`{SHARD_MAP_OPERATION_NAME}` makes manual axis `{axis}` manual again inside an enclosing \
@@ -3892,7 +4361,7 @@ where
         // Every reference input is copied into fresh local roots and written back independently below, so two inputs
         // that denote the same allocation would lose the writes through one of them. They are rejected, as reference
         // discharge rejects them, per enclosing device, whose reference inputs are its own local roots.
-        for device in 0..self.grid.device_count() {
+        for device in 0..self.domain.grid().device_count() {
             let allocations = inputs
                 .iter()
                 .map(|values| match &values[device] {
@@ -3990,13 +4459,12 @@ where
             body_inputs.push(local_values);
         }
 
-        let mut manual_regions = self.manual_regions.clone();
+        let mut manual_regions = self.domain.manual_regions().to_vec();
         manual_regions.push(boundary.clone());
         let emulator = ShardMapEmulator {
             context: self.context,
             driver: self.driver,
-            grid: self.grid.with_axes(&manual_axes),
-            manual_regions,
+            domain: LockstepDomain::new(self.domain.grid().with_axes(&manual_axes), manual_regions),
         };
         let body_outputs = emulator.run_region(body, body_inputs)?;
         check_count!("output", body_outputs, operation.global_output_types().len(), ProgramError);
@@ -4067,11 +4535,11 @@ where
     fn run_region(
         &self,
         region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
-        inputs: Vec<DeviceValues>,
-    ) -> Result<Vec<DeviceValues>, ProgramError> {
+        inputs: Vec<Vec<ArrayIrValue<Array>>>,
+    ) -> Result<Vec<Vec<ArrayIrValue<Array>>>, ProgramError> {
         // One replay mapping scope serves every instruction of this region replay, as in ordinary region replay.
         let mappings = RegionReplayMappings::new();
-        let device_count = self.grid.device_count();
+        let device_count = self.domain.grid().device_count();
         region.interpret_with(
             inputs,
             |_, constant| Ok(vec![constant.clone(); device_count]),
@@ -4085,11 +4553,29 @@ where
         region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
         mappings: &RegionReplayMappings<ArrayIrValue<Array>, C::Operation>,
         instruction: &Instruction<C::Operation>,
-        inputs: &[DeviceValues],
-    ) -> Result<Vec<DeviceValues>, ProgramError> {
+        inputs: &[Vec<ArrayIrValue<Array>>],
+    ) -> Result<Vec<Vec<ArrayIrValue<Array>>>, ProgramError> {
         let operation = instruction.operation();
-        if let Some(outputs) = self.run_collective(operation, inputs)? {
-            return Ok(outputs);
+
+        // A collective over an emulated axis communicates across the devices, so it runs its own rule over all of them
+        // (refer to `LockstepOperation`). That rule executes no regions, so it needs no driver.
+        let collective_axes = operation.axes();
+        if collective_axes.names().iter().any(|name| self.domain.grid().axis(name).is_some()) {
+            let inputs = inputs
+                .iter()
+                .map(|values| LockstepValue::new(values.clone(), &self.domain))
+                .collect::<Result<Vec<_>, _>>()?;
+            return match operation.interpret_in_lockstep(&self.domain, &EmptyRegionDriver, &inputs) {
+                Some(outputs) => Ok(outputs?.into_iter().map(|output| output.values).collect()),
+                None => Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "`{}` interpretation cannot emulate `{}`, which is a collective over the manual axes `{}`",
+                        SHARD_MAP_OPERATION_NAME,
+                        operation.name(),
+                        collective_axes,
+                    ),
+                }),
+            };
         }
 
         // An instruction communicates across the emulated devices when the closure of its regions contains a
@@ -4097,12 +4583,12 @@ where
         // is bound once per device, in device order, with the inputs of that device and the regions of the instruction.
         let regions = instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
         let uses_emulated_axes = regions.iter().any(|region| {
-            region
-                .instructions_in_closure()
-                .any(|(_, nested)| nested.operation().axes().names().iter().any(|name| self.grid.axis(name).is_some()))
+            region.instructions_in_closure().any(|(_, nested)| {
+                nested.operation().axes().names().iter().any(|name| self.domain.grid().axis(name).is_some())
+            })
         });
         if !uses_emulated_axes {
-            let device_count = self.grid.device_count();
+            let device_count = self.domain.grid().device_count();
             let mut outputs = vec![Vec::with_capacity(device_count); instruction.outputs().len()];
             for device in 0..device_count {
                 let device_inputs = inputs.iter().map(|values| values[device].clone()).collect::<Vec<_>>();
@@ -4121,17 +4607,45 @@ where
         operation
             .validate_region_interfaces(&regions.iter().map(|region| region.interface().clone()).collect::<Vec<_>>())?;
 
-        // TODO(eaplatanios): Is there a way to avoid special-casing specific operations by type here?
-        if let Some(operation) = operation.projected_payload::<WhileOperation<ArrayIrType>>() {
-            return self.run_lockstep(operation, &regions, inputs);
-        }
-
-        if let Some(operation) = operation.projected_payload::<ConditionOperation<ArrayIrType>>() {
-            return self.run_lockstep(operation, &regions, inputs);
-        }
-
-        if let Some(operation) = operation.projected_payload::<ScanOperation<ArrayIrType>>() {
-            return self.run_lockstep(operation, &regions, inputs);
+        // An operation with a rule over all devices (refer to `LockstepOperation`) runs that rule with one value per
+        // device. The rule only requests the execution of the regions, which this emulator replays in lockstep. The
+        // input of every device must have the type of the input of device zero for such a rule. Devices whose inputs
+        // differ in type (e.g., in the extent of the iteration count of a `scan`, which is its trip count) could take
+        // different paths through the operation, while the lockstep emulation requires every device to take the same
+        // path, which is stricter than a device runtime. Only the rule tells whether the operation has one, so it is
+        // consulted first, without running any region when the devices disagree, and its result is then discarded.
+        let disagreement = inputs
+            .iter()
+            .position(|values| values.iter().any(|value| value.r#type() != values[0].r#type()))
+            .map(|index| ProgramError::UnsupportedOperation {
+                message: format!(
+                    "the devices of a `{}` disagree on the type of input {} of a `{}` whose regions use collectives \
+                     over the manual axes, but lockstep emulation requires every device to take the same path",
+                    SHARD_MAP_OPERATION_NAME,
+                    index,
+                    operation.name(),
+                ),
+            });
+        let driver = LockstepInterpretationDriver {
+            regions: regions.as_slice(),
+            interpret_region: |region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
+                               inputs: Vec<LockstepValue<C::Operation>>| {
+                if let Some(disagreement) = &disagreement {
+                    return Err(disagreement.clone());
+                }
+                let outputs = self.run_region(region, inputs.into_iter().map(|input| input.values).collect())?;
+                outputs.into_iter().map(|output| LockstepValue::new(output, &self.domain)).collect()
+            },
+        };
+        let lockstep_inputs = inputs
+            .iter()
+            .map(|values| LockstepValue::new(values.clone(), &self.domain))
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(outputs) = operation.interpret_in_lockstep(&self.domain, &driver, &lockstep_inputs) {
+            if let Some(disagreement) = disagreement {
+                return Err(disagreement);
+            }
+            return Ok(outputs?.into_iter().map(|output| output.values).collect());
         }
 
         if let Some(operation) = operation.projected_payload::<ShardMapOperation>() {
@@ -4172,635 +4686,9 @@ where
             ),
         })
     }
-
-    /// Checks that a variation or reduction state cast belongs to the actual checked manual binding of its axis.
-    /// The operation's inference has already validated the input's mesh and source state. A nested region that binds
-    /// other axes does not replace this axis's owning boundary, so ownership is resolved by axis, from the inside out.
-    fn validate_tracked_collective(
-        &self,
-        operation_name: &str,
-        axis_name: &str,
-        input_type: &ArrayType,
-    ) -> Result<(), ProgramError> {
-        let boundary = self
-            .manual_regions
-            .iter()
-            .rev()
-            .find(|boundary| boundary.manual_axes().iter().any(|axis| axis == axis_name))
-            .ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "`{operation_name}` manual axis `{axis_name}` has no enclosing manual binding",
-                ))
-            })?;
-
-        if !input_type.sharding().unwrap().mesh().has_same_manual_axes(boundary.mesh()) {
-            return Err(ProgramError::MalformedProgram(format!(
-                "`{operation_name}` operation mesh does not match the enclosing manual axis `{axis_name}` mesh",
-            )));
-        }
-
-        if !boundary.checks_manual_variation() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "`{operation_name}` cannot use tracked mesh metadata inside an unchecked manual binding",
-            )));
-        }
-
-        Ok(())
-    }
-
-    /// Computes `operation` across the devices when it is a collective over an emulated axis, and returns [`None`]
-    /// otherwise. The trailing first-class dimension inputs of the mixed forms of the shape-changing collectives
-    /// describe the result extents, which the emulator validates against the computed results.
-    fn run_collective(
-        &self,
-        operation: &C::Operation,
-        inputs: &[DeviceValues],
-    ) -> Result<Option<Vec<DeviceValues>>, ProgramError> {
-        // An operation that is not a collective communicates along no axis, so it also returns here.
-        let axis_names = operation.axes();
-        let name = operation.name();
-        let axes = axis_names.names().iter().map(|axis_name| self.grid.axis(axis_name)).collect::<Vec<_>>();
-        if axes.iter().all(Option::is_none) {
-            return Ok(None);
-        }
-
-        let Some(axes) = axes.into_iter().collect::<Option<Vec<_>>>() else {
-            return Err(ProgramError::MalformedProgram(format!(
-                "`{name}` over manual axes `{axis_names}` combines emulated axes with axes of an enclosing region",
-            )));
-        };
-
-        let axis_size = axes.iter().map(|axis| self.grid.axes[*axis].1).product::<usize>();
-        let validate_axis_size = |payload_axis_size: usize| {
-            if payload_axis_size == axis_size {
-                Ok(())
-            } else {
-                Err(ProgramError::MalformedProgram(format!(
-                    "`{name}` was staged for {payload_axis_size} participants, but manual axis `{axis_names}` has \
-                     {axis_size} devices",
-                )))
-            }
-        };
-
-        if let Some(payload) = operation.projected_payload::<AxisIndexOperation>() {
-            check_count!("input", inputs, 0, ProgramError);
-            let output_type = single_output_type(payload, &[])?;
-            return Ok(Some(vec![self.grid.map_devices(|device| {
-                let position = Array::scalar(self.grid.position(device, &axes) as u64)?;
-                with_array_type(&position.converted_to(output_type.data_type())?, &output_type)
-            })?]));
-        }
-
-        if let Some(payload) = operation.projected_payload::<ParallelRaggedAllToAllOperation>() {
-            // The devices that differ only along the axis exchange segments in one host-side exchange, whose
-            // participants are ordered by their coordinates and whose participant groups select the exchange partners.
-            // Unlike the other collectives, the exchange runs through the operation's own physical representation,
-            // which keeps one implementation of its offset, size, participant group, and update semantics.
-            validate_axis_size(payload.axis_size())?;
-            check_count!("input", inputs, 6, ProgramError);
-            let mut outputs = vec![None; self.grid.device_count()];
-            for device in (0..self.grid.device_count()).filter(|device| self.grid.position(*device, &axes) == 0) {
-                let (participants, _) = self.grid.participants(device, &axes, None)?;
-                let participant_inputs = participants
-                    .iter()
-                    .map(|participant| {
-                        inputs
-                            .iter()
-                            .map(|values| ValueProjection::<ArrayType>::projected(&values[*participant]).cloned())
-                            .collect::<Result<Vec<_>, _>>()
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                // Validate each participant at its logical type before packing unplaced physical arrays. The
-                // inferred output types retain its mesh and manual variation for restoration after the exchange.
-                let output_types = participant_inputs
-                    .iter()
-                    .map(|inputs| {
-                        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                        Ok(payload.infer_output_types(&input_types, &[])?.remove(0))
-                    })
-                    .collect::<Result<Vec<_>, ProgramError>>()?;
-
-                // Each of the six physical inputs has one leading row per participant, in axis index order.
-                // Corresponding inputs must have one static shape and data type to share that representation.
-                let stacked_inputs = (0..6)
-                    .map(|index| {
-                        let input_type = participant_inputs[0][index].r#type();
-                        let Some(shape) = input_type.static_shape() else {
-                            return Err(TypeError::invalid(format!(
-                                "`{name}` participant input {index} must have a static shape but got `{input_type}`",
-                            ))
-                            .into());
-                        };
-                        let mut stacked_shape = vec![participants.len()];
-                        stacked_shape.extend(shape.dimensions());
-                        let mut bytes = Vec::new();
-                        for inputs in &participant_inputs {
-                            let participant_type = inputs[index].r#type();
-                            if participant_type.data_type() != input_type.data_type()
-                                || participant_type.shape() != input_type.shape()
-                            {
-                                return Err(TypeError::invalid(format!(
-                                    "`{name}` participant inputs {index} must share one static shape and data type \
-                                     but got `{input_type}` and `{participant_type}`",
-                                ))
-                                .into());
-                            }
-                            bytes.extend(inputs[index].logical_bytes());
-                        }
-                        Array::from_logical_bytes(ArrayType::new_static(input_type.data_type(), stacked_shape), &bytes)
-                    })
-                    .collect::<Result<Vec<_>, ProgramError>>()?;
-
-                let mut stacked_outputs = payload.with_physical_representation(None).interpret(
-                    &EagerContext::<Array, ArrayOperation<Array>>::new(),
-                    &EmptyRegionDriver,
-                    &stacked_inputs,
-                )?;
-                check_count!("output", stacked_outputs, 1, ProgramError);
-
-                // Split the physical result in the same participant order and restore each logical output type.
-                let stacked_bytes = stacked_outputs.remove(0).logical_bytes();
-                let row_byte_count = stacked_bytes.len() / participants.len();
-                for (position, (participant, output_type)) in participants.iter().zip(output_types).enumerate() {
-                    let row = position * row_byte_count..(position + 1) * row_byte_count;
-                    let output = Array::from_logical_bytes(output_type, &stacked_bytes[row])?;
-                    outputs[*participant] = Some(ArrayIrValue::Array(output));
-                }
-            }
-
-            return Ok(Some(vec![outputs.into_iter().map(Option::unwrap).collect()]));
-        }
-
-        // Every remaining collective consumes one array per device, followed by the result extents of its mixed form.
-        let (values, extents) =
-            inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
-        let arrays = values.iter().map(ValueProjection::<ArrayType>::projected).collect::<Result<Vec<_>, _>>()?;
-
-        // TODO(eaplatanios): Can we avoid the hardcoding of specific operation types in the following branches?
-        let outputs = if let Some(payload) = operation.projected_payload::<ParallelVaryOperation>() {
-            // Varying an invariant value along an axis changes only its type, because every device already holds it.
-            self.grid.map_devices(|device| {
-                let output_type = collective_output_type(payload, arrays[device], extents, device)?;
-                self.validate_tracked_collective(name, payload.axis_name(), &arrays[device].r#type())?;
-                with_array_type(arrays[device], &output_type)
-            })?
-        } else if let Some(payload) = operation.projected_payload::<ParallelCastOperation>() {
-            // Every cast changes only the state that the type records, so each device keeps its own value. In
-            // particular, the per-device values of an unreduced value are its summands, which a later sum completes.
-            self.grid.map_devices(|device| {
-                let output_type = collective_output_type(payload, arrays[device], extents, device)?;
-                self.validate_tracked_collective(name, payload.axis_name(), &arrays[device].r#type())?;
-                with_array_type(arrays[device], &output_type)
-            })?
-        } else if let Some(payload) = operation.projected_payload::<ParallelReduceOperation>() {
-            if let Some(payload_axis_size) = payload.axis_size() {
-                validate_axis_size(payload_axis_size)?;
-            }
-            self.grid.map_devices(|device| {
-                let (participants, _) = self.grid.participants(device, &axes, payload.axis_index_groups())?;
-                let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
-                with_array_type(
-                    &reduce_participants(name, &participants, payload.kind())?,
-                    &collective_output_type(payload, arrays[device], extents, device)?,
-                )
-            })?
-        } else if let Some(payload) = operation.projected_payload::<ParallelAllGatherOperation>() {
-            validate_axis_size(payload.axis_size())?;
-            self.grid.map_devices(|device| {
-                let output_type = collective_output_type(payload, arrays[device], extents, device)?;
-                let (participants, _) = self.grid.participants(device, &axes, payload.options().axis_index_groups())?;
-                let participant_arrays =
-                    participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
-                validate_participant_types(name, &participant_arrays)?;
-                let mut output = Array::uninitialized(output_type.clone())?;
-                let concatenation_axis = payload.concatenation_axis();
-                for (position, participant) in participants.iter().enumerate() {
-                    let input = arrays[*participant];
-                    let input_type = input.r#type();
-                    let mut shape = input_type.static_shape().unwrap().dimensions().to_vec();
-                    let mut offsets = vec![0; shape.len()];
-                    match payload.options().mode() {
-                        CollectiveMode::Untiled => {
-                            shape.insert(concatenation_axis, 1);
-                            offsets.insert(concatenation_axis, position);
-                        }
-                        CollectiveMode::Tiled => offsets[concatenation_axis] = position * shape[concatenation_axis],
-                    }
-                    let block_type = ArrayType::new_static(input_type.data_type(), shape);
-                    output =
-                        output.replace_block(&Array::from_logical_bytes(block_type, &input.logical_bytes())?, &offsets);
-                }
-                Ok(output)
-            })?
-        } else if let Some(payload) = operation.projected_payload::<ParallelSumScatterOperation>() {
-            validate_axis_size(payload.axis_size())?;
-            self.grid.map_devices(|device| {
-                let output_type = collective_output_type(payload, arrays[device], extents, device)?;
-                let groups = payload.options().axis_index_groups();
-                let (participants, position) = self.grid.participants(device, &axes, groups)?;
-                let participant_count = participants.len();
-                let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
-                let sum = reduce_participants(name, &participants, ReductionKind::Sum)?;
-                let scatter_axis = payload.scatter_axis();
-                let mut shape = sum.r#type().static_shape().unwrap().dimensions().to_vec();
-                shape[scatter_axis] = match payload.options().mode() {
-                    CollectiveMode::Untiled => 1,
-                    CollectiveMode::Tiled => shape[scatter_axis] / participant_count,
-                };
-                let mut offsets = vec![0; shape.len()];
-                offsets[scatter_axis] = position * shape[scatter_axis];
-                sum.copy_block(output_type, &block_axes(&offsets, &shape))
-            })?
-        } else if let Some(payload) = operation.projected_payload::<ParallelAllToAllOperation>() {
-            validate_axis_size(payload.axis_size())?;
-            self.grid.map_devices(|device| {
-                let output_type = collective_output_type(payload, arrays[device], extents, device)?;
-                let groups = payload.options().axis_index_groups();
-                let (participants, position) = self.grid.participants(device, &axes, groups)?;
-                let (split_axis, concatenation_axis) = (payload.split_axis(), payload.concatenation_axis());
-                let participant_arrays =
-                    participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
-                validate_participant_types(name, &participant_arrays)?;
-                let mut output = Array::uninitialized(output_type.clone())?;
-                for (sender_position, sender) in participants.iter().enumerate() {
-                    // Every sender contributes the chunk of its split axis that belongs to this device's position.
-                    let input = arrays[*sender];
-                    let input_type = input.r#type();
-                    let mut chunk_shape = input_type.static_shape().unwrap().dimensions().to_vec();
-                    chunk_shape[split_axis] = match payload.options().mode() {
-                        CollectiveMode::Untiled => 1,
-                        CollectiveMode::Tiled => chunk_shape[split_axis] / participants.len(),
-                    };
-                    let mut chunk_offsets = vec![0; chunk_shape.len()];
-                    chunk_offsets[split_axis] = position * chunk_shape[split_axis];
-                    let selection = block_axes(&chunk_offsets, &chunk_shape);
-
-                    // The chunks are stacked along a new sender axis (untiled) or concatenated along an existing one
-                    // (tiled) in the order of their senders' positions.
-                    let mut offsets = vec![0; chunk_shape.len()];
-                    match payload.options().mode() {
-                        CollectiveMode::Untiled => {
-                            chunk_shape.remove(split_axis);
-                            chunk_shape.insert(concatenation_axis, 1);
-                            offsets[concatenation_axis] = sender_position;
-                        }
-                        CollectiveMode::Tiled => {
-                            offsets[concatenation_axis] = sender_position * chunk_shape[concatenation_axis];
-                        }
-                    }
-                    let chunk =
-                        input.copy_block(ArrayType::new_static(input_type.data_type(), chunk_shape), &selection)?;
-                    output = output.replace_block(&chunk, &offsets);
-                }
-                Ok(output)
-            })?
-        } else if let Some(payload) = operation.projected_payload::<ParallelBroadcastOperation>() {
-            validate_axis_size(payload.axis_size())?;
-            let dynamic = payload.source() == ParallelBroadcastSource::Dynamic(());
-            check_count!("input", inputs, if dynamic { 2 } else { 1 }, ProgramError);
-            self.grid.map_devices(|device| {
-                // Runtime roots are ordinary per-device inputs. Validate their types before decoding them and
-                // require agreement within this participant group before selecting its source.
-                let mut input_types = vec![arrays[device].r#type().into_owned()];
-                if dynamic {
-                    input_types
-                        .push(ValueProjection::<ArrayType>::projected(&inputs[1][device])?.r#type().into_owned());
-                }
-                let output_type = payload.infer_output_types(&input_types, &[])?.remove(0);
-                let source = match payload.source() {
-                    ParallelBroadcastSource::Static(source) => source,
-                    ParallelBroadcastSource::Dynamic(()) => {
-                        let (participants, _) = self.grid.participants(device, &axes, None)?;
-                        let sources = participants
-                            .iter()
-                            .map(|participant| {
-                                let source = ValueProjection::<ArrayType>::projected(&inputs[1][*participant])?;
-                                payload.infer_output_types(
-                                    &[arrays[*participant].r#type().into_owned(), source.r#type().into_owned()],
-                                    &[],
-                                )?;
-                                Ok(source.elements::<u64>()?[0])
-                            })
-                            .collect::<Result<Vec<_>, ProgramError>>()?;
-                        let minimum = sources.iter().copied().min().unwrap();
-                        let maximum = sources.iter().copied().max().unwrap();
-                        let minimum_value = Array::scalar(minimum)?;
-                        let maximum_value = Array::scalar(maximum)?;
-                        Array::scalar(minimum == maximum)?.assert(
-                            &format!("`{name}` runtime sources must agree across participants"),
-                            &[("minimum", minimum_value.clone()), ("maximum", maximum_value)],
-                        )?;
-                        Array::scalar(maximum < axis_size as u64)?.assert(
-                            &format!("`{name}` runtime source must be smaller than axis size {axis_size}"),
-                            &[("source", minimum_value)],
-                        )?;
-                        minimum as usize
-                    }
-                };
-                with_array_type(arrays[self.grid.device_at(device, &axes, source)], &output_type)
-            })?
-        } else if let Some(payload) = operation.projected_payload::<ParallelPermuteOperation>() {
-            validate_axis_size(payload.axis_size())?;
-            self.grid.map_devices(|device| {
-                // A device that no pair targets receives zeros.
-                let output_type = collective_output_type(payload, arrays[device], extents, device)?;
-                let position = self.grid.position(device, &axes);
-                match payload.source_target_pairs().iter().find(|(_, target)| *target == position) {
-                    Some((source, _)) => {
-                        with_array_type(arrays[self.grid.device_at(device, &axes, *source)], &output_type)
-                    }
-                    None => EagerContext::<Array, ArrayOperation<Array>>::new().zero(&output_type),
-                }
-            })?
-        } else {
-            // The operation family declares a collective that is not one of the collectives above.
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{SHARD_MAP_OPERATION_NAME}` interpretation cannot emulate `{name}`, which is a collective over \
-                     the manual axes `{axis_names}`",
-                ),
-            });
-        };
-
-        Ok(Some(vec![outputs]))
-    }
-
-    /// Runs a control-flow `operation` whose `regions` use collectives over the emulated axes through its ordinary
-    /// eager rule with one value per device. Devices agree on condition predicates and dynamic scan lengths, and scan
-    /// writes reconcile the manual variation of their slices.
-    fn run_lockstep(
-        &self,
-        operation: &impl InterpretableOperation<LockstepDomain<C::Operation>>,
-        regions: &[RegionRef<'_, ArrayIrValue<Array>, C::Operation>],
-        inputs: &[DeviceValues],
-    ) -> Result<Vec<DeviceValues>, ProgramError> {
-        // The input of every device must have the type of the input of device zero. Devices whose inputs differ in
-        // type (e.g., in the extent of the iteration count of a `scan`, which is its trip count) could take different
-        // paths through the operation, while the lockstep emulation requires every device to take the same path, which
-        // is stricter than a device runtime (refer to the `# Reference Backend Emulation` section of the module
-        // documentation).
-        let operation_name = operation.name();
-        let inputs = inputs
-            .iter()
-            .enumerate()
-            .map(|(index, values)| {
-                if values.iter().any(|value| value.r#type() != values[0].r#type()) {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on the type of input {index} of \
-                             a `{operation_name}` whose regions use collectives over the manual axes, but lockstep \
-                             emulation requires every device to take the same path",
-                        ),
-                    });
-                }
-                Ok(LockstepValue::new(values.clone()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let context = LockstepDomain::<C::Operation>::new(self.grid.device_count());
-        let driver = LockstepInterpretationDriver {
-            regions,
-            interpret_region: |region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
-                               inputs: Vec<LockstepValue<C::Operation>>| {
-                let outputs = self.run_region(region, inputs.into_iter().map(|input| input.0).collect())?;
-                Ok(outputs.into_iter().map(LockstepValue::new).collect())
-            },
-        };
-        let outputs = operation.interpret(&context, &driver, &inputs)?;
-        Ok(outputs.into_iter().map(|output| output.0).collect())
-    }
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Devices of one lockstep emulation, identified by their coordinates along the emulated manual axes. Device indices
-/// enumerate these coordinates in row-major order, so a nested grid that appends the axes of an inner manual region
-/// keeps every device of the outer grid as one contiguous block of inner devices.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct LockstepDeviceGrid {
-    /// Names and sizes of the emulated manual axes, outermost first.
-    axes: Vec<(String, usize)>,
-}
-
-impl LockstepDeviceGrid {
-    /// Returns this grid extended by the provided innermost `axes`.
-    fn with_axes(&self, axes: &[(String, usize)]) -> Self {
-        Self { axes: self.axes.iter().chain(axes).cloned().collect() }
-    }
-
-    /// Returns the number of devices of this grid, which is one for a grid without axes.
-    fn device_count(&self) -> usize {
-        self.axes.iter().map(|(_, size)| size).product()
-    }
-
-    /// Returns the position of the emulated axis named `axis_name`, if any.
-    fn axis(&self, axis_name: &str) -> Option<usize> {
-        self.axes.iter().position(|(name, _)| name == axis_name)
-    }
-
-    /// Returns the coordinates of `device` along every axis of this grid.
-    fn coordinates(&self, device: usize) -> Vec<usize> {
-        let mut coordinates = vec![0; self.axes.len()];
-        let mut remainder = device;
-        for (coordinate, (_, size)) in coordinates.iter_mut().zip(&self.axes).rev() {
-            *coordinate = remainder % size;
-            remainder /= size;
-        }
-        coordinates
-    }
-
-    /// Returns the index of the device at `coordinates`.
-    fn device(&self, coordinates: &[usize]) -> usize {
-        coordinates
-            .iter()
-            .zip(&self.axes)
-            .fold(0, |device, (coordinate, (_, size))| device * size + coordinate)
-    }
-
-    /// Returns the values that `function` computes for every device of this grid, in device order.
-    fn map_devices<F: FnMut(usize) -> Result<Array, ProgramError>>(
-        &self,
-        mut function: F,
-    ) -> Result<DeviceValues, ProgramError> {
-        (0..self.device_count()).map(|device| Ok(ArrayIrValue::Array(function(device)?))).collect()
-    }
-
-    /// Returns the position of `device` along the combined axis of the grid axes `axes`, which linearizes their
-    /// coordinates in the given order with the first axis major (refer to [`CollectiveAxes`]).
-    fn position(&self, device: usize, axes: &[usize]) -> usize {
-        let coordinates = self.coordinates(device);
-        axes.iter().fold(0, |position, axis| position * self.axes[*axis].1 + coordinates[*axis])
-    }
-
-    /// Returns the device that shares the coordinates of `device` along every grid axis other than `axes` and has
-    /// `position` along their combined axis (refer to [`position`](Self::position)).
-    fn device_at(&self, device: usize, axes: &[usize], mut position: usize) -> usize {
-        let mut coordinates = self.coordinates(device);
-        for axis in axes.iter().rev() {
-            coordinates[*axis] = position % self.axes[*axis].1;
-            position /= self.axes[*axis].1;
-        }
-        self.device(&coordinates)
-    }
-
-    /// Returns the devices that take part with `device` in a collective over the combined axis of the grid axes
-    /// `axes`, ordered by their positions along it, together with the position of `device` among them. Without
-    /// `axis_index_groups`, they are all devices that share the coordinates of `device` along the other grid axes.
-    /// With them, they are the members of the group that contains the position of `device`, in group order.
-    fn participants(
-        &self,
-        device: usize,
-        axes: &[usize],
-        axis_index_groups: Option<&[Vec<usize>]>,
-    ) -> Result<(Vec<usize>, usize), ProgramError> {
-        let axis_size = axes.iter().map(|axis| self.axes[*axis].1).product::<usize>();
-        let position = self.position(device, axes);
-        let members = match axis_index_groups {
-            None => (0..axis_size).collect::<Vec<_>>(),
-            Some(groups) => groups
-                .iter()
-                .find(|group| group.contains(&position))
-                .filter(|group| group.iter().all(|member| *member < axis_size))
-                .cloned()
-                .ok_or_else(|| {
-                    let axis_names =
-                        CollectiveAxes::from(axes.iter().map(|axis| self.axes[*axis].0.clone()).collect::<Vec<_>>());
-                    ProgramError::InvalidArgument {
-                        message: format!(
-                            "the participant groups `{groups:?}` of a collective over manual axis `{axis_names}` do \
-                             not partition its {axis_size} coordinates",
-                        ),
-                    }
-                })?,
-        };
-        let member_position = members.iter().position(|member| *member == position).unwrap();
-        let devices = members.iter().map(|member| self.device_at(device, axes, *member)).collect();
-        Ok((devices, member_position))
-    }
-}
-
-/// Values of one program atom on every emulated device, in device order, as one value of the [`LockstepDomain`]. The
-/// emulator runs the eager rules of the region operations that must run in lockstep (i.e., `while`, `condition`, and
-/// `scan`) over these values, so that every device follows the rule that eager interpretation follows. The type of a
-/// [`LockstepValue`] is that of the value of device zero, which is the type of the value of every device when the value
-/// enters such an operation (refer to [`ShardMapEmulator::run_lockstep`]), so that the rules validate each application
-/// once for all devices. The operation family `O` of the regions that the emulator replays only ties these values to
-/// their [`LockstepDomain`].
-struct LockstepValue<O>(DeviceValues, PhantomData<fn() -> O>);
-
-impl<O> LockstepValue<O> {
-    /// Creates a [`LockstepValue`] that holds the `values` of every device, in device order.
-    fn new(values: DeviceValues) -> Self {
-        Self(values, PhantomData)
-    }
-}
-
-impl<O> Clone for LockstepValue<O> {
-    fn clone(&self) -> Self {
-        Self::new(self.0.clone())
-    }
-}
-
-impl<O> Debug for LockstepValue<O> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_tuple("LockstepValue").field(&self.0).finish()
-    }
-}
-
-impl<O> Display for LockstepValue<O> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let values = self.0.iter().map(ToString::to_string).collect::<Vec<_>>();
-        write!(formatter, "[{}]", values.join(", "))
-    }
-}
-
-impl<O> Parameter for LockstepValue<O> {}
-
-impl<O> Typed for LockstepValue<O> {
-    type Type = ArrayIrType;
-
-    #[inline]
-    fn r#type(&self) -> Cow<'_, ArrayIrType> {
-        self.0[0].r#type()
-    }
-}
-
-impl<O: Operation<Type = ArrayIrType>> Value for LockstepValue<O> {
-    type Dispatch = ValueDirectDispatch;
-    type Domain = LockstepDomain<O>;
-
-    #[inline]
-    fn domain(&self) -> LockstepDomain<O> {
-        LockstepDomain::new(self.0.len())
-    }
-}
-
-// The devices must agree on a predicate, because the regions that it selects or repeats communicate across them, while
-// each device masks its own state with its own predicate (refer to `WhilePredicate`).
-impl<O> Concretizable<bool> for LockstepValue<O> {
-    fn concretize(&self) -> Result<bool, ProgramError> {
-        let values = self.0.iter().map(Concretizable::concretize).collect::<Result<Vec<_>, _>>()?;
-        if values.iter().any(|value| *value != values[0]) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on the predicate of a \
-                     `{CONDITION_OPERATION_NAME}` whose regions use collectives over the manual axes, but lockstep \
-                     emulation requires every device to take the same path",
-                ),
-            });
-        }
-        Ok(values[0])
-    }
-}
-
-impl<O: Operation<Type = ArrayIrType>> WhilePredicate for LockstepValue<O> {
-    fn any_true(&self) -> Result<bool, ProgramError> {
-        let values = self.0.iter().map(WhilePredicate::any_true).collect::<Result<Vec<_>, _>>()?;
-        if values.iter().any(|value| *value != values[0]) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "the devices of a `{SHARD_MAP_OPERATION_NAME}` disagree on the predicate of a \
-                     `{WHILE_OPERATION_NAME}` whose regions use collectives over the manual axes, but lockstep \
-                     emulation requires every device to take the same path",
-                ),
-            });
-        }
-        Ok(values[0])
-    }
-
-    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        self.0
-            .iter()
-            .zip(on_true.0.iter().zip(&on_false.0))
-            .map(|(predicate, (on_true, on_false))| predicate.select(on_true, on_false))
-            .collect::<Result<_, _>>()
-            .map(Self::new)
-    }
-}
-
-/// Passive [`Domain`] of the [`LockstepValue`]s of a fixed number of emulated devices. Regions retain their ordinary
-/// constants and operation family `O`, and the emulator lifts each constant to one copy per device during replay.
-struct LockstepDomain<O: Operation<Type = ArrayIrType>> {
-    /// Number of emulated devices.
-    device_count: usize,
-
-    /// [`PhantomData`] marker tying this [`Domain`] to its stored [`Operation`] family.
-    marker: PhantomData<fn() -> O>,
-}
-
-impl<O: Operation<Type = ArrayIrType>> LockstepDomain<O> {
-    /// Creates a [`LockstepDomain`] for `device_count` devices.
-    fn new(device_count: usize) -> Self {
-        Self { device_count, marker: PhantomData }
-    }
-}
-
-impl<O: Operation<Type = ArrayIrType>> Domain for LockstepDomain<O> {
-    type Type = ArrayIrType;
-    type Value = LockstepValue<O>;
-    type Constant = ArrayIrValue<Array>;
-    type Operation = O;
-}
 
 /// Adapts the stored `regions` of one control-flow application to their lockstep replay. The eager rules of
 /// `condition`, `while`, and `scan` only request region execution, and the emulator dispatches the instructions inside
@@ -4848,78 +4736,6 @@ where
         Err(ProgramError::UnsupportedOperation {
             message: format!("lockstep interpretation cannot bind `{}` outside region replay", operation.name()),
         })
-    }
-}
-
-// Every device applies the eager array IR iteration functions to its own values, so the manual variation of slices and
-// stacks is reconciled exactly as when the scan binds per device. The devices agree on a dynamic trip count, because
-// they agree on the type of the iteration count (refer to `ShardMapEmulator::run_lockstep`), which is its extent.
-impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDomain<O> {
-    fn iteration_count(iteration_count: &LockstepValue<O>) -> Result<usize, ProgramError> {
-        EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::iteration_count(&iteration_count.0[0])
-    }
-
-    fn iteration_index(&self, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
-        let index = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().iteration_index(iteration)?;
-        Ok(LockstepValue::new(vec![index; self.device_count]))
-    }
-
-    fn empty_stack(
-        &self,
-        output_type: &Self::Type,
-        body_input_types: &[Self::Type],
-        inputs: &[LockstepValue<O>],
-    ) -> Result<LockstepValue<O>, ProgramError> {
-        (0..self.device_count)
-            .map(|device| {
-                let inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
-                EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().empty_stack(
-                    output_type,
-                    body_input_types,
-                    &inputs,
-                )
-            })
-            .collect::<Result<_, _>>()
-            .map(LockstepValue::new)
-    }
-
-    fn read_iteration(stack: &LockstepValue<O>, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
-        stack
-            .0
-            .iter()
-            .map(|stack| EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::read_iteration(stack, iteration))
-            .collect::<Result<_, _>>()
-            .map(LockstepValue::new)
-    }
-
-    fn write_iteration(
-        &self,
-        output_index: usize,
-        stack: Option<LockstepValue<O>>,
-        iteration_count: usize,
-        axis_sharding: &ShardingDimension,
-        iteration: usize,
-        value: LockstepValue<O>,
-    ) -> Result<LockstepValue<O>, ProgramError> {
-        let stacks = match stack {
-            Some(stack) => stack.0.into_iter().map(Some).collect(),
-            None => vec![None; self.device_count],
-        };
-        stacks
-            .into_iter()
-            .zip(value.0)
-            .map(|(stack, value)| {
-                EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().write_iteration(
-                    output_index,
-                    stack,
-                    iteration_count,
-                    axis_sharding,
-                    iteration,
-                    value,
-                )
-            })
-            .collect::<Result<_, _>>()
-            .map(LockstepValue::new)
     }
 }
 
@@ -5212,46 +5028,13 @@ fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
 }
 
 /// Returns the single output type that `operation` infers for `input_types`.
-fn single_output_type<O: Operation<Type = ArrayType>>(
+pub(crate) fn single_output_type<O: Operation<Type = ArrayType>>(
     operation: &O,
     input_types: &[ArrayType],
 ) -> Result<ArrayType, ProgramError> {
     let mut output_types = operation.infer_output_types(input_types, &[])?;
     check_count!("output", output_types, 1, ProgramError);
     Ok(output_types.remove(0))
-}
-
-/// Returns the output type of the collective `payload` on `device`, whose array input is `input`, after validating that
-/// the trailing first-class dimension inputs of its mixed form, if any, are exactly the extents of that output type.
-fn collective_output_type<P: Operation<Type = ArrayType>>(
-    payload: &P,
-    input: &Array,
-    extents: &[DeviceValues],
-    device: usize,
-) -> Result<ArrayType, ProgramError> {
-    let output_type = single_output_type(payload, &[input.r#type().into_owned()])?;
-    if extents.is_empty() {
-        return Ok(output_type);
-    }
-    let shape = emulated_extents(&output_type)?;
-    if extents.len() != shape.len() {
-        return Err(ProgramError::InvalidInputCount { expected: shape.len() + 1, actual: extents.len() + 1 });
-    }
-    for (axis, (extent, expected)) in extents.iter().map(|extents| &extents[device]).zip(shape).enumerate() {
-        match extent {
-            ArrayIrValue::Dimension(extent) if extent.extent() == expected => {}
-            _ => {
-                return Err(ProgramError::InvalidArgument {
-                    message: format!(
-                        "`{}` result extent input #{axis} is `{extent}`, but result axis #{axis} has extent \
-                         {expected}",
-                        payload.name(),
-                    ),
-                });
-            }
-        }
-    }
-    Ok(output_type)
 }
 
 /// Returns the static extents of `array_type`, which the emulation requires.
@@ -5268,7 +5051,7 @@ fn emulated_extents(array_type: &ArrayType) -> Result<Vec<usize>, ProgramError> 
 
 /// Returns `value` with the same logical elements but of type `type`, which must have the data type and the shape of
 /// the type of `value` and may differ from it only in its placement metadata.
-fn with_array_type(value: &Array, r#type: &ArrayType) -> Result<Array, ProgramError> {
+pub(crate) fn with_array_type(value: &Array, r#type: &ArrayType) -> Result<Array, ProgramError> {
     if value.r#type().data_type() != r#type.data_type() || value.r#type().shape() != r#type.shape() {
         return Err(ProgramError::MalformedProgram(format!(
             "cannot reinterpret a value of type `{}` as type `{type}`",
@@ -5283,7 +5066,7 @@ fn with_array_type(value: &Array, r#type: &ArrayType) -> Result<Array, ProgramEr
 /// products accumulate in the element data type of the participants, as a cross-device all-reduce does (refer to
 /// [`ParallelReduceOperation`]), so they fold the participants one at a time instead of reducing them all at once
 /// through the kernel of a reduction across an array axis, which accumulates narrow floating-point values in `f32`.
-fn reduce_participants(
+pub(crate) fn reduce_participants(
     operation_name: &str,
     participants: &[&Array],
     kind: ReductionKind,
@@ -5310,7 +5093,7 @@ fn reduce_participants(
 /// Validates that the participants of collective `operation_name` share one data type and shape, which their emulation
 /// combines elementwise or places into blocks of one shape. Devices may hold values of different shapes (e.g., when a
 /// body derives an extent from data that differs across devices), which no collective can combine.
-fn validate_participant_types(operation_name: &str, participants: &[&Array]) -> Result<(), ProgramError> {
+pub(crate) fn validate_participant_types(operation_name: &str, participants: &[&Array]) -> Result<(), ProgramError> {
     let participant_type = participants[0].r#type();
     for participant in &participants[1..] {
         let other_type = participant.r#type();
@@ -5326,7 +5109,7 @@ fn validate_participant_types(operation_name: &str, participants: &[&Array]) -> 
 }
 
 /// Returns the slice axes that select the block of shape `block_shape` that starts at `offsets`.
-fn block_axes(offsets: &[usize], block_shape: &[usize]) -> Vec<ArraySliceAxis> {
+pub(crate) fn block_axes(offsets: &[usize], block_shape: &[usize]) -> Vec<ArraySliceAxis> {
     offsets.iter().zip(block_shape).map(|(&start, &size)| ArraySliceAxis::new(start, size, 1)).collect()
 }
 
@@ -7702,7 +7485,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayReferenceTransformIndex, DataType, DimensionBounds, DimensionError, Memory, MeshAxis, TiledLayout,
+        ArrayIrOperation, ArrayReferenceTransformIndex, DataType, DimensionBounds, DimensionError, Memory, MeshAxis,
+        TiledLayout,
     };
     use crate::axes::AxisError;
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingLevelExtent, batch};
@@ -7713,21 +7497,26 @@ mod tests {
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation, SubOperation};
     use crate::operations::assertions::AssertionError;
-    use crate::operations::collectives::CollectiveOptions;
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_all_gather::ParallelAllGather;
-    use crate::operations::collectives::parallel_all_to_all::ParallelAllToAll;
+    use crate::operations::collectives::parallel_all_to_all::{ParallelAllToAll, ParallelAllToAllOperation};
     use crate::operations::collectives::parallel_arg_extrema::ParallelArgExtrema;
     use crate::operations::collectives::parallel_broadcast::{PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcast};
-    use crate::operations::collectives::parallel_cast::{ParallelCast, ParallelCastTarget};
-    use crate::operations::collectives::parallel_permute::ParallelPermute;
-    use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAll;
+    use crate::operations::collectives::parallel_cast::{ParallelCast, ParallelCastOperation, ParallelCastTarget};
+    use crate::operations::collectives::parallel_permute::{ParallelPermute, ParallelPermuteOperation};
+    use crate::operations::collectives::parallel_ragged_all_to_all::{
+        ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation,
+    };
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
-    use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatter;
+    use crate::operations::collectives::parallel_sum_scatter::{ParallelSumScatter, ParallelSumScatterOperation};
+    use crate::operations::collectives::{CollectiveMode, CollectiveOptions};
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::composites::{CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, composite};
     use crate::operations::constants::one_like::OneLikeOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
+    use crate::operations::control_flow::condition::ConditionOperation;
+    use crate::operations::control_flow::scan::ScanOperation;
+    use crate::operations::control_flow::r#while::WhileOperation;
     use crate::operations::debugging::{Print, PrintOperation};
     use crate::operations::differentiation::linear_call::LinearCallOperation;
     use crate::operations::differentiation::rematerialize::RematerializeOperation;
@@ -8674,22 +8463,35 @@ mod tests {
         })
     }
 
-    /// Runs the collective `operation` through [`ShardMapEmulator::run_collective`] over the `inputs` of the devices of
-    /// an emulated manual axis `x` with `axis_size` devices, one value per device in every input, and returns the
-    /// per-device outputs.
+    /// Runs the rule of the collective `operation` over all devices of `domain` (refer to [`LockstepOperation`]) on
+    /// the provided `inputs`, one value per device in every input, and returns the per-device outputs, or [`None`]
+    /// when the collective communicates along no emulated axis.
+    fn run_collective_in(
+        domain: &LockstepDomain<TestOperation>,
+        operation: &TestOperation,
+        inputs: &[Vec<ArrayIrValue<Array>>],
+    ) -> Result<Option<Vec<Vec<ArrayIrValue<Array>>>>, ProgramError> {
+        let inputs = inputs
+            .iter()
+            .map(|values| LockstepValue::new(values.clone(), domain))
+            .collect::<Result<Vec<_>, _>>()?;
+        let outputs = operation.interpret_in_lockstep(domain, &EmptyRegionDriver, &inputs).transpose()?;
+        Ok(outputs.map(|outputs| outputs.into_iter().map(|output| output.values).collect()))
+    }
+
+    /// Runs the collective `operation` through [`run_collective_in`] over the `inputs` of the devices of an emulated
+    /// manual axis `x` with `axis_size` devices.
     fn run_collective(
         axis_size: usize,
         operation: impl Into<TestOperation>,
-        inputs: &[DeviceValues],
-    ) -> Result<Option<Vec<DeviceValues>>, ProgramError> {
+        inputs: &[Vec<ArrayIrValue<Array>>],
+    ) -> Result<Option<Vec<Vec<ArrayIrValue<Array>>>>, ProgramError> {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", axis_size, MeshAxisType::Manual).unwrap()]).unwrap();
-        let emulator = ShardMapEmulator {
-            context: &EagerContext::<TestValue, TestOperation>::new(),
-            driver: &EmptyRegionDriver,
-            grid: LockstepDeviceGrid { axes: vec![("x".to_string(), axis_size)] },
-            manual_regions: vec![ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap()],
-        };
-        emulator.run_collective(&operation.into(), inputs)
+        let domain = LockstepDomain::new(
+            LockstepDeviceGrid { axes: vec![("x".to_string(), axis_size)] },
+            vec![ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap()],
+        );
+        run_collective_in(&domain, &operation.into(), inputs)
     }
 
     /// Adds `parallel_vary(parallel_reduce(input))` over the manual axis `x` of `mesh` to `builder`, which sums `input`
@@ -13023,6 +12825,23 @@ mod tests {
     }
 
     #[test]
+    fn test_lockstep_value_new() {
+        let domain =
+            LockstepDomain::<TestOperation>::new(LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] }, Vec::new());
+        let values = vec![f32_value(f32_vector_type(2), &[1.0, 2.0]), f32_value(f32_vector_type(2), &[3.0, 4.0])];
+        assert_eq!(LockstepValue::new(values.clone(), &domain).map(LockstepValue::into_values), Ok(values.clone()));
+
+        // A value must hold exactly one value per emulated device.
+        assert_eq!(
+            LockstepValue::new(values[..1].to_vec(), &domain).map(LockstepValue::into_values),
+            Err(ProgramError::InvalidArgument {
+                message: "a lockstep value must hold one value per emulated device, but got 1 values for 2 devices"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
     fn test_shard_map_interpretation_scan_widens_stacks_whose_manual_variation_changes_across_iterations() {
         // The body declares its carry and slice without manual variation, returns the slice as the next carry, and
         // stacks the carry that it receives, so with an invariant initial carry the first stacked slice is invariant
@@ -13036,12 +12855,18 @@ mod tests {
         let body =
             build_program(vec![index_type, scalar_type.clone(), scalar_type], |_, inputs| vec![inputs[2], inputs[1]]);
         let initial = f32_value(f32_type(&[], Some(replicated(0))), &[10.0]);
+        let domain =
+            LockstepDomain::<TestOperation>::new(LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] }, Vec::new());
         let inputs = vec![
-            LockstepValue::new(vec![initial.clone(), initial]),
-            LockstepValue::new(vec![
-                f32_value(f32_type(&[2], Some(varying(1))), &[1.0, 2.0]),
-                f32_value(f32_type(&[2], Some(varying(1))), &[3.0, 4.0]),
-            ]),
+            LockstepValue::new(vec![initial.clone(), initial], &domain).unwrap(),
+            LockstepValue::new(
+                vec![
+                    f32_value(f32_type(&[2], Some(varying(1))), &[1.0, 2.0]),
+                    f32_value(f32_type(&[2], Some(varying(1))), &[3.0, 4.0]),
+                ],
+                &domain,
+            )
+            .unwrap(),
         ];
         let regions = [body.entry_region_ref()];
         let driver = LockstepInterpretationDriver {
@@ -13050,7 +12875,7 @@ mod tests {
                                inputs: Vec<LockstepValue<TestOperation>>| {
                 let mut outputs = vec![Vec::new(); 2];
                 for device in 0..2 {
-                    let device_inputs = inputs.iter().map(|input| input.0[device].clone()).collect::<Vec<_>>();
+                    let device_inputs = inputs.iter().map(|input| input.values[device].clone()).collect::<Vec<_>>();
                     for (output, value) in outputs.iter_mut().zip(region.interpret_in_context(
                         &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
                         device_inputs,
@@ -13058,14 +12883,12 @@ mod tests {
                         output.push(value);
                     }
                 }
-                Ok(outputs.into_iter().map(LockstepValue::new).collect())
+                outputs.into_iter().map(|output| LockstepValue::new(output, &domain)).collect()
             },
         };
-        let outputs = ScanOperation::<ArrayIrType>::new(1, 2usize)
-            .interpret(&LockstepDomain::new(2), &driver, &inputs)
-            .unwrap();
+        let outputs = ScanOperation::<ArrayIrType>::new(1, 2usize).interpret(&domain, &driver, &inputs).unwrap();
         assert_eq!(
-            outputs.into_iter().map(|output| output.0).collect::<Vec<_>>(),
+            outputs.into_iter().map(|output| output.values).collect::<Vec<_>>(),
             vec![
                 vec![
                     f32_value(f32_type(&[], Some(varying(0))), &[2.0]),
@@ -13498,19 +13321,16 @@ mod tests {
         ])
         .unwrap();
         let foreign_type = f32_scalar_type().with_sharding(Sharding::replicated(foreign_mesh, 0)).unwrap();
-        let context = TestEagerContext::new();
         for (outer_checked, inner_checked) in [(true, false), (false, true)] {
             let boundary = |axis: &str, checked| {
                 ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec![axis.to_string()])
                     .unwrap()
                     .with_check_manual_variation(checked)
             };
-            let emulator = ShardMapEmulator {
-                context: &context,
-                driver: &EmptyRegionDriver,
-                grid: LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 2)] },
-                manual_regions: vec![boundary("x", outer_checked), boundary("y", inner_checked)],
-            };
+            let domain = LockstepDomain::new(
+                LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 2)] },
+                vec![boundary("x", outer_checked), boundary("y", inner_checked)],
+            );
             for (axis, checked) in [("x", outer_checked), ("y", inner_checked)] {
                 for operation in [
                     ArrayOperation::ParallelVary(ParallelVaryOperation::new(axis.to_string())),
@@ -13530,10 +13350,10 @@ mod tests {
                             "`{name}` cannot use tracked mesh metadata inside an unchecked manual binding",
                         )))
                     };
-                    assert_eq!(emulator.run_collective(&operation, &inputs), expected);
+                    assert_eq!(run_collective_in(&domain, &operation, &inputs), expected);
                     let inputs = [vec![f32_value(foreign_type.clone(), &[2.0]); 4]];
                     assert_eq!(
-                        emulator.run_collective(&operation, &inputs),
+                        run_collective_in(&domain, &operation, &inputs),
                         Err(ProgramError::MalformedProgram(format!(
                             "`{name}` operation mesh does not match the enclosing manual axis `{axis}` mesh",
                         ))),

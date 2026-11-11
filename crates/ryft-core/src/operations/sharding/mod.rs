@@ -114,8 +114,9 @@ pub use constrain_sharding::{
 };
 pub use reshard::{RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation};
 pub use shard_map::{
-    SHARD_MAP_OPERATION_NAME, ShardMap, ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions,
-    ShardMapValueKind, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+    LockstepDeviceGrid, LockstepDomain, LockstepOperation, LockstepValue, SHARD_MAP_OPERATION_NAME, ShardMap,
+    ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, ShardMapValueKind, shard_map, shard_map_along,
+    shard_map_with_inferred_input_shardings,
 };
 
 /// Group of the sharding-control capabilities [`Reshard`] and [`ConstrainSharding`]. It is implemented automatically
