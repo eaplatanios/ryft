@@ -1918,6 +1918,9 @@ mod tests {
     use crate::differentiation::{DifferentiableType, TransposableOperation, TranspositionContext};
     use crate::operations::assertions::AssertionError;
     use crate::operations::constants::constant::DimensionConstant;
+    use crate::operations::sharding::{
+        LockstepDeviceGrid, LockstepDomain, LockstepOperation, LockstepValue, ShardMapBoundary,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::{EffectClasses, EmptyRegionDriver, Program, ProgramBuilder};
     use crate::tests::TestArrayTracingContext;
@@ -1985,6 +1988,27 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap()
             .to_string()
+    }
+
+    /// Runs the lockstep rule of the collective `operation` (refer to [`LockstepOperation`]) over the devices of one
+    /// emulated manual axis `x` with `axis_size` devices. Every input holds one value per device, and the result holds
+    /// the outputs of every device, or [`None`] when the operation has no rule over all devices.
+    pub(super) fn run_collective(
+        axis_size: usize,
+        operation: impl Into<ArrayIrOperation<Array>>,
+        inputs: &[Vec<ArrayIrValue<Array>>],
+    ) -> Result<Option<Vec<Vec<ArrayIrValue<Array>>>>, ProgramError> {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", axis_size, MeshAxisType::Manual).unwrap()]).unwrap();
+        let domain = LockstepDomain::<ArrayIrOperation<Array>>::new(
+            LockstepDeviceGrid::new(vec![("x".to_string(), axis_size)]),
+            vec![ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap()],
+        );
+        let inputs = inputs
+            .iter()
+            .map(|values| LockstepValue::new(values.clone(), &domain))
+            .collect::<Result<Vec<_>, _>>()?;
+        let outputs = operation.into().interpret_in_lockstep(&domain, &EmptyRegionDriver, &inputs).transpose()?;
+        Ok(outputs.map(|outputs| outputs.into_iter().map(LockstepValue::into_values).collect()))
     }
 
     /// Creates an eager array IR batching level that binds the axis `"x"` and whose mapped extent is a first-class

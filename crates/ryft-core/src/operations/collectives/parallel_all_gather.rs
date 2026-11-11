@@ -1538,10 +1538,11 @@ mod tests {
         check_gradient, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
-    use crate::operations::collectives::tests::{batch_collective, collective_program, transpose_ignored_collective};
+    use crate::operations::collectives::tests::{
+        batch_collective, collective_program, run_collective, transpose_ignored_collective,
+    };
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::reductions::{Reduce, ReductionKind};
-    use crate::operations::sharding::shard_map::tests::run_collective;
     use crate::parameters::Placeholder;
     use crate::partial::PartialEvaluationOutput;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypedProgram};

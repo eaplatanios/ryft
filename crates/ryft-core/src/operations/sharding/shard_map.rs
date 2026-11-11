@@ -5176,6 +5176,13 @@ pub struct LockstepDeviceGrid {
 }
 
 impl LockstepDeviceGrid {
+    /// Creates a [`LockstepDeviceGrid`] over the emulated manual `axes`, given as their names and sizes, outermost
+    /// first.
+    #[inline]
+    pub fn new(axes: Vec<(String, usize)>) -> Self {
+        Self { axes }
+    }
+
     /// Returns this grid extended by the provided innermost `axes`.
     #[inline]
     pub fn with_axes(&self, axes: &[(String, usize)]) -> Self {
@@ -7169,7 +7176,7 @@ where
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use std::cell::RefCell;
 
     use indoc::{formatdoc, indoc};
@@ -7237,6 +7244,10 @@ pub(crate) mod tests {
     /// Array projection of a [`TestContext`] tracer. It is both the input leaf of `shard_map` invocations in a
     /// [`TestContext`] trace and the local value of bodies traced for [`TestContext`].
     type TestTracer = ProjectedValue<ArrayType, DomainTracer<TestContext>>;
+
+    /// Tracer of the [`TestContext`], which the closures of composites and rematerialized functions in the bodies of the
+    /// tests take.
+    type BodyTracer = Tracer<TestContext>;
 
     /// Eager context over the array IR test family, which interprets the test programs.
     type TestEagerContext = EagerContext<TestValue, TestOperation>;
@@ -7402,7 +7413,7 @@ pub(crate) mod tests {
     }
 
     /// Replicated single-input, single-output boundary over the two-device manual mesh.
-    fn single_input_test_shard_map() -> ShardMapBoundary {
+    fn replicated_scalar_boundary() -> ShardMapBoundary {
         let mesh = manual_mesh();
         ShardMapBoundary::from_validated_shardings(
             mesh.clone(),
@@ -7437,20 +7448,6 @@ pub(crate) mod tests {
             vec![Placeholder; inputs.len()],
             vec![Placeholder; output_count],
         )
-    }
-
-    /// Builds an identity `shard_map` boundary and body over a replicated scalar on a two-manual-axis mesh, whose
-    /// boundary differs from another such boundary only in the provided manual-axis selection.
-    fn metadata_fingerprint_shard_map(manual_axes: &[&str]) -> (ShardMapOperation, TestProgram) {
-        let mesh = manual_mesh_2x2();
-        let boundary = ShardMapBoundary::from_validated_shardings(
-            mesh.clone(),
-            vec![Sharding::replicated(mesh.clone(), 0)],
-            vec![Sharding::replicated(mesh, 0)],
-            manual_axes.iter().map(|axis| axis.to_string()).collect(),
-        );
-        let operation = ShardMapOperation::from_boundary(boundary, vec![f32_scalar_type()], vec![f32_scalar_type()]);
-        (operation, identity_body(f32_scalar_type()))
     }
 
     /// Builds a program staging one replicated `shard_map` over `[a, x]` whose body computes
@@ -7814,6 +7811,26 @@ pub(crate) mod tests {
         .1
     }
 
+    /// Traces `shard_map(|x| x)` over [`TestTracer`]s of one caller input of type `caller_type` in a fresh
+    /// [`TestContext`] seeded with `named_axes`, and returns the traced program.
+    fn identity_shard_map_program(
+        mesh: LogicalMesh,
+        input_sharding: Sharding,
+        output_sharding: Sharding,
+        caller_type: ArrayType,
+        named_axes: Vec<(String, NamedAxis)>,
+    ) -> TestProgram {
+        trace_test_program(
+            |inputs| {
+                let input = inputs[0].clone();
+                let options = ShardMapOptions::new();
+                vec![shard_map(|x: TestTracer| Ok(x), input, mesh, input_sharding, output_sharding, options).unwrap()]
+            },
+            vec![caller_type],
+            named_axes,
+        )
+    }
+
     /// Builds the program without inputs that binds, in a fresh [`TestContext`], a `shard_map` without inputs over
     /// [`manual_mesh`] whose body reshapes the coordinate of the executing device along `x` to `u64[1]` and whose
     /// output sharding tiles it along `x`, so that its output is the global vector of device coordinates (JAX's
@@ -7853,11 +7870,6 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// Returns the array reference transform that indexes axis 0 at a dynamic position.
-    fn dynamic_index_transform() -> ArrayReferenceTransform {
-        ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }
-    }
-
     /// Adds the coordinate of the executing device along `x` of [`manual_mesh`] to `builder` and returns it.
     fn add_axis_index(builder: &mut ProgramBuilder<TestValue, TestOperation>) -> AtomId {
         let operation = ArrayOperation::AxisIndex(AxisIndexOperation::new("x".to_string()).with_mesh(manual_mesh()));
@@ -7870,50 +7882,13 @@ pub(crate) mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(ReferenceType::new(referent).into());
         let index = add_axis_index(&mut builder);
-        let read = ReferenceReadOperation::new().with_transforms(vec![dynamic_index_transform()]);
+        let read = ReferenceReadOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
+            axis: 0,
+            index: ArrayReferenceTransformIndex::Dynamic,
+        }]);
         let value = builder.add_instruction(read, Vec::new(), vec![reference, index], None).unwrap()[0];
         builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder], vec![Placeholder])
-            .unwrap()
-    }
-
-    /// Builds the single-input program `x -> { r = reference_new(x); update(r); read(r) }` over `x: f32[2]`. When
-    /// `mapped` is set, `update` mutates `r` in the body of a `shard_map` over [`manual_mesh`] without outputs that
-    /// receives `r` replicated along `x`, and otherwise it mutates `r` directly. This lets tests compare the
-    /// derivatives of a body that mutates a replicated reference with those of the same mutation outside `shard_map`.
-    fn replicated_reference_update_program(
-        mapped: bool,
-        update: impl Fn(&mut ProgramBuilder<TestValue, TestOperation>, AtomId),
-    ) -> TestProgram {
-        let global_type = f32_vector_type(2);
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let input = builder.add_input(global_type.clone().into());
-        let reference =
-            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        if mapped {
-            let mesh = manual_mesh();
-            let boundary =
-                ShardMapBoundary::new(mesh.clone(), vec![Sharding::replicated(mesh, 1)], Vec::new(), Vec::new())
-                    .unwrap();
-            let local_type = boundary.local_input_type(0, &global_type).unwrap();
-            let body = {
-                let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-                let reference = builder.add_input(ReferenceType::new(local_type).into());
-                update(&mut builder, reference);
-                builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap()
-            };
-            let operation =
-                ShardMapOperation::from_program(&body, vec![ReferenceType::new(global_type).into()], boundary).unwrap();
-            let body = builder.import_program(body);
-            let operation = TestOperation::ShardMap(operation);
-            builder.add_instruction(operation, vec![body], vec![reference], None).unwrap();
-        } else {
-            update(&mut builder, reference);
-        }
-        let output =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap()
     }
 
@@ -7969,81 +7944,6 @@ pub(crate) mod tests {
         tangent_inputs.extend(residuals);
         let output_tangents = linearization.tangent().interpret(tangent_inputs).unwrap();
         arrays_f64(outputs.into_iter().chain(output_tangents).collect())
-    }
-
-    /// Builds a program whose unbounded `while` loop runs over the states `[counter: f32[], x: f32[4]]` (with `x`
-    /// sharded along `x`), replacing `x` by `sin(x)` and decrementing `counter` while `counter` is positive. When
-    /// `through_shard_map` is `true`, the loop body computes `sin(x)` inside a `shard_map`, and otherwise directly.
-    fn sine_while_program(through_shard_map: bool) -> TestProgram {
-        let sharded = sharded_along_x();
-        let counter_type = ArrayIrType::Array(f32_scalar_type());
-        let state_type = ArrayIrType::Array(f32_vector_type(4).with_sharding(sharded.clone()).unwrap());
-        let condition = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let counter = builder.add_input(counter_type.clone());
-            builder.add_input(state_type.clone());
-            let zero = builder
-                .add_instruction(ArrayOperation::ZeroLike(ZeroLikeOperation::new()), Vec::new(), vec![counter], None)
-                .unwrap()[0];
-            let operation = ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan));
-            let predicate = builder.add_instruction(operation, Vec::new(), vec![counter, zero], None).unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let body = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let counter = builder.add_input(counter_type.clone());
-            let x = builder.add_input(state_type.clone());
-            let one = builder
-                .add_instruction(ArrayOperation::OneLike(OneLikeOperation::new()), Vec::new(), vec![counter], None)
-                .unwrap()[0];
-            let operation = ArrayOperation::Sub(SubOperation::new());
-            let next_counter = builder.add_instruction(operation, Vec::new(), vec![counter, one], None).unwrap()[0];
-            let sine = if through_shard_map {
-                let boundary =
-                    ShardMapBoundary::new(manual_mesh(), vec![sharded.clone()], vec![sharded.clone()], Vec::new())
-                        .unwrap();
-                let global_type = <&ArrayType>::try_from(&state_type).unwrap().clone();
-                let local_type = boundary.local_input_type(0, &global_type).unwrap();
-                let sine_body = {
-                    let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-                    let input = builder.add_input(local_type.into());
-                    let sine = builder
-                        .add_instruction(ArrayOperation::Sin(SinOperation::new()), Vec::new(), vec![input], None)
-                        .unwrap()[0];
-                    builder
-                        .build::<Vec<TestValue>, Vec<TestValue>>(vec![sine], vec![Placeholder], vec![Placeholder])
-                        .unwrap()
-                };
-                let operation =
-                    ShardMapOperation::from_program(&sine_body, vec![state_type.clone()], boundary).unwrap();
-                let sine_body = builder.import_program(sine_body);
-                builder.add_instruction(operation, vec![sine_body], vec![x], None).unwrap()[0]
-            } else {
-                builder
-                    .add_instruction(ArrayOperation::Sin(SinOperation::new()), Vec::new(), vec![x], None)
-                    .unwrap()[0]
-            };
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(
-                    vec![next_counter, sine],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let inputs = vec![builder.add_input(counter_type), builder.add_input(state_type)];
-        let condition = builder.import_program(condition);
-        let body = builder.import_program(body);
-        let outputs = builder
-            .add_instruction(WhileOperation::new(), vec![condition, body], inputs, None)
-            .unwrap()
-            .to_vec();
-        builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap()
     }
 
     /// Traces the single-input program `x -> function(reference_new(x), x)` over an input of type `global_type`. When
@@ -8152,37 +8052,6 @@ pub(crate) mod tests {
         })
     }
 
-    /// Runs the rule of the collective `operation` over all devices of `domain` (refer to [`LockstepOperation`]) on
-    /// the provided `inputs`, one value per device in every input, and returns the per-device outputs, or [`None`]
-    /// when the operation has no rule over all devices. The tests of the collectives use this helper as well.
-    pub(crate) fn run_collective_in(
-        domain: &LockstepDomain<ArrayIrOperation<Array>>,
-        operation: &ArrayIrOperation<Array>,
-        inputs: &[Vec<ArrayIrValue<Array>>],
-    ) -> Result<Option<Vec<Vec<ArrayIrValue<Array>>>>, ProgramError> {
-        let inputs = inputs
-            .iter()
-            .map(|values| LockstepValue::new(values.clone(), domain))
-            .collect::<Result<Vec<_>, _>>()?;
-        let outputs = operation.interpret_in_lockstep(domain, &EmptyRegionDriver, &inputs).transpose()?;
-        Ok(outputs.map(|outputs| outputs.into_iter().map(LockstepValue::into_values).collect()))
-    }
-
-    /// Runs the collective `operation` through [`run_collective_in`] over the `inputs` of the devices of an emulated
-    /// manual axis `x` with `axis_size` devices. The tests of the collectives use this helper as well.
-    pub(crate) fn run_collective(
-        axis_size: usize,
-        operation: impl Into<ArrayIrOperation<Array>>,
-        inputs: &[Vec<ArrayIrValue<Array>>],
-    ) -> Result<Option<Vec<Vec<ArrayIrValue<Array>>>>, ProgramError> {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", axis_size, MeshAxisType::Manual).unwrap()]).unwrap();
-        let domain = LockstepDomain::new(
-            LockstepDeviceGrid { axes: vec![("x".to_string(), axis_size)] },
-            vec![ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap()],
-        );
-        run_collective_in(&domain, &operation.into(), inputs)
-    }
-
     /// Adds `parallel_vary(parallel_reduce(input))` over the manual axis `x` of `mesh` to `builder`, which sums `input`
     /// across the devices and keeps the sum varying along `x`, so that it can replace a value that varies along `x`.
     fn add_sum_over_x(
@@ -8197,6 +8066,7 @@ pub(crate) mod tests {
         builder.add_instruction(vary, Vec::new(), vec![sum], None).unwrap()[0]
     }
 
+    // ===== RANGE A START (do not move or delete this line) =====
     #[test]
     fn test_shard_map_error_from_program_error() {
         // A program error that holds a `ShardMapError` converts back into that error, so a `ShardMapError` that crosses
@@ -8378,7 +8248,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_shard_map_boundary_with_check_manual_variation() {
-        let boundary = single_input_test_shard_map();
+        let boundary = replicated_scalar_boundary();
         assert!(boundary.checks_manual_variation());
         assert!(boundary.checks_output_replication());
         let unchecked = boundary.clone().with_check_manual_variation(false);
@@ -9331,6 +9201,21 @@ pub(crate) mod tests {
 
     #[test]
     fn test_shard_map() {
+        /// Builds an identity `shard_map` boundary and body over a replicated scalar on a two-manual-axis mesh, whose
+        /// boundary differs from another such boundary only in the provided manual-axis selection.
+        fn metadata_fingerprint_shard_map(manual_axes: &[&str]) -> (ShardMapOperation, TestProgram) {
+            let mesh = manual_mesh_2x2();
+            let boundary = ShardMapBoundary::from_validated_shardings(
+                mesh.clone(),
+                vec![Sharding::replicated(mesh.clone(), 0)],
+                vec![Sharding::replicated(mesh, 0)],
+                manual_axes.iter().map(|axis| axis.to_string()).collect(),
+            );
+            let operation =
+                ShardMapOperation::from_boundary(boundary, vec![f32_scalar_type()], vec![f32_scalar_type()]);
+            (operation, identity_body(f32_scalar_type()))
+        }
+
         // The rendering is the metadata fingerprint of `Operation::render`. The manual SPMD boundary metadata steers
         // differentiation, transposition, and backend lowering, yet none of it is visible in the instruction's rendered
         // atom types. The debug transform cache diagnostic compares a retained transform artifact against a freshly
@@ -9578,7 +9463,7 @@ pub(crate) mod tests {
     #[test]
     fn test_shard_map_operation_from_program_rejects_input_type_count_mismatch() {
         let body = identity_body(f32_scalar_type());
-        let result = ShardMapOperation::from_program(&body, Vec::new(), single_input_test_shard_map());
+        let result = ShardMapOperation::from_program(&body, Vec::new(), replicated_scalar_boundary());
         assert_eq!(result, Err(ShardMapError::InputTypeCountMismatch { expected: 1, actual: 0 }));
         assert_eq!(result.unwrap_err().to_string(), "`shard_map` expects 1 global input type(s) but got 0");
     }
@@ -10179,7 +10064,7 @@ pub(crate) mod tests {
         let array_type = f32_scalar_type();
         let array_ir_array_type = ArrayIrType::Array(array_type.clone());
         let operation =
-            ShardMapOperation::from_boundary(single_input_test_shard_map(), vec![array_type.clone()], vec![array_type]);
+            ShardMapOperation::from_boundary(replicated_scalar_boundary(), vec![array_type.clone()], vec![array_type]);
         let array_body = RegionInterface::new(
             vec![array_ir_array_type.clone()],
             vec![array_ir_array_type.clone()],
@@ -10453,7 +10338,7 @@ pub(crate) mod tests {
         // value of an enclosing manual region over that axis varies along it, so the map would make that axis manual a
         // second time.
         let operation = ShardMapOperation::from_boundary(
-            single_input_test_shard_map(),
+            replicated_scalar_boundary(),
             vec![f32_scalar_type()],
             vec![f32_scalar_type()],
         );
@@ -11037,7 +10922,7 @@ pub(crate) mod tests {
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap();
             let operation = ShardMapOperation::from_boundary(
-                single_input_test_shard_map(),
+                replicated_scalar_boundary(),
                 vec![array_type.clone()],
                 vec![array_type.clone()],
             );
@@ -11051,7 +10936,7 @@ pub(crate) mod tests {
             let first_body = builder.import_program(first_body);
             builder.add_instruction(first_operation, vec![first_body], vec![known_input], None).unwrap();
             let pure_operation = ShardMapOperation::from_boundary(
-                single_input_test_shard_map(),
+                replicated_scalar_boundary(),
                 vec![f32_scalar_type()],
                 vec![f32_scalar_type()],
             );
@@ -12107,6 +11992,7 @@ pub(crate) mod tests {
         );
     }
 
+    // ===== RANGE B START (do not move or delete this line) =====
     #[test]
     fn test_shard_map_interpretation() {
         // Each device receives its tile of the input, and the output assembles the local outputs in mesh order.
@@ -14819,6 +14705,7 @@ pub(crate) mod tests {
         );
     }
 
+    // ===== RANGE C START (do not move or delete this line) =====
     #[test]
     fn test_shard_map_partial_evaluation() {
         // Online partial evaluation of a mixed `shard_map` against a live outer trace rewraps the known half of the
@@ -19351,6 +19238,7 @@ pub(crate) mod tests {
         );
     }
 
+    // ===== RANGE D START (do not move or delete this line) =====
     #[test]
     fn test_shard_map_differentiation() {
         // Forward mode differentiation binds one fused `shard_map` over the primal and the tangent of its input, whose
@@ -20266,6 +20154,86 @@ pub(crate) mod tests {
 
     #[test]
     fn test_shard_map_differentiation_of_while_loops_over_fused_maps() {
+        /// Builds a program whose unbounded `while` loop runs over the states `[counter: f32[], x: f32[4]]` (with `x`
+        /// sharded along `x`), replacing `x` by `sin(x)` and decrementing `counter` while `counter` is positive. When
+        /// `through_shard_map` is `true`, the loop body computes `sin(x)` inside a `shard_map`, and otherwise directly.
+        fn sine_while_program(through_shard_map: bool) -> TestProgram {
+            let sharded = sharded_along_x();
+            let counter_type = ArrayIrType::Array(f32_scalar_type());
+            let state_type = ArrayIrType::Array(f32_vector_type(4).with_sharding(sharded.clone()).unwrap());
+            let condition = {
+                let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+                let counter = builder.add_input(counter_type.clone());
+                builder.add_input(state_type.clone());
+                let zero = builder
+                    .add_instruction(
+                        ArrayOperation::ZeroLike(ZeroLikeOperation::new()),
+                        Vec::new(),
+                        vec![counter],
+                        None,
+                    )
+                    .unwrap()[0];
+                let operation = ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan));
+                let predicate = builder.add_instruction(operation, Vec::new(), vec![counter, zero], None).unwrap()[0];
+                builder
+                    .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                    .unwrap()
+            };
+            let body = {
+                let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+                let counter = builder.add_input(counter_type.clone());
+                let x = builder.add_input(state_type.clone());
+                let one = builder
+                    .add_instruction(ArrayOperation::OneLike(OneLikeOperation::new()), Vec::new(), vec![counter], None)
+                    .unwrap()[0];
+                let operation = ArrayOperation::Sub(SubOperation::new());
+                let next_counter = builder.add_instruction(operation, Vec::new(), vec![counter, one], None).unwrap()[0];
+                let sine = if through_shard_map {
+                    let boundary =
+                        ShardMapBoundary::new(manual_mesh(), vec![sharded.clone()], vec![sharded.clone()], Vec::new())
+                            .unwrap();
+                    let global_type = <&ArrayType>::try_from(&state_type).unwrap().clone();
+                    let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                    let sine_body = {
+                        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+                        let input = builder.add_input(local_type.into());
+                        let sine = builder
+                            .add_instruction(ArrayOperation::Sin(SinOperation::new()), Vec::new(), vec![input], None)
+                            .unwrap()[0];
+                        builder
+                            .build::<Vec<TestValue>, Vec<TestValue>>(vec![sine], vec![Placeholder], vec![Placeholder])
+                            .unwrap()
+                    };
+                    let operation =
+                        ShardMapOperation::from_program(&sine_body, vec![state_type.clone()], boundary).unwrap();
+                    let sine_body = builder.import_program(sine_body);
+                    builder.add_instruction(operation, vec![sine_body], vec![x], None).unwrap()[0]
+                } else {
+                    builder
+                        .add_instruction(ArrayOperation::Sin(SinOperation::new()), Vec::new(), vec![x], None)
+                        .unwrap()[0]
+                };
+                builder
+                    .build::<Vec<TestValue>, Vec<TestValue>>(
+                        vec![next_counter, sine],
+                        vec![Placeholder; 2],
+                        vec![Placeholder; 2],
+                    )
+                    .unwrap()
+            };
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let inputs = vec![builder.add_input(counter_type), builder.add_input(state_type)];
+            let condition = builder.import_program(condition);
+            let body = builder.import_program(body);
+            let outputs = builder
+                .add_instruction(WhileOperation::new(), vec![condition, body], inputs, None)
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        }
+
         // The forward mode rule of an unbounded `while` loop differentiates its body with the fused policy, so a
         // `shard_map` in the body becomes one fused map, and linearization then partitions the fused loop, whose body
         // the partial evaluation rule of `shard_map` splits. The result matches that of the same loop without the map.
@@ -20326,7 +20294,6 @@ pub(crate) mod tests {
         // The partitioned forward mode rule of `rematerialize` partitions the fused derivative of its body, whose
         // `shard_map` becomes one fused map that the partial evaluation rule of `shard_map` splits. The result matches
         // that of the same function without the map.
-        type BodyTracer = Tracer<TestContext>;
         let sharded = sharded_along_x();
         let global_type = f32_vector_type(4).with_sharding(sharded.clone()).unwrap();
         let program = |through_shard_map: bool| {
@@ -20369,7 +20336,6 @@ pub(crate) mod tests {
         // reference, so forward mode binds one fused map, whose dead work (here, the allocations of the reference and
         // its tangent) is removed before binding, and in reverse mode, only `cos(x)` crosses from the primal map to the
         // tangent map.
-        type BodyTracer = Tracer<TestContext>;
         let function = composite(|(_, x): (BodyTracer, BodyTracer)| {
             Ok(ValueProjection::<ArrayType>::into_projected(x)?.sin()?.into_value())
         })
@@ -20458,7 +20424,6 @@ pub(crate) mod tests {
         // residual edge tiled along `x`, and the tangent map allocates its own `r` from that edge. Forward mode binds
         // one fused map, whose derived `jvp` call takes the primal `r` directly (the dead allocation of the tangent of
         // `r` is removed before binding). Both match the same function outside `shard_map` on the reference backend.
-        type BodyTracer = Tracer<TestContext>;
         let function = composite(custom_sine).with_non_differentiated_count(1).with_batching(
             |(r, x): (BodyTracer, BodyTracer),
              (_, axis): (BatchAxis, BatchAxis),
@@ -20584,7 +20549,6 @@ pub(crate) mod tests {
         // next to a JVP rule (which reverse mode does not use). The primal map snapshots the final state of `r`, which
         // is replicated, into an untiled residual edge, and the tangent map allocates its own `r` from that edge before
         // the transposed backward rule receives it. Both match the same function outside `shard_map`.
-        type BodyTracer = Tracer<TestContext>;
         let forward = |(r, x): (BodyTracer, BodyTracer)| {
             let x = ValueProjection::<ArrayType>::into_projected(x)?;
             Ok((x.sin()?.into_value(), (r, x.cos()?.into_value())))
@@ -20672,7 +20636,6 @@ pub(crate) mod tests {
         // `x * x`, and the snapshot that crosses from the primal map to the tangent map holds that same final state,
         // because the primal body reads it after its last instruction. The gradient is therefore `cos(x) * x * x` in
         // both cases.
-        type BodyTracer = Tracer<TestContext>;
         let function = composite(custom_sine).with_non_differentiated_count(1).with_vjp(
             |(r, x): (BodyTracer, BodyTracer)| {
                 let x = ValueProjection::<ArrayType>::into_projected(x)?;
@@ -20767,7 +20730,6 @@ pub(crate) mod tests {
         // `cos(x) * x`. Outside `shard_map`, the backward rule would update the primal allocation itself instead, so
         // that a later application would observe the doubled state. The body also reshapes its `f32[1]` shard to the
         // varying scalar `x`, whose snapshot edge is promoted to `f32[1]` so that it can be tiled along `x`.
-        type BodyTracer = Tracer<TestContext>;
         let function = composite(custom_sine).with_non_differentiated_count(1).with_vjp(
             |(r, x): (BodyTracer, BodyTracer)| {
                 let x = ValueProjection::<ArrayType>::into_projected(x)?;
@@ -22029,6 +21991,47 @@ pub(crate) mod tests {
 
     #[test]
     fn test_shard_map_differentiation_of_writes_into_replicated_references() {
+        /// Builds the single-input program `x -> { r = reference_new(x); update(r); read(r) }` over `x: f32[2]`. When
+        /// `mapped` is set, `update` mutates `r` in the body of a `shard_map` over [`manual_mesh`] without outputs that
+        /// receives `r` replicated along `x`, and otherwise it mutates `r` directly. This lets tests compare the
+        /// derivatives of a body that mutates a replicated reference with those of the same mutation outside `shard_map`.
+        fn replicated_reference_update_program(
+            mapped: bool,
+            update: impl Fn(&mut ProgramBuilder<TestValue, TestOperation>, AtomId),
+        ) -> TestProgram {
+            let global_type = f32_vector_type(2);
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let input = builder.add_input(global_type.clone().into());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            if mapped {
+                let mesh = manual_mesh();
+                let boundary =
+                    ShardMapBoundary::new(mesh.clone(), vec![Sharding::replicated(mesh, 1)], Vec::new(), Vec::new())
+                        .unwrap();
+                let local_type = boundary.local_input_type(0, &global_type).unwrap();
+                let body = {
+                    let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+                    let reference = builder.add_input(ReferenceType::new(local_type).into());
+                    update(&mut builder, reference);
+                    builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap()
+                };
+                let operation =
+                    ShardMapOperation::from_program(&body, vec![ReferenceType::new(global_type).into()], boundary)
+                        .unwrap();
+                let body = builder.import_program(body);
+                let operation = TestOperation::ShardMap(operation);
+                builder.add_instruction(operation, vec![body], vec![reference], None).unwrap();
+            } else {
+                update(&mut builder, reference);
+            }
+            let output =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        }
+
         // Overwriting a replicated reference with a constant kills the dependence of its state on the input, so the
         // input receives a zero cotangent. The cotangent reference of a mutated replicated reference crosses the
         // transposed map by identity (it is forwarded rather than frozen), so the transposed write zeroes the caller's
@@ -22159,6 +22162,7 @@ pub(crate) mod tests {
         );
     }
 
+    // ===== RANGE E START (do not move or delete this line) =====
     #[test]
     fn test_shard_map_transposition() {
         // Reverse mode through a `shard_map` reaches the transposition rule through the array IR operation family's
@@ -26010,6 +26014,13 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_lockstep_device_grid_new() {
+        let grid = LockstepDeviceGrid::new(vec![("x".to_string(), 2), ("y".to_string(), 3)]);
+        assert_eq!(grid, LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] });
+        assert_eq!(grid.device_count(), 6);
+    }
+
+    #[test]
     fn test_lockstep_device_grid_with_axes() {
         let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
         assert_eq!(
@@ -26537,4 +26548,5 @@ pub(crate) mod tests {
         );
         assert!(matches!(result, Err(ProgramError::MalformedProgram(message)) if message == expected));
     }
+    // ===== RANGE E END (do not move or delete this line) =====
 }

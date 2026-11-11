@@ -1819,10 +1819,9 @@ mod tests {
         check_operation_type_inference,
     };
     use crate::operations::arithmetic::Mul;
-    use crate::operations::collectives::tests::eager_collective_context;
+    use crate::operations::collectives::tests::{eager_collective_context, run_collective};
     use crate::operations::manipulation::transposition::Transpose;
     use crate::operations::reductions::{Reduce, ReductionKind};
-    use crate::operations::sharding::shard_map::tests::run_collective;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialTracer};
     use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramRenderingMode};

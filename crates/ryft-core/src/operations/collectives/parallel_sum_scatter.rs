@@ -1142,9 +1142,8 @@ mod tests {
     use crate::differentiation::{DifferentiableType, DifferentiationTracer};
     use crate::macros::{check_gradient, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::assertions::AssertionError;
-    use crate::operations::collectives::tests::{batch_collective, collective_program};
+    use crate::operations::collectives::tests::{batch_collective, collective_program, run_collective};
     use crate::operations::manipulation::slicing::Slice;
-    use crate::operations::sharding::shard_map::tests::run_collective;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypedProgram};
