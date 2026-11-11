@@ -22,7 +22,7 @@ use crate::operations::arithmetic::AddOperation;
 use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME, ParallelVary};
 use crate::operations::collectives::{
     CollectiveAxes, CollectiveOperation, LinearCollectiveOperation, resolve_collective_axes, route_axis_slices,
-    validate_manual_mesh_axes_input,
+    validate_manual_mesh_axes_input, with_placement_of,
 };
 use crate::operations::constants::zero::Zero;
 use crate::operations::constants::zero_like::ZeroLike;
@@ -30,7 +30,6 @@ use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::reshard::Reshard;
-use crate::operations::sharding::shard_map::with_array_type;
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -426,7 +425,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
             let position = context.grid().position(device, &axes);
             match self.source_target_pairs().iter().find(|(_, target)| *target == position) {
                 Some((source, _)) => {
-                    with_array_type(arrays[context.grid().device_at(device, &axes, *source)], &output_type)
+                    with_placement_of(arrays[context.grid().device_at(device, &axes, *source)], &output_type)
                 }
                 None => EagerContext::<Array, ArrayOperation<Array>>::new().zero(&output_type),
             }

@@ -32,7 +32,7 @@ use crate::operations::collectives::parallel_vary::{
 };
 use crate::operations::collectives::{
     CollectiveAxes, CollectiveOperation, CollectiveOptions, LinearCollectiveOperation, resolve_collective_axes,
-    route_axis_slices, validate_manual_mesh_axes_input,
+    route_axis_slices, validate_manual_mesh_axes_input, with_placement_of,
 };
 use crate::operations::comparisons::{Compare, CompareOperation};
 use crate::operations::constants::constant::ConstantOperation;
@@ -48,7 +48,6 @@ use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::sharding::reshard::Reshard;
-use crate::operations::sharding::shard_map::with_array_type;
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
@@ -908,7 +907,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
                     minimum as usize
                 }
             };
-            with_array_type(arrays[context.grid().device_at(device, &axes, source)], &output_type)
+            with_placement_of(arrays[context.grid().device_at(device, &axes, source)], &output_type)
         })?;
         Ok(vec![LockstepValue::new(outputs, context)?])
     }

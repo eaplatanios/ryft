@@ -17,8 +17,8 @@ use crate::operations::arithmetic::{Add, DivOperation, Sub};
 use crate::operations::collectives::parallel_cast::{ParallelCastOperation, ParallelCastTarget};
 use crate::operations::collectives::parallel_vary::{ManualVariationAlignment, ParallelVary, ParallelVaryOperation};
 use crate::operations::collectives::{
-    CollectiveAxes, CollectiveOperation, effective_collective_axis_size, resolve_named_axis_size,
-    validate_manual_mesh_input,
+    CollectiveAxes, CollectiveOperation, effective_collective_axis_size, reduce_participants, resolve_named_axis_size,
+    validate_manual_mesh_input, with_placement_of,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::complex::{Complex, Real};
@@ -30,7 +30,6 @@ use crate::operations::exponential::{Exp, Log};
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::memory::TransferToMemory;
 use crate::operations::reductions::{Reduce, ReductionKind};
-use crate::operations::sharding::shard_map::{reduce_participants, with_array_type};
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -427,7 +426,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
         let outputs = context.grid().map_devices(|device| {
             let (participants, _) = context.grid().participants(device, &axes, self.axis_index_groups())?;
             let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
-            with_array_type(
+            with_placement_of(
                 &reduce_participants(name, &participants, self.kind())?,
                 &context.collective_output_type(self, arrays[device], extents, device)?,
             )

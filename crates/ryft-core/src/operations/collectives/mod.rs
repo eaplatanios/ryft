@@ -149,9 +149,9 @@ use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, Dimension, DimensionType, DimensionValue, DynamicArrayExtentBatchingPolicy, LinearResiduals,
-    LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension, StaticArrayExtentBatchingPolicy,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
+    ArrayIrType, ArrayType, Dimension, DimensionType, DimensionValue, DynamicArrayExtentBatchingPolicy,
+    LinearResiduals, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension, StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchingContext, BatchingError, BatchingPolicy, BatchingTracer};
@@ -175,6 +175,7 @@ use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::sharding::reshard::Reshard;
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -1840,6 +1841,66 @@ impl<C: Context<Type = ArrayIrType>> BatchingContext<C, ArrayIrBatchingPolicy> {
         .with_axis_name(self.axis_name().map(str::to_string))
         .with_axis_sharding(self.axis_sharding().clone())
     }
+}
+
+/// Returns `value` with the same logical elements but of type `type`, which must have the data type and the shape of
+/// the type of `value` and may differ from it only in its placement metadata.
+fn with_placement_of(value: &Array, r#type: &ArrayType) -> Result<Array, ProgramError> {
+    if value.r#type().data_type() != r#type.data_type() || value.r#type().shape() != r#type.shape() {
+        return Err(ProgramError::MalformedProgram(format!(
+            "cannot reinterpret a value of type `{}` as type `{}`",
+            value.r#type(),
+            r#type,
+        )));
+    }
+    Array::from_logical_bytes(r#type.clone(), &value.logical_bytes())
+}
+
+/// Reduces the values of the participants of collective `operation_name` elementwise with `kind`, in participant
+/// order, and returns the result at a plain (unplaced, dense) type with the participants' shape and data type. Sums and
+/// products accumulate in the element data type of the participants, as a cross-device all-reduce does (refer to
+/// [`ParallelReduceOperation`]), so they fold the participants one at a time instead of reducing them all at once
+/// through the kernel of a reduction across an array axis, which accumulates narrow floating-point values in `f32`.
+pub(crate) fn reduce_participants(
+    operation_name: &str,
+    participants: &[&Array],
+    kind: ReductionKind,
+) -> Result<Array, ProgramError> {
+    validate_participant_types(operation_name, participants)?;
+    let reduce = |participants: &[&Array]| -> Result<Array, ProgramError> {
+        let participant_type = participants[0].r#type();
+        let data_type = participant_type.data_type();
+        let mut stacked_shape = vec![participants.len()];
+        stacked_shape.extend(participant_type.static_shape().unwrap().dimensions());
+        let stacked_bytes = participants.iter().flat_map(|participant| participant.logical_bytes()).collect::<Vec<_>>();
+        let stacked = Array::from_logical_bytes(ArrayType::new_static(data_type, stacked_shape), &stacked_bytes)?;
+        let reduced = stacked.reduce(&[0], kind)?;
+        if reduced.r#type().data_type() == data_type { Ok(reduced) } else { Ok(reduced.converted_to(data_type)?) }
+    };
+    match kind {
+        ReductionKind::Sum | ReductionKind::Product => participants[1..]
+            .iter()
+            .try_fold(reduce(&participants[..1])?, |accumulator, participant| reduce(&[&accumulator, participant])),
+        _ => reduce(participants),
+    }
+}
+
+/// Validates that the participants of collective `operation_name` share one data type and shape, which their emulation
+/// combines elementwise or places into blocks of one shape. Devices may hold values of different shapes (e.g., when a
+/// body derives an extent from data that differs across devices), which no collective can combine.
+pub(crate) fn validate_participant_types(operation_name: &str, participants: &[&Array]) -> Result<(), ProgramError> {
+    let participant_type = participants[0].r#type();
+    for participant in &participants[1..] {
+        let other_type = participant.r#type();
+        if other_type.data_type() != participant_type.data_type() || other_type.shape() != participant_type.shape() {
+            return Err(TypeError::invalid(format!(
+                "`{operation_name}` participants must share one data type and shape but got `{participant_type}` and \
+                 `{other_type}`",
+            ))
+            .into());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

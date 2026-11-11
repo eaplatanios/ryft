@@ -284,7 +284,9 @@ use crate::operations::collectives::parallel_all_gather::{
 };
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_vary::{ParallelVary, ParallelVaryOperation};
-use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
+use crate::operations::collectives::{
+    CollectiveAxes, CollectiveOperation, reduce_participants, validate_participant_types,
+};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -297,7 +299,7 @@ use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::operations::manipulation::memory::TransferToMemoryOperation;
 use crate::operations::manipulation::reshaping::ReshapeOperation;
 use crate::operations::manipulation::slicing::DynamicSliceOperation;
-use crate::operations::reductions::{Reduce, ReductionKind};
+use crate::operations::reductions::ReductionKind;
 use crate::operations::references::{
     ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
 };
@@ -3944,7 +3946,13 @@ impl<O: Operation<Type = ArrayIrType>> LockstepDomain<O> {
         if extents.is_empty() {
             return Ok(output_type);
         }
-        let shape = emulated_extents(&output_type)?;
+        let shape = output_type.static_shape().map(|shape| shape.dimensions().to_vec()).ok_or_else(|| {
+            ProgramError::InvalidArgument {
+                message: format!(
+                    "`{SHARD_MAP_OPERATION_NAME}` interpretation requires static types but got `{output_type}`"
+                ),
+            }
+        })?;
         if extents.len() != shape.len() {
             return Err(ProgramError::InvalidInputCount { expected: shape.len() + 1, actual: extents.len() + 1 });
         }
@@ -4988,8 +4996,6 @@ struct ShardMapOutputs<S> {
     shardings: ShardMapOutputShardings,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns `true` when two `shard_map` boundary types agree apart from carried placement metadata, which is when their
 /// element types, shapes, and layouts are equal, and they vary along exactly the same mesh axes, including axes that
 /// are not manual axes of the mesh of `expected`, and have the same unreduced axes and kind and the same reduced axes
@@ -5020,77 +5026,7 @@ fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
     }
 }
 
-/// Returns the static extents of `array_type`, which the emulation requires.
-fn emulated_extents(array_type: &ArrayType) -> Result<Vec<usize>, ProgramError> {
-    array_type
-        .static_shape()
-        .map(|shape| shape.dimensions().to_vec())
-        .ok_or_else(|| ProgramError::InvalidArgument {
-            message: format!(
-                "`{SHARD_MAP_OPERATION_NAME}` interpretation requires static types but got `{array_type}`"
-            ),
-        })
-}
-
-/// Returns `value` with the same logical elements but of type `type`, which must have the data type and the shape of
-/// the type of `value` and may differ from it only in its placement metadata.
-pub(crate) fn with_array_type(value: &Array, r#type: &ArrayType) -> Result<Array, ProgramError> {
-    if value.r#type().data_type() != r#type.data_type() || value.r#type().shape() != r#type.shape() {
-        return Err(ProgramError::MalformedProgram(format!(
-            "cannot reinterpret a value of type `{}` as type `{}`",
-            value.r#type(),
-            r#type,
-        )));
-    }
-    Array::from_logical_bytes(r#type.clone(), &value.logical_bytes())
-}
-
-/// Reduces the values of the participants of collective `operation_name` elementwise with `kind`, in participant
-/// order, and returns the result at a plain (unplaced, dense) type with the participants' shape and data type. Sums and
-/// products accumulate in the element data type of the participants, as a cross-device all-reduce does (refer to
-/// [`ParallelReduceOperation`]), so they fold the participants one at a time instead of reducing them all at once
-/// through the kernel of a reduction across an array axis, which accumulates narrow floating-point values in `f32`.
-pub(crate) fn reduce_participants(
-    operation_name: &str,
-    participants: &[&Array],
-    kind: ReductionKind,
-) -> Result<Array, ProgramError> {
-    validate_participant_types(operation_name, participants)?;
-    let reduce = |participants: &[&Array]| -> Result<Array, ProgramError> {
-        let participant_type = participants[0].r#type();
-        let data_type = participant_type.data_type();
-        let mut stacked_shape = vec![participants.len()];
-        stacked_shape.extend(participant_type.static_shape().unwrap().dimensions());
-        let stacked_bytes = participants.iter().flat_map(|participant| participant.logical_bytes()).collect::<Vec<_>>();
-        let stacked = Array::from_logical_bytes(ArrayType::new_static(data_type, stacked_shape), &stacked_bytes)?;
-        let reduced = stacked.reduce(&[0], kind)?;
-        if reduced.r#type().data_type() == data_type { Ok(reduced) } else { Ok(reduced.converted_to(data_type)?) }
-    };
-    match kind {
-        ReductionKind::Sum | ReductionKind::Product => participants[1..]
-            .iter()
-            .try_fold(reduce(&participants[..1])?, |accumulator, participant| reduce(&[&accumulator, participant])),
-        _ => reduce(participants),
-    }
-}
-
-/// Validates that the participants of collective `operation_name` share one data type and shape, which their emulation
-/// combines elementwise or places into blocks of one shape. Devices may hold values of different shapes (e.g., when a
-/// body derives an extent from data that differs across devices), which no collective can combine.
-pub(crate) fn validate_participant_types(operation_name: &str, participants: &[&Array]) -> Result<(), ProgramError> {
-    let participant_type = participants[0].r#type();
-    for participant in &participants[1..] {
-        let other_type = participant.r#type();
-        if other_type.data_type() != participant_type.data_type() || other_type.shape() != participant_type.shape() {
-            return Err(TypeError::invalid(format!(
-                "`{operation_name}` participants must share one data type and shape but got `{participant_type}` and \
-                 `{other_type}`",
-            ))
-            .into());
-        }
-    }
-    Ok(())
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the offset of the block that the device at `coordinates` holds, along every dimension of a boundary value
 /// placed by `sharding`. Along a dimension sharded over active manual axes (which precede every free axis of that
@@ -5141,7 +5077,13 @@ fn local_input_shard(
     {
         return EagerContext::<Array, ArrayOperation<Array>>::new().zero(local_type);
     }
-    let local_shape = emulated_extents(local_type)?;
+    let local_shape = local_type.static_shape().map(|shape| shape.dimensions().to_vec()).ok_or_else(|| {
+        ProgramError::InvalidArgument {
+            message: format!(
+                "`{SHARD_MAP_OPERATION_NAME}` interpretation requires static types but got `{local_type}`"
+            ),
+        }
+    })?;
     let offsets = manual_block_offsets(sharding, grid, coordinates, &local_shape);
     let block = offsets.iter().zip(&local_shape).map(|(&start, &size)| ArraySliceAxis::new(start, size, 1));
     value.copy_block(local_type.clone(), &block.collect::<Vec<_>>())
@@ -7452,7 +7394,7 @@ mod tests {
         Cast, CastOperation, ConvertElementType, ConvertElementTypeOperation,
     };
     use crate::operations::manipulation::reshaping::Reshape;
-    use crate::operations::reductions::ReduceOperation;
+    use crate::operations::reductions::{Reduce, ReduceOperation};
     use crate::operations::references::{ReferenceNew, ReferenceRead, ReferenceWrite, ReferenceWriteOperation};
     use crate::operations::trigonometric::{Cos, CosOperation, Sin, SinOperation};
     use crate::partial::{
@@ -20495,7 +20437,8 @@ mod tests {
                 in (%2)"},
         );
         let seed = Array::vector(vec![1f32]).unwrap().converted_to(DataType::F8E4M3FN).unwrap();
-        let seed = with_array_type(&seed, <&ArrayType>::try_from(&pullback.input_types()[0]).unwrap()).unwrap();
+        let seed_type = <&ArrayType>::try_from(&pullback.input_types()[0]).unwrap().clone();
+        let seed = Array::from_logical_bytes(seed_type, &seed.logical_bytes()).unwrap();
         assert_eq!(arrays_f64(pullback.interpret(vec![TestValue::Array(seed)]).unwrap()), vec![vec![1.0 / 512.0; 512]]);
     }
 

@@ -31,7 +31,8 @@ use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveAxes, CollectiveMode, CollectiveOperation, CollectiveOptions,
     LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
     ShapeChangingCollectiveValue, infer_array_ir_shape_changing_collective_output_type,
-    infer_linear_collective_operation_output_type, resolve_collective_axes, validate_manual_mesh_axes_input,
+    infer_linear_collective_operation_output_type, reduce_participants, resolve_collective_axes,
+    validate_manual_mesh_axes_input,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -42,7 +43,6 @@ use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBro
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
-use crate::operations::sharding::shard_map::reduce_participants;
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{

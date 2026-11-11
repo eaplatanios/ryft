@@ -16,10 +16,9 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver, Member
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
-use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation, with_placement_of};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::reductions::ReductionKind;
-use crate::operations::sharding::shard_map::with_array_type;
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -214,7 +213,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
         let outputs = context.grid().map_devices(|device| {
             let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
             context.validate_tracked_collective(self, self.axis_name(), &arrays[device].r#type())?;
-            with_array_type(arrays[device], &output_type)
+            with_placement_of(arrays[device], &output_type)
         })?;
 
         Ok(vec![LockstepValue::new(outputs, context)?])
