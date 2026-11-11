@@ -20,10 +20,14 @@
 //! with [`AttentionKey::from_composite_key`] and then either lowers the portable body of the definition or replaces
 //! the call with its own implementation, as the [`AttentionImplementation`] of the configuration requests.
 //!
-//! The portable bodies are written once over an [`AttentionUniverse`], which abstracts how they obtain and construct
-//! the extents of the arrays that they shape. Values typed by [`ArrayType`] use static host extents, while array IR
-//! values (i.e., values typed by [`ArrayIrType`]) use first-class dimension values and therefore also support dynamic
-//! batch and sequence extents.
+//! The portable bodies are written once over an [`AttentionUniverse`] and compute on array views with ordinary value
+//! capabilities. Their constants, coordinates, and broadcasts take the runtime shapes of existing values (refer to
+//! [`FillLike`], [`IotaLike`], and [`BroadcastLike`]), and their reshapes keep the batch and sequence dimensions, so
+//! they support static and dynamic batch and sequence extents for values typed by [`ArrayType`] and for array IR
+//! values (i.e., values typed by [`ArrayIrType`]) alike. Only the batching rule constructs shapes that no existing
+//! value has, and it takes their extents from the universe, which supports dynamic extents there only for array IR
+//! values, whose extents are first-class dimension values. Dropout is the exception in both universes, because it
+//! draws the random bits of its mask for static extents.
 //!
 //! # Ownership and Lifecycle
 //!
@@ -47,7 +51,9 @@
 //!   - **Differentiation:** The forward and backward definitions have no derivative rules, so differentiating a call
 //!     of the inference function fails. The training function stages a third named composite, named
 //!     [`DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME`], whose reverse mode rule calls the forward definition with
-//!     its residual and then the backward definition.
+//!     its residual and then the backward definition. Reverse mode over dynamic shapes with integer inputs (e.g.,
+//!     sequence lengths) needs an array IR family, because homogeneous array programs cannot materialize the
+//!     structurally zero tangents of such inputs for a dynamic shape.
 //!
 //! # Example
 //!
@@ -82,7 +88,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 use ryft_macros::Parameterized;
 
-use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape};
+use crate::arrays::{ArrayIrType, ArrayMemberType, ArrayType, DataType, Dimension, DimensionType, Shape};
 use crate::batching::{BatchAxis, BatchableType, BatchingLevelExtent};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::DifferentiableType;
@@ -97,8 +103,8 @@ use crate::operations::composites::configurations::{
 use crate::operations::composites::rules::CustomRuleTracer;
 use crate::operations::composites::rules::definitions::{CompositeAttribute, CompositeKey, CustomRuleDefinition};
 use crate::operations::constants::constant::DimensionConstant;
-use crate::operations::constants::fill::Fill;
-use crate::operations::constants::iota::{DynamicIota, Iota};
+use crate::operations::constants::fill_like::FillLike;
+use crate::operations::constants::iota_like::IotaLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
@@ -106,7 +112,7 @@ use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::dot::{Dot, DotDimensionNumbers};
 use crate::operations::exponential::{Exp, Log};
 use crate::operations::logical::And;
-use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast};
+use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastLike, DynamicBroadcast};
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
@@ -116,18 +122,32 @@ use crate::parameters::{Parameter, Parameterized};
 use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value, ValueProjection};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
-/// Type universe in which the portable attention bodies run, which determines how they obtain and construct the extents
-/// of the arrays that they shape (i.e., for broadcasts, reshapes, iotas, and fills). The bodies are written once over a
-/// value `V` whose [`Type`] implements this trait, and they compute on its array view [`Self::ArrayValue`]. The
-/// following universes implement it:
+/// Type universe in which the portable attention bodies run, which provides the array views that they compute on and
+/// the extents of the arrays whose shapes no existing value has. The bodies are written once over a value `V` whose
+/// [`Type`] implements this trait. They project their inputs once to array views of type [`Self::ArrayValue`] and
+/// compute on those with ordinary value capabilities. These include the exemplar-relative [`FillLike`], [`IotaLike`],
+/// and [`BroadcastLike`] capabilities, which read the runtime shape of an existing value, so the constants,
+/// coordinates, and broadcasts of the bodies support static and dynamic shapes in both universes. Only the batching
+/// rule of the named definitions constructs shapes that no existing value has, because it folds a possibly dynamic
+/// mapped extent into the batch axis and restores it on the outputs, and it takes their extents from this trait.
+///
+/// The following universes implement it:
 ///
 ///   - [`ArrayType`] implements it for homogeneous array values, whose extents are static host numbers. The array
-///     view is the value itself, and every extent must be static, so attention over dynamically shaped arrays in a
-///     homogeneous array family fails with an exact error. Such programs stage attention in an array IR family
-///     instead, which is how backends support bounded dynamic shapes (e.g., XLA tracers).
-///   - [`ArrayIrType`] implements it for array IR values, whose extents are first-class dimension values. Every
-///     constructor, broadcast, and reshape that depends on a shape takes its extents from ordinary dimension values,
-///     so the same body supports static and dynamic batch and sequence extents.
+///     view is the value itself. Dynamically shaped attention is therefore supported in a homogeneous array family,
+///     except with batched calls whose batching rule needs a dynamic extent (e.g., a dynamic mapped extent, or a
+///     dynamic extent of a rank-4 input whose mapped axis is folded into its batch axis, of a bias or mask, or of a
+///     replicated input that is broadcast along the mapped axis). A dynamic mapped extent fails with an error that
+///     says that attention over homogeneous arrays cannot be batched with a dynamic extent, and every other case
+///     fails with an error that names the dynamic axis (e.g., "attention over homogeneous arrays requires static
+///     extents, but axis 2 of `f32[2, 1, length, 1, 1]` has extent `length`; use array IR values for dynamic
+///     extents"). Such programs stage attention in an array IR family instead, which is how backends support bounded
+///     dynamic shapes (e.g., XLA tracers).
+///   - [`ArrayIrType`] implements it for array IR values, whose extents are first-class dimension values, so the
+///     batching rule supports static and dynamic extents as well.
+///
+/// The supertraits relate the types of a universe to the array types of their array views, through which the bodies
+/// and the output type rules of the definitions validate their inputs.
 ///
 /// The implementations are on the type universes rather than on the values, which keeps them coherent for every value
 /// type. Both are blanket implementations over every value of their universe whose capabilities satisfy their bounds,
@@ -135,18 +155,21 @@ use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 /// implementing this trait, which coherence permits only for values that the blanket implementations do not cover. A
 /// new type universe participates by implementing this trait for its own type. The trait is public because it bounds
 /// [`dot_product_attention`] and [`differentiable_dot_product_attention`].
-pub trait AttentionUniverse<V>: Type {
+pub trait AttentionUniverse<V>: Type + ArrayMemberType + From<ArrayType> {
     /// Array view of `V` on which the attention mathematics computes.
     type ArrayValue: Value<Type = ArrayType>
         + Add
         + And
         + Broadcast
+        + BroadcastLike
         + Compare
         + ConvertElementType
         + Div
         + Dot
         + Dropout
         + Exp
+        + FillLike
+        + IotaLike
         + Log
         + Mul
         + Reduce
@@ -165,15 +188,6 @@ pub trait AttentionUniverse<V>: Type {
     /// Returns the value whose array view is `array`.
     fn from_array(array: Self::ArrayValue) -> V;
 
-    /// Returns the array type of `value`.
-    fn array_type(value: &V) -> Result<ArrayType, ProgramError>;
-
-    /// Returns the array type that `r#type` describes.
-    fn to_array_type(r#type: &Self) -> Result<ArrayType, TypeError>;
-
-    /// Returns the type of this universe that describes the array type `r#type`.
-    fn from_array_type(r#type: ArrayType) -> Self;
-
     /// Returns the extent of the batching level whose extent is `extent`, constructed next to `value` (i.e., in its
     /// context).
     fn batch_extent(value: &V, extent: &BatchingLevelExtent<V>) -> Result<Self::Extent, ProgramError>;
@@ -182,8 +196,12 @@ pub trait AttentionUniverse<V>: Type {
     fn extent(value: &V, axis: usize) -> Result<Self::Extent, ProgramError>;
 
     /// Returns the extent of every axis of `value`, in axis order.
-    fn extents(value: &V) -> Result<Vec<Self::Extent>, ProgramError> {
-        (0..Self::array_type(value)?.rank()).map(|axis| Self::extent(value, axis)).collect()
+    fn extents(value: &V) -> Result<Vec<Self::Extent>, ProgramError>
+    where
+        V: Typed<Type = Self>,
+    {
+        let r#type = value.r#type();
+        (0..r#type.as_array_type()?.rank()).map(|axis| Self::extent(value, axis)).collect()
     }
 
     /// Returns the constant extent `extent`, constructed next to `value` (i.e., in its context).
@@ -197,12 +215,6 @@ pub trait AttentionUniverse<V>: Type {
 
     /// Reshapes `value` to the provided output extents.
     fn reshape(value: &V, extents: &[Self::Extent]) -> Result<V, ProgramError>;
-
-    /// Returns an `i32` iota with the shape of `target` that counts along `axis`.
-    fn iota(target: &V, axis: usize) -> Result<V, ProgramError>;
-
-    /// Returns `value` at the data type of `target`, broadcast to the shape of `target`.
-    fn fill(target: &V, value: f64) -> Result<V, ProgramError>;
 }
 
 impl<A> AttentionUniverse<A> for ArrayType
@@ -211,12 +223,15 @@ where
         + Add
         + And
         + Broadcast
+        + BroadcastLike
         + Compare
         + ConvertElementType
         + Div
         + Dot
         + Dropout
         + Exp
+        + FillLike
+        + IotaLike
         + Log
         + Mul
         + Reduce
@@ -225,7 +240,6 @@ where
         + StopGradient
         + Sub
         + Transpose,
-    A::Domain: Fill<f64, A> + Iota<A>,
 {
     type ArrayValue = A;
     type Extent = usize;
@@ -238,21 +252,6 @@ where
     #[inline]
     fn from_array(array: A) -> A {
         array
-    }
-
-    #[inline]
-    fn array_type(value: &A) -> Result<ArrayType, ProgramError> {
-        Ok(value.r#type().into_owned())
-    }
-
-    #[inline]
-    fn to_array_type(r#type: &ArrayType) -> Result<ArrayType, TypeError> {
-        Ok(r#type.clone())
-    }
-
-    #[inline]
-    fn from_array_type(r#type: ArrayType) -> ArrayType {
-        r#type
     }
 
     fn batch_extent(_value: &A, extent: &BatchingLevelExtent<A>) -> Result<usize, ProgramError> {
@@ -310,20 +309,6 @@ where
     fn reshape(value: &A, extents: &[usize]) -> Result<A, ProgramError> {
         value.reshape(extents)
     }
-
-    fn iota(target: &A, axis: usize) -> Result<A, ProgramError> {
-        let output_type = target.r#type().into_owned().with_data_type(DataType::I32).with_layout(None);
-        target.domain().iota(&output_type, axis)
-    }
-
-    fn fill(target: &A, value: f64) -> Result<A, ProgramError> {
-        let target_type = target.r#type();
-        let scalar = target.domain().fill(&ArrayType::scalar(target_type.data_type()), value)?;
-        let extents = (0..target_type.rank())
-            .map(|axis| <Self as AttentionUniverse<A>>::extent(target, axis))
-            .collect::<Result<Vec<_>, _>>()?;
-        <Self as AttentionUniverse<A>>::broadcast(&scalar, extents.as_slice(), &[])
-    }
 }
 
 impl<V> AttentionUniverse<V> for ArrayIrType
@@ -338,12 +323,15 @@ where
         + Add
         + And
         + Broadcast
+        + BroadcastLike
         + Compare
         + ConvertElementType
         + Div
         + Dot
         + Dropout
         + Exp
+        + FillLike
+        + IotaLike
         + Log
         + Mul
         + Reduce
@@ -352,9 +340,7 @@ where
         + StopGradient
         + Sub
         + Transpose,
-    <<V as ValueProjection<ArrayType>>::Projected as Value>::Domain:
-        Fill<f64, <V as ValueProjection<ArrayType>>::Projected>,
-    V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionMulOperation>> + DimensionConstant + DynamicIota<V>,
+    V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionMulOperation>> + DimensionConstant,
 {
     type ArrayValue = <V as ValueProjection<ArrayType>>::Projected;
     type Extent = V;
@@ -367,21 +353,6 @@ where
     #[inline]
     fn from_array(array: Self::ArrayValue) -> V {
         <V as ValueProjection<ArrayType>>::from_projected(array)
-    }
-
-    #[inline]
-    fn array_type(value: &V) -> Result<ArrayType, ProgramError> {
-        Ok(<&ArrayType>::try_from(value.r#type().as_ref())?.clone())
-    }
-
-    #[inline]
-    fn to_array_type(r#type: &ArrayIrType) -> Result<ArrayType, TypeError> {
-        Ok(<&ArrayType>::try_from(r#type)?.clone())
-    }
-
-    #[inline]
-    fn from_array_type(r#type: ArrayType) -> ArrayIrType {
-        r#type.into()
     }
 
     fn batch_extent(value: &V, extent: &BatchingLevelExtent<V>) -> Result<V, ProgramError> {
@@ -423,32 +394,6 @@ where
     #[inline]
     fn reshape(value: &V, extents: &[V]) -> Result<V, ProgramError> {
         value.clone().dynamic_reshape(extents)
-    }
-
-    fn iota(target: &V, axis: usize) -> Result<V, ProgramError> {
-        let target_type = target.r#type();
-        let target_type = <&ArrayType>::try_from(target_type.as_ref())?;
-        let output_type = target_type.clone().with_data_type(DataType::I32);
-        // Only the dynamic axes of the output type take dimension inputs, in axis order.
-        let dynamic_extents = output_type
-            .shape()
-            .dimensions()
-            .iter()
-            .enumerate()
-            .filter(|(_, dimension)| matches!(dimension, Dimension::Dynamic(_)))
-            .map(|(axis, _)| target.dimension_size(axis))
-            .collect::<Result<Vec<_>, _>>()?;
-        target.domain().dynamic_iota(&output_type, axis, dynamic_extents.as_slice())
-    }
-
-    fn fill(target: &V, value: f64) -> Result<V, ProgramError> {
-        let target_type = target.r#type();
-        let target_type = <&ArrayType>::try_from(target_type.as_ref())?;
-        let scalar = <Self as AttentionUniverse<V>>::into_array(target.clone())?
-            .domain()
-            .fill(&ArrayType::scalar(target_type.data_type()), value)?;
-        let extents = (0..target_type.rank()).map(|axis| target.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
-        <Self as AttentionUniverse<V>>::from_array(scalar).dynamic_broadcast(extents.as_slice(), &[])
     }
 }
 
@@ -1219,8 +1164,9 @@ where
 ///
 /// The definition's portable body computes attention with ordinary array operations, while backends may replace it
 /// (e.g., the XLA backend replaces it with cuDNN's fused attention kernels when the configuration and the input types
-/// are eligible). Homogeneous array domains support static extents only, while array IR domains also support dynamic
-/// batch and sequence extents (e.g., in bounded dynamic programs).
+/// are eligible). Array IR domains support dynamic batch and sequence extents (e.g., in bounded dynamic programs).
+/// Homogeneous array domains support them as well, except in batching rules that need a dynamic extent (refer to
+/// [`AttentionUniverse`]).
 ///
 /// # Parameters
 ///
@@ -1332,7 +1278,7 @@ where
                     let input_types = input_types
                         .into_values()
                         .iter()
-                        .map(<C::Type as AttentionUniverse<DomainTracer<C>>>::to_array_type)
+                        .map(|r#type| r#type.as_array_type().cloned())
                         .collect::<Result<Vec<_>, _>>()?;
                     let mut output_types = attention_forward_output_types(
                         DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
@@ -1341,7 +1287,7 @@ where
                         input_types.as_slice(),
                     )?;
                     check_count!("output", output_types, 1, ProgramError);
-                    Ok(<C::Type as AttentionUniverse<DomainTracer<C>>>::from_array_type(output_types.remove(0)))
+                    Ok(output_types.remove(0).into())
                 };
                 // The primal stages the forward definition without its residual.
                 let primal = {
@@ -1722,19 +1668,16 @@ type BackwardFunction<V, O> = AttentionFunction<
 type TrainingFunction<V, O> =
     Composite<V, O, AttentionInputs<RuleTracer<V, O>>, RuleTracer<V, O>, DefaultJvp, AttentionVjp<V, O>>;
 
-/// Shared normalized inputs and masked logits consumed by the forward and backward attention bodies.
+/// Shared normalized inputs and masked logits consumed by the forward and backward attention bodies, as array views.
 struct PreparedAttention<V: Value<Type: AttentionUniverse<V>>> {
     /// Normalized query.
-    query: V,
-
-    /// Normalized key.
-    key: V,
+    query: ArrayOf<V>,
 
     /// Normalized key expanded from key/value heads to query heads.
-    expanded_key: V,
+    expanded_key: ArrayOf<V>,
 
     /// Normalized value expanded from key/value heads to query heads.
-    expanded_value: V,
+    expanded_value: ArrayOf<V>,
 
     /// Masked logits converted to the data type used by softmax.
     logits: ArrayOf<V>,
@@ -1820,7 +1763,8 @@ where
     let mut varying_manual_axes = None;
     let mut aligned = true;
     for input in inputs.parameters() {
-        let array_type = U::to_array_type(&input.r#type())?;
+        let r#type = input.r#type();
+        let array_type = r#type.as_array_type()?;
         let axes = array_type.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
         match &varying_manual_axes {
             None => varying_manual_axes = Some(axes),
@@ -2186,11 +2130,11 @@ fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayT
 
 /// Returns the named composite of the forward definition with the provided configuration and optional input signature.
 ///
-/// The body of the definition evaluates portable scaled dot-product attention with ordinary array operations and
-/// returns the attended output, followed by the log-sum-exp residual when `configuration` requests it. Every
-/// constructor, broadcast, and reshape that depends on a shape takes its extents from the [`AttentionUniverse`] of the
-/// values, so the same body supports static extents in homogeneous array families and static and dynamic extents in
-/// array IR families, and backends need no attention mathematics of their own.
+/// The body of the definition evaluates portable scaled dot-product attention with ordinary array operations on the
+/// array views of its inputs and returns the attended output, followed by the log-sum-exp residual when
+/// `configuration` requests it. Its constants, coordinates, and broadcasts take their shapes from existing values, and
+/// only the grouped key/value head expansion takes its extents from the [`AttentionUniverse`] of the values, so the
+/// same body supports static and dynamic extents and backends need no attention mathematics of their own.
 fn forward_function<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
     signature: AttentionInputSignature,
@@ -2217,7 +2161,7 @@ where
         let input_types = input_types
             .into_values()
             .iter()
-            .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::to_array_type)
+            .map(|r#type| r#type.as_array_type().cloned())
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = attention_forward_output_types(
             DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
@@ -2225,10 +2169,7 @@ where
             signature,
             input_types.as_slice(),
         )?;
-        Ok(output_types
-            .into_iter()
-            .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::from_array_type)
-            .collect())
+        Ok(output_types.into_iter().map(Into::into).collect())
     };
     let body = move |inputs: AttentionInputs<RuleTracer<V, O>>| -> Result<Vec<RuleTracer<V, O>>, ProgramError> {
         // The output type rule above has already validated this boundary, so the types are only needed for the
@@ -2237,7 +2178,7 @@ where
             .clone()
             .into_values()
             .iter()
-            .map(V::Type::array_type)
+            .map(|input| -> Result<ArrayType, ProgramError> { Ok(input.r#type().as_array_type()?.clone()) })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         let query_rank = input_types[0].rank();
         let dimensions = validate_attention_inputs(
@@ -2252,22 +2193,12 @@ where
         // The softmax over the key/value axis subtracts the maximum of every row before exponentiating, so that the
         // exponentials cannot overflow and the largest one is exactly one.
         let prepared = prepare_attention(&inputs, configuration, &dimensions)?;
-        let logits = V::Type::from_array(prepared.logits.clone());
         let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
-        let maxima_broadcast = V::Type::into_array(V::Type::broadcast(
-            &V::Type::from_array(maxima.clone()),
-            V::Type::extents(&logits)?.as_slice(),
-            &[0, 1, 2],
-        )?)?;
+        let maxima_broadcast = maxima.broadcast_like(&prepared.logits, &[0, 1, 2])?;
         let shifted = prepared.logits.sub(&maxima_broadcast)?;
         let exponentials = shifted.exp()?;
-        let exponentials_value = V::Type::from_array(exponentials.clone());
         let sums = exponentials.reduce(&[3], ReductionKind::Sum)?;
-        let sums_broadcast = V::Type::into_array(V::Type::broadcast(
-            &V::Type::from_array(sums.clone()),
-            V::Type::extents(&exponentials_value)?.as_slice(),
-            &[0, 1, 2],
-        )?)?;
+        let sums_broadcast = sums.broadcast_like(&exponentials, &[0, 1, 2])?;
         // Dropout applies to the normalized probabilities in the softmax data type, before they return to the data
         // type of the query.
         let weights = apply_dropout(exponentials.div(&sums_broadcast)?, &inputs, configuration)?;
@@ -2279,16 +2210,14 @@ where
         // The weights have the `BNTS` score form, and the values have the `BSNH` form with their heads expanded to the
         // query heads. Contracting the key/value axis for every batch item and head gives `BNTH`, which is transposed
         // to the `BTNH` form of the query.
-        let attended = weights.dot(
-            &V::Type::into_array(prepared.expanded_value)?,
-            &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]),
-        )?;
+        let attended = weights
+            .dot(&prepared.expanded_value, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?;
         let mut output = attended.transpose([0, 2, 1, 3])?;
         // Query rows at or beyond the query length of their batch item are exact zeros.
         if let Some(query_lengths) = &inputs.query_sequence_lengths {
             output = zero_query_rows::<RuleTracer<V, O>>(output, query_lengths, 1)?;
         }
-        let output = denormalize_attention_output::<RuleTracer<V, O>>(output, query_rank)?;
+        let output = denormalize_attention_output(output, query_rank)?;
         // The residual is the logarithm of the sum of the exponentiated logits of every row, which is the row maximum
         // plus the logarithm of the sum of the shifted exponentials. It is a statistic of the forward pass rather
         // than a differentiable output, so it stops gradients.
@@ -2300,7 +2229,7 @@ where
                 residual.convert_element_type(prepared.data_type)?
             };
             let residual = residual.transpose([0, 2, 1])?;
-            Some(denormalize_attention_output::<RuleTracer<V, O>>(residual, query_rank)?.stop_gradient()?)
+            Some(denormalize_attention_output(residual, query_rank)?.stop_gradient()?)
         } else {
             None
         };
@@ -2418,7 +2347,7 @@ where
         let input_types = input_types
             .into_values()
             .iter()
-            .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::to_array_type)
+            .map(|r#type| r#type.as_array_type().cloned())
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = attention_backward_output_types(
             DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
@@ -2426,10 +2355,7 @@ where
             signature,
             input_types.as_slice(),
         )?;
-        Ok(output_types
-            .into_iter()
-            .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::from_array_type)
-            .collect())
+        Ok(output_types.into_iter().map(Into::into).collect())
     };
     let body = move |inputs: AttentionBackwardInputs<RuleTracer<V, O>>| -> Result<Vec<RuleTracer<V, O>>, ProgramError> {
         // The forward output and its residual are validated inputs for backend implementations of this definition.
@@ -2442,7 +2368,7 @@ where
             .clone()
             .into_values()
             .iter()
-            .map(V::Type::array_type)
+            .map(|input| -> Result<ArrayType, ProgramError> { Ok(input.r#type().as_array_type()?.clone()) })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         let input_ranks = [input_types[0].rank(), input_types[1].rank(), input_types[2].rank()];
         let dimensions = validate_attention_inputs(
@@ -2454,46 +2380,31 @@ where
             inputs.mask.as_ref().map(|_| &input_types[3 + usize::from(inputs.bias.is_some())]),
         )?;
         let prepared = prepare_attention(inputs, configuration, &dimensions)?;
-        let output_cotangent = normalize_attention_input(output_cotangent)?;
-        let logits = V::Type::from_array(prepared.logits.clone());
+        let output_cotangent = normalize_attention_input(V::Type::into_array(output_cotangent.clone())?)?;
         // The public residual and output have the query data type, which can lose the normalization correction in
         // narrow formats. Recompute probabilities in the softmax type instead of recovering them from those values.
         let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
-        let maxima = V::Type::into_array(V::Type::broadcast(
-            &V::Type::from_array(maxima),
-            V::Type::extents(&logits)?.as_slice(),
-            &[0, 1, 2],
-        )?)?;
+        let maxima = maxima.broadcast_like(&prepared.logits, &[0, 1, 2])?;
         let exponentials = prepared.logits.sub(&maxima)?.exp()?;
         let sums = exponentials.reduce(&[3], ReductionKind::Sum)?;
-        let sums = V::Type::into_array(V::Type::broadcast(
-            &V::Type::from_array(sums),
-            V::Type::extents(&logits)?.as_slice(),
-            &[0, 1, 2],
-        )?)?;
+        let sums = sums.broadcast_like(&prepared.logits, &[0, 1, 2])?;
         let weights = exponentials.div(&sums)?;
 
         // Pick exactly one maximum, including when logits tie. Keeping the pivot out of the final sum avoids
         // subtracting two nearly equal dominant contributions. The integer constants cannot carry tangents.
-        let columns = V::Type::iota(&logits, 3)?;
-        let column_array = V::Type::into_array(columns.clone())?;
-        let sentinel = V::Type::into_array(V::Type::fill(&columns, i32::MAX as f64)?)?;
+        let columns = prepared.logits.iota_like(3, DataType::I32)?;
+        let sentinel = columns.fill_like(i32::MAX)?;
         let is_maximum = prepared.logits.compare(&maxima, ComparisonDirection::Equal)?;
-        let pivot = is_maximum.select(&column_array, &sentinel)?.reduce(&[3], ReductionKind::Min)?;
-        let pivot = V::Type::into_array(V::Type::broadcast(
-            &V::Type::from_array(pivot),
-            V::Type::extents(&logits)?.as_slice(),
-            &[0, 1, 2],
-        )?)?;
-        let is_pivot = column_array.compare(&pivot, ComparisonDirection::Equal)?;
+        let pivot = is_maximum.select(&columns, &sentinel)?.reduce(&[3], ReductionKind::Min)?;
+        // The column coordinates share the shape and the data type of the pivot, so they are its exemplar.
+        let pivot = pivot.broadcast_like(&columns, &[0, 1, 2])?;
+        let is_pivot = columns.compare(&pivot, ComparisonDirection::Equal)?;
 
         // Query rows at or beyond the query length of their batch item are zero in the forward output, so their
         // output cotangents contribute nothing.
         let output_cotangent = match &inputs.query_sequence_lengths {
-            None => V::Type::into_array(output_cotangent)?,
-            Some(query_lengths) => {
-                zero_query_rows::<RuleTracer<V, O>>(V::Type::into_array(output_cotangent)?, query_lengths, 1)?
-            }
+            None => output_cotangent,
+            Some(query_lengths) => zero_query_rows::<RuleTracer<V, O>>(output_cotangent, query_lengths, 1)?,
         };
         // The backward mathematics runs in the softmax data type, like the recomputed probabilities.
         let convert = |array: ArrayOf<RuleTracer<V, O>>| -> Result<ArrayOf<RuleTracer<V, O>>, ProgramError> {
@@ -2503,9 +2414,9 @@ where
                 Ok(array.convert_element_type(prepared.softmax_type)?)
             }
         };
-        let softmax_query = convert(V::Type::into_array(prepared.query.clone())?)?;
-        let softmax_key = convert(V::Type::into_array(prepared.expanded_key.clone())?)?;
-        let softmax_value = convert(V::Type::into_array(prepared.expanded_value)?)?;
+        let softmax_query = convert(prepared.query)?;
+        let softmax_key = convert(prepared.expanded_key)?;
+        let softmax_value = convert(prepared.expanded_value)?;
         let softmax_output_cotangent = convert(output_cotangent)?;
 
         // With dropout, the output uses the dropped probabilities `D = dropout(P)`, so the value cotangent uses `D`
@@ -2517,39 +2428,26 @@ where
             inputs,
             configuration,
         )?;
-        let zero = V::Type::into_array(V::Type::fill(&logits, 0.0)?)?;
+        let zero = prepared.logits.fill_like(0.0)?;
         let pivot_cotangent = is_pivot.select(&weight_cotangents, &zero)?.reduce(&[3], ReductionKind::Sum)?;
-        let pivot_cotangent = V::Type::into_array(V::Type::broadcast(
-            &V::Type::from_array(pivot_cotangent),
-            V::Type::extents(&logits)?.as_slice(),
-            &[0, 1, 2],
-        )?)?;
+        let pivot_cotangent = pivot_cotangent.broadcast_like(&prepared.logits, &[0, 1, 2])?;
         // Center the incoming weight cotangents before their weighted sum. This preserves a tiny dominant derivative
         // and gives exact zero when every weight cotangent is equal, even if the rounded probabilities do not sum to
         // one.
         let centered = weight_cotangents.sub(&pivot_cotangent)?;
         let delta = weights.mul(&centered)?.reduce(&[3], ReductionKind::Sum)?;
-        let delta = V::Type::into_array(V::Type::broadcast(
-            &V::Type::from_array(delta),
-            V::Type::extents(&logits)?.as_slice(),
-            &[0, 1, 2],
-        )?)?;
+        let delta = delta.broadcast_like(&prepared.logits, &[0, 1, 2])?;
         let logit_cotangents = weights.mul(&centered.sub(&delta)?)?;
         // The logit cotangents of every row sum to zero, so the pivot's entry is replaced by the negative sum of the
         // other entries. That keeps the dominant derivative when the probability of the pivot rounds to one.
         let other_cotangents = is_pivot.select(&zero, &logit_cotangents)?;
         let pivot_cotangent = other_cotangents.reduce(&[3], ReductionKind::Sum)?;
-        let pivot_cotangent = V::Type::into_array(V::Type::broadcast(
-            &V::Type::from_array(pivot_cotangent),
-            V::Type::extents(&logits)?.as_slice(),
-            &[0, 1, 2],
-        )?)?;
+        let pivot_cotangent = pivot_cotangent.broadcast_like(&prepared.logits, &[0, 1, 2])?;
         let logit_cotangents = is_pivot.select(&zero.sub(&pivot_cotangent)?, &other_cotangents)?;
-        let logit_cotangents_value = V::Type::from_array(logit_cotangents.clone());
         // The scores are `scale * Q * transpose(K)`, so the query and key cotangents contract the scaled logit
         // cotangents with the keys and the queries, and the value cotangent contracts the dropped probabilities with
         // the output cotangent. Every result is transposed from `BNTH` or `BNSH` to the form of its input.
-        let scale_value = V::Type::into_array(V::Type::fill(&logit_cotangents_value, prepared.scale)?)?;
+        let scale_value = logit_cotangents.fill_like(prepared.scale)?;
         let scaled_logit_cotangents = logit_cotangents.mul(&scale_value)?;
         let mut query_cotangent = scaled_logit_cotangents
             .dot(&softmax_key, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?
@@ -2569,18 +2467,9 @@ where
         let (key_cotangent, value_cotangent) = if dimensions.key_value_heads == dimensions.query_heads {
             (key_cotangent, value_cotangent)
         } else {
-            let group = dimensions.query_heads / dimensions.key_value_heads;
-            let key_extents = V::Type::extents(&prepared.key)?;
-            let key_value_heads = V::Type::constant_extent(&prepared.key, dimensions.key_value_heads)?;
-            let group = V::Type::constant_extent(&prepared.key, group)?;
-            let head_dimension = V::Type::constant_extent(&prepared.key, dimensions.head_dimension)?;
-            let grouped_extents =
-                [key_extents[0].clone(), key_extents[1].clone(), key_value_heads, group, head_dimension];
-            let grouped_key = V::Type::reshape(&V::Type::from_array(key_cotangent), &grouped_extents)?;
-            let grouped_value = V::Type::reshape(&V::Type::from_array(value_cotangent), &grouped_extents)?;
             (
-                V::Type::into_array(grouped_key)?.reduce(&[3], ReductionKind::Sum)?,
-                V::Type::into_array(grouped_value)?.reduce(&[3], ReductionKind::Sum)?,
+                sum_key_value_head_groups(key_cotangent, &dimensions)?,
+                sum_key_value_head_groups(value_cotangent, &dimensions)?,
             )
         };
         // Every cotangent returns to the cotangent data type and to the rank of its input.
@@ -2594,11 +2483,11 @@ where
                 } else {
                     cotangent.convert_element_type(cotangent_data_type)?
                 };
-                denormalize_attention_output::<RuleTracer<V, O>>(cotangent, rank).map(V::Type::from_array)
+                denormalize_attention_output(cotangent, rank).map(V::Type::from_array)
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         if let Some(bias) = &inputs.bias {
-            let bias_type = V::Type::array_type(bias)?;
+            let bias_type = bias.r#type().as_array_type()?.clone();
             let bias_cotangent_type = bias_type.cotangent()?;
             // A bias whose cotangent space is zero-dimensional (e.g., an integer bias) has no cotangent output.
             if bias_cotangent_type.is_zero_space() {
@@ -2621,10 +2510,9 @@ where
             } else {
                 logit_cotangents.reduce(reduce_axes.as_slice(), ReductionKind::Sum)?
             };
-            let bias_cotangent = V::Type::into_array(V::Type::reshape(
-                &V::Type::from_array(bias_cotangent),
-                V::Type::extents(bias)?.as_slice(),
-            )?)?;
+            // The reduced cotangent keeps the axes along which the bias is not broadcast, which are the axes of the
+            // bias other than its unit axes, so restoring the shape of the bias only inserts or removes unit axes.
+            let bias_cotangent = bias_cotangent.reshape(bias_type.shape().clone())?;
             let bias_cotangent = if bias_cotangent_type.data_type() == prepared.softmax_type {
                 bias_cotangent
             } else {
@@ -2689,11 +2577,11 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
     configuration: AttentionConfiguration,
     dimensions: &AttentionDimensions,
 ) -> Result<PreparedAttention<V>, ProgramError> {
-    let query = normalize_attention_input(&inputs.query)?;
-    let key = normalize_attention_input(&inputs.key)?;
-    let value_input = normalize_attention_input(&inputs.value)?;
-    let expanded_key = expand_key_value_heads(&key, dimensions)?;
-    let expanded_value = expand_key_value_heads(&value_input, dimensions)?;
+    let query = normalize_attention_input(V::Type::into_array(inputs.query.clone())?)?;
+    let key = normalize_attention_input(V::Type::into_array(inputs.key.clone())?)?;
+    let value_input = normalize_attention_input(V::Type::into_array(inputs.value.clone())?)?;
+    let expanded_key = expand_key_value_heads(key, dimensions)?;
+    let expanded_value = expand_key_value_heads(value_input, dimensions)?;
     let data_type = dimensions.data_type;
     // Dot products, scaling, bias, and masking promote low precision inputs to `f32`, while `f64` remains `f64`.
     // The stable softmax itself always runs in `f32`, matching the public attention contract.
@@ -2701,26 +2589,19 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
     let softmax_type = DataType::F32;
     // The scores contract the head dimension of the query and of the expanded key for every batch item and head,
     // which gives the `BNTS` score form.
-    let scores = V::Type::into_array(query.clone())?.dot(
-        &V::Type::into_array(expanded_key.clone())?,
-        &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]),
-    )?;
+    let scores = query.dot(&expanded_key, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?;
     let scores = if data_type == logits_type { scores } else { scores.convert_element_type(logits_type)? };
-    let mut scores = V::Type::from_array(scores);
     let scale = configuration.scale().unwrap_or(1.0 / (dimensions.head_dimension as f64).sqrt());
-    let scale_value = V::Type::into_array(V::Type::fill(&scores, scale)?)?;
-    scores = V::Type::from_array(V::Type::into_array(scores)?.mul(&scale_value)?);
-    // A bias is right-aligned to `BNTS`, converted to the data type of the scores, and broadcast to their shape.
+    let scale_value = scores.fill_like(scale)?;
+    let mut scores = scores.mul(&scale_value)?;
+    // A bias is right-aligned to `BNTS`, converted to the data type of the scores, and broadcast to their shape. Every
+    // axis of the normalized bias either has the extent of the corresponding score axis or is a unit axis.
     if let Some(bias) = &inputs.bias {
-        let bias = V::Type::into_array(normalize_attention_score_input(bias)?)?;
+        let bias = normalize_attention_score_input(V::Type::into_array(bias.clone())?)?;
         let bias =
             if bias.r#type().data_type() == logits_type { bias } else { bias.convert_element_type(logits_type)? };
-        let bias = V::Type::into_array(V::Type::broadcast(
-            &V::Type::from_array(bias),
-            V::Type::extents(&scores)?.as_slice(),
-            &[0, 1, 2, 3],
-        )?)?;
-        scores = V::Type::from_array(V::Type::into_array(scores)?.add(&bias)?);
+        let bias = bias.broadcast_like(&scores, &[0, 1, 2, 3])?;
+        scores = scores.add(&bias)?;
     }
 
     // Visibility is the conjunction of the explicit mask, causal ordering, the local window, and both sequence
@@ -2733,23 +2614,20 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
     {
         scores
     } else {
-        // The row and column coordinates of the scores are integer constants that cannot carry tangents.
-        let columns = V::Type::iota(&scores, 3)?;
+        // The row and column coordinates of the scores are integer constants that cannot carry tangents. They take the
+        // runtime shape of the scores, and so do the broadcasts of the mask and of the sequence lengths below.
+        let columns = scores.iota_like(3, DataType::I32)?;
         let mut visible = match &inputs.mask {
             None => None,
             Some(mask) => {
-                let mask = V::Type::into_array(normalize_attention_score_input(mask)?)?;
-                Some(V::Type::into_array(V::Type::broadcast(
-                    &V::Type::from_array(mask),
-                    V::Type::extents(&scores)?.as_slice(),
-                    &[0, 1, 2, 3],
-                )?)?)
+                let mask = normalize_attention_score_input(V::Type::into_array(mask.clone())?)?;
+                Some(mask.broadcast_like(&scores, &[0, 1, 2, 3])?)
             }
         };
         // Causal masking lets query position `i` attend only to key/value positions `j <= i`.
         if configuration.causal() {
-            let rows = V::Type::into_array(V::Type::iota(&scores, 2)?)?;
-            let causal = V::Type::into_array(columns.clone())?.compare(&rows, ComparisonDirection::LessThanOrEqual)?;
+            let rows = scores.iota_like(2, DataType::I32)?;
+            let causal = columns.compare(&rows, ComparisonDirection::LessThanOrEqual)?;
             visible = Some(match visible {
                 None => causal,
                 Some(visible) => visible.and(&causal)?,
@@ -2757,11 +2635,9 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
         }
         // The local window keeps the key/value positions `j` with `i - left <= j <= i + right`.
         if let Some((left, right)) = configuration.local_window() {
-            let rows = V::Type::iota(&scores, 2)?;
-            let columns = V::Type::into_array(columns.clone())?;
-            let left = V::Type::into_array(V::Type::fill(&rows, left as f64)?)?;
-            let right = V::Type::into_array(V::Type::fill(&rows, right as f64)?)?;
-            let rows = V::Type::into_array(rows)?;
+            let rows = scores.iota_like(2, DataType::I32)?;
+            let left = rows.fill_like(left as f64)?;
+            let right = rows.fill_like(right as f64)?;
             let lower = rows.sub(&left)?;
             let upper = rows.add(&right)?;
             let in_window = columns
@@ -2774,10 +2650,9 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
         }
         // Query rows at or beyond the query length of their batch item see no key/value position at all.
         if let Some(lengths) = &inputs.query_sequence_lengths {
-            let rows = V::Type::iota(&scores, 2)?;
-            let bounds = V::Type::broadcast(lengths, V::Type::extents(&rows)?.as_slice(), &[0])?;
-            let in_range =
-                V::Type::into_array(rows)?.compare(&V::Type::into_array(bounds)?, ComparisonDirection::LessThan)?;
+            let rows = scores.iota_like(2, DataType::I32)?;
+            let bounds = V::Type::into_array(lengths.clone())?.broadcast_like(&rows, &[0])?;
+            let in_range = rows.compare(&bounds, ComparisonDirection::LessThan)?;
             visible = Some(match visible {
                 None => in_range,
                 Some(visible) => visible.and(&in_range)?,
@@ -2785,9 +2660,8 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
         }
         // Key/value columns at or beyond the key/value length of their batch item are invisible to every row.
         if let Some(lengths) = &inputs.key_value_sequence_lengths {
-            let bounds = V::Type::broadcast(lengths, V::Type::extents(&columns)?.as_slice(), &[0])?;
-            let in_range =
-                V::Type::into_array(columns)?.compare(&V::Type::into_array(bounds)?, ComparisonDirection::LessThan)?;
+            let bounds = V::Type::into_array(lengths.clone())?.broadcast_like(&columns, &[0])?;
+            let in_range = columns.compare(&bounds, ComparisonDirection::LessThan)?;
             visible = Some(match visible {
                 None => in_range,
                 Some(visible) => visible.and(&in_range)?,
@@ -2796,73 +2670,92 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
         // Invisible scores use a finite large negative value rather than negative infinity, so that a row without
         // any visible position still has a finite maximum and a finite log-sum-exp residual. At least one of the
         // masks above is present on this path, so the visibility is known.
-        let score_type = V::Type::into_array(scores.clone())?.r#type().into_owned();
         let large_negative =
-            if score_type.data_type() == DataType::F64 { -0.7 * f64::MAX } else { -0.7 * f32::MAX as f64 };
-        let masked = V::Type::into_array(V::Type::fill(&scores, large_negative)?)?;
-        V::Type::from_array(visible.unwrap().select(&V::Type::into_array(scores)?, &masked)?)
+            if scores.r#type().data_type() == DataType::F64 { -0.7 * f64::MAX } else { -0.7 * f32::MAX as f64 };
+        let masked = scores.fill_like(large_negative)?;
+        visible.unwrap().select(&scores, &masked)?
     };
-    let logits = V::Type::into_array(logits)?;
     let logits = if logits_type == softmax_type { logits } else { logits.convert_element_type(softmax_type)? };
-    Ok(PreparedAttention { query, key, expanded_key, expanded_value, logits, data_type, softmax_type, scale })
+    Ok(PreparedAttention { query, expanded_key, expanded_value, logits, data_type, softmax_type, scale })
 }
 
 /// Adds the implicit batch axis used to evaluate one unbatched `TNH` attention input (i.e., a query, key, value,
-/// forward output, or output cotangent).
-fn normalize_attention_input<V: Value<Type: AttentionUniverse<V>>>(input: &V) -> Result<V, ProgramError> {
-    if V::Type::array_type(input)?.rank() == 4 {
-        return Ok(input.clone());
+/// forward output, or output cotangent). Inserting a unit axis preserves the dynamic extents of the input.
+fn normalize_attention_input<A: Value<Type = ArrayType> + Reshape>(input: A) -> Result<A, ProgramError> {
+    if input.r#type().rank() == 4 {
+        return Ok(input);
     }
-    let mut input_extents = V::Type::extents(input)?;
-    input_extents.insert(0, V::Type::constant_extent(input, 1)?);
-    V::Type::reshape(input, input_extents.as_slice())
+    input.expand_dimensions(0)
 }
 
-/// Expands grouped key/value heads to the query heads through broadcast and reshape extents.
-fn expand_key_value_heads<V: Value<Type: AttentionUniverse<V>>>(
-    key_or_value: &V,
+/// Expands grouped key/value heads to the query heads. The `BSKH` input is replicated along a new group axis, which
+/// gives the `BSKGH` form, and its key/value head and group axes are then merged into the query head axis of the
+/// `BSNH` form. Both steps keep the batch and sequence dimensions, so they support dynamic extents along them.
+fn expand_key_value_heads<A: Value<Type = ArrayType> + Broadcast + Reshape>(
+    key_or_value: A,
     dimensions: &AttentionDimensions,
-) -> Result<V, ProgramError> {
+) -> Result<A, ProgramError> {
     if dimensions.key_value_heads == dimensions.query_heads {
-        return Ok(key_or_value.clone());
+        return Ok(key_or_value);
     }
     let group = dimensions.query_heads / dimensions.key_value_heads;
-    let key_or_value_extents = V::Type::extents(key_or_value)?;
-    let key_value_heads = V::Type::constant_extent(key_or_value, dimensions.key_value_heads)?;
-    let group = V::Type::constant_extent(key_or_value, group)?;
-    let query_heads = V::Type::constant_extent(key_or_value, dimensions.query_heads)?;
-    let expanded = V::Type::broadcast(
-        key_or_value,
-        &[
-            key_or_value_extents[0].clone(),
-            key_or_value_extents[1].clone(),
-            key_value_heads,
-            group,
-            key_or_value_extents[3].clone(),
-        ],
-        &[0, 1, 2, 4],
-    )?;
-    V::Type::reshape(
-        &expanded,
-        &[
-            key_or_value_extents[0].clone(),
-            key_or_value_extents[1].clone(),
-            query_heads,
-            key_or_value_extents[3].clone(),
-        ],
-    )
+    let r#type = key_or_value.r#type();
+    let [batch, length, _, head_dimension] = r#type.shape().dimensions() else {
+        return Err(TypeError::invalid(format!(
+            "attention key or value type `{}` does not have the normalized rank 4",
+            r#type.as_ref(),
+        ))
+        .into());
+    };
+    // The output keeps the memory space and the placement of the input along the mapped axes, and its group axis is
+    // replicated, because a broadcast cannot change manual variation.
+    let axes = [0, 1, 2, 4];
+    let sharding = r#type
+        .sharding()
+        .map(|sharding| sharding.with_broadcasted_dimensions(5, &axes))
+        .transpose()
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let grouped_dimensions =
+        vec![batch.clone(), length.clone(), dimensions.key_value_heads.into(), group.into(), head_dimension.clone()];
+    let grouped_type = ArrayType::new(r#type.data_type(), Shape::new(grouped_dimensions))
+        .with_memory(r#type.memory())
+        .with_sharding(sharding)
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let expanded_dimensions =
+        vec![batch.clone(), length.clone(), dimensions.query_heads.into(), head_dimension.clone()];
+    key_or_value.broadcast(grouped_type, &axes)?.reshape(Shape::new(expanded_dimensions))
 }
 
-/// Prepends singleton axes until one bias or mask input has the normalized `BNTS` score rank.
-fn normalize_attention_score_input<V: Value<Type: AttentionUniverse<V>>>(input: &V) -> Result<V, ProgramError> {
-    let rank = V::Type::array_type(input)?.rank();
+/// Sums the `BSNH` key or value cotangent of grouped query heads back to the `BSKH` form of the key/value heads that
+/// those query heads share, by splitting its query head axis into the key/value head and group axes of the `BSKGH`
+/// form and summing over the group axis. Like [`expand_key_value_heads`], it keeps the batch and sequence dimensions.
+fn sum_key_value_head_groups<A: Value<Type = ArrayType> + Reduce + Reshape>(
+    cotangent: A,
+    dimensions: &AttentionDimensions,
+) -> Result<A, ProgramError> {
+    let group = dimensions.query_heads / dimensions.key_value_heads;
+    let r#type = cotangent.r#type();
+    let grouped_dimensions = vec![
+        r#type.dimension(0),
+        r#type.dimension(1),
+        dimensions.key_value_heads.into(),
+        group.into(),
+        dimensions.head_dimension.into(),
+    ];
+    cotangent.reshape(Shape::new(grouped_dimensions))?.reduce(&[3], ReductionKind::Sum)
+}
+
+/// Prepends unit axes until one bias or mask input has the normalized `BNTS` score rank, which preserves the dynamic
+/// extents of the input.
+fn normalize_attention_score_input<A: Value<Type = ArrayType> + Reshape>(input: A) -> Result<A, ProgramError> {
+    let rank = input.r#type().rank();
     if rank == 4 {
-        return Ok(input.clone());
+        return Ok(input);
     }
-    let singleton = V::Type::constant_extent(input, 1)?;
-    let mut input_extents = vec![singleton; 4 - rank];
-    input_extents.extend(V::Type::extents(input)?);
-    V::Type::reshape(input, input_extents.as_slice())
+    let dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - rank)
+        .chain(input.r#type().shape().dimensions().iter().cloned())
+        .collect::<Vec<_>>();
+    input.reshape(Shape::new(dimensions))
 }
 
 /// Applies the configured dropout to `probabilities`, whose shape is the normalized `BNTS` score shape, using the
@@ -2886,25 +2779,23 @@ fn zero_query_rows<V: Value<Type: AttentionUniverse<V>>>(
     query_lengths: &V,
     row_axis: usize,
 ) -> Result<ArrayOf<V>, ProgramError> {
-    let rows_value = V::Type::from_array(rows_value);
-    let rows = V::Type::iota(&rows_value, row_axis)?;
-    let lengths = V::Type::broadcast(query_lengths, V::Type::extents(&rows_value)?.as_slice(), &[0])?;
-    let in_range = V::Type::into_array(rows)?.compare(&V::Type::into_array(lengths)?, ComparisonDirection::LessThan)?;
-    let zero = V::Type::into_array(V::Type::fill(&rows_value, 0.0)?)?;
-    in_range.select(&V::Type::into_array(rows_value)?, &zero)
+    let rows = rows_value.iota_like(row_axis, DataType::I32)?;
+    let lengths = V::Type::into_array(query_lengths.clone())?.broadcast_like(&rows, &[0])?;
+    let in_range = rows.compare(&lengths, ComparisonDirection::LessThan)?;
+    let zero = rows_value.fill_like(0.0)?;
+    in_range.select(&rows_value, &zero)
 }
 
-/// Removes the implicit batch axis after evaluating unbatched attention.
-fn denormalize_attention_output<V: Value<Type: AttentionUniverse<V>>>(
-    output: ArrayOf<V>,
+/// Removes the implicit batch axis after evaluating unbatched attention. The removed axis is the unit axis that
+/// [`normalize_attention_input`] inserts, which every output and cotangent inherits from the query or the key.
+fn denormalize_attention_output<A: Value<Type = ArrayType> + Reshape>(
+    output: A,
     rank: usize,
-) -> Result<ArrayOf<V>, ProgramError> {
+) -> Result<A, ProgramError> {
     if rank == 4 {
         return Ok(output);
     }
-    let output = V::Type::from_array(output);
-    let output_extents = V::Type::extents(&output)?;
-    V::Type::into_array(V::Type::reshape(&output, &output_extents[1..])?)
+    output.squeeze(0)
 }
 
 /// Batches one attention call by folding its mapped axis into attention's batch axis, staging the definition once at
@@ -2940,7 +2831,7 @@ fn batch_attention<V: Value<Type: AttentionUniverse<V>>>(
         .iter()
         .zip(&axes)
         .map(|(input, axis)| {
-            let rank = V::Type::array_type(input)?.rank();
+            let rank = input.r#type().as_array_type()?.rank();
             match axis.axis() {
                 Some(axis) => {
                     let position = axis.normalize(rank).map_err(|error| TypeError::invalid(error.to_string()))?;
@@ -2959,7 +2850,7 @@ fn batch_attention<V: Value<Type: AttentionUniverse<V>>>(
             }
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
-    let logical_rank = |value: &V| -> Result<usize, ProgramError> { Ok(V::Type::array_type(value)?.rank() - 1) };
+    let logical_rank = |value: &V| -> Result<usize, ProgramError> { Ok(value.r#type().as_array_type()?.rank() - 1) };
     let query_rank = logical_rank(&aligned[0])?;
     let key_rank = logical_rank(&aligned[1])?;
     let batch_extent =
@@ -2996,7 +2887,7 @@ fn batch_attention<V: Value<Type: AttentionUniverse<V>>>(
         .iter()
         .zip(input_roles)
         .map(|(value, role)| {
-            let rank = V::Type::array_type(value)?.rank();
+            let rank = value.r#type().as_array_type()?.rank();
             let trailing_extents = |start: usize| {
                 (start..rank).map(|axis| V::Type::extent(value, axis)).collect::<Result<Vec<_>, ProgramError>>()
             };
@@ -3034,7 +2925,7 @@ fn batch_attention<V: Value<Type: AttentionUniverse<V>>>(
         .zip(output_roles)
         .map(|(output, role)| {
             let trailing_extents = |output: &V| {
-                let rank = V::Type::array_type(output)?.rank();
+                let rank = output.r#type().as_array_type()?.rank();
                 (1..rank).map(|axis| V::Type::extent(output, axis)).collect::<Result<Vec<_>, ProgramError>>()
             };
             match role {
@@ -3056,7 +2947,7 @@ fn batch_attention<V: Value<Type: AttentionUniverse<V>>>(
                 }
                 AttentionBatchOutput::Residual => Ok(output),
                 AttentionBatchOutput::Score(input_index) => {
-                    let bias_type = V::Type::array_type(&aligned[input_index])?;
+                    let bias_type = aligned[input_index].r#type().as_array_type()?.clone();
                     let offset = 5 - bias_type.rank();
                     let reduction_axes = (0..4)
                         .filter(|&axis| {
@@ -3134,15 +3025,11 @@ mod tests {
 
     #[test]
     fn test_attention_universe() {
-        let r#type = ArrayType::new_static(DataType::F32, [2, 3]);
         let array = f32_array(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
-        // Homogeneous array values are their own array views, and their types are array types.
+        // Homogeneous array values are their own array views.
         assert_eq!(<ArrayType as AttentionUniverse<Array>>::into_array(array.clone()), Ok(array.clone()));
         assert_eq!(<ArrayType as AttentionUniverse<Array>>::from_array(array.clone()), array);
-        assert_eq!(<ArrayType as AttentionUniverse<Array>>::array_type(&array), Ok(r#type.clone()));
-        assert_eq!(<ArrayType as AttentionUniverse<Array>>::to_array_type(&r#type), Ok(r#type.clone()));
-        assert_eq!(<ArrayType as AttentionUniverse<Array>>::from_array_type(r#type.clone()), r#type);
 
         // Extents are static host numbers, so dynamic batching extents and overflowing products are rejected.
         assert_eq!(
@@ -3165,7 +3052,7 @@ mod tests {
                 if message == format!("attention extent product {} × 2 overflows `usize`", usize::MAX),
         ));
 
-        // Broadcasts, reshapes, iotas, and fills take static extents.
+        // Broadcasts and reshapes take static extents.
         assert_eq!(
             <ArrayType as AttentionUniverse<Array>>::broadcast(&f32_array(&[3], &[1.0, 2.0, 3.0]), &[2, 3], &[1]),
             Ok(f32_array(&[2, 3], &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0])),
@@ -3174,35 +3061,20 @@ mod tests {
             <ArrayType as AttentionUniverse<Array>>::reshape(&array, &[3, 2]),
             Ok(f32_array(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
         );
-        assert_eq!(
-            <ArrayType as AttentionUniverse<Array>>::iota(&array, 1),
-            Ok(Array::from_elements(ArrayType::new_static(DataType::I32, [2, 3]), &[0i32, 1, 2, 0, 1, 2]).unwrap()),
-        );
-        assert_eq!(<ArrayType as AttentionUniverse<Array>>::fill(&array, 2.5), Ok(f32_array(&[2, 3], &[2.5; 6])));
     }
 
     #[test]
     fn test_attention_universe_array_ir() {
-        let r#type = ArrayType::new_static(DataType::F32, [2, 3]);
         let array = f32_array(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         let value = ArrayIrValue::Array(array.clone());
         let dimension = |extent| ArrayIrValue::<Array>::Dimension(DimensionValue::constant(extent).unwrap());
 
-        // Array IR values project to their array members, and only their array types describe arrays.
+        // Array IR values project to their array members.
         assert_eq!(
             <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::into_array(value.clone()),
             Ok(array.clone()),
         );
         assert_eq!(<ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::from_array(array), value);
-        assert_eq!(<ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::array_type(&value), Ok(r#type.clone()));
-        assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::to_array_type(&ArrayIrType::Array(r#type.clone())),
-            Ok(r#type.clone()),
-        );
-        assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::from_array_type(r#type.clone()),
-            ArrayIrType::Array(r#type),
-        );
 
         // Extents are first-class dimension values, which include dynamic batching extents.
         assert_eq!(
@@ -3237,7 +3109,7 @@ mod tests {
             Ok(dimension(6)),
         );
 
-        // Broadcasts, reshapes, iotas, and fills take their extents from dimension values.
+        // Broadcasts and reshapes take their extents from dimension values.
         assert_eq!(
             <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::broadcast(
                 &ArrayIrValue::Array(f32_array(&[3], &[1.0, 2.0, 3.0])),
@@ -3250,38 +3122,42 @@ mod tests {
             <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::reshape(&value, &[dimension(3), dimension(2)]),
             Ok(ArrayIrValue::Array(f32_array(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))),
         );
-        assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::iota(&value, 1),
-            Ok(ArrayIrValue::Array(
-                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 3]), &[0i32, 1, 2, 0, 1, 2]).unwrap(),
-            )),
-        );
-        assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::fill(&value, 2.5),
-            Ok(ArrayIrValue::Array(f32_array(&[2, 3], &[2.5; 6]))),
-        );
     }
 
     #[test]
     fn test_attention_universe_array_ir_dynamic_extents() {
-        // Staged array IR values construct iotas whose dimension inputs are the dynamic extents of their targets.
+        // Staged array IR values read their dynamic extents as dimension values and fold their static extents into
+        // dimension constants, and broadcasts take one dimension input per output axis.
+        type IrTracer = DomainTracer<ArrayIrContext>;
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let shape = Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]);
         let (output_type, program) = ArrayIrContext::trace(
-            |value: DomainTracer<ArrayIrContext>| {
-                <ArrayIrType as AttentionUniverse<DomainTracer<ArrayIrContext>>>::iota(&value, 1)
+            |value: IrTracer| {
+                let mut extents = <ArrayIrType as AttentionUniverse<IrTracer>>::extents(&value)?;
+                extents.push(<ArrayIrType as AttentionUniverse<IrTracer>>::constant_extent(&value, 2)?);
+                <ArrayIrType as AttentionUniverse<IrTracer>>::broadcast(&value, &extents, &[0, 1])
             },
-            ArrayIrType::Array(ArrayType::new(DataType::F32, shape.clone())),
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]),
+            )),
         )
         .unwrap();
-        assert_eq!(output_type, ArrayIrType::Array(ArrayType::new(DataType::I32, shape)));
+        assert_eq!(
+            output_type,
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3), Dimension::Static(2)]),
+            )),
+        );
         assert_eq!(
             program.to_string(),
             indoc! {"
                 lambda %0:f32[batch, 3] .
                 let %1:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %0
-                    %2:i32[batch, 3] = iota [type=i32[batch, 3], dimension=1] %1
-                in (%2)
+                    %2:dimension<3> = constant [value=3]
+                    %3:dimension<2> = constant [value=2]
+                    %4:f32[batch, 3, 2] = broadcast [output_axes=[0, 1]] %0 %1 %2 %3
+                in (%4)
             "}
             .trim_end(),
         );
@@ -3735,6 +3611,7 @@ mod tests {
         let varying_rank_4 = rendered_sharding(4, true);
         let varying_rank_3 = rendered_sharding(3, true);
         let varying_rank_1 = rendered_sharding(1, true);
+        let varying_rank_0 = rendered_sharding(0, true);
         let invariant_rank_4 = rendered_sharding(4, false);
         let invariant_rank_1 = rendered_sharding(1, false);
         assert_eq!(
@@ -3772,83 +3649,77 @@ mod tests {
                                 dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
                                     rhs_batching=[0, 2]),
                             ] %0 %1
-                                %8:f32[] = constant [value=1.0]
-                                %9:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %8
-                                %10:f32[1, 1, 1, 1]{invariant_rank_4} = broadcast [
-                                    output_type=f32[1, 1, 1, 1]{invariant_rank_4},
-                                    output_axes=[0, 1, 2, 3],
-                                ] %9
-                                %11:f32[1, 1, 1, 1]{varying_rank_4} = parallel_vary [axis_name=\"x\"] %10
-                                %12:f32[1, 1, 1, 1]{varying_rank_4} = mul %7 %11
-                                %13:f32[1, 1, 1, 1]{varying_rank_4} = add %12 %3
-                                %14:i32[1, 1, 1, 1]{varying_rank_4} = iota [
+                                %8:f32[]{varying_rank_0} = constant [value=1.0]
+                                %9:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                    output_type=f32[1, 1, 1, 1]{varying_rank_4},
+                                    output_axes=[],
+                                ] %8
+                                %10:f32[1, 1, 1, 1]{varying_rank_4} = mul %7 %9
+                                %11:f32[1, 1, 1, 1]{varying_rank_4} = add %10 %3
+                                %12:i32[1, 1, 1, 1]{varying_rank_4} = iota [
                                     type=i32[1, 1, 1, 1]{varying_rank_4},
                                     dimension=3,
                                 ]
-                                %15:i32[1, 1, 1, 1]{varying_rank_4} = iota [
+                                %13:i32[1, 1, 1, 1]{varying_rank_4} = iota [
                                     type=i32[1, 1, 1, 1]{varying_rank_4},
                                     dimension=2,
                                 ]
-                                %16:i32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                %14:i32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                     output_type=i32[1, 1, 1, 1]{varying_rank_4},
                                     output_axes=[0],
                                 ] %5
-                                %17:bool[1, 1, 1, 1]{varying_rank_4} = compare [direction=LessThan] %15 %16
-                                %18:bool[1, 1, 1, 1]{varying_rank_4} = and %4 %17
-                                %19:i32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                %15:bool[1, 1, 1, 1]{varying_rank_4} = compare [direction=LessThan] %13 %14
+                                %16:bool[1, 1, 1, 1]{varying_rank_4} = and %4 %15
+                                %17:i32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                     output_type=i32[1, 1, 1, 1]{varying_rank_4},
                                     output_axes=[0],
                                 ] %6
-                                %20:bool[1, 1, 1, 1]{varying_rank_4} = compare [direction=LessThan] %14 %19
-                                %21:bool[1, 1, 1, 1]{varying_rank_4} = and %18 %20
-                                %22:f32[] = constant [value=-2.3819763e38]
-                                %23:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %22
-                                %24:f32[1, 1, 1, 1]{invariant_rank_4} = broadcast [
-                                    output_type=f32[1, 1, 1, 1]{invariant_rank_4},
-                                    output_axes=[0, 1, 2, 3],
+                                %18:bool[1, 1, 1, 1]{varying_rank_4} = compare [direction=LessThan] %12 %17
+                                %19:bool[1, 1, 1, 1]{varying_rank_4} = and %16 %18
+                                %20:f32[]{varying_rank_0} = constant [value=-2.3819763e38]
+                                %21:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                    output_type=f32[1, 1, 1, 1]{varying_rank_4},
+                                    output_axes=[],
+                                ] %20
+                                %22:f32[1, 1, 1, 1]{varying_rank_4} = select %19 %11 %21
+                                %23:f32[1, 1, 1]{varying_rank_3} = reduce [kind=max, axes=[3]] %22
+                                %24:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                    output_type=f32[1, 1, 1, 1]{varying_rank_4},
+                                    output_axes=[0, 1, 2],
                                 ] %23
-                                %25:f32[1, 1, 1, 1]{varying_rank_4} = parallel_vary [axis_name=\"x\"] %24
-                                %26:f32[1, 1, 1, 1]{varying_rank_4} = select %21 %13 %25
-                                %27:f32[1, 1, 1]{varying_rank_3} = reduce [kind=max, axes=[3]] %26
+                                %25:f32[1, 1, 1, 1]{varying_rank_4} = sub %22 %24
+                                %26:f32[1, 1, 1, 1]{varying_rank_4} = exp %25
+                                %27:f32[1, 1, 1]{varying_rank_3} = reduce [kind=sum, axes=[3]] %26
                                 %28:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                     output_type=f32[1, 1, 1, 1]{varying_rank_4},
                                     output_axes=[0, 1, 2],
                                 ] %27
-                                %29:f32[1, 1, 1, 1]{varying_rank_4} = sub %26 %28
-                                %30:f32[1, 1, 1, 1]{varying_rank_4} = exp %29
-                                %31:f32[1, 1, 1]{varying_rank_3} = reduce [kind=sum, axes=[3]] %30
-                                %32:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
-                                    output_type=f32[1, 1, 1, 1]{varying_rank_4},
-                                    output_axes=[0, 1, 2],
-                                ] %31
-                                %33:f32[1, 1, 1, 1]{varying_rank_4} = div %30 %32
-                                %34:f32[1, 1, 1, 1]{varying_rank_4} = dot [
+                                %29:f32[1, 1, 1, 1]{varying_rank_4} = div %26 %28
+                                %30:f32[1, 1, 1, 1]{varying_rank_4} = dot [
                                     dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
                                         rhs_batching=[0, 2]),
-                                ] %33 %2
-                                %35:f32[1, 1, 1, 1]{varying_rank_4} = transpose [permutation=[0, 2, 1, 3]] %34
-                                %36:i32[1, 1, 1, 1]{varying_rank_4} = iota [
+                                ] %29 %2
+                                %31:f32[1, 1, 1, 1]{varying_rank_4} = transpose [permutation=[0, 2, 1, 3]] %30
+                                %32:i32[1, 1, 1, 1]{varying_rank_4} = iota [
                                     type=i32[1, 1, 1, 1]{varying_rank_4},
                                     dimension=1,
                                 ]
-                                %37:i32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                %33:i32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                     output_type=i32[1, 1, 1, 1]{varying_rank_4},
                                     output_axes=[0],
                                 ] %5
-                                %38:bool[1, 1, 1, 1]{varying_rank_4} = compare [direction=LessThan] %36 %37
-                                %39:f32[] = constant [value=0.0]
-                                %40:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %39
-                                %41:f32[1, 1, 1, 1]{invariant_rank_4} = broadcast [
-                                    output_type=f32[1, 1, 1, 1]{invariant_rank_4},
-                                    output_axes=[0, 1, 2, 3],
-                                ] %40
-                                %42:f32[1, 1, 1, 1]{varying_rank_4} = parallel_vary [axis_name=\"x\"] %41
-                                %43:f32[1, 1, 1, 1]{varying_rank_4} = select %38 %35 %42
-                                %44:f32[1, 1, 1]{varying_rank_3} = log %31
-                                %45:f32[1, 1, 1]{varying_rank_3} = add %27 %44
-                                %46:f32[1, 1, 1]{varying_rank_3} = transpose [permutation=[0, 2, 1]] %45
-                                %47:f32[1, 1, 1]{varying_rank_3} = stop_gradient %46
-                            in (%43, %47)
+                                %34:bool[1, 1, 1, 1]{varying_rank_4} = compare [direction=LessThan] %32 %33
+                                %35:f32[]{varying_rank_0} = constant [value=0.0]
+                                %36:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                    output_type=f32[1, 1, 1, 1]{varying_rank_4},
+                                    output_axes=[],
+                                ] %35
+                                %37:f32[1, 1, 1, 1]{varying_rank_4} = select %34 %31 %36
+                                %38:f32[1, 1, 1]{varying_rank_3} = log %27
+                                %39:f32[1, 1, 1]{varying_rank_3} = add %23 %38
+                                %40:f32[1, 1, 1]{varying_rank_3} = transpose [permutation=[0, 2, 1]] %39
+                                %41:f32[1, 1, 1]{varying_rank_3} = stop_gradient %40
+                            in (%37, %41)
                         }},
                     ]
                 in (%13, %14)
@@ -4179,6 +4050,151 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_product_attention_dynamic_shapes() {
+        // Homogeneous array programs stage attention over dynamic batch and sequence extents. The scale, the causal
+        // mask, the sequence length masks, and the softmax broadcasts take the runtime shape of the scores, so the
+        // staged program agrees with eager attention at every runtime shape.
+        let batch = DimensionVariable::new("batch", DimensionBounds::positive(Some(4)).unwrap());
+        let query_length = DimensionVariable::new("query_length", DimensionBounds::positive(Some(4)).unwrap());
+        let key_length = DimensionVariable::new("key_length", DimensionBounds::positive(Some(4)).unwrap());
+        let operand_type = |length: &DimensionVariable| {
+            let dimensions = vec![batch.clone().into(), length.clone().into(), 1.into(), 2.into()];
+            ArrayType::new(DataType::F32, Shape::new(dimensions))
+        };
+        let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![batch.clone().into()]));
+        let elements = |count: usize, offset: f32| {
+            (0..count).map(|index| ((index * 7 + 3) % 11) as f32 * 0.25 - offset).collect::<Vec<_>>()
+        };
+        let operands = |batch: usize, query_length: usize, key_length: usize| {
+            AttentionInputs::new(
+                f32_array(&[batch, query_length, 1, 2], &elements(2 * batch * query_length, 1.0)),
+                f32_array(&[batch, key_length, 1, 2], &elements(2 * batch * key_length, 0.5)),
+                f32_array(&[batch, key_length, 1, 2], &elements(2 * batch * key_length, -2.0)),
+            )
+        };
+        let lengths = |values: &[i32]| {
+            Array::from_elements(ArrayType::new_static(DataType::I32, [values.len()]), values).unwrap()
+        };
+
+        let configuration = AttentionConfiguration::new().with_causal(true).with_residual(true);
+        let function = dot_product_attention::<ArrayContext>(configuration);
+        let (_, program) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| {
+                let (output, residual) = function.call(inputs)?;
+                Ok((output, residual.unwrap()))
+            },
+            AttentionInputs {
+                query_sequence_lengths: Some(lengths_type.clone()),
+                key_value_sequence_lengths: Some(lengths_type),
+                ..AttentionInputs::new(
+                    operand_type(&query_length),
+                    operand_type(&key_length),
+                    operand_type(&key_length),
+                )
+            },
+        )
+        .unwrap();
+        for inputs in [
+            AttentionInputs {
+                query_sequence_lengths: Some(lengths(&[2, 1])),
+                key_value_sequence_lengths: Some(lengths(&[3, 2])),
+                ..operands(2, 2, 3)
+            },
+            AttentionInputs {
+                query_sequence_lengths: Some(lengths(&[2])),
+                key_value_sequence_lengths: Some(lengths(&[1])),
+                ..operands(1, 3, 2)
+            },
+        ] {
+            let (output, residual) = function.call(inputs.clone()).unwrap();
+            assert_eq!(program.interpret(inputs), Ok((output, residual.unwrap())));
+        }
+
+        // Attention without masks broadcasts only the softmax statistics and the scale.
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let (_, program) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            AttentionInputs::new(operand_type(&query_length), operand_type(&key_length), operand_type(&key_length)),
+        )
+        .unwrap();
+        for inputs in [operands(2, 2, 3), operands(1, 3, 2)] {
+            assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap().0));
+        }
+
+        // A bias and a mask are right-aligned to the scores through unit axes and then take the runtime shape of the
+        // scores, and the local window compares row and column coordinates of that shape.
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_local_window((1, 0)));
+        let bias_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![query_length.clone().into(), key_length.clone().into()]));
+        let mask_type = ArrayType::new(
+            DataType::Boolean,
+            Shape::new(vec![batch.clone().into(), 1.into(), query_length.clone().into(), key_length.clone().into()]),
+        );
+        let (_, program) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            AttentionInputs {
+                bias: Some(bias_type),
+                mask: Some(mask_type),
+                ..AttentionInputs::new(
+                    operand_type(&query_length),
+                    operand_type(&key_length),
+                    operand_type(&key_length),
+                )
+            },
+        )
+        .unwrap();
+        for (items, rows, columns) in [(2, 2, 3), (1, 3, 2)] {
+            let visible = (0..items * rows * columns).map(|index| index % 3 != 1).collect::<Vec<_>>();
+            let mask_type = ArrayType::new_static(DataType::Boolean, [items, 1, rows, columns]);
+            let inputs = AttentionInputs {
+                bias: Some(f32_array(&[rows, columns], &elements(rows * columns, 0.75))),
+                mask: Some(Array::from_elements(mask_type, &visible).unwrap()),
+                ..operands(items, rows, columns)
+            };
+            assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap().0));
+        }
+
+        // Dropout draws the random bits of its mask for a static shape, so definitions with dropout still require
+        // static shapes.
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_dropout(0.5));
+        let result = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            AttentionInputs::new(operand_type(&query_length), operand_type(&key_length), operand_type(&key_length)),
+        );
+        assert!(matches!(
+            result,
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == "`dropout` requires static extents along the axes that are not broadcast axes, but axis \
+                               0 of `f32[batch, 1, query_length, key_length]` has extent `batch`",
+        ));
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+
+        // Grouped key/value heads are replicated along a new group axis and merged into the query heads, which keeps
+        // the dynamic batch and sequence dimensions.
+        let grouped_type = |length: &DimensionVariable, heads: usize| {
+            let dimensions = vec![batch.clone().into(), length.clone().into(), heads.into(), 2.into()];
+            ArrayType::new(DataType::F32, Shape::new(dimensions))
+        };
+        let (_, program) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            AttentionInputs::new(
+                grouped_type(&query_length, 4),
+                grouped_type(&key_length, 2),
+                grouped_type(&key_length, 2),
+            ),
+        )
+        .unwrap();
+        for (items, rows, columns) in [(2, 2, 3), (1, 3, 1)] {
+            let inputs = AttentionInputs::new(
+                f32_array(&[items, rows, 4, 2], &elements(8 * items * rows, 1.0)),
+                f32_array(&[items, columns, 2, 2], &elements(4 * items * columns, 0.5)),
+                f32_array(&[items, columns, 2, 2], &elements(4 * items * columns, -2.0)),
+            );
+            assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap().0));
+        }
+    }
+
+    #[test]
     fn test_dot_product_attention_batching() {
         let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_residual(true));
 
@@ -4317,17 +4333,53 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_product_attention_batching_static_extents() {
-        // Homogeneous array families support static extents only, so batching over dynamic extents fails.
+    fn test_dot_product_attention_batching_dynamic_shapes() {
+        // Homogeneous array families support dynamic sequence extents in batched calls whose mapped axis becomes the
+        // implicit batch axis of rank-3 attention, because their batching rule reads no dynamic extent.
         let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
         let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(3)).unwrap());
-        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), length.into(), 1.into(), 1.into()]));
+        let axes = AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0));
+        let r#type =
+            ArrayType::new(DataType::F32, Shape::new(vec![2.into(), length.clone().into(), 1.into(), 1.into()]));
+        let (_, program) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| {
+                batch(
+                    |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+                    inputs,
+                    axes.clone(),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .map_err(ProgramError::from)
+            },
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
+        )
+        .unwrap();
+        let inputs = AttentionInputs::new(
+            f32_array(&[2, 2, 1, 1], &[1.0, 0.5, -1.0, 2.0]),
+            f32_array(&[2, 2, 1, 1], &[0.25, -0.5, 1.5, 1.0]),
+            f32_array(&[2, 2, 1, 1], &[3.0, 5.0, 7.0, 11.0]),
+        );
+        let expected = batch(
+            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            inputs.clone(),
+            axes.clone(),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(program.interpret(inputs), Ok(expected));
+
+        // Rank-4 attention folds its mapped axis into its batch axis, whose extents and trailing extents must be
+        // static in homogeneous array families, so batching over a dynamic sequence extent fails.
+        let r#type =
+            ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 1.into(), length.into(), 1.into(), 1.into()]));
         let result = ArrayContext::trace(
             |inputs: AttentionInputs<_>| {
                 batch(
                     |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
                     inputs,
-                    AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
+                    axes.clone(),
                     BatchAxis::new(0),
                     None,
                 )
@@ -4338,8 +4390,8 @@ mod tests {
         assert!(matches!(
             result,
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "attention over homogeneous arrays requires static extents, but axis 0 of \
-                               `f32[length, 1, 1]` has extent `length`; use array IR values for dynamic extents",
+                if message == "attention over homogeneous arrays requires static extents, but axis 2 of \
+                               `f32[2, 1, length, 1, 1]` has extent `length`; use array IR values for dynamic extents",
         ));
     }
 
@@ -4378,7 +4430,7 @@ mod tests {
         let varying_rank_5 = rendered_sharding(5, true);
         let varying_rank_4 = rendered_sharding(4, true);
         let varying_rank_3 = rendered_sharding(3, true);
-        let invariant_rank_4 = rendered_sharding(4, false);
+        let varying_rank_0 = rendered_sharding(0, true);
         assert_eq!(
             program.to_string(),
             formatdoc! {"
@@ -4420,34 +4472,32 @@ mod tests {
                                         dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
                                             rhs_batching=[0, 2]),
                                     ] %0 %1
-                                        %5:f32[] = constant [value=1.0]
-                                        %6:f32[2, 1, 1, 2] = broadcast [output_type=f32[2, 1, 1, 2], output_axes=[]] %5
-                                        %7:f32[2, 1, 1, 2]{invariant_rank_4} = broadcast [
-                                            output_type=f32[2, 1, 1, 2]{invariant_rank_4},
-                                            output_axes=[0, 1, 2, 3],
-                                        ] %6
-                                        %8:f32[2, 1, 1, 2]{varying_rank_4} = parallel_vary [axis_name=\"x\"] %7
-                                        %9:f32[2, 1, 1, 2]{varying_rank_4} = mul %4 %8
-                                        %10:f32[2, 1, 1, 2]{varying_rank_4} = add %9 %3
-                                        %11:f32[2, 1, 1]{varying_rank_3} = reduce [kind=max, axes=[3]] %10
-                                        %12:f32[2, 1, 1, 2]{varying_rank_4} = broadcast [
+                                        %5:f32[]{varying_rank_0} = constant [value=1.0]
+                                        %6:f32[2, 1, 1, 2]{varying_rank_4} = broadcast [
+                                            output_type=f32[2, 1, 1, 2]{varying_rank_4},
+                                            output_axes=[],
+                                        ] %5
+                                        %7:f32[2, 1, 1, 2]{varying_rank_4} = mul %4 %6
+                                        %8:f32[2, 1, 1, 2]{varying_rank_4} = add %7 %3
+                                        %9:f32[2, 1, 1]{varying_rank_3} = reduce [kind=max, axes=[3]] %8
+                                        %10:f32[2, 1, 1, 2]{varying_rank_4} = broadcast [
                                             output_type=f32[2, 1, 1, 2]{varying_rank_4},
                                             output_axes=[0, 1, 2],
-                                        ] %11
-                                        %13:f32[2, 1, 1, 2]{varying_rank_4} = sub %10 %12
-                                        %14:f32[2, 1, 1, 2]{varying_rank_4} = exp %13
-                                        %15:f32[2, 1, 1]{varying_rank_3} = reduce [kind=sum, axes=[3]] %14
-                                        %16:f32[2, 1, 1, 2]{varying_rank_4} = broadcast [
+                                        ] %9
+                                        %11:f32[2, 1, 1, 2]{varying_rank_4} = sub %8 %10
+                                        %12:f32[2, 1, 1, 2]{varying_rank_4} = exp %11
+                                        %13:f32[2, 1, 1]{varying_rank_3} = reduce [kind=sum, axes=[3]] %12
+                                        %14:f32[2, 1, 1, 2]{varying_rank_4} = broadcast [
                                             output_type=f32[2, 1, 1, 2]{varying_rank_4},
                                             output_axes=[0, 1, 2],
-                                        ] %15
-                                        %17:f32[2, 1, 1, 2]{varying_rank_4} = div %14 %16
-                                        %18:f32[2, 1, 1, 1]{varying_rank_4} = dot [
+                                        ] %13
+                                        %15:f32[2, 1, 1, 2]{varying_rank_4} = div %12 %14
+                                        %16:f32[2, 1, 1, 1]{varying_rank_4} = dot [
                                             dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
                                                 rhs_batching=[0, 2]),
-                                        ] %17 %2
-                                        %19:f32[2, 1, 1, 1]{varying_rank_4} = transpose [permutation=[0, 2, 1, 3]] %18
-                                    in (%19)
+                                        ] %15 %2
+                                        %17:f32[2, 1, 1, 1]{varying_rank_4} = transpose [permutation=[0, 2, 1, 3]] %16
+                                    in (%17)
                                 }},
                             ]
                         in (%6)
@@ -4549,36 +4599,23 @@ mod tests {
                                             dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
                                                 rhs_batching=[0, 2]),
                                         ] %0 %1
-                                            %4:f32[] = constant [value=1.0]
-                                            %5:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %3
-                                            %6:dimension<1> = constant [value=1]
-                                            %7:dimension<1> = constant [value=1]
-                                            %8:dimension<1> = constant [value=1]
-                                            %9:f32[batch, 1, 1, 1] = broadcast [output_axes=[]] %4 %5 %6 %7 %8
-                                            %10:f32[batch, 1, 1, 1] = mul %3 %9
-                                            %11:f32[batch, 1, 1] = reduce [kind=max, axes=[3]] %10
-                                            %12:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %10
-                                            %13:dimension<1> = constant [value=1]
-                                            %14:dimension<1> = constant [value=1]
-                                            %15:dimension<1> = constant [value=1]
-                                            %16:f32[batch, 1, 1, 1] = \
-                                                broadcast [output_axes=[0, 1, 2]] %11 %12 %13 %14 %15
-                                            %17:f32[batch, 1, 1, 1] = sub %10 %16
-                                            %18:f32[batch, 1, 1, 1] = exp %17
-                                            %19:f32[batch, 1, 1] = reduce [kind=sum, axes=[3]] %18
-                                            %20:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %18
-                                            %21:dimension<1> = constant [value=1]
-                                            %22:dimension<1> = constant [value=1]
-                                            %23:dimension<1> = constant [value=1]
-                                            %24:f32[batch, 1, 1, 1] = \
-                                                broadcast [output_axes=[0, 1, 2]] %19 %20 %21 %22 %23
-                                            %25:f32[batch, 1, 1, 1] = div %18 %24
-                                            %26:f32[batch, 1, 1, 1] = dot [
+                                            %4:f32[batch, 1, 1, 1] = fill_like [value=1.0] %3
+                                            %5:f32[batch, 1, 1, 1] = mul %3 %4
+                                            %6:f32[batch, 1, 1] = reduce [kind=max, axes=[3]] %5
+                                            %7:f32[batch, 1, 1, 1] = \
+                                                broadcast [output_type=f32[batch, 1, 1, 1], output_axes=[0, 1, 2]] %6
+                                            %8:f32[batch, 1, 1, 1] = sub %5 %7
+                                            %9:f32[batch, 1, 1, 1] = exp %8
+                                            %10:f32[batch, 1, 1] = reduce [kind=sum, axes=[3]] %9
+                                            %11:f32[batch, 1, 1, 1] = \
+                                                broadcast [output_type=f32[batch, 1, 1, 1], output_axes=[0, 1, 2]] %10
+                                            %12:f32[batch, 1, 1, 1] = div %9 %11
+                                            %13:f32[batch, 1, 1, 1] = dot [
                                                 dimensions=(lhs_contracting=[3], rhs_contracting=[1], \
                                                     lhs_batching=[0, 1], rhs_batching=[0, 2]),
-                                            ] %25 %2
-                                            %27:f32[batch, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %26
-                                        in (%27)
+                                            ] %12 %2
+                                            %14:f32[batch, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %13
+                                        in (%14)
                                     },
                                 ]
                                 %21:dimension<1> = constant [value=1]
@@ -4840,6 +4877,7 @@ mod tests {
         assert_eq!(output_type, varying);
         let varying_rank_4 = rendered_sharding(4, true);
         let varying_rank_3 = rendered_sharding(3, true);
+        let varying_rank_0 = rendered_sharding(0, true);
         let invariant_rank_4 = rendered_sharding(4, false);
         assert_eq!(
             program.to_string(),
@@ -4876,33 +4914,31 @@ mod tests {
                                         dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
                                             rhs_batching=[0, 2]),
                                     ] %0 %1
-                                        %4:f32[] = constant [value=1.0]
-                                        %5:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %4
-                                        %6:f32[1, 1, 1, 1]{invariant_rank_4} = broadcast [
-                                            output_type=f32[1, 1, 1, 1]{invariant_rank_4},
-                                            output_axes=[0, 1, 2, 3],
-                                        ] %5
-                                        %7:f32[1, 1, 1, 1]{varying_rank_4} = parallel_vary [axis_name=\"x\"] %6
-                                        %8:f32[1, 1, 1, 1]{varying_rank_4} = mul %3 %7
-                                        %9:f32[1, 1, 1]{varying_rank_3} = reduce [kind=max, axes=[3]] %8
-                                        %10:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                        %4:f32[]{varying_rank_0} = constant [value=1.0]
+                                        %5:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                            output_type=f32[1, 1, 1, 1]{varying_rank_4},
+                                            output_axes=[],
+                                        ] %4
+                                        %6:f32[1, 1, 1, 1]{varying_rank_4} = mul %3 %5
+                                        %7:f32[1, 1, 1]{varying_rank_3} = reduce [kind=max, axes=[3]] %6
+                                        %8:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                             output_type=f32[1, 1, 1, 1]{varying_rank_4},
                                             output_axes=[0, 1, 2],
-                                        ] %9
-                                        %11:f32[1, 1, 1, 1]{varying_rank_4} = sub %8 %10
-                                        %12:f32[1, 1, 1, 1]{varying_rank_4} = exp %11
-                                        %13:f32[1, 1, 1]{varying_rank_3} = reduce [kind=sum, axes=[3]] %12
-                                        %14:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                        ] %7
+                                        %9:f32[1, 1, 1, 1]{varying_rank_4} = sub %6 %8
+                                        %10:f32[1, 1, 1, 1]{varying_rank_4} = exp %9
+                                        %11:f32[1, 1, 1]{varying_rank_3} = reduce [kind=sum, axes=[3]] %10
+                                        %12:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                             output_type=f32[1, 1, 1, 1]{varying_rank_4},
                                             output_axes=[0, 1, 2],
-                                        ] %13
-                                        %15:f32[1, 1, 1, 1]{varying_rank_4} = div %12 %14
-                                        %16:f32[1, 1, 1, 1]{varying_rank_4} = dot [
+                                        ] %11
+                                        %13:f32[1, 1, 1, 1]{varying_rank_4} = div %10 %12
+                                        %14:f32[1, 1, 1, 1]{varying_rank_4} = dot [
                                             dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
                                                 rhs_batching=[0, 2]),
-                                        ] %15 %2
-                                        %17:f32[1, 1, 1, 1]{varying_rank_4} = transpose [permutation=[0, 2, 1, 3]] %16
-                                    in (%17)
+                                        ] %13 %2
+                                        %15:f32[1, 1, 1, 1]{varying_rank_4} = transpose [permutation=[0, 2, 1, 3]] %14
+                                    in (%15)
                                 }},
                             ]
                             in (%3)
@@ -5063,5 +5099,194 @@ mod tests {
         assert_eq!(output.to_f64s(), vec![0.5]);
         assert_eq!(gradients.query.to_f64s(), vec![0.0]);
         assert_eq!(gradients.key.to_f64s(), vec![0.25, -0.25]);
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_dynamic_shapes() {
+        // Reverse mode stages the forward and backward definitions over dynamic batch and sequence extents, whose
+        // causal masks, sequence length masks, pivot coordinates, and softmax broadcasts take the runtime shape of
+        // the logits. The staged gradient then matches the eager gradient at every runtime shape.
+        let batch = DimensionVariable::new("batch", DimensionBounds::positive(Some(4)).unwrap());
+        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(4)).unwrap());
+        let r#type = ArrayIrType::Array(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![batch.clone().into(), length.into(), 1.into(), 2.into()]),
+        ));
+        let lengths_type = ArrayIrType::Array(ArrayType::new(DataType::I32, Shape::new(vec![batch.into()])));
+        let configuration = AttentionConfiguration::new().with_causal(true);
+        let function = differentiable_dot_product_attention::<ArrayIrContext>(configuration);
+        let (_, program) = ArrayIrContext::trace(
+            |(operands, lengths): ((_, _, _), _)| {
+                differentiate_at(operands)
+                    .with_captures(lengths)
+                    .gradient(|(query, key, value), lengths| {
+                        function
+                            .call(AttentionInputs {
+                                query_sequence_lengths: Some(lengths),
+                                ..AttentionInputs::new(query, key, value)
+                            })?
+                            .reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+                    })
+                    .map_err(ProgramError::from)
+            },
+            ((r#type.clone(), r#type.clone(), r#type), lengths_type),
+        )
+        .unwrap();
+        let expected_function = differentiable_dot_product_attention::<ArrayContext>(configuration);
+        let elements = |count: usize, offset: f32| {
+            (0..count).map(|index| ((index * 5 + 2) % 7) as f32 * 0.25 - offset).collect::<Vec<_>>()
+        };
+        for (batch, length) in [(2, 3), (1, 2)] {
+            let dimensions = [batch, length, 1, 2];
+            let count = 2 * batch * length;
+            let operands = (
+                f32_array(&dimensions, &elements(count, 0.5)),
+                f32_array(&dimensions, &elements(count, 1.0)),
+                f32_array(&dimensions, &elements(count, -1.0)),
+            );
+            let query_lengths = (0..batch).map(|item| (length - item) as i32).collect::<Vec<_>>();
+            let lengths = Array::from_elements(ArrayType::new_static(DataType::I32, [batch]), &query_lengths).unwrap();
+            let (query, key, value) = differentiate_at(operands.clone())
+                .with_captures(lengths.clone())
+                .gradient(|(query, key, value), lengths| {
+                    expected_function
+                        .call(AttentionInputs {
+                            query_sequence_lengths: Some(lengths),
+                            ..AttentionInputs::new(query, key, value)
+                        })?
+                        .reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+                })
+                .unwrap();
+            let (query_input, key_input, value_input) = operands;
+            assert_eq!(
+                program.interpret((
+                    (
+                        ArrayIrValue::Array(query_input),
+                        ArrayIrValue::Array(key_input),
+                        ArrayIrValue::Array(value_input),
+                    ),
+                    ArrayIrValue::Array(lengths),
+                )),
+                Ok((ArrayIrValue::Array(query), ArrayIrValue::Array(key), ArrayIrValue::Array(value))),
+            );
+        }
+
+        // Homogeneous array programs stage the pullback of an explicit output cotangent over dynamic extents, which
+        // needs no runtime extent because the backward definition takes its shapes from its inputs. A bias also runs
+        // the reduction of its cotangent over the axes along which it was broadcast.
+        let batch = DimensionVariable::new("batch", DimensionBounds::positive(Some(4)).unwrap());
+        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(4)).unwrap());
+        let operand_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![batch.clone().into(), length.clone().into(), 1.into(), 2.into()]),
+        );
+        let bias_type = ArrayType::new(DataType::F32, Shape::new(vec![1.into(), length.clone().into()]));
+        let function = differentiable_dot_product_attention::<ArrayContext>(configuration);
+        let (_, program) = ArrayContext::trace(
+            |(operands, cotangent): ((_, _, _, _), _)| {
+                let (_, pullback) = differentiate_at(operands).vjp(|(query, key, value, bias)| {
+                    function.call(AttentionInputs { bias: Some(bias), ..AttentionInputs::new(query, key, value) })
+                })?;
+                let (query, key, value, bias) = pullback.apply(cotangent)?;
+                let cotangents = [query, key, value, bias].map(|cotangent| match cotangent {
+                    MaybeZero::Value(cotangent) => cotangent,
+                    MaybeZero::Zero(_) => unreachable!("every floating-point input has a cotangent"),
+                });
+                let [query, key, value, bias] = cotangents;
+                Ok((query, key, value, bias))
+            },
+            ((operand_type.clone(), operand_type.clone(), operand_type.clone(), bias_type), operand_type.clone()),
+        )
+        .unwrap();
+        for (batch, length) in [(2, 3), (1, 2)] {
+            let dimensions = [batch, length, 1, 2];
+            let count = 2 * batch * length;
+            let operands = (
+                f32_array(&dimensions, &elements(count, 0.5)),
+                f32_array(&dimensions, &elements(count, 1.0)),
+                f32_array(&dimensions, &elements(count, -1.0)),
+                f32_array(&[1, length], &elements(length, 0.25)),
+            );
+            let cotangent = f32_array(&dimensions, &elements(count, 0.75));
+            let (_, pullback) = differentiate_at(operands.clone())
+                .vjp(|(query, key, value, bias)| {
+                    function.call(AttentionInputs { bias: Some(bias), ..AttentionInputs::new(query, key, value) })
+                })
+                .unwrap();
+            let (query, key, value, bias) = pullback.apply(cotangent.clone()).unwrap();
+            let expected = [query, key, value, bias].map(|cotangent| match cotangent {
+                MaybeZero::Value(cotangent) => cotangent,
+                MaybeZero::Zero(_) => unreachable!("every floating-point input has a cotangent"),
+            });
+            let [query, key, value, bias] = expected;
+            assert_eq!(program.interpret((operands, cotangent)), Ok((query, key, value, bias)));
+        }
+
+        // Grouped key/value heads sum the cotangents of the query heads that share them, by splitting the query head
+        // axis next to the dynamic batch and sequence dimensions.
+        let grouped_type = |heads: usize| {
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![batch.clone().into(), length.clone().into(), heads.into(), 2.into()]),
+            )
+        };
+        let (_, program) = ArrayContext::trace(
+            |(operands, cotangent): ((_, _, _), _)| {
+                let (_, pullback) = differentiate_at(operands)
+                    .vjp(|(query, key, value)| function.call(AttentionInputs::new(query, key, value)))?;
+                let (query, key, value) = pullback.apply(cotangent)?;
+                let cotangents = [query, key, value].map(|cotangent| match cotangent {
+                    MaybeZero::Value(cotangent) => cotangent,
+                    MaybeZero::Zero(_) => unreachable!("every floating-point input has a cotangent"),
+                });
+                let [query, key, value] = cotangents;
+                Ok((query, key, value))
+            },
+            ((grouped_type(4), grouped_type(2), grouped_type(2)), grouped_type(4)),
+        )
+        .unwrap();
+        for (batch, length) in [(2, 3), (1, 1)] {
+            let operands = (
+                f32_array(&[batch, length, 4, 2], &elements(8 * batch * length, 0.5)),
+                f32_array(&[batch, length, 2, 2], &elements(4 * batch * length, 1.0)),
+                f32_array(&[batch, length, 2, 2], &elements(4 * batch * length, -1.0)),
+            );
+            let cotangent = f32_array(&[batch, length, 4, 2], &elements(8 * batch * length, 0.75));
+            let (_, pullback) = differentiate_at(operands.clone())
+                .vjp(|(query, key, value)| function.call(AttentionInputs::new(query, key, value)))
+                .unwrap();
+            let (query, key, value) = pullback.apply(cotangent.clone()).unwrap();
+            let expected = [query, key, value].map(|cotangent| match cotangent {
+                MaybeZero::Value(cotangent) => cotangent,
+                MaybeZero::Zero(_) => unreachable!("every floating-point input has a cotangent"),
+            });
+            let [query, key, value] = expected;
+            assert_eq!(program.interpret((operands, cotangent)), Ok((query, key, value)));
+        }
+
+        // Integer inputs (e.g., sequence lengths) have structurally zero tangents, which homogeneous array programs
+        // cannot materialize for a dynamic shape, so reverse mode with such inputs needs an array IR family.
+        let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![batch.into()]));
+        let result = ArrayContext::trace(
+            |(operands, lengths): ((_, _, _), _)| {
+                let (output, _) =
+                    differentiate_at(operands).with_captures(lengths).vjp(|(query, key, value), lengths| {
+                        function.call(AttentionInputs {
+                            query_sequence_lengths: Some(lengths),
+                            ..AttentionInputs::new(query, key, value)
+                        })
+                    })?;
+                Ok(output)
+            },
+            ((operand_type.clone(), operand_type.clone(), operand_type), lengths_type),
+        );
+        assert_eq!(
+            result.map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "cannot materialize a zero of type zero[batch] because no source has exactly that type \
+                          (source types: [i32[batch]])"
+                    .to_string(),
+            }),
+        );
     }
 }
