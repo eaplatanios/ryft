@@ -6642,16 +6642,14 @@ fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Rewraps a body's boundary with element-preserving conversions. Arrays only change their shape (e.g., between a
-/// varying scalar residual and its promoted type), and reference positions must remain unchanged. A first-class
-/// dimension leaves a body as its integer scalar value, placed on the mesh of the target edge and marked
-/// varying over that edge's manual axes before it is promoted, and re-enters a body by recovering that scalar and
-/// redefining the same dimension variable from it (refer to [`ShardMapResidualEdge::new`]). Only the first input edge
-/// that carries a given dimension identity redefines it. Later edges that carry an already defined identity reuse the
-/// value converted from that first edge, since equal identities denote equal extents and a program region rejects
-/// defining the same identity more than once.
+/// Rewraps a body's boundary with element-preserving conversions. Arrays only change their shape (e.g., between
+/// a varying scalar residual and its promoted type), and reference positions must remain unchanged. A first-class
+/// dimension leaves a body as its integer scalar value, placed on the mesh of the target edge and marked varying over
+/// that edge's manual axes before it is promoted, and re-enters a body by recovering that scalar and redefining the
+/// same dimension variable from it (refer to [`ShardMapResidualEdge::new`]). Only the first input edge that carries a
+/// given dimension identity redefines it. Later edges that carry an already defined identity reuse the value converted
+/// from that first edge, since equal identities denote equal extents and a program region rejects defining the same
+/// identity more than once.
 fn reshape_program_boundary<V: Value<Type = ArrayIrType>, O>(
     program: &Program<V, O, Vec<V>, Vec<V>>,
     input_types: Vec<ArrayIrType>,
@@ -6760,8 +6758,8 @@ where
 /// validation tolerates dimension shardings) and moved it into device memory (boundary types carry no memory kind).
 /// This function undoes those implicit conversions in reverse order:
 ///
-///   1. A placement difference over [`Explicit`](MeshAxisType::Explicit) mesh axes is a tracked sharding transition, so
-///      it is undone with `reshard` to the caller's placement over those axes. The axis types of the caller's mesh
+///   1. A placement difference over [`Explicit`](MeshAxisType::Explicit) mesh axes is a tracked sharding transition,
+///      so it is undone with `reshard` to the caller's placement over those axes. The axis types of the caller's mesh
 ///      decide which axes are `Explicit` (the mesh of the assembled cotangent may differ from it in its axis types
 ///      only), and a caller without a sharding is treated as replicated over the mesh. The caller's type places
 ///      nothing over [`Auto`](MeshAxisType::Auto) axes, because array types cannot record such placement (refer to
@@ -6780,8 +6778,8 @@ where
 ///
 /// Returns [`ProgramError::MalformedProgram`] when `contribution` differs from `target` in more than its placement and
 /// memory kind (i.e., in its element type, shape, layout, reference kind, mesh axes, manual variation, or reduction
-/// state), which no well-formed boundary produces, because boundary validation and transposed assembly preserve all of
-/// them, and the errors of staging the reconciling operations otherwise.
+/// state), which no well-formed boundary produces, because boundary validation and transposed assembly preserve all
+/// of them, and the errors of staging the reconciling operations otherwise.
 fn reconcile_input_cotangent<V: Value<Type = ArrayIrType>, O>(
     context: &TracingContext<V, O>,
     input_index: usize,
@@ -6842,6 +6840,7 @@ where
                 _ => false,
             })
         });
+
         let explicit_axes = |sharding: Option<&Sharding>| {
             (0..target_array.rank())
                 .map(|dimension| match sharding.map(|sharding| &sharding.dimensions()[dimension]) {
@@ -6854,6 +6853,7 @@ where
                 })
                 .collect::<Vec<_>>()
         };
+
         if !placed_along_manual_axes && explicit_axes(actual_array.sharding()) != explicit_axes(target_array.sharding())
         {
             let target_placement = match target_array.sharding() {
@@ -6869,7 +6869,7 @@ where
         }
     }
 
-    // Step 2: placement-only `broadcast` for the remaining placement difference, in the current memory kind.
+    // Step 2: Placement-only `broadcast` for the remaining placement difference, in the current memory kind.
     let memory = boundary_array_type(&contribution.r#type())?.memory();
     let placed_target = target_array.clone().with_memory(memory);
     if *contribution.r#type() != ArrayIrType::Array(placed_target.clone()) {
@@ -6887,6 +6887,8 @@ where
     }
     Ok(contribution)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Validates that `value` has the structure whose parameter paths are `expected_paths` (i.e., that input shardings have
 /// the structure of their inputs, or that the outputs of a body function have the structure of their output shardings).
