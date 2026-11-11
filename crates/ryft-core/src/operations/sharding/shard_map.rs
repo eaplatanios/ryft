@@ -3128,11 +3128,11 @@ where
             .map_err(ProgramError::from)?;
         let outputs = context.parent().bind(operation, vec![batched_body], &input_values)?;
         check_count!("output", outputs, output_axes.len(), ProgramError);
-        Ok(outputs
+        outputs
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| ArrayIrBatch::new(output, axis))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -4124,7 +4124,7 @@ pub trait ShardMap: Context<Value: ValueProjection<ArrayType, Projected: Paramet
         ) -> Result<Output, ProgramError>,
         M: Into<Option<LogicalMesh>>,
     {
-        let mesh = resolve_shard_map_mesh(self, mesh.into())?;
+        let mesh = mesh.into().or_else(|| self.default_mesh()).ok_or(ShardMapError::MissingMesh)?;
         let input_shardings = inputs
             .parameters()
             .enumerate()
@@ -4224,7 +4224,7 @@ where
         ) -> Result<Output, ProgramError>,
         M: Into<Option<LogicalMesh>>,
     {
-        let mesh = resolve_shard_map_mesh(self, mesh.into())?;
+        let mesh = mesh.into().or_else(|| self.default_mesh()).ok_or(ShardMapError::MissingMesh)?;
         validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
         let output_paths = output_shardings.parameter_paths().collect::<Vec<_>>();
         let output_structure = output_shardings.parameter_structure();
@@ -4265,7 +4265,7 @@ where
         ) -> Result<Output, ProgramError>,
         M: Into<Option<LogicalMesh>>,
     {
-        let mesh = resolve_shard_map_mesh(self, mesh.into())?;
+        let mesh = mesh.into().or_else(|| self.default_mesh()).ok_or(ShardMapError::MissingMesh)?;
         validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_axes)?;
         let input_shardings = inputs
             .parameters()
@@ -4563,6 +4563,121 @@ impl LockstepDeviceGrid {
             .iter()
             .zip(&self.axes)
             .fold(0, |device, (coordinate, (_, size))| device * size + coordinate)
+    }
+
+    /// Returns the positions of the axes of this grid along which `sharding` tiles a value.
+    fn tiled_axes(&self, sharding: &Sharding) -> Vec<usize> {
+        sharding
+            .dimensions()
+            .iter()
+            .flat_map(|dimension| match dimension {
+                ShardingDimension::Sharded(axis_names) => axis_names.as_slice(),
+                ShardingDimension::Replicated | ShardingDimension::Unconstrained => &[],
+            })
+            .filter_map(|axis_name| self.axis(axis_name))
+            .collect()
+    }
+
+    /// Returns the offset of the block that the device at `coordinates` holds, along every dimension of a boundary
+    /// value placed by `sharding`. Along a dimension sharded over active manual axes (which precede every free axis
+    /// of that dimension), the offset is the row-major partition index over those axes scaled by the local extent
+    /// `local_shape` of the dimension. Free axes do not partition the local value, so they do not contribute.
+    fn block_offsets(&self, sharding: &Sharding, coordinates: &[usize], local_shape: &[usize]) -> Vec<usize> {
+        sharding
+            .dimensions()
+            .iter()
+            .zip(local_shape)
+            .map(|(dimension, extent)| match dimension {
+                ShardingDimension::Sharded(axis_names) => {
+                    let partition = axis_names.iter().fold(0, |partition, axis_name| match self.axis(axis_name) {
+                        Some(axis) => partition * self.axes[axis].1 + coordinates[axis],
+                        None => partition,
+                    });
+                    partition * extent
+                }
+                ShardingDimension::Replicated | ShardingDimension::Unconstrained => 0,
+            })
+            .collect()
+    }
+
+    /// Assembles a global boundary value of type `global_type` (i.e., a global output or the referent of a reference
+    /// input) from the local `values` of the devices of this grid (i.e., of the local grid of one enclosing device),
+    /// which `sharding` places. Every device places its value at its tile of `sharding`. Along an active manual axis
+    /// that `sharding` does not tile, the devices hold per-device values when the axis is unreduced, which are combined
+    /// with the [`Sharding::unreduced_kind`] of `sharding` (e.g., summed), and otherwise hold the same value, of which
+    /// the device at coordinate zero contributes.
+    fn assemble_global_value(
+        &self,
+        sharding: &Sharding,
+        global_type: &ArrayType,
+        values: &[ArrayIrValue<Array>],
+    ) -> Result<Array, ProgramError> {
+        let tiled_axes = self.tiled_axes(sharding);
+        let unreduced_axes =
+            sharding.unreduced_axes().iter().filter_map(|axis_name| self.axis(axis_name)).collect::<Vec<_>>();
+        let mut tiles = Vec::<(Vec<usize>, Vec<&Array>)>::new();
+        for (device, value) in values.iter().enumerate() {
+            let coordinates = self.coordinates(device);
+            let contributes = coordinates.iter().enumerate().all(|(axis, coordinate)| {
+                *coordinate == 0 || tiled_axes.contains(&axis) || unreduced_axes.contains(&axis)
+            });
+            if !contributes {
+                continue;
+            }
+            let value = ValueProjection::<ArrayType>::projected(value)?;
+            let shape = value.r#type().static_shape().unwrap();
+            let offsets = self.block_offsets(sharding, &coordinates, shape.dimensions());
+            match tiles.iter_mut().find(|(tile_offsets, _)| *tile_offsets == offsets) {
+                Some((_, summands)) => summands.push(value),
+                None => tiles.push((offsets, vec![value])),
+            }
+        }
+
+        // Every tile has the local shape that the boundary derives, so every contribution must have it.
+        validate_participant_types(
+            SHARD_MAP_OPERATION_NAME,
+            &tiles.iter().flat_map(|(_, summands)| summands.iter().copied()).collect::<Vec<_>>(),
+        )?;
+
+        let mut output = Array::uninitialized(global_type.clone())?;
+        for (offsets, summands) in tiles {
+            let tile = if summands.len() == 1 {
+                summands[0].clone()
+            } else {
+                reduce_participants(SHARD_MAP_OPERATION_NAME, &summands, sharding.unreduced_kind().into())?
+            };
+            output = output.replace_block(&tile, &offsets);
+        }
+
+        Ok(output)
+    }
+
+    /// Returns the first active manual axis along which `values` contain different copies that `sharding` declares
+    /// replicated. Tiled and unreduced axes permit distinct values. Copies are compared by their logical bytes, so
+    /// the guarantee includes floating-point encodings such as signed zeros and NaN payloads.
+    fn replicated_copy_mismatch(
+        &self,
+        sharding: &Sharding,
+        values: &[ArrayIrValue<Array>],
+    ) -> Result<Option<&str>, ProgramError> {
+        let tiled_axes = self.tiled_axes(sharding);
+        let unreduced_axes =
+            sharding.unreduced_axes().iter().filter_map(|axis_name| self.axis(axis_name)).collect::<Vec<_>>();
+        for (device, value) in values.iter().enumerate() {
+            let coordinates = self.coordinates(device);
+            for (axis, coordinate) in coordinates.iter().enumerate() {
+                if *coordinate == 0 || tiled_axes.contains(&axis) || unreduced_axes.contains(&axis) {
+                    continue;
+                }
+                let mut first_coordinates = coordinates.clone();
+                first_coordinates[axis] = 0;
+                let first = ValueProjection::<ArrayType>::projected(&values[self.device(&first_coordinates)])?;
+                if ValueProjection::<ArrayType>::projected(value)?.logical_bytes() != first.logical_bytes() {
+                    return Ok(Some(&self.axes[axis].0));
+                }
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -5196,7 +5311,7 @@ where
                                 ),
                             })?;
 
-                        let offsets = manual_block_offsets(sharding, &local_grid, &coordinates, &local_shape);
+                        let offsets = local_grid.block_offsets(sharding, &coordinates, &local_shape);
                         let block =
                             offsets.iter().zip(&local_shape).map(|(&start, &size)| ArraySliceAxis::new(start, size, 1));
                         array.copy_block(local_type.clone(), &block.collect::<Vec<_>>())
@@ -5235,7 +5350,7 @@ where
                 }
                 let sharding = &boundary.output_shardings()[index];
                 for values in values.chunks(local_device_count) {
-                    if let Some(axis_name) = replicated_copy_mismatch(sharding, &local_grid, values)? {
+                    if let Some(axis_name) = local_grid.replicated_copy_mismatch(sharding, values)? {
                         return Err(ProgramError::MalformedProgram(format!(
                             "`{SHARD_MAP_OPERATION_NAME}` output #{index} promises replication along manual axis \
                              `{axis_name}`, but its devices along that axis produced different values",
@@ -5261,14 +5376,14 @@ where
 
             // Copies that differ indicate a body that violates the reference contract (e.g., one that writes a
             // reference from a branch that the devices select differently) rather than values that could be assembled.
-            if let Some(axis_name) = replicated_copy_mismatch(sharding, &local_grid, &shards)? {
+            if let Some(axis_name) = local_grid.replicated_copy_mismatch(sharding, &shards)? {
                 return Err(ProgramError::MalformedProgram(format!(
                     "`{SHARD_MAP_OPERATION_NAME}` reference input #{index} is replicated along manual axis \
                      `{axis_name}`, but its devices along that axis finished with different states",
                 )));
             }
 
-            let value = assemble_global_value(sharding, reference_type.referent(), &local_grid, &shards)?;
+            let value = local_grid.assemble_global_value(sharding, reference_type.referent(), &shards)?;
             reference_updates.push((reference, value));
         }
 
@@ -5290,7 +5405,7 @@ where
                 values
                     .chunks(local_device_count)
                     .map(|values| {
-                        Ok(ArrayIrValue::Array(assemble_global_value(sharding, global_type, &local_grid, values)?))
+                        Ok(ArrayIrValue::Array(local_grid.assemble_global_value(sharding, global_type, values)?))
                     })
                     .collect()
             })
@@ -5811,128 +5926,7 @@ fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
     }
 }
 
-/// Returns the offset of the block that the device at `coordinates` holds, along every dimension of a boundary value
-/// placed by `sharding`. Along a dimension sharded over active manual axes (which precede every free axis of that
-/// dimension), the offset is the row-major partition index over those axes scaled by the local extent `local_shape`
-/// of the dimension. Free axes do not partition the local value, so they do not contribute.
-fn manual_block_offsets(
-    sharding: &Sharding,
-    grid: &LockstepDeviceGrid,
-    coordinates: &[usize],
-    local_shape: &[usize],
-) -> Vec<usize> {
-    sharding
-        .dimensions()
-        .iter()
-        .zip(local_shape)
-        .map(|(dimension, extent)| match dimension {
-            ShardingDimension::Sharded(axis_names) => {
-                let partition = axis_names.iter().fold(0, |partition, axis_name| match grid.axis(axis_name) {
-                    Some(axis) => partition * grid.axes[axis].1 + coordinates[axis],
-                    None => partition,
-                });
-                partition * extent
-            }
-            ShardingDimension::Replicated | ShardingDimension::Unconstrained => 0,
-        })
-        .collect()
-}
-
-/// Assembles a global boundary value of type `global_type` (i.e., a global output or the referent of a reference
-/// input) from the local `values` of the devices of `grid` (i.e., of the local grid of one enclosing device), which
-/// `sharding` places. Every device places its value at its tile of `sharding`. Along an active manual axis that
-/// `sharding` does not tile, the devices hold per-device values when the axis is unreduced, which are combined with
-/// the [`Sharding::unreduced_kind`] of `sharding` (e.g., summed), and otherwise hold the same value, of which the
-/// device at coordinate zero contributes.
-fn assemble_global_value(
-    sharding: &Sharding,
-    global_type: &ArrayType,
-    grid: &LockstepDeviceGrid,
-    values: &[ArrayIrValue<Array>],
-) -> Result<Array, ProgramError> {
-    let tiled_axes = tiled_grid_axes(sharding, grid);
-    let unreduced_axes =
-        sharding.unreduced_axes().iter().filter_map(|axis_name| grid.axis(axis_name)).collect::<Vec<_>>();
-    let mut tiles = Vec::<(Vec<usize>, Vec<&Array>)>::new();
-    for (device, value) in values.iter().enumerate() {
-        let coordinates = grid.coordinates(device);
-        let contributes = coordinates
-            .iter()
-            .enumerate()
-            .all(|(axis, coordinate)| *coordinate == 0 || tiled_axes.contains(&axis) || unreduced_axes.contains(&axis));
-        if !contributes {
-            continue;
-        }
-        let value = ValueProjection::<ArrayType>::projected(value)?;
-        let shape = value.r#type().static_shape().unwrap();
-        let offsets = manual_block_offsets(sharding, grid, &coordinates, shape.dimensions());
-        match tiles.iter_mut().find(|(tile_offsets, _)| *tile_offsets == offsets) {
-            Some((_, summands)) => summands.push(value),
-            None => tiles.push((offsets, vec![value])),
-        }
-    }
-
-    // Every tile has the local shape that the boundary derives, so every contribution must have it.
-    validate_participant_types(
-        SHARD_MAP_OPERATION_NAME,
-        &tiles.iter().flat_map(|(_, summands)| summands.iter().copied()).collect::<Vec<_>>(),
-    )?;
-
-    let mut output = Array::uninitialized(global_type.clone())?;
-    for (offsets, summands) in tiles {
-        let tile = if summands.len() == 1 {
-            summands[0].clone()
-        } else {
-            reduce_participants(SHARD_MAP_OPERATION_NAME, &summands, sharding.unreduced_kind().into())?
-        };
-        output = output.replace_block(&tile, &offsets);
-    }
-
-    Ok(output)
-}
-
 // TODO(eaplatanios): Review from here onwards.
-
-/// Returns the positions of the axes of `grid` along which `sharding` tiles a value.
-fn tiled_grid_axes(sharding: &Sharding, grid: &LockstepDeviceGrid) -> Vec<usize> {
-    sharding
-        .dimensions()
-        .iter()
-        .flat_map(|dimension| match dimension {
-            ShardingDimension::Sharded(axis_names) => axis_names.as_slice(),
-            ShardingDimension::Replicated | ShardingDimension::Unconstrained => &[],
-        })
-        .filter_map(|axis_name| grid.axis(axis_name))
-        .collect()
-}
-
-/// Returns the first active manual axis along which `values` contain different copies that `sharding` declares
-/// replicated. Tiled and unreduced axes permit distinct values. Copies are compared by their logical bytes, so the
-/// guarantee includes floating-point encodings such as signed zeros and NaN payloads.
-fn replicated_copy_mismatch<'o>(
-    sharding: &Sharding,
-    grid: &'o LockstepDeviceGrid,
-    values: &[ArrayIrValue<Array>],
-) -> Result<Option<&'o str>, ProgramError> {
-    let tiled_axes = tiled_grid_axes(sharding, grid);
-    let unreduced_axes =
-        sharding.unreduced_axes().iter().filter_map(|axis_name| grid.axis(axis_name)).collect::<Vec<_>>();
-    for (device, value) in values.iter().enumerate() {
-        let coordinates = grid.coordinates(device);
-        for (axis, coordinate) in coordinates.iter().enumerate() {
-            if *coordinate == 0 || tiled_axes.contains(&axis) || unreduced_axes.contains(&axis) {
-                continue;
-            }
-            let mut first_coordinates = coordinates.clone();
-            first_coordinates[axis] = 0;
-            let first = ValueProjection::<ArrayType>::projected(&values[grid.device(&first_coordinates)])?;
-            if ValueProjection::<ArrayType>::projected(value)?.logical_bytes() != first.logical_bytes() {
-                return Ok(Some(&grid.axes[axis].0));
-            }
-        }
-    }
-    Ok(None)
-}
 
 /// Returns `true` when a `shard_map` body has a reference input or output or accesses a reference anywhere in its
 /// region closure. The partial evaluation rule of [`ShardMapOperation`] keeps the boundary of such a body whole, so its
@@ -6916,17 +6910,6 @@ fn sharding_along(
         *dimension = ShardingDimension::sharded([axis_name]);
     }
     Ok(Sharding::new(mesh.clone(), dimensions)?)
-}
-
-/// Returns the mesh of a `shard_map` bound in `context` and given `mesh`, which is the default mesh of `context` (e.g.,
-/// the mesh of its innermost enclosing manual region; refer to [`MeshContext::default_mesh`]) when `mesh` is [`None`],
-/// as JAX's `shard_map` uses its context mesh. A given mesh is returned unchanged, and the boundary validates it
-/// against the enclosing manual regions as before.
-fn resolve_shard_map_mesh<C: MeshContext>(
-    context: &C,
-    mesh: Option<LogicalMesh>,
-) -> Result<LogicalMesh, ShardMapError> {
-    mesh.or_else(|| context.default_mesh()).ok_or(ShardMapError::MissingMesh)
 }
 
 /// Traces `function` as the local body of a `shard_map` over `mesh` on `inputs` in `context` and binds it there,
@@ -14283,7 +14266,7 @@ mod tests {
         let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
         let partials = [f32_value(local_type.clone(), &[1.0, 2.0]), f32_value(local_type, &[10.0, 20.0])];
         assert_eq!(
-            assemble_global_value(&boundary.output_shardings()[0], &unreduced_type, &grid, &partials)
+            grid.assemble_global_value(&boundary.output_shardings()[0], &unreduced_type, &partials)
                 .map(ArrayIrValue::Array),
             Ok(f32_value(unreduced_type, &[11.0, 22.0])),
         );
@@ -15137,15 +15120,15 @@ mod tests {
         let replicated = Sharding::replicated(manual_mesh(), 1);
         let copy = |element: f32| f32_value(f32_vector_type(1), &[element]);
         let nan = f32::from_bits(0x7fc00001);
-        assert_eq!(replicated_copy_mismatch(&replicated, &grid, &[copy(nan), copy(nan)]), Ok(None));
+        assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(nan), copy(nan)]), Ok(None));
         assert_eq!(
-            replicated_copy_mismatch(&replicated, &grid, &[copy(nan), copy(f32::from_bits(0x7fc00002))]),
+            grid.replicated_copy_mismatch(&replicated, &[copy(nan), copy(f32::from_bits(0x7fc00002))]),
             Ok(Some("x")),
         );
-        assert_eq!(replicated_copy_mismatch(&replicated, &grid, &[copy(0.0), copy(-0.0)]), Ok(Some("x")));
+        assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(0.0), copy(-0.0)]), Ok(Some("x")));
 
         let unreduced = replicated.with_unreduced_axes(["x"]).unwrap();
-        assert_eq!(replicated_copy_mismatch(&unreduced, &grid, &[copy(1.0), copy(2.0)]), Ok(None));
+        assert_eq!(grid.replicated_copy_mismatch(&unreduced, &[copy(1.0), copy(2.0)]), Ok(None));
     }
 
     #[test]
@@ -15157,15 +15140,12 @@ mod tests {
         let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
         let replicated = Sharding::replicated(manual_mesh(), 1);
         let copy = |elements: &[f32]| f32_value(f32_vector_type(2), elements);
-        assert_eq!(replicated_copy_mismatch(&replicated, &grid, &[copy(&[1.0, 2.0]), copy(&[1.0, 2.0])]), Ok(None));
-        assert_eq!(
-            replicated_copy_mismatch(&replicated, &grid, &[copy(&[1.0, 2.0]), copy(&[1.0, 3.0])]),
-            Ok(Some("x")),
-        );
+        assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(&[1.0, 2.0]), copy(&[1.0, 2.0])]), Ok(None));
+        assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(&[1.0, 2.0]), copy(&[1.0, 3.0])]), Ok(Some("x")),);
 
         // Along an unreduced axis, the devices hold partial states, which differ without violating the contract.
         let unreduced = replicated.with_unreduced_axes(["x"]).unwrap();
-        assert_eq!(replicated_copy_mismatch(&unreduced, &grid, &[copy(&[1.0, 2.0]), copy(&[0.0, 0.0])]), Ok(None));
+        assert_eq!(grid.replicated_copy_mismatch(&unreduced, &[copy(&[1.0, 2.0]), copy(&[0.0, 0.0])]), Ok(None));
     }
 
     #[test]
