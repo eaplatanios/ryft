@@ -6931,13 +6931,10 @@ fn bind_shard_map<C, F, Input, Output>(
     options: ShardMapOptions,
 ) -> Result<Output::To<<C::Value as ValueProjection<ArrayType>>::Projected>, ShardMapError>
 where
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
     C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation> + OperationPayloadProjection>
         + NamedAxes
         + MeshContext,
     C::Value: ValueProjection<ArrayType, Projected: Parameter>,
-    ProjectedValue<ArrayType, DomainTracer<C>>: ParallelVary,
     Input: Parameterized<<C::Value as ValueProjection<ArrayType>>::Projected>,
     Input::Family: ParameterizedFamily<ProjectedValue<ArrayType, DomainTracer<C>>>,
     Output: Parameterized<ProjectedValue<ArrayType, DomainTracer<C>>>,
@@ -6946,6 +6943,9 @@ where
         &ProjectedContext<DomainTracingContext<C>, ArrayType>,
         Input::To<ProjectedValue<ArrayType, DomainTracer<C>>>,
     ) -> Result<Output, ProgramError>,
+    ProjectedValue<ArrayType, DomainTracer<C>>: ParallelVary,
+    TracingContext<C::Constant, C::Operation>:
+        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
     let ShardMapOutputs { paths: output_paths, structure: output_structure, shardings: output_shardings } = outputs;
     let input_structure = inputs.parameter_structure();
@@ -6957,6 +6957,7 @@ where
         ShardMapOutputShardings::Given(shardings) => (shardings, None),
         ShardMapOutputShardings::Along { axis_name, axes } => (Vec::new(), Some((axis_name, axes))),
     };
+
     let (boundary, outer_named_axes) = shard_map_within_named_axes(
         mesh.clone(),
         input_shardings.clone(),
@@ -6964,6 +6965,7 @@ where
         options.manual_axes.clone(),
         &named_axes,
     )?;
+
     let caller_mesh = {
         // The candidate is the common mesh of the sharded inputs, or the context's default mesh when no input is
         // sharded. Inputs placed over different meshes leave no candidate.
@@ -6990,6 +6992,7 @@ where
                 })
         })
     };
+
     let boundary = boundary.with_caller_mesh(caller_mesh.clone()).with_manual_variation_checks(checks);
     let rebuild_boundary = output_axes.map(|(axis_name, axes)| {
         move |output_types: &[ArrayType]| -> Result<ShardMapBoundary, ShardMapError> {
@@ -7022,8 +7025,9 @@ where
             Ok(boundary.with_caller_mesh(caller_mesh.clone()).with_manual_variation_checks(checks))
         }
     });
-    // The traced body is compiled once per domain, so its callback is passed with its type erased. The callback is
-    // invoked exactly once.
+
+    // The traced body is compiled once per domain, so its callback is passed with its type erased.
+    // The callback is invoked exactly once.
     let mut function = Some(
         |body_context: &ProjectedContext<DomainTracingContext<C>, ArrayType>,
          local_inputs: Vec<ProjectedValue<ArrayType, DomainTracer<C>>>| {
@@ -7036,6 +7040,7 @@ where
             Ok(local_outputs.into_parameters().collect())
         },
     );
+
     let (operation, body) = trace_shard_map_body::<C>(
         boundary,
         &mut |body_context, local_inputs| function.take().unwrap()(body_context, local_inputs),
@@ -7043,11 +7048,13 @@ where
         global_input_types,
         outer_named_axes,
     )?;
+
     let outputs = context
         .bind(operation, vec![body], inputs.as_slice())?
         .into_iter()
         .map(|output| ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from))
         .collect::<Result<Vec<_>, _>>()?;
+
     Ok(Output::To::<<C::Value as ValueProjection<ArrayType>>::Projected>::from_parameters(output_structure, outputs)?)
 }
 
