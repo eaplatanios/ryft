@@ -16,12 +16,14 @@ use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDr
 use crate::contexts::{Context, ContextProjection, Domain, StagingContext};
 use crate::differentiation::elementwise::reduce_broadcast_cotangent;
 use crate::differentiation::{
-    BroadcastDerivativeAlignment, DifferentiableType, DifferentiationDual, TransposableOperation,
+    BroadcastDerivativeAlignment, DifferentiableType, DifferentiationDual, DifferentiationError, TransposableOperation,
+    TranspositionContext,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_vary::ParallelVaryOperation;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::zero::ZeroOperation;
@@ -31,7 +33,7 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, ReshapeOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
-use crate::operations::reductions::ReduceOperation;
+use crate::operations::reductions::{ReduceOperation, ReductionKind};
 use crate::operations::sharding::reshard::ReshardOperation;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -275,8 +277,9 @@ impl_differentiable_operation! {
             + From<BroadcastOperation>
             + From<ReduceOperation>
             + From<ReshardOperation>
-            + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
-            + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
+            + OperationProvider<ArrayType, BroadcastOperation, Operation = O>
+            + OperationProvider<ArrayType, ParallelReduceOperation, Operation = O>
+            + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>,
     {
         |operation, context, _driver, inputs, outputs, accumulators| {
             // Transposition rule for `BroadcastOperation`. The pullback of a broadcast is a sum reduction over the
@@ -284,8 +287,9 @@ impl_differentiable_operation! {
             // `output_axes`, plus the mapped axes whose input extent is `1` stretched to a larger target extent).
             // After the reduction, the surviving axes are reordered into input-axis order when `output_axes` is not
             // monotonically increasing, and stretched unit axes are restored with a reshape so the cotangent matches
-            // the input type exactly. Symbolic-zero cotangents propagate unchanged, and an input with no cotangent
-            // space receives the structural zero of that space.
+            // the input type exactly. A broadcast that places an invariant input along a manual mesh axis additionally
+            // sums the contributions of the devices along that axis. Symbolic-zero cotangents propagate unchanged, and
+            // an input with no cotangent space receives the structural zero of that space.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
             check_count!("accumulator", accumulators, 1, DifferentiationError);
@@ -296,9 +300,12 @@ impl_differentiable_operation! {
             let MaybeZero::Value(cotangent) = &outputs[0] else {
                 return Ok(());
             };
-            let contribution = MaybeZero::Value(
-                cotangent.unalign_cotangent_along(&input_cotangent_type, operation.output_axes())?,
-            );
+            let contribution = MaybeZero::Value(transpose_broadcast_cotangent(
+                context,
+                cotangent,
+                &input_cotangent_type,
+                operation.output_axes(),
+            )?);
             accumulators[0].accumulate(context, contribution)?;
             Ok(())
         }
@@ -663,6 +670,301 @@ impl<
             BroadcastOperation::new(output_type, output_axes.to_vec()),
             Vec::new(),
             std::slice::from_ref(self),
+        )?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
+/// Canonical operation name for [`BroadcastLikeOperation`].
+pub const BROADCAST_LIKE_OPERATION_NAME: &str = "broadcast_like";
+
+/// [`Operation`] that broadcasts its first input to the shape of its second input, which is the exemplar. It is the
+/// counterpart of [`BroadcastOperation`] for output shapes that are only known when the program runs. The exemplar
+/// stays an input, so the extents of its dynamic dimensions are read at execution time and the broadcast may replicate
+/// its first input along them, while the element values of the exemplar never affect the result. Refer to
+/// [`BroadcastLike`] for the value-level contract.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BroadcastLikeOperation {
+    /// Vector that contains, for each axis of the broadcast input, the axis of the exemplar that it maps to.
+    output_axes: Vec<usize>,
+}
+
+impl BroadcastLikeOperation {
+    /// Creates a new [`BroadcastLikeOperation`] with the supplied output axes.
+    #[inline]
+    pub fn new(output_axes: Vec<usize>) -> Self {
+        Self { output_axes }
+    }
+
+    /// Returns the output axes of this [`BroadcastLikeOperation`]. The resulting slice contains, for each axis of the
+    /// broadcast input, the axis of the exemplar that it maps to.
+    #[inline]
+    pub fn output_axes(&self) -> &[usize] {
+        self.output_axes.as_slice()
+    }
+}
+
+impl Display for BroadcastLikeOperation {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for BroadcastLikeOperation {
+    type Type = ArrayType;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        BROADCAST_LIKE_OPERATION_NAME
+    }
+
+    #[inline]
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayType],
+        region_interfaces: &[RegionInterface<ArrayType>],
+    ) -> Result<Vec<ArrayType>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        Ok(vec![infer_broadcast_like_output_type(&input_types[0], &input_types[1], self.output_axes())?])
+    }
+
+    #[inline]
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?
+            .bracketed(|operation| operation.field("output_axes", format_args!("{:?}", self.output_axes)))
+    }
+}
+
+impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for BroadcastLikeOperation
+where
+    C::Value: BroadcastLike,
+{
+    #[inline]
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        Ok(vec![inputs[0].broadcast_like(&inputs[1], self.output_axes())?])
+    }
+}
+
+impl<C: Context<Type = ArrayType, Operation: From<BroadcastLikeOperation>>> PartiallyEvaluatableOperation<C>
+    for BroadcastLikeOperation
+{
+}
+
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for BroadcastLikeOperation
+where
+    C::Value: BroadcastLike,
+{
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let (value, exemplar) = (&inputs[0], &inputs[1]);
+        self.infer_output_types(&[value.unbatched_type(), exemplar.unbatched_type()], &[])?;
+        if value.batch_axis().is_replicated() && exemplar.batch_axis().is_replicated() {
+            // Neither input has a mapped axis to lift, so the original broadcast remains replicated.
+            let output = value.value().broadcast_like(exemplar.value(), self.output_axes())?;
+            return Ok(vec![ArrayBatch::replicated(output)]);
+        }
+
+        // The output is mapped at the batch axis of the exemplar, which supplies the output shape. A replicated
+        // exemplar next to a mapped broadcast input has no such axis, so it is materialized across the mapped extent
+        // at the leading position.
+        let exemplar = match exemplar.batch_axis_position() {
+            Some(_) => exemplar.clone(),
+            None => P::match_axis(context, exemplar, Axis::from(0))?,
+        };
+        let batch_axis = exemplar.batch_axis_position().unwrap();
+
+        // Every existing mapping at or after the mapped axis shifts around it. A mapped broadcast input additionally
+        // maps its own batch axis to the batch axis of the exemplar, while a replicated one is replicated along it.
+        let mut output_axes = self
+            .output_axes()
+            .iter()
+            .map(|&output_axis| if output_axis >= batch_axis { output_axis + 1 } else { output_axis })
+            .collect::<Vec<_>>();
+        if let Some(value_batch_axis) = value.batch_axis_position() {
+            output_axes.insert(value_batch_axis, batch_axis);
+        }
+        Ok(vec![ArrayBatch::new(
+            value.value().broadcast_like(exemplar.value(), output_axes.as_slice())?,
+            BatchAxis::from_position(batch_axis),
+        )?])
+    }
+}
+
+impl_differentiable_operation! {
+    BroadcastLikeOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType, Operation: From<BroadcastLikeOperation>>,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward mode differentiation rule for `BroadcastLikeOperation`. For a fixed exemplar shape, the
+            // broadcast is linear in its first input, so the tangent follows the same axis mapping as the primal.
+            // The exemplar only supplies the output shape, so its own tangent is ignored. The tangent broadcast uses
+            // the primal output as its exemplar, which has the same shape and makes the result have the tangent
+            // type of that output even when the tangent element data type is wider than the primal one (the layout
+            // rule of the operation then matches the layout rule of tangent types). A structural zero input tangent
+            // remains structural and acquires the tangent type of the primal output.
+            check_count!("input", inputs, 2, ProgramError);
+            let (value, exemplar) = (&inputs[0], &inputs[1]);
+            let mut primal = context.primal().bind(
+                operation.clone(),
+                Vec::new(),
+                &[value.primal().clone(), exemplar.primal().clone()],
+            )?;
+            check_count!("output", primal, 1, ProgramError);
+            let primal = primal.remove(0);
+            let tangent = match value.tangent() {
+                MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
+                MaybeZero::Value(tangent) => {
+                    let exemplar = context.primal_to_tangent(primal.clone())?;
+                    let mut tangent =
+                        context.tangent().bind(operation.clone(), Vec::new(), &[tangent.clone(), exemplar])?;
+                    check_count!("output", tangent, 1, ProgramError);
+                    MaybeZero::Value(tangent.remove(0))
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType>
+            + From<ZeroOperation<ArrayType>>
+            + From<ZeroLikeOperation<ArrayType>>
+            + From<AddOperation<ArrayType>>
+            + From<ConvertElementTypeOperation<ArrayType>>
+            + From<TransposeOperation>
+            + From<ReshapeOperation>
+            + From<BroadcastOperation>
+            + From<ReduceOperation>
+            + From<ReshardOperation>
+            + OperationProvider<ArrayType, ParallelReduceOperation, Operation = O>
+            + OperationProvider<ArrayType, ParallelVaryOperation, Operation = O>
+            + OperationProvider<ArrayType, BroadcastOperation, Operation = O>,
+    {
+        |operation, context, _driver, inputs, outputs, accumulators| {
+            // Transposition rule for `BroadcastLikeOperation`. The pullback of the broadcast input is a sum reduction
+            // over the exemplar axes that it was replicated along, exactly as for `BroadcastOperation` (including the
+            // sum over the devices of a manual mesh axis that the broadcast places an invariant input along), and the
+            // reduction reads no runtime extent. The values of the exemplar never affect the output, so the exemplar
+            // receives a structural zero cotangent whether it is a known or a linear input. Symbolic zero cotangents
+            // propagate unchanged, and an input with no cotangent space receives the structural zero of that space.
+            check_count!("input", inputs, 2, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 2, DifferentiationError);
+            let input_cotangent_type = inputs[0].r#type().cotangent()?;
+            if input_cotangent_type.is_zero_space() {
+                return Ok(());
+            }
+            let MaybeZero::Value(cotangent) = &outputs[0] else {
+                return Ok(());
+            };
+            let contribution = MaybeZero::Value(transpose_broadcast_cotangent(
+                context,
+                cotangent,
+                &input_cotangent_type,
+                operation.output_axes(),
+            )?);
+            accumulators[0].accumulate(context, contribution)?;
+            Ok(())
+        }
+    },
+}
+
+/// Replicates an array along new axes or expands axes of size one so that it has the shape of an exemplar. Input axis
+/// `i` maps to exemplar axis `output_axes[i]`, with the same mapping rules as [`Broadcast`]. Unlike [`Broadcast`],
+/// the output shape comes from the exemplar rather than from an [`ArrayType`], so a new axis or an expanded size-one
+/// axis may have a dynamic extent, which is read from the exemplar when the program runs. A mapped extent must equal
+/// its input extent or expand a static size-one axis.
+///
+/// The result has the exemplar's type with the element [`DataType`](crate::DataType) of the broadcast input (i.e.,
+/// the exemplar's runtime shape, memory placement, and sharding). It also has the exemplar's [`Layout`] when the two
+/// element data types are equal and the default layout otherwise, because byte strides do not carry across element
+/// widths. Both inputs must be in the same [`Memory`](crate::Memory) space. The element values of the exemplar have
+/// no effect on the result, so differentiation ignores its tangent and returns zero for its cotangent, while the
+/// tangent of the broadcast input is broadcast the same way and its cotangent sums the contributions of the
+/// replicated axes.
+///
+/// A staged call binds [`BroadcastOperation`] when [`Broadcast`] accepts the output type (i.e., when every dynamic
+/// output extent passes through from an identical extent of the broadcast input), which has no data dependence on the
+/// exemplar. Otherwise, a staged call binds [`BroadcastLikeOperation`], which retains the exemplar as an input so
+/// that dynamic extents are read at execution time. Eager calls always use the exemplar, whose runtime placement may
+/// be more specific than its type.
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
+/// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`].
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{Array, BroadcastLike};
+/// let exemplar = Array::matrix(2, 3, vec![0.0f32; 6]).unwrap();
+/// let input = Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap();
+/// assert_eq!(
+///     input.broadcast_like(&exemplar, &[1]),
+///     Ok(Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()),
+/// );
+/// ```
+#[capability(projection(ArrayIrType => ArrayType))]
+pub trait BroadcastLike<T = <Self as Capability>::Universe>: Capability + Sized {
+    /// Broadcasts `self` to the runtime shape of `exemplar`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `exemplar`: Value whose type and runtime shape the result takes. Its element values are not read.
+    ///   - `output_axes`: Contains, for each axis of `self`, the axis of `exemplar` that it maps to.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when `output_axes` does not map every axis of `self` to a distinct axis of
+    /// `exemplar`, when a mapped extent neither equals the exemplar's extent nor is a static one, when the two values
+    /// are in different memory spaces, or when they are not unreduced over the same mesh axes.
+    fn broadcast_like(&self, exemplar: &Self, output_axes: &[usize]) -> Result<Self, ProgramError>;
+}
+
+impl BroadcastLike for Array {
+    #[inline]
+    fn broadcast_like(&self, exemplar: &Self, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        let output_type = infer_broadcast_like_output_type(&self.r#type(), &exemplar.r#type(), output_axes)?;
+        self.broadcast(output_type, output_axes)
+    }
+}
+
+impl<V> BroadcastLike<ArrayType> for V
+where
+    V: Value<Type = ArrayType, Dispatch = ValueDomainDispatch> + Broadcast,
+    V::Domain: Context<Type = ArrayType, Operation: From<BroadcastLikeOperation>>,
+{
+    fn broadcast_like(&self, exemplar: &Self, output_axes: &[usize]) -> Result<Self, ProgramError> {
+        // An output type that the static broadcast accepts is determined without reading the exemplar, so the
+        // staged operation is the same broadcast that `Broadcast` stages, which lets dead code elimination drop the
+        // exemplar. Eager contexts keep `broadcast_like`, because the runtime placement of an eager value (e.g., of
+        // an automatically sharded array) may be more specific than its type.
+        let domain = self.domain();
+        let output_type = infer_broadcast_like_output_type(&self.r#type(), &exemplar.r#type(), output_axes)?;
+        if !domain.is_eager() && self.r#type().broadcast(output_type.clone(), output_axes).is_ok() {
+            return self.broadcast(output_type, output_axes);
+        }
+        let mut outputs = domain.bind(
+            BroadcastLikeOperation::new(output_axes.to_vec()),
+            Vec::new(),
+            &[self.clone(), exemplar.clone()],
         )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -1539,6 +1841,127 @@ where
     }
 }
 
+/// Returns the contribution of the output `cotangent` of a broadcast to the cotangent of its broadcast input, whose
+/// type is `input_cotangent_type`, where `output_axes` contains, for each input axis, the output axis that it maps to.
+/// The local part of the pullback is [`BroadcastDerivativeAlignment::unalign_cotangent_along`]. A broadcast that places
+/// an invariant input along a manual mesh axis also makes its output vary along that axis (refer to
+/// [`validate_broadcast_manual_state`]), which treats the one shared input as one copy per device, exactly like
+/// [`ParallelVaryOperation`]. The adjoint of that implicit transition sums the contributions of the devices, so each
+/// such axis is reduced through a mesh-form [`ParallelReduceOperation`], like the transpose of that operation.
+fn transpose_broadcast_cotangent<V, O>(
+    context: &mut TranspositionContext<V, O>,
+    cotangent: &Tracer<TracingContext<V, O>>,
+    input_cotangent_type: &ArrayType,
+    output_axes: &[usize],
+) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType> + OperationProvider<ArrayType, ParallelReduceOperation, Operation = O>,
+    Tracer<TracingContext<V, O>>: BroadcastDerivativeAlignment,
+    TracingContext<V, O>: StagingContext<Type = ArrayType, Constant = V, Operation = O>,
+{
+    let cotangent_type = cotangent.r#type();
+    let input_varying_axes = input_cotangent_type.sharding().map(Sharding::varying_manual_axes);
+    let introduced_axes = cotangent_type
+        .sharding()
+        .into_iter()
+        .flat_map(Sharding::varying_manual_axes)
+        .filter(|axis| input_varying_axes.is_none_or(|axes| !axes.contains(*axis)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let Some(sharding) = cotangent_type.sharding().filter(|_| !introduced_axes.is_empty()) else {
+        return cotangent.unalign_cotangent_along(input_cotangent_type, output_axes);
+    };
+
+    // The local contribution of every device still varies along the introduced axes, so it is first unaligned to
+    // the input cotangent type with the variation of the output cotangent.
+    let local_sharding = input_cotangent_type
+        .sharding()
+        .cloned()
+        .unwrap_or_else(|| Sharding::replicated(sharding.mesh().clone(), input_cotangent_type.rank()))
+        .with_varying_manual_axes(sharding.varying_manual_axes().iter().cloned())
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let local_type = input_cotangent_type
+        .clone()
+        .with_sharding(local_sharding)
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let mut contribution = cotangent.unalign_cotangent_along(&local_type, output_axes)?;
+    for axis_name in introduced_axes {
+        let reduction = O::provide(
+            ParallelReduceOperation::new(ReductionKind::Sum, axis_name).with_mesh(sharding.mesh().clone()),
+            &[contribution.r#type().as_ref()],
+        )?;
+        let mut contributions = context.bind(reduction, Vec::new(), std::slice::from_ref(&contribution))?;
+        check_count!("output", contributions, 1, ProgramError);
+        contribution = contributions.remove(0);
+    }
+
+    Ok(contribution)
+}
+
+/// Returns the output type of broadcasting a value of `value_type` to the shape of an exemplar of `exemplar_type`,
+/// where `output_axes` contains, for each axis of the value, the axis of the exemplar that it maps to. The output has
+/// the exemplar's type with the value's element data type, and it keeps the exemplar's layout only when the two element
+/// data types are equal, because byte strides do not carry across element widths. Unlike the static [`Broadcast`] rule,
+/// an unmapped output axis and the expansion of a static size-one axis may have a dynamic extent, because the exemplar
+/// supplies that extent when the program runs.
+fn infer_broadcast_like_output_type(
+    value_type: &ArrayType,
+    exemplar_type: &ArrayType,
+    output_axes: &[usize],
+) -> Result<ArrayType, TypeError> {
+    if value_type.memory() != exemplar_type.memory() {
+        return Err(TypeError::invalid(format!(
+            "`{}` input memory {} does not match exemplar memory {}",
+            BROADCAST_LIKE_OPERATION_NAME,
+            value_type.memory(),
+            exemplar_type.memory(),
+        )));
+    }
+
+    // A broadcast replicates per-device partial results unchanged, so its output is unreduced over exactly the mesh
+    // axes that the broadcast input is unreduced over. The output takes the exemplar's sharding, so the two must
+    // agree, or the output would claim partial results that the input does not hold (or drop the ones it holds).
+    if value_type.unreduced_axes() != exemplar_type.unreduced_axes()
+        || (!value_type.unreduced_axes().is_empty() && value_type.unreduced_kind() != exemplar_type.unreduced_kind())
+    {
+        return Err(TypeError::invalid(format!(
+            "`{BROADCAST_LIKE_OPERATION_NAME}` input type `{value_type}` and exemplar type `{exemplar_type}` are not \
+             unreduced over the same mesh axes",
+        )));
+    }
+    let output_type = if value_type.data_type() == exemplar_type.data_type() {
+        exemplar_type.clone()
+    } else {
+        exemplar_type.clone().with_data_type(value_type.data_type()).with_layout(None)
+    };
+
+    // A variation transition without a placement change requires its own operation, exactly as for `broadcast`.
+    validate_broadcast_manual_state(value_type.sharding(), output_type.sharding())?;
+    validate_broadcast_output_axes(value_type.rank(), output_type.rank(), output_axes)?;
+    for (input_axis, &output_axis) in output_axes.iter().enumerate() {
+        // A mapped axis keeps its extent (including an identical dynamic extent and an extent that singleton bounds
+        // prove equal) or expands a static size-one axis to the exemplar's extent.
+        let input_dimension = value_type.dimension(input_axis);
+        let output_dimension = output_type.dimension(output_axis);
+        let same_extent = input_dimension == output_dimension
+            || match (&input_dimension, &output_dimension) {
+                (Dimension::Static(size), dimension) | (dimension, Dimension::Static(size)) => {
+                    dimension.bounds() == Dimension::Static(*size).bounds()
+                }
+                _ => false,
+            };
+        if !same_extent && input_dimension != Dimension::Static(1) {
+            return Err(TypeError::invalid(format!(
+                "`{BROADCAST_LIKE_OPERATION_NAME}` input axis {input_axis} has size {input_dimension}, which is \
+                 neither the exemplar size {output_dimension} nor 1",
+            )));
+        }
+    }
+    output_type.validate_layout()?;
+    Ok(output_type)
+}
+
 /// Infers the result of the canonical mixed broadcast from its explicit output extent types.
 fn infer_explicit_broadcast_output_type(
     input: &ArrayType,
@@ -1757,7 +2180,7 @@ mod tests {
         DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
         ShardingDimension, StridedLayout, Tile, TileDimension, f8e8m0fnu,
     };
-    use crate::batching::BatchingTracer;
+    use crate::batching::{BatchAxis, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext, differentiate_at};
     use crate::macros::{
@@ -1765,6 +2188,7 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::operations::assertions::GuardOperation;
+    use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
     use crate::programs::{
@@ -2596,6 +3020,47 @@ mod tests {
     }
 
     #[test]
+    fn test_broadcast_transposition_manual_placement() {
+        // Placing an invariant input along a manual mesh axis makes the output vary along that axis, which treats the
+        // shared input as one copy per device, so the pullback also sums the contributions of the devices.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F64, [3])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let output_type = ArrayType::new_static(DataType::F64, [2, 3])
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(BroadcastOperation::new(output_type, vec![1]), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap()
+            .transpose_with_respect_to(&[0], &[])
+            .map(|program| program.to_string());
+        assert_eq!(
+            program,
+            Ok(indoc! {"
+                lambda %0:f64[2, 3][sharding={mesh<['x'=2:manual]>, [{'x'}, {}], varying_manual={'x'}}] .
+                let %1:f64[3][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    reduce [kind=sum, axes=[0]] %0
+                    %2:f64[3][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %1
+                in (%2)
+            "}
+            .trim_end()
+            .to_string()),
+        );
+    }
+
+    #[test]
     fn test_broadcast_transposition_symbolic_zero() {
         // Symbolic-zero cotangents remain symbolic and acquire the input's promoted cotangent type.
         let input_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![Dimension::Static(3)]));
@@ -3143,6 +3608,716 @@ mod tests {
         let output = input.broadcast(output_type.clone(), &[]).unwrap();
         assert_eq!(output.r#type().as_ref(), &output_type);
         assert!(output.storage_bytes().is_empty());
+    }
+
+    #[test]
+    fn test_broadcast_like() {
+        // Verify the operation's payload and rendering.
+        let operation = BroadcastLikeOperation::new(vec![1]);
+        assert_eq!(operation.output_axes(), &[1]);
+        assert_eq!(operation.to_string(), "broadcast_like [output_axes=[1]]");
+
+        // Verify the operation's textual form when it appears in a program.
+        let mut builder = ProgramBuilder::<Array, BroadcastLikeOperation>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F64, [3]));
+        let exemplar = builder.add_input(ArrayType::new_static(DataType::F32, [2, 3]));
+        let output = builder.add_instruction(operation, Vec::new(), vec![input, exemplar], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f32[2, 3] .
+                let %2:f64[2, 3] = broadcast_like [output_axes=[1]] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_broadcast_like_type_inference() {
+        // The output has the exemplar's type with the element data type of the broadcast input. Unlike `broadcast`,
+        // an unmapped output axis and an expanded size-one axis may have a dynamic extent, because the exemplar
+        // supplies it.
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let r#type =
+            |data_type: DataType, dimensions: Vec<Dimension>| ArrayType::new(data_type, Shape::new(dimensions));
+        check_operation_type_inference!(
+            operation = BroadcastLikeOperation::new(vec![1]),
+            cases = [
+                {
+                    input_types = [
+                        ArrayType::new_static(DataType::F64, [3]),
+                        ArrayType::new_static(DataType::F32, [2, 3]),
+                    ],
+                    output_types = [ArrayType::new_static(DataType::F64, [2, 3])],
+                },
+                {
+                    input_types = [
+                        ArrayType::new_static(DataType::F32, [3]),
+                        r#type(DataType::F32, vec![Dimension::Dynamic(size.clone()), 3.into()]),
+                    ],
+                    output_types = [r#type(DataType::F32, vec![Dimension::Dynamic(size.clone()), 3.into()])],
+                },
+                {
+                    input_types = [
+                        ArrayType::new_static(DataType::F32, [1]),
+                        r#type(DataType::F32, vec![2.into(), Dimension::Dynamic(size.clone())]),
+                    ],
+                    output_types = [r#type(DataType::F32, vec![2.into(), Dimension::Dynamic(size.clone())])],
+                },
+                {
+                    input_types = [
+                        r#type(DataType::F32, vec![Dimension::Dynamic(size.clone())]),
+                        r#type(DataType::F32, vec![2.into(), Dimension::Dynamic(size.clone())]),
+                    ],
+                    output_types = [r#type(DataType::F32, vec![2.into(), Dimension::Dynamic(size.clone())])],
+                },
+                {
+                    input_types = [
+                        ArrayType::new_static(DataType::F32, [4]),
+                        ArrayType::new_static(DataType::F32, [2, 3]),
+                    ],
+                    error = format!(
+                        "`{BROADCAST_LIKE_OPERATION_NAME}` input axis 0 has size 4, which is neither the exemplar \
+                         size 3 nor 1",
+                    ),
+                },
+                {
+                    input_types = [
+                        ArrayType::new_static(DataType::F32, [2, 3]),
+                        ArrayType::new_static(DataType::F32, [2, 3]),
+                    ],
+                    error = "broadcasting output axes has length 1 but input has rank 2",
+                },
+            ],
+        );
+
+        // The output keeps the exemplar's layout for an unchanged element data type and takes the default layout
+        // otherwise, and both inputs must be in the same memory space.
+        let operation = BroadcastLikeOperation::new(vec![0]);
+        let exemplar_type =
+            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        assert_eq!(
+            operation.infer_output_types(&[ArrayType::new_static(DataType::F32, [1]), exemplar_type.clone()], &[]),
+            Ok(vec![exemplar_type.clone()]),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[ArrayType::new_static(DataType::F64, [1]), exemplar_type.clone()], &[]),
+            Ok(vec![ArrayType::new_static(DataType::F64, [2])]),
+        );
+        let pinned_type = ArrayType::new_static(DataType::F32, [1]).with_memory(Memory::Host { pinned: true });
+        assert_eq!(
+            operation.infer_output_types(&[pinned_type.clone(), exemplar_type.clone()], &[]),
+            Err(TypeError::invalid(format!(
+                "`{BROADCAST_LIKE_OPERATION_NAME}` input memory {} does not match exemplar memory {}",
+                pinned_type.memory(),
+                exemplar_type.memory(),
+            ))),
+        );
+
+        // The output takes the exemplar's sharding. Placing a replicated input along a manual axis makes the output
+        // vary along it, as for `broadcast`, while the unreduced mesh axes of the two inputs must agree, because a
+        // broadcast replicates per-device partial results unchanged.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated_type = ArrayType::new_static(DataType::F32, [1])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let sharded_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            operation.infer_output_types(&[replicated_type.clone(), sharded_type.clone()], &[]),
+            Ok(vec![sharded_type]),
+        );
+        let varying_type = ArrayType::new_static(DataType::F32, [1])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let invariant_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        assert_eq!(
+            operation.infer_output_types(&[varying_type, invariant_type], &[]),
+            Err(TypeError::invalid("broadcasting cannot change varying manual axes")),
+        );
+        let unreduced_type = ArrayType::new_static(DataType::F32, [2])
+            .with_sharding(Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        assert_eq!(
+            operation.infer_output_types(&[unreduced_type.clone(), unreduced_type.clone()], &[]),
+            Ok(vec![unreduced_type.clone()]),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[replicated_type.clone(), unreduced_type.clone()], &[]),
+            Err(TypeError::invalid(format!(
+                "`{BROADCAST_LIKE_OPERATION_NAME}` input type `{replicated_type}` and exemplar type \
+                 `{unreduced_type}` are not unreduced over the same mesh axes",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_broadcast_like_interpretation() {
+        let exemplar = Array::matrix(2, 3, vec![0.0f32; 6]).unwrap();
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &BroadcastLikeOperation::new(vec![1]),
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![1.0f64, 2.0, 3.0]).unwrap(), exemplar.clone()],
+            ),
+            Ok(vec![Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()]),
+        );
+
+        // A rank-0 input fills the exemplar's shape, a size-one axis expands, and an empty exemplar gives an empty
+        // result. The element values of the exemplar are never read.
+        assert_eq!(
+            Array::scalar(7i32).unwrap().broadcast_like(&exemplar, &[]),
+            Ok(Array::matrix(2, 3, vec![7i32; 6]).unwrap()),
+        );
+        assert_eq!(
+            Array::matrix(2, 1, vec![1.0f32, 2.0]).unwrap().broadcast_like(&exemplar, &[0, 1]),
+            Ok(Array::matrix(2, 3, vec![1.0f32, 1.0, 1.0, 2.0, 2.0, 2.0]).unwrap()),
+        );
+        let empty = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, 3]), &[]).unwrap();
+        assert_eq!(Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap().broadcast_like(&empty, &[1]), Ok(empty.clone()));
+
+        // The result has the memory and sharding of the exemplar, and its physical layout only for an unchanged
+        // element data type.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let memory = Memory::Host { pinned: true };
+        let r#type = ArrayType::new_static(DataType::F32, [2, 3])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])))
+            .with_memory(memory)
+            .with_sharding(Sharding::replicated(mesh, 2))
+            .unwrap();
+        let placed = Array::from_elements(r#type.clone(), &[0.0f32; 6]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [3]).with_memory(memory);
+        assert_eq!(
+            Array::from_elements(input_type, &[1.0f32, 2.0, 3.0]).unwrap().broadcast_like(&placed, &[1]),
+            Ok(Array::from_elements(r#type.clone(), &[1.0f32, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()),
+        );
+        let input_type = ArrayType::new_static(DataType::I32, [3]).with_memory(memory);
+        assert_eq!(
+            Array::from_elements(input_type, &[1i32, 2, 3]).unwrap().broadcast_like(&placed, &[1]),
+            Ok(Array::from_elements(r#type.with_data_type(DataType::I32).with_layout(None), &[1i32, 2, 3, 1, 2, 3],)
+                .unwrap()),
+        );
+        assert_eq!(
+            Array::vector(vec![1.0f32, 2.0]).unwrap().broadcast_like(&exemplar, &[1]),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{BROADCAST_LIKE_OPERATION_NAME}` input axis 0 has size 2, which is neither \
+                 the exemplar size 3 nor 1",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_broadcast_like_interpretation_array_ir() {
+        // Array IR values broadcast their array members, and a first-class dimension is not an array.
+        let exemplar = ArrayIrValue::Array(Array::matrix(2, 2, vec![0.0f32; 4]).unwrap());
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
+        assert_eq!(
+            input.broadcast_like(&exemplar, &[1]),
+            Ok(ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0f32, 2.0, 1.0, 2.0]).unwrap())),
+        );
+        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        assert_eq!(
+            input.broadcast_like(&dimension, &[0]),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+    }
+
+    #[test]
+    fn test_broadcast_like_partial_evaluation() {
+        // Known inputs fold, and an unknown broadcast input leaves the broadcast in the residual program.
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        let exemplar = Array::matrix(2, 3, vec![0.0; 6]).unwrap();
+        let expected = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap();
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = BroadcastLikeOperation::new(vec![1]),
+            cases = [
+                {
+                    inputs = [(@known, input.clone()), (@known, exemplar.clone())],
+                    outputs = [(@known, expected.clone())],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = input.r#type().into_owned(), replay = input.clone())),
+                        (@known, exemplar),
+                    ],
+                    outputs = [(@residual, expected)],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_broadcast_like_batching() {
+        // The output is mapped at the batch axis of the exemplar. A replicated broadcast input is replicated along
+        // that axis, a mapped one maps its own batch axis to it, and a replicated exemplar next to a mapped broadcast
+        // input is materialized at the leading axis.
+        let rows = |row: &[f64], count: usize| row.repeat(count);
+        let array = |dimensions: Vec<usize>, elements: Vec<f64>| {
+            Array::from_elements(ArrayType::new_static(DataType::F64, dimensions), elements.as_slice()).unwrap()
+        };
+        check_operation_batching!(
+            @exact,
+            operation = BroadcastLikeOperation::new(vec![1]),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@replicated, array(vec![3], vec![1.0, 2.0, 3.0])),
+                        (@replicated, array(vec![4, 3], vec![0.0; 12])),
+                    ],
+                    outputs = [(@replicated, array(vec![4, 3], rows(&[1.0, 2.0, 3.0], 4)))],
+                },
+                {
+                    inputs = [
+                        (@replicated, array(vec![3], vec![1.0, 2.0, 3.0])),
+                        (@mapped(axis = 0), array(vec![2, 4, 3], vec![0.0; 24])),
+                    ],
+                    outputs = [(@mapped(axis = 0), array(vec![2, 4, 3], rows(&[1.0, 2.0, 3.0], 8)))],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), array(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+                        (@replicated, array(vec![4, 3], vec![0.0; 12])),
+                    ],
+                    outputs = [(@mapped(axis = 0), array(
+                        vec![2, 4, 3],
+                        [rows(&[1.0, 2.0, 3.0], 4), rows(&[4.0, 5.0, 6.0], 4)].concat(),
+                    ))],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 1), array(vec![3, 2], vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0])),
+                        (@mapped(axis = 2), array(vec![4, 3, 2], vec![0.0; 24])),
+                    ],
+                    outputs = [(@mapped(axis = 2), array(
+                        vec![4, 3, 2],
+                        rows(&[1.0, 4.0, 2.0, 5.0, 3.0, 6.0], 4),
+                    ))],
+                },
+            ],
+        );
+
+        // The staged program of a batch of `broadcast_like` calls along the leading axes of the mapped inputs.
+        let stage = |input_type: ArrayType, exemplar_type: ArrayType, batch_axes: (BatchAxis, BatchAxis)| {
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let input = context.input(input_type);
+            let exemplar = context.input(exemplar_type);
+            let output = batch(
+                |(input, exemplar): (_, _)| input.broadcast_like(&exemplar, &[1]),
+                (input, exemplar),
+                batch_axes,
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+            context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<Array>, Vec<Array>>(
+                    vec![output.atom_id().unwrap()],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let r#type = |dimensions: Vec<Dimension>| ArrayType::new(DataType::F64, Shape::new(dimensions));
+
+        // A replicated exemplar with a dynamic extent next to a mapped broadcast input is materialized across the
+        // mapped extent first, and the batched broadcast then reads the dynamic extent from that exemplar.
+        let program = stage(
+            r#type(vec![2.into(), 3.into()]),
+            r#type(vec![Dimension::Dynamic(size.clone()), 3.into()]),
+            (BatchAxis::new(0), BatchAxis::replicated()),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[2, 3], %1:f64[size, 3] .
+                let %2:f64[2, size, 3] = broadcast [output_type=f64[2, size, 3], output_axes=[1, 2]] %1
+                    %3:f64[2, size, 3] = broadcast_like [output_axes=[0, 2]] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![
+                array(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+                array(vec![4, 3], vec![0.0; 12]),
+            ]),
+            Ok(vec![array(vec![2, 4, 3], [rows(&[1.0, 2.0, 3.0], 4), rows(&[4.0, 5.0, 6.0], 4)].concat())]),
+        );
+
+        // A mapped exemplar with a dynamic extent keeps its batch axis, along which a replicated broadcast input is
+        // replicated.
+        let program = stage(
+            r#type(vec![3.into()]),
+            r#type(vec![2.into(), Dimension::Dynamic(size), 3.into()]),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[2, size, 3] .
+                let %2:f64[2, size, 3] = broadcast_like [output_axes=[2]] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![array(vec![3], vec![1.0, 2.0, 3.0]), array(vec![2, 4, 3], vec![0.0; 24])]),
+            Ok(vec![array(vec![2, 4, 3], rows(&[1.0, 2.0, 3.0], 8))]),
+        );
+    }
+
+    #[test]
+    fn test_broadcast_like_differentiation() {
+        // For a fixed exemplar shape, the broadcast is linear in its first input, so its JVP broadcasts the primal
+        // and the tangent of that input, and the tangent of the exemplar has no effect.
+        check_operation_differentiation!(
+            @approx(step = 0.125, epsilon = 1e-9),
+            operation = BroadcastLikeOperation::new(vec![1]),
+            cases = [{
+                primals = [Array::vector(vec![1.0, 2.0]).unwrap(), Array::matrix(2, 2, vec![9.0; 4]).unwrap()],
+                tangents = [Array::vector(vec![3.0, 4.0]).unwrap(), Array::matrix(2, 2, vec![5.0; 4]).unwrap()],
+                primal_outputs = [Array::matrix(2, 2, vec![1.0, 2.0, 1.0, 2.0]).unwrap()],
+                tangent_outputs = [Array::matrix(2, 2, vec![3.0, 4.0, 3.0, 4.0]).unwrap()],
+                jvp = indoc! {"
+                    lambda %0:f64[2], %1:f64[2, 2], %2:f64[2], %3:f64[2, 2] .
+                    let %4:f64[2, 2] = broadcast_like [output_axes=[1]] %0 %1
+                        %5:f64[2, 2] = broadcast_like [output_axes=[1]] %2 %4
+                    in (%4, %5)
+                "},
+            }],
+        );
+
+        // A broadcast input whose tangent element data type is wider than its own has a tangent of the tangent type
+        // of the primal output, which takes the default layout even though the exemplar has an explicit layout and
+        // the tangent's element data type.
+        let exemplar_type =
+            ArrayType::new_static(DataType::F32, [2, 3]).with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F8E8M0FNU, [3]));
+        let exemplar = builder.add_input(exemplar_type);
+        let output = builder
+            .add_instruction(BroadcastLikeOperation::new(vec![1]), Vec::new(), vec![input, exemplar], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda \
+                    %0:f8e8m0fnu[3], %1:f32[2, 3][layout=strided{12,4}], %2:f32[3], %3:f32[2, 3][layout=strided{12,4}] .
+                let %4:f8e8m0fnu[2, 3] = broadcast_like [output_axes=[1]] %0 %1
+                    %5:f32[2, 3] = broadcast_like [output_axes=[1]] %2 %4
+                in (%4, %5)
+            "}
+            .trim_end(),
+        );
+
+        // A broadcast input without a tangent space has a structurally zero tangent, so the output tangent is
+        // structurally zero too, whatever the tangent of the exemplar is, and the staged JVP has no tangent output.
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let exemplar_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(size), 3.into()]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::I32, [3]));
+        let exemplar = builder.add_input(exemplar_type.clone());
+        let output = builder
+            .add_instruction(BroadcastLikeOperation::new(vec![1]), Vec::new(), vec![input, exemplar], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap()
+            .jvp()
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i32[3], %1:f64[size, 3], %2:f64[size, 3] .
+                let %3:i32[size, 3] = broadcast_like [output_axes=[1]] %0 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
+        // Linearization keeps the primal output as the residual that gives the tangent and the pullback their shape.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F64, [3]));
+        let exemplar = builder.add_input(exemplar_type);
+        let output = builder
+            .add_instruction(BroadcastLikeOperation::new(vec![1]), Vec::new(), vec![input, exemplar], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[size, 3] .
+                let %2:f64[size, 3] = broadcast_like [output_axes=[1]] %0 %1
+                in (%2, %2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[3], %1:f64[size, 3], %2:f64[size, 3] .
+                let %3:f64[size, 3] = broadcast_like [output_axes=[1]] %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            linearization.pullback().unwrap().program().to_string(),
+            indoc! {"
+                lambda %0:f64[size, 3], %1:f64[size, 3] .
+                let %2:f64[3] = reduce [kind=sum, axes=[0]] %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // Reverse mode sums the cotangent of the broadcast input over the replicated axis and gives the exemplar a
+        // zero gradient.
+        let input = Array::vector(vec![1.0, 2.0, 3.0]).unwrap();
+        let exemplar = Array::matrix(2, 3, vec![9.0; 6]).unwrap();
+        assert_eq!(
+            differentiate_at((input, exemplar)).gradient(|(input, exemplar)| input
+                .broadcast_like(&exemplar, &[1])?
+                .reduce(&[0, 1], ReductionKind::Sum)),
+            Ok((Array::vector(vec![2.0, 2.0, 2.0]).unwrap(), Array::matrix(2, 3, vec![0.0; 6]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_broadcast_like_transposition() {
+        // The pullback sums the output cotangent over the replicated exemplar axis, and the exemplar receives no
+        // cotangent.
+        check_operation_transposition!(
+            @exact,
+            operation = BroadcastLikeOperation::new(vec![1]),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::new_static(DataType::F64, [3]))),
+                    (@known, Array::matrix(2, 3, vec![0.0; 6]).unwrap()),
+                ],
+                output_cotangents = [Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap()],
+                input_cotangents = [Array::vector(vec![5.0, 7.0, 9.0]).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f64[2, 3], %1:f64[2, 3] .
+                    let %2:f64[3] = reduce [kind=sum, axes=[0]] %0
+                    in (%2)
+                "},
+            }],
+        );
+
+        // The pullback of one `broadcast_like` instruction with respect to its broadcast input.
+        let pullback = |input_type: ArrayType, exemplar_type: ArrayType| {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(input_type);
+            let exemplar = builder.add_input(exemplar_type);
+            let output = builder
+                .add_instruction(BroadcastLikeOperation::new(vec![0]), Vec::new(), vec![input, exemplar], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+                .unwrap()
+                .transpose_with_respect_to(&[0], &[])
+                .map(|program| program.to_string())
+        };
+
+        // An integer broadcast input has no cotangent space, so its pullback carries no cotangent at all.
+        let program = pullback(ArrayType::new_static(DataType::I32, [1]), ArrayType::new_static(DataType::F64, [2]));
+        assert_eq!(
+            program,
+            Ok(indoc! {"
+                lambda %0:zero[2], %1:f64[2] .
+                let %2:zero[1] = zero [type=zero[1]]
+                in (%2)
+            "}
+            .trim_end()
+            .to_string()),
+        );
+
+        // A cotangent that varies along a manual mesh axis keeps that variation through the pullback, which sums it
+        // over the stretched axis on every device.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let varying_type = |size: usize| {
+            ArrayType::new_static(DataType::F64, [size])
+                .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+                .unwrap()
+        };
+        let program = pullback(varying_type(1), varying_type(2));
+        assert_eq!(
+            program,
+            Ok(indoc! {"
+                lambda \
+                    %0:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], \
+                    %1:f64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                let %2:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %0
+                    %3:f64[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape [shape=[1]] %2
+                in (%3)
+            "}
+            .trim_end()
+            .to_string()),
+        );
+        // Placing an invariant broadcast input along a manual mesh axis makes the output vary along that axis, which
+        // treats the shared input as one copy per device, so the pullback also sums the contributions of the devices.
+        let invariant_type = ArrayType::new_static(DataType::F64, [1])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let placed_type = ArrayType::new_static(DataType::F64, [2])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap(),
+            )
+            .unwrap();
+        let program = pullback(invariant_type, placed_type);
+        assert_eq!(
+            program,
+            Ok(indoc! {"
+                lambda \
+                    %0:f64[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}], \
+                    %1:f64[2][sharding={mesh<['x'=2:manual]>, [{'x'}], varying_manual={'x'}}] .
+                let %2:f64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %0
+                    %3:f64[1][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape [shape=[1]] %2
+                    %4:f64[1][sharding={mesh<['x'=2:manual]>, [{}]}] = \
+                        parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %3
+                in (%4)
+            "}
+            .trim_end()
+            .to_string()),
+        );
+    }
+
+    #[test]
+    fn test_broadcast_like_staging() {
+        // The staged program of one `broadcast_like` call over the provided input and exemplar types.
+        let stage = |input_type: ArrayType, exemplar_type: ArrayType| {
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let input = context.input(input_type);
+            let exemplar = context.input(exemplar_type);
+            let output = input.broadcast_like(&exemplar, &[1]).unwrap();
+            context
+                .builder()
+                .borrow()
+                .clone()
+                .build::<Vec<Array>, Vec<Array>>(
+                    vec![output.atom_id().unwrap()],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let r#type = |dimensions: Vec<Dimension>| ArrayType::new(DataType::F32, Shape::new(dimensions));
+
+        // An output type that the static broadcast accepts stages that broadcast and leaves the exemplar unused,
+        // including when a dynamic extent passes through from the broadcast input.
+        assert_eq!(
+            stage(ArrayType::new_static(DataType::F32, [3]), ArrayType::new_static(DataType::F64, [2, 3])).to_string(),
+            indoc! {"
+                lambda %0:f32[3], %1:f64[2, 3] .
+                let %2:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[1]] %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            stage(
+                r#type(vec![Dimension::Dynamic(size.clone())]),
+                r#type(vec![2.into(), Dimension::Dynamic(size.clone())])
+            )
+            .to_string(),
+            indoc! {"
+                lambda %0:f32[size], %1:f32[2, size] .
+                let %2:f32[2, size] = broadcast [output_type=f32[2, size], output_axes=[1]] %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // A new dynamic axis keeps the exemplar as an input, whose extent is read when the program runs.
+        let program =
+            stage(ArrayType::new_static(DataType::F32, [3]), r#type(vec![Dimension::Dynamic(size), 3.into()]));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3], %1:f32[size, 3] .
+                let %2:f32[size, 3] = broadcast_like [output_axes=[1]] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let input = Array::vector(vec![1.0f32, 2.0, 3.0]).unwrap();
+        assert_eq!(
+            program.interpret(vec![input.clone(), Array::matrix(2, 3, vec![0.0f32; 6]).unwrap()]),
+            Ok(vec![Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap()]),
+        );
+        let empty = Array::from_elements::<f32>(ArrayType::new_static(DataType::F32, [0, 3]), &[]).unwrap();
+        assert_eq!(program.interpret(vec![input, empty.clone()]), Ok(vec![empty]));
+    }
+
+    #[test]
+    fn test_broadcast_like_staging_array_ir() {
+        // Array IR values stage the broadcast of their array members, so a new dynamic axis binds the homogeneous
+        // member operation with the exemplar as an input and without any dimension input.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(8)).unwrap());
+        let exemplar_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size), 2.into()]));
+        let input = context.input(ArrayType::new_static(DataType::F32, [2]).into());
+        let exemplar = context.input(exemplar_type.clone().into());
+        let output = input.broadcast_like(&exemplar, &[1]).unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(exemplar_type));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[size, 2] .
+                let %2:f32[size, 2] = broadcast_like [output_axes=[1]] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::matrix(3, 2, vec![0.0f32; 6]).unwrap()),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0f32, 2.0, 1.0, 2.0, 1.0, 2.0]).unwrap())]),
+        );
     }
 
     #[test]
