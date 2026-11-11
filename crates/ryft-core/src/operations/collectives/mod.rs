@@ -10,13 +10,13 @@
 //!   - **Reading Positions:** [`AxisIndex`] returns the position of the current batch item or device shard along
 //!     a named axis. It exchanges nothing and is a context capability rather than a value capability, because the
 //!     position belongs to the enclosing binder rather than to any value.
-//!   - **Reducing and Varying Values:** [`ParallelReduce`] combines the values of all participants with
-//!     a [`ReductionKind`](crate::ReductionKind), so that every participant receives the same result, and
-//!     [`ParallelVary`] marks a value that is invariant over a manual mesh axis as varying over it, which is the
-//!     transpose of a sum over that axis. [`ParallelCast`] moves a value between the remaining variation and reduction
-//!     states of a manual mesh axis (e.g., marking per-device summands as unreduced, which a sum then completes), and
-//!     [`ManualVariationAlignment`] aligns the manual variation of several inputs before an operation combines them.
-//!     [`ParallelArgExtrema`] composes reductions and [`AxisIndex`] to find the participant that holds an extremum.
+//!   - **Reducing and Varying Values:** [`ParallelReduce`] combines the values of all participants with a
+//!     [`ReductionKind`], so that every participant receives the same result, and [`ParallelVary`] marks a value
+//!     that is invariant over a manual mesh axis as varying over it, which is the transpose of a sum over that axis.
+//!     [`ParallelCast`] moves a value between the remaining variation and reduction states of a manual mesh axis
+//!     (e.g., marking per-device summands as unreduced, which a sum then completes), and [`ManualVariationAlignment`]
+//!     aligns the manual variation of several inputs before an operation combines them. [`ParallelArgExtrema`] composes
+//!     reductions and [`AxisIndex`] to find the participant that holds an extremum.
 //!   - **Resizing Array Axes:** [`ParallelAllGather`] gives every participant the values of all participants,
 //!     [`ParallelSumScatter`] sums them and gives every participant one chunk of the sum, and [`ParallelAllToAll`]
 //!     splits an axis into one chunk per participant and concatenates the chunks that it receives along another axis.
@@ -1905,6 +1905,7 @@ pub(crate) fn validate_participant_types(operation_name: &str, participants: &[&
 
 #[cfg(test)]
 mod tests {
+    use half::bf16;
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -3522,6 +3523,43 @@ mod tests {
             Err(BatchingError::UnsupportedOperation {
                 message: "`parallel_permute` over several axes cannot bind a named batch axis".to_string(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_reduce_participants_accumulates_in_the_element_type() {
+        // A sum across participants accumulates in their element type, as an all-reduce does, so the `bf16` values
+        // `256`, `1`, `1`, and `1` sum to `256` because every partial sum `257` rounds back to `256`. Accumulating in
+        // `f32` and rounding once would instead give `260`, the nearest even `bf16` to `259`.
+        let r#type = ArrayType::new_static(DataType::BF16, [1]);
+        let large = Array::from_elements(r#type.clone(), &[bf16::from_f64(256.0)]).unwrap();
+        let one = Array::from_elements(r#type, &[bf16::from_f64(1.0)]).unwrap();
+        assert_eq!(reduce_participants("parallel_reduce", &[&large, &one, &one, &one], ReductionKind::Sum), Ok(large),);
+    }
+
+    #[test]
+    fn test_validate_participant_types() {
+        // Participants that share one data type and shape are accepted whatever their values.
+        let participant = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        assert_eq!(
+            validate_participant_types(
+                "parallel_all_gather",
+                &[&participant, &Array::vector(vec![3.0f32, 4.0]).unwrap()],
+            ),
+            Ok(()),
+        );
+
+        // Devices may hold values of different shapes (e.g., when a body derives an extent from data that differs
+        // across devices), which no collective can combine.
+        assert_eq!(
+            validate_participant_types(
+                "parallel_all_gather",
+                &[&participant, &Array::vector(vec![3.0f32, 4.0, 5.0]).unwrap()],
+            ),
+            Err(TypeError::invalid(
+                "`parallel_all_gather` participants must share one data type and shape but got `f32[2]` and `f32[3]`",
+            )
+            .into()),
         );
     }
 }

@@ -1375,6 +1375,7 @@ mod tests {
     use crate::operations::collectives::tests::{batch_collective, collective_program};
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::reductions::{Reduce, ReductionKind};
+    use crate::operations::sharding::shard_map::tests::run_collective;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder};
@@ -2086,6 +2087,48 @@ mod tests {
                 ],
             ),
             Ok(vec![ArrayIrValue::Array(Array::matrix(3, 1, vec![1.0f32, 2.0, 3.0]).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_interpretation_in_lockstep_untiled() {
+        // An untiled exchange gives the device at position `p` element `p` of the inputs `[1, 2]` and `[3, 4]` of both
+        // devices, stacked along a new axis in the order of their senders.
+        let operation =
+            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::new(CollectiveMode::Untiled));
+        let inputs = vec![vec![
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap()),
+        ]];
+        assert_eq!(
+            run_collective(2, operation, &inputs),
+            Ok(Some(vec![vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 3.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![2.0f32, 4.0]).unwrap()),
+            ]])),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_interpretation_in_lockstep_axis_index_groups() {
+        // Device `p` holds `[10·p + 1, 10·p + 2]`. With groups `[[0, 2], [3, 1]]`, every member receives the chunk of
+        // its position from each member of its group, concatenated in the order of the positions of their senders.
+        let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+        let operation = ParallelAllToAllOperation::new("x".to_string(), 4, 0, 0, options);
+        let inputs = vec![vec![
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![11.0f32, 12.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![21.0f32, 22.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![31.0f32, 32.0]).unwrap()),
+        ]];
+        assert_eq!(
+            run_collective(4, operation, &inputs),
+            Ok(Some(vec![vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 21.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![32.0f32, 12.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![2.0f32, 22.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![31.0f32, 11.0]).unwrap()),
+            ]])),
         );
     }
 

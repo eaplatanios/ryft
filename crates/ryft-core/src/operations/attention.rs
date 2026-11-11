@@ -47,7 +47,7 @@
 //!   - **Differentiation:** The forward and backward definitions have no derivative rules, so differentiating a call
 //!     of the inference function fails. The training function stages a third named composite, named
 //!     [`DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME`], whose reverse mode rule calls the forward definition with
-//!     its residual and then the backward definition. Higher-order derivatives differentiate the backward body.
+//!     its residual and then the backward definition.
 //!
 //! # Example
 //!
@@ -1327,6 +1327,7 @@ where
                 // its rules call the definitions that this function owns.
                 let definitions = self.definitions.clone();
                 let configuration = definitions.configuration();
+                // The composite returns only the attended output, whose type the forward boundary determines.
                 let output_types = move |input_types: AttentionInputs<C::Type>| -> Result<C::Type, ProgramError> {
                     let input_types = input_types
                         .into_values()
@@ -1342,6 +1343,7 @@ where
                     check_count!("output", output_types, 1, ProgramError);
                     Ok(<C::Type as AttentionUniverse<DomainTracer<C>>>::from_array_type(output_types.remove(0)))
                 };
+                // The primal stages the forward definition without its residual.
                 let primal = {
                     let definitions = definitions.clone();
                     move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<DomainTracer<C>, ProgramError> {
@@ -1350,6 +1352,8 @@ where
                         Ok(outputs.remove(0))
                     }
                 };
+                // The forward rule stages the forward definition with its residual, and it retains the inputs, the
+                // output, and the residual for the backward rule.
                 let forward = {
                     let definitions = definitions.clone();
                     move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<_, ProgramError> {
@@ -1364,6 +1368,8 @@ where
                                      output_cotangent: MaybeZero<DomainTracer<C>>|
                       -> Result<_, ProgramError> {
                     let AttentionResiduals { inputs, output, residual } = residuals;
+                    // A structurally zero output cotangent (e.g., of an unused output) makes every input cotangent
+                    // a structural zero, without staging the backward definition.
                     let MaybeZero::Value(output_cotangent) = output_cotangent else {
                         return inputs.try_map_parameters(|input| zero_cotangent(&input));
                     };
@@ -1479,9 +1485,6 @@ type RuleTracer<V, O> = CustomRuleTracer<V, O>;
 
 /// Array view of a value of an [`AttentionUniverse`].
 type ArrayOf<V> = <<V as Typed>::Type as AttentionUniverse<V>>::ArrayValue;
-
-/// Extent of a value of an [`AttentionUniverse`].
-type ExtentOf<V> = <<V as Typed>::Type as AttentionUniverse<V>>::Extent;
 
 /// Borrowed canonical view of attention input types.
 struct AttentionInputTypes<'o> {
@@ -2321,8 +2324,8 @@ where
                     Err(ProgramError::UnsupportedOperation {
                         message: format!(
                             "named composite `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` with dropout cannot be batched \
-                         with the fused implementation, because a batched call cannot use the fused kernels or \
-                         reproduce their dropout mask; use the portable implementation or a dropout state",
+                             with the fused implementation, because a batched call cannot use the fused kernels or \
+                             reproduce their dropout mask; use the portable implementation or a dropout state",
                         ),
                     })
                 })))
@@ -2597,9 +2600,12 @@ where
         if let Some(bias) = &inputs.bias {
             let bias_type = V::Type::array_type(bias)?;
             let bias_cotangent_type = bias_type.cotangent()?;
+            // A bias whose cotangent space is zero-dimensional (e.g., an integer bias) has no cotangent output.
             if bias_cotangent_type.is_zero_space() {
                 return Ok(cotangents);
             }
+            // The bias was right-aligned and broadcast to the `BNTS` score shape, so its cotangent sums the logit
+            // cotangents over the axes along which it was broadcast and then returns to the shape of the bias.
             let bias_dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - bias_type.rank())
                 .chain(bias_type.shape().dimensions().iter().cloned())
                 .collect::<Vec<_>>();
@@ -2639,9 +2645,9 @@ where
                     Err(ProgramError::UnsupportedOperation {
                         message: format!(
                             "named composite `{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` with dropout cannot be \
-                         batched with the fused implementation, because a batched call cannot use the fused \
-                         kernels or reproduce their dropout mask; use the portable implementation or a dropout \
-                         state",
+                             batched with the fused implementation, because a batched call cannot use the fused \
+                             kernels or reproduce their dropout mask; use the portable implementation or a dropout \
+                             state",
                         ),
                     })
                 })))
@@ -2693,6 +2699,8 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
     // The stable softmax itself always runs in `f32`, matching the public attention contract.
     let logits_type = if data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
     let softmax_type = DataType::F32;
+    // The scores contract the head dimension of the query and of the expanded key for every batch item and head,
+    // which gives the `BNTS` score form.
     let scores = V::Type::into_array(query.clone())?.dot(
         &V::Type::into_array(expanded_key.clone())?,
         &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]),
@@ -2702,6 +2710,7 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
     let scale = configuration.scale().unwrap_or(1.0 / (dimensions.head_dimension as f64).sqrt());
     let scale_value = V::Type::into_array(V::Type::fill(&scores, scale)?)?;
     scores = V::Type::from_array(V::Type::into_array(scores)?.mul(&scale_value)?);
+    // A bias is right-aligned to `BNTS`, converted to the data type of the scores, and broadcast to their shape.
     if let Some(bias) = &inputs.bias {
         let bias = V::Type::into_array(normalize_attention_score_input(bias)?)?;
         let bias =
@@ -3082,6 +3091,8 @@ mod tests {
     use crate::batching::{BatchingError, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationError, differentiate_at};
+    use crate::macros::check_gradient;
+    use crate::operations::manipulation::slicing::Slice;
     use crate::parameters::Placeholder;
     use crate::tests::hash_of;
     use crate::tracing::Trace;
@@ -3145,6 +3156,7 @@ mod tests {
                                values for dynamic extents",
         ));
         assert_eq!(<ArrayType as AttentionUniverse<Array>>::extent(&array, 1), Ok(3));
+        assert_eq!(<ArrayType as AttentionUniverse<Array>>::extents(&array), Ok(vec![2, 3]));
         assert_eq!(<ArrayType as AttentionUniverse<Array>>::constant_extent(&array, 7), Ok(7));
         assert_eq!(<ArrayType as AttentionUniverse<Array>>::multiply_extents(&array, &2, &3), Ok(6));
         assert!(matches!(
@@ -3208,6 +3220,10 @@ mod tests {
             Ok(dimension(5)),
         );
         assert_eq!(<ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::extent(&value, 1), Ok(dimension(3)));
+        assert_eq!(
+            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::extents(&value),
+            Ok(vec![dimension(2), dimension(3)]),
+        );
         assert_eq!(
             <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::constant_extent(&value, 7),
             Ok(dimension(7)),
@@ -4958,44 +4974,33 @@ mod tests {
 
     #[test]
     fn test_differentiable_dot_product_attention_dropout() {
-        // The backward definition applies the dropout mask of the forward definition, so the analytical gradient
-        // agrees with the gradient of the portable forward body, whose dropout is differentiated automatically, up to
-        // the rounding of their `f32` softmax computations.
-        let array = |dimensions: &[usize], elements: &[f64]| {
-            Array::from_elements(ArrayType::new_static(DataType::F64, dimensions.to_vec()), elements).unwrap()
-        };
-        let inputs = AttentionInputs {
-            dropout_state: Some(Array::from_elements(ArrayType::new_static(DataType::U64, [2]), &[0u64, 3]).unwrap()),
-            ..AttentionInputs::new(
-                array(&[1, 2, 1, 2], &[0.1, -0.2, 0.3, 0.4]),
-                array(&[1, 3, 1, 2], &[0.5, 0.2, -0.3, 0.7, 0.1, -0.6]),
-                array(&[1, 3, 1, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-            )
-        };
-        let configuration = AttentionConfiguration::new().with_dropout(0.5);
-        let function = differentiable_dot_product_attention::<ArrayContext>(configuration);
-        let (output, gradients) = differentiate_at(inputs.clone())
-            .value_and_gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum))
-            .unwrap();
-        let (expected_output, expected_gradients) = differentiate_at(inputs)
-            .value_and_gradient(|inputs| {
-                let (output, _) = dot_product_attention_forward_body(&inputs, configuration)?;
-                output.reduce(&[0, 1, 2, 3], ReductionKind::Sum)
-            })
-            .unwrap();
-        assert_abs_diff_eq!(output.to_f64s()[0], expected_output.to_f64s()[0], epsilon = 1e-6);
-        for (actual, expected) in [
-            (gradients.query, expected_gradients.query),
-            (gradients.key, expected_gradients.key),
-            (gradients.value, expected_gradients.value),
-        ] {
-            actual
-                .to_f64s()
-                .iter()
-                .zip(expected.to_f64s())
-                .for_each(|(actual, expected)| assert_abs_diff_eq!(*actual, expected, epsilon = 1e-6));
-        }
-        assert_eq!(gradients.dropout_state.unwrap().r#type().data_type(), DataType::Zero);
+        // The backward definition applies the dropout mask of the forward definition, which the random state
+        // determines, so the analytical gradient agrees with central finite differences of the forward definition.
+        // The tolerance reflects the `f32` softmax of attention, which limits the accuracy of the differences.
+        let function =
+            differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_dropout(0.5));
+        let state = Array::from_elements(ArrayType::new_static(DataType::U64, [2]), &[0u64, 3]).unwrap();
+        check_gradient!(
+            |input, state| {
+                // The input packs the `[1, 2, 1, 2]` query, the `[1, 3, 1, 2]` key, and the `[1, 3, 1, 2]` value.
+                let inputs = AttentionInputs {
+                    dropout_state: Some(state),
+                    ..AttentionInputs::new(
+                        input.slice_axis(0, 0, 4, 1)?.reshape([1, 2, 1, 2])?,
+                        input.slice_axis(0, 4, 10, 1)?.reshape([1, 3, 1, 2])?,
+                        input.slice_axis(0, 10, 16, 1)?.reshape([1, 3, 1, 2])?,
+                    )
+                };
+                function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+            },
+            at = Array::vector(vec![
+                0.1f64, -0.2, 0.3, 0.4, 0.5, 0.2, -0.3, 0.7, 0.1, -0.6, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+            ])
+            .unwrap(),
+            with = state,
+            step = 5e-3,
+            tolerance = 5e-3,
+        );
     }
 
     #[test]
@@ -5058,65 +5063,5 @@ mod tests {
         assert_eq!(output.to_f64s(), vec![0.5]);
         assert_eq!(gradients.query.to_f64s(), vec![0.0]);
         assert_eq!(gradients.key.to_f64s(), vec![0.25, -0.25]);
-    }
-
-    #[test]
-    fn test_dot_product_attention_forward_body_differentiation() {
-        let r#type = ArrayType::new_static(DataType::F64, [1, 1, 1, 1]);
-        let scalar_type = ArrayType::scalar(DataType::F64);
-        let (_, program) = ArrayIrContext::trace(
-            |inputs: AttentionInputs<_>| {
-                let (output, residual) = dot_product_attention_forward_body(
-                    &inputs,
-                    AttentionConfiguration::new().with_scale(0.5).with_residual(true),
-                )?;
-                Ok((output.into_value(), residual.unwrap().into_value()))
-            },
-            AttentionInputs {
-                bias: Some(ArrayIrType::Array(scalar_type.clone())),
-                ..AttentionInputs::new(
-                    ArrayIrType::Array(r#type.clone()),
-                    ArrayIrType::Array(r#type.clone()),
-                    ArrayIrType::Array(r#type.clone()),
-                )
-            },
-        )
-        .unwrap();
-        let array = |r#type: &ArrayType, element: f64| {
-            ArrayIrValue::Array(Array::from_elements(r#type.clone(), &[element]).unwrap())
-        };
-
-        let outputs = program
-            .into_flat_program()
-            .jvp()
-            .unwrap()
-            .interpret(vec![
-                array(&r#type, 2.0),
-                array(&r#type, 3.0),
-                array(&r#type, 5.0),
-                array(&scalar_type, 1.0),
-                array(&r#type, 7.0),
-                array(&r#type, 11.0),
-                array(&r#type, 13.0),
-                array(&scalar_type, 17.0),
-            ])
-            .unwrap();
-        let [
-            ArrayIrValue::Array(output),
-            ArrayIrValue::Array(residual),
-            ArrayIrValue::Array(tangent),
-            ArrayIrValue::Array(residual_tangent),
-        ] = outputs.as_slice()
-        else {
-            panic!("the attention JVP produces array primals and tangents")
-        };
-
-        // The softmax over one visible key is identically one, so the output is the value and the residual is the
-        // only logit. The query, key, and bias tangents therefore vanish, the value tangent passes through unchanged,
-        // and the residual has a zero tangent because it stops gradients.
-        assert_eq!(output.to_f64s(), vec![5.0]);
-        assert_eq!(residual.to_f64s(), vec![4.0]);
-        assert_eq!(tangent.to_f64s(), vec![13.0]);
-        assert_eq!(residual_tangent.to_f64s(), vec![0.0]);
     }
 }

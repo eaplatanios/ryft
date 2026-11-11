@@ -7172,7 +7172,6 @@ where
 pub(crate) mod tests {
     use std::cell::RefCell;
 
-    use half::bf16;
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
@@ -7189,19 +7188,17 @@ pub(crate) mod tests {
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation, NegOperation, SubOperation};
     use crate::operations::assertions::AssertionError;
+    use crate::operations::collectives::CollectiveOptions;
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_all_gather::ParallelAllGather;
-    use crate::operations::collectives::parallel_all_to_all::{ParallelAllToAll, ParallelAllToAllOperation};
+    use crate::operations::collectives::parallel_all_to_all::ParallelAllToAll;
     use crate::operations::collectives::parallel_arg_extrema::ParallelArgExtrema;
     use crate::operations::collectives::parallel_broadcast::{PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcast};
     use crate::operations::collectives::parallel_cast::{ParallelCast, ParallelCastOperation, ParallelCastTarget};
     use crate::operations::collectives::parallel_permute::{ParallelPermute, ParallelPermuteOperation};
-    use crate::operations::collectives::parallel_ragged_all_to_all::{
-        ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation,
-    };
+    use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAll;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
     use crate::operations::collectives::parallel_sum_scatter::{ParallelSumScatter, ParallelSumScatterOperation};
-    use crate::operations::collectives::{CollectiveMode, CollectiveOptions};
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::composites::{CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, composite};
     use crate::operations::constants::one_like::OneLikeOperation;
@@ -10834,46 +10831,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_shard_map_rejects_divergent_writes_into_replicated_references() {
-        // Every device holds its own copy of a reference that is replicated along `x`, so a mutation keeps those copies
-        // identical only when every device writes the same value at the same position. A write at an index that varies
-        // along `x` and a write of a value that varies along `x` are rejected when they are staged.
-        let mesh = manual_mesh();
-        let boundary =
-            ShardMapBoundary::new(mesh.clone(), vec![Sharding::replicated(mesh, 1)], Vec::new(), Vec::new()).unwrap();
-        let local_type = boundary.local_input_type(0, &f32_vector_type(2)).unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(ReferenceType::new(local_type.clone()).into());
-        let index = add_axis_index(&mut builder);
-        let static_index = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(0) };
-        let read = ReferenceReadOperation::new().with_transforms(vec![static_index.clone()]);
-        let value = builder.add_instruction(read, Vec::new(), vec![reference], None).unwrap()[0];
-        let write = ReferenceWriteOperation::new().with_transforms(vec![dynamic_index_transform()]);
-        assert_eq!(
-            builder.add_instruction(write, Vec::new(), vec![reference, value, index], None).map(|_| ()),
-            Err(TypeError::invalid(
-                "reference transform index `u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies \
-                 over manual axis `x` but the referent `f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]` does not, so a \
-                 mutation through it would update a different element on every device of a referent that is identical \
-                 across them; vary the referent over that axis or use an invariant index",
-            )
-            .into()),
-        );
-        let varying_value = builder
-            .add_instruction(ParallelVaryOperation::new("x".to_string()), Vec::new(), vec![value], None)
-            .unwrap()[0];
-        let write = ReferenceWriteOperation::new().with_transforms(vec![static_index]);
-        assert_eq!(
-            builder.add_instruction(write, Vec::new(), vec![reference, varying_value], None).map(|_| ()),
-            Err(TypeError::invalid(
-                "`reference_write` replacement type `f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` \
-                 must exactly match reference referent type `f32[][sharding={mesh<['x'=2:manual]>, []}]`",
-            )
-            .into()),
-        );
-    }
-
-    #[test]
     fn test_shard_map_operation_region_data_flow() {
         let operation = forwarding_reference_shard_map().0;
         assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
@@ -12756,67 +12713,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_shard_map_interpretation_scan_widens_stacks_whose_manual_variation_changes_across_iterations() {
-        // The body declares its carry and slice without manual variation, returns the slice as the next carry, and
-        // stacks the carry that it receives, so with an invariant initial carry the first stacked slice is invariant
-        // and the second one varies along `x`. Running the scan rule over the values of both devices widens the stack
-        // to the join of the variation of its slices, as `parallel_vary` would, instead of rejecting the second slice.
-        let mesh = manual_mesh();
-        let replicated = |rank| Sharding::replicated(mesh.clone(), rank);
-        let varying = |rank| replicated(rank).with_varying_manual_axes(["x"]).unwrap();
-        let scalar_type = ArrayIrType::Array(f32_scalar_type());
-        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
-        let body =
-            build_program(vec![index_type, scalar_type.clone(), scalar_type], |_, inputs| vec![inputs[2], inputs[1]]);
-        let initial = f32_value(f32_type(&[], Some(replicated(0))), &[10.0]);
-        let domain =
-            LockstepDomain::<TestOperation>::new(LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] }, Vec::new());
-        let inputs = vec![
-            LockstepValue::new(vec![initial.clone(), initial], &domain).unwrap(),
-            LockstepValue::new(
-                vec![
-                    f32_value(f32_type(&[2], Some(varying(1))), &[1.0, 2.0]),
-                    f32_value(f32_type(&[2], Some(varying(1))), &[3.0, 4.0]),
-                ],
-                &domain,
-            )
-            .unwrap(),
-        ];
-        let regions = [body.entry_region_ref()];
-        let driver = LockstepInterpretationDriver {
-            regions: &regions,
-            interpret_region: |region: RegionRef<'_, TestValue, TestOperation>,
-                               inputs: Vec<LockstepValue<TestOperation>>| {
-                let mut outputs = vec![Vec::new(); 2];
-                for device in 0..2 {
-                    let device_inputs = inputs.iter().map(|input| input.values[device].clone()).collect::<Vec<_>>();
-                    for (output, value) in outputs.iter_mut().zip(region.interpret_in_context(
-                        &EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-                        device_inputs,
-                    )?) {
-                        output.push(value);
-                    }
-                }
-                outputs.into_iter().map(|output| LockstepValue::new(output, &domain)).collect()
-            },
-        };
-        let outputs = ScanOperation::<ArrayIrType>::new(1, 2usize).interpret(&domain, &driver, &inputs).unwrap();
-        assert_eq!(
-            outputs.into_iter().map(|output| output.values).collect::<Vec<_>>(),
-            vec![
-                vec![
-                    f32_value(f32_type(&[], Some(varying(0))), &[2.0]),
-                    f32_value(f32_type(&[], Some(varying(0))), &[4.0]),
-                ],
-                vec![
-                    f32_value(f32_type(&[2], Some(varying(1))), &[10.0, 1.0]),
-                    f32_value(f32_type(&[2], Some(varying(1))), &[10.0, 3.0]),
-                ],
-            ],
-        );
-    }
-
-    #[test]
     fn test_shard_map_interpretation_scan_widening_does_not_depend_on_collectives() {
         // The scan body declares its carry and slice without manual variation, returns the slice as the next carry, and
         // stacks the carry that it receives, so with the invariant initial carry `10` the first stacked slice is
@@ -13101,99 +12997,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_shard_map_interpretation_parallel_ragged_all_to_all_axis_index_groups() {
-        // Participant `p` holds the rows `[10·p + 1, 10·p + 2]` and sends row `i` to the member at position `i` of its
-        // group, which places it at the row given by the sender's own position. With groups `[[0, 2], [3, 1]]`, the
-        // members exchange only within their group, and the last row of every output seed passes through unchanged.
-        let operation =
-            ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 2], vec![3, 1]]).unwrap();
-        let inputs = vec![
-            vec![
-                f32_value(f32_vector_type(2), &[1.0, 2.0]),
-                f32_value(f32_vector_type(2), &[11.0, 12.0]),
-                f32_value(f32_vector_type(2), &[21.0, 22.0]),
-                f32_value(f32_vector_type(2), &[31.0, 32.0]),
-            ],
-            vec![f32_value(f32_vector_type(3), &[-1.0; 3]); 4],
-            vec![ArrayIrValue::Array(Array::vector(vec![0i64, 1]).unwrap()); 4],
-            vec![ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()); 4],
-            vec![
-                ArrayIrValue::Array(Array::vector(vec![0i64, 0]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()),
-                ArrayIrValue::Array(Array::vector(vec![0i64, 0]).unwrap()),
-            ],
-            vec![ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()); 4],
-        ];
-        assert_eq!(
-            run_collective(4, operation.clone(), &inputs),
-            Ok(Some(vec![vec![
-                f32_value(f32_vector_type(3), &[1.0, 21.0, -1.0]),
-                f32_value(f32_vector_type(3), &[32.0, 12.0, -1.0]),
-                f32_value(f32_vector_type(3), &[2.0, 22.0, -1.0]),
-                f32_value(f32_vector_type(3), &[31.0, 11.0, -1.0]),
-            ]])),
-        );
-
-        // The staged participant count must agree with the emulated axis, whose inputs cover every device.
-        let fewer_inputs = inputs.iter().map(|values| values[..2].to_vec()).collect::<Vec<_>>();
-        assert_eq!(
-            run_collective(2, operation.clone(), &fewer_inputs),
-            Err(ProgramError::MalformedProgram(
-                "`parallel_ragged_all_to_all` was staged for 4 participants, but manual axis `x` has 2 devices"
-                    .to_string(),
-            )),
-        );
-
-        // The emulator requires all six exchange inputs, each containing one value per device.
-        assert_eq!(
-            run_collective(4, operation.clone(), &inputs[..5]),
-            Err(ProgramError::InvalidInputCount { expected: 6, actual: 5 }),
-        );
-
-        // Corresponding participant inputs must share one static shape and data type, even when each participant's
-        // own inputs describe a valid exchange.
-        let mut longer_inputs = inputs.clone();
-        longer_inputs[0][1] = f32_value(f32_vector_type(3), &[11.0, 12.0, 13.0]);
-        assert_eq!(
-            run_collective(4, operation.clone(), &longer_inputs),
-            Err(TypeError::invalid(
-                "`parallel_ragged_all_to_all` participant inputs 0 must share one static shape and data type but got \
-                 `f32[2]` and `f32[3]`",
-            )
-            .into()),
-        );
-        let mut wider_inputs = inputs.clone();
-        wider_inputs[0][1] = ArrayIrValue::Array(Array::vector(vec![11.0f64, 12.0]).unwrap());
-        wider_inputs[1][1] = ArrayIrValue::Array(Array::vector(vec![-1.0f64; 3]).unwrap());
-        assert_eq!(
-            run_collective(4, operation.clone(), &wider_inputs),
-            Err(TypeError::invalid(
-                "`parallel_ragged_all_to_all` participant inputs 0 must share one static shape and data type but got \
-                 `f32[2]` and `f64[2]`",
-            )
-            .into()),
-        );
-
-        // Packing the physical exchange requires static shapes even when the logical exchange types are valid.
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(4)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
-        let mut dynamic_inputs = inputs;
-        for input in &mut dynamic_inputs[0] {
-            let ArrayIrValue::Array(array) = input else { unreachable!() };
-            let bytes = array.logical_bytes();
-            *input = ArrayIrValue::Array(Array::new_unchecked(dynamic_type.clone(), Arc::new(bytes)));
-        }
-        assert_eq!(
-            run_collective(4, operation, &dynamic_inputs),
-            Err(TypeError::invalid(
-                "`parallel_ragged_all_to_all` participant input 0 must have a static shape but got `f32[extent]`",
-            )
-            .into()),
-        );
-    }
-
-    #[test]
     fn test_shard_map_interpretation_parallel_vary() {
         // Varying a replicated input along the manual axis retypes the copy that every device holds, so the tiled
         // output holds one copy per device.
@@ -13293,36 +13096,6 @@ pub(crate) mod tests {
             program.interpret(vec![f32_value(f32_vector_type(4), &[1.0, 2.0, 3.0, 4.0])]),
             Ok(vec![f32_value(f32_type(&[4], Some(sharded)), &[3.0, 3.0, 7.0, 7.0])]),
         );
-
-        // The participants of a device are the members of its group, positioned by their order in that group, and
-        // groups that leave a coordinate without a group do not partition the axis.
-        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 4)] };
-        assert_eq!(grid.participants(2, &[0], Some([vec![3, 2], vec![1, 0]].as_slice())), Ok((vec![3, 2], 1)));
-        assert_eq!(
-            grid.participants(2, &[0], Some([vec![0, 1]].as_slice())),
-            Err(ProgramError::InvalidArgument {
-                message: "the participant groups `[[0, 1]]` of a collective over manual axis `x` do not partition \
-                          its 4 coordinates"
-                    .to_string(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_shard_map_interpretation_parallel_reduce_accumulates_in_the_element_type() {
-        // A sum across devices accumulates in the element type of its participants, as an all-reduce does, so the
-        // `bf16` values `256`, `1`, `1`, and `1` of the four devices sum to `256`, because every partial sum `257`
-        // rounds back to `256`, while accumulating in `f32` and rounding once would give `260`, the nearest even
-        // `bf16` to `259`.
-        let value = |value: f64| {
-            let r#type = ArrayType::new_static(DataType::BF16, [1]);
-            ArrayIrValue::Array(Array::from_elements::<bf16>(r#type, &[bf16::from_f64(value)]).unwrap())
-        };
-        let operation =
-            ArrayOperation::ParallelReduce(ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()));
-        let inputs = vec![vec![value(256.0), value(1.0), value(1.0), value(1.0)]];
-        assert_eq!(run_collective(4, operation, &inputs), Ok(Some(vec![vec![value(256.0); 4]])));
-        assert_eq!(f64::from(bf16::from_f64(259.0)), 260.0);
     }
 
     #[test]
@@ -13777,45 +13550,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_shard_map_interpretation_parallel_all_gather_axis_index_groups() {
-        // A grouped gather concatenates the inputs of the members of each group in the order of their positions in that
-        // group, so with groups `[[0, 2], [3, 1]]` the devices `0` and `2` gather `[1, 3]` and the devices `3` and `1`
-        // gather `[4, 2]`.
-        let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
-        let operation =
-            ParallelAllGatherOperation::new("x".to_string(), 4, 0, options, ParallelAllGatherOutputVariance::Varying);
-        let inputs = vec![(1..=4).map(|value| f32_value(f32_vector_type(1), &[value as f32])).collect::<Vec<_>>()];
-        assert_eq!(
-            run_collective(4, operation, &inputs),
-            Ok(Some(vec![vec![
-                f32_value(f32_vector_type(2), &[1.0, 3.0]),
-                f32_value(f32_vector_type(2), &[4.0, 2.0]),
-                f32_value(f32_vector_type(2), &[1.0, 3.0]),
-                f32_value(f32_vector_type(2), &[4.0, 2.0]),
-            ]])),
-        );
-    }
-
-    #[test]
-    fn test_shard_map_interpretation_parallel_all_gather_rejects_participants_of_different_types() {
-        // Devices may hold values of different shapes (e.g., when a body derives an extent from data that differs
-        // across devices), which no collective can combine, so the emulator rejects them instead of reading out of
-        // bounds.
-        let options = CollectiveOptions::tiled();
-        let operation =
-            ParallelAllGatherOperation::new("x".to_string(), 2, 0, options, ParallelAllGatherOutputVariance::Varying);
-        let inputs =
-            vec![vec![f32_value(f32_vector_type(2), &[1.0, 2.0]), f32_value(f32_vector_type(3), &[3.0, 4.0, 5.0])]];
-        assert_eq!(
-            run_collective(2, operation, &inputs),
-            Err(TypeError::invalid(
-                "`parallel_all_gather` participants must share one data type and shape but got `f32[2]` and `f32[3]`",
-            )
-            .into()),
-        );
-    }
-
-    #[test]
     fn test_shard_map_interpretation_parallel_sum_scatter() {
         // Every device receives its tile of the sum of the inputs of both devices. The sum `[6, 8, 10, 12]` of the
         // tiles `[1, 2, 3, 4]` and `[5, 6, 7, 8]` is scattered, so device 0 receives `[6, 8]` and device 1 `[10, 12]`.
@@ -13841,42 +13575,6 @@ pub(crate) mod tests {
         assert_eq!(
             program.interpret(vec![f32_value(f32_vector_type(8), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])]),
             Ok(vec![f32_value(f32_type(&[4], Some(sharded)), &[6.0, 8.0, 10.0, 12.0])]),
-        );
-    }
-
-    #[test]
-    fn test_shard_map_interpretation_parallel_sum_scatter_untiled() {
-        // An untiled scatter gives every device the element of the sum `[4, 6]` of the inputs `[1, 2]` and `[3, 4]` at
-        // its own position, without the scattered axis.
-        let operation =
-            ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::new(CollectiveMode::Untiled));
-        let inputs = vec![vec![f32_value(f32_vector_type(2), &[1.0, 2.0]), f32_value(f32_vector_type(2), &[3.0, 4.0])]];
-        assert_eq!(
-            run_collective(2, operation, &inputs),
-            Ok(Some(vec![vec![f32_value(f32_scalar_type(), &[4.0]), f32_value(f32_scalar_type(), &[6.0])]])),
-        );
-    }
-
-    #[test]
-    fn test_shard_map_interpretation_parallel_sum_scatter_axis_index_groups() {
-        // Device `p` holds `[10·p + 1, 10·p + 2]`. With groups `[[0, 2], [3, 1]]`, the devices `0` and `2` scatter
-        // their sum `[22, 24]`, and the devices `3` and `1` scatter their sum `[42, 44]`, by their positions in their
-        // groups.
-        let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
-        let operation = ParallelSumScatterOperation::new("x".to_string(), 4, 0, options);
-        let inputs = vec![
-            (0..4)
-                .map(|device| f32_value(f32_vector_type(2), &[10.0 * device as f32 + 1.0, 10.0 * device as f32 + 2.0]))
-                .collect::<Vec<_>>(),
-        ];
-        assert_eq!(
-            run_collective(4, operation, &inputs),
-            Ok(Some(vec![vec![
-                f32_value(f32_vector_type(1), &[22.0]),
-                f32_value(f32_vector_type(1), &[44.0]),
-                f32_value(f32_vector_type(1), &[24.0]),
-                f32_value(f32_vector_type(1), &[42.0]),
-            ]])),
         );
     }
 
@@ -13957,44 +13655,6 @@ pub(crate) mod tests {
         assert_eq!(
             program.interpret(vec![f32_value(f32_type(&[2, 2], None), &[1.0, 2.0, 3.0, 4.0])]),
             Ok(vec![f32_value(f32_type(&[2, 2], Some(columns)), &[1.0, 2.0, 3.0, 4.0])]),
-        );
-    }
-
-    #[test]
-    fn test_shard_map_interpretation_parallel_all_to_all_untiled() {
-        // An untiled exchange gives the device at position `p` element `p` of the inputs `[1, 2]` and `[3, 4]` of both
-        // devices, stacked along a new axis in the order of their senders.
-        let operation =
-            ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::new(CollectiveMode::Untiled));
-        let inputs = vec![vec![f32_value(f32_vector_type(2), &[1.0, 2.0]), f32_value(f32_vector_type(2), &[3.0, 4.0])]];
-        assert_eq!(
-            run_collective(2, operation, &inputs),
-            Ok(Some(vec![vec![
-                f32_value(f32_vector_type(2), &[1.0, 3.0]),
-                f32_value(f32_vector_type(2), &[2.0, 4.0])
-            ]])),
-        );
-    }
-
-    #[test]
-    fn test_shard_map_interpretation_parallel_all_to_all_axis_index_groups() {
-        // Device `p` holds `[10·p + 1, 10·p + 2]`. With groups `[[0, 2], [3, 1]]`, every member receives the chunk of
-        // its position from each member of its group, concatenated in the order of the positions of their senders.
-        let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
-        let operation = ParallelAllToAllOperation::new("x".to_string(), 4, 0, 0, options);
-        let inputs = vec![
-            (0..4)
-                .map(|device| f32_value(f32_vector_type(2), &[10.0 * device as f32 + 1.0, 10.0 * device as f32 + 2.0]))
-                .collect::<Vec<_>>(),
-        ];
-        assert_eq!(
-            run_collective(4, operation, &inputs),
-            Ok(Some(vec![vec![
-                f32_value(f32_vector_type(2), &[1.0, 21.0]),
-                f32_value(f32_vector_type(2), &[32.0, 12.0]),
-                f32_value(f32_vector_type(2), &[2.0, 22.0]),
-                f32_value(f32_vector_type(2), &[31.0, 11.0]),
-            ]])),
         );
     }
 
@@ -14166,17 +13826,6 @@ pub(crate) mod tests {
         assert_eq!(
             program.interpret(vec![f32_value(unreduced_type.clone(), &[1.0, 2.0])]),
             Ok(vec![f32_value(unreduced_type.clone(), &[2.0, 4.0])]),
-        );
-
-        // The partial outputs of distinct devices are summed elementwise.
-        let boundary = ShardMapBoundary::new(mesh, vec![unreduced.clone()], vec![unreduced], Vec::new()).unwrap();
-        let local_type = boundary.local_input_type(0, &unreduced_type).unwrap();
-        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
-        let partials = [f32_value(local_type.clone(), &[1.0, 2.0]), f32_value(local_type, &[10.0, 20.0])];
-        assert_eq!(
-            grid.assemble_global_value(&boundary.output_shardings()[0], &unreduced_type, &partials)
-                .map(ArrayIrValue::Array),
-            Ok(f32_value(unreduced_type, &[11.0, 22.0])),
         );
     }
 
@@ -26361,91 +26010,318 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_shard_map_interpretation_output_replication_compares_logical_bytes() {
+    fn test_lockstep_device_grid_with_axes() {
         let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
-        let replicated = Sharding::replicated(manual_mesh(), 1);
-        let copy = |element: f32| f32_value(f32_vector_type(1), &[element]);
-        let nan = f32::from_bits(0x7fc00001);
-        assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(nan), copy(nan)]), Ok(None));
         assert_eq!(
-            grid.replicated_copy_mismatch(&replicated, &[copy(nan), copy(f32::from_bits(0x7fc00002))]),
-            Ok(Some("x")),
+            grid.with_axes(&[("y".to_string(), 3)]),
+            LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] },
         );
-        assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(0.0), copy(-0.0)]), Ok(Some("x")));
-
-        let unreduced = replicated.with_unreduced_axes(["x"]).unwrap();
-        assert_eq!(grid.replicated_copy_mismatch(&unreduced, &[copy(1.0), copy(2.0)]), Ok(None));
+        assert_eq!(grid.with_axes(&[]), grid);
     }
 
     #[test]
-    fn test_shard_map_interpretation_validates_replicated_reference_copies() {
-        // Along an active manual axis that the input sharding of a reference neither tiles nor marks as unreduced,
-        // every device holds its own copy of the referent, which the reference contract keeps identical. Copies that
-        // differ indicate a body that violates the contract (e.g., one that writes the reference from a branch that the
-        // devices select differently), so they are rejected instead of being assembled from the copy of device zero.
+    fn test_lockstep_device_grid_axis_size() {
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] };
+        assert_eq!(grid.axis_size(&[0]), 2);
+        assert_eq!(grid.axis_size(&[1]), 3);
+        assert_eq!(grid.axis_size(&[0, 1]), 6);
+        assert_eq!(grid.axis_size(&[]), 1);
+    }
+
+    #[test]
+    fn test_lockstep_device_grid_device_count() {
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] };
+        assert_eq!(grid.device_count(), 6);
+        assert_eq!(LockstepDeviceGrid { axes: Vec::new() }.device_count(), 1);
+    }
+
+    #[test]
+    fn test_lockstep_device_grid_map_devices() {
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 3)] };
+        assert_eq!(
+            grid.map_devices(|device| Array::scalar(device as u64)),
+            Ok(vec![
+                ArrayIrValue::Array(Array::scalar(0u64).unwrap()),
+                ArrayIrValue::Array(Array::scalar(1u64).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2u64).unwrap()),
+            ]),
+        );
+
+        // The error of the first failing device is returned.
+        let error = ProgramError::InvalidArgument { message: "rejected device".to_string() };
+        assert_eq!(grid.map_devices(|_| Err(error.clone())), Err(error));
+    }
+
+    #[test]
+    fn test_lockstep_device_grid_position() {
+        // Device 4 of a `2x3` grid has the coordinates `(1, 1)`, in row-major order.
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] };
+        assert_eq!(grid.position(4, &[0]), 1);
+        assert_eq!(grid.position(4, &[1]), 1);
+
+        // Several axes combine in the given order, with the first axis major.
+        assert_eq!(grid.position(4, &[0, 1]), 4);
+        assert_eq!(grid.position(4, &[1, 0]), 3);
+        assert_eq!(grid.position(4, &[]), 0);
+    }
+
+    #[test]
+    fn test_lockstep_device_grid_device_at() {
+        // Device 4 of a `2x3` grid has the coordinates `(1, 1)`, and only its coordinates along the given axes change.
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] };
+        assert_eq!(grid.device_at(4, &[0], 0), 1);
+        assert_eq!(grid.device_at(4, &[1], 2), 5);
+
+        // Several axes combine in the given order, with the first axis major.
+        assert_eq!(grid.device_at(4, &[0, 1], 0), 0);
+        assert_eq!(grid.device_at(4, &[1, 0], 5), 5);
+        assert_eq!(grid.device_at(4, &[], 0), 4);
+    }
+
+    #[test]
+    fn test_lockstep_device_grid_participants() {
+        // Without groups, the participants are the devices that differ from the device only along the given axes,
+        // ordered by their positions along them.
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] };
+        assert_eq!(grid.participants(4, &[1], None), Ok((vec![3, 4, 5], 1)));
+        assert_eq!(grid.participants(4, &[0], None), Ok((vec![1, 4], 1)));
+
+        // With groups, the participants of a device are the members of its group, positioned by their order in that
+        // group, and groups that leave a coordinate without a group do not partition the axis.
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 4)] };
+        assert_eq!(grid.participants(2, &[0], Some([vec![3, 2], vec![1, 0]].as_slice())), Ok((vec![3, 2], 1)));
+        assert_eq!(
+            grid.participants(2, &[0], Some([vec![0, 1]].as_slice())),
+            Err(ProgramError::InvalidArgument {
+                message: "the participant groups `[[0, 1]]` of a collective over manual axis `x` do not partition \
+                          its 4 coordinates"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_lockstep_device_grid_assemble_global_value() {
+        // Along an axis that the sharding tiles, every device contributes its own block.
+        let mesh = manual_mesh();
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
+        let tiled_type = f32_type(&[4], Some(sharded_along_x()));
+        let blocks = [f32_value(f32_vector_type(2), &[1.0, 2.0]), f32_value(f32_vector_type(2), &[3.0, 4.0])];
+        assert_eq!(
+            grid.assemble_global_value(&sharded_along_x(), &tiled_type, &blocks).map(ArrayIrValue::Array),
+            Ok(f32_value(tiled_type, &[1.0, 2.0, 3.0, 4.0])),
+        );
+
+        // Along an unreduced axis, the devices hold partial values, which are summed elementwise.
+        let unreduced = Sharding::replicated(mesh, 1).with_unreduced_axes(["x"]).unwrap();
+        let unreduced_type = f32_type(&[2], Some(unreduced.clone()));
+        let partials = [f32_value(f32_vector_type(2), &[1.0, 2.0]), f32_value(f32_vector_type(2), &[10.0, 20.0])];
+        assert_eq!(
+            grid.assemble_global_value(&unreduced, &unreduced_type, &partials).map(ArrayIrValue::Array),
+            Ok(f32_value(unreduced_type, &[11.0, 22.0])),
+        );
+    }
+
+    #[test]
+    fn test_lockstep_device_grid_replicated_copy_mismatch() {
+        // Along an active manual axis that the sharding neither tiles nor marks as unreduced, every device holds a
+        // copy that must match the copy of device zero.
         let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
         let replicated = Sharding::replicated(manual_mesh(), 1);
-        let copy = |elements: &[f32]| f32_value(f32_vector_type(2), elements);
+        let copy = |elements: &[f32]| f32_value(f32_vector_type(elements.len()), elements);
         assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(&[1.0, 2.0]), copy(&[1.0, 2.0])]), Ok(None));
-        assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(&[1.0, 2.0]), copy(&[1.0, 3.0])]), Ok(Some("x")),);
+        assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(&[1.0, 2.0]), copy(&[1.0, 3.0])]), Ok(Some("x")));
 
-        // Along an unreduced axis, the devices hold partial states, which differ without violating the contract.
+        // Copies are compared by their logical bytes, so equal NaN payloads match while distinct NaN payloads and
+        // signed zeros do not.
+        let nan = f32::from_bits(0x7fc00001);
+        assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(&[nan]), copy(&[nan])]), Ok(None));
+        assert_eq!(
+            grid.replicated_copy_mismatch(&replicated, &[copy(&[nan]), copy(&[f32::from_bits(0x7fc00002)])]),
+            Ok(Some("x")),
+        );
+        assert_eq!(grid.replicated_copy_mismatch(&replicated, &[copy(&[0.0]), copy(&[-0.0])]), Ok(Some("x")));
+
+        // Along an unreduced axis, the devices hold partial values, which may differ.
         let unreduced = replicated.with_unreduced_axes(["x"]).unwrap();
         assert_eq!(grid.replicated_copy_mismatch(&unreduced, &[copy(&[1.0, 2.0]), copy(&[0.0, 0.0])]), Ok(None));
     }
 
     #[test]
-    fn test_lockstep_domain_validate_tracked_collective() {
-        // A raw cast uses the policy of the region that binds its axis, even through an inner region over another
-        // axis. Its input mesh must agree with that owner, rather than merely containing an axis with the same name.
+    fn test_lockstep_domain_new() {
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
+        let boundary = ShardMapBoundary::new(manual_mesh(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let domain = LockstepDomain::<TestOperation>::new(grid.clone(), vec![boundary.clone()]);
+        assert_eq!(domain.grid(), &grid);
+        assert_eq!(domain.manual_regions(), &[boundary]);
+    }
+
+    #[test]
+    fn test_lockstep_domain_grid() {
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] };
+        let domain = LockstepDomain::<TestOperation>::new(grid.clone(), Vec::new());
+        assert_eq!(domain.grid(), &grid);
+    }
+
+    #[test]
+    fn test_lockstep_domain_manual_regions() {
+        // The manual regions keep their order, which is outermost first.
         let mesh = manual_mesh_2x2();
+        let outer = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec!["x".to_string()]).unwrap();
+        let inner = ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), vec!["y".to_string()]).unwrap();
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 2)] };
+        let domain = LockstepDomain::<TestOperation>::new(grid.clone(), vec![outer.clone(), inner.clone()]);
+        assert_eq!(domain.manual_regions(), &[outer, inner]);
+        assert_eq!(LockstepDomain::<TestOperation>::new(grid, Vec::new()).manual_regions(), &[]);
+    }
+
+    #[test]
+    fn test_lockstep_domain_collective_axes() {
+        // The axes of a collective resolve to their positions in the grid, in the order in which it names them.
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] };
+        let domain = LockstepDomain::<TestOperation>::new(grid, Vec::new());
+        let reduce = |axis_name: &str| ParallelReduceOperation::new(ReductionKind::Sum, axis_name.to_string());
+        let gather = |axes: [&str; 2]| {
+            ParallelAllGatherOperation::new(
+                axes,
+                6,
+                0,
+                CollectiveOptions::default(),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+        };
+        assert_eq!(domain.collective_axes(&reduce("y")), Ok(vec![1]));
+        assert_eq!(domain.collective_axes(&gather(["y", "x"])), Ok(vec![1, 0]));
+
+        // A collective that names no emulated axis runs on every device independently, so it has no rule to resolve
+        // axes for, and one that mixes emulated axes with axes of an enclosing region is malformed.
+        assert_eq!(
+            domain.collective_axes(&reduce("z")),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_reduce` over manual axes `z` does not communicate along an emulated axis".to_string(),
+            )),
+        );
+        assert_eq!(
+            domain.collective_axes(&gather(["x", "z"])),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_all_gather` over manual axes `(x, z)` combines emulated axes with axes of an enclosing \
+                 region"
+                    .to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_lockstep_domain_collective_arrays() {
+        // The first input holds the arrays of every device, and the remaining inputs are returned as they are.
+        let domain =
+            LockstepDomain::<TestOperation>::new(LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] }, Vec::new());
+        let arrays = [Array::vector(vec![1f32, 2.0]).unwrap(), Array::vector(vec![3f32, 4.0]).unwrap()];
+        let extent = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let inputs = [
+            LockstepValue::new(arrays.iter().cloned().map(ArrayIrValue::Array).collect(), &domain).unwrap(),
+            LockstepValue::new(vec![extent.clone(), extent.clone()], &domain).unwrap(),
+        ];
+        let (device_arrays, extents) = domain.collective_arrays(&inputs).unwrap();
+        assert_eq!(device_arrays, arrays.iter().collect::<Vec<_>>());
+        assert_eq!(extents.iter().map(LockstepValue::values).collect::<Vec<_>>(), vec![&[extent.clone(), extent]]);
+
+        // A collective has at least one input, which must be an array on every device.
+        assert_eq!(
+            domain.collective_arrays(&[]).map(|_| ()),
+            Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+        );
+        assert!(domain.collective_arrays(&inputs[1..]).is_err());
+    }
+
+    #[test]
+    fn test_lockstep_domain_collective_output_type() {
+        // Without extent inputs, the output type is the one that the collective infers for its array input.
+        let domain =
+            LockstepDomain::<TestOperation>::new(LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] }, Vec::new());
+        let reduce = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string());
+        let input = Array::vector(vec![1f32, 2.0]).unwrap();
+        assert_eq!(domain.collective_output_type(&reduce, &input, &[], 0), Ok(f32_vector_type(2)));
+
+        // The extent inputs of a mixed form must be exactly the extents of the output type on that device.
+        let extents = |extent| {
+            let extent = ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
+            [LockstepValue::new(vec![extent.clone(), extent], &domain).unwrap()]
+        };
+        assert_eq!(domain.collective_output_type(&reduce, &input, &extents(2), 1), Ok(f32_vector_type(2)));
+        assert_eq!(
+            domain.collective_output_type(&reduce, &input, &extents(3), 1),
+            Err(ProgramError::InvalidArgument {
+                message: "`parallel_reduce` result extent input #0 is `3`, but result axis #0 has extent 2".to_string(),
+            }),
+        );
+        let [extent] = extents(2);
+        assert_eq!(
+            domain.collective_output_type(&reduce, &input, &[extent.clone(), extent], 1),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 3 }),
+        );
+    }
+
+    #[test]
+    fn test_lockstep_domain_validate_collective_axis_size() {
+        // A collective must have been staged for the number of devices along its emulated axes.
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] };
+        let domain = LockstepDomain::<TestOperation>::new(grid, Vec::new());
+        let reduce = ParallelReduceOperation::new(ReductionKind::Sum, "y".to_string());
+        assert_eq!(domain.validate_collective_axis_size(&reduce, &[1], 3), Ok(()));
+        assert_eq!(
+            domain.validate_collective_axis_size(&reduce, &[1], 4),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_reduce` was staged for 4 participants, but manual axis `y` has 3 devices".to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_lockstep_domain_validate_tracked_collective() {
+        // A tracked collective uses the policy of the region that binds its axis, even through an inner region over
+        // another axis. Here the outer region binds `x` with manual variation checking and the inner one binds `y`
+        // without it.
+        let mesh = manual_mesh_2x2();
+        let boundary = |axis: &str, checked| {
+            ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec![axis.to_string()])
+                .unwrap()
+                .with_check_manual_variation(checked)
+        };
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 2)] };
+        let domain = LockstepDomain::<TestOperation>::new(grid, vec![boundary("x", true), boundary("y", false)]);
         let input_type = f32_scalar_type().with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let vary = |axis: &str| ParallelVaryOperation::new(axis.to_string());
+        assert_eq!(domain.validate_tracked_collective(&vary("x"), "x", &input_type), Ok(()));
+        assert_eq!(
+            domain.validate_tracked_collective(&vary("y"), "y", &input_type),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_vary` cannot use tracked mesh metadata inside an unchecked manual binding".to_string(),
+            )),
+        );
+
+        // The mesh of the input must agree with the mesh of the owning region, rather than merely contain an axis
+        // with the same name.
         let foreign_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
         ])
         .unwrap();
         let foreign_type = f32_scalar_type().with_sharding(Sharding::replicated(foreign_mesh, 0)).unwrap();
-        for (outer_checked, inner_checked) in [(true, false), (false, true)] {
-            let boundary = |axis: &str, checked| {
-                ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec![axis.to_string()])
-                    .unwrap()
-                    .with_check_manual_variation(checked)
-            };
-            let domain = LockstepDomain::new(
-                LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 2)] },
-                vec![boundary("x", outer_checked), boundary("y", inner_checked)],
-            );
-            for (axis, checked) in [("x", outer_checked), ("y", inner_checked)] {
-                for operation in [
-                    ArrayOperation::ParallelVary(ParallelVaryOperation::new(axis.to_string())),
-                    ArrayOperation::ParallelCast(ParallelCastOperation::new(
-                        axis.to_string(),
-                        ParallelCastTarget::Reduced,
-                    )),
-                ] {
-                    let name = operation.name();
-                    let output_type = operation.infer_output_types(&[input_type.clone()], &[]).unwrap().remove(0);
-                    let operation = TestOperation::from(operation);
-                    let inputs = [vec![f32_value(input_type.clone(), &[2.0]); 4]];
-                    let expected = if checked {
-                        Ok(Some(vec![vec![f32_value(output_type, &[2.0]); 4]]))
-                    } else {
-                        Err(ProgramError::MalformedProgram(format!(
-                            "`{name}` cannot use tracked mesh metadata inside an unchecked manual binding",
-                        )))
-                    };
-                    assert_eq!(run_collective_in(&domain, &operation, &inputs), expected);
-                    let inputs = [vec![f32_value(foreign_type.clone(), &[2.0]); 4]];
-                    assert_eq!(
-                        run_collective_in(&domain, &operation, &inputs),
-                        Err(ProgramError::MalformedProgram(format!(
-                            "`{name}` operation mesh does not match the enclosing manual axis `{axis}` mesh",
-                        ))),
-                    );
-                }
-            }
-        }
+        assert_eq!(
+            domain.validate_tracked_collective(&vary("x"), "x", &foreign_type),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_vary` operation mesh does not match the enclosing manual axis `x` mesh".to_string(),
+            )),
+        );
+
+        // An axis that no enclosing region binds has no owner.
+        assert_eq!(
+            domain.validate_tracked_collective(&vary("z"), "z", &input_type),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_vary` manual axis `z` has no enclosing manual binding".to_string(),
+            )),
+        );
     }
 
     #[test]
@@ -26463,6 +26339,22 @@ pub(crate) mod tests {
                     .to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_lockstep_value_values() {
+        let domain =
+            LockstepDomain::<TestOperation>::new(LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] }, Vec::new());
+        let values = vec![f32_value(f32_vector_type(1), &[1.0]), f32_value(f32_vector_type(1), &[2.0])];
+        assert_eq!(LockstepValue::new(values.clone(), &domain).unwrap().values(), values.as_slice());
+    }
+
+    #[test]
+    fn test_lockstep_value_into_values() {
+        let domain =
+            LockstepDomain::<TestOperation>::new(LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] }, Vec::new());
+        let values = vec![f32_value(f32_vector_type(1), &[1.0]), f32_value(f32_vector_type(1), &[2.0])];
+        assert_eq!(LockstepValue::new(values.clone(), &domain).unwrap().into_values(), values);
     }
 
     #[test]

@@ -1802,6 +1802,8 @@ impl<
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -1820,6 +1822,7 @@ mod tests {
     use crate::operations::collectives::tests::eager_collective_context;
     use crate::operations::manipulation::transposition::Transpose;
     use crate::operations::reductions::{Reduce, ReductionKind};
+    use crate::operations::sharding::shard_map::tests::run_collective;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput, PartialTracer};
     use crate::programs::{EmptyRegionDriver, Program, ProgramBuilder, ProgramRenderingMode};
@@ -3019,6 +3022,121 @@ mod tests {
                 ],
             ),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.0f32, 3.0, 9.0, 9.0]).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_interpretation_in_lockstep_axis_index_groups() {
+        // Participant `p` holds the rows `[10·p + 1, 10·p + 2]` and sends row `i` to the member at position `i` of its
+        // group, which places it at the row given by the sender's own position. With groups `[[0, 2], [3, 1]]`, the
+        // members exchange only within their group, and the last row of every output seed passes through unchanged.
+        let operation =
+            ParallelRaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 2], vec![3, 1]]).unwrap();
+        let inputs = vec![
+            vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![11.0f32, 12.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![21.0f32, 22.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![31.0f32, 32.0]).unwrap()),
+            ],
+            vec![ArrayIrValue::Array(Array::vector(vec![-1.0f32; 3]).unwrap()); 4],
+            vec![ArrayIrValue::Array(Array::vector(vec![0i64, 1]).unwrap()); 4],
+            vec![ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()); 4],
+            vec![
+                ArrayIrValue::Array(Array::vector(vec![0i64, 0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![0i64, 0]).unwrap()),
+            ],
+            vec![ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()); 4],
+        ];
+        assert_eq!(
+            run_collective(4, operation, &inputs),
+            Ok(Some(vec![vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 21.0, -1.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![32.0f32, 12.0, -1.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![2.0f32, 22.0, -1.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![31.0f32, 11.0, -1.0]).unwrap()),
+            ]])),
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_interpretation_in_lockstep_validates_participant_inputs() {
+        // Participant `p` sends row `i` to participant `i`, which places it at row `p`. The emulator validates the
+        // inputs of all participants together before it packs the exchange.
+        let operation = ParallelRaggedAllToAllOperation::new("x".to_string(), 2);
+        let inputs = vec![
+            vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![11.0f32, 12.0]).unwrap()),
+            ],
+            vec![ArrayIrValue::Array(Array::vector(vec![-1.0f32; 3]).unwrap()); 2],
+            vec![ArrayIrValue::Array(Array::vector(vec![0i64, 1]).unwrap()); 2],
+            vec![ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()); 2],
+            vec![
+                ArrayIrValue::Array(Array::vector(vec![0i64, 0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()),
+            ],
+            vec![ArrayIrValue::Array(Array::vector(vec![1i64, 1]).unwrap()); 2],
+        ];
+
+        // The emulator requires all six exchange inputs, each containing one value per device.
+        assert_eq!(
+            run_collective(2, operation.clone(), &inputs[..5]),
+            Err(ProgramError::InvalidInputCount { expected: 6, actual: 5 }),
+        );
+
+        // Corresponding participant inputs must share one static shape and data type, even when each participant's
+        // own inputs describe a valid exchange.
+        let mut longer_inputs = inputs.clone();
+        longer_inputs[0][1] = ArrayIrValue::Array(Array::vector(vec![11.0f32, 12.0, 13.0]).unwrap());
+        assert_eq!(
+            run_collective(2, operation.clone(), &longer_inputs),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` participant inputs 0 must share one static shape and data type but got \
+                 `f32[2]` and `f32[3]`",
+            )
+            .into()),
+        );
+        let mut wider_inputs = inputs.clone();
+        wider_inputs[0][1] = ArrayIrValue::Array(Array::vector(vec![11.0f64, 12.0]).unwrap());
+        wider_inputs[1][1] = ArrayIrValue::Array(Array::vector(vec![-1.0f64; 3]).unwrap());
+        assert_eq!(
+            run_collective(2, operation.clone(), &wider_inputs),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` participant inputs 0 must share one static shape and data type but got \
+                 `f32[2]` and `f64[2]`",
+            )
+            .into()),
+        );
+
+        // Packing the physical exchange requires static shapes even when the logical exchange types are valid.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(4)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let dynamic_inputs = vec![
+            vec![
+                ArrayIrValue::Array(Array::new_unchecked(
+                    dynamic_type.clone(),
+                    Arc::new(Array::vector(vec![1.0f32, 2.0]).unwrap().logical_bytes()),
+                )),
+                ArrayIrValue::Array(Array::new_unchecked(
+                    dynamic_type,
+                    Arc::new(Array::vector(vec![11.0f32, 12.0]).unwrap().logical_bytes()),
+                )),
+            ],
+            inputs[1].clone(),
+            inputs[2].clone(),
+            inputs[3].clone(),
+            inputs[4].clone(),
+            inputs[5].clone(),
+        ];
+        assert_eq!(
+            run_collective(2, operation, &dynamic_inputs),
+            Err(TypeError::invalid(
+                "`parallel_ragged_all_to_all` participant input 0 must have a static shape but got `f32[extent]`",
+            )
+            .into()),
         );
     }
 

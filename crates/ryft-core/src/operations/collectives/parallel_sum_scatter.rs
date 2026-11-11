@@ -1144,6 +1144,7 @@ mod tests {
     use crate::operations::assertions::AssertionError;
     use crate::operations::collectives::tests::{batch_collective, collective_program};
     use crate::operations::manipulation::slicing::Slice;
+    use crate::operations::sharding::shard_map::tests::run_collective;
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue};
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypedProgram};
@@ -1676,6 +1677,49 @@ mod tests {
                 &[input.clone(), ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())],
             ),
             Ok(vec![input]),
+        );
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_interpretation_in_lockstep_untiled() {
+        // An untiled scatter gives every device the element of the sum `[4, 6]` of the inputs `[1, 2]` and `[3, 4]` at
+        // its own position, without the scattered axis.
+        let operation =
+            ParallelSumScatterOperation::new("x".to_string(), 2, 0, CollectiveOptions::new(CollectiveMode::Untiled));
+        let inputs = vec![vec![
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap()),
+        ]];
+        assert_eq!(
+            run_collective(2, operation, &inputs),
+            Ok(Some(vec![vec![
+                ArrayIrValue::Array(Array::scalar(4.0f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(6.0f32).unwrap()),
+            ]])),
+        );
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_interpretation_in_lockstep_axis_index_groups() {
+        // Device `p` holds `[10·p + 1, 10·p + 2]`. With groups `[[0, 2], [3, 1]]`, the devices `0` and `2` scatter
+        // their sum `[22, 24]`, and the devices `3` and `1` scatter their sum `[42, 44]`, by their positions in their
+        // groups.
+        let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+        let operation = ParallelSumScatterOperation::new("x".to_string(), 4, 0, options);
+        let inputs = vec![vec![
+            ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![11.0f32, 12.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![21.0f32, 22.0]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![31.0f32, 32.0]).unwrap()),
+        ]];
+        assert_eq!(
+            run_collective(4, operation, &inputs),
+            Ok(Some(vec![vec![
+                ArrayIrValue::Array(Array::vector(vec![22.0f32]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![44.0f32]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![24.0f32]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![42.0f32]).unwrap()),
+            ]])),
         );
     }
 

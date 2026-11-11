@@ -1541,6 +1541,7 @@ mod tests {
     use crate::operations::collectives::tests::{batch_collective, collective_program, transpose_ignored_collective};
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::reductions::{Reduce, ReductionKind};
+    use crate::operations::sharding::shard_map::tests::run_collective;
     use crate::parameters::Placeholder;
     use crate::partial::PartialEvaluationOutput;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypedProgram};
@@ -2413,6 +2414,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_parallel_all_gather_interpretation_in_lockstep_axis_index_groups() {
+        // A grouped gather concatenates the inputs of the members of each group in the order of their positions in that
+        // group, so with groups `[[0, 2], [3, 1]]` the devices `0` and `2` gather `[1, 3]` and the devices `3` and `1`
+        // gather `[4, 2]`.
+        let options = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+        let operation =
+            ParallelAllGatherOperation::new("x".to_string(), 4, 0, options, ParallelAllGatherOutputVariance::Varying);
+        let inputs = vec![vec![
+            ArrayIrValue::Array(Array::vector(vec![1.0f32]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![2.0f32]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![3.0f32]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![4.0f32]).unwrap()),
+        ]];
+        assert_eq!(
+            run_collective(4, operation, &inputs),
+            Ok(Some(vec![vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 3.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![4.0f32, 2.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![1.0f32, 3.0]).unwrap()),
+                ArrayIrValue::Array(Array::vector(vec![4.0f32, 2.0]).unwrap()),
+            ]])),
+        );
     }
 
     #[test]
