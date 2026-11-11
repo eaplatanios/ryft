@@ -584,7 +584,7 @@ where
 
     /// Homogeneous array operation. Member zero constructors are promoted to their mixed array IR carrier when an
     /// array operation is lifted into this family.
-    #[ryft(projected(ArrayType), collective, skip_from)]
+    #[ryft(projected(ArrayType), collective, lockstep, skip_from)]
     Array(ArrayOperation<<Payload as ValueProjection<ArrayType>>::Projected>),
 
     /// Homogeneous first-class-dimension operation.
@@ -657,28 +657,31 @@ where
     RngBitGenerator(RngBitGeneratorOperation<ArrayIrType>),
 
     /// Gathers values with one explicit extent per result axis.
-    #[ryft(mixed, collective)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelAllGather(ParallelAllGatherOperation),
 
     /// Scatters values with one explicit extent per result axis.
-    #[ryft(mixed, collective)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelSumScatter(ParallelSumScatterOperation),
 
     /// Exchanges values with one explicit extent per result axis.
-    #[ryft(mixed, collective)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelAllToAll(ParallelAllToAllOperation),
 
     /// Exchanges variable-length leading-axis slices through an XLA FFI custom call.
-    #[ryft(mixed, collective)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
 
     /// Backend-owned condition whose attached branch regions can contain XLA operations.
+    #[ryft(lockstep)]
     Condition(ConditionOperation<ArrayIrType>),
 
     /// Backend-owned loop whose attached condition and body regions can contain XLA operations.
+    #[ryft(lockstep)]
     While(WhileOperation<ArrayIrType>),
 
     /// Backend-owned scan whose attached body region can contain XLA operations.
+    #[ryft(lockstep)]
     Scan(ScanOperation<ArrayIrType>),
 
     /// Backend-owned composite call whose primal region can contain XLA operations, with either attached rule regions

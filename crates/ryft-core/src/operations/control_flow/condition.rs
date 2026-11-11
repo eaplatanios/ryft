@@ -69,6 +69,7 @@ use crate::operations::manipulation::broadcasting::{
 };
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::references::ReferenceNewOperation;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
@@ -681,6 +682,21 @@ impl<C: Domain<Type: ConditionType, Value: Concretizable<bool>>> InterpretableOp
         self.validate_application(&input_types, branches)?;
         let branch = if inputs[0].concretize()? { 0 } else { 1 };
         driver.interpret_region(context, branch, inputs[1..].to_vec())
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ConditionOperation<ArrayIrType>
+where
+    Self: InterpretableOperation<LockstepDomain<O>>,
+{
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret(context, driver, inputs))
     }
 }
 

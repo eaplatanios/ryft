@@ -1,4 +1,4 @@
-error: invalid operation variant `#[ryft(...)]` attribute `family_member`; only `projected`, `mixed`, `collective`, and `skip_from` are supported here
+error: invalid operation variant `#[ryft(...)]` attribute `family_member`; only `projected`, `mixed`, `collective`, `lockstep`, and `skip_from` are supported here
  --> tests/operations/error_variants.rs:6:12
   |
 6 |     #[ryft(family_member(ArrayType))]

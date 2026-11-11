@@ -77,6 +77,7 @@ use crate::operations::control_flow::{
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::slicing::DynamicUpdateSlice;
 use crate::operations::reductions::Reduce;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
@@ -1354,6 +1355,21 @@ impl<C: Domain<Type: WhileType, Value: WhilePredicate>> InterpretableOperation<C
                 .collect::<Result<Vec<_>, _>>()?;
             completed_iterations += 1;
         }
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for WhileOperation<ArrayIrType>
+where
+    Self: InterpretableOperation<LockstepDomain<O>>,
+{
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret(context, driver, inputs))
     }
 }
 

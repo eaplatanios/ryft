@@ -46,8 +46,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayOperation, ArrayType, DataType, Dimension, DimensionMemberType,
-    DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, Shape, Sharding, ShardingDimension,
+    ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayMemberType, ArrayOperation, ArrayType, DataType, Dimension,
+    DimensionMemberType, DimensionType, DimensionVariable, MAX_DIMENSION_EXTENT, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -79,6 +79,7 @@ use crate::operations::manipulation::conversions::{CastOperation, CastType};
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
 use crate::operations::references::ReferenceNewOperation;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::residuals::ResidualRecomputation;
 use crate::partial::{
@@ -780,6 +781,78 @@ impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for EagerContext
         let stack = joined.pop().unwrap();
 
         Ok(ArrayIrValue::Array(write_scan_iteration(stack, iteration, value, axis_sharding)?))
+    }
+}
+
+// Every device applies the eager array IR iteration functions to its own values, so the manual variation of slices and
+// stacks is reconciled exactly as when the scan binds per device. The devices agree on a dynamic trip count, because
+// they agree on the type of the iteration count (refer to `LockstepOperation`), which is its extent.
+impl<O: Operation<Type = ArrayIrType>> ScanInterpretationDomain for LockstepDomain<O> {
+    fn iteration_count(iteration_count: &LockstepValue<O>) -> Result<usize, ProgramError> {
+        EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::iteration_count(&iteration_count.values()[0])
+    }
+
+    fn iteration_index(&self, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
+        let index = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().iteration_index(iteration)?;
+        LockstepValue::new(vec![index; self.grid().device_count()], self)
+    }
+
+    fn empty_stack(
+        &self,
+        output_type: &Self::Type,
+        body_input_types: &[Self::Type],
+        inputs: &[LockstepValue<O>],
+    ) -> Result<LockstepValue<O>, ProgramError> {
+        (0..self.grid().device_count())
+            .map(|device| {
+                let inputs = inputs.iter().map(|input| input.values()[device].clone()).collect::<Vec<_>>();
+                EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().empty_stack(
+                    output_type,
+                    body_input_types,
+                    &inputs,
+                )
+            })
+            .collect::<Result<_, _>>()
+            .and_then(|values| LockstepValue::new(values, self))
+    }
+
+    fn read_iteration(stack: &LockstepValue<O>, iteration: usize) -> Result<LockstepValue<O>, ProgramError> {
+        stack
+            .values()
+            .iter()
+            .map(|stack| EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::read_iteration(stack, iteration))
+            .collect::<Result<_, _>>()
+            .and_then(|values| LockstepValue::new(values, &stack.domain()))
+    }
+
+    fn write_iteration(
+        &self,
+        output_index: usize,
+        stack: Option<LockstepValue<O>>,
+        iteration_count: usize,
+        axis_sharding: &ShardingDimension,
+        iteration: usize,
+        value: LockstepValue<O>,
+    ) -> Result<LockstepValue<O>, ProgramError> {
+        let stacks = match stack {
+            Some(stack) => stack.into_values().into_iter().map(Some).collect(),
+            None => vec![None; self.grid().device_count()],
+        };
+        stacks
+            .into_iter()
+            .zip(value.into_values())
+            .map(|(stack, value)| {
+                EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().write_iteration(
+                    output_index,
+                    stack,
+                    iteration_count,
+                    axis_sharding,
+                    iteration,
+                    value,
+                )
+            })
+            .collect::<Result<_, _>>()
+            .and_then(|values| LockstepValue::new(values, self))
     }
 }
 
@@ -1893,6 +1966,21 @@ impl<C: ScanInterpretationDomain> InterpretableOperation<C> for ScanOperation<C:
             });
         }
         Ok(carries)
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ScanOperation<ArrayIrType>
+where
+    Self: InterpretableOperation<LockstepDomain<O>>,
+{
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret(context, driver, inputs))
     }
 }
 

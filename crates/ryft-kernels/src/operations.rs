@@ -14,13 +14,13 @@ use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayType,
     CollectiveAxes, CollectiveOperation, ConditionOperation, ConstantOperation, Context, DimensionOperation,
     DimensionSizeOperation, DimensionType, DimensionValue, Domain, DynamicBroadcastOperation, Effects, ErasedOperation,
-    InputRegionProvenance, InterpretableOperation, InterpretationDriver, Operation, OperationBoundaryPruning,
-    OperationPayloadProjection, OperationProjection, OutputRegionProvenance, PartialEvaluationContext,
-    PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation, ProgramError,
-    ReferenceAccessDescriptor, ReferenceAccessMode, ReferenceAccessOperation, ReferenceAddUpdateOperation,
-    ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSwapOperation, ReferenceWriteOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionSlot, Type,
-    TypeError, TypeIdentityRenaming,
+    InputRegionProvenance, InterpretableOperation, InterpretationDriver, LockstepDomain, LockstepOperation,
+    LockstepValue, Operation, OperationBoundaryPruning, OperationPayloadProjection, OperationProjection,
+    OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
+    PartiallyEvaluatableOperation, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
+    ReferenceAccessOperation, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation,
+    ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionDataFlow,
+    RegionInterface, RegionLiveness, RegionSlot, Type, TypeError, TypeIdentityRenaming,
 };
 
 use crate::calls::{KernelCallOperation, KernelDefinition};
@@ -828,6 +828,32 @@ impl<Extension: Operation<Type = ArrayIrType>> CollectiveOperation for KernelOpe
             | Self::MaskedStore(_)
             | Self::MaskedSwap(_)
             | Self::Extension(_) => Cow::Owned(CollectiveAxes::default()),
+        }
+    }
+}
+
+impl<Extension: Operation<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> LockstepOperation<O>
+    for KernelOperation<Extension>
+{
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        // Only the portable operations can have a rule over all emulated devices. The adapter-owned extension is a
+        // generic payload, so it is not consulted, as for the collective axes.
+        match self {
+            Self::Portable(operation) => operation.interpret_in_lockstep(context, driver, inputs),
+            Self::Call(_)
+            | Self::Scratch(_)
+            | Self::TileLoad(_)
+            | Self::AsyncCopy(_)
+            | Self::Wait(_)
+            | Self::MaskedLoad(_)
+            | Self::MaskedStore(_)
+            | Self::MaskedSwap(_)
+            | Self::Extension(_) => None,
         }
     }
 }

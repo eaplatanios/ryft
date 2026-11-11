@@ -98,25 +98,25 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Dot(DotOperation),
     RaggedDot(RaggedDotOperation),
     ScaledDot(ScaledDotOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     AxisIndex(AxisIndexOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     ParallelReduce(ParallelReduceOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     ParallelVary(ParallelVaryOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     ParallelCast(ParallelCastOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     ParallelAllGather(ParallelAllGatherOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     ParallelSumScatter(ParallelSumScatterOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     ParallelPermute(ParallelPermuteOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     ParallelBroadcast(ParallelBroadcastOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     ParallelAllToAll(ParallelAllToAllOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
     Compare(CompareOperation<ArrayType>),
     Select(SelectOperation<ArrayType>),
@@ -343,7 +343,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Attached regions belong to the array IR universe and cannot pass through this projection. Region-carrying
     /// operations must instead use dedicated array IR family variants that retain access to their regions. Transforms
     /// reject a region-carrying payload constructed here directly, with a diagnostic naming its operation.
-    #[ryft(projected(ArrayType), collective, skip_from)]
+    #[ryft(projected(ArrayType), collective, lockstep, skip_from)]
     Array(ArrayOperation<A>),
 
     /// Homogeneous [`DimensionOperation`] member.
@@ -381,20 +381,20 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
 
     /// All-gather with explicit result extents.
-    #[ryft(mixed, collective)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelAllGather(ParallelAllGatherOperation),
 
     /// Sum-scatter with explicit result extents.
-    #[ryft(mixed, collective)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelSumScatter(ParallelSumScatterOperation),
 
     /// All-to-all with explicit result extents.
-    #[ryft(mixed, collective)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelAllToAll(ParallelAllToAllOperation),
 
     /// Array-only ragged all-to-all. It needs an explicit carrier because [`Array`](Self::Array) is already the single
     /// canonical projected carrier for [`ArrayType`].
-    #[ryft(mixed, collective)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
 
     /// Compares two dimensions, producing a rank-zero Boolean array: `(Dimension, Dimension) -> Array(Boolean scalar)`.
@@ -424,13 +424,16 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     ShardMap(ShardMapOperation),
 
     /// Branches between array IR regions.
+    #[ryft(lockstep)]
     Condition(ConditionOperation<ArrayIrType>),
 
     /// Loops over array IR condition and body regions.
+    #[ryft(lockstep)]
     While(WhileOperation<ArrayIrType>),
 
     /// Scans an array IR body, including first-class dimension carries, dynamic trip counts, reference carries,
     /// and reference stacks.
+    #[ryft(lockstep)]
     Scan(ScanOperation<ArrayIrType>),
 
     /// Rematerialized call with an array IR body.
