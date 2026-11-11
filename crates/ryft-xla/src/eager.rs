@@ -3878,8 +3878,10 @@ mod tests {
 
     #[test]
     fn test_eager_dot_product_attention_parity_with_reference_backend() {
-        use ryft_core::operations::attention::{AttentionConfiguration, AttentionInputs, dot_product_attention};
-        use ryft_core::{ArrayOperation, EagerContext, ProjectedContext};
+        use ryft_core::{
+            ArrayOperation, AttentionConfiguration, AttentionInputs, EagerContext, ProjectedContext,
+            dot_product_attention,
+        };
 
         type ArrayDomain<'c> = ProjectedContext<Domain<'c>, ArrayType>;
         type ReferenceContext = EagerContext<CoreArray, ArrayOperation<CoreArray>>;
@@ -3979,10 +3981,10 @@ mod tests {
 
     #[test]
     fn test_eager_differentiable_dot_product_attention_gradient() {
-        use ryft_core::operations::attention::{
-            AttentionConfiguration, AttentionInputs, differentiable_dot_product_attention,
+        use ryft_core::{
+            ArrayOperation, AttentionConfiguration, AttentionInputs, EagerContext, ProjectedContext,
+            differentiable_dot_product_attention,
         };
-        use ryft_core::{ArrayOperation, EagerContext, ProjectedContext};
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

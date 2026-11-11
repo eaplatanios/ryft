@@ -304,7 +304,10 @@ use crate::operations::references::{
     ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
 };
 use crate::operations::sharding::reshard::ReshardOperation;
-use crate::parameters::{Parameter, ParameterError, ParameterPath, Parameterized, ParameterizedFamily, Placeholder};
+use crate::parameters::{
+    Parameter, ParameterError, ParameterPath, Parameterized, ParameterizedFamily, Placeholder,
+    validate_parameter_structure,
+};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, ResidualInputSource,
@@ -6890,32 +6893,6 @@ where
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Validates that `value` has the structure whose parameter paths are `expected_paths` (i.e., that input shardings have
-/// the structure of their inputs, or that the outputs of a body function have the structure of their output shardings).
-/// Leaves are paired with their shardings in flat order, so without this check, a value with as many leaves but a
-/// different structure would silently pair leaves with the wrong shardings.
-///
-/// # Errors
-///
-/// Returns [`ParameterError::MismatchedParameterStructures`], wrapped in [`ShardMapError::Parameter`], when the
-/// parameter paths of `value` differ from `expected_paths`.
-fn validate_parameter_structure<P: Parameter, Value: Parameterized<P>>(
-    expected_paths: &[ParameterPath],
-    value: &Value,
-) -> Result<(), ShardMapError> {
-    let paths = value.parameter_paths().collect::<Vec<_>>();
-    if paths != expected_paths {
-        let render = |paths: &[ParameterPath]| {
-            format!("[{}]", paths.iter().map(ParameterPath::to_string).collect::<Vec<_>>().join(", "))
-        };
-        return Err(ShardMapError::Parameter(ParameterError::MismatchedParameterStructures {
-            left_structure: render(expected_paths),
-            right_structure: render(paths.as_slice()),
-        }));
-    }
-    Ok(())
-}
-
 /// Traces `function` as the local body of a `shard_map` over `mesh` on `inputs` in `context` and binds it there,
 /// which is the shared implementation of the `shard_map` and `shard_map_along` functions of [`ShardMap`]. The boundary
 /// of a map whose output shardings are [`ShardMapOutputShardings::Along`] starts without outputs, since the output
@@ -6947,6 +6924,62 @@ where
     TracingContext<C::Constant, C::Operation>:
         StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
 {
+    /// Builds the [`ShardMapBoundary`] of a closure-traced `shard_map` that is bound in the scope of named axes
+    /// `named_axes` (innermost first, as returned by [`NamedAxes::named_axes`]), and returns it together with the
+    /// enclosing bindings that its body inherits. These are, first, the [`NamedAxis::Mesh`] bindings of `named_axes`
+    /// whose names are axes of `mesh`, in mesh order, which name the axes that enclosing manual regions already made
+    /// manual (JAX's `mesh.manual_axes`), so the boundary is validated against them through
+    /// [`ShardMapBoundary::new_with_enclosing_manual_axes`], and the map can make none of them manual again, followed
+    /// by the [`NamedAxis::Batched`] bindings of `named_axes` whose names are not axes of `mesh`, in scope order, which
+    /// name the axes of enclosing `batch` levels, so that collectives inside the body can refer to them and the
+    /// batching rule of the level that binds such a name consumes them. Every other binding (i.e., a mesh binding whose
+    /// name is not an axis of `mesh`, or a batched binding named like an axis of `mesh`) is not visible to the body.
+    /// When several bindings share a name, the first one is used, which is the one that [`NamedAxes::named_axis`]
+    /// resolves. A mesh binding whose name is an axis of `mesh` but whose mesh is another device mesh is rejected
+    /// with [`ShardMapError::EnclosingManualAxisMeshMismatch`].
+    fn shard_map_within_named_axes(
+        mesh: LogicalMesh,
+        input_shardings: Vec<Sharding>,
+        output_shardings: Vec<Sharding>,
+        manual_axes: Vec<String>,
+        named_axes: &[(String, NamedAxis)],
+    ) -> Result<(ShardMapBoundary, Vec<(String, NamedAxis)>), ShardMapError> {
+        let mut enclosing_named_axes = Vec::new();
+        for axis in mesh.axes() {
+            match named_axes.iter().find(|(name, _)| name == axis.name()) {
+                Some((name, binding @ NamedAxis::Mesh { mesh: enclosing_mesh, .. })) => {
+                    if !enclosing_mesh.has_same_topology(&mesh) {
+                        return Err(ShardMapError::EnclosingManualAxisMeshMismatch {
+                            axis_name: name.clone(),
+                            enclosing_mesh: enclosing_mesh.clone(),
+                            mesh: mesh.clone(),
+                        });
+                    }
+                    enclosing_named_axes.push((name.clone(), binding.clone()));
+                }
+                Some((_, NamedAxis::Batched { .. })) | None => {}
+            }
+        }
+        let enclosing_manual_axes = enclosing_named_axes.iter().map(|(name, _)| name.as_str()).collect::<HashSet<_>>();
+        let boundary = ShardMapBoundary::new_with_enclosing_manual_axes(
+            mesh,
+            input_shardings,
+            output_shardings,
+            manual_axes.into(),
+            &enclosing_manual_axes,
+        )?;
+        let mut visited_names = HashSet::new();
+        for (name, binding) in named_axes {
+            if visited_names.insert(name.as_str())
+                && matches!(binding, NamedAxis::Batched { .. })
+                && boundary.mesh().axis_index(name).is_none()
+            {
+                enclosing_named_axes.push((name.clone(), binding.clone()));
+            }
+        }
+        Ok((boundary, enclosing_named_axes))
+    }
+
     let ShardMapOutputs { paths: output_paths, structure: output_structure, shardings: output_shardings } = outputs;
     let input_structure = inputs.parameter_structure();
     let global_input_types = inputs.parameters().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -6958,7 +6991,7 @@ where
         ShardMapOutputShardings::Along { axis_name, axes } => (Vec::new(), Some((axis_name, axes))),
     };
 
-    let (boundary, outer_named_axes) = shard_map_within_named_axes(
+    let (boundary, mut outer_named_axes) = shard_map_within_named_axes(
         mesh.clone(),
         input_shardings.clone(),
         initial_output_shardings,
@@ -7026,129 +7059,14 @@ where
         }
     });
 
-    // The traced body is compiled once per domain, so its callback is passed with its type erased.
-    // The callback is invoked exactly once.
-    let mut function = Some(
-        |body_context: &ProjectedContext<DomainTracingContext<C>, ArrayType>,
-         local_inputs: Vec<ProjectedValue<ArrayType, DomainTracer<C>>>| {
-            let local_inputs = Input::To::<ProjectedValue<ArrayType, DomainTracer<C>>>::from_parameters(
-                input_structure,
-                local_inputs,
-            )?;
-            let local_outputs = function(body_context, local_inputs)?;
-            validate_parameter_structure(&output_paths, &local_outputs)?;
-            Ok(local_outputs.into_parameters().collect())
-        },
-    );
-
-    let (operation, body) = trace_shard_map_body::<C>(
-        boundary,
-        &mut |body_context, local_inputs| function.take().unwrap()(body_context, local_inputs),
-        rebuild_boundary.as_ref().map(|rebuild| rebuild as &dyn Fn(&[ArrayType]) -> Result<_, _>),
-        global_input_types,
-        outer_named_axes,
-    )?;
-
-    let outputs = context
-        .bind(operation, vec![body], inputs.as_slice())?
-        .into_iter()
-        .map(|output| ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(Output::To::<<C::Value as ValueProjection<ArrayType>>::Projected>::from_parameters(output_structure, outputs)?)
-}
-
-/// Builds the [`ShardMapBoundary`] of a closure-traced `shard_map` that is bound in the scope of named axes
-/// `named_axes` (innermost first, as returned by [`NamedAxes::named_axes`]), and returns it together with the enclosing
-/// bindings that its body inherits. These are, first, the [`NamedAxis::Mesh`] bindings of `named_axes` whose names are
-/// axes of `mesh`, in mesh order, which name the axes that enclosing manual regions already made manual (JAX's
-/// `mesh.manual_axes`), so the boundary is validated against them through
-/// [`ShardMapBoundary::new_with_enclosing_manual_axes`], and the map can make none of them manual again, followed by
-/// the [`NamedAxis::Batched`] bindings of `named_axes` whose names are not axes of `mesh`, in scope order, which name
-/// the axes of enclosing `batch` levels, so that collectives inside the body can refer to them and the batching rule of
-/// the level that binds such a name consumes them. Every other binding (i.e., a mesh binding whose name is not an axis
-/// of `mesh`, or a batched binding named like an axis of `mesh`) is not visible to the body. When several bindings
-/// share a name, the first one is used, which is the one that [`NamedAxes::named_axis`] resolves. A mesh binding whose
-/// name is an axis of `mesh` but whose mesh is another device mesh is rejected with
-/// [`ShardMapError::EnclosingManualAxisMeshMismatch`].
-fn shard_map_within_named_axes(
-    mesh: LogicalMesh,
-    input_shardings: Vec<Sharding>,
-    output_shardings: Vec<Sharding>,
-    manual_axes: Vec<String>,
-    named_axes: &[(String, NamedAxis)],
-) -> Result<(ShardMapBoundary, Vec<(String, NamedAxis)>), ShardMapError> {
-    let mut enclosing_named_axes = Vec::new();
-    for axis in mesh.axes() {
-        match named_axes.iter().find(|(name, _)| name == axis.name()) {
-            Some((name, binding @ NamedAxis::Mesh { mesh: enclosing_mesh, .. })) => {
-                if !enclosing_mesh.has_same_topology(&mesh) {
-                    return Err(ShardMapError::EnclosingManualAxisMeshMismatch {
-                        axis_name: name.clone(),
-                        enclosing_mesh: enclosing_mesh.clone(),
-                        mesh: mesh.clone(),
-                    });
-                }
-                enclosing_named_axes.push((name.clone(), binding.clone()));
-            }
-            Some((_, NamedAxis::Batched { .. })) | None => {}
-        }
-    }
-    let enclosing_manual_axes = enclosing_named_axes.iter().map(|(name, _)| name.as_str()).collect::<HashSet<_>>();
-    let boundary = ShardMapBoundary::new_with_enclosing_manual_axes(
-        mesh,
-        input_shardings,
-        output_shardings,
-        manual_axes.into(),
-        &enclosing_manual_axes,
-    )?;
-    let mut visited_names = HashSet::new();
-    for (name, binding) in named_axes {
-        if visited_names.insert(name.as_str())
-            && matches!(binding, NamedAxis::Batched { .. })
-            && boundary.mesh().axis_index(name).is_none()
-        {
-            enclosing_named_axes.push((name.clone(), binding.clone()));
-        }
-    }
-    Ok((boundary, enclosing_named_axes))
-}
-
-/// Traces `function` as the local body of `shard_map` for the flat caller input types `global_input_types` and returns
-/// the checked [`ShardMapOperation`] together with the traced body that the `shard_map` function of [`ShardMap`] binds.
-/// The caller types are normalized through [`ShardMapBoundary::global_input_type`], `function` is traced in a fresh
-/// [`DomainTracingContext`] of `C` over the [`ProjectedContext`] array view of that trace and the local shards of those
-/// types, with the trace seeded with `outer_named_axes` shadowed by the active manual axes of `shard_map`, each output
-/// receives `parallel_vary` along every active manual axis that its output sharding tiles and along which it does not
-/// vary yet, and the simplified body is checked through [`ShardMapOperation::from_program`], which also derives the
-/// global output types.
-///
-/// # Parameters
-///
-///   - `boundary`: Boundary metadata of the traced body.
-///   - `function`: Flat body closure over the body context and the local `shard_map` values, which is invoked exactly
-///     once. Its type is erased so that this function is compiled once per domain rather than once per closure type.
-///   - `rebuild_boundary`: Optional function that rebuilds `boundary` from the local output types of the body, for a
-///     map whose output shardings depend on its output ranks (refer to the `shard_map_along` function of
-///     [`ShardMap`]). It replaces `boundary` once `function` returns.
-///   - `global_input_types`: Caller's global input types, in the order of the input shardings.
-///   - `outer_named_axes`: Enclosing bindings of named axes that the body inherits.
-fn trace_shard_map_body<C: Domain<Type = ArrayIrType>>(
-    boundary: ShardMapBoundary,
-    function: &mut dyn FnMut(
-        &ProjectedContext<DomainTracingContext<C>, ArrayType>,
-        Vec<ProjectedValue<ArrayType, DomainTracer<C>>>,
-    ) -> Result<Vec<ProjectedValue<ArrayType, DomainTracer<C>>>, ProgramError>,
-    rebuild_boundary: Option<&dyn Fn(&[ArrayType]) -> Result<ShardMapBoundary, ShardMapError>>,
-    global_input_types: Vec<ArrayType>,
-    mut outer_named_axes: Vec<(String, NamedAxis)>,
-) -> Result<(ShardMapOperation, FlatProgram<C>), ShardMapError>
-where
-    C::Operation: OperationPayloadProjection,
-    ProjectedValue<ArrayType, DomainTracer<C>>: ParallelVary,
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
-{
+    // Trace `function` as the local body of the `shard_map` for the flat caller input types `global_input_types`,
+    // which gives the checked `ShardMapOperation` together with the traced body that is bound below. The caller types
+    // are normalized through `ShardMapBoundary::global_input_type`, `function` is traced in a fresh
+    // `DomainTracingContext` of `C` over the `ProjectedContext` array view of that trace and the local shards of those
+    // types, with the trace seeded with `outer_named_axes` shadowed by the active manual axes of `shard_map`, each
+    // output receives `parallel_vary` along every active manual axis that its output sharding tiles and along which
+    // it does not vary yet, and the simplified body is checked through `ShardMapOperation::from_program`, which also
+    // derives the global output types.
     if global_input_types.len() != boundary.input_shardings().len() {
         return Err(ShardMapError::InputTypeCountMismatch {
             expected: boundary.input_shardings().len(),
@@ -7194,9 +7112,15 @@ where
                 .into_iter()
                 .map(|input| ValueProjection::<ArrayType>::into_projected(input).map_err(ProgramError::from))
                 .collect::<Result<Vec<_>, _>>()?;
-            let local_outputs =
-                function(&ProjectedContext::<DomainTracingContext<C>, ArrayType>::new(context.clone()), local_inputs)?;
-            let boundary = match rebuild_boundary {
+            let body_context = ProjectedContext::<DomainTracingContext<C>, ArrayType>::new(context.clone());
+            let local_inputs = Input::To::<ProjectedValue<ArrayType, DomainTracer<C>>>::from_parameters(
+                input_structure,
+                local_inputs,
+            )?;
+            let local_outputs = function(&body_context, local_inputs)?;
+            validate_parameter_structure(&output_paths, &local_outputs)?;
+            let local_outputs = local_outputs.into_parameters().collect::<Vec<_>>();
+            let boundary = match &rebuild_boundary {
                 Some(rebuild_boundary) => {
                     let output_types =
                         local_outputs.iter().map(|output| output.r#type().into_owned()).collect::<Vec<_>>();
@@ -7236,7 +7160,14 @@ where
         global_input_types.iter().cloned().map(ArrayIrType::Array).collect(),
         boundary,
     )?;
-    Ok((operation, body))
+
+    let outputs = context
+        .bind(operation, vec![body], inputs.as_slice())?
+        .into_iter()
+        .map(|output| ValueProjection::<ArrayType>::into_projected(output).map_err(ProgramError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(Output::To::<<C::Value as ValueProjection<ArrayType>>::Projected>::from_parameters(output_structure, outputs)?)
 }
 
 #[cfg(test)]

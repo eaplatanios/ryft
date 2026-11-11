@@ -2068,10 +2068,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_attention_varying_keys_gradient_executes_on_cpu() {
-        use ryft_core::operations::attention::{
-            AttentionConfiguration, AttentionImplementation, AttentionInputs, differentiable_dot_product_attention,
+        use ryft_core::{
+            ArrayOperation, AttentionConfiguration, AttentionImplementation, AttentionInputs, DomainTracer,
+            EagerContext, differentiable_dot_product_attention,
         };
-        use ryft_core::{ArrayOperation, DomainTracer, EagerContext};
 
         use crate::experimental::ops::ArrayConstant;
 

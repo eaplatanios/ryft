@@ -1658,14 +1658,12 @@ mod tests {
     #[cfg(test)]
     use ryft_core::Array as CoreArray;
     #[cfg(feature = "cuda-13")]
-    use ryft_core::operations::attention::dot_product_attention;
-    use ryft_core::operations::attention::{
-        AttentionConfiguration, AttentionImplementation, AttentionInputs, differentiable_dot_product_attention,
-    };
+    use ryft_core::dot_product_attention;
     use ryft_core::{
         AddOperation, ArgMaxOperation, ArgMinOperation, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, AtomId, AxisIndexOperation,
-        BatchAxis, CaptureReference, CollectiveOptions, CompareOperation, ComparisonDirection, CompilationCacheDomain,
+        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, AtomId,
+        AttentionConfiguration, AttentionImplementation, AttentionInputs, AxisIndexOperation, BatchAxis,
+        CaptureReference, CollectiveOptions, CompareOperation, ComparisonDirection, CompilationCacheDomain,
         CompilationDomain, CompilationTracer, Compile, CompiledFunctionDispatcher, ConditionOperation,
         ConstantOperation, Context, ConvertElementTypeOperation, CotangentDestinationKind, CumulativeKind,
         CumulativeOperation, CustomCallOperation, DataType, Device, DeviceMesh, Differentiate,
@@ -1685,7 +1683,8 @@ mod tests {
         ScanOperation, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, ShardMapBoundary,
         ShardMapOperation, ShardMapOptions, Sharding, ShardingDimension, SliceOperation, SortDirection, SortOperation,
         StagedFunction as CoreStagedFunction, StagingContext, StaticShape, SubOperation, TiledLayout, TracingContext,
-        Type, Typed, TypedProgram, Value as CoreValue, ValueProjection, WhileOperation, batch, shard_map,
+        Type, Typed, TypedProgram, Value as CoreValue, ValueProjection, WhileOperation, batch,
+        differentiable_dot_product_attention, shard_map,
     };
     use ryft_pjrt::protos::CompilationOptions;
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};

@@ -8,12 +8,11 @@
 //! bodies.
 
 use ryft_core::macros::check_count;
-use ryft_core::operations::attention::{
-    AttentionConfiguration, AttentionDefinitionKind, AttentionImplementation, AttentionInputSignature, AttentionInputs,
-    AttentionKey, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-};
 use ryft_core::{
-    ArrayIrType, ArrayType, CompositeKey, DataType, Dimension as CoreDimension, ProgramError, ReductionKind, Shape,
+    ArrayIrType, ArrayType, AttentionConfiguration, AttentionDefinitionKind, AttentionImplementation,
+    AttentionInputSignature, AttentionInputs, AttentionKey, CompositeKey,
+    DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DataType,
+    Dimension as CoreDimension, ProgramError, ReductionKind, Shape,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::{CustomCallApiVersion, CustomCallMemoryLayouts};
@@ -168,7 +167,7 @@ const FMHA_BACKWARD_DOT_DIMENSION_NUMBERS: &str = "\"bmm1_grad_gemm1_dot_dimensi
 /// Renders the `GpuBackendConfig` proto-JSON string of one cuDNN fMHA custom call — the raw backend-config form
 /// (not typed-FFI dictionaries) that XLA's cuDNN custom-call compiler parses — with the score scale, the
 /// intermediate `[batch, q_heads, q_seq, kv_seq]` score shape at the operand element type (load-bearing on the
-/// backward path, where the `P` descriptor and statistic strides derive from it), the mask kind, the
+/// backward path, where the `P` descriptor and residual strides derive from it), the mask kind, the
 /// forward or backward dot-dimension-number block, the dropout rate and the fixed seed [`FMHA_DROPOUT_SEED`] (the
 /// rate is the hardware-validated default `0.0` when dropout is off), and the sliding-window length.
 fn fmha_backend_config(
@@ -539,7 +538,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
         );
         // The operand order matches the traced operand order exactly: the bias sits after the value and the
         // `i32[batch]` sequence lengths trail. The workspace result is declared at size zero (the compiler resizes
-        // it as needed), and the training form inserts the `f32[b, n, t]` activation statistic before it.
+        // it as needed), and the training form inserts the `f32[b, n, t]` log-sum-exp residual before it.
         let mut operands = physical_inputs[..3].to_vec();
         if let Some(bias) = bias {
             operands.push(bias);
@@ -556,9 +555,8 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
         let mut custom_call_output_types = vec![lower_tensor_type(&attended_type, context, location)?];
         let mut result_layouts = vec![vec![3, 1, 2, 0]];
         if configuration.return_residual() {
-            let activation_type =
-                attention_array_type(DataType::F32, &[physical_batch, heads, physical_query_sequence]);
-            custom_call_output_types.push(lower_tensor_type(&activation_type, context, location)?);
+            let residual_type = attention_array_type(DataType::F32, &[physical_batch, heads, physical_query_sequence]);
+            custom_call_output_types.push(lower_tensor_type(&residual_type, context, location)?);
             result_layouts.push(vec![2, 1, 0]);
         }
         custom_call_output_types.push(lower_tensor_type(&attention_array_type(DataType::U8, &[0]), context, location)?);
@@ -599,34 +597,34 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
         )?;
         let mut results = vec![result];
         if configuration.return_residual() {
-            let activation = custom_call
+            let residual = custom_call
                 .result(1)
-                .expect("stablehlo.custom_call should return the activation statistic")
+                .expect("stablehlo.custom_call should return the log-sum-exp residual")
                 .as_ref();
-            let activation = block.append_operation(stable_hlo::transpose(activation, &[0, 2, 1], location)?)?;
-            let mut activation = activation.result(0).expect("stablehlo.transpose should return one result").as_ref();
-            let physical_activation_type = if input_types[0].rank() == 3 {
+            let residual = block.append_operation(stable_hlo::transpose(residual, &[0, 2, 1], location)?)?;
+            let mut residual = residual.result(0).expect("stablehlo.transpose should return one result").as_ref();
+            let physical_residual_type = if input_types[0].rank() == 3 {
                 attention_array_type(data_type, &[physical_batch, physical_query_sequence, heads])
             } else {
                 physical_bound_type(&output_types[1])?
             };
             let converted = block.append_operation(stable_hlo::convert(
-                activation,
-                lower_tensor_type(&physical_activation_type, context, location)?,
+                residual,
+                lower_tensor_type(&physical_residual_type, context, location)?,
                 location,
             )?)?;
-            activation = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
+            residual = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
             if input_types[0].rank() == 3 {
                 let reshaped = block.append_operation(stable_hlo::reshape(
-                    activation,
+                    residual,
                     &[physical_query_sequence, heads],
                     location,
                 )?)?;
-                activation = reshaped.result(0).expect("stablehlo.reshape should return one result").as_ref();
+                residual = reshaped.result(0).expect("stablehlo.reshape should return one result").as_ref();
             }
             let residual_sources = (0..output_types[1].rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
             results.push(lower_restore_dynamic_dimensions(
-                activation,
+                residual,
                 &output_types[1],
                 residual_sources.as_slice(),
                 block,
@@ -758,7 +756,7 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
             configuration.dropout(),
             configuration.local_window().map_or(0, |(left, _)| left + 1),
         );
-        let activation_input = if input_types[0].rank() == 3 {
+        let residual_input = if input_types[0].rank() == 3 {
             let reshaped = block.append_operation(stable_hlo::reshape(
                 physical_inputs[offset + 1],
                 &[1, physical_query_sequence, heads],
@@ -768,22 +766,22 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
         } else {
             physical_inputs[offset + 1]
         };
-        let activation_type = attention_array_type(DataType::F32, &[physical_batch, physical_query_sequence, heads]);
-        let activation = block.append_operation(stable_hlo::convert(
-            activation_input,
-            lower_tensor_type(&activation_type, context, location)?.as_ref(),
+        let residual_type = attention_array_type(DataType::F32, &[physical_batch, physical_query_sequence, heads]);
+        let residual = block.append_operation(stable_hlo::convert(
+            residual_input,
+            lower_tensor_type(&residual_type, context, location)?.as_ref(),
             location,
         )?)?;
-        let activation = block.append_operation(stable_hlo::transpose(
-            activation.result(0).expect("stablehlo.convert should return one result").as_ref(),
+        let residual = block.append_operation(stable_hlo::transpose(
+            residual.result(0).expect("stablehlo.convert should return one result").as_ref(),
             &[0, 2, 1],
             location,
         )?)?;
-        let activation = activation.result(0).expect("stablehlo.transpose should return one result").as_ref();
-        // The kernel call order differs from the traced operand order: `(Q, K, V, activation, dO[, bias], O
+        let residual = residual.result(0).expect("stablehlo.transpose should return one result").as_ref();
+        // The kernel call order differs from the traced operand order: `(Q, K, V, residual, dO[, bias], O
         // [, q_seqlen, kv_seqlen])`, with the bias between the output cotangent and the forward output.
         let mut operands =
-            vec![physical_inputs[0], physical_inputs[1], physical_inputs[2], activation, physical_inputs[offset + 2]];
+            vec![physical_inputs[0], physical_inputs[1], physical_inputs[2], residual, physical_inputs[offset + 2]];
         let mut operand_layouts =
             vec![vec![3, 2, 1, 0], vec![3, 2, 1, 0], vec![3, 2, 1, 0], vec![2, 1, 0], vec![3, 2, 1, 0]];
         if let Some(bias) = bias {
@@ -920,12 +918,10 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::operations::attention::{
-        DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION, DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME,
-        differentiable_dot_product_attention, dot_product_attention,
-    };
     use ryft_core::{
-        Differentiate, DimensionBounds, DimensionVariable, DomainTracingContext, Typed, Value as CoreValue,
+        DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION, DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME, Differentiate,
+        DimensionBounds, DimensionVariable, DomainTracingContext, Typed, Value as CoreValue,
+        differentiable_dot_product_attention, dot_product_attention,
     };
 
     use crate::domains::Tracer;
@@ -1173,7 +1169,7 @@ mod tests {
         assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmax("));
         assert!(module.contains("tensor<2x2x4x4xbf16>"));
 
-        // Residual attention carries both length vectors and converts the `f32` kernel statistic to the residual.
+        // Residual attention carries both length vectors and converts the `f32` kernel residual to the query data type.
         let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, false, true);
         let module =
             lower(&forward_program(configuration.with_residual(true), signature, input_types, 1), Some("cuda"))
@@ -1194,7 +1190,7 @@ mod tests {
 
     #[test]
     fn test_fused_attention_backward_on_cuda() {
-        // Fused training stages the forward kernels with their statistic and the backward kernels, which restore the
+        // Fused training stages the forward kernels with their residual and the backward kernels, which restore the
         // input cotangents and sum the score-shaped bias cotangent to the bias shape.
         let (signature, input_types) = extended_input_types(DataType::BF16, 2, 2, true, false);
         let configuration = AttentionConfiguration::new()

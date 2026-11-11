@@ -10,20 +10,19 @@ use std::error::Error;
 
 use serde::Serialize;
 
-use ryft_core::operations::attention::{
-    AttentionConfiguration, AttentionImplementation, AttentionInputs, dot_product_attention,
-};
 use ryft_core::{
     Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
-    ArrayOperation, ArrayType, BatchAxis, BatchingContext, BatchingTracer, BlockQuantizedValue, BlockScaleFormat,
-    BlockScaledDotConfiguration, CollectiveOptions, Compare, ComparisonDirection, Condition, Context,
-    ConvertElementTypeOperation, DataType, Device, DeviceMesh, Differentiate, Dimension as CoreDimension,
-    DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers,
-    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, EagerContext, LogicalMesh, MeshAxis, MeshAxisType,
-    ParallelAllGather, ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelPermute, ParallelReduce,
-    ParallelSumScatter, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, Reduce,
-    ReduceOperation, ReductionKind, ScaledDot, ScaledDotOperation, Shape, ShardMapOptions, Sharding, ShardingDimension,
-    TypedProgram, Value as CoreValue, ValueProjection, ZeroLike, block_scaled_dot, differentiate_at, shard_map,
+    ArrayOperation, ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, BatchAxis,
+    BatchingContext, BatchingTracer, BlockQuantizedValue, BlockScaleFormat, BlockScaledDotConfiguration,
+    CollectiveOptions, Compare, ComparisonDirection, Condition, Context, ConvertElementTypeOperation, DataType, Device,
+    DeviceMesh, Differentiate, Dimension as CoreDimension, DimensionBounds, DimensionFromScalarOperation,
+    DimensionValue, DimensionVariable, DotDimensionNumbers, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice,
+    EagerContext, LogicalMesh, MeshAxis, MeshAxisType, ParallelAllGather, ParallelAllGatherOutputVariance,
+    ParallelAllToAll, ParallelPermute, ParallelReduce, ParallelSumScatter, Placeholder,
+    ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, Reduce, ReduceOperation, ReductionKind,
+    ScaledDot, ScaledDotOperation, Shape, ShardMapOptions, Sharding, ShardingDimension, TypedProgram,
+    Value as CoreValue, ValueProjection, ZeroLike, block_scaled_dot, differentiate_at, dot_product_attention,
+    shard_map,
 };
 use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
 use ryft_pjrt::{BufferType, Client, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};

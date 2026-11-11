@@ -1253,11 +1253,9 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::operations::attention::{
-        AttentionConfiguration, AttentionDefinitionKind, AttentionInputSignature, AttentionKey,
-    };
     use ryft_core::{
-        ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, CompositeAttribute, CompositeJvpRule,
+        ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, AttentionConfiguration,
+        AttentionDefinitionKind, AttentionInputSignature, AttentionKey, CompositeAttribute, CompositeJvpRule,
         CompositeKey, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context,
         CustomRuleDefinition, CustomRuleRegistration, DataType, DimensionError, DimensionType, DimensionValue,
         EffectClasses, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, NamedComposite, Placeholder,

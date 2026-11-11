@@ -1,14 +1,12 @@
 use std::hash::Hash;
 use std::rc::Rc;
 
-use ryft_core::operations::attention::{
-    AttentionConfiguration, AttentionImplementation, AttentionInputSignature,
-    DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-};
 use ryft_core::{
-    ArrayIrType, ArrayType, COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey,
-    CompositeOperation, CompositeTransposeOperation, CustomRuleSource, DifferentiableType, Operation as CoreOperation,
-    Parameter, ProgramError, RematerializationOptimizationBarrier, Typed,
+    ArrayIrType, ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputSignature,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation,
+    CompositeTransposeOperation, CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+    DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DifferentiableType, Operation as CoreOperation, Parameter, ProgramError,
+    RematerializationOptimizationBarrier, Typed,
 };
 use ryft_mlir::ValueRef;
 #[cfg(test)]
