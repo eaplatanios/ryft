@@ -1,13 +1,13 @@
 //! Scaled dot-product attention, staged as calls of named composites rather than as a primitive operation. Attention
 //! has a portable body built from ordinary array operations, a stabilized analytical derivative, and optional backend
-//! implementations (e.g., cuDNN's fused attention kernels). Staging it through named composites (refer to
-//! [`Composite::with_named_composite`]) keeps one body that every program transform already supports, while backends
-//! recognize the calls by their keys and may replace them with their own implementations.
+//! implementations (e.g., cuDNN's fused attention kernels). Staging it through named composites (i.e., using
+//! [`Composite::with_named_composite`]) keeps one body that every program transform already supports, while
+//! backends recognize the calls by their keys and may replace them with their own implementations.
 //!
 //! # Definitions
 //!
-//! A named attention definition is a named composite whose [`CompositeKey`] encodes an [`AttentionKey`], which
-//! consists of an [`AttentionDefinitionKind`], the value-independent [`AttentionConfiguration`], and the
+//! A named attention definition is a named composite whose [`CompositeKey`] encodes an [`AttentionKey`],
+//! which consists of an [`AttentionDefinitionKind`], the value-independent [`AttentionConfiguration`], and the
 //! [`AttentionInputSignature`] of the optional inputs that are present. There are two kinds of definitions:
 //!
 //!   - **Forward:** Named [`DOT_PRODUCT_ATTENTION_COMPOSITE_NAME`]. It maps the [`AttentionInputs`] to the attended
@@ -25,9 +25,9 @@
 //! [`IotaLike`], and [`BroadcastLike`]), and their reshapes keep the batch and sequence dimensions, so they support
 //! static and dynamic batch and sequence extents for values typed by [`ArrayType`] and for array IR values (i.e.,
 //! values typed by [`ArrayIrType`]) alike. Only the batching rule constructs shapes that no existing value has, and it
-//! takes their extents from the [`AttentionUniverse`] of the values, which supports dynamic extents there only for
-//! array IR values, whose extents are first-class dimension values. Dropout is the exception in both universes,
-//! because it draws the random bits of its mask for static extents.
+//! computes their extents through the [`AttentionType`] implementation of the type universe, which supports dynamic
+//! extents there only for array IR values, whose extents are first-class dimension values. Dropout is the exception in
+//! both universes, because it draws the random bits of its mask for static extents.
 //!
 //! # Ownership and Lifecycle
 //!
@@ -123,87 +123,63 @@ use crate::parameters::{Parameter, Parameterized};
 use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
-/// Value capabilities with which the portable attention bodies compute. The bodies are written once over the values of
-/// a type universe and compute on them directly. Their capabilities include the exemplar-relative [`FillLike`],
-/// [`IotaLike`], and [`BroadcastLike`], which read the runtime shape of an existing value, so the constants,
-/// coordinates, and broadcasts of the bodies support static and dynamic shapes. This bundle is implemented
-/// automatically for every value that implements all of its members, and so it must never be implemented manually. It
-/// is public because it bounds [`dot_product_attention`] and [`differentiable_dot_product_attention`].
+/// Type-family extent arithmetic for the named attention definitions, with which their batching rule constructs
+/// shapes that no existing value has. It is the only part of attention that each type universe implements separately.
+/// The portable bodies take every shape from an existing value, so they need only ordinary value capabilities (refer
+/// to [`AttentionOperations`]).
 ///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
-/// [`ArrayIrType`] by applying the capabilities to their array members.
-pub trait AttentionOperations<T = <Self as Capability>::Universe>:
-    Value
-    + Add<T>
-    + And<T>
-    + Broadcast<T>
-    + BroadcastLike<T>
-    + Compare<Self, T>
-    + ConvertElementType<T>
-    + Div<T>
-    + Dot<T>
-    + Dropout<T>
-    + Exp<T>
-    + FillLike<T>
-    + IotaLike<T>
-    + Log<T>
-    + Mul<T>
-    + Reduce<T>
-    + Reshape<T>
-    + Select<T>
-    + StopGradient<T>
-    + Sub<T>
-    + Transpose<T>
-{
-}
-
-impl<
-    T,
-    V: Value
-        + Add<T>
-        + And<T>
-        + Broadcast<T>
-        + BroadcastLike<T>
-        + Compare<V, T>
-        + ConvertElementType<T>
-        + Div<T>
-        + Dot<T>
-        + Dropout<T>
-        + Exp<T>
-        + FillLike<T>
-        + IotaLike<T>
-        + Log<T>
-        + Mul<T>
-        + Reduce<T>
-        + Reshape<T>
-        + Select<T>
-        + StopGradient<T>
-        + Sub<T>
-        + Transpose<T>,
-> AttentionOperations<T> for V
-{
-}
-
-/// Type universe that provides the extents with which the batching rule of the named attention definitions constructs
-/// shapes that no existing value has. The rule folds a possibly dynamic mapped extent into the batch axis and restores
-/// it on the outputs, so it multiplies extents and broadcasts and reshapes values to them, and the universes represent
-/// an extent differently. The portable bodies do not need this trait, because they take every shape from an existing
-/// value (refer to [`AttentionOperations`]).
+/// # Why Batching Needs Extents
 ///
-/// The following universes implement it:
+/// Batching an attention call gives its inputs a mapped axis (i.e., an additional axis that holds the batch items),
+/// which is one axis more than a definition accepts. The batching rule does not batch the operations of the body one
+/// by one. It folds the mapped axis into the batch axis that attention already has, calls the same definition once on
+/// the folded inputs, and unfolds the outputs. A batched call therefore remains a call of the named definition, which
+/// lets a backend keep using its own implementation of that definition (e.g., a fused kernel).
 ///
-///   - [`ArrayType`] implements it for homogeneous array values, whose extents are static host numbers. A homogeneous
-///     array family therefore supports dynamically shaped attention except with batched calls whose batching rule
-///     needs a dynamic extent (e.g., a dynamic mapped extent, or a dynamic extent of a rank-4 input whose mapped axis
-///     is folded into its batch axis, of a bias or mask, or of a replicated input that is broadcast along the mapped
-///     axis). A dynamic mapped extent fails with an error that says that attention over homogeneous arrays cannot be
-///     batched with a dynamic extent, and every other case fails with an error that names the dynamic axis (e.g.,
-///     "attention over homogeneous arrays requires static extents, but axis 2 of `f32[2, 1, length, 1, 1]` has extent
-///     `length`; use array IR values for dynamic extents"). Such programs stage attention in an array IR family
-///     instead, which is how backends support bounded dynamic shapes (e.g., XLA tracers).
-///   - [`ArrayIrType`] implements it for array IR values, whose extents are first-class dimension values, so the
-///     batching rule supports static and dynamic extents as well.
+/// The shapes below name one extent per letter. `v` is the mapped extent (i.e., the number of batch items), `B` is the
+/// batch extent of attention, `T` and `S` are the query and key/value sequence lengths, `N` is the number of query
+/// heads, `H` is the head dimension, and `v · B` is the product of two extents. For a call whose inputs have a batch
+/// axis, the rule takes the steps in the following table, in which keys and values are treated like the query.
+///
+///   | Step      | Values                              | From               | To                 |
+///   |-----------|-------------------------------------|--------------------|--------------------|
+///   | Align     | Inputs that every batch item shares | `[B, T, N, H]`     | `[v, B, T, N, H]`  |
+///   | Normalize | Biases and masks                    | e.g., `[v, T, S]`  | `[v, B, N, T, S]`  |
+///   | Fold      | Queries, keys, and values           | `[v, B, T, N, H]`  | `[v · B, T, N, H]` |
+///   | Fold      | Biases and masks                    | `[v, B, N, T, S]`  | `[v · B, N, T, S]` |
+///   | Fold      | Sequence lengths                    | `[v, B]`           | `[v · B]`          |
+///   | Unfold    | Outputs                             | `[v · B, T, N, H]` | `[v, B, T, N, H]`  |
+///
+/// A call whose inputs have no batch axis needs no product, because its mapped axis becomes the batch axis.
+///
+/// The rule constructs every shape in the last column, and in general no value has that shape beforehand. The
+/// exemplar-relative capabilities (e.g., [`BroadcastLike`]) copy the shape of an existing value, so they cannot
+/// produce it. [`Reshape`] can regroup static dimensions next to the dynamic dimensions that it keeps, but `v · B` is
+/// a new extent whenever `v` or `B` is dynamic. The rule therefore reads extents, multiplies two of them, and
+/// broadcasts and reshapes values to the results, which are the functions of this trait. Batching the body one
+/// operation at a time needs none of them, and definitions with dropout are batched that way, but such a call is no
+/// longer a call of the named definition.
+///
+/// # Implementations
+///
+/// The two built-in universes represent an extent differently, which is why the rule is written once over this trait
+/// instead of over one set of capabilities.
+///
+///   - [`ArrayType`] implements it for homogeneous array values. Their extents are static host numbers (i.e.,
+///     [`Self::Extent`] is `usize`) that are read from their types, and their broadcasts and reshapes are the static
+///     [`Broadcast`] and [`Reshape`]. A dynamic extent has no host number, so a homogeneous array family supports
+///     dynamically shaped attention except with batched calls whose batching rule needs a dynamic extent (e.g., a
+///     dynamic mapped extent, or a dynamic extent of a rank-4 input whose mapped axis is folded into its batch axis,
+///     of a bias or mask, or of a replicated input that is broadcast along the mapped axis). A dynamic mapped extent
+///     fails with an error that says that attention over homogeneous arrays cannot be batched with a dynamic extent,
+///     and every other case fails with an error that names the dynamic axis (e.g., "attention over homogeneous arrays
+///     requires static extents, but axis 2 of `f32[2, 1, length, 1, 1]` has extent `length`; use array IR values for
+///     dynamic extents"). Such programs stage attention in an array IR family instead, which is how backends support
+///     bounded dynamic shapes (e.g., XLA tracers).
+///   - [`ArrayIrType`] implements it for array IR values. Their extents are first-class dimension values (i.e.,
+///     [`Self::Extent`] is the value type itself) that are read with [`DimensionSize`], multiplied with
+///     [`DimensionMulOperation`], and passed to [`DynamicBroadcast`] and [`DynamicReshape`], so the batching rule
+///     supports static and dynamic extents.
 ///
 /// The supertraits relate the types of a universe to array types, through which the output type rules of the
 /// definitions validate their inputs.
@@ -214,7 +190,7 @@ impl<
 /// implementing this trait, which coherence permits only for values that the blanket implementations do not cover. A
 /// new type universe participates by implementing this trait for its own type. The trait is public because it bounds
 /// [`dot_product_attention`] and [`differentiable_dot_product_attention`].
-pub trait AttentionUniverse<V>: Type + ArrayMemberType + From<ArrayType> {
+pub trait AttentionType<V>: Type + ArrayMemberType + From<ArrayType> {
     /// Extent of one axis (e.g., `usize` for static extents or a dimension value for first-class extents).
     type Extent: Clone;
 
@@ -247,7 +223,7 @@ pub trait AttentionUniverse<V>: Type + ArrayMemberType + From<ArrayType> {
     fn reshape(value: &V, extents: &[Self::Extent]) -> Result<V, ProgramError>;
 }
 
-impl<A: Value<Type = ArrayType> + Broadcast + Reshape> AttentionUniverse<A> for ArrayType {
+impl<A: Value<Type = ArrayType> + Broadcast + Reshape> AttentionType<A> for ArrayType {
     type Extent = usize;
 
     fn batch_extent(_value: &A, extent: &BatchingLevelExtent<A>) -> Result<usize, ProgramError> {
@@ -307,7 +283,7 @@ impl<A: Value<Type = ArrayType> + Broadcast + Reshape> AttentionUniverse<A> for 
     }
 }
 
-impl<V> AttentionUniverse<V> for ArrayIrType
+impl<V> AttentionType<V> for ArrayIrType
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicBroadcast + DynamicReshape,
     V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionMulOperation>> + DimensionConstant,
@@ -354,6 +330,67 @@ where
     fn reshape(value: &V, extents: &[V]) -> Result<V, ProgramError> {
         value.clone().dynamic_reshape(extents)
     }
+}
+
+/// Value capabilities with which the portable attention bodies compute. The bodies are written once over the values of
+/// a type universe and compute on them directly. Their capabilities include the exemplar-relative [`FillLike`],
+/// [`IotaLike`], and [`BroadcastLike`], which read the runtime shape of an existing value, so the constants,
+/// coordinates, and broadcasts of the bodies support static and dynamic shapes. This bundle is implemented
+/// automatically for every value that implements all of its members, and so it must never be implemented manually. It
+/// is public because it bounds [`dot_product_attention`] and [`differentiable_dot_product_attention`].
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
+/// [`ArrayIrType`] by applying the capabilities to their array members.
+pub trait AttentionOperations<T = <Self as Capability>::Universe>:
+    Capability
+    + Add<T>
+    + And<T>
+    + Broadcast<T>
+    + BroadcastLike<T>
+    + Compare<Self, T>
+    + ConvertElementType<T>
+    + Div<T>
+    + Dot<T>
+    + Dropout<T>
+    + Exp<T>
+    + FillLike<T>
+    + IotaLike<T>
+    + Log<T>
+    + Mul<T>
+    + Reduce<T>
+    + Reshape<T>
+    + Select<T>
+    + StopGradient<T>
+    + Sub<T>
+    + Transpose<T>
+{
+}
+
+impl<
+    T,
+    V: Add<T>
+        + And<T>
+        + Broadcast<T>
+        + BroadcastLike<T>
+        + Compare<V, T>
+        + ConvertElementType<T>
+        + Div<T>
+        + Dot<T>
+        + Dropout<T>
+        + Exp<T>
+        + FillLike<T>
+        + IotaLike<T>
+        + Log<T>
+        + Mul<T>
+        + Reduce<T>
+        + Reshape<T>
+        + Select<T>
+        + StopGradient<T>
+        + Sub<T>
+        + Transpose<T>,
+> AttentionOperations<T> for V
+{
 }
 
 /// Rule configurations that the named attention definitions of the operation family `(V, O)` require, which collects
@@ -1086,7 +1123,7 @@ impl<C: Domain> DotProductAttention<C>
 where
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: AttentionUniverse<DomainTracer<C>> + BatchableType,
+    C::Type: AttentionType<DomainTracer<C>> + BatchableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>,
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
@@ -1126,7 +1163,7 @@ where
 /// (e.g., the XLA backend replaces it with cuDNN's fused attention kernels when the configuration and the input types
 /// are eligible). Array IR domains support dynamic batch and sequence extents (e.g., in bounded dynamic programs).
 /// Homogeneous array domains support them as well, except in batching rules that need a dynamic extent (refer to
-/// [`AttentionUniverse`]).
+/// [`AttentionType`]).
 ///
 /// # Parameters
 ///
@@ -1135,7 +1172,7 @@ pub fn dot_product_attention<C: Domain>(configuration: AttentionConfiguration) -
 where
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: AttentionUniverse<DomainTracer<C>> + BatchableType,
+    C::Type: AttentionType<DomainTracer<C>> + BatchableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>,
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
@@ -1188,7 +1225,7 @@ impl<C: Domain> DifferentiableDotProductAttention<C>
 where
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: AttentionUniverse<DomainTracer<C>> + BatchableType + DifferentiableType,
+    C::Type: AttentionType<DomainTracer<C>> + BatchableType + DifferentiableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>
         + CompositeVjp<
@@ -1367,7 +1404,7 @@ pub fn differentiable_dot_product_attention<C: Domain>(
 where
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: AttentionUniverse<DomainTracer<C>> + BatchableType + DifferentiableType,
+    C::Type: AttentionType<DomainTracer<C>> + BatchableType + DifferentiableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>
         + CompositeVjp<
@@ -1525,7 +1562,7 @@ impl<V: Value, O: Operation<Type = V::Type>> AttentionDefinitions<V, O>
 where
     V: 'static,
     O: 'static,
-    V::Type: AttentionUniverse<RuleTracer<V, O>> + BatchableType,
+    V::Type: AttentionType<RuleTracer<V, O>> + BatchableType,
     RuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
@@ -2102,7 +2139,7 @@ fn forward_function<V: Value, O: Operation<Type = V::Type>>(
 where
     V: 'static,
     O: 'static,
-    V::Type: AttentionUniverse<RuleTracer<V, O>> + BatchableType,
+    V::Type: AttentionType<RuleTracer<V, O>> + BatchableType,
     RuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
@@ -2285,7 +2322,7 @@ fn backward_function<V: Value, O: Operation<Type = V::Type>>(
 where
     V: 'static,
     O: 'static,
-    V::Type: AttentionUniverse<RuleTracer<V, O>> + BatchableType,
+    V::Type: AttentionType<RuleTracer<V, O>> + BatchableType,
     RuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
@@ -2772,10 +2809,10 @@ fn denormalize_attention_output<V: Value<Type: ArrayMemberType> + Reshape>(
 /// rank-4 attention folds `[v, B, T, N, H]` to `[v · B, T, N, H]`. Biases and masks are first materialized to
 /// `[v, B, N, T, S]`, which handles every broadcastable rank and preserves mapped bias and mask inputs. Outputs reverse
 /// the normalization, and a bias cotangent is reduced over precisely the axes that its logical bias input broadcasts.
-/// Every extent comes from the values' [`AttentionUniverse`], so this supports static extents and, in array IR
-/// families, first-class dynamic extents (i.e., a dynamic mapped extent, logical batch, or sequence length never
-/// becomes host metadata). Calls whose inputs are all replicated stage the unbatched definition.
-fn batch_attention<V: Value<Type: AttentionUniverse<V>> + Reduce + Transpose>(
+/// Every extent comes from the [`AttentionType`] implementation of the values' type universe, so this supports static
+/// extents and, in array IR families, first-class dynamic extents (i.e., a dynamic mapped extent, logical batch, or
+/// sequence length never becomes host metadata). Calls whose inputs are all replicated stage the unbatched definition.
+fn batch_attention<V: Value<Type: AttentionType<V>> + Reduce + Transpose>(
     inputs: Vec<V>,
     axes: Vec<BatchAxis>,
     extent: &BatchingLevelExtent<V>,
@@ -2989,82 +3026,69 @@ mod tests {
     }
 
     #[test]
-    fn test_attention_universe() {
+    fn test_attention_type() {
         let array = f32_array(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
         // Extents are static host numbers, so dynamic batching extents and overflowing products are rejected.
-        assert_eq!(
-            <ArrayType as AttentionUniverse<Array>>::batch_extent(&array, &BatchingLevelExtent::Static(4)),
-            Ok(4),
-        );
+        assert_eq!(<ArrayType as AttentionType<Array>>::batch_extent(&array, &BatchingLevelExtent::Static(4)), Ok(4));
         assert!(matches!(
-            <ArrayType as AttentionUniverse<Array>>::batch_extent(&array, &BatchingLevelExtent::Dynamic(array.clone())),
+            <ArrayType as AttentionType<Array>>::batch_extent(&array, &BatchingLevelExtent::Dynamic(array.clone())),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
                 if message == "attention over homogeneous arrays cannot be batched with a dynamic extent; use array IR \
                                values for dynamic extents",
         ));
-        assert_eq!(<ArrayType as AttentionUniverse<Array>>::extent(&array, 1), Ok(3));
-        assert_eq!(<ArrayType as AttentionUniverse<Array>>::extents(&array), Ok(vec![2, 3]));
-        assert_eq!(<ArrayType as AttentionUniverse<Array>>::constant_extent(&array, 7), Ok(7));
-        assert_eq!(<ArrayType as AttentionUniverse<Array>>::multiply_extents(&array, &2, &3), Ok(6));
+        assert_eq!(<ArrayType as AttentionType<Array>>::extent(&array, 1), Ok(3));
+        assert_eq!(<ArrayType as AttentionType<Array>>::extents(&array), Ok(vec![2, 3]));
+        assert_eq!(<ArrayType as AttentionType<Array>>::constant_extent(&array, 7), Ok(7));
+        assert_eq!(<ArrayType as AttentionType<Array>>::multiply_extents(&array, &2, &3), Ok(6));
         assert!(matches!(
-            <ArrayType as AttentionUniverse<Array>>::multiply_extents(&array, &usize::MAX, &2),
+            <ArrayType as AttentionType<Array>>::multiply_extents(&array, &usize::MAX, &2),
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
                 if message == format!("attention extent product {} × 2 overflows `usize`", usize::MAX),
         ));
 
         // Broadcasts and reshapes take static extents.
         assert_eq!(
-            <ArrayType as AttentionUniverse<Array>>::broadcast(&f32_array(&[3], &[1.0, 2.0, 3.0]), &[2, 3], &[1]),
+            <ArrayType as AttentionType<Array>>::broadcast(&f32_array(&[3], &[1.0, 2.0, 3.0]), &[2, 3], &[1]),
             Ok(f32_array(&[2, 3], &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0])),
         );
         assert_eq!(
-            <ArrayType as AttentionUniverse<Array>>::reshape(&array, &[3, 2]),
+            <ArrayType as AttentionType<Array>>::reshape(&array, &[3, 2]),
             Ok(f32_array(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
         );
     }
 
     #[test]
-    fn test_attention_universe_array_ir() {
+    fn test_attention_type_array_ir() {
         let value = ArrayIrValue::Array(f32_array(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
         let dimension = |extent| ArrayIrValue::<Array>::Dimension(DimensionValue::constant(extent).unwrap());
 
         // Extents are first-class dimension values, which include dynamic batching extents.
         assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::batch_extent(
-                &value,
-                &BatchingLevelExtent::Static(4),
-            ),
+            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::batch_extent(&value, &BatchingLevelExtent::Static(4)),
             Ok(dimension(4)),
         );
         assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::batch_extent(
+            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::batch_extent(
                 &value,
                 &BatchingLevelExtent::Dynamic(dimension(5)),
             ),
             Ok(dimension(5)),
         );
-        assert_eq!(<ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::extent(&value, 1), Ok(dimension(3)));
+        assert_eq!(<ArrayIrType as AttentionType<ArrayIrValue<Array>>>::extent(&value, 1), Ok(dimension(3)));
         assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::extents(&value),
+            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::extents(&value),
             Ok(vec![dimension(2), dimension(3)]),
         );
+        assert_eq!(<ArrayIrType as AttentionType<ArrayIrValue<Array>>>::constant_extent(&value, 7), Ok(dimension(7)));
         assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::constant_extent(&value, 7),
-            Ok(dimension(7)),
-        );
-        assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::multiply_extents(
-                &value,
-                &dimension(2),
-                &dimension(3),
-            ),
+            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::multiply_extents(&value, &dimension(2), &dimension(3)),
             Ok(dimension(6)),
         );
 
         // Broadcasts and reshapes take their extents from dimension values.
         assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::broadcast(
+            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::broadcast(
                 &ArrayIrValue::Array(f32_array(&[3], &[1.0, 2.0, 3.0])),
                 &[dimension(2), dimension(3)],
                 &[1],
@@ -3072,22 +3096,22 @@ mod tests {
             Ok(ArrayIrValue::Array(f32_array(&[2, 3], &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]))),
         );
         assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::reshape(&value, &[dimension(3), dimension(2)]),
+            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::reshape(&value, &[dimension(3), dimension(2)]),
             Ok(ArrayIrValue::Array(f32_array(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))),
         );
     }
 
     #[test]
-    fn test_attention_universe_array_ir_dynamic_extents() {
+    fn test_attention_type_array_ir_dynamic_extents() {
         // Staged array IR values read their dynamic extents as dimension values and fold their static extents into
         // dimension constants, and broadcasts take one dimension input per output axis.
         type IrTracer = DomainTracer<ArrayIrContext>;
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let (output_type, program) = ArrayIrContext::trace(
             |value: IrTracer| {
-                let mut extents = <ArrayIrType as AttentionUniverse<IrTracer>>::extents(&value)?;
-                extents.push(<ArrayIrType as AttentionUniverse<IrTracer>>::constant_extent(&value, 2)?);
-                <ArrayIrType as AttentionUniverse<IrTracer>>::broadcast(&value, &extents, &[0, 1])
+                let mut extents = <ArrayIrType as AttentionType<IrTracer>>::extents(&value)?;
+                extents.push(<ArrayIrType as AttentionType<IrTracer>>::constant_extent(&value, 2)?);
+                <ArrayIrType as AttentionType<IrTracer>>::broadcast(&value, &extents, &[0, 1])
             },
             ArrayIrType::Array(ArrayType::new(
                 DataType::F32,
