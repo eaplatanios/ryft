@@ -440,18 +440,7 @@ impl Lowering {
         if !bytes.is_empty() {
             bits[..size].copy_from_slice(&bytes[..size]);
         }
-        let bits = u64::from_le_bytes(bits);
-        let scalar = match r#type.data_type() {
-            DataType::F16 | DataType::BF16 => {
-                format!("ct.bitcast(ct.full((), {bits}, ct.uint16), ct.{})", dtype(r#type.data_type())?)
-            }
-            DataType::F32 => format!("ct.bitcast(ct.full((), {bits}, ct.uint32), ct.float32)"),
-            DataType::F64 => format!("ct.bitcast(ct.full((), {bits}, ct.uint64), ct.float64)"),
-            DataType::I32 => format!("ct.full((), {}, ct.int32)", bits as u32 as i32),
-            DataType::I64 => format!("ct.full((), {}, ct.int64)", bits as i64),
-            DataType::Boolean => format!("ct.full((), {}, ct.bool_)", if bits == 0 { "False" } else { "True" }),
-            data_type => format!("ct.full((), {bits}, ct.{})", dtype(data_type)?),
-        };
+        let scalar = literal_expression(r#type.data_type(), u64::from_le_bytes(bits))?;
         Ok(self.assign(format!("ct.broadcast_to({scalar}, {})", physical_shape(&shape))))
     }
 
@@ -595,6 +584,16 @@ impl Lowering {
             ArrayOperation::One(_) | ArrayOperation::OneLike(_) => {
                 format!("ct.full({}, 1, ct.{data_type})", physical_shape(&shape))
             }
+            ArrayOperation::FillLike(operation) => {
+                // The fill value is a rank-0 literal, so its logical bytes encode exactly one element.
+                let bytes = operation.value().logical_bytes();
+                let mut bits = [0u8; 8];
+                bits[..bytes.len()].copy_from_slice(&bytes);
+                let scalar = literal_expression(output.data_type(), u64::from_le_bytes(bits))?;
+                format!("ct.broadcast_to({scalar}, {})", physical_shape(&shape))
+            }
+            ArrayOperation::Iota(iota) => iota_expression(&shape, iota.dimension(), data_type),
+            ArrayOperation::IotaLike(iota) => iota_expression(&shape, iota.dimension(), data_type),
             ArrayOperation::Add(_) => format!("({} + {})", inputs[0], inputs[1]),
             ArrayOperation::Sub(_) => format!("({} - {})", inputs[0], inputs[1]),
             ArrayOperation::SaturatingSub(_) => {
@@ -635,16 +634,11 @@ impl Lowering {
             {
                 format!("ct.reshape({}, {})", inputs[0], physical_shape(&shape))
             }
-            ArrayOperation::Broadcast(operation) => {
-                if operation.output_axes().windows(2).any(|axes| axes[0] >= axes[1]) {
-                    return Err(unsupported(operation.name(), "broadcast axes must preserve source order"));
-                }
-                let input_shape = checked_shape(&types[0])?;
-                let mut expanded = vec![1; shape.len()];
-                for (axis, &output_axis) in operation.output_axes().iter().enumerate() {
-                    expanded[output_axis] = input_shape[axis].max(1).next_power_of_two();
-                }
-                format!("ct.broadcast_to(ct.reshape({}, {}), {})", inputs[0], tuple(&expanded), physical_shape(&shape))
+            ArrayOperation::Broadcast(broadcast) => {
+                broadcast_expression(operation.name(), &inputs[0], &types[0], broadcast.output_axes(), &shape)?
+            }
+            ArrayOperation::BroadcastLike(broadcast) => {
+                broadcast_expression(operation.name(), &inputs[0], &types[0], broadcast.output_axes(), &shape)?
             }
             ArrayOperation::Transpose(operation) => {
                 let permutation = operation.permutation().normalize(shape.len()).map_err(ProgramError::from)?;
@@ -732,6 +726,55 @@ fn physical_shape(shape: &[usize]) -> String {
     tuple(&shape.iter().map(|extent| extent.max(&1).next_power_of_two()).collect::<Vec<_>>())
 }
 
+/// Spells one scalar of `data_type` from its exact little-endian `bits` without decimal floating-point conversion.
+fn literal_expression(data_type: DataType, bits: u64) -> Result<String, Error> {
+    Ok(match data_type {
+        DataType::F16 | DataType::BF16 => {
+            format!("ct.bitcast(ct.full((), {bits}, ct.uint16), ct.{})", dtype(data_type)?)
+        }
+        DataType::F32 => format!("ct.bitcast(ct.full((), {bits}, ct.uint32), ct.float32)"),
+        DataType::F64 => format!("ct.bitcast(ct.full((), {bits}, ct.uint64), ct.float64)"),
+        DataType::I32 => format!("ct.full((), {}, ct.int32)", bits as u32 as i32),
+        DataType::I64 => format!("ct.full((), {}, ct.int64)", bits as i64),
+        DataType::Boolean => format!("ct.full((), {}, ct.bool_)", if bits == 0 { "False" } else { "True" }),
+        data_type => format!("ct.full((), {bits}, ct.{})", dtype(data_type)?),
+    })
+}
+
+/// Spells the coordinates of a tile with the logical `shape` along `dimension`, converted to the cuTile element type
+/// named `data_type`. Coordinates in the physical padding exceed the logical extent, which is harmless because padding
+/// never reaches global memory.
+fn iota_expression(shape: &[usize], dimension: usize, data_type: &str) -> String {
+    let mut expanded = vec![1; shape.len()];
+    expanded[dimension] = shape[dimension].max(1).next_power_of_two();
+    format!(
+        "ct.astype(ct.broadcast_to(ct.reshape(ct.arange({}, dtype=ct.int64), {}), {}), ct.{data_type})",
+        expanded[dimension],
+        tuple(&expanded),
+        physical_shape(shape),
+    )
+}
+
+/// Spells the broadcast of `input` to a tile with the logical `shape`, where `output_axes` contains the output axis of
+/// each input axis. The input is first reshaped so that it has unit extents along the axes it does not occupy.
+fn broadcast_expression(
+    operation: &'static str,
+    input: &str,
+    input_type: &ArrayType,
+    output_axes: &[usize],
+    shape: &[usize],
+) -> Result<String, Error> {
+    if output_axes.windows(2).any(|axes| axes[0] >= axes[1]) {
+        return Err(unsupported(operation, "broadcast axes must preserve source order"));
+    }
+    let input_shape = checked_shape(input_type)?;
+    let mut expanded = vec![1; shape.len()];
+    for (axis, &output_axis) in output_axes.iter().enumerate() {
+        expanded[output_axis] = input_shape[axis].max(1).next_power_of_two();
+    }
+    Ok(format!("ct.broadcast_to(ct.reshape({input}, {}), {})", tuple(&expanded), physical_shape(shape)))
+}
+
 /// Rejects unbounded source expansion and unsupported physical tiles before code generation.
 fn checked_tile(shape: &[usize]) -> Result<(), Error> {
     if shape.len() > 4
@@ -811,7 +854,8 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArraySliceAxis, DimensionBounds, DimensionMulOperation, DimensionType, ReferenceRead, ReferenceWrite,
+        ArraySliceAxis, BroadcastLikeOperation, DimensionBounds, DimensionMulOperation, DimensionType,
+        FillLikeOperation, IotaLikeOperation, IotaOperation, ReferenceRead, ReferenceWrite,
     };
     use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
 
@@ -1018,6 +1062,106 @@ mod tests {
             v1 = ct.reshape(v0, (4,))
         "}
         );
+    }
+
+    #[test]
+    fn test_lowering_array_fill_like() {
+        // Floating literals are spelled as integer bits, which preserves signs and NaN payloads exactly.
+        let mut lowering = Lowering { code: String::new(), indentation: 0, next: 0, remaining: 10 };
+        for (value, shape) in [
+            (Array::scalar(2.5f32).unwrap(), vec![2, 3]),
+            (Array::scalar(f32::from_bits(0xffc0_0001)).unwrap(), vec![2, 3]),
+            (Array::scalar(-7i64).unwrap(), vec![3]),
+            (Array::scalar(true).unwrap(), vec![]),
+        ] {
+            let r#type = ArrayType::new_static(value.r#type().data_type(), shape);
+            let operation = ArrayOperation::FillLike(FillLikeOperation::new(value).unwrap());
+            lowering.array(&operation, &["exemplar".to_owned()], &[r#type.clone()], &r#type).unwrap();
+        }
+        assert_eq!(
+            lowering.code,
+            indoc! {"
+            v0 = ct.broadcast_to(ct.bitcast(ct.full((), 1075838976, ct.uint32), ct.float32), (2, 4))
+            v1 = ct.broadcast_to(ct.bitcast(ct.full((), 4290772993, ct.uint32), ct.float32), (2, 4))
+            v2 = ct.broadcast_to(ct.full((), -7, ct.int64), (4,))
+            v3 = ct.broadcast_to(ct.full((), True, ct.bool_), ())
+        "}
+        );
+    }
+
+    #[test]
+    fn test_lowering_array_iota() {
+        let mut lowering = Lowering { code: String::new(), indentation: 0, next: 0, remaining: 10 };
+        let output = ArrayType::new_static(DataType::I32, [2, 3]);
+        let iota = ArrayOperation::Iota(IotaOperation::new(output.clone(), 1).unwrap());
+        assert_eq!(lowering.array(&iota, &[], &[], &output).unwrap(), "v0");
+        let exemplar = ArrayType::new_static(DataType::Boolean, [2, 3, 5]);
+        let iota_like = ArrayOperation::IotaLike(IotaLikeOperation::new(1, DataType::F32).unwrap());
+        let output = ArrayType::new_static(DataType::F32, [2, 3, 5]);
+        assert_eq!(lowering.array(&iota_like, &["exemplar".to_owned()], &[exemplar], &output).unwrap(), "v1");
+        assert_eq!(
+            lowering.code,
+            indoc! {"
+            v0 = ct.astype(ct.broadcast_to(ct.reshape(ct.arange(4, dtype=ct.int64), (1, 4)), (2, 4)), ct.int32)
+            v1 = ct.astype(ct.broadcast_to(ct.reshape(ct.arange(4, dtype=ct.int64), (1, 4, 1)), (2, 4, 8)), ct.float32)
+        "}
+        );
+    }
+
+    #[test]
+    fn test_lowering_array_iota_like_unsupported_data_type() {
+        let mut lowering = Lowering { code: String::new(), indentation: 0, next: 0, remaining: 10 };
+        let operation = ArrayOperation::IotaLike(IotaLikeOperation::new(0, DataType::I8).unwrap());
+        assert!(matches!(
+            lowering.array(
+                &operation,
+                &["exemplar".to_owned()],
+                &[ArrayType::new_static(DataType::F32, [4])],
+                &ArrayType::new_static(DataType::I8, [4]),
+            ),
+            Err(Error::Unsupported { operation: "array", reason })
+                if reason == "element dtype is outside the qualified cuTile subset"
+        ));
+    }
+
+    #[test]
+    fn test_lowering_array_broadcast_like() {
+        // A new leading axis and a stretched unit axis both reshape the value to unit extents along the axes it does
+        // not occupy. The exemplar's element type does not matter.
+        let mut lowering = Lowering { code: String::new(), indentation: 0, next: 0, remaining: 10 };
+        let output = ArrayType::new_static(DataType::F32, [2, 3]);
+        let exemplar = ArrayType::new_static(DataType::F16, [2, 3]);
+        for (value, output_axes) in [
+            (ArrayType::new_static(DataType::F32, [3]), vec![1]),
+            (ArrayType::new_static(DataType::F32, [1, 3]), vec![0, 1]),
+        ] {
+            let operation = ArrayOperation::BroadcastLike(BroadcastLikeOperation::new(output_axes));
+            let inputs = ["value".to_owned(), "exemplar".to_owned()];
+            lowering.array(&operation, &inputs, &[value, exemplar.clone()], &output).unwrap();
+        }
+        assert_eq!(
+            lowering.code,
+            indoc! {"
+            v0 = ct.broadcast_to(ct.reshape(value, (1, 4)), (2, 4))
+            v1 = ct.broadcast_to(ct.reshape(value, (1, 4)), (2, 4))
+        "}
+        );
+    }
+
+    #[test]
+    fn test_lowering_array_broadcast_like_unordered_axes() {
+        let mut lowering = Lowering { code: String::new(), indentation: 0, next: 0, remaining: 10 };
+        let operation = ArrayOperation::BroadcastLike(BroadcastLikeOperation::new(vec![1, 0]));
+        assert!(matches!(
+            lowering.array(
+                &operation,
+                &["value".to_owned(), "exemplar".to_owned()],
+                &[ArrayType::new_static(DataType::F32, [4, 2]), ArrayType::new_static(DataType::F32, [2, 4])],
+                &ArrayType::new_static(DataType::F32, [2, 4]),
+            ),
+            Err(Error::Unsupported { operation: "broadcast_like", reason })
+                if reason == "broadcast axes must preserve source order"
+        ));
     }
 
     #[test]

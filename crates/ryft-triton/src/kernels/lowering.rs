@@ -442,6 +442,55 @@ impl<'c, 't> Lowering<'c, 't> {
         Ok((indices, mask))
     }
 
+    /// Emits the coordinates of a tile of type `output` along `dimension`. Coordinates in the physical padding exceed
+    /// the logical extent, which is harmless because padding never reaches global memory.
+    fn iota(
+        &self,
+        block: &mut DetachedBlock<'c, 't>,
+        operation: &ArrayOperation<Array>,
+        dimension: usize,
+        output: &ArrayType,
+    ) -> Result<Native<'c, 't>, Error> {
+        let output_shape = shape(output)?;
+        let coordinates = self.indices(block, &output_shape)?.0[dimension];
+        match output.data_type() {
+            DataType::I64 => Ok(coordinates),
+            DataType::F32 => {
+                append(block, arith::sitofp(coordinates, self.r#type(DataType::F32, &output_shape)?, self.location)?)
+            }
+            _ => Err(unsupported(operation.name(), "iota requires an F32 or I64 element type")),
+        }
+    }
+
+    /// Broadcasts `input` to a tile of type `output`, where `output_axes` contains the output axis of each input axis.
+    fn broadcast(
+        &self,
+        block: &mut DetachedBlock<'c, 't>,
+        operation: &ArrayOperation<Array>,
+        input: Native<'c, 't>,
+        input_type: &ArrayType,
+        output_axes: &[usize],
+        output: &ArrayType,
+    ) -> Result<Native<'c, 't>, Error> {
+        let output_shape = shape(output)?;
+        if input_type.rank() == 0 {
+            return self.splat(block, input, output.data_type(), &output_shape);
+        }
+        if output_axes.windows(2).any(|axes| axes[0] >= axes[1]) {
+            return Err(unsupported(operation.name(), "broadcast axes must preserve source order"));
+        }
+        let source = shape(input_type)?;
+        let mut expanded = vec![1; output_shape.len()];
+        for (axis, output_axis) in output_axes.iter().enumerate() {
+            expanded[*output_axis] = source[axis];
+        }
+        let reshaped = append(
+            block,
+            tt::reshape(input, false, false, self.r#type(output.data_type(), &expanded)?, self.location)?,
+        )?;
+        append(block, tt::broadcast(reshaped, self.r#type(output.data_type(), &output_shape)?, self.location)?)
+    }
+
     /// Creates valid pointer tensors, intersecting root, enclosing-window and physical-padding bounds.
     fn pointers(
         &self,
@@ -895,6 +944,12 @@ impl<'c, 't> Lowering<'c, 't> {
                 };
                 self.splat(block, scalar, output.data_type(), &output_shape)?
             }
+            ArrayOperation::FillLike(operation) => {
+                let scalar = self.constant(block, operation.value())?;
+                self.splat(block, scalar, output.data_type(), &output_shape)?
+            }
+            ArrayOperation::Iota(iota) => self.iota(block, operation, iota.dimension(), output)?,
+            ArrayOperation::IotaLike(iota) => self.iota(block, operation, iota.dimension(), output)?,
             ArrayOperation::Add(_) if output.data_type() == DataType::F32 => {
                 append(block, arith::addf(values[0], values[1], location)?)?
             }
@@ -943,24 +998,11 @@ impl<'c, 't> Lowering<'c, 't> {
                     append(block, tt::reshape(inputs[0], false, false, output_type, location)?)?
                 }
             }
-            ArrayOperation::Broadcast(operation) => {
-                if types[0].rank() == 0 {
-                    self.splat(block, inputs[0], output.data_type(), &output_shape)?
-                } else {
-                    if operation.output_axes().windows(2).any(|axes| axes[0] >= axes[1]) {
-                        return Err(unsupported(operation.name(), "broadcast axes must preserve source order"));
-                    }
-                    let source = shape(&types[0])?;
-                    let mut expanded = vec![1; output_shape.len()];
-                    for (axis, output_axis) in operation.output_axes().iter().enumerate() {
-                        expanded[*output_axis] = source[axis];
-                    }
-                    let reshaped = append(
-                        block,
-                        tt::reshape(inputs[0], false, false, self.r#type(output.data_type(), &expanded)?, location)?,
-                    )?;
-                    append(block, tt::broadcast(reshaped, output_type, location)?)?
-                }
+            ArrayOperation::Broadcast(broadcast) => {
+                self.broadcast(block, operation, inputs[0], &types[0], broadcast.output_axes(), output)?
+            }
+            ArrayOperation::BroadcastLike(broadcast) => {
+                self.broadcast(block, operation, inputs[0], &types[0], broadcast.output_axes(), output)?
             }
             ArrayOperation::Transpose(operation) => {
                 let permutation =
@@ -1132,11 +1174,56 @@ fn unsupported(operation: &'static str, reason: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArraySliceAxis, Placeholder, ProgramBuilder, ReferenceReadOperation, ReferenceWriteOperation};
+    use ryft_core::{
+        ArraySliceAxis, BroadcastLikeOperation, BroadcastOperation, FillLikeOperation, IotaLikeOperation,
+        IotaOperation, Placeholder, ProgramBuilder, ReferenceReadOperation, ReferenceWriteOperation,
+    };
     use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
     use ryft_mlir::{OpRef, Region};
 
     use super::*;
+
+    /// Lowers one array operation over native block arguments of the given input types. It returns the names of the
+    /// emitted operations, the values of their non-Boolean integer literals, and the position of the operation that
+    /// defines the result.
+    fn lowered_array(
+        operation: ArrayOperation<Array>,
+        types: Vec<ArrayType>,
+    ) -> Result<(Vec<String>, Vec<i64>, Option<usize>), Error> {
+        let context = Context::new();
+        let mut lowering = Lowering {
+            context: &context,
+            location: context.unknown_location(),
+            remaining: 100,
+            maximum_tile_elements: 1024,
+        };
+        let arguments = types
+            .iter()
+            .map(|r#type| (lowering.r#type(r#type.data_type(), &shape(r#type).unwrap()).unwrap(), lowering.location))
+            .collect::<Vec<_>>();
+        let mut block = context.block(&arguments);
+        let inputs = (0..types.len()).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+        let output = operation.infer_output_types(&types, &[]).unwrap().remove(0);
+        let result = lowering.array(&mut block, &operation, &inputs, &types, &output)?;
+        let mut names = Vec::new();
+        let mut literals = Vec::new();
+        let mut position = None;
+        for (index, native) in block.operations().unwrap().enumerate() {
+            let native = native.unwrap();
+            let name = native.name().as_str().unwrap().to_owned();
+            let value = native.result(0).unwrap().as_ref();
+            if let ("arith.constant", Ok(attribute)) = (name.as_str(), native.integer_attribute("value"))
+                && value.r#type().unwrap() != context.signless_integer_type(1).as_ref()
+            {
+                literals.push(attribute.signless_value());
+            }
+            if value == result {
+                position = Some(index);
+            }
+            names.push(name);
+        }
+        Ok((names, literals, position))
+    }
 
     /// Covers global windows and the partially populated final tile through the public macro.
     #[ryft_kernels::kernel(crate = "ryft_kernels", requires = left.shape()[0] == right.shape()[0])]
@@ -1406,6 +1493,134 @@ mod tests {
         let operation = block.operations().unwrap().last().unwrap().unwrap();
         let comparison = unsafe { operation.cast::<arith::CmpiOperationRef>() }.unwrap();
         assert_eq!(comparison.predicate().unwrap(), arith::IntegerComparisonPredicate::UnsignedLessThan);
+    }
+
+    #[test]
+    fn test_lowering_array_fill_like() {
+        let fill = |value: Array, r#type: ArrayType| {
+            lowered_array(ArrayOperation::FillLike(FillLikeOperation::new(value).unwrap()), vec![r#type]).unwrap()
+        };
+        assert_eq!(
+            fill(Array::scalar(2.5f32).unwrap(), ArrayType::new_static(DataType::F32, [2, 3])),
+            (
+                vec!["arith.constant".to_owned(), "arith.bitcast".to_owned(), "tt.splat".to_owned()],
+                vec![i64::from(2.5f32.to_bits() as i32)],
+                Some(2),
+            ),
+        );
+
+        // Floating literals are emitted as integer bits, which preserves signs and NaN payloads exactly. Rank-0
+        // outputs keep the scalar itself.
+        assert_eq!(
+            fill(Array::scalar(f32::from_bits(0xffc0_0001)).unwrap(), ArrayType::scalar(DataType::F32)),
+            (
+                vec!["arith.constant".to_owned(), "arith.bitcast".to_owned()],
+                vec![i64::from(0xffc0_0001u32 as i32)],
+                Some(1),
+            ),
+        );
+        assert_eq!(
+            fill(Array::scalar(-7i64).unwrap(), ArrayType::new_static(DataType::I64, [4])),
+            (vec!["arith.constant".to_owned(), "tt.splat".to_owned()], vec![-7], Some(1)),
+        );
+    }
+
+    #[test]
+    fn test_lowering_array_iota() {
+        let axis = [
+            "tt.make_range",
+            "tt.reshape",
+            "arith.extsi",
+            "tt.broadcast",
+            "arith.constant",
+            "tt.splat",
+            "arith.cmpi",
+            "arith.andi",
+        ];
+        let mut expected = vec!["arith.constant", "tt.splat"];
+        expected.extend(axis);
+        expected.extend(axis);
+        let expected = expected.into_iter().map(str::to_owned).collect::<Vec<_>>();
+
+        // The coordinates along dimension one are the second axis range, which follows the two mask operations and
+        // the eight operations of the first axis.
+        for (data_type, names, position) in [
+            (DataType::I64, expected.clone(), 13),
+            (DataType::F32, [expected, vec!["arith.sitofp".to_owned()]].concat(), 18),
+        ] {
+            let output = ArrayType::new_static(data_type, [2, 4]);
+            let lowered = (names, vec![2, 4], Some(position));
+            assert_eq!(
+                lowered_array(ArrayOperation::Iota(IotaOperation::new(output, 1).unwrap()), vec![]).unwrap(),
+                lowered,
+            );
+            assert_eq!(
+                lowered_array(
+                    ArrayOperation::IotaLike(IotaLikeOperation::new(1, data_type).unwrap()),
+                    vec![ArrayType::new_static(DataType::Boolean, [2, 4])],
+                )
+                .unwrap(),
+                lowered,
+            );
+        }
+    }
+
+    #[test]
+    fn test_lowering_array_iota_like_unsupported_data_type() {
+        assert!(matches!(
+            lowered_array(
+                ArrayOperation::IotaLike(IotaLikeOperation::new(0, DataType::I32).unwrap()),
+                vec![ArrayType::new_static(DataType::F32, [4])],
+            ),
+            Err(Error::Unsupported { operation: "array", reason })
+                if reason == "only F32, I64 and Boolean tile values are supported",
+        ));
+    }
+
+    #[test]
+    fn test_lowering_array_broadcast_like() {
+        // Replicating along a new leading axis and stretching a unit axis both reshape before broadcasting, and the
+        // exemplar's element type does not matter.
+        for (value, exemplar, output_axes) in [
+            (ArrayType::new_static(DataType::F32, [4]), ArrayType::new_static(DataType::F32, [2, 4]), vec![1]),
+            (ArrayType::new_static(DataType::I64, [1, 4]), ArrayType::new_static(DataType::F32, [2, 4]), vec![0, 1]),
+        ] {
+            let output = ArrayType::new_static(value.data_type(), [2, 4]);
+            let lowered = (vec!["tt.reshape".to_owned(), "tt.broadcast".to_owned()], vec![], Some(1));
+            assert_eq!(
+                lowered_array(
+                    ArrayOperation::BroadcastLike(BroadcastLikeOperation::new(output_axes.clone())),
+                    vec![value.clone(), exemplar],
+                )
+                .unwrap(),
+                lowered,
+            );
+            assert_eq!(
+                lowered_array(ArrayOperation::Broadcast(BroadcastOperation::new(output, output_axes)), vec![value])
+                    .unwrap(),
+                lowered,
+            );
+        }
+        assert_eq!(
+            lowered_array(
+                ArrayOperation::BroadcastLike(BroadcastLikeOperation::new(vec![])),
+                vec![ArrayType::scalar(DataType::F32), ArrayType::new_static(DataType::F32, [2, 4])],
+            )
+            .unwrap(),
+            (vec!["tt.splat".to_owned()], vec![], Some(0)),
+        );
+    }
+
+    #[test]
+    fn test_lowering_array_broadcast_like_unordered_axes() {
+        assert!(matches!(
+            lowered_array(
+                ArrayOperation::BroadcastLike(BroadcastLikeOperation::new(vec![1, 0])),
+                vec![ArrayType::new_static(DataType::F32, [4, 2]), ArrayType::new_static(DataType::F32, [2, 4])],
+            ),
+            Err(Error::Unsupported { operation: "broadcast_like", reason })
+                if reason == "broadcast axes must preserve source order",
+        ));
     }
 
     #[test]

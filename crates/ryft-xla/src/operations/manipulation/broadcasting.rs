@@ -1,7 +1,7 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, BroadcastOperation, Dimension as CoreDimension, DynamicBroadcastOperation, MeshAxisType,
-    Operation as CoreOperation, ProgramError, Sharding, ShardingDimension,
+    ArrayIrType, ArrayType, BroadcastLikeOperation, BroadcastOperation, Dimension as CoreDimension,
+    DynamicBroadcastOperation, MeshAxisType, Operation as CoreOperation, ProgramError, Sharding, ShardingDimension,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
 use ryft_mlir::{
@@ -198,6 +198,50 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
 }
 
+impl LowerableOperation for BroadcastLikeOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_values, 2, ProgramError);
+        check_count!("input", input_types, 2, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let context = lowerer.context;
+        let location = lowerer.location;
+        let block = &mut lowerer.block;
+        let output_type = &output_types[0];
+        // The exemplar only provides the logical sizes of the dynamic axes. The value is broadcast at the physical
+        // allocation, where a stretched unit axis has a static extent even when its output axis is dynamic, and
+        // every logical size is then restored from the exemplar.
+        let physical_type = physical_bound_type(output_type)?;
+        let value = lower_physical_bound_value(input_values[0], &input_types[0], 0.0, block, context, location)?;
+        let broadcast = block.append_operation(stable_hlo::broadcast(
+            value,
+            lower_tensor_type(&physical_type, context, location)?,
+            self.output_axes(),
+            location,
+        )?)?;
+        let result = broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
+        let result = lower_layout_constraint(result, &physical_type, block, location)?;
+        let sources = (0..output_type.rank()).map(|axis| (input_values[1], axis)).collect::<Vec<_>>();
+        let result = lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)?;
+        if broadcast_changes_explicit_sharding(&input_types[0], output_type, self.output_axes()) {
+            lower_sharding_constraint(
+                &[result],
+                output_type.sharding().unwrap(),
+                &lowerer.collective_state.bound_manual_axes,
+                block,
+                location,
+            )
+        } else {
+            Ok(vec![result])
+        }
+    }
+}
+
 impl LowerableOperation for DynamicBroadcastOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
@@ -321,8 +365,8 @@ mod tests {
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::experimental::lowering::tests::{
-        PlainProgram, ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, shard_map_module,
-        test_manual_mesh, test_vector_type,
+        MixedValue, PlainProgram, ProgramBuilder, dynamic_dimension, execute_mixed_program,
+        ragged_dot_cpu_compilation_options, shard_map_module, test_manual_mesh, test_vector_type,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{ArrayConstant, Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
@@ -586,6 +630,160 @@ mod tests {
             execute(pullback, &[1., 2., 3., 4., 5., 6., 0., 0., 0., 0., 0., 0.], 2),
             (vec![6., 15.], vec![2, 1]),
         );
+    }
+
+    #[test]
+    fn test_lower_broadcast_like_dynamic_shape() {
+        // The exemplar provides the logical size of the dynamic output axis, both for a value that the axis
+        // replicates and for a value whose own dynamic axis maps to it next to a stretched unit axis.
+        let size = dynamic_dimension("size", Some(5));
+        let exemplar_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone(), CoreDimension::Static(3)]));
+        let column_type = ArrayType::new(DataType::F32, Shape::new(vec![size, CoreDimension::Static(1)]));
+        let mut builder = ProgramBuilder::new();
+        let row = builder.add_input(test_vector_type(3));
+        let column = builder.add_input(column_type);
+        let exemplar = builder.add_input(exemplar_type);
+        let rows = builder
+            .add_instruction(BroadcastLikeOperation::new(vec![1]), Vec::new(), vec![row, exemplar], None)
+            .unwrap()[0];
+        let columns = builder
+            .add_instruction(BroadcastLikeOperation::new(vec![0, 1]), Vec::new(), vec![column, exemplar], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                vec![rows, columns],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<3xf32>, %arg1: tensor<?x1xf32, #stablehlo.bounds<4, ?>>, %arg2: tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> (tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<?x3xf32, #stablehlo.bounds<4, ?>>) {
+                    %0 = stablehlo.broadcast_in_dim %arg0, dims = [1] : (tensor<3xf32>) -> tensor<4x3xf32>
+                    %1 = stablehlo.get_dimension_size %arg2, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %2 = stablehlo.set_dimension_size %0, %1, dim = 0 : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32, #stablehlo.bounds<4, ?>>
+                    %3 = stablehlo.get_dimension_size %arg1, dim = 0 : (tensor<?x1xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %c = stablehlo.constant dense<4> : tensor<i32>
+                    %4 = stablehlo.set_dimension_size %arg1, %c, dim = 0 : (tensor<?x1xf32, #stablehlo.bounds<4, ?>>, tensor<i32>) -> tensor<4x1xf32>
+                    %5 = stablehlo.iota dim = 0 : tensor<4x1xi32>
+                    %6 = stablehlo.broadcast_in_dim %3, dims = [] : (tensor<i32>) -> tensor<4x1xi32>
+                    %7 = stablehlo.compare LT, %5, %6, SIGNED : (tensor<4x1xi32>, tensor<4x1xi32>) -> tensor<4x1xi1>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %8 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x1xf32>
+                    %9 = stablehlo.select %7, %4, %8 : tensor<4x1xi1>, tensor<4x1xf32>
+                    %10 = stablehlo.broadcast_in_dim %9, dims = [0, 1] : (tensor<4x1xf32>) -> tensor<4x3xf32>
+                    %11 = stablehlo.get_dimension_size %arg2, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %12 = stablehlo.set_dimension_size %10, %11, dim = 0 : (tensor<4x3xf32>, tensor<i32>) -> tensor<?x3xf32, #stablehlo.bounds<4, ?>>
+                    return %2, %12 : tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<?x3xf32, #stablehlo.bounds<4, ?>>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_broadcast_like_dynamic_shape_requires_finite_bound() {
+        let exemplar_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
+        let mut builder = ProgramBuilder::new();
+        let value = builder.add_input(ArrayType::scalar(DataType::F32));
+        let exemplar = builder.add_input(exemplar_type);
+        let output = builder
+            .add_instruction(BroadcastLikeOperation::new(Vec::new()), Vec::new(), vec![value, exemplar], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let error = to_mlir_module_for_plain_program(&program, "main").unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })
+                if reason == "dynamic dimension size needs a finite positive physical bound",
+        ));
+    }
+
+    #[test]
+    fn test_lower_broadcast_like_explicit_sharding_transition_lowers_to_constraint() {
+        // The output takes the exemplar's sharding, which differs from the value's over an explicit mesh axis.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let value_type = test_vector_type(4).with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
+        let exemplar_type = test_vector_type(4)
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let mut builder = ProgramBuilder::new();
+        let value = builder.add_input(value_type);
+        let exemplar = builder.add_input(exemplar_type);
+        let output = builder
+            .add_instruction(BroadcastLikeOperation::new(vec![0]), Vec::new(), vec![value, exemplar], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.broadcast_in_dim %arg0, dims = [0] : (tensor<4xf32>) -> tensor<4xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<4xf32>
+                    return %1 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_broadcast_like_executes_dynamic_shape() {
+        // One compiled program serves every runtime extent of the exemplar, including an empty one, and the
+        // exemplar's elements never reach the results.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap());
+        let exemplar_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![rows.clone().into(), CoreDimension::Static(2)]));
+        let column_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.into(), CoreDimension::Static(1)]));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let row = builder.add_input(ArrayType::new_static(DataType::F64, [2]).into());
+        let column = builder.add_input(column_type.into());
+        let exemplar = builder.add_input(exemplar_type.into());
+        let rows = builder
+            .add_instruction(BroadcastLikeOperation::new(vec![1]), Vec::new(), vec![row, exemplar], None)
+            .unwrap()[0];
+        let columns = builder
+            .add_instruction(BroadcastLikeOperation::new(vec![0, 1]), Vec::new(), vec![column, exemplar], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![rows, columns], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        for extent in [3, 0] {
+            let length = extent as usize;
+            let outputs = execute_mixed_program(
+                &execution_client(),
+                &program,
+                &[
+                    MixedValue::Array(vec![1.0, 2.0], vec![2]),
+                    MixedValue::Array(vec![10.0, 20.0, 30.0, 40.0], vec![4, 1]),
+                    MixedValue::Array(vec![7.0; 8], vec![4, 2]),
+                ],
+                &[extent, extent],
+            )
+            .unwrap();
+            assert_eq!(
+                outputs,
+                vec![
+                    MixedValue::Array([1.0, 2.0].repeat(length), vec![length as u64, 2]),
+                    MixedValue::Array(
+                        [10.0, 20.0, 30.0][..length].iter().flat_map(|value| [*value, *value]).collect(),
+                        vec![length as u64, 2],
+                    ),
+                    MixedValue::Dimension(extent as i64),
+                    MixedValue::Dimension(extent as i64),
+                ],
+            );
+        }
     }
 
     #[test]

@@ -6322,6 +6322,75 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_compile_softmax_dynamic_shapes() {
+        // One compiled program normalizes dynamic batch and class extents at their runtime sizes. For dynamic shapes
+        // the normalization stages its class coordinates, fills, and broadcasts relative to the logits, whose
+        // runtime extents the lowered program reads.
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let domain = Session::new(&client).domain();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let classes = DimensionVariable::new("classes", DimensionBounds::new(1, Some(5)).unwrap());
+        let replicated = |r#type: ArrayType| {
+            let rank = r#type.rank();
+            r#type.with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), rank)).unwrap()
+        };
+        let logits_type =
+            replicated(ArrayType::new(DataType::F32, Shape::new(vec![batch.clone().into(), classes.into()])));
+        let labels_type = replicated(ArrayType::new(DataType::I32, Shape::new(vec![batch.into()])));
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+            |(logits, labels)| {
+                let log_probabilities = logits.log_softmax(1).unwrap();
+                let loss = logits.softmax_cross_entropy_with_integer_labels(&labels, 1).unwrap();
+                (log_probabilities, loss)
+            },
+            (logits_type, labels_type),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        for (rows, columns) in [(2, 3), (1, 4), (4, 1)] {
+            let values = (0..rows * columns).map(|index| 3.0 * (0.75 * index as f32).sin()).collect::<Vec<_>>();
+            let label_values = (0..rows).map(|row| (row % columns) as i32).collect::<Vec<_>>();
+            let logits = Array::from_host_buffer(
+                &domain,
+                replicated(ArrayType::new_static(DataType::F32, [rows, columns])),
+                mesh.clone(),
+                &values_to_bytes(&values),
+            )
+            .unwrap();
+            let labels = Array::from_host_buffer(
+                &domain,
+                replicated(ArrayType::new_static(DataType::I32, [rows])),
+                mesh.clone(),
+                &values_to_bytes(&label_values),
+            )
+            .unwrap();
+            let (log_probabilities, loss) = compiled.executable().execute(&domain, (logits, labels)).unwrap();
+
+            // The reference arrays compute the same functions at the static runtime shape.
+            let expected_logits = CoreArray::matrix(rows, columns, values).unwrap();
+            let expected_labels = CoreArray::vector(label_values).unwrap();
+            let expected_log_probabilities = expected_logits.log_softmax(1).unwrap().elements::<f32>().unwrap();
+            let expected_loss = expected_logits
+                .softmax_cross_entropy_with_integer_labels(&expected_labels, 1)
+                .unwrap()
+                .elements::<f32>()
+                .unwrap();
+            let log_probabilities = read_f32_array(&client, &log_probabilities);
+            let loss = read_f32_array(&client, &loss);
+            assert_eq!(log_probabilities.len(), expected_log_probabilities.len());
+            assert_eq!(loss.len(), expected_loss.len());
+            for (actual, expected) in log_probabilities.iter().zip(&expected_log_probabilities) {
+                assert!((actual - expected).abs() < 1e-5, "{actual} differs from {expected}");
+            }
+            for (actual, expected) in loss.iter().zip(&expected_loss) {
+                assert!((actual - expected).abs() < 1e-5, "{actual} differs from {expected}");
+            }
+        }
+    }
+
+    #[test]
     fn test_executable_function_execute_async_retains_zero_output_completion() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin

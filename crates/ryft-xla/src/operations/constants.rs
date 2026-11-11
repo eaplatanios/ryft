@@ -1,8 +1,8 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Array as CoreArray, ArrayIrType, ArrayType, ConstantOperation, DataType, Dimension as CoreDimension, IotaOperation,
-    Layout, OneLikeOperation, OneOperation, Operation as CoreOperation, ProgramError, Shape, TypeError,
-    ZeroLikeOperation, ZeroOperation,
+    Array as CoreArray, ArrayIrType, ArrayType, ConstantOperation, DataType, Dimension as CoreDimension,
+    FillLikeOperation, IotaLikeOperation, IotaOperation, Layout, OneLikeOperation, OneOperation,
+    Operation as CoreOperation, ProgramError, Shape, TypeError, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
@@ -11,7 +11,8 @@ use ryft_mlir::{
 
 use crate::experimental::lowering::MlirLowerableValue;
 use crate::experimental::lowering::types::{
-    lower_constant_output, lower_tensor_type, stable_hlo_dynamic_dimension_bound,
+    lower_constant_output, lower_restore_dynamic_dimensions, lower_tensor_type, physical_bound_type,
+    stable_hlo_dynamic_dimension_bound,
 };
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::operations::manipulation::memory::annotate_output_memory;
@@ -118,6 +119,96 @@ pub(crate) fn lower_like_constant<'b, 'c: 'b, 't: 'c>(
         lower_sharding_constraint(&result, sharding, bound_manual_axes, block, location)
     } else {
         Ok(result)
+    }
+}
+
+/// Finishes a constructor whose result takes the type and the runtime shape of an exemplar. `result` must have the
+/// [`physical_bound_type`] of `output_type`, because allocation uses the declared bounds. This function applies the
+/// declared memory placement and layout to that allocation, restores the logical size of every dynamic axis from
+/// `exemplar` (including zero extents), and constrains the result to the sharding that its type declares, if any.
+fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
+    result: ValueRef<'b, 'c, 't>,
+    exemplar: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    bound_manual_axes: &[String],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    let physical_type = physical_bound_type(output_type)?;
+    let result = annotate_output_memory(result, &physical_type, block, context, location)?;
+    let result = lower_layout_constraint(result, &physical_type, block, location)?;
+    let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
+    let result = lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)?;
+    match output_type.sharding() {
+        Some(sharding) => lower_sharding_constraint(&[result], sharding, bound_manual_axes, block, location),
+        None => Ok(vec![result]),
+    }
+}
+
+impl LowerableOperation for FillLikeOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_values, 1, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        // The exemplar only provides the logical sizes of the dynamic axes, so the scalar is broadcast to the
+        // statically shaped physical allocation, like the static `fill`.
+        let physical_type = physical_bound_type(&output_types[0])?;
+        let physical_tensor_type = lowerer.lower_tensor_type(&physical_type)?;
+        let value = self.value().lower_constant_value(&[], &mut lowerer.block, lowerer.context, lowerer.location)?;
+        let result = lowerer.block.append_operation(stable_hlo::broadcast(
+            value,
+            physical_tensor_type,
+            &[],
+            lowerer.location,
+        )?)?;
+        let result = result.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
+        lower_exemplar_shape(
+            result,
+            input_values[0],
+            &output_types[0],
+            &lowerer.collective_state.bound_manual_axes,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )
+    }
+}
+
+impl LowerableOperation for IotaLikeOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        _input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_values, 1, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        // Coordinates do not depend on the extent of their axis, so the coordinates of the physical allocation are
+        // correct inside every logical size that the exemplar provides.
+        let physical_type = physical_bound_type(&output_types[0])?;
+        let physical_tensor_type = lowerer.lower_tensor_type(&physical_type)?;
+        let result = lowerer.block.append_operation(stable_hlo::iota(
+            physical_tensor_type,
+            self.dimension(),
+            lowerer.location,
+        )?)?;
+        let result = result.result(0).expect("stablehlo.iota should return one result").as_ref();
+        lower_exemplar_shape(
+            result,
+            input_values[0],
+            &output_types[0],
+            &lowerer.collective_state.bound_manual_axes,
+            &mut lowerer.block,
+            lowerer.context,
+            lowerer.location,
+        )
     }
 }
 
@@ -1173,6 +1264,163 @@ mod tests {
             );
             assert_eq!(values_from_bytes::<i32>(outputs[2].as_slice()), vec![extent]);
             assert_eq!(values_from_bytes::<i32>(outputs[3].as_slice()), vec![extent]);
+        }
+    }
+
+    #[test]
+    fn test_lower_exemplar_constructor_static_shape() {
+        // A static exemplar provides no runtime sizes, so the constructors only keep the sharding of their type.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = test_vector_type(4)
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let fill = FillLikeOperation::<ArrayType>::new(CoreArray::scalar(2.5f32).unwrap()).unwrap();
+        let fill = builder.add_instruction(fill, Vec::new(), vec![input], None).unwrap()[0];
+        let iota = IotaLikeOperation::<ArrayType>::new(0, DataType::I64).unwrap();
+        let iota = builder.add_instruction(iota, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![fill, iota], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>) -> (tensor<4xf32>, tensor<4xi64>) {
+                    %cst = stablehlo.constant dense<2.500000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4xf32>
+                    %1 = sdy.sharding_constraint %0 <@mesh, [{"x"}]> : tensor<4xf32>
+                    %2 = stablehlo.iota dim = 0 : tensor<4xi64>
+                    %3 = sdy.sharding_constraint %2 <@mesh, [{"x"}]> : tensor<4xi64>
+                    return %1, %3 : tensor<4xf32>, tensor<4xi64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_exemplar_constructor_dynamic_shape() {
+        let input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![dynamic_dimension("size", Some(5)), CoreDimension::Static(2)]),
+        );
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let fill = FillLikeOperation::<ArrayType>::new(CoreArray::scalar(2.5f32).unwrap()).unwrap();
+        let fill = builder.add_instruction(fill, Vec::new(), vec![input], None).unwrap()[0];
+        let iota = IotaLikeOperation::<ArrayType>::new(0, DataType::I32).unwrap();
+        let iota = builder.add_instruction(iota, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![fill, iota], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> (tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<?x2xi32, #stablehlo.bounds<4, ?>>) {
+                    %cst = stablehlo.constant dense<2.500000e+00> : tensor<f32>
+                    %0 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<4x2xf32>
+                    %1 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %2 = stablehlo.set_dimension_size %0, %1, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    %3 = stablehlo.iota dim = 0 : tensor<4x2xi32>
+                    %4 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %5 = stablehlo.set_dimension_size %3, %4, dim = 0 : (tensor<4x2xi32>, tensor<i32>) -> tensor<?x2xi32, #stablehlo.bounds<4, ?>>
+                    return %2, %5 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<?x2xi32, #stablehlo.bounds<4, ?>>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_exemplar_constructor_dynamic_metadata() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("size", Some(5))]))
+            .with_memory(Memory::Host { pinned: true })
+            .with_layout(Some(TiledLayout::new(vec![0], Vec::new()).into()))
+            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        let fill = FillLikeOperation::<ArrayType>::new(CoreArray::scalar(2.5f64).unwrap()).unwrap();
+        let fill = builder.add_instruction(fill, Vec::new(), vec![input], None).unwrap()[0];
+        let iota = IotaLikeOperation::<ArrayType>::new(0, DataType::I32).unwrap();
+        let iota = builder.add_instruction(iota, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![fill, iota], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        // Byte strides do not carry across element widths, so the coordinates take the default layout.
+        let iota_type = input_type.clone().with_data_type(DataType::I32).with_layout(None);
+        assert_eq!(program.output_types(), vec![input_type, iota_type]);
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(module.matches("stablehlo.get_dimension_size").count(), 2, "{module}");
+        assert_eq!(module.matches("stablehlo.set_dimension_size").count(), 2, "{module}");
+        assert_eq!(module.matches("_xla_buffer_placement = \"pinned_host\"").count(), 2, "{module}");
+        assert_eq!(module.matches("stablehlo.custom_call @LayoutConstraint").count(), 1, "{module}");
+        assert_eq!(module.matches("sdy.sharding_constraint").count(), 2, "{module}");
+    }
+
+    #[test]
+    fn test_lower_exemplar_constructor_dynamic_shape_requires_finite_bound() {
+        let fill = FillLikeOperation::<ArrayType>::new(CoreArray::scalar(2.5f32).unwrap()).unwrap();
+        let iota = IotaLikeOperation::<ArrayType>::new(0, DataType::I32).unwrap();
+        for operation in [ArrayOperation::FillLike(fill), ArrayOperation::IotaLike(iota)] {
+            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(input_type);
+            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let error = to_mlir_module_for_plain_program(&program, "main").unwrap_err();
+            assert!(matches!(
+                error,
+                Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })
+                    if reason == "dynamic dimension size needs a finite positive physical bound",
+            ));
+        }
+    }
+
+    #[test]
+    fn test_lower_exemplar_constructor_executes_dynamic_shape() {
+        // One compiled program serves every runtime extent of the exemplar, including an empty one, and the
+        // exemplar's elements never reach the results.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap());
+        let exemplar_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.into(), CoreDimension::Static(2)]));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let exemplar = builder.add_input(exemplar_type.into());
+        let fill = FillLikeOperation::<ArrayIrType>::new(CoreArray::scalar(2.5f64).unwrap()).unwrap();
+        let fill = ArrayIrOperation::<ArrayConstant>::from(fill);
+        let fill = builder.add_instruction(fill, Vec::new(), vec![exemplar], None).unwrap()[0];
+        let iota = IotaLikeOperation::<ArrayIrType>::new(0, DataType::I32).unwrap();
+        let iota = ArrayIrOperation::<ArrayConstant>::from(iota);
+        let iota = builder.add_instruction(iota, Vec::new(), vec![exemplar], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![fill, iota], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        for extent in [3, 0] {
+            let length = extent as usize;
+            let outputs = execute_mixed_program(
+                &execution_client(),
+                &program,
+                &[MixedValue::Array(vec![7.0; 8], vec![4, 2])],
+                &[extent],
+            )
+            .unwrap();
+            assert_eq!(
+                outputs,
+                vec![
+                    MixedValue::Array(vec![2.5; 2 * length], vec![length as u64, 2]),
+                    MixedValue::Integers((0..extent).flat_map(|row| [row, row]).collect(), vec![length as u64, 2]),
+                    MixedValue::Dimension(extent as i64),
+                    MixedValue::Dimension(extent as i64),
+                ],
+            );
         }
     }
 

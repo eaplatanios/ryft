@@ -1,6 +1,8 @@
 //! Scalar-loop implementations of canonical array operations over cooperative flat storage.
 
-use ryft_core::{Array, ArrayOperation, ArrayType, ComparisonDirection, DataType, Operation, ReductionKind};
+use ryft_core::{
+    Array, ArrayAddressing, ArrayOperation, ArrayType, ComparisonDirection, DataType, Operation, ReductionKind,
+};
 use ryft_mlir::dialects::{arith, math, scf};
 use ryft_mlir::{Block, DetachedBlock, Type, Value};
 
@@ -14,7 +16,17 @@ pub(super) fn validate(
     inputs: &[ArrayType],
     output: &ArrayType,
 ) -> Result<(), Error> {
+    // The exemplar inputs of the like operations contribute only their shape, which the output type already carries,
+    // so their element types never reach the scalar implementation and must not restrict which operations lower.
+    let value_inputs = match operation {
+        ArrayOperation::FillLike(_) | ArrayOperation::IotaLike(_) => &inputs[..0],
+        ArrayOperation::BroadcastLike(_) => &inputs[..inputs.len().min(1)],
+        _ => inputs,
+    };
     for r#type in inputs.iter().chain(std::iter::once(output)) {
+        checked_count(operation, &shape(r#type)?)?;
+    }
+    for r#type in value_inputs.iter().chain(std::iter::once(output)) {
         if !matches!(
             r#type.data_type(),
             DataType::Boolean
@@ -32,18 +44,19 @@ pub(super) fn validate(
         ) {
             return Err(unsupported(operation, "element type has no baseline scalar implementation"));
         }
-        checked_count(operation, &shape(r#type)?)?;
     }
-    if inputs
+    if value_inputs
         .iter()
         .chain(std::iter::once(output))
         .any(|r#type| matches!(r#type.data_type(), DataType::F16 | DataType::BF16))
         && !matches!(
             operation,
-            ArrayOperation::Constant(_)
+            ArrayOperation::FillLike(_)
+                | ArrayOperation::Constant(_)
                 | ArrayOperation::ConvertElementType(_)
                 | ArrayOperation::Transpose(_)
                 | ArrayOperation::Broadcast(_)
+                | ArrayOperation::BroadcastLike(_)
                 | ArrayOperation::Reshape(_)
                 | ArrayOperation::StopGradient(_)
                 | ArrayOperation::Select(_)
@@ -54,15 +67,17 @@ pub(super) fn validate(
             "half-precision storage supports only bit-preserving operations and numeric conversion",
         ));
     }
-    if inputs
+    if value_inputs
         .iter()
         .chain(std::iter::once(output))
         .any(|r#type| matches!(r#type.data_type(), DataType::U8 | DataType::F8E4M3FN | DataType::F8E8M0FNU))
         && !matches!(
             operation,
-            ArrayOperation::Constant(_)
+            ArrayOperation::FillLike(_)
+                | ArrayOperation::Constant(_)
                 | ArrayOperation::Transpose(_)
                 | ArrayOperation::Broadcast(_)
+                | ArrayOperation::BroadcastLike(_)
                 | ArrayOperation::Reshape(_)
                 | ArrayOperation::StopGradient(_)
                 | ArrayOperation::Select(_)
@@ -77,7 +92,7 @@ pub(super) fn validate(
     if expected.as_slice() != [output.clone()] {
         return Err(unsupported(operation, "result type differs from canonical array inference"));
     }
-    let data_inputs = if matches!(operation, ArrayOperation::Select(_)) { &inputs[1..] } else { inputs };
+    let data_inputs = if matches!(operation, ArrayOperation::Select(_)) { &inputs[1..] } else { value_inputs };
     if data_inputs.windows(2).any(|pair| pair[0].data_type() != pair[1].data_type()) {
         return Err(unsupported(operation, "arithmetic operand element types must agree"));
     }
@@ -89,9 +104,11 @@ pub(super) fn validate(
         | ArrayOperation::ZeroLike(_)
         | ArrayOperation::One(_)
         | ArrayOperation::OneLike(_)
+        | ArrayOperation::FillLike(_)
         | ArrayOperation::Constant(_)
         | ArrayOperation::Transpose(_)
         | ArrayOperation::Broadcast(_)
+        | ArrayOperation::BroadcastLike(_)
         | ArrayOperation::Add(_)
         | ArrayOperation::Sub(_)
         | ArrayOperation::Mul(_)
@@ -103,7 +120,7 @@ pub(super) fn validate(
         | ArrayOperation::Select(_)
         | ArrayOperation::Compare(_)
         | ArrayOperation::StopGradient(_) => Ok(()),
-        ArrayOperation::Iota(_) if output.data_type() != DataType::Boolean => Ok(()),
+        ArrayOperation::Iota(_) | ArrayOperation::IotaLike(_) if output.data_type() != DataType::Boolean => Ok(()),
         ArrayOperation::Div(_) if is_float(output.data_type()) => Ok(()),
         ArrayOperation::Exp(_) if matches!(output.data_type(), DataType::F32 | DataType::F64) => Ok(()),
         ArrayOperation::ConvertElementType(operation)
@@ -180,17 +197,10 @@ impl<'c, 't> Lowering<'c, 't> {
                 }
                 ArrayOperation::Constant(constant) => {
                     let bytes = constant.value().logical_bytes();
-                    let width = match data_type {
-                        DataType::Boolean => 1,
-                        DataType::F16 | DataType::BF16 => 16,
-                        DataType::F32 | DataType::I32 | DataType::U32 => 4,
-                        _ => 8,
-                    };
+                    let width = ArrayAddressing::element_byte_width_for_data_type(data_type);
                     let mut selected = lowering.literal(body, data_type, 0)?;
                     for (element, bytes) in bytes.chunks_exact(width).enumerate() {
-                        let mut encoding = [0u8; 8];
-                        encoding[..width].copy_from_slice(bytes);
-                        let value = lowering.literal(body, data_type, u64::from_le_bytes(encoding))?;
+                        let value = lowering.literal(body, data_type, element_bits(bytes))?;
                         let position = lowering.index(body, element)?;
                         let matches = append(
                             body,
@@ -200,22 +210,15 @@ impl<'c, 't> Lowering<'c, 't> {
                     }
                     selected
                 }
+                ArrayOperation::FillLike(fill) => {
+                    // The literal is a rank-0 array of the output data type, so its logical bytes encode one element.
+                    lowering.literal(body, data_type, element_bits(&fill.value().logical_bytes()))?
+                }
                 ArrayOperation::Iota(iota) => {
-                    let value = coordinates[iota.dimension()];
-                    let integer_type = lowering.context.signless_integer_type(64);
-                    let value = append(body, arith::index_cast(value, integer_type, lowering.location)?)?;
-                    match data_type {
-                        DataType::F32 | DataType::F64 => append(
-                            body,
-                            arith::sitofp(value, element_type(lowering.context, data_type)?, lowering.location)?,
-                        )?,
-                        DataType::I64 | DataType::U64 => value,
-                        DataType::I32 | DataType::U32 => append(
-                            body,
-                            arith::trunci(value, element_type(lowering.context, data_type)?, lowering.location)?,
-                        )?,
-                        _ => return Err(unsupported(operation, "iota requires a supported numeric element type")),
-                    }
+                    lowering.iota(body, operation, coordinates[iota.dimension()], data_type)?
+                }
+                ArrayOperation::IotaLike(iota) => {
+                    lowering.iota(body, operation, coordinates[iota.dimension()], data_type)?
                 }
                 ArrayOperation::Reshape(_) => lowering.load(body, &inputs[0], index)?,
                 ArrayOperation::Transpose(transpose) => {
@@ -229,20 +232,10 @@ impl<'c, 't> Lowering<'c, 't> {
                     lowering.load(body, &inputs[0], source)?
                 }
                 ArrayOperation::Broadcast(broadcast) => {
-                    let source_coordinates = broadcast
-                        .output_axes()
-                        .iter()
-                        .enumerate()
-                        .map(|(axis, &output_axis)| {
-                            if input_shapes[0][axis] == 1 {
-                                lowering.index(body, 0)
-                            } else {
-                                Ok(coordinates[output_axis])
-                            }
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let source = lowering.flat_index(body, &source_coordinates, &input_shapes[0])?;
-                    lowering.load(body, &inputs[0], source)?
+                    lowering.broadcast(body, &inputs[0], &input_shapes[0], broadcast.output_axes(), &coordinates)?
+                }
+                ArrayOperation::BroadcastLike(broadcast) => {
+                    lowering.broadcast(body, &inputs[0], &input_shapes[0], broadcast.output_axes(), &coordinates)?
                 }
                 ArrayOperation::Reduce(reduction) if reduction.axes().is_empty() => {
                     lowering.load(body, &inputs[0], index)?
@@ -401,6 +394,51 @@ impl<'c, 't> Lowering<'c, 't> {
             index = append(block, arith::addi(scaled, coordinate, self.location)?)?;
         }
         Ok(index)
+    }
+
+    /// Converts the output coordinate along the varying dimension of an iota to the output element type.
+    fn iota(
+        &self,
+        block: &mut DetachedBlock<'c, 't>,
+        operation: &ArrayOperation<Array>,
+        coordinate: KernelValue<'c, 't>,
+        data_type: DataType,
+    ) -> Result<KernelValue<'c, 't>, Error> {
+        let integer_type = self.context.signless_integer_type(64);
+        let value = append(block, arith::index_cast(coordinate, integer_type, self.location)?)?;
+        Ok(match data_type {
+            DataType::F32 | DataType::F64 => {
+                append(block, arith::sitofp(value, element_type(self.context, data_type)?, self.location)?)?
+            }
+            DataType::I64 | DataType::U64 => value,
+            DataType::I32 | DataType::U32 => {
+                append(block, arith::trunci(value, element_type(self.context, data_type)?, self.location)?)?
+            }
+            _ => return Err(unsupported(operation, "iota requires a supported numeric element type")),
+        })
+    }
+
+    /// Loads the input element that a broadcast copies to the output element at `coordinates`. Unit input axes always
+    /// read their only element, so they stretch to any output extent.
+    fn broadcast(
+        &self,
+        block: &mut DetachedBlock<'c, 't>,
+        input: &Buffer<'c, 't>,
+        input_shape: &[usize],
+        output_axes: &[usize],
+        coordinates: &[KernelValue<'c, 't>],
+    ) -> Result<KernelValue<'c, 't>, Error> {
+        let source_coordinates = output_axes
+            .iter()
+            .enumerate()
+            .map(
+                |(axis, &output_axis)| {
+                    if input_shape[axis] == 1 { self.index(block, 0) } else { Ok(coordinates[output_axis]) }
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        let source = self.flat_index(block, &source_coordinates, input_shape)?;
+        self.load(block, input, source)
     }
 
     /// Emits an exact scalar encoding, including NaN payloads and signed zeros.
@@ -596,6 +634,13 @@ fn is_float(data_type: DataType) -> bool {
     matches!(data_type, DataType::F16 | DataType::BF16 | DataType::F32 | DataType::F64)
 }
 
+/// Zero-extends the little-endian logical bytes of one element, which every admitted data type keeps within 8 bytes.
+fn element_bits(bytes: &[u8]) -> u64 {
+    let mut encoding = [0u8; 8];
+    encoding[..bytes.len()].copy_from_slice(bytes);
+    u64::from_le_bytes(encoding)
+}
+
 /// Returns the exact encoding of one at the admitted scalar type.
 fn one_bits(data_type: DataType) -> u64 {
     match data_type {
@@ -615,8 +660,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        AddOperation, ArrayIrOperation, Context, ConvertElementTypeOperation, DotDimensionNumbers, DotOperation,
-        ExpOperation, ReduceOperation, ReferenceRead, ReferenceWrite, SaturatingSubOperation,
+        AddOperation, ArrayIrOperation, BroadcastLikeOperation, BroadcastOperation, ConstantOperation, Context,
+        ConvertElementTypeOperation, DotDimensionNumbers, DotOperation, ExpOperation, FillLikeOperation,
+        IotaLikeOperation, IotaOperation, ReduceOperation, ReferenceRead, ReferenceWrite, SaturatingSubOperation,
     };
     use ryft_kernels::{
         Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, KernelSchedule, VerifiedKernel,
@@ -628,9 +674,16 @@ mod tests {
 
     use super::*;
 
-    /// Lowers a canonically traced operation inside a real GPU module and records its floating arithmetic.
-    fn lowered_arithmetic(operation: ArrayOperation<Array>, input_types: Vec<ArrayType>) -> Vec<String> {
-        let output_type = operation.infer_output_types(&input_types, &[]).unwrap().remove(0);
+    /// Lowers a canonically traced operation inside a real GPU module. It returns the names of all native operations in
+    /// walk order, the integer literal that each `arith.bitcast` reinterprets, and the values of all 8-bit integer
+    /// literals, which hold byte elements without a bitcast. Every input is read, but the operation consumes only the
+    /// first `used` of them, so kernels whose operations consume different inputs keep the same parameters and reads.
+    fn lowered(
+        operation: ArrayOperation<Array>,
+        input_types: Vec<ArrayType>,
+        used: usize,
+    ) -> (Vec<String>, Vec<i64>, Vec<i64>) {
+        let output_type = operation.infer_output_types(&input_types[..used], &[]).unwrap().remove(0);
         let mut parameters = input_types
             .into_iter()
             .map(|r#type| whole_array_parameter(r#type, KernelParameterAccess::ReadOnly).unwrap())
@@ -642,7 +695,7 @@ mod tests {
             let inputs = references[..input_count].iter().map(ReferenceRead::read).collect::<Result<Vec<_>, _>>()?;
             let value = references[input_count]
                 .context()
-                .bind(ArrayIrOperation::Array(operation), vec![], &inputs)?
+                .bind(ArrayIrOperation::Array(operation), vec![], &inputs[..used])?
                 .remove(0);
             references[input_count].write(&value)
         })
@@ -653,18 +706,42 @@ mod tests {
             .module(&context, &kernel, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default())
             .unwrap();
         assert!(module.verify().unwrap());
-        let mut operations = Vec::new();
+        let mut names = Vec::new();
+        let mut literals = Vec::new();
+        let mut bitcasts = Vec::new();
+        let mut bytes = Vec::new();
         module.as_operation().unwrap().walk(WalkOrder::PreOrder, |operation| {
             let name = operation.name().to_string();
-            if matches!(
-                name.as_str(),
-                "arith.addf" | "arith.mulf" | "arith.maximumf" | "math.exp" | "arith.extf" | "arith.truncf"
-            ) {
-                operations.push(name);
+            if let ("arith.constant", Ok(attribute)) = (name.as_str(), operation.integer_attribute("value")) {
+                let value = operation.result(0).unwrap().as_ref();
+                if value.r#type().unwrap() == context.signless_integer_type(8).as_ref() {
+                    bytes.push(attribute.signless_value());
+                }
+                literals.push((value, attribute.signless_value()));
             }
+            if name == "arith.bitcast" {
+                let input = operation.operand_value(0).unwrap();
+                bitcasts.push(literals.iter().find(|(value, _)| *value == input).unwrap().1);
+            }
+            names.push(name);
             WalkResult::Advance
         });
-        operations
+        (names, bitcasts, bytes)
+    }
+
+    /// Lowers a canonically traced operation inside a real GPU module and records its floating arithmetic.
+    fn lowered_arithmetic(operation: ArrayOperation<Array>, input_types: Vec<ArrayType>) -> Vec<String> {
+        let used = input_types.len();
+        lowered(operation, input_types, used)
+            .0
+            .into_iter()
+            .filter(|name| {
+                matches!(
+                    name.as_str(),
+                    "arith.addf" | "arith.mulf" | "arith.maximumf" | "math.exp" | "arith.extf" | "arith.truncf"
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -699,6 +776,35 @@ mod tests {
             validate(&operation, &[r#type.clone(), r#type.clone()], &r#type),
             Err(Error::Unsupported { operation: "saturating_sub", reason })
                 if reason == "integer saturation has no baseline scalar implementation",
+        ));
+    }
+
+    #[test]
+    fn test_validate_like_operations_ignore_exemplar_element_types() {
+        let exemplar = ArrayType::new_static(DataType::F16, [2, 3]);
+        let iota = ArrayOperation::IotaLike(IotaLikeOperation::new(1, DataType::I64).unwrap());
+        assert!(validate(&iota, &[exemplar.clone()], &ArrayType::new_static(DataType::I64, [2, 3])).is_ok());
+        let broadcast = ArrayOperation::BroadcastLike(BroadcastLikeOperation::new(vec![1]));
+        let inputs = [ArrayType::new_static(DataType::I32, [3]), exemplar];
+        assert!(validate(&broadcast, &inputs, &ArrayType::new_static(DataType::I32, [2, 3])).is_ok());
+        let fill = ArrayOperation::FillLike(FillLikeOperation::new(Array::scalar(7u8).unwrap()).unwrap());
+        let r#type = ArrayType::new_static(DataType::U8, [2, 3]);
+        assert!(validate(&fill, &[r#type.clone()], &r#type).is_ok());
+    }
+
+    #[test]
+    fn test_validate_iota_like_half_precision() {
+        // Iota values are converted numerically, so half-precision outputs are rejected even though the exemplar's
+        // element type does not matter.
+        let operation = ArrayOperation::IotaLike(IotaLikeOperation::new(1, DataType::F16).unwrap());
+        assert!(matches!(
+            validate(
+                &operation,
+                &[ArrayType::new_static(DataType::F32, [2, 3])],
+                &ArrayType::new_static(DataType::F16, [2, 3]),
+            ),
+            Err(Error::Unsupported { operation: "iota_like", reason })
+                if reason == "half-precision storage supports only bit-preserving operations and numeric conversion",
         ));
     }
 
@@ -843,6 +949,91 @@ mod tests {
             ),
             vec!["arith.mulf", "arith.addf"],
         );
+    }
+
+    #[test]
+    fn test_array_fill_like() {
+        // Literals are emitted as integer bits and reinterpreted, which preserves signs and NaN payloads exactly. The
+        // leading zero is the fallback of the exemplar's read, which the fill never consumes.
+        let fill = |value: Array, r#type: ArrayType| {
+            lowered(ArrayOperation::FillLike(FillLikeOperation::new(value).unwrap()), vec![r#type], 1).1
+        };
+        assert_eq!(
+            fill(Array::scalar(2.5f32).unwrap(), ArrayType::new_static(DataType::F32, [2, 3])),
+            vec![0, i64::from(2.5f32.to_bits() as i32)],
+        );
+        assert_eq!(
+            fill(Array::scalar(f32::from_bits(0xffc0_0001)).unwrap(), ArrayType::new_static(DataType::F32, [3])),
+            vec![0, i64::from(0xffc0_0001u32 as i32)],
+        );
+        assert_eq!(
+            fill(Array::scalar(-2.5f64).unwrap(), ArrayType::new_static(DataType::F64, [2])),
+            vec![0, (-2.5f64).to_bits() as i64],
+        );
+    }
+
+    #[test]
+    fn test_array_constant() {
+        // Every element is decoded at its own byte width, and the leading zero initializes the chain of selections.
+        // Float elements are reinterpreted through bitcasts, while byte elements are 8-bit integer literals.
+        let constant = |data_type: DataType, elements: &[u64]| {
+            let width = ArrayAddressing::element_byte_width_for_data_type(data_type);
+            let bytes = elements.iter().flat_map(|element| element.to_le_bytes()[..width].to_vec()).collect::<Vec<_>>();
+            let value = Array::new(ArrayType::new_static(data_type, [elements.len()]), bytes).unwrap();
+            let (_, bitcasts, bytes) = lowered(ArrayOperation::Constant(ConstantOperation::new(value)), vec![], 0);
+            (bitcasts, bytes)
+        };
+        assert_eq!(
+            constant(DataType::F16, &[0x3c00, 0xc000, 0x3800]),
+            (vec![0, 0x3c00, i64::from(0xc000u16 as i16), 0x3800], vec![]),
+        );
+        assert_eq!(
+            constant(DataType::F16, &(0x3c00..0x3c09).collect::<Vec<u64>>()),
+            ([vec![0], (0x3c00..0x3c09).collect::<Vec<i64>>()].concat(), vec![]),
+        );
+        assert_eq!(constant(DataType::U8, &[7, 200, 3]), (vec![], vec![0, 7, i64::from(200u8 as i8), 3]));
+        assert_eq!(
+            constant(DataType::F32, &[u64::from(1.5f32.to_bits()), u64::from((-2.0f32).to_bits())]),
+            (vec![0, i64::from(1.5f32.to_bits() as i32), i64::from((-2.0f32).to_bits() as i32)], vec![]),
+        );
+    }
+
+    #[test]
+    fn test_array_iota_like() {
+        // The lowering never loads the exemplar, so the kernel matches one that reads the same input but binds an iota.
+        let exemplar = ArrayType::new_static(DataType::F16, [2, 3]);
+        for data_type in [DataType::I32, DataType::F32, DataType::U64] {
+            let output = ArrayType::new_static(data_type, [2, 3]);
+            assert_eq!(
+                lowered(
+                    ArrayOperation::IotaLike(IotaLikeOperation::new(1, data_type).unwrap()),
+                    vec![exemplar.clone()],
+                    1,
+                ),
+                lowered(ArrayOperation::Iota(IotaOperation::new(output, 1).unwrap()), vec![exemplar.clone()], 0),
+            );
+        }
+    }
+
+    #[test]
+    fn test_array_broadcast_like() {
+        // Both kernels read the exemplar, and the lowering of a broadcast like it never loads the exemplar, so the two
+        // kernels must match. The second case also stretches a unit axis and uses an exemplar of another element type.
+        for (value, exemplar, output_axes) in [
+            (ArrayType::new_static(DataType::F32, [3]), ArrayType::new_static(DataType::F32, [2, 3]), vec![1]),
+            (ArrayType::new_static(DataType::I32, [1, 3]), ArrayType::new_static(DataType::F16, [2, 3]), vec![0, 1]),
+        ] {
+            let output = ArrayType::new_static(value.data_type(), [2, 3]);
+            let inputs = vec![value, exemplar];
+            assert_eq!(
+                lowered(
+                    ArrayOperation::BroadcastLike(BroadcastLikeOperation::new(output_axes.clone())),
+                    inputs.clone(),
+                    2,
+                ),
+                lowered(ArrayOperation::Broadcast(BroadcastOperation::new(output, output_axes)), inputs, 1),
+            );
+        }
     }
 
     #[test]

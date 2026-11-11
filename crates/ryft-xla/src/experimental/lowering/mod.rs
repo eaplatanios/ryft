@@ -5,13 +5,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use ryft_core::{
-    Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, BroadcastOperation, CastOperation, CollectiveAxes,
-    ConstrainShardingOperation, DataType, DimensionOperation, DimensionType, DimensionValue, DynamicBroadcastOperation,
-    DynamicReshapeOperation, EffectClass, EffectClasses, ExternalReferenceBinding, GatherOperation, Instruction,
-    LogicalMesh, Memory, OneLikeOperation, Operation as CoreOperation, OperationPayloadProjection, Parameterized,
-    ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
-    ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as RyftType,
-    TypeError, Typed, TypedProgram, Value as CoreValue, ZeroLikeOperation, ZeroOperation,
+    Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, BroadcastLikeOperation, BroadcastOperation,
+    CastOperation, CollectiveAxes, ConstrainShardingOperation, DataType, DimensionOperation, DimensionType,
+    DimensionValue, DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses,
+    ExternalReferenceBinding, FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, LogicalMesh, Memory,
+    OneLikeOperation, Operation as CoreOperation, OperationPayloadProjection, Parameterized, ProgramError, Provenance,
+    RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation, Shape,
+    ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as RyftType, TypeError, Typed, TypedProgram,
+    Value as CoreValue, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -657,14 +658,15 @@ impl<V: MlirLowerableValue> LowerableOperation for ArrayOperation<V> {
         // `validate_local_output_placement`).
         lower_operation_variants!(
             self, ArrayOperation, lowerer, input_values, input_types, output_types;
-            Zero, ZeroLike, One, OneLike, Constant, Iota, Min, Max, Clamp, Sign, Neg, Add, Sub, SaturatingSub,
+            Zero, ZeroLike, One, OneLike, Constant, FillLike, Iota, IotaLike,
+            Min, Max, Clamp, Sign, Neg, Add, Sub, SaturatingSub,
             Mul, Div, Rem, Pow, Sqrt, Rsqrt, Abs, Sin, Cos, Tan, Tanh, Atan2, Exp, ExpM1, Log, Ln1p, LogAddExp, Logistic, Erf,
             Floor, Ceil, Round, Not,
             And, Or, Xor, Complex, Real, Imaginary, Conjugate, Reduce, ArgMax, ArgMin, Cumulative, Sort, Dot, RaggedDot,
             ScaledDot, AxisIndex, ParallelReduce, ParallelVary, ParallelCast,
             ParallelAllGather, ParallelSumScatter, ParallelPermute, ParallelBroadcast, ParallelAllToAll,
-            ParallelRaggedAllToAll, Compare, Select, Transpose, Reverse, Reshape, Broadcast, Pad, Concatenate, Gather,
-            Scatter, Slice, UpdateSlice,
+            ParallelRaggedAllToAll, Compare, Select, Transpose, Reverse, Reshape, Broadcast, BroadcastLike, Pad,
+            Concatenate, Gather, Scatter, Slice, UpdateSlice,
             DynamicSlice, DynamicUpdateSlice, ConvertElementType, ReducePrecision, TransferToMemory, Reshard,
             ConstrainSharding, Condition, While, Scan, StopGradient, Tag, Rematerialize, LinearCall, RngBitGenerator,
             Dropout, Print, Assert, Guard, Cast, CustomCall, Composite, CompositeTranspose,
@@ -2161,6 +2163,9 @@ where
                     .map(DynamicBroadcastOperation::output_axes)
                     .or_else(|| {
                         operation.projected_payload::<BroadcastOperation>().map(BroadcastOperation::output_axes)
+                    })
+                    .or_else(|| {
+                        operation.projected_payload::<BroadcastLikeOperation>().map(BroadcastLikeOperation::output_axes)
                     });
                 let emits_constraint = if let Some(output_axes) = output_axes {
                     let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
@@ -2195,6 +2200,8 @@ where
                         || operation.projected_payload::<ZeroOperation<ArrayType>>().is_some()
                         || operation.projected_payload::<ZeroLikeOperation<ArrayType>>().is_some()
                         || operation.projected_payload::<OneLikeOperation<ArrayType>>().is_some()
+                        || operation.projected_payload::<FillLikeOperation<ArrayType>>().is_some()
+                        || operation.projected_payload::<IotaLikeOperation<ArrayType>>().is_some()
                 };
                 if !emits_constraint {
                     continue;

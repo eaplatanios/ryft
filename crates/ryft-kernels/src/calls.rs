@@ -1086,6 +1086,9 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 ArrayOperation::Constant(operation) => {
                     Self::semantic_field(key, &format!("constant bytes {:02x?}", operation.value().logical_bytes()))
                 }
+                ArrayOperation::FillLike(operation) => {
+                    Self::semantic_field(key, &format!("fill bytes {:02x?}", operation.value().logical_bytes()))
+                }
                 ArrayOperation::CustomCall(operation) => Self::custom_call_semantic_fields(key, operation),
                 ArrayOperation::Dropout(operation) => {
                     Self::semantic_field(key, &format!("dropout rate bits {:016x}", operation.rate().to_bits()))
@@ -1105,6 +1108,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::One(_)
                 | ArrayOperation::OneLike(_)
                 | ArrayOperation::Iota(_)
+                | ArrayOperation::IotaLike(_)
                 | ArrayOperation::Min(_)
                 | ArrayOperation::Max(_)
                 | ArrayOperation::Clamp(_)
@@ -1166,6 +1170,7 @@ impl<Extension: Operation<Type = ArrayIrType>> KernelDefinition<Extension> {
                 | ArrayOperation::Transpose(_)
                 | ArrayOperation::Reshape(_)
                 | ArrayOperation::Broadcast(_)
+                | ArrayOperation::BroadcastLike(_)
                 | ArrayOperation::Pad(_)
                 | ArrayOperation::Concatenate(_)
                 | ArrayOperation::Gather(_)
