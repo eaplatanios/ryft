@@ -777,7 +777,8 @@ where
         // a participant axis followed by the chunk axis yields the untiled view, whose participant axis is then sliced
         // at the current participant's index and removed.
         if self.options.mode == CollectiveMode::Tiled {
-            let operation = ReshapeOperation::new(participants_type.shape().clone())
+            let cotangent_shape = cotangent.r#type().shape().clone();
+            let operation = ReshapeOperation::new(cotangent_shape, participants_type.shape().clone())
                 .with_output_sharding(participants_type.sharding().cloned());
             cotangent = context.bind(O::from(operation), Vec::new(), &[cotangent])?.remove(0);
         }
@@ -839,7 +840,8 @@ where
         let selected = context
             .bind(O::from(DynamicSliceOperation::new(sizes)), Vec::new(), slice_inputs.as_slice())?
             .remove(0);
-        let operation = ReshapeOperation::new(input_cotangent_type.shape().clone())
+        let selected_shape = selected.r#type().shape().clone();
+        let operation = ReshapeOperation::new(selected_shape, input_cotangent_type.shape().clone())
             .with_output_sharding(input_cotangent_type.sharding().cloned());
         let contribution = context.bind(O::from(operation), Vec::new(), &[selected])?.remove(0);
         accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;

@@ -2092,7 +2092,7 @@ mod tests {
                     let index = AxisIndexOperation::new("x".to_string()).with_mesh(mesh.clone());
                     let index = array_operation(ArrayOperation::AxisIndex(index));
                     let index = builder.add_instruction(index, Vec::new(), Vec::new(), None).unwrap()[0];
-                    let reshape = ReshapeOperation::new(Shape::new(vec![CoreDimension::Static(1)]));
+                    let reshape = ReshapeOperation::new(Shape::new(Vec::new()), vec![1]);
                     let reshape = array_operation(ArrayOperation::Reshape(reshape));
                     builder.add_instruction(reshape, Vec::new(), vec![index], None).unwrap().to_vec()
                 });

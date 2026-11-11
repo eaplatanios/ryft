@@ -3608,7 +3608,7 @@ pub(crate) mod tests {
                 &self,
                 _residual_type: &ArrayIrType,
             ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
-                Ok(vec![ErasedOperation::new(ReshapeOperation::new(vec![8, 1]))])
+                Ok(vec![ErasedOperation::new(ReshapeOperation::new(vec![8], vec![8, 1]))])
             }
 
             fn restore_payloads(
@@ -3616,7 +3616,7 @@ pub(crate) mod tests {
                 _stored_type: &ArrayIrType,
                 _residual_type: &ArrayIrType,
             ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
-                Ok(vec![ErasedOperation::new(ReshapeOperation::new(vec![8]))])
+                Ok(vec![ErasedOperation::new(ReshapeOperation::new(vec![8, 1], vec![8]))])
             }
         }
 

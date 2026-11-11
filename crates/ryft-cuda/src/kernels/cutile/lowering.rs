@@ -1053,7 +1053,10 @@ mod tests {
         let transpose = ArrayOperation::Transpose(ryft_core::TransposeOperation::new(vec![1, 0]));
         let transposed =
             lowering.array(&transpose, &["input".to_owned()], &[matrix_type.clone()], &matrix_type).unwrap();
-        let reshape = ArrayOperation::Reshape(ryft_core::ReshapeOperation::new(output.shape().clone()));
+        let reshape = ArrayOperation::Reshape(ryft_core::ReshapeOperation::new(
+            matrix_type.shape().clone(),
+            output.shape().clone(),
+        ));
         assert_eq!(lowering.array(&reshape, &[transposed], &[matrix_type], &output).unwrap(), "v1");
         assert_eq!(
             lowering.code,

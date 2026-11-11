@@ -419,8 +419,7 @@ fn test_collect_nested_sharding_mesh() {
     let input = builder.add_input(input_type.clone());
     builder
         .add_instruction(
-            ReshapeOperation::new(Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]))
-                .with_output_sharding(sharding),
+            ReshapeOperation::new(vec![4], vec![2, 2]).with_output_sharding(sharding),
             Vec::new(),
             vec![input],
             None,

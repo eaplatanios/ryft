@@ -3678,7 +3678,8 @@ where
                             .map_err(|error| ProgramError::from(TypeError::from(error)))?;
                         let split_shape = Shape::new(split_dimensions.iter().copied().map(Dimension::Static).collect());
                         let split = operation(ErasedOperation::new(
-                            ReshapeOperation::new(split_shape).with_output_sharding(split_sharding),
+                            ReshapeOperation::new(value_type.shape().clone(), split_shape)
+                                .with_output_sharding(split_sharding),
                         ))?;
                         let split = builder.add_instruction(split, Vec::new(), vec![value], None)?[0];
 
@@ -3740,8 +3741,9 @@ where
                         let mut block_dimensions = dimensions;
                         block_dimensions[position] = block;
                         let block_shape = Shape::new(block_dimensions.into_iter().map(Dimension::Static).collect());
-                        let merge =
-                            ReshapeOperation::new(block_shape).with_output_sharding(value_type.sharding().cloned());
+                        let sliced_shape = atom_type(&builder, sliced)?.shape().clone();
+                        let merge = ReshapeOperation::new(sliced_shape, block_shape)
+                            .with_output_sharding(value_type.sharding().cloned());
                         *output = builder.add_instruction(
                             operation(ErasedOperation::new(merge))?,
                             Vec::new(),
@@ -6678,8 +6680,11 @@ where
 
     // Array conversions are homogeneous array operations, which every family lifts through its array member.
     let array = |operation: <O as OperationProjection<ArrayType>>::Projected| O::from(operation);
-    let reshape_array = |builder: &mut ProgramBuilder<V, O>, value, target: &ArrayType| {
-        let operation = ReshapeOperation::new(target.shape().clone()).with_output_sharding(target.sharding().cloned());
+    let reshape_array = |builder: &mut ProgramBuilder<V, O>, value: AtomId, target: &ArrayType| {
+        let source_type = builder.atoms()[value.index()].r#type();
+        let source_shape = <&ArrayType>::try_from(source_type.as_ref())?.shape().clone();
+        let operation = ReshapeOperation::new(source_shape, target.shape().clone())
+            .with_output_sharding(target.sharding().cloned());
         bind(builder, array(operation.into()), value)
     };
     let reshape = |builder: &mut ProgramBuilder<V, O>, value, source: &ArrayIrType, target: &ArrayIrType| {
@@ -12364,7 +12369,10 @@ mod tests {
         let local_type = boundary.local_input_type(0, &f32_type(&[2], Some(sharded))).unwrap();
         let local_type = ArrayIrType::Array(local_type);
         let condition = build_program(vec![local_type.clone()], |builder, inputs| {
-            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(Shape::new(Vec::new())));
+            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(
+                Shape::new(vec![Dimension::Static(1)]),
+                Shape::new(Vec::new()),
+            ));
             let value = builder.add_instruction(reshape, Vec::new(), vec![inputs[0]], None).unwrap()[0];
             let zero = ArrayOperation::ZeroLike(ZeroLikeOperation::new());
             let zero = builder.add_instruction(zero, Vec::new(), vec![value], None).unwrap()[0];
@@ -12458,7 +12466,10 @@ mod tests {
         let reduce =
             build_program(state_types, |builder, inputs| vec![add_sum_over_x(builder, &mesh, inputs[0]), inputs[1]]);
         let body = build_program(vec![local_type], |builder, inputs| {
-            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(Shape::new(Vec::new())));
+            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(
+                Shape::new(vec![Dimension::Static(1)]),
+                Shape::new(Vec::new()),
+            ));
             let value = builder.add_instruction(reshape, Vec::new(), vec![inputs[0]], None).unwrap()[0];
             let convert = ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false));
             let count = builder.add_instruction(convert, Vec::new(), vec![value], None).unwrap()[0];
@@ -12621,7 +12632,10 @@ mod tests {
         let varying = Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["x"]).unwrap();
         let value_type = ArrayIrType::Array(f32_type(&[], Some(varying)));
         let body = build_program(vec![local_type, count_type], |builder, inputs| {
-            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(Shape::new(Vec::new())));
+            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(
+                Shape::new(vec![Dimension::Static(1)]),
+                Shape::new(Vec::new()),
+            ));
             let value = builder.add_instruction(reshape, Vec::new(), vec![inputs[0]], None).unwrap()[0];
             let convert = ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false));
             let count = builder.add_instruction(convert, Vec::new(), vec![inputs[1]], None).unwrap()[0];
@@ -12636,7 +12650,10 @@ mod tests {
             let scan_body = builder.import_program(scan_body);
             let scan = ScanOperation::<ArrayIrType>::new(1, Dimension::Dynamic(length.clone()));
             let carry = builder.add_instruction(scan, vec![scan_body], vec![value, stack, dimension], None).unwrap()[0];
-            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(Shape::new(vec![Dimension::Static(1)])));
+            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(
+                Shape::new(Vec::new()),
+                Shape::new(vec![Dimension::Static(1)]),
+            ));
             builder.add_instruction(reshape, Vec::new(), vec![carry], None).unwrap().to_vec()
         });
         let input_types = vec![ArrayIrType::Array(f32_type(&[2], None)), ArrayIrType::Array(f32_type(&[], None))];
@@ -12667,7 +12684,10 @@ mod tests {
             ArrayIrType::Array(boundary.local_input_type(0, &f32_type(&[2], Some(sharded.clone()))).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
         let body = build_program(vec![local_type.clone(), local_type.clone()], |builder, inputs| {
-            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(Shape::new(Vec::new())));
+            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(
+                Shape::new(vec![Dimension::Static(1)]),
+                Shape::new(Vec::new()),
+            ));
             let count = builder.add_instruction(reshape, Vec::new(), vec![inputs[1]], None).unwrap()[0];
             let convert = ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::I64, false));
             let count = builder.add_instruction(convert, Vec::new(), vec![count], None).unwrap()[0];
@@ -12773,7 +12793,10 @@ mod tests {
             build_program(vec![value_type.clone()], |builder, inputs| vec![add_sum_over_x(builder, &mesh, inputs[0])]);
         let identity_branch = build_program(vec![value_type.clone()], |_, inputs| inputs.to_vec());
         let body = build_program(vec![ArrayIrType::Array(predicate_type), value_type], |builder, inputs| {
-            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(Shape::new(Vec::new())));
+            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(
+                Shape::new(vec![Dimension::Static(1)]),
+                Shape::new(Vec::new()),
+            ));
             let predicate = builder.add_instruction(reshape, Vec::new(), vec![inputs[0]], None).unwrap()[0];
             let branches = vec![builder.import_program(reduce_branch), builder.import_program(identity_branch)];
             let condition = ConditionOperation::<ArrayIrType>::new();
@@ -13474,7 +13497,10 @@ mod tests {
                 let sum = builder.add_instruction(scatter, Vec::new(), vec![inputs[0], dimension], None).unwrap()[0];
                 let reduce = ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum));
                 let sum = builder.add_instruction(reduce, Vec::new(), vec![sum], None).unwrap()[0];
-                let reshape = ArrayOperation::Reshape(ReshapeOperation::new(Shape::new(vec![Dimension::Static(1)])));
+                let reshape = ArrayOperation::Reshape(ReshapeOperation::new(
+                    Shape::new(Vec::new()),
+                    Shape::new(vec![Dimension::Static(1)]),
+                ));
                 builder.add_instruction(reshape, Vec::new(), vec![sum], None).unwrap().to_vec()
             });
         let input_types = vec![ArrayIrType::Array(f32_type(&[8], None)), ArrayIrType::Array(f32_type(&[], None))];
@@ -22035,7 +22061,10 @@ mod tests {
                 let rows = ArrayReferenceTransform::Slice { axes };
                 let read = ReferenceReadOperation::new().with_transforms(vec![rows]);
                 let rows = builder.add_instruction(read, Vec::new(), vec![reference], None).unwrap()[0];
-                let reshape = ArrayOperation::Reshape(ReshapeOperation::new(f32_type(&[2], None).shape().clone()));
+                let reshape = ArrayOperation::Reshape(ReshapeOperation::new(
+                    f32_type(&[2, 1], None).shape().clone(),
+                    f32_type(&[2], None).shape().clone(),
+                ));
                 builder.add_instruction(reshape, Vec::new(), vec![rows], None).unwrap()[0]
             };
             builder
@@ -23628,7 +23657,7 @@ mod tests {
             builder
                 .add_instruction(
                     ArrayOperation::Reshape(
-                        ReshapeOperation::new(tile_type.shape().clone())
+                        ReshapeOperation::new(scalar_type.shape().clone(), tile_type.shape().clone())
                             .with_output_sharding(tile_type.sharding().cloned()),
                     ),
                     Vec::new(),
@@ -23698,7 +23727,7 @@ mod tests {
             builder
                 .add_instruction(
                     ArrayOperation::Reshape(
-                        ReshapeOperation::new(tile_type.shape().clone())
+                        ReshapeOperation::new(scalar_type.shape().clone(), tile_type.shape().clone())
                             .with_output_sharding(tile_type.sharding().cloned()),
                     ),
                     Vec::new(),

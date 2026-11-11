@@ -7177,6 +7177,7 @@ mod tests {
                 Ok(vec![
                     ErasedOperation::new(NegOperation::<ArrayType>::new()),
                     ErasedOperation::new(ReshapeOperation::new(
+                        ArrayType::scalar(DataType::BF16).shape().clone(),
                         ArrayType::new_static(DataType::BF16, [1]).shape().clone(),
                     )),
                 ])
@@ -7188,7 +7189,10 @@ mod tests {
                 _: &ArrayIrType,
             ) -> Result<Vec<ErasedOperation>, ResidualPolicyError> {
                 Ok(vec![
-                    ErasedOperation::new(ReshapeOperation::new(ArrayType::scalar(DataType::BF16).shape().clone())),
+                    ErasedOperation::new(ReshapeOperation::new(
+                        ArrayType::new_static(DataType::BF16, [1]).shape().clone(),
+                        ArrayType::scalar(DataType::BF16).shape().clone(),
+                    )),
                     ErasedOperation::new(NegOperation::<ArrayType>::new()),
                 ])
             }
