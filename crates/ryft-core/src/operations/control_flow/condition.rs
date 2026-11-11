@@ -2721,6 +2721,7 @@ mod tests {
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceRead,
         ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
     };
+    use crate::operations::sharding::LockstepDeviceGrid;
     use crate::operations::trigonometric::{Cos, CosOperation, SIN_OPERATION_NAME, Sin, SinOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::{
@@ -6837,6 +6838,82 @@ mod tests {
         let inputs = vec![array(Array::scalar(true).unwrap()), dimension(&renamed_extent_type, 4), input];
         assert!(is_extent_mismatch(&eager.bind(ConditionOperation::new(), vec![branch.clone(), branch], &inputs)));
         assert!(is_extent_mismatch(&program.interpret(inputs)));
+    }
+
+    #[test]
+    fn test_condition_interpretation_in_lockstep_rejects_mutations_under_varying_predicates() {
+        // The reference backend emulation of a `shard_map` runs the eager rule of a `condition` over one value
+        // per device (refer to `LockstepOperation`). Devices whose predicates vary along `x` could take different
+        // branches, so the rule rejects a branch that mutates a reference whose referent does not vary along `x`
+        // before any device takes a branch.
+        struct BranchDriver([Program<TestIrValue, TestIrOperation, Vec<TestIrValue>, Vec<TestIrValue>>; 2]);
+
+        impl RegionDriver<TestIrValue, TestIrOperation> for BranchDriver {
+            fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, TestIrValue, TestIrOperation>>
+            where
+                TestIrValue: 'r,
+                TestIrOperation: 'r,
+            {
+                self.0.iter().map(Program::entry_region_ref)
+            }
+        }
+
+        impl InterpretationDriver<LockstepDomain<TestIrOperation>> for BranchDriver {
+            fn interpret_region(
+                &self,
+                _context: &LockstepDomain<TestIrOperation>,
+                _index: usize,
+                _inputs: Vec<LockstepValue<TestIrOperation>>,
+            ) -> Result<Vec<LockstepValue<TestIrOperation>>, ProgramError> {
+                Err(ProgramError::MalformedProgram("the rejected application must not run a branch".to_string()))
+            }
+
+            fn bind(
+                &self,
+                _context: &LockstepDomain<TestIrOperation>,
+                _operation: TestIrOperation,
+                _regions: AttachedRegions<'_, TestIrValue, TestIrOperation>,
+                _inputs: &[LockstepValue<TestIrOperation>],
+            ) -> Result<Vec<LockstepValue<TestIrOperation>>, ProgramError> {
+                Err(ProgramError::MalformedProgram("the rejected application must not bind an operation".to_string()))
+            }
+        }
+
+        let (referent_type, predicate_type) = manual_mutation_types(false);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type.clone()));
+        let branch = |mutate: bool| {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let reference = builder.add_input(reference_type.clone());
+            manual_mutation_branch(&mut builder, reference, mutate);
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder], Vec::new())
+                .unwrap()
+        };
+        let driver = BranchDriver([branch(true), branch(false)]);
+        let grid = LockstepDeviceGrid::new(vec![("x".to_string(), 2)]);
+        let domain = LockstepDomain::<TestIrOperation>::new(grid, Vec::new());
+        let predicate = |value: bool| array(Array::from_elements(predicate_type.clone(), &[value]).unwrap());
+        let reference = || {
+            let state = Array::from_elements(referent_type.clone(), &[1.0f32, 2.0]).unwrap();
+            TestIrValue::Reference(ArrayReference::new(state))
+        };
+        let inputs = [
+            LockstepValue::new(vec![predicate(true), predicate(false)], &domain).unwrap(),
+            LockstepValue::new(vec![reference(), reference()], &domain).unwrap(),
+        ];
+        assert_eq!(
+            ConditionOperation::<ArrayIrType>::new()
+                .interpret_in_lockstep(&domain, &driver, &inputs)
+                .map(|outputs| outputs.map(|_| ())),
+            Some(Err(TypeError::invalid(
+                "`condition` `true` branch mutates region input 0 of type \
+                 `ref<f32[2][sharding={mesh<['x'=2:manual]>, [{}]}]>`, whose referent does not vary over every manual \
+                 axis that the predicate `bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` varies \
+                 over, so devices that take different branches would leave it different across devices; vary the \
+                 referent over those axes",
+            )
+            .into())),
+        );
     }
 
     #[test]
