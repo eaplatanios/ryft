@@ -10,7 +10,7 @@ use crate::axes::{Axis, AxisError, NamedAxes};
 use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, DivOperation, Sub};
@@ -30,6 +30,8 @@ use crate::operations::exponential::{Exp, Log};
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::memory::TransferToMemory;
 use crate::operations::reductions::{Reduce, ReductionKind};
+use crate::operations::sharding::shard_map::{reduce_participants, with_array_type};
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
@@ -331,6 +333,18 @@ impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ParallelReduceOp
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ParallelReduceOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: From<ParallelReduceOperation>>> PartiallyEvaluatableOperation<C>
     for ParallelReduceOperation
 {
@@ -394,6 +408,31 @@ where
         let batch_axis = input.batch_axis_position().unwrap();
         let output = input.value().reduce(&[batch_axis], self.kind)?;
         Ok(vec![ArrayBatch::new(output, BatchAxis::replicated())?])
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for ParallelReduceOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        let axes = context.collective_axes(self)?;
+        let (arrays, extents) = context.collective_arrays(inputs)?;
+        let name = self.name();
+        if let Some(payload_axis_size) = self.axis_size() {
+            context.validate_collective_axis_size(self, &axes, payload_axis_size)?;
+        }
+        let outputs = context.grid().map_devices(|device| {
+            let (participants, _) = context.grid().participants(device, &axes, self.axis_index_groups())?;
+            let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
+            with_array_type(
+                &reduce_participants(name, &participants, self.kind())?,
+                &context.collective_output_type(self, arrays[device], extents, device)?,
+            )
+        })?;
+        Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }
 

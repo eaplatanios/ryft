@@ -37,6 +37,8 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::sharding::shard_map::{block_axes, validate_participant_types};
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
@@ -688,6 +690,18 @@ where
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ParallelAllToAllOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: From<ParallelAllToAllOperation>>> PartiallyEvaluatableOperation<C>
     for ParallelAllToAllOperation
 {
@@ -798,6 +812,60 @@ where
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         self.shape_changing_collective_interpret_in_parent::<C>(inputs)
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for ParallelAllToAllOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        let axes = context.collective_axes(self)?;
+        let (arrays, extents) = context.collective_arrays(inputs)?;
+        let name = self.name();
+        context.validate_collective_axis_size(self, &axes, self.axis_size())?;
+        let outputs = context.grid().map_devices(|device| {
+            let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
+            let groups = self.options().axis_index_groups();
+            let (participants, position) = context.grid().participants(device, &axes, groups)?;
+            let (split_axis, concatenation_axis) = (self.split_axis(), self.concatenation_axis());
+            let participant_arrays = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
+            validate_participant_types(name, &participant_arrays)?;
+            let mut output = Array::uninitialized(output_type.clone())?;
+            for (sender_position, sender) in participants.iter().enumerate() {
+                // Every sender contributes the chunk of its split axis that belongs to this device's position.
+                let input = arrays[*sender];
+                let input_type = input.r#type();
+                let mut chunk_shape = input_type.static_shape().unwrap().dimensions().to_vec();
+                chunk_shape[split_axis] = match self.options().mode() {
+                    CollectiveMode::Untiled => 1,
+                    CollectiveMode::Tiled => chunk_shape[split_axis] / participants.len(),
+                };
+                let mut chunk_offsets = vec![0; chunk_shape.len()];
+                chunk_offsets[split_axis] = position * chunk_shape[split_axis];
+                let selection = block_axes(&chunk_offsets, &chunk_shape);
+
+                // The chunks are stacked along a new sender axis (untiled) or concatenated along an existing one
+                // (tiled) in the order of their senders' positions.
+                let mut offsets = vec![0; chunk_shape.len()];
+                match self.options().mode() {
+                    CollectiveMode::Untiled => {
+                        chunk_shape.remove(split_axis);
+                        chunk_shape.insert(concatenation_axis, 1);
+                        offsets[concatenation_axis] = sender_position;
+                    }
+                    CollectiveMode::Tiled => {
+                        offsets[concatenation_axis] = sender_position * chunk_shape[concatenation_axis];
+                    }
+                }
+                let chunk = input.copy_block(ArrayType::new_static(input_type.data_type(), chunk_shape), &selection)?;
+                output = output.replace_block(&chunk, &offsets);
+            }
+            Ok(output)
+        })?;
+        Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }
 

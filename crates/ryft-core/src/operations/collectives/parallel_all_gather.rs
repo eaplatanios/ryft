@@ -44,6 +44,8 @@ use crate::operations::manipulation::broadcasting::{BroadcastOperation, DynamicB
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape, ReshapeOperation};
 use crate::operations::manipulation::slicing::DynamicSliceOperation;
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::sharding::shard_map::validate_participant_types;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
@@ -645,6 +647,18 @@ where
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ParallelAllGatherOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: From<ParallelAllGatherOperation>>> PartiallyEvaluatableOperation<C>
     for ParallelAllGatherOperation
 {
@@ -880,6 +894,46 @@ where
     ) -> Result<Vec<C::Value>, ProgramError> {
         self.validate_local_interpretation()?;
         self.shape_changing_collective_interpret_in_parent::<C>(inputs)
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for ParallelAllGatherOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        let axes = context.collective_axes(self)?;
+        let (arrays, extents) = context.collective_arrays(inputs)?;
+        let name = self.name();
+        context.validate_collective_axis_size(self, &axes, self.axis_size())?;
+        let outputs = context.grid().map_devices(|device| {
+            let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
+            let (participants, _) = context.grid().participants(device, &axes, self.options().axis_index_groups())?;
+            let participant_arrays = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
+            validate_participant_types(name, &participant_arrays)?;
+            let mut output = Array::uninitialized(output_type.clone())?;
+            let concatenation_axis = self.concatenation_axis();
+            for (position, participant) in participants.iter().enumerate() {
+                let input = arrays[*participant];
+                let input_type = input.r#type();
+                let mut shape = input_type.static_shape().unwrap().dimensions().to_vec();
+                let mut offsets = vec![0; shape.len()];
+                match self.options().mode() {
+                    CollectiveMode::Untiled => {
+                        shape.insert(concatenation_axis, 1);
+                        offsets.insert(concatenation_axis, position);
+                    }
+                    CollectiveMode::Tiled => offsets[concatenation_axis] = position * shape[concatenation_axis],
+                }
+                let block_type = ArrayType::new_static(input_type.data_type(), shape);
+                output =
+                    output.replace_block(&Array::from_logical_bytes(block_type, &input.logical_bytes())?, &offsets);
+            }
+            Ok(output)
+        })?;
+        Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }
 

@@ -10,12 +10,12 @@ use crate::arrays::{
 };
 use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::contexts::{Context, Domain, EagerContext, StagingContext};
 use crate::differentiation::{
     CotangentAccumulator, DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
 use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
@@ -24,11 +24,14 @@ use crate::operations::collectives::{
     CollectiveAxes, CollectiveOperation, LinearCollectiveOperation, resolve_collective_axes, route_axis_slices,
     validate_manual_mesh_axes_input,
 };
+use crate::operations::constants::zero::Zero;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::reshard::Reshard;
+use crate::operations::sharding::shard_map::with_array_type;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
@@ -299,6 +302,18 @@ where
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ParallelPermuteOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: From<ParallelPermuteOperation>>> PartiallyEvaluatableOperation<C>
     for ParallelPermuteOperation
 {
@@ -392,6 +407,31 @@ where
         accumulators: &[CotangentAccumulator],
     ) -> Result<(), DifferentiationError> {
         self.linear_collective_transpose(context, inputs, outputs, accumulators)
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for ParallelPermuteOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        let axes = context.collective_axes(self)?;
+        let (arrays, extents) = context.collective_arrays(inputs)?;
+        context.validate_collective_axis_size(self, &axes, self.axis_size())?;
+        let outputs = context.grid().map_devices(|device| {
+            // A device that no pair targets receives zeros.
+            let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
+            let position = context.grid().position(device, &axes);
+            match self.source_target_pairs().iter().find(|(_, target)| *target == position) {
+                Some((source, _)) => {
+                    with_array_type(arrays[context.grid().device_at(device, &axes, *source)], &output_type)
+                }
+                None => EagerContext::<Array, ArrayOperation<Array>>::new().zero(&output_type),
+            }
+        })?;
+        Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }
 

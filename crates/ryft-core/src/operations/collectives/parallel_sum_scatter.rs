@@ -42,6 +42,8 @@ use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBro
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
+use crate::operations::sharding::shard_map::{block_axes, reduce_participants};
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, MemberOperation, Operation, OperationFormatter, OperationProjection, ProgramError, ProjectedValue,
@@ -613,6 +615,18 @@ where
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ParallelSumScatterOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>> PartiallyEvaluatableOperation<C>
     for ParallelSumScatterOperation
 {
@@ -722,6 +736,38 @@ where
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         self.shape_changing_collective_interpret_in_parent::<C>(inputs)
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for ParallelSumScatterOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        let axes = context.collective_axes(self)?;
+        let (arrays, extents) = context.collective_arrays(inputs)?;
+        let name = self.name();
+        context.validate_collective_axis_size(self, &axes, self.axis_size())?;
+        let outputs = context.grid().map_devices(|device| {
+            let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
+            let groups = self.options().axis_index_groups();
+            let (participants, position) = context.grid().participants(device, &axes, groups)?;
+            let participant_count = participants.len();
+            let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
+            let sum = reduce_participants(name, &participants, ReductionKind::Sum)?;
+            let scatter_axis = self.scatter_axis();
+            let mut shape = sum.r#type().static_shape().unwrap().dimensions().to_vec();
+            shape[scatter_axis] = match self.options().mode() {
+                CollectiveMode::Untiled => 1,
+                CollectiveMode::Tiled => shape[scatter_axis] / participant_count,
+            };
+            let mut offsets = vec![0; shape.len()];
+            offsets[scatter_axis] = position * shape[scatter_axis];
+            sum.copy_block(output_type, &block_axes(&offsets, &shape))
+        })?;
+        Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }
 

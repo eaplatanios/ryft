@@ -5,14 +5,14 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, DataType, Dimension, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, Shape,
-    ShardingDimension,
+    ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionVariable, DynamicArrayExtentBatchingPolicy,
+    LogicalMesh, Shape, ShardingDimension,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation,
 };
-use crate::contexts::{Context, ContextProjection, Domain, ProjectedContext, StagingContext};
+use crate::contexts::{Context, ContextProjection, Domain, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
@@ -45,11 +45,12 @@ use crate::operations::manipulation::scattering::{
     Scatter, ScatterDimensionNumbers, ScatterOperation, ScatterOptions, ScatterReductionKind,
 };
 use crate::operations::manipulation::slicing::{Slice, SliceOperation};
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, MemberOperation, Operation, OperationFormatter, OperationPayloadProjection, OperationProjection,
-    OperationProvider, ProgramError, ProvenanceScope, RegionInterface, TypeError, TypeIdentityRenaming, Typed, Value,
-    ValueDomainDispatch, ValueProjection, infer_projected_operation_output_types,
+    EmptyRegionDriver, MaybeZero, MemberOperation, Operation, OperationFormatter, OperationPayloadProjection,
+    OperationProjection, OperationProvider, ProgramError, ProvenanceScope, RegionInterface, TypeError,
+    TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection, infer_projected_operation_output_types,
     infer_projected_operation_region_input_types,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -1012,6 +1013,18 @@ impl<C: Domain<Type = ArrayType, Value = Array>> InterpretableOperation<C> for P
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ParallelRaggedAllToAllOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: From<ParallelRaggedAllToAllOperation>>> PartiallyEvaluatableOperation<C>
     for ParallelRaggedAllToAllOperation
 {
@@ -1433,6 +1446,99 @@ impl<C: Domain<Type = ArrayIrType, Value: ValueProjection<ArrayType, Projected =
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         interpret_projected_operation(context, self, driver, inputs)
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>>
+    for ParallelRaggedAllToAllOperation
+{
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        let axes = context.collective_axes(self)?;
+        let name = self.name();
+
+        // The devices that differ only along the axis exchange segments in one host-side exchange, whose
+        // participants are ordered by their coordinates and whose participant groups select the exchange partners.
+        // Unlike the other collectives, the exchange runs through the operation's own physical representation,
+        // which keeps one implementation of its offset, size, participant group, and update semantics.
+        context.validate_collective_axis_size(self, &axes, self.axis_size())?;
+        check_count!("input", inputs, 6, ProgramError);
+        let mut outputs = vec![None; context.grid().device_count()];
+        for device in (0..context.grid().device_count()).filter(|device| context.grid().position(*device, &axes) == 0) {
+            let (participants, _) = context.grid().participants(device, &axes, None)?;
+            let participant_inputs = participants
+                .iter()
+                .map(|participant| {
+                    inputs
+                        .iter()
+                        .map(|values| ValueProjection::<ArrayType>::projected(&values.values()[*participant]).cloned())
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Validate each participant at its logical type before packing unplaced physical arrays. The
+            // inferred output types retain its mesh and manual variation for restoration after the exchange.
+            let output_types = participant_inputs
+                .iter()
+                .map(|inputs| {
+                    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+                    Ok(self.infer_output_types(&input_types, &[])?.remove(0))
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+
+            // Each of the six physical inputs has one leading row per participant, in axis index order.
+            // Corresponding inputs must have one static shape and data type to share that representation.
+            let stacked_inputs = (0..6)
+                .map(|index| {
+                    let input_type = participant_inputs[0][index].r#type();
+                    let Some(shape) = input_type.static_shape() else {
+                        return Err(TypeError::invalid(format!(
+                            "`{name}` participant input {index} must have a static shape but got `{input_type}`",
+                        ))
+                        .into());
+                    };
+                    let mut stacked_shape = vec![participants.len()];
+                    stacked_shape.extend(shape.dimensions());
+                    let mut bytes = Vec::new();
+                    for inputs in &participant_inputs {
+                        let participant_type = inputs[index].r#type();
+                        if participant_type.data_type() != input_type.data_type()
+                            || participant_type.shape() != input_type.shape()
+                        {
+                            return Err(TypeError::invalid(format!(
+                                "`{name}` participant inputs {index} must share one static shape and data type \
+                                 but got `{input_type}` and `{participant_type}`",
+                            ))
+                            .into());
+                        }
+                        bytes.extend(inputs[index].logical_bytes());
+                    }
+                    Array::from_logical_bytes(ArrayType::new_static(input_type.data_type(), stacked_shape), &bytes)
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+
+            let mut stacked_outputs = self.with_physical_representation(None).interpret(
+                &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                &EmptyRegionDriver,
+                &stacked_inputs,
+            )?;
+            check_count!("output", stacked_outputs, 1, ProgramError);
+
+            // Split the physical result in the same participant order and restore each logical output type.
+            let stacked_bytes = stacked_outputs.remove(0).logical_bytes();
+            let row_byte_count = stacked_bytes.len() / participants.len();
+            for (position, (participant, output_type)) in participants.iter().zip(output_types).enumerate() {
+                let row = position * row_byte_count..(position + 1) * row_byte_count;
+                let output = Array::from_logical_bytes(output_type, &stacked_bytes[row])?;
+                outputs[*participant] = Some(ArrayIrValue::Array(output));
+            }
+        }
+
+        Ok(vec![LockstepValue::new(outputs.into_iter().map(Option::unwrap).collect(), context)?])
     }
 }
 

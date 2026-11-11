@@ -12,7 +12,7 @@ use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, check_types, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
@@ -20,6 +20,8 @@ use crate::operations::collectives::parallel_vary::{PARALLEL_VARY_OPERATION_NAME
 use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::reductions::ReductionKind;
+use crate::operations::sharding::shard_map::with_array_type;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
@@ -243,6 +245,18 @@ impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for ParallelCastOper
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ParallelCastOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: From<ParallelCastOperation>>> PartiallyEvaluatableOperation<C>
     for ParallelCastOperation
 {
@@ -267,6 +281,28 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelCastOperation>>, P: Ar
             .into());
         }
         Ok(context.forward_to_parent(self.clone().into(), inputs)?)
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for ParallelCastOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        context.collective_axes(self)?;
+        let (arrays, extents) = context.collective_arrays(inputs)?;
+
+        // Every cast changes only the state that the type records, so each device keeps its own value. In
+        // particular, the per-device values of an unreduced value are its summands, which a later sum completes.
+        let outputs = context.grid().map_devices(|device| {
+            let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
+            context.validate_tracked_collective(self, self.axis_name(), &arrays[device].r#type())?;
+            with_array_type(arrays[device], &output_type)
+        })?;
+
+        Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }
 

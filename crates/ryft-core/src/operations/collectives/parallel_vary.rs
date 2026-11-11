@@ -12,13 +12,15 @@ use crate::axes::{NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::DifferentiationDual;
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
 use crate::operations::reductions::ReductionKind;
+use crate::operations::sharding::shard_map::with_array_type;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, TypeError, Typed,
@@ -161,6 +163,18 @@ where
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ParallelVaryOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
+    }
+}
+
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ParallelVaryOperation where
     C::Operation: From<ParallelVaryOperation>
 {
@@ -183,6 +197,27 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelVaryOperation>>, P: Ar
             .into());
         }
         Ok(context.forward_to_parent(self.clone().into(), inputs)?)
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for ParallelVaryOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        context.collective_axes(self)?;
+        let (arrays, extents) = context.collective_arrays(inputs)?;
+
+        // Varying an invariant value along an axis changes only its type, because every device already holds it.
+        let outputs = context.grid().map_devices(|device| {
+            let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
+            context.validate_tracked_collective(self, self.axis_name(), &arrays[device].r#type())?;
+            with_array_type(arrays[device], &output_type)
+        })?;
+
+        Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }
 

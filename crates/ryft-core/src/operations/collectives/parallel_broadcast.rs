@@ -16,7 +16,7 @@ use crate::differentiation::{
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext,
     TranspositionDriver,
 };
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, AddOperation, Mul, MulOperation};
@@ -48,6 +48,8 @@ use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::sharding::reshard::Reshard;
+use crate::operations::sharding::shard_map::with_array_type;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
@@ -440,6 +442,18 @@ where
         interpret_dynamic_parallel_broadcast(self, context, inputs, None, |value| {
             value.parallel_all_gather(self.axes.clone(), 0)
         })
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ParallelBroadcastOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
     }
 }
 
@@ -838,6 +852,65 @@ where
 
         accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
         Ok(())
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for ParallelBroadcastOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        let axes = context.collective_axes(self)?;
+        let (arrays, _) = context.collective_arrays(inputs)?;
+        let name = self.name();
+        let axis_size = context.grid().axis_size(&axes);
+        context.validate_collective_axis_size(self, &axes, self.axis_size())?;
+        let dynamic = self.source() == ParallelBroadcastSource::Dynamic(());
+        check_count!("input", inputs, if dynamic { 2 } else { 1 }, ProgramError);
+        let outputs = context.grid().map_devices(|device| {
+            // Runtime roots are ordinary per-device inputs. Validate their types before decoding them and
+            // require agreement within this participant group before selecting its source.
+            let mut input_types = vec![arrays[device].r#type().into_owned()];
+            if dynamic {
+                input_types
+                    .push(ValueProjection::<ArrayType>::projected(&inputs[1].values()[device])?.r#type().into_owned());
+            }
+            let output_type = self.infer_output_types(&input_types, &[])?.remove(0);
+            let source = match self.source() {
+                ParallelBroadcastSource::Static(source) => source,
+                ParallelBroadcastSource::Dynamic(()) => {
+                    let (participants, _) = context.grid().participants(device, &axes, None)?;
+                    let sources = participants
+                        .iter()
+                        .map(|participant| {
+                            let source = ValueProjection::<ArrayType>::projected(&inputs[1].values()[*participant])?;
+                            self.infer_output_types(
+                                &[arrays[*participant].r#type().into_owned(), source.r#type().into_owned()],
+                                &[],
+                            )?;
+                            Ok(source.elements::<u64>()?[0])
+                        })
+                        .collect::<Result<Vec<_>, ProgramError>>()?;
+                    let minimum = sources.iter().copied().min().unwrap();
+                    let maximum = sources.iter().copied().max().unwrap();
+                    let minimum_value = Array::scalar(minimum)?;
+                    let maximum_value = Array::scalar(maximum)?;
+                    Array::scalar(minimum == maximum)?.assert(
+                        &format!("`{name}` runtime sources must agree across participants"),
+                        &[("minimum", minimum_value.clone()), ("maximum", maximum_value)],
+                    )?;
+                    Array::scalar(maximum < axis_size as u64)?.assert(
+                        &format!("`{name}` runtime source must be smaller than axis size {axis_size}"),
+                        &[("source", minimum_value)],
+                    )?;
+                    minimum as usize
+                }
+            };
+            with_array_type(arrays[context.grid().device_at(device, &axes, source)], &output_type)
+        })?;
+        Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }
 

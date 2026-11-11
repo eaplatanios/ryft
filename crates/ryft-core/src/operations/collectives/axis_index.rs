@@ -2,16 +2,18 @@ use std::borrow::Cow;
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, Shape,
-    Sharding,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
+    LogicalMesh, Shape, Sharding,
 };
 use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::operations::collectives::{CollectiveAxes, CollectiveOperation, validate_manual_mesh_axis};
 use crate::operations::constants::iota::IotaOperation;
+use crate::operations::sharding::shard_map::{single_output_type, with_array_type};
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
@@ -164,6 +166,18 @@ impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for AxisIndexOperati
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for AxisIndexOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: From<AxisIndexOperation>>> PartiallyEvaluatableOperation<C>
     for AxisIndexOperation
 {
@@ -213,6 +227,24 @@ impl<
             check_count!("output", index, 1, ProgramError);
             Ok(vec![ArrayBatch::replicated(index.remove(0))])
         }
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for AxisIndexOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        let axes = context.collective_axes(self)?;
+        check_count!("input", inputs, 0, ProgramError);
+        let output_type = single_output_type(self, &[])?;
+        let outputs = context.grid().map_devices(|device| {
+            let position = Array::scalar(context.grid().position(device, &axes) as u64)?;
+            with_array_type(&position.converted_to(output_type.data_type())?, &output_type)
+        })?;
+        Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }
 
