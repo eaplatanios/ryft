@@ -52,9 +52,9 @@ pub use assertions::{
     AssertionValue, GUARD_OPERATION_NAME, GuardOperation,
 };
 pub use attention::{
-    AttentionBackwardInputs, AttentionConfiguration, AttentionDefinitionKind, AttentionImplementation,
-    AttentionInputSignature, AttentionInputs, AttentionKey, AttentionOperations, AttentionResiduals, AttentionRules,
-    AttentionType, AttentionVjp, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+    AttentionBackwardInputs, AttentionConfiguration, AttentionImplementation, AttentionInputSignature, AttentionInputs,
+    AttentionKey, AttentionOperations, AttentionResiduals, AttentionRules, AttentionType, AttentionVjp,
+    DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
     DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION, DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME,
     DifferentiableDotProductAttention, DotProductAttention, differentiable_dot_product_attention,
     dot_product_attention,

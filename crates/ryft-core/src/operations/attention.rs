@@ -6,12 +6,12 @@
 //!
 //! # Definitions
 //!
-//! A named attention definition is a named composite whose [`CompositeKey`] encodes an [`AttentionKey`],
-//! which consists of an [`AttentionDefinitionKind`], the value-independent [`AttentionConfiguration`], and the
-//! [`AttentionInputSignature`] of the optional inputs that are present. There are two kinds of definitions:
+//! A named attention definition is a named composite whose [`CompositeKey`] encodes an [`AttentionKey`], which
+//! identifies the forward or the backward definition and records its value-independent [`AttentionConfiguration`] and
+//! the [`AttentionInputSignature`] of the optional inputs that are present. There are two definitions:
 //!
 //!   - **Forward:** Named [`DOT_PRODUCT_ATTENTION_COMPOSITE_NAME`]. It maps the [`AttentionInputs`] to the attended
-//!     output, followed by the log-sum-exp residual of its softmax when the configuration requests it.
+//!     output, followed by the log-sum-exp residual of its softmax when its key requests it.
 //!   - **Backward:** Named [`DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME`]. It maps the [`AttentionBackwardInputs`]
 //!     (i.e., the forward inputs, the forward output, its residual, and the output cotangent) to the cotangents of the
 //!     query, key, and value, followed by that of a bias whose cotangent space is not zero-dimensional.
@@ -34,8 +34,8 @@
 //! Named composites are owned by their callers, so attention is staged through functions that are created once and
 //! called many times, which are the [`DotProductAttention`] that [`dot_product_attention`] creates for inference and
 //! the [`DifferentiableDotProductAttention`] that [`differentiable_dot_product_attention`] creates for training. Each
-//! function owns one cache of definitions with one named composite per definition kind, residual request, and
-//! optional input signature, each created on first use. Its calls therefore share the traced bodies, their lowering,
+//! function owns one cache of definitions with one named composite per definition, residual request, and optional
+//! input signature, each created on first use. Its calls therefore share the traced bodies, their lowering,
 //! and their rule specializations for as long as the function lives. Programs that contain staged calls remain valid
 //! after their function is dropped, and batching such a program stages an equivalent definition.
 //!
@@ -71,10 +71,9 @@
 //! let query = Array::from_elements(r#type.clone(), &[1.0f32, 1.0])?;
 //! let key = Array::from_elements(r#type.clone(), &[1.0f32, 1.0])?;
 //! let value = Array::from_elements(r#type, &[3.0f32, 5.0])?;
-//! let (output, residual) = attention.call(AttentionInputs::new(query, key, value))?;
+//! let output = attention.call(AttentionInputs::new(query, key, value))?;
 //! // The first position sees only the first value, and the second position weighs both values equally.
 //! assert_eq!(output.to_f64s(), vec![3.0, 4.0]);
-//! assert!(residual.is_none());
 //! # Ok(())
 //! # }
 //! ```
@@ -448,23 +447,10 @@ pub const DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME: &str = "ryft.dot_produc
 /// changes.
 pub const DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION: u32 = 1;
 
-/// Named attention definition that an [`AttentionKey`] identifies.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum AttentionDefinitionKind {
-    /// Forward attention, whose inputs are the [`AttentionInputs`] and whose outputs are the attended output, followed
-    /// by the log-sum-exp residual when [`AttentionConfiguration::return_residual`] is set.
-    Forward,
-
-    /// Analytical backward attention, whose inputs are the [`AttentionBackwardInputs`] and whose outputs are the
-    /// cotangents of the query, key, and value, followed by that of a present bias whose cotangent space is not
-    /// zero-dimensional.
-    Backward,
-}
-
-/// Semantic identity of one named attention definition, consisting of its kind, its value-independent configuration,
-/// and the signature of its optional inputs. It converts losslessly to and from the [`CompositeKey`] of the
-/// definition's named composite, which is how backends recognize attention calls (e.g., to replace them with fused
-/// kernels). The key's attributes are, in order:
+/// Semantic identity of one named attention definition, which identifies the forward or the backward definition and
+/// records its value-independent configuration and the signature of its optional inputs. It converts losslessly to
+/// and from the [`CompositeKey`] of the definition's named composite, which is how backends recognize attention calls
+/// (e.g., to replace them with fused kernels). The key's attributes are, in order:
 ///
 ///   - `scale`: Optional explicit score scale.
 ///   - `causal`: Whether causal masking is enabled.
@@ -476,33 +462,33 @@ pub enum AttentionDefinitionKind {
 ///   - `bias`, `mask`, `query_sequence_lengths`, `key_value_sequence_lengths`, and `dropout_state`: Whether the
 ///     corresponding optional input is present.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct AttentionKey {
-    /// Kind of the definition.
-    kind: AttentionDefinitionKind,
+pub enum AttentionKey {
+    /// Forward attention, named [`DOT_PRODUCT_ATTENTION_COMPOSITE_NAME`], whose inputs are the [`AttentionInputs`] and
+    /// whose outputs are the attended output, followed by the log-sum-exp residual when `return_residual` is set.
+    Forward {
+        /// Value-independent configuration of the definition.
+        configuration: AttentionConfiguration,
 
-    /// Value-independent configuration of the definition.
-    configuration: AttentionConfiguration,
+        /// Signature of the optional inputs of the definition.
+        signature: AttentionInputSignature,
 
-    /// Signature of the optional inputs of the definition.
-    signature: AttentionInputSignature,
+        /// Whether the definition also returns the log-sum-exp residual of its softmax.
+        return_residual: bool,
+    },
+
+    /// Analytical backward attention, named [`DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME`], whose inputs are the
+    /// [`AttentionBackwardInputs`] and whose outputs are the cotangents of the query, key, and value, followed by that
+    /// of a present bias whose cotangent space is not zero-dimensional.
+    Backward {
+        /// Value-independent configuration of the definition.
+        configuration: AttentionConfiguration,
+
+        /// Signature of the optional inputs of the definition.
+        signature: AttentionInputSignature,
+    },
 }
 
 impl AttentionKey {
-    /// Creates a new [`AttentionKey`]. Backward definitions ignore [`AttentionConfiguration::return_residual`], which
-    /// is therefore cleared for them.
-    #[inline]
-    pub fn new(
-        kind: AttentionDefinitionKind,
-        configuration: AttentionConfiguration,
-        signature: AttentionInputSignature,
-    ) -> Self {
-        let configuration = match kind {
-            AttentionDefinitionKind::Forward => configuration,
-            AttentionDefinitionKind::Backward => configuration.with_residual(false),
-        };
-        Self { kind, configuration, signature }
-    }
-
     /// Returns the [`AttentionKey`] that `key` encodes, or [`None`] when `key` does not name an attention definition.
     ///
     /// # Errors
@@ -511,11 +497,10 @@ impl AttentionKey {
     /// differ from the encoding that [`Self::to_composite_key`] produces (e.g., missing, additional, reordered, or
     /// malformed attributes).
     pub fn from_composite_key(key: &CompositeKey) -> Result<Option<Self>, TypeError> {
-        let kind = match key.name() {
-            DOT_PRODUCT_ATTENTION_COMPOSITE_NAME => AttentionDefinitionKind::Forward,
-            DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME => AttentionDefinitionKind::Backward,
-            _ => return Ok(None),
-        };
+        let name = key.name();
+        if name != DOT_PRODUCT_ATTENTION_COMPOSITE_NAME && name != DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME {
+            return Ok(None);
+        }
         if key.version() != DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION {
             return Err(TypeError::invalid(format!(
                 "named composite `{key}` has attention definition version {}, but only version \
@@ -563,17 +548,12 @@ impl AttentionKey {
             CompositeAttribute::Integer(2) => AttentionImplementation::Fused,
             _ => return Err(malformed()),
         };
-        let return_residual = match kind {
-            AttentionDefinitionKind::Forward => boolean("residual")?,
-            AttentionDefinitionKind::Backward => false,
-        };
         let configuration = AttentionConfiguration::new()
             .with_scale(optional_float("scale")?)
             .with_causal(boolean("causal")?)
             .with_local_window(local_window)
             .with_implementation(implementation)
-            .with_dropout(optional_float("dropout_rate")?)
-            .with_residual(return_residual);
+            .with_dropout(optional_float("dropout_rate")?);
         let signature = AttentionInputSignature::new(
             boolean("bias")?,
             boolean("mask")?,
@@ -581,51 +561,58 @@ impl AttentionKey {
             boolean("key_value_sequence_lengths")?,
         )
         .with_dropout_state(boolean("dropout_state")?);
-        let decoded = Self::new(kind, configuration, signature);
+        let decoded = if name == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME {
+            Self::Forward { configuration, signature, return_residual: boolean("residual")? }
+        } else {
+            Self::Backward { configuration, signature }
+        };
         if &decoded.to_composite_key() != key {
             return Err(malformed());
         }
         Ok(Some(decoded))
     }
 
-    /// Returns the kind of the definition.
-    #[inline]
-    pub fn kind(&self) -> AttentionDefinitionKind {
-        self.kind
-    }
-
     /// Returns the value-independent configuration of the definition.
     #[inline]
     pub fn configuration(&self) -> AttentionConfiguration {
-        self.configuration
+        match self {
+            Self::Forward { configuration, .. } | Self::Backward { configuration, .. } => *configuration,
+        }
     }
 
     /// Returns the signature of the optional inputs of the definition.
     #[inline]
     pub fn signature(&self) -> AttentionInputSignature {
-        self.signature
+        match self {
+            Self::Forward { signature, .. } | Self::Backward { signature, .. } => *signature,
+        }
     }
 
     /// Returns the [`CompositeKey`] of the named composite of this definition.
     pub fn to_composite_key(&self) -> CompositeKey {
-        let (name, residual) = match self.kind {
-            AttentionDefinitionKind::Forward => {
-                (DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, Some(self.configuration.return_residual()))
+        match *self {
+            Self::Forward { configuration, signature, return_residual } => attention_composite_key(
+                DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                configuration,
+                signature,
+                Some(return_residual),
+            ),
+            Self::Backward { configuration, signature } => {
+                attention_composite_key(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, configuration, signature, None)
             }
-            AttentionDefinitionKind::Backward => (DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, None),
-        };
-        attention_composite_key(name, self.configuration, self.signature, residual)
+        }
     }
 
     /// Returns the batching roles of the canonical inputs of this definition. Dropout states never reach batching
     /// rules, because definitions with dropout are batched structurally.
     fn batch_input_roles(&self) -> Vec<AttentionBatchInput> {
+        let signature = self.signature();
         let mut roles = vec![AttentionBatchInput::Tensor; 3];
-        roles.extend(self.signature.has_bias().then_some(AttentionBatchInput::Score));
-        roles.extend(self.signature.has_mask().then_some(AttentionBatchInput::Score));
-        roles.extend(self.signature.has_query_sequence_lengths().then_some(AttentionBatchInput::Length));
-        roles.extend(self.signature.has_key_value_sequence_lengths().then_some(AttentionBatchInput::Length));
-        if self.kind == AttentionDefinitionKind::Backward {
+        roles.extend(signature.has_bias().then_some(AttentionBatchInput::Score));
+        roles.extend(signature.has_mask().then_some(AttentionBatchInput::Score));
+        roles.extend(signature.has_query_sequence_lengths().then_some(AttentionBatchInput::Length));
+        roles.extend(signature.has_key_value_sequence_lengths().then_some(AttentionBatchInput::Length));
+        if matches!(self, Self::Backward { .. }) {
             roles.extend([AttentionBatchInput::Tensor, AttentionBatchInput::Residual, AttentionBatchInput::Tensor]);
         }
         roles
@@ -635,18 +622,18 @@ impl AttentionKey {
     /// bias cotangent, whose bias is always the fourth canonical input, only when the bias is present and its
     /// cotangent space is not zero-dimensional.
     fn batch_output_roles(&self, output_count: usize) -> Vec<AttentionBatchOutput> {
-        match self.kind {
-            AttentionDefinitionKind::Forward => [AttentionBatchOutput::Tensor(0), AttentionBatchOutput::Residual]
+        match self {
+            Self::Forward { .. } => [AttentionBatchOutput::Tensor(0), AttentionBatchOutput::Residual]
                 .into_iter()
                 .take(output_count)
                 .collect(),
-            AttentionDefinitionKind::Backward => {
+            Self::Backward { signature, .. } => {
                 let mut roles = vec![
                     AttentionBatchOutput::Tensor(0),
                     AttentionBatchOutput::Tensor(1),
                     AttentionBatchOutput::Tensor(2),
                 ];
-                if self.signature.has_bias() && output_count == 4 {
+                if signature.has_bias() && output_count == 4 {
                     roles.push(AttentionBatchOutput::Score(3));
                 }
                 roles
@@ -699,16 +686,13 @@ pub struct AttentionConfiguration {
     /// Requested backend implementation.
     implementation: AttentionImplementation,
 
-    /// Whether the forward operation also returns its log-sum-exp residual.
-    return_residual: bool,
-
     /// Optional probability with which dropout drops each attention probability.
     dropout: Option<f64>,
 }
 
 impl AttentionConfiguration {
     /// Creates the default configuration, which has an inferred scale, non-causal global attention, automatic
-    /// implementation selection, no residual output, and no dropout.
+    /// implementation selection, and no dropout.
     #[inline]
     pub fn new() -> Self {
         Self::default()
@@ -728,7 +712,9 @@ impl AttentionConfiguration {
         self
     }
 
-    /// Sets the inclusive `(left, right)` local window radii. The local window is independent of causal masking.
+    /// Sets the inclusive `(left, right)` local window radii, with which query position `i` may attend only to
+    /// key/value positions `j` with `i - left <= j <= i + right`. Causal masking already hides every position to the
+    /// right, so the right radius has no effect with it and [`Self::local_window`] reports it as zero.
     #[inline]
     pub fn with_local_window<W: Into<Option<(usize, usize)>>>(mut self, local_window: W) -> Self {
         self.local_window = local_window.into();
@@ -746,13 +732,6 @@ impl AttentionConfiguration {
     #[inline]
     pub fn with_implementation(mut self, implementation: AttentionImplementation) -> Self {
         self.implementation = implementation;
-        self
-    }
-
-    /// Requests or suppresses the log-sum-exp residual output.
-    #[inline]
-    pub fn with_residual(mut self, return_residual: bool) -> Self {
-        self.return_residual = return_residual;
         self
     }
 
@@ -778,22 +757,21 @@ impl AttentionConfiguration {
         self.causal
     }
 
-    /// Returns the optional inclusive `(left, right)` local window radii.
+    /// Returns the optional inclusive `(left, right)` local window radii. The right radius is zero with causal
+    /// masking, which hides every position to the right, so that configurations with the same semantics are equal and
+    /// have the same keys.
     #[inline]
     pub fn local_window(&self) -> Option<(usize, usize)> {
-        self.local_window
+        match self.local_window {
+            Some((left, _)) if self.causal => Some((left, 0)),
+            local_window => local_window,
+        }
     }
 
     /// Returns the requested backend implementation.
     #[inline]
     pub fn implementation(&self) -> AttentionImplementation {
         self.implementation
-    }
-
-    /// Returns whether the forward operation produces its log-sum-exp residual.
-    #[inline]
-    pub fn return_residual(&self) -> bool {
-        self.return_residual
     }
 
     /// Returns the optional probability with which dropout drops each attention probability.
@@ -807,9 +785,8 @@ impl PartialEq for AttentionConfiguration {
     fn eq(&self, other: &Self) -> bool {
         self.scale.map(f64::to_bits) == other.scale.map(f64::to_bits)
             && self.causal == other.causal
-            && self.local_window == other.local_window
+            && self.local_window() == other.local_window()
             && self.implementation == other.implementation
-            && self.return_residual == other.return_residual
             && self.dropout.map(f64::to_bits) == other.dropout.map(f64::to_bits)
     }
 }
@@ -820,9 +797,8 @@ impl Hash for AttentionConfiguration {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.scale.map(f64::to_bits).hash(state);
         self.causal.hash(state);
-        self.local_window.hash(state);
+        self.local_window().hash(state);
         self.implementation.hash(state);
-        self.return_residual.hash(state);
         self.dropout.map(f64::to_bits).hash(state);
     }
 }
@@ -1093,8 +1069,8 @@ impl<P: Parameter> AttentionBackwardInputs<P> {
 /// their lengths are exact zeros. Without a configured scale, attention uses `1 / sqrt(H)`. Every batch item uses the
 /// same rectangular storage shape, and sequence lengths control visibility within that storage.
 ///
-/// With [`AttentionConfiguration::return_residual`], a second `TN` or `BTN` output contains the log-sum-exp residual
-/// (i.e., the natural logarithm of the sum of the exponentiated logits) at the query data type. With
+/// [`DotProductAttention::call_with_residual`] also returns the log-sum-exp residual (i.e., the natural logarithm of
+/// the sum of the exponentiated logits), which has the `TN` or `BTN` form and the query data type. With
 /// [`AttentionConfiguration::with_dropout`], the attention weights are dropped and rescaled by [`Dropout`] with the
 /// dropout state of the inputs, which determines the mask (refer to [`AttentionInputs::dropout_state`]). Dropout
 /// supports sharding only along the broadcast axes of its input, so attention with dropout over sharded inputs runs
@@ -1135,24 +1111,40 @@ where
         self.definitions.configuration()
     }
 
-    /// Aligns the manual variation of `inputs` and stages one attention call, returning the attended output together
-    /// with its log-sum-exp residual when the configuration requests it (refer to
-    /// [`AttentionConfiguration::with_residual`]).
+    /// Aligns the manual variation of `inputs` and stages one attention call, returning the attended output.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when `inputs` are invalid for the configuration (e.g., because their shapes are
     /// incompatible) or when staging the call fails.
-    pub fn call<Caller, X>(&self, inputs: AttentionInputs<X>) -> Result<(X, Option<X>), ProgramError>
+    pub fn call<Caller, X>(&self, inputs: AttentionInputs<X>) -> Result<X, ProgramError>
     where
         Caller: CompositeCallContext<Type = C::Type, Value = X, Constant = C::Constant, Operation = C::Operation>,
         X: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
     {
         let inputs = align_attention_inputs(inputs)?;
-        let return_residual = self.definitions.configuration().return_residual();
-        let mut outputs = self.definitions.forward(inputs, return_residual)?.into_iter();
-        let output = outputs.next().ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })?;
-        Ok((output, outputs.next()))
+        let mut outputs = self.definitions.forward(inputs, false)?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+
+    /// Aligns the manual variation of `inputs` and stages one attention call, returning the attended output together
+    /// with the log-sum-exp residual of its softmax.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when `inputs` are invalid for the configuration (e.g., because their shapes are
+    /// incompatible) or when staging the call fails.
+    pub fn call_with_residual<Caller, X>(&self, inputs: AttentionInputs<X>) -> Result<(X, X), ProgramError>
+    where
+        Caller: CompositeCallContext<Type = C::Type, Value = X, Constant = C::Constant, Operation = C::Operation>,
+        X: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
+    {
+        let inputs = align_attention_inputs(inputs)?;
+        let mut outputs = self.definitions.forward(inputs, true)?;
+        check_count!("output", outputs, 2, ProgramError);
+        let residual = outputs.remove(1);
+        Ok((outputs.remove(0), residual))
     }
 }
 
@@ -1283,6 +1275,7 @@ where
                         DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                         configuration,
                         signature,
+                        false,
                         input_types.as_slice(),
                     )?;
                     check_count!("output", output_types, 1, ProgramError);
@@ -1421,7 +1414,7 @@ where
         AttentionImplementation::Portable | AttentionImplementation::Fused => configuration,
     };
     DifferentiableDotProductAttention {
-        definitions: Arc::new(AttentionDefinitions::new(configuration.with_residual(false))),
+        definitions: Arc::new(AttentionDefinitions::new(configuration)),
         functions: Mutex::new(HashMap::new()),
     }
 }
@@ -1541,14 +1534,14 @@ struct AttentionDimensions {
 }
 
 /// Named attention definitions of one operation family `(V, O)` and one [`AttentionConfiguration`], with one named
-/// composite per [`AttentionKey`] (i.e., per definition kind, residual request, and optional input signature), each
+/// composite per [`AttentionKey`] (i.e., per definition, residual request, and optional input signature), each
 /// created on first use. The functions that stage attention own this cache, so its definitions, their traced bodies,
 /// and their rule specializations live exactly as long as those functions.
 struct AttentionDefinitions<V: Value, O: Operation<Type = V::Type>>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
-    /// Configuration of every definition in this cache. Forward definitions override its residual request.
+    /// Configuration of every definition in this cache.
     configuration: AttentionConfiguration,
 
     /// Forward definitions by residual request and optional input signature.
@@ -1592,7 +1585,7 @@ where
             .lock()
             .expect("attention definitions mutex is poisoned")
             .entry((return_residual, signature))
-            .or_insert_with(|| forward_function(self.configuration.with_residual(return_residual), signature))
+            .or_insert_with(|| forward_function(self.configuration, signature, return_residual))
             .clone();
         match function {
             AttentionFunction::Folding(function) => function.call(inputs),
@@ -1779,13 +1772,14 @@ where
 /// Validates one forward attention boundary (i.e., the [`AttentionInputs`] of `signature` in canonical order) and
 /// returns the types of its outputs. The first output is the attended output, which has the query type and therefore
 /// propagates the query's metadata (e.g., its sharding), and it is followed by the log-sum-exp residual when
-/// `configuration` requests it. Every input must have matching manual variation, and reduced and unreduced inputs are
+/// `return_residual` is set. Every input must have matching manual variation, and reduced and unreduced inputs are
 /// rejected, because softmax and the log-sum-exp residual preserve neither partial sums nor replicas that are filled
 /// with zeros.
 fn attention_forward_output_types(
     operation_name: &str,
     configuration: AttentionConfiguration,
     signature: AttentionInputSignature,
+    return_residual: bool,
     input_types: &[ArrayType],
 ) -> Result<Vec<ArrayType>, TypeError> {
     if input_types.len() != 3 + signature.count() {
@@ -1798,7 +1792,7 @@ fn attention_forward_output_types(
     let types = AttentionInputTypes::forward(signature, input_types)?;
     let dimensions = validate_attention_boundary(operation_name, configuration, &types, input_types)?;
     let mut output_types = vec![types.query.clone()];
-    if configuration.return_residual() {
+    if return_residual {
         output_types.push(attention_residual_type(&dimensions, types.query)?);
     }
     Ok(output_types)
@@ -2125,16 +2119,18 @@ fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayT
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
-/// Returns the named composite of the forward definition with the provided configuration and optional input signature.
+/// Returns the named composite of the forward definition with the provided configuration, optional input signature,
+/// and residual request.
 ///
 /// The body of the definition evaluates portable scaled dot-product attention with ordinary array operations and
-/// returns the attended output, followed by the log-sum-exp residual when `configuration` requests it. Its constants,
+/// returns the attended output, followed by the log-sum-exp residual when `return_residual` is set. Its constants,
 /// coordinates, and broadcasts take their shapes from existing values, and its reshapes keep the batch and sequence
 /// dimensions, so the same body supports static and dynamic extents and backends need no attention mathematics of
 /// their own.
 fn forward_function<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
     signature: AttentionInputSignature,
+    return_residual: bool,
 ) -> ForwardFunction<V, O>
 where
     V: 'static,
@@ -2145,7 +2141,7 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
 {
-    let key = AttentionKey::new(AttentionDefinitionKind::Forward, configuration, signature);
+    let key = AttentionKey::Forward { configuration, signature, return_residual };
     let output_types = move |input_types: AttentionInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
         // Every definition is specialized to the optional input signature that its key records.
         if input_types.signature() != signature {
@@ -2165,6 +2161,7 @@ where
             DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
             configuration,
             signature,
+            return_residual,
             input_types.as_slice(),
         )?;
         Ok(output_types.into_iter().map(Into::into).collect())
@@ -2219,7 +2216,7 @@ where
         // The residual is the logarithm of the sum of the exponentiated logits of every row, which is the row maximum
         // plus the logarithm of the sum of the shifted exponentials. It is a statistic of the forward pass rather
         // than a differentiable output, so it stops gradients.
-        let residual = if configuration.return_residual() {
+        let residual = if return_residual {
             let residual = maxima.add(&sums.log()?)?;
             let residual = if prepared.softmax_type == prepared.data_type {
                 residual
@@ -2269,7 +2266,7 @@ where
             // dropped, in which case the folded call stages an equivalent definition.
             let function = match weak.upgrade() {
                 Some(function) => function,
-                None => match forward_function::<V, O>(configuration, signature) {
+                None => match forward_function::<V, O>(configuration, signature, return_residual) {
                     AttentionFunction::Folding(function) => function,
                     AttentionFunction::Structural(_) => unreachable!("definitions without dropout batch by folding"),
                 },
@@ -2328,8 +2325,7 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
 {
-    let key = AttentionKey::new(AttentionDefinitionKind::Backward, configuration, signature);
-    let configuration = key.configuration();
+    let key = AttentionKey::Backward { configuration, signature };
     let output_types = move |input_types: AttentionBackwardInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
         // Every definition is specialized to the optional input signature that its key records.
         if input_types.inputs.signature() != signature {
@@ -3011,9 +3007,9 @@ mod tests {
         format!("[sharding={{mesh<['x'=2:manual]>, [{dimensions}]{varying}}}]")
     }
 
-    /// Returns the outputs of one eager attention call with the provided configuration.
-    fn attend(inputs: AttentionInputs<Array>, configuration: AttentionConfiguration) -> (Array, Option<Array>) {
-        dot_product_attention::<ArrayContext>(configuration).call(inputs).unwrap()
+    /// Returns the attended output and the residual of one eager attention call with the provided configuration.
+    fn attend(inputs: AttentionInputs<Array>, configuration: AttentionConfiguration) -> (Array, Array) {
+        dot_product_attention::<ArrayContext>(configuration).call_with_residual(inputs).unwrap()
     }
 
     /// Returns the sum of one differentiable attention output at unit score scale, together with its gradient.
@@ -3142,41 +3138,46 @@ mod tests {
 
     #[test]
     fn test_attention_key() {
-        let configuration = AttentionConfiguration::new().with_causal(true).with_dropout(0.25).with_residual(true);
+        let configuration = AttentionConfiguration::new().with_causal(true).with_dropout(0.25);
         let signature = AttentionInputSignature::new(true, false, true, false).with_dropout_state(true);
-        let key = AttentionKey::new(AttentionDefinitionKind::Forward, configuration, signature);
-        assert_eq!(key.kind(), AttentionDefinitionKind::Forward);
+        let key = AttentionKey::Forward { configuration, signature, return_residual: true };
         assert_eq!(key.configuration(), configuration);
         assert_eq!(key.signature(), signature);
 
-        // Backward definitions ignore the residual request, so their keys clear it.
-        let key = AttentionKey::new(AttentionDefinitionKind::Backward, configuration, signature);
-        assert_eq!(key.kind(), AttentionDefinitionKind::Backward);
-        assert_eq!(key.configuration(), configuration.with_residual(false));
+        // Forward keys with different residual requests identify different definitions.
+        assert_ne!(key, AttentionKey::Forward { configuration, signature, return_residual: false });
+
+        // Backward definitions have no residual request.
+        let key = AttentionKey::Backward { configuration, signature };
+        assert_eq!(key.configuration(), configuration);
         assert_eq!(key.signature(), signature);
     }
 
     #[test]
     fn test_attention_key_from_composite_key() {
-        // Keys of every definition kind and implementation round trip, with and without their optional attributes.
+        // Keys of every definition and implementation round trip, with and without their optional attributes.
         let configuration = AttentionConfiguration::new()
             .with_scale(0.125)
             .with_causal(true)
             .with_local_window((2, 0))
-            .with_dropout(0.25)
-            .with_residual(true);
+            .with_dropout(0.25);
         let signature = AttentionInputSignature::new(true, false, true, false).with_dropout_state(true);
-        for kind in [AttentionDefinitionKind::Forward, AttentionDefinitionKind::Backward] {
-            for implementation in
-                [AttentionImplementation::Automatic, AttentionImplementation::Portable, AttentionImplementation::Fused]
-            {
-                let key = AttentionKey::new(kind, configuration.with_implementation(implementation), signature);
-                assert_eq!(AttentionKey::from_composite_key(&key.to_composite_key()), Ok(Some(key)));
-                let key = AttentionKey::new(
-                    kind,
-                    AttentionConfiguration::new().with_implementation(implementation),
-                    AttentionInputSignature::default(),
-                );
+        for implementation in
+            [AttentionImplementation::Automatic, AttentionImplementation::Portable, AttentionImplementation::Fused]
+        {
+            let default_configuration = AttentionConfiguration::new().with_implementation(implementation);
+            let default_signature = AttentionInputSignature::default();
+            let configuration = configuration.with_implementation(implementation);
+            for key in [
+                AttentionKey::Forward { configuration, signature, return_residual: true },
+                AttentionKey::Forward {
+                    configuration: default_configuration,
+                    signature: default_signature,
+                    return_residual: false,
+                },
+                AttentionKey::Backward { configuration, signature },
+                AttentionKey::Backward { configuration: default_configuration, signature: default_signature },
+            ] {
                 assert_eq!(AttentionKey::from_composite_key(&key.to_composite_key()), Ok(Some(key)));
             }
         }
@@ -3193,11 +3194,11 @@ mod tests {
                  {DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION} is supported",
             ))),
         );
-        let forward_key = AttentionKey::new(
-            AttentionDefinitionKind::Forward,
-            AttentionConfiguration::new(),
-            AttentionInputSignature::default(),
-        )
+        let forward_key = AttentionKey::Forward {
+            configuration: AttentionConfiguration::new(),
+            signature: AttentionInputSignature::default(),
+            return_residual: false,
+        }
         .to_composite_key();
         let extended = forward_key.clone().with_attribute("extra", true);
         assert_eq!(
@@ -3222,6 +3223,27 @@ mod tests {
             AttentionKey::from_composite_key(&missing),
             Err(TypeError::invalid(format!("named composite `{missing}` is not a valid attention definition"))),
         );
+
+        // Only forward keys have a residual request, so a forward key without one and a backward key with one are
+        // rejected.
+        let without_residual = forward_key.attributes().iter().filter(|(name, _)| name != "residual").fold(
+            CompositeKey::new(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION),
+            |key, (name, value)| key.with_attribute(name.clone(), value.clone()),
+        );
+        assert_eq!(
+            AttentionKey::from_composite_key(&without_residual),
+            Err(TypeError::invalid(format!(
+                "named composite `{without_residual}` is not a valid attention definition",
+            ))),
+        );
+        let with_residual = forward_key.attributes().iter().fold(
+            CompositeKey::new(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION),
+            |key, (name, value)| key.with_attribute(name.clone(), value.clone()),
+        );
+        assert_eq!(
+            AttentionKey::from_composite_key(&with_residual),
+            Err(TypeError::invalid(format!("named composite `{with_residual}` is not a valid attention definition"))),
+        );
     }
 
     #[test]
@@ -3231,12 +3253,11 @@ mod tests {
             .with_causal(true)
             .with_local_window((2, 0))
             .with_implementation(AttentionImplementation::Fused)
-            .with_dropout(0.25)
-            .with_residual(true);
+            .with_dropout(0.25);
         let signature = AttentionInputSignature::new(true, false, true, false).with_dropout_state(true);
 
-        // Forward keys encode every configuration attribute, including the residual request.
-        let key = AttentionKey::new(AttentionDefinitionKind::Forward, configuration, signature).to_composite_key();
+        // Forward keys encode every configuration attribute and their residual request.
+        let key = AttentionKey::Forward { configuration, signature, return_residual: true }.to_composite_key();
         assert_eq!(key.name(), DOT_PRODUCT_ATTENTION_COMPOSITE_NAME);
         assert_eq!(key.version(), DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION);
         assert_eq!(
@@ -3246,8 +3267,8 @@ mod tests {
              query_sequence_lengths = true, key_value_sequence_lengths = false, dropout_state = true}",
         );
 
-        // Backward keys ignore the residual request, so they omit its attribute.
-        let key = AttentionKey::new(AttentionDefinitionKind::Backward, configuration, signature).to_composite_key();
+        // Backward keys have no residual request, so they omit its attribute.
+        let key = AttentionKey::Backward { configuration, signature }.to_composite_key();
         assert_eq!(key.name(), DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME);
         assert_eq!(key.version(), DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION);
         assert_eq!(
@@ -3272,7 +3293,6 @@ mod tests {
         assert!(!configuration.causal());
         assert_eq!(configuration.local_window(), None);
         assert_eq!(configuration.implementation(), AttentionImplementation::Automatic);
-        assert!(!configuration.return_residual());
         assert_eq!(configuration.dropout(), None);
 
         let configuration = configuration
@@ -3280,20 +3300,21 @@ mod tests {
             .with_causal(true)
             .with_local_window((2, 1))
             .with_implementation(AttentionImplementation::Fused)
-            .with_residual(true)
             .with_dropout(0.1);
         assert_eq!(configuration.scale(), Some(0.25));
         assert!(configuration.causal());
-        assert_eq!(configuration.local_window(), Some((2, 1)));
+        assert_eq!(configuration.local_window(), Some((2, 0)));
         assert_eq!(configuration.implementation(), AttentionImplementation::Fused);
-        assert!(configuration.return_residual());
         assert_eq!(configuration.dropout(), Some(0.1));
+
+        // Causal masking hides every position to the right, so the right radius is reported only without it.
+        assert_eq!(configuration.with_causal(false).local_window(), Some((2, 1)));
 
         // Absent values restore the inferred scale and disable the local window and dropout, and a symmetric local
         // window uses its radius on both sides.
         assert_eq!(configuration.with_scale(None).scale(), None);
         assert_eq!(configuration.with_local_window(None).local_window(), None);
-        assert_eq!(configuration.with_symmetric_local_window(3).local_window(), Some((3, 3)));
+        assert_eq!(configuration.with_causal(false).with_symmetric_local_window(3).local_window(), Some((3, 3)));
         assert_eq!(configuration.with_symmetric_local_window(None).local_window(), None);
         assert_eq!(configuration.with_dropout(None).dropout(), None);
     }
@@ -3305,6 +3326,19 @@ mod tests {
         let same_configuration = AttentionConfiguration::new().with_scale(0.25).with_causal(true).with_dropout(0.1);
         assert_eq!(configuration, same_configuration);
         assert_eq!(hash_of(&configuration), hash_of(&same_configuration));
+
+        // The right local-window radius has no effect with causal masking, so it does not distinguish configurations
+        // or their keys there, while it does without causal masking.
+        let left = configuration.with_local_window((2, 0));
+        let both = configuration.with_local_window((2, 3));
+        assert_eq!(left, both);
+        assert_eq!(hash_of(&left), hash_of(&both));
+        let signature = AttentionInputSignature::default();
+        assert_eq!(
+            AttentionKey::Backward { configuration: left, signature }.to_composite_key(),
+            AttentionKey::Backward { configuration: both, signature }.to_composite_key(),
+        );
+        assert_ne!(left.with_causal(false), both.with_causal(false));
         let configurations = HashMap::from([(configuration, "configuration")]);
         assert_eq!(configurations.get(&same_configuration), Some(&"configuration"));
         assert_eq!(configurations.get(&configuration.with_dropout(0.2)), None);
@@ -3483,9 +3517,8 @@ mod tests {
         // Calls with equal input types share one traced body, which the program imports once.
         let (_, program) = ArrayContext::trace(
             |inputs: AttentionInputs<_>| {
-                let (first, _) = function.call(inputs.clone())?;
-                let (second, _) = function.call(AttentionInputs::new(first, inputs.key, inputs.value))?;
-                Ok(second)
+                let first = function.call(inputs.clone())?;
+                function.call(AttentionInputs::new(first, inputs.key, inputs.value))
             },
             AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
         )
@@ -3541,6 +3574,21 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // One function stages both forward definitions, which agree on the attended output and are cached separately.
+        let ones = f32_array(&[1, 2, 1, 1], &[1.0, 1.0]);
+        let inputs = AttentionInputs::new(ones.clone(), ones, f32_array(&[1, 2, 1, 1], &[3.0, 5.0]));
+        let output = function.call(inputs.clone()).unwrap();
+        assert_eq!(output, f32_array(&[1, 2, 1, 1], &[3.0, 4.0]));
+        assert_eq!(
+            function.call_with_residual(inputs),
+            Ok((output, f32_array(&[1, 2, 1], &[1.0, 1.0 + std::f32::consts::LN_2]))),
+        );
+        let signature = AttentionInputSignature::default();
+        let definitions = function.definitions.forward.lock().unwrap();
+        assert_eq!(definitions.len(), 2);
+        assert!(definitions.contains_key(&(false, signature)));
+        assert!(definitions.contains_key(&(true, signature)));
     }
 
     #[test]
@@ -3562,15 +3610,12 @@ mod tests {
         let residual = ArrayType::new_static(DataType::F32, [1, 1, 1])
             .with_sharding(Sharding::replicated(mesh.clone(), 3).with_varying_manual_axes(["x"]).unwrap())
             .unwrap();
-        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_residual(true));
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
 
         // The function aligns the manual variation of its inputs before the call, so the invariant inputs become
         // varying and the outputs vary like the query.
         let (output_types, program) = DomainTracingContext::<ArrayContext>::trace_with_named_axes(
-            |inputs: AttentionInputs<_>| {
-                let (output, residual) = function.call(inputs)?;
-                Ok((output, residual.unwrap()))
-            },
+            |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
             AttentionInputs {
                 query: varying.clone(),
                 key: invariant.clone(),
@@ -3711,7 +3756,7 @@ mod tests {
         let key_value = ArrayType::new_static(DataType::F32, [3, 1, 2]);
         let lengths = ArrayType::new_static(DataType::I32, [1]);
         let signature = AttentionInputSignature::new(true, true, true, true);
-        let configuration = AttentionConfiguration::new().with_local_window((0, 0)).with_residual(true);
+        let configuration = AttentionConfiguration::new().with_local_window((0, 0));
         let input_types = vec![
             query.clone(),
             key_value.clone(),
@@ -3728,6 +3773,7 @@ mod tests {
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 configuration,
                 signature,
+                true,
                 input_types.as_slice(),
             ),
             Ok(vec![query.clone(), ArrayType::new_static(DataType::F32, [2, 2])]),
@@ -3735,8 +3781,9 @@ mod tests {
         assert_eq!(
             attention_forward_output_types(
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-                configuration.with_residual(false),
+                configuration,
                 signature,
+                false,
                 input_types.as_slice(),
             ),
             Ok(vec![query.clone()]),
@@ -3752,6 +3799,7 @@ mod tests {
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 AttentionConfiguration::new().with_dropout(0.5),
                 stateful,
+                false,
                 stateful_types.as_slice(),
             ),
             Ok(vec![query.clone()]),
@@ -3761,6 +3809,7 @@ mod tests {
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 AttentionConfiguration::new().with_dropout(0.5),
                 AttentionInputSignature::default(),
+                false,
                 plain_types.as_slice(),
             ),
             Ok(vec![query]),
@@ -3771,6 +3820,7 @@ mod tests {
                     DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                     AttentionConfiguration::new().with_dropout(rate),
                     stateful,
+                    false,
                     stateful_types.as_slice(),
                 ),
                 Err(TypeError::Invalid { message, .. })
@@ -3785,6 +3835,7 @@ mod tests {
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 AttentionConfiguration::new(),
                 stateful,
+                false,
                 stateful_types.as_slice(),
             ),
             Err(TypeError::Invalid { message, .. })
@@ -3799,6 +3850,7 @@ mod tests {
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 AttentionConfiguration::new().with_dropout(0.5),
                 stateful,
+                false,
                 invalid_state_types.as_slice(),
             ),
             Err(TypeError::Invalid { message, .. })
@@ -3824,6 +3876,7 @@ mod tests {
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 AttentionConfiguration::new(),
                 AttentionInputSignature::default(),
+                false,
                 &[varying, invariant.clone(), invariant.clone()],
             ),
             Err(TypeError::Invalid { message, .. })
@@ -3837,6 +3890,7 @@ mod tests {
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 AttentionConfiguration::new(),
                 AttentionInputSignature::default(),
+                false,
                 &[reduced, invariant.clone(), invariant],
             ),
             Err(TypeError::Invalid { message, .. })
@@ -3922,11 +3976,11 @@ mod tests {
                 f32_array(&[3, 1, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
             )
         };
-        let configuration = AttentionConfiguration::new().with_local_window((1, 0)).with_residual(true);
+        let configuration = AttentionConfiguration::new().with_local_window((1, 0));
         let (output, residual) = attend(inputs.clone(), configuration);
         assert_eq!(output, f32_array(&[2, 1, 2], &[1.0, 2.0, 0.0, 0.0]));
         let invisible = (-0.7 * f64::from(f32::MAX)) as f32;
-        assert_eq!(residual, Some(f32_array(&[2, 1], &[std::f32::consts::FRAC_1_SQRT_2, invisible])));
+        assert_eq!(residual, f32_array(&[2, 1], &[std::f32::consts::FRAC_1_SQRT_2, invisible]));
         let (explicit, _) = attend(inputs, configuration.with_scale(1.0 / 2f64.sqrt()));
         assert_eq!(output, explicit);
 
@@ -3985,16 +4039,16 @@ mod tests {
         let query = f32_array(&[2, 1, 2], &[1.0, 0.0, 0.0, 1.0]);
         let key = f32_array(&[3, 1, 2], &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0]);
         let value = f32_array(&[3, 1, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let configuration = AttentionConfiguration::new().with_residual(true);
+        let configuration = AttentionConfiguration::new();
         let (output, residual) = attend(AttentionInputs::new(query.clone(), key.clone(), value.clone()), configuration);
         let function = dot_product_attention::<ArrayIrContext>(configuration);
         assert_eq!(
-            function.call(AttentionInputs::new(
+            function.call_with_residual(AttentionInputs::new(
                 ArrayIrValue::Array(query),
                 ArrayIrValue::Array(key),
                 ArrayIrValue::Array(value),
             )),
-            Ok((ArrayIrValue::Array(output), residual.map(ArrayIrValue::Array))),
+            Ok((ArrayIrValue::Array(output), ArrayIrValue::Array(residual))),
         );
     }
 
@@ -4018,7 +4072,7 @@ mod tests {
         // Dropout scales the kept uniform attention weights by `1 / (1 - rate)`, so every output row is the sum of a
         // subset of the values scaled by `2 / 4`, and different states select different subsets. The subsets
         // themselves belong to the dropout operation, so this test does not pin them.
-        let outputs = (0..8).map(|seed| function.call(with_state(seed)).unwrap().0.to_f64s()).collect::<Vec<_>>();
+        let outputs = (0..8).map(|seed| function.call(with_state(seed)).unwrap().to_f64s()).collect::<Vec<_>>();
         assert!(outputs.iter().any(|output| output != &outputs[0]));
         for subset_sum in outputs.iter().flatten().map(|element| element / 0.5) {
             assert!((0.0..=10.0).contains(&subset_sum));
@@ -4053,13 +4107,10 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::I32, [values.len()]), values).unwrap()
         };
 
-        let configuration = AttentionConfiguration::new().with_causal(true).with_residual(true);
+        let configuration = AttentionConfiguration::new().with_causal(true);
         let function = dot_product_attention::<ArrayContext>(configuration);
         let (_, program) = ArrayContext::trace(
-            |inputs: AttentionInputs<_>| {
-                let (output, residual) = function.call(inputs)?;
-                Ok((output, residual.unwrap()))
-            },
+            |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
             AttentionInputs {
                 query_sequence_lengths: Some(lengths_type.clone()),
                 key_value_sequence_lengths: Some(lengths_type),
@@ -4083,19 +4134,18 @@ mod tests {
                 ..operands(1, 3, 2)
             },
         ] {
-            let (output, residual) = function.call(inputs.clone()).unwrap();
-            assert_eq!(program.interpret(inputs), Ok((output, residual.unwrap())));
+            assert_eq!(program.interpret(inputs.clone()), Ok(function.call_with_residual(inputs).unwrap()));
         }
 
         // Attention without masks broadcasts only the softmax statistics and the scale.
         let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
         let (_, program) = ArrayContext::trace(
-            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            |inputs: AttentionInputs<_>| function.call(inputs),
             AttentionInputs::new(operand_type(&query_length), operand_type(&key_length), operand_type(&key_length)),
         )
         .unwrap();
         for inputs in [operands(2, 2, 3), operands(1, 3, 2)] {
-            assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap().0));
+            assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap()));
         }
 
         // A bias and a mask are right-aligned to the scores through unit axes and then take the runtime shape of the
@@ -4108,7 +4158,7 @@ mod tests {
             Shape::new(vec![batch.clone().into(), 1.into(), query_length.clone().into(), key_length.clone().into()]),
         );
         let (_, program) = ArrayContext::trace(
-            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            |inputs: AttentionInputs<_>| function.call(inputs),
             AttentionInputs {
                 bias: Some(bias_type),
                 mask: Some(mask_type),
@@ -4128,14 +4178,14 @@ mod tests {
                 mask: Some(Array::from_elements(mask_type, &visible).unwrap()),
                 ..operands(items, rows, columns)
             };
-            assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap().0));
+            assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap()));
         }
 
         // Dropout draws the random bits of its mask for a static shape, so definitions with dropout still require
         // static shapes.
         let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_dropout(0.5));
         let result = ArrayContext::trace(
-            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            |inputs: AttentionInputs<_>| function.call(inputs),
             AttentionInputs::new(operand_type(&query_length), operand_type(&key_length), operand_type(&key_length)),
         );
         assert!(matches!(
@@ -4153,7 +4203,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(dimensions))
         };
         let (_, program) = ArrayContext::trace(
-            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            |inputs: AttentionInputs<_>| function.call(inputs),
             AttentionInputs::new(
                 grouped_type(&query_length, 4),
                 grouped_type(&key_length, 2),
@@ -4167,23 +4217,20 @@ mod tests {
                 f32_array(&[items, columns, 2, 2], &elements(4 * items * columns, 0.5)),
                 f32_array(&[items, columns, 2, 2], &elements(4 * items * columns, -2.0)),
             );
-            assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap().0));
+            assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap()));
         }
     }
 
     #[test]
     fn test_dot_product_attention_batching() {
-        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_residual(true));
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
 
         // Each batch item carries one complete rank-4 attention problem. The batching rule folds the mapped axis into
         // the logical batch axis and restores it on the outputs.
         let ones = f32_array(&[2, 1, 1, 1, 1], &[1.0, 1.0]);
         let values = f32_array(&[2, 1, 1, 1, 1], &[5.0, 7.0]);
         let (output, residual) = batch(
-            |inputs: AttentionInputs<_>| {
-                let (output, residual) = function.call(inputs)?;
-                Ok((output, residual.unwrap()))
-            },
+            |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
             AttentionInputs::new(ones.clone(), ones, values.clone()),
             AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
             (BatchAxis::new(0), BatchAxis::new(0)),
@@ -4212,10 +4259,7 @@ mod tests {
             ..AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::replicated())
         };
         let (output, residual) = batch(
-            |inputs: AttentionInputs<_>| {
-                let (output, residual) = function.call(inputs)?;
-                Ok((output, residual.unwrap()))
-            },
+            |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
             inputs,
             axes,
             (BatchAxis::new(0), BatchAxis::new(0)),
@@ -4230,7 +4274,7 @@ mod tests {
         let (_, program) = ArrayContext::trace(
             |inputs: AttentionInputs<_>| {
                 batch(
-                    |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+                    |inputs: AttentionInputs<_>| Ok(function.call_with_residual(inputs)?.0),
                     inputs,
                     AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(1), BatchAxis::new(1)),
                     BatchAxis::new(0),
@@ -4320,14 +4364,8 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![2.into(), length.clone().into(), 1.into(), 1.into()]));
         let (_, program) = ArrayContext::trace(
             |inputs: AttentionInputs<_>| {
-                batch(
-                    |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
-                    inputs,
-                    axes.clone(),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .map_err(ProgramError::from)
+                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                    .map_err(ProgramError::from)
             },
             AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
         )
@@ -4338,7 +4376,7 @@ mod tests {
             f32_array(&[2, 2, 1, 1], &[3.0, 5.0, 7.0, 11.0]),
         );
         let expected = batch(
-            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            |inputs: AttentionInputs<_>| function.call(inputs),
             inputs.clone(),
             axes.clone(),
             BatchAxis::new(0),
@@ -4353,14 +4391,8 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 1.into(), length.into(), 1.into(), 1.into()]));
         let result = ArrayContext::trace(
             |inputs: AttentionInputs<_>| {
-                batch(
-                    |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
-                    inputs,
-                    axes.clone(),
-                    BatchAxis::new(0),
-                    None,
-                )
-                .map_err(ProgramError::from)
+                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                    .map_err(ProgramError::from)
             },
             AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
         );
@@ -4390,7 +4422,7 @@ mod tests {
                     bias: Some(BatchAxis::new(0)),
                     ..AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0))
                 };
-                batch(|inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0), inputs, axes, BatchAxis::new(0), None)
+                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes, BatchAxis::new(0), None)
                     .map_err(ProgramError::from)
             },
             AttentionInputs {
@@ -4506,7 +4538,7 @@ mod tests {
         let key = trace.input(r#type.clone().into());
         let value = trace.input(r#type.clone().into());
         let output = batch(
-            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            |inputs: AttentionInputs<_>| function.call(inputs),
             AttentionInputs::new(query, key, value),
             AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
             BatchAxis::new(0),
@@ -4616,7 +4648,7 @@ mod tests {
         let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_dropout(0.5));
         let state = Array::from_elements(ArrayType::new_static(DataType::U64, [2]), &[0u64, 1]).unwrap();
         let zeros = f32_array(&[1, 4, 1, 1], &[0.0; 4]);
-        let (expected, _) = function
+        let expected = function
             .call(AttentionInputs {
                 dropout_state: Some(state.clone()),
                 ..AttentionInputs::new(zeros.clone(), zeros, f32_array(&[1, 4, 1, 1], &[1.0, 2.0, 3.0, 4.0]))
@@ -4635,8 +4667,7 @@ mod tests {
             ..AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0))
         };
         let output =
-            batch(|inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0), inputs, axes, BatchAxis::new(0), None)
-                .unwrap();
+            batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes, BatchAxis::new(0), None).unwrap();
         assert_eq!(output.to_f64s(), [expected.to_f64s(), expected.to_f64s()].concat());
     }
 
@@ -4649,7 +4680,7 @@ mod tests {
         let function = dot_product_attention::<ArrayContext>(configuration);
         let ones = f32_array(&[2, 1, 1, 1, 1], &[1.0, 1.0]);
         let result = batch(
-            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
+            |inputs: AttentionInputs<_>| function.call(inputs),
             AttentionInputs::new(ones.clone(), ones.clone(), ones),
             AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
             BatchAxis::new(0),
@@ -4673,8 +4704,8 @@ mod tests {
         let r#type = ArrayType::new_static(DataType::F32, [1, 1, 1, 1]);
         let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
         let (_, program) = ArrayContext::trace(
-            |inputs: AttentionInputs<_>| Ok(function.call(inputs)?.0),
-            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
+            |inputs: AttentionInputs<_>| function.call(inputs),
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type.clone()),
         )
         .unwrap();
         drop(function);
@@ -4686,13 +4717,38 @@ mod tests {
                 let context = inputs[0].domain();
                 Ok(program.entry_region_ref().interpret_in_context(&context, inputs)?.remove(0))
             },
-            vec![ones.clone(), ones, values.clone()],
+            vec![ones.clone(), ones.clone(), values.clone()],
             vec![BatchAxis::new(0); 3],
             BatchAxis::new(0),
             None,
         )
         .unwrap();
         assert_eq!(output, values);
+
+        // A call that also returns its residual stages an equivalent folded definition that returns it as well.
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let (_, program) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
+        )
+        .unwrap();
+        drop(function);
+        let program = program.into_flat_program();
+        let (output, residual) = batch(
+            |inputs: Vec<_>| {
+                let context = inputs[0].domain();
+                let mut outputs = program.entry_region_ref().interpret_in_context(&context, inputs)?;
+                let residual = outputs.remove(1);
+                Ok((outputs.remove(0), residual))
+            },
+            vec![ones.clone(), ones, values.clone()],
+            vec![BatchAxis::new(0); 3],
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output, values);
+        assert_eq!(residual, f32_array(&[2, 1, 1, 1], &[1.0, 1.0]));
     }
 
     #[test]
@@ -4702,7 +4758,7 @@ mod tests {
         let ones = f32_array(&[1, 1, 1, 1], &[1.0]);
         assert!(matches!(
             differentiate_at(AttentionInputs::new(ones.clone(), ones.clone(), ones))
-                .gradient(|inputs| function.call(inputs)?.0.reduce(&[0, 1, 2, 3], ReductionKind::Sum)),
+                .gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum)),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == format!(
                     "cannot differentiate a `composite` call of `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` that has no \
