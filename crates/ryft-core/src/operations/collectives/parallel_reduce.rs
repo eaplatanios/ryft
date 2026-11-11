@@ -33,8 +33,8 @@ use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
-    ValueDomainDispatch,
+    MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, TypeError, Typed,
+    Value, ValueDomainDispatch,
 };
 
 /// Name of [`ParallelReduceOperation`]. The operation's [`ReductionKind`] is rendered as its `kind` attribute.
@@ -410,31 +410,6 @@ where
     }
 }
 
-impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for ParallelReduceOperation {
-    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
-        &self,
-        context: &LockstepDomain<O>,
-        _driver: &D,
-        inputs: &[LockstepValue<O>],
-    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
-        let axes = context.collective_axes(self)?;
-        let (arrays, extents) = context.collective_arrays(inputs)?;
-        let name = self.name();
-        if let Some(payload_axis_size) = self.axis_size() {
-            context.validate_collective_axis_size(self, &axes, payload_axis_size)?;
-        }
-        let outputs = context.grid().map_devices(|device| {
-            let (participants, _) = context.grid().participants(device, &axes, self.axis_index_groups())?;
-            let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
-            with_placement_of(
-                &reduce_participants(name, &participants, self.kind())?,
-                &context.collective_output_type(self, arrays[device], extents, device)?,
-            )
-        })?;
-        Ok(vec![LockstepValue::new(outputs, context)?])
-    }
-}
-
 impl_differentiable_operation! {
     ParallelReduceOperation,
     jvp<C>
@@ -528,6 +503,48 @@ impl_differentiable_operation! {
             }
         }
     },
+}
+
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for ParallelReduceOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        let axes = context.collective_axes(self)?;
+        let (arrays, extents) = context.collective_arrays(inputs)?;
+        let name = self.name();
+        if let Some(payload_axis_size) = self.axis_size() {
+            context.validate_collective_axis_size(self, &axes, payload_axis_size)?;
+        }
+        let outputs = context.grid().map_devices(|device| {
+            let (participants, _) = context.grid().participants(device, &axes, self.axis_index_groups())?;
+            let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
+            with_placement_of(
+                &reduce_participants(name, &participants, self.kind())?,
+                &context.collective_output_type(self, arrays[device], extents, device)?,
+            )
+        })?;
+        Ok(vec![LockstepValue::new(outputs, context)?])
+    }
+}
+
+impl<O: Operation<Type = ArrayType> + From<ParallelReduceOperation>>
+    OperationProvider<ArrayType, ParallelReduceOperation> for O
+{
+    type Operation = Self;
+
+    #[inline]
+    fn provide(request: ParallelReduceOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+        // Any operation family that contains `ParallelReduceOperation` can provide it on request. Transposition rules
+        // request it this way for the cross-device sum that is the adjoint of an implicit variation transition (e.g.,
+        // of a broadcast that places an invariant input along a manual mesh axis). Families that cannot stage
+        // collectives (e.g., test-only families) override this with an implementation that returns
+        // `ProgramError::UnsupportedOperation`, which keeps those rules available to their values.
+        check_count!("input", input_types, 1, ProgramError);
+        Ok(Self::from(request))
+    }
 }
 
 /// Represents the ability to reduce a value across the participants of a named axis, producing one result that every

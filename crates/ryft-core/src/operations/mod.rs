@@ -89,9 +89,10 @@ pub use composites::{
 };
 pub use constants::{
     CONSTANT_OPERATION_NAME, Constant, ConstantOperation, ConstantOperations, DimensionConstant, DynamicFill,
-    DynamicIota, DynamicOne, DynamicZero, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation, ONE_LIKE_OPERATION_NAME,
-    ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME,
-    Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    DynamicIota, DynamicOne, DynamicZero, FILL_LIKE_OPERATION_NAME, Fill, FillLike, FillLikeOperation,
+    IOTA_LIKE_OPERATION_NAME, IOTA_OPERATION_NAME, Iota, IotaLike, IotaLikeOperation, IotaOperation,
+    ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation,
+    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 pub use control_flow::scan::scan;
 pub use control_flow::r#while::r#while;
@@ -140,21 +141,21 @@ pub use logical::{
     Or, OrOperation, XOR_OPERATION_NAME, Xor, XorOperation,
 };
 pub use manipulation::{
-    BROADCAST_OPERATION_NAME, BasicIndex, Broadcast, BroadcastOperation, CAST_OPERATION_NAME,
-    CONCATENATE_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, Cast, CastOperation, CastType, Concatenate,
-    ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME,
-    DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate,
-    DynamicGather, DynamicManipulationOperations, DynamicPad, DynamicReshape, DynamicReshapeOperation, DynamicScatter,
-    DynamicSlice, DynamicSliceBounds, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode,
-    GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed, Indexing,
-    ManipulationOperations, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, REDUCE_PRECISION_OPERATION_NAME,
-    RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME, ReducePrecision, ReducePrecisionOperation, Reshape,
-    ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
-    ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Slice,
-    SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, TransferToMemory,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
-    UpdateSliceOperation,
+    BROADCAST_LIKE_OPERATION_NAME, BROADCAST_OPERATION_NAME, BasicIndex, Broadcast, BroadcastLike,
+    BroadcastLikeOperation, BroadcastOperation, CAST_OPERATION_NAME, CONCATENATE_OPERATION_NAME,
+    CONVERT_ELEMENT_TYPE_OPERATION_NAME, Cast, CastOperation, CastType, Concatenate, ConcatenateOperation,
+    ConvertElementType, ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
+    DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicGather, DynamicManipulationOperations,
+    DynamicPad, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceBounds,
+    DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType,
+    GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IndexInteger,
+    IndexMask, IndexSelector, IndexSlice, Indexed, Indexing, ManipulationOperations, PAD_OPERATION_NAME, Pad,
+    PadOperation, Permutation, REDUCE_PRECISION_OPERATION_NAME, RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME,
+    ReducePrecision, ReducePrecisionOperation, Reshape, ReshapeOperation, Reverse, ReverseOperation,
+    SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
+    ScatterOptions, ScatterReductionKind, Slice, SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME,
+    TRANSPOSE_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
+    UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
 };
 pub use quantization::{
     BlockDequantize, BlockQuantize, BlockQuantizedValue, BlockScaleFormat, BlockScaledDot, BlockScaledDotConfiguration,

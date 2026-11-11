@@ -4460,12 +4460,12 @@ pub(crate) mod tests {
     use crate::operations::{
         AddOperation, BroadcastOperation, CastOperation, CompareOperation, ConcatenateOperation, ConditionOperation,
         Constant, ConstantOperation, ConvertElementTypeOperation, DivOperation, ExpOperation, MulOperation,
-        NegOperation, OneLikeOperation, PadOperation, ParallelVaryOperation, PrintOperation, ReduceOperation,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap,
-        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ReshapeOperation, ReshardOperation,
-        SelectOperation, Sin, SliceOperation, StopGradient, SubOperation, TransposeOperation, UpdateSliceOperation,
-        ZeroLikeOperation, ZeroOperation,
+        NegOperation, OneLikeOperation, PadOperation, ParallelReduceOperation, ParallelVaryOperation, PrintOperation,
+        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ReshapeOperation,
+        ReshardOperation, SelectOperation, Sin, SliceOperation, StopGradient, SubOperation, TransposeOperation,
+        UpdateSliceOperation, ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
@@ -10041,6 +10041,17 @@ pub(crate) mod tests {
                 check_count!("input", input_types, 1, ProgramError);
                 Err(ProgramError::UnsupportedOperation {
                     message: "value-only test operation family cannot align manual variation".to_string(),
+                })
+            }
+        }
+
+        impl OperationProvider<ArrayType, ParallelReduceOperation> for ValueOnlyArrayOperation {
+            type Operation = Self;
+
+            fn provide(_request: ParallelReduceOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "value-only test operation family cannot reduce over manual mesh axes".to_string(),
                 })
             }
         }
