@@ -7118,7 +7118,10 @@ where
                 local_inputs,
             )?;
             let local_outputs = function(&body_context, local_inputs)?;
-            validate_parameter_structure(&output_paths, &local_outputs)?;
+
+            // The error crosses the trace as a `ShardMapError`, so that the caller recovers its `Parameter` variant.
+            validate_parameter_structure(&output_paths, &local_outputs).map_err(ShardMapError::from)?;
+
             let local_outputs = local_outputs.into_parameters().collect::<Vec<_>>();
             let boundary = match &rebuild_boundary {
                 Some(rebuild_boundary) => {
