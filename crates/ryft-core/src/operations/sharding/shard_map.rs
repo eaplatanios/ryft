@@ -3940,7 +3940,7 @@ impl<O: Operation<Type = ArrayIrType>> LockstepDomain<O> {
         extents: &[LockstepValue<O>],
         device: usize,
     ) -> Result<ArrayType, ProgramError> {
-        let output_type = single_output_type(payload, &[input.r#type().into_owned()])?;
+        let output_type = payload.infer_output_types(&[input.r#type().into_owned()], &[])?.remove(0);
         if extents.is_empty() {
             return Ok(output_type);
         }
@@ -5020,16 +5020,6 @@ fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
     }
 }
 
-/// Returns the single output type that `operation` infers for `input_types`.
-pub(crate) fn single_output_type<O: Operation<Type = ArrayType>>(
-    operation: &O,
-    input_types: &[ArrayType],
-) -> Result<ArrayType, ProgramError> {
-    let mut output_types = operation.infer_output_types(input_types, &[])?;
-    check_count!("output", output_types, 1, ProgramError);
-    Ok(output_types.remove(0))
-}
-
 /// Returns the static extents of `array_type`, which the emulation requires.
 fn emulated_extents(array_type: &ArrayType) -> Result<Vec<usize>, ProgramError> {
     array_type
@@ -5102,11 +5092,6 @@ pub(crate) fn validate_participant_types(operation_name: &str, participants: &[&
     Ok(())
 }
 
-/// Returns the slice axes that select the block of shape `block_shape` that starts at `offsets`.
-pub(crate) fn block_axes(offsets: &[usize], block_shape: &[usize]) -> Vec<ArraySliceAxis> {
-    offsets.iter().zip(block_shape).map(|(&start, &size)| ArraySliceAxis::new(start, size, 1)).collect()
-}
-
 /// Returns the offset of the block that the device at `coordinates` holds, along every dimension of a boundary value
 /// placed by `sharding`. Along a dimension sharded over active manual axes (which precede every free axis of that
 /// dimension), the offset is the row-major partition index over those axes scaled by the local extent `local_shape`
@@ -5158,7 +5143,8 @@ fn local_input_shard(
     }
     let local_shape = emulated_extents(local_type)?;
     let offsets = manual_block_offsets(sharding, grid, coordinates, &local_shape);
-    value.copy_block(local_type.clone(), &block_axes(&offsets, &local_shape))
+    let block = offsets.iter().zip(&local_shape).map(|(&start, &size)| ArraySliceAxis::new(start, size, 1));
+    value.copy_block(local_type.clone(), &block.collect::<Vec<_>>())
 }
 
 /// Assembles a global boundary value of type `global_type` (i.e., a global output or the referent of a reference
@@ -13278,7 +13264,7 @@ mod tests {
                     )),
                 ] {
                     let name = operation.name();
-                    let output_type = single_output_type(&operation, &[input_type.clone()]).unwrap();
+                    let output_type = operation.infer_output_types(&[input_type.clone()], &[]).unwrap().remove(0);
                     let operation = TestOperation::from(operation);
                     let inputs = [vec![f32_value(input_type.clone(), &[2.0]); 4]];
                     let expected = if checked {

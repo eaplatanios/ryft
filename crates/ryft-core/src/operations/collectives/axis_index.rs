@@ -12,7 +12,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver, Member
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::operations::collectives::{CollectiveAxes, CollectiveOperation, validate_manual_mesh_axis};
 use crate::operations::constants::iota::IotaOperation;
-use crate::operations::sharding::shard_map::{single_output_type, with_array_type};
+use crate::operations::sharding::shard_map::with_array_type;
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -239,7 +239,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
     ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
         let axes = context.collective_axes(self)?;
         check_count!("input", inputs, 0, ProgramError);
-        let output_type = single_output_type(self, &[])?;
+        let output_type = self.infer_output_types(&[], &[])?.remove(0);
         let outputs = context.grid().map_devices(|device| {
             let position = Array::scalar(context.grid().position(device, &axes) as u64)?;
             with_array_type(&position.converted_to(output_type.data_type())?, &output_type)

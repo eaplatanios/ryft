@@ -4,9 +4,9 @@ use std::fmt::Display;
 use ryft_macros::capability;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType,
-    DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape,
-    Sharding,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue,
+    ArraySliceAxis, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue,
+    DimensionVariable, LogicalMesh, Shape, Sharding,
 };
 use crate::axes::{Axis, AxisError, NamedAxes};
 use crate::batching::{
@@ -42,7 +42,7 @@ use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBro
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
-use crate::operations::sharding::shard_map::{block_axes, reduce_participants};
+use crate::operations::sharding::shard_map::reduce_participants;
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -765,7 +765,8 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
             };
             let mut offsets = vec![0; shape.len()];
             offsets[scatter_axis] = position * shape[scatter_axis];
-            sum.copy_block(output_type, &block_axes(&offsets, &shape))
+            let block = offsets.iter().zip(&shape).map(|(&start, &size)| ArraySliceAxis::new(start, size, 1));
+            sum.copy_block(output_type, &block.collect::<Vec<_>>())
         })?;
         Ok(vec![LockstepValue::new(outputs, context)?])
     }

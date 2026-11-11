@@ -4,8 +4,9 @@ use std::fmt::Display;
 use ryft_macros::capability;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType,
-    Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, Shape, Sharding,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue,
+    ArraySliceAxis, ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable,
+    LogicalMesh, Shape, Sharding,
 };
 use crate::axes::{Axis, AxisError, NamedAxes};
 use crate::batching::{
@@ -37,7 +38,7 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::sharding::shard_map::{block_axes, validate_participant_types};
+use crate::operations::sharding::shard_map::validate_participant_types;
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -845,7 +846,11 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
                 };
                 let mut chunk_offsets = vec![0; chunk_shape.len()];
                 chunk_offsets[split_axis] = position * chunk_shape[split_axis];
-                let selection = block_axes(&chunk_offsets, &chunk_shape);
+                let selection = chunk_offsets
+                    .iter()
+                    .zip(&chunk_shape)
+                    .map(|(&start, &size)| ArraySliceAxis::new(start, size, 1))
+                    .collect::<Vec<_>>();
 
                 // The chunks are stacked along a new sender axis (untiled) or concatenated along an existing one
                 // (tiled) in the order of their senders' positions.
