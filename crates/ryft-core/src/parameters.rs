@@ -810,6 +810,32 @@ pub trait Parameterized<P: Parameter>: Sized {
         self.named_parameters().map(|(path, _)| path)
     }
 
+    /// Validates that this [`Parameterized`] value has the parameter structure whose parameter paths are
+    /// `expected_paths`. Two values that are paired parameter by parameter in flat order (e.g., inputs and their
+    /// per-input options) must have the same structure, because a value with as many parameters but a different
+    /// structure would otherwise be paired silently with the wrong parameters.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParameterError::MismatchedParameterStructures`] when the parameter paths of this value differ from
+    /// `expected_paths`.
+    fn validate_parameter_structure(&self, expected_paths: &[ParameterPath]) -> Result<(), ParameterError> {
+        let paths = self.parameter_paths().collect::<Vec<_>>();
+        if paths != expected_paths {
+            return Err(ParameterError::MismatchedParameterStructures {
+                left_structure: format!(
+                    "[{}]",
+                    expected_paths.iter().map(ParameterPath::to_string).collect::<Vec<_>>().join(", "),
+                ),
+                right_structure: format!(
+                    "[{}]",
+                    paths.iter().map(ParameterPath::to_string).collect::<Vec<_>>().join(", "),
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Reconstructs a value of this [`Parameterized`] type having the provided `structure` and consuming values
     /// from the provided `parameters` to populate its parameters. This function may not consume all the provided
     /// parameters, but if there are not enough parameters in the provided iterator, it will return a
@@ -2937,6 +2963,21 @@ mod tests {
                 .into_parameters()
                 .collect::<Vec<_>>(),
             vec![1, 200, 3, 4, 500, 6, 700, 8, 9, 1000],
+        );
+    }
+
+    #[test]
+    fn test_parameterized_validate_parameter_structure() {
+        let expected_paths = (1, (2, 3)).parameter_paths().collect::<Vec<_>>();
+        assert_eq!((4, (5, 6)).validate_parameter_structure(&expected_paths), Ok(()));
+
+        // A value with as many parameters but a different structure is rejected.
+        assert_eq!(
+            ((4, 5), 6).validate_parameter_structure(&expected_paths),
+            Err(ParameterError::MismatchedParameterStructures {
+                left_structure: "[$.0, $.1.0, $.1.1]".to_string(),
+                right_structure: "[$.0.0, $.0.1, $.1]".to_string(),
+            }),
         );
     }
 

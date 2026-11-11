@@ -196,7 +196,7 @@ pub use parameters::{
     ArrayParameterizedFamily, BTreeMapParameterizedFamily, HashMapParameterizedFamily, Parameter, ParameterError,
     ParameterParameterizedFamily, ParameterPath, ParameterPathSegment, Parameterized, ParameterizedFamily,
     Parameterwise, PathPrefixedParameterIterator, PhantomDataParameterizedFamily, Placeholder, SameAs,
-    VecParameterizedFamily, validate_parameter_structure,
+    VecParameterizedFamily,
 };
 pub use partial::{
     ErasedResidualStorage, NativeResidualPolicies, NoStorage, PartialEvaluation, PartialEvaluationContext,

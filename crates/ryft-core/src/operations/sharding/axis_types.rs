@@ -46,7 +46,7 @@ use thiserror::Error;
 use crate::arrays::{ArrayMemberType, LogicalMesh, MeshAxisType, Sharding, ShardingError};
 use crate::axes::MeshContext;
 use crate::operations::sharding::reshard::Reshard;
-use crate::parameters::{Parameter, ParameterError, ParameterPath, Parameterized, ParameterizedFamily};
+use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, Value};
 
 /// Error returned by [`auto_axes`] and [`explicit_axes`]. It converts into [`ProgramError`] so that functions
@@ -284,7 +284,7 @@ where
     let outputs = switch
         .run(context.as_ref(), || Ok::<_, AxisTypesError>(function(Input::from_parameters(structure, inputs)?)?))?;
 
-    validate_parameter_structure(&output_shardings.parameter_paths().collect::<Vec<_>>(), &outputs)?;
+    outputs.validate_parameter_structure(&output_shardings.parameter_paths().collect::<Vec<_>>())?;
     let structure = outputs.parameter_structure();
     let outputs = outputs
         .into_parameters()
@@ -360,7 +360,7 @@ where
     // The input shardings have the structure of the inputs, so there is no context to take a default mesh from when
     // there are none.
     let switch = AxisTypeSwitch::new(input_shardings.parameters(), || None, axes, MeshAxisType::Explicit)?;
-    validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
+    input_shardings.validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>())?;
 
     // Each input is resharded to its input sharding over the switched mesh, which may name the switched axes.
     let context = inputs.parameters().next().map(Value::domain);
@@ -511,24 +511,6 @@ fn reshard_target(sharding: &Sharding, mesh: &LogicalMesh) -> Result<Sharding, S
     let mut target = sharding.with_mesh(mesh.clone())?.without_auto_axes().without_manual_reduction_axes();
     target.clear_varying_manual_axes();
     Ok(target)
-}
-
-/// Validates that `value` has the parameter paths `expected_paths`, returning a [`ParameterError`] otherwise.
-fn validate_parameter_structure<P: Parameter, S: Parameterized<P>>(
-    expected_paths: &[ParameterPath],
-    value: &S,
-) -> Result<(), ParameterError> {
-    let paths = value.parameter_paths().collect::<Vec<_>>();
-    if paths != expected_paths {
-        let render = |paths: &[ParameterPath]| {
-            format!("[{}]", paths.iter().map(ParameterPath::to_string).collect::<Vec<_>>().join(", "))
-        };
-        return Err(ParameterError::MismatchedParameterStructures {
-            left_structure: render(expected_paths),
-            right_structure: render(paths.as_slice()),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]

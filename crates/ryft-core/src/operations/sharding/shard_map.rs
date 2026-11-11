@@ -304,10 +304,7 @@ use crate::operations::references::{
     ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
 };
 use crate::operations::sharding::reshard::ReshardOperation;
-use crate::parameters::{
-    Parameter, ParameterError, ParameterPath, Parameterized, ParameterizedFamily, Placeholder,
-    validate_parameter_structure,
-};
+use crate::parameters::{Parameter, ParameterError, ParameterPath, Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, ResidualInputSource,
@@ -4936,7 +4933,7 @@ where
         M: Into<Option<LogicalMesh>>,
     {
         let mesh = mesh.into().or_else(|| self.default_mesh()).ok_or(ShardMapError::MissingMesh)?;
-        validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_shardings)?;
+        input_shardings.validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>())?;
         let output_paths = output_shardings.parameter_paths().collect::<Vec<_>>();
         let output_structure = output_shardings.parameter_structure();
         bind_shard_map::<Self, F, Input, Output>(
@@ -4977,7 +4974,7 @@ where
         M: Into<Option<LogicalMesh>>,
     {
         let mesh = mesh.into().or_else(|| self.default_mesh()).ok_or(ShardMapError::MissingMesh)?;
-        validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>(), &input_axes)?;
+        input_axes.validate_parameter_structure(&inputs.parameter_paths().collect::<Vec<_>>())?;
         let input_shardings = inputs
             .parameters()
             .zip(input_axes.into_parameters())
@@ -6891,8 +6888,6 @@ where
     Ok(contribution)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Traces `function` as the local body of a `shard_map` over `mesh` on `inputs` in `context` and binds it there,
 /// which is the shared implementation of the `shard_map` and `shard_map_along` functions of [`ShardMap`]. The boundary
 /// of a map whose output shardings are [`ShardMapOutputShardings::Along`] starts without outputs, since the output
@@ -7120,7 +7115,7 @@ where
             let local_outputs = function(&body_context, local_inputs)?;
 
             // The error crosses the trace as a `ShardMapError`, so that the caller recovers its `Parameter` variant.
-            validate_parameter_structure(&output_paths, &local_outputs).map_err(ShardMapError::from)?;
+            local_outputs.validate_parameter_structure(&output_paths).map_err(ShardMapError::from)?;
 
             let local_outputs = local_outputs.into_parameters().collect::<Vec<_>>();
             let boundary = match &rebuild_boundary {
@@ -7172,6 +7167,8 @@ where
 
     Ok(Output::To::<<C::Value as ValueProjection<ArrayType>>::Projected>::from_parameters(output_structure, outputs)?)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
