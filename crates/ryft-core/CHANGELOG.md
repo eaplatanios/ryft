@@ -64,8 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   eager values and to traced values, and which provide rules for interpretation and all of the above transforms.
   Related capabilities are also bundled for generic code (e.g., `ArithmeticOperations`, `ManipulationOperations`,
   `CollectiveOperations`, and `ArrayOperations`). The supported operations are:
-  - **Constants:** `Constant`, `Zero`, `One`, `Fill`, `Iota`, `ZeroLike`, and `OneLike`, along with the dynamic-shape
-    `DynamicZero`, `DynamicOne`, `DynamicFill`, and `DynamicIota`.
+  - **Constants:** `Constant`, `Zero`, `One`, `Fill`, `Iota`, `ZeroLike`, `OneLike`, `FillLike`, and `IotaLike`, along
+    with the dynamic-shape `DynamicZero`, `DynamicOne`, `DynamicFill`, and `DynamicIota`.
   - **Arithmetic:** `Sign`, `Neg`, `Abs`, `Add`, `Sub`, `SaturatingSub`, `Mul`, `Div`, `Rem`, `Pow`, `Sqrt`, and
     `Rsqrt`.
   - **Exponential, Trigonometric, & Special Functions:** `Exp`, `ExpM1`, `Log`, `Ln1p`, `LogAddExp`, `Logistic`, `Sin`,
@@ -73,8 +73,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - **Rounding & Extrema:** `Floor`, `Ceil`, `Round`, `Min`, `Max`, and `Clamp`.
   - **Comparisons & Logical:** `Compare`, `Not`, `And`, `Or`, and `Xor`.
   - **Complex Numbers:** `Complex`, `Real`, `Imaginary`, and `Conjugate`.
-  - **Manipulation:** `Transpose`, `Reverse`, `Reshape`, `Broadcast`, `Pad`, `Concatenate`, `Slice`, `UpdateSlice`,
-    `DynamicSlice`, `DynamicUpdateSlice`, `Gather`, `Scatter`, `Indexing`, `ConvertElementType`, `Cast`,
+  - **Manipulation:** `Transpose`, `Reverse`, `Reshape`, `Broadcast`, `BroadcastLike`, `Pad`, `Concatenate`, `Slice`,
+    `UpdateSlice`, `DynamicSlice`, `DynamicUpdateSlice`, `Gather`, `Scatter`, `Indexing`, `ConvertElementType`, `Cast`,
     `ReducePrecision`, and `TransferToMemory`, along with the dynamic-shape `DynamicReshape`, `DynamicBroadcast`,
     `DynamicPad`, `DynamicConcatenate`, `DynamicSliceWithDimensions`, `DynamicGather`, and `DynamicScatter`.
   - **Contractions, Reductions, & Sorting:** `Dot`, `RaggedDot`, `Reduce`, `ArgMax`, `ArgMin`, `Cumulative`,

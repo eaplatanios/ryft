@@ -9,8 +9,8 @@
 //!     one first-class dimension value per dynamic axis of the requested type, so shapes that are only known at run
 //!     time can still be constructed inside the mixed [`ArrayIrValue`](crate::ArrayIrValue) family.
 //!   - Literals and exemplars like [`Constant`] which embeds an existing value, [`DimensionConstant`] which embeds a
-//!     dimension extent, and [`ZeroLike`] and [`OneLike`] which take their shape from a value they are called on, which
-//!     is why they are value capabilities and need no dynamic variant.
+//!     dimension extent, and [`ZeroLike`], [`OneLike`], [`FillLike`], and [`IotaLike`] which take their shape from a
+//!     value they are called on, which is why they are value capabilities and need no dynamic variant.
 //!
 //! # Examples
 //!
@@ -305,7 +305,9 @@ pub(crate) fn validate_dynamic_constant_dimensions<V: Typed<Type = ArrayIrType>>
 
 pub mod constant;
 pub mod fill;
+pub mod fill_like;
 pub mod iota;
+pub mod iota_like;
 pub mod one;
 pub mod one_like;
 pub mod zero;
@@ -313,22 +315,28 @@ pub mod zero_like;
 
 pub use constant::{CONSTANT_OPERATION_NAME, Constant, ConstantOperation, DimensionConstant};
 pub use fill::{DynamicFill, Fill};
+pub use fill_like::{FILL_LIKE_OPERATION_NAME, FillLike, FillLikeOperation};
 pub use iota::{DynamicIota, IOTA_OPERATION_NAME, Iota, IotaOperation};
+pub use iota_like::{IOTA_LIKE_OPERATION_NAME, IotaLike, IotaLikeOperation};
 pub use one::{DynamicOne, ONE_OPERATION_NAME, One, OneOperation};
 pub use one_like::{ONE_LIKE_OPERATION_NAME, OneLike, OneLikeOperation};
 pub use zero::{DynamicZero, ZERO_OPERATION_NAME, Zero, ZeroOperation};
 pub use zero_like::{ZERO_LIKE_OPERATION_NAME, ZeroLike, ZeroLikeOperation};
 
-/// Group of the value-driven constant capabilities [`ZeroLike`] and [`OneLike`]. It is implemented automatically for
-/// every type that implements all of its members. The context-side constructors (e.g., [`Zero`] and [`One`]) are
-/// implemented by contexts rather than values and are therefore not members.
+/// Group of the value-driven constant capabilities [`ZeroLike`], [`OneLike`], [`FillLike`], and [`IotaLike`], which
+/// construct a value from an exemplar. It is implemented automatically for every type that implements all of its
+/// members. The context-side constructors (e.g., [`Zero`] and [`One`]) are implemented by contexts rather than values
+/// and are therefore not members.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
 /// [`ArrayIrType`].
-pub trait ConstantOperations<T = <Self as Capability>::Universe>: Capability + ZeroLike<T> + OneLike<T> {}
+pub trait ConstantOperations<T = <Self as Capability>::Universe>:
+    Capability + ZeroLike<T> + OneLike<T> + FillLike<T> + IotaLike<T>
+{
+}
 
-impl<T, V: ZeroLike<T> + OneLike<T>> ConstantOperations<T> for V {}
+impl<T, V: ZeroLike<T> + OneLike<T> + FillLike<T> + IotaLike<T>> ConstantOperations<T> for V {}
 
 #[cfg(test)]
 mod tests {

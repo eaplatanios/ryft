@@ -127,7 +127,7 @@ impl<L, C: Context<Type: DifferentiableType> + Fill<L, C::Value>, P: Differentia
 /// then broadcasts that scalar to the requested type. The [`Array`] is only a portable literal payload that a backend
 /// context interprets or lowers the constant into its own runtime value. It is distinct from the context's
 /// [`Domain::Constant`](crate::Domain::Constant) representation, which stores lifted constants and program captures.
-trait FillLiteral<L, T: Type>: Context<Type = T> {
+pub(super) trait FillLiteral<L, T: Type>: Context<Type = T> {
     /// Embeds `value` as a host literal and expands it to a value of `type` in this [`Context`].
     fn fill_literal(&self, r#type: &T, value: L) -> Result<Self::Value, ProgramError>;
 }
@@ -169,11 +169,8 @@ where
 ///
 /// When the fill value is already a mixed-domain array value, use
 /// [`DynamicBroadcast::dynamic_broadcast_to`](crate::DynamicBroadcast::dynamic_broadcast_to) directly.
-/// To fill the shape of an exemplar, obtain each output dimension using
-/// [`DimensionSize::dimension_size`](crate::DimensionSize::dimension_size) and pass those values to the broadcast.
-/// This uses the exemplar's runtime shape, including empty dimensions, without reading its element contents. Conversion
-/// and placement overrides can be applied to the projected array value before broadcasting; no separate value-fill
-/// operation is required.
+/// To fill the shape of an exemplar, use [`FillLike::fill_like`](crate::FillLike::fill_like), which uses the
+/// exemplar's runtime shape, including empty dimensions, without reading its element contents.
 ///
 /// # Example
 ///
@@ -305,7 +302,7 @@ where
 /// (they are computationally indistinguishable from replicated ones) but not a partial sum that still needs a
 /// cross-device reduction. Fills of types that are unreduced over any mesh axis are therefore rejected; use
 /// [`Zero`](crate::Zero) to create zero partial sums.
-fn fill_literal_array<L: ArrayElement>(r#type: &ArrayType, value: L) -> Result<Array, ProgramError> {
+pub(super) fn fill_literal_array<L: ArrayElement>(r#type: &ArrayType, value: L) -> Result<Array, ProgramError> {
     let literal = Array::scalar(value)?
         .convert_element_type(r#type.data_type())?
         .transfer_to_memory(r#type.memory())?;
