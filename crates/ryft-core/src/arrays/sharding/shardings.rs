@@ -195,6 +195,28 @@ impl Sharding {
         }
     }
 
+    /// Creates a new [`Sharding`] for an array with rank `rank` whose dimension `dimension` is sharded along the mesh
+    /// axis named `axis_name` and whose other dimensions are all [`ShardingDimension::Replicated`]. When `dimension`
+    /// is [`None`], the result is the _fully-replicated_ sharding that [`Self::replicated`] creates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardingError::DimensionOutOfBounds`] when `dimension` is not smaller than `rank`, and the errors
+    /// of [`Self::new`] otherwise (e.g., when `mesh` has no axis named `axis_name`).
+    pub fn along(
+        mesh: LogicalMesh,
+        axis_name: &str,
+        dimension: Option<usize>,
+        rank: usize,
+    ) -> Result<Self, ShardingError> {
+        let mut dimensions = vec![ShardingDimension::Replicated; rank];
+        if let Some(dimension) = dimension {
+            *dimensions.get_mut(dimension).ok_or(ShardingError::DimensionOutOfBounds { dimension, rank })? =
+                ShardingDimension::sharded([axis_name]);
+        }
+        Self::new(mesh, dimensions)
+    }
+
     /// Returns the [`LogicalMesh`] that describes the device topology underlying this [`Sharding`] and gives meaning
     /// to every [`MeshAxis`](crate::arrays::MeshAxis) name stored in it. This is effectively the coordinate system for
     /// the rest of this struct. Every axis name mentioned in [`Self::dimensions`], [`Self::unreduced_axes`],
@@ -1006,6 +1028,24 @@ mod tests {
             Sharding::new(mesh.clone(), vec![ShardingDimension::Sharded(Vec::new())]),
             Err(ShardingError::EmptySharding { dimension }) if dimension == 0,
         ));
+    }
+
+    #[test]
+    fn test_sharding_along() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        assert_eq!(
+            Sharding::along(mesh.clone(), "data", Some(1), 2),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["data"])]),
+        );
+        assert_eq!(Sharding::along(mesh.clone(), "data", None, 2), Ok(Sharding::replicated(mesh.clone(), 2)));
+        assert_eq!(
+            Sharding::along(mesh.clone(), "data", Some(2), 2),
+            Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 }),
+        );
+        assert_eq!(
+            Sharding::along(mesh, "model", Some(0), 1),
+            Err(ShardingError::UnknownMeshAxisName { name: "model".to_string() }),
+        );
     }
 
     #[test]

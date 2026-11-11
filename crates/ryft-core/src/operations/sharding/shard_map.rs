@@ -2027,6 +2027,708 @@ impl ShardMapOperation {
         }
         Ok(())
     }
+
+    /// Splits the _local_ `body` of a `shard_map` with mixed known and unknown inputs through the shared
+    /// [`PartitionedProgram`](crate::PartitionedProgram) machinery and returns the reassembled outputs of this
+    /// operation. The known side becomes a `shard_map` over the known boundary inputs that it uses, whose outputs are
+    /// the fully known boundary outputs followed by the residual edges (each with the global type and sharding that
+    /// [`ShardMapResidualEdge::new`] derives), and which is bound in the known side context. The residual side becomes
+    /// a `shard_map` over the unknown boundary inputs, the forwarded known boundary inputs and outputs, and the
+    /// residual edges, which is emitted into the residual program. A split that would hoist no work or that would
+    /// carry a dynamically shaped residual across the boundary keeps operation whole instead.
+    fn partially_evaluate_split<C, D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        body: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
+    where
+        C: Context<
+                Type = ArrayIrType,
+                Operation: From<ShardMapOperation>
+                               + OperationProjection<
+                    ArrayType,
+                    Projected: From<ReshapeOperation> + From<BroadcastOperation> + From<ParallelVaryOperation>,
+                > + From<DimensionToScalarOperation>
+                               + From<DimensionFromScalarOperation>
+                               + OperationPayloadProjection,
+            >,
+    {
+        let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
+        let partition = driver.partition_program(context, body, input_known.as_slice())?;
+
+        // A trivial partition hoists no work, so keep the original boundary and let the default materialize the knowns
+        // directly as residual feeders. A partition is trivial when it determines no known output and its known program
+        // only converts known inputs between representations (i.e., reshapes them or redefines first-class dimensions
+        // from their integer scalar values), because its known side could then only convert known inputs into residual
+        // edges, which the residual side would read through the same free conversions. In particular, the tangent map
+        // of a partitioned linearization (refer to `ShardMapOperation::linearize_body`) is bound in a partial
+        // evaluation context in which its residual edges are known, and its body starts by unpacking the varying scalar
+        // and first-class dimension residuals from their edges (refer to `reshape_program_boundary`). Hoisting those
+        // unpacking conversions would only split off a known map that unpacks and repacks the same edges. A known
+        // output keeps the split even without known instructions, so that it stays known (as in JAX, which always
+        // binds the known `shard_map`).
+        if partition.outputs().iter().all(|output| output.is_unknown())
+            && partition.known_program().instructions().iter().all(|instruction| {
+                let operation = instruction.operation();
+                operation.projected_payload::<ReshapeOperation>().is_some()
+                    || operation.projected_payload::<DimensionFromScalarOperation>().is_some()
+            })
+        {
+            return context.fold_or_residualize(self.clone(), vec![body.to_program()], inputs);
+        }
+
+        // Feed the residual side directly from the known boundary inputs and known boundary outputs that residual edges
+        // would merely repeat (JAX's `in_fwd` and `out_fwd`), so that the known `shard_map` returns each value once. An
+        // output whose replication is trusted loses local variation at its public boundary. Forwarding that output as a
+        // residual would then feed an invariant local input into a residual body that expects a varying one. Keep the
+        // original residual edges in that case, so that their tiled shardings preserve every per-device residual value.
+        // The same holds for an unchecked output with reduction state along an active manual axis, whose summands could
+        // only return as an unreduced input, which an unchecked map does not accept.
+        let keeps_residual_edges = partition.outputs().iter().enumerate().any(|(index, output)| {
+            output.is_known()
+                && ((!self.boundary.checks_output_replication()
+                    && boundary_array_type(&body.output_types()[index])
+                        .is_ok_and(|r#type| !self.boundary.unproven_output_replication_axes(index, r#type).is_empty()))
+                    || self.boundary.has_unchecked_output_reduction_state(index))
+        });
+        let partition = if keeps_residual_edges { partition } else { partition.forward_residuals()? };
+        let known_output_indices = partition
+            .outputs()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, output)| output.is_known().then_some(index))
+            .collect::<Vec<_>>();
+
+        // Derive each residual edge's global boundary type and sharding from its local type. A dynamically shaped
+        // residual cannot cross the boundary (refer to the `# Static Boundaries` section of the documentation of
+        // `ShardMapOperation`), so a split that needs one keeps the original boundary whole, like a trivial partition.
+        let mesh = self.boundary.mesh();
+        let residual_edges = match partition.known_program().output_types()[known_output_indices.len()..]
+            .iter()
+            .enumerate()
+            .map(|(index, edge_type)| ShardMapResidualEdge::new(index, edge_type, &self.boundary))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Err(ShardMapError::DynamicResidualNotSupported { .. }) => {
+                return context.fold_or_residualize(self.clone(), vec![body.to_program()], inputs);
+            }
+            residual_edges => residual_edges?,
+        };
+
+        // Gather the boundary metadata of the known side, which consists of the shardings and global types per original
+        // index, with the residual edges appended.
+        let known_global_input_types = partition
+            .known_input_indices()
+            .iter()
+            .map(|&index| self.input_types[index].clone())
+            .collect::<Vec<_>>();
+        let known_input_shardings = partition
+            .known_input_indices()
+            .iter()
+            .map(|&index| self.boundary.input_shardings()[index].clone())
+            .collect::<Vec<_>>();
+        let mut known_global_output_types =
+            known_output_indices.iter().map(|&index| self.output_types[index].clone()).collect::<Vec<_>>();
+        let mut known_output_shardings = known_output_indices
+            .iter()
+            .map(|&index| self.boundary.output_shardings()[index].clone())
+            .collect::<Vec<_>>();
+        for edge in &residual_edges {
+            known_global_output_types.push(edge.global_type.clone().into());
+            known_output_shardings.push(edge.sharding.clone());
+        }
+
+        // Gather the boundary metadata of the staged side, which consists of the unknown and forwarded known boundary
+        // inputs, the forwarded known boundary outputs, and the residual edges, in residual input order, and the
+        // outputs that the residual side owns.
+        let mut staged_global_input_types = Vec::with_capacity(partition.residual_inputs().len());
+        let mut staged_input_shardings = Vec::with_capacity(partition.residual_inputs().len());
+        for source in partition.residual_inputs().iter() {
+            match *source {
+                ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => {
+                    // An unknown or forwarded known boundary input crosses under its declared global type
+                    // and input sharding.
+                    staged_global_input_types.push(self.input_types[index].clone());
+                    staged_input_shardings.push(self.boundary.input_shardings()[index].clone());
+                }
+                ResidualInputSource::KnownOutput(index) => {
+                    // A forwarded known boundary output crosses under its declared global type, with its output
+                    // sharding as the input sharding, which places exactly the local value that the known body returns
+                    // for it.
+                    let output_index = known_output_indices[index];
+                    staged_global_input_types.push(self.output_types[output_index].clone());
+                    staged_input_shardings.push(self.boundary.output_shardings()[output_index].clone());
+                }
+                ResidualInputSource::ResidualEdge(edge) => {
+                    staged_global_input_types.push(residual_edges[edge].global_type.clone().into());
+                    staged_input_shardings.push(residual_edges[edge].sharding.clone());
+                }
+            }
+        }
+
+        let mut staged_global_output_types = Vec::new();
+        let mut staged_output_shardings = Vec::new();
+        for (index, output) in partition.outputs().iter().enumerate() {
+            if output.is_unknown() {
+                staged_global_output_types.push(self.output_types[index].clone());
+                staged_output_shardings.push(self.boundary.output_shardings()[index].clone());
+            }
+        }
+
+        // Both bodies convert each residual edge between its local type and its local boundary type, which differ only
+        // for varying scalars and for first-class dimensions (refer to `ShardMapResidualEdge::new`).
+        let known_program = partition.known_program().clone();
+        let mut known_output_types = known_program.output_types().into_owned();
+        for (r#type, edge) in known_output_types[known_output_indices.len()..].iter_mut().zip(&residual_edges) {
+            *r#type = edge.local_type.clone().into();
+        }
+        let known_input_types = known_program.input_types().into_owned();
+        let known_body = reshape_program_boundary(&known_program, known_input_types, known_output_types)?;
+        let residual_program = partition.residual_program().clone();
+        let mut residual_input_types = residual_program.input_types().into_owned();
+        for (source, r#type) in partition.residual_inputs().iter().zip(&mut residual_input_types) {
+            if let ResidualInputSource::ResidualEdge(edge) = source {
+                *r#type = residual_edges[*edge].local_type.clone().into();
+            }
+        }
+        let residual_output_types = residual_program.output_types().into_owned();
+        let residual_body = reshape_program_boundary(&residual_program, residual_input_types, residual_output_types)?;
+
+        // Bind the known side `shard_map` into the enclosing known side context, emit the residual `shard_map` over
+        // its residual sources, and reassemble the original outputs. The global inputs do not enter the body directly,
+        // whose declared types are local, and the static boundary types relate no inputs through identities (refer to
+        // the `# Static Boundaries` section of the documentation of `ShardMapOperation`), so there is no entry to
+        // guard.
+        context.inline_partitioned_program(
+            partition,
+            None,
+            inputs,
+            |_known_program| {
+                let known_boundary = ShardMapBoundary::from_validated_shardings(
+                    mesh.clone(),
+                    known_input_shardings,
+                    known_output_shardings,
+                    self.boundary.manual_axes().to_vec(),
+                )
+                .with_caller_mesh(self.boundary.caller_mesh.clone())
+                .with_manual_variation_checks(self.boundary.manual_variation_checks);
+                let known_operation = ShardMapOperation::from_boundary(
+                    known_boundary,
+                    known_global_input_types,
+                    known_global_output_types,
+                );
+                (known_operation, vec![known_body])
+            },
+            |_residual_program| {
+                let staged_boundary = ShardMapBoundary::from_validated_shardings(
+                    mesh.clone(),
+                    staged_input_shardings,
+                    staged_output_shardings,
+                    self.boundary.manual_axes().to_vec(),
+                )
+                .with_caller_mesh(self.boundary.caller_mesh.clone())
+                .with_manual_variation_checks(self.boundary.manual_variation_checks);
+                let staged_operation = ShardMapOperation::from_boundary(
+                    staged_boundary,
+                    staged_global_input_types,
+                    staged_global_output_types,
+                );
+                (staged_operation, vec![residual_body])
+            },
+        )
+    }
+
+    /// Linearizes a `shard_map` body capture-free under the inputs' activity mask into a primal body and a tangent
+    /// body that thread residuals as plain input edges across the `shard_map` boundary, which is the unfused form that
+    /// partitioned differentiation contexts need. Returns both bodies with their boundary operations, the sources of
+    /// the tangent body's residuals, and the output activity mask used to reconstruct the caller's output duals (refer
+    /// to [`ShardMapBodies`]).
+    ///
+    /// The borrowed `body` region is linearized once through `driver`, yielding a primal sub-program `local_inputs ->
+    /// [local_outputs..., local_residuals...]` and a tangent sub-program `[active(local_input_tangents)...,
+    /// local_residuals...] -> [local_output_tangents...]` together with the residual count. The tangent sub-program
+    /// keeps only the live output tangents, and the returned output activity mask marks the outputs that have one. An
+    /// output whose tangent depends on no active input tangent (e.g., one computed only from inputs with structurally
+    /// zero tangents) has no tangent boundary slot and receives a structurally zero tangent, as under JAX's
+    /// `which_nz_out`. When no output tangent is live and the tangent sub-program has no observable effects (e.g., when
+    /// every active tangent only reaches integer outputs), no tangent `shard_map` is returned and the primal one is the
+    /// source boundary with its body.
+    ///
+    /// Otherwise, each residual is classified by [`ShardMapResidual`], which describes how it crosses the boundary,
+    /// and the residuals that become residual edges are tiled along the manual axes along which they vary by
+    /// [`ShardMapResidualEdge::new`] (so that the local shard of each is the residual itself). The primal boundary
+    /// keeps every input and gains the residual edges as trailing outputs, and the tangent boundary consumes the active
+    /// inputs' tangents (for an active reference input, a tangent reference `ref<tangent(T)>` under the primal's input
+    /// sharding) followed by the residuals. A reference output that forwards an active reference input forwards that
+    /// input's tangent reference in the tangent boundary, and one that forwards an inactive reference input keeps its
+    /// primal handle and has no tangent boundary slot. This implements `jvp(shard_map(f)) = shard_map(jvp f)` without
+    /// introducing symbolic captures.
+    ///
+    /// # Parameters
+    ///
+    ///   - `driver`: Call-scoped access to the active differentiation machinery.
+    ///   - `body`: Borrowed `body` region of that shard map.
+    ///   - `activity`: One entry per input recording whether the tangent body receives a tangent at that position.
+    fn linearize_body<C, D: DifferentiationDriver<C>>(
+        &self,
+        driver: &D,
+        body: RegionRef<'_, C::Constant, C::Operation>,
+        activity: &[bool],
+    ) -> Result<ShardMapBodies<C>, DifferentiationError>
+    where
+        C: Context<
+                Type = ArrayIrType,
+                Operation: OperationProjection<
+                    ArrayType,
+                    Projected: From<ReshapeOperation> + From<BroadcastOperation> + From<ParallelVaryOperation>,
+                > + From<DimensionToScalarOperation>
+                               + From<DimensionFromScalarOperation>
+                               + From<ReferenceNewOperation<ArrayType, ArrayIrType>>
+                               + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
+            >,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
+    {
+        let output_count = self.output_types.len();
+        check_count!("input", activity, self.input_types.len(), ProgramError);
+        let input_indices = activity
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &active)| active.then_some(index))
+            .collect::<Vec<_>>();
+        let linearization = driver.linearize_program(body, &input_indices, Some(&[]))?;
+        let (primal_program, tangent_program, residual_count, tangent_slots) = linearization.into_parts();
+
+        // Linearization validates this partition, in which the tangent inputs precede the trailing primal residuals.
+        // Dependence must start from that compact prefix of tangent inputs, not from the original primal input indices
+        // or the residuals.
+        let tangent_input_count = tangent_program.input_count() - residual_count;
+
+        // Map compact tangent outputs back to primal output order, excluding the primal program's trailing residuals.
+        // Zero differential spaces and inactive reference outputs have no tangent slot and consume no dependence entry.
+        // Every remaining output that depends on no tangent input is a structural zero, so it does not cross the
+        // boundary.
+        let mut dependence =
+            tangent_program.output_dependence(&(0..tangent_input_count).collect::<Vec<_>>())?.into_iter();
+        let output_activity = tangent_slots[..output_count]
+            .iter()
+            .map(|&slot| slot && dependence.next().unwrap())
+            .collect::<Vec<_>>();
+        let live_tangent_slots = (0..output_count)
+            .filter(|&index| tangent_slots[index])
+            .enumerate()
+            .filter_map(|(slot, index)| output_activity[index].then_some(slot))
+            .collect::<Vec<_>>();
+
+        // Output projection keeps the complete tangent/residual input boundary and instructions with observable
+        // effects. When all outputs are live, consume the original program handle without rebuilding its boundary.
+        let tangent_program = if live_tangent_slots.len() == tangent_program.output_count() {
+            Arc::unwrap_or_clone(tangent_program)
+        } else {
+            Arc::unwrap_or_clone(tangent_program).with_outputs(&live_tangent_slots)?
+        };
+
+        // A tangent body without live outputs is linear and computes nothing observable unless it has effects (e.g., a
+        // write into a tangent reference), so no tangent `shard_map` is bound, and the primal `shard_map` is the source
+        // one, whose residuals nothing would consume.
+        if !output_activity.contains(&true) && !tangent_program.effects().is_retained_when_unused() {
+            return Ok(ShardMapBodies {
+                primal_operation: self.clone(),
+                primal_body: body.to_program(),
+                tangent: None,
+                output_activity,
+            });
+        }
+
+        // Classify the residuals as `ShardMapResidual` describes (JAX's `in_fwd`, `out_fwd`, and residual
+        // deduplication). A reference residual preserves the identity of the primal reference rather than a snapshot of
+        // its state (refer to the documentation of `Linearization::tangent`), so the reference analysis of the primal
+        // program resolves the input that it denotes or the allocation whose final state it snapshots, with one edge
+        // per allocation. The analysis resolves constants, so that any other reference residual (i.e., one that refers
+        // to state outside the body, which no valid body does) is rejected precisely. That is a defensive check for
+        // programs assembled without the usual validations, because the only other root that the analysis can report is
+        // an external constant, which program builders reject, and the primal program's explicitly empty capture scope
+        // rejects unbound captures.
+        let primal_input_ids = primal_program.input_ids();
+        let primal_output_ids = primal_program.output_ids();
+        let primal_output_types = primal_program.output_types();
+        let mut residuals = Vec::new();
+        let mut residual_slots = Vec::with_capacity(residual_count);
+        let mut edge_positions = Vec::new();
+        let mut edge_roots = Vec::new();
+        let mut reference_analysis = None;
+        for position in output_count..output_count + residual_count {
+            let atom = primal_output_ids[position];
+            let is_reference = primal_output_types[position].is_reference();
+            let input_index = primal_input_ids.iter().position(|input| *input == atom);
+            let output_index = primal_output_ids[..output_count]
+                .iter()
+                .position(|output| *output == atom)
+                .filter(|&index| !is_reference && !self.output_types[index].is_reference())
+                .filter(|&index| {
+                    boundary_array_type(&primal_output_types[index])
+                        .is_ok_and(|r#type| self.boundary.unproven_output_replication_axes(index, r#type).is_empty())
+                        && !self.boundary.has_unchecked_output_reduction_state(index)
+                });
+
+            let residual = match (input_index, output_index) {
+                (Some(index), _) => ShardMapResidual::Input(index),
+                (None, Some(index)) => ShardMapResidual::Output(index),
+                (None, None) if is_reference => {
+                    if reference_analysis.is_none() {
+                        let analysis = primal_program
+                            .entry_region_ref()
+                            .reference_analysis_with_configuration(Some(0), true, &[])
+                            .map_err(ProgramError::from)?;
+                        reference_analysis = Some(analysis);
+                    }
+                    match reference_analysis.as_ref().unwrap().output_roots()[position] {
+                        Some(ReferenceRoot::RegionInput { input_index, .. }) => ShardMapResidual::Input(input_index),
+                        Some(root @ ReferenceRoot::Allocation { .. }) => {
+                            match edge_roots.iter().position(|edge_root| *edge_root == Some(root)) {
+                                Some(edge) => ShardMapResidual::ReferenceSnapshot(edge),
+                                None => {
+                                    edge_positions.push(position);
+                                    edge_roots.push(Some(root));
+                                    ShardMapResidual::ReferenceSnapshot(edge_positions.len() - 1)
+                                }
+                            }
+                        }
+                        _ => {
+                            let residual_index = position - output_count;
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "`{SHARD_MAP_OPERATION_NAME}` residual #{residual_index} is a reference that is \
+                                 neither a body input nor allocated in the body",
+                            ))
+                            .into());
+                        }
+                    }
+                }
+                (None, None) => match edge_positions.iter().position(|&edge| primal_output_ids[edge] == atom) {
+                    Some(edge) => ShardMapResidual::Edge(edge),
+                    None => {
+                        edge_positions.push(position);
+                        edge_roots.push(None);
+                        ShardMapResidual::Edge(edge_positions.len() - 1)
+                    }
+                },
+            };
+
+            let slot = residuals.iter().position(|candidate| *candidate == residual).unwrap_or_else(|| {
+                residuals.push(residual);
+                residuals.len() - 1
+            });
+
+            residual_slots.push(slot);
+        }
+
+        // The local types of the residual edges are authoritative and back their boundary types on both bodies.
+        // The edge of a reference snapshot carries the referent of that reference.
+        let boundary = self.boundary();
+        let mesh = boundary.mesh();
+        let mut edge_global_types = Vec::with_capacity(edge_positions.len());
+        let mut edge_shardings = Vec::with_capacity(edge_positions.len());
+        let mut edge_local_types = Vec::with_capacity(edge_positions.len());
+        for &position in &edge_positions {
+            let edge = ShardMapResidualEdge::new(position - output_count, &primal_output_types[position], boundary)
+                .map_err(ProgramError::from)?;
+            edge_global_types.push(ArrayIrType::Array(edge.global_type));
+            edge_shardings.push(edge.sharding);
+            edge_local_types.push(ArrayIrType::Array(edge.local_type));
+        }
+
+        // The primal body returns the original outputs followed by the residual edges only, each converted to its local
+        // boundary type (which only promotes varying scalars and recovers the integer scalars of dimensions). The edge
+        // of a reference snapshot is the complete referent, read after the last instruction of the body. A read leaves
+        // the allocation usable, so the snapshot stays valid even when the read is later scheduled ahead of uses of the
+        // reference that do not access it (e.g., passing it to an opaque call), while the declared read effect keeps it
+        // ordered after every access.
+        let primal_program = Arc::unwrap_or_clone(primal_program)
+            .with_outputs(&(0..output_count).chain(edge_positions).collect::<Vec<_>>())?;
+        let primal_program = if edge_roots.iter().any(Option::is_some) {
+            let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+            let inputs = primal_program
+                .input_types()
+                .into_owned()
+                .into_iter()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
+            let mut outputs = builder.splice_program(&primal_program, inputs.as_slice())?;
+            for (output, root) in outputs[output_count..].iter_mut().zip(&edge_roots) {
+                if root.is_some() {
+                    let operation = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                    *output = builder.add_instruction(operation, Vec::new(), vec![*output], None)?[0];
+                }
+            }
+            let output_count = outputs.len();
+            builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+                outputs,
+                vec![Placeholder; inputs.len()],
+                vec![Placeholder; output_count],
+            )?
+        } else {
+            primal_program
+        };
+        let mut primal_output_types = primal_program.output_types().into_owned();
+        primal_output_types[output_count..].clone_from_slice(&edge_local_types);
+        let primal_input_types = primal_program.input_types().into_owned();
+        let primal_program = reshape_program_boundary(&primal_program, primal_input_types, primal_output_types)?;
+
+        // The tangent body receives one residual input per distinct residual, in order of first use, so it is rebuilt
+        // over those inputs whenever forwarding, deduplication, or a reference snapshot changed its residual inputs,
+        // and the residual edges are converted back to their local types on entry. A reference snapshot enters as its
+        // referent, from which the tangent body allocates the reference that it uses in place of the primal one before
+        // its first instruction.
+        let tangent_program = if residuals.iter().copied().eq((0..residual_count).map(ShardMapResidual::Edge)) {
+            tangent_program
+        } else {
+            let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+            let tangent_input_types = tangent_program.input_types();
+            let mut tangent_inputs = tangent_input_types[..tangent_input_count]
+                .iter()
+                .cloned()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
+            let mut residual_inputs = vec![None; residuals.len()];
+            for (index, &slot) in residual_slots.iter().enumerate() {
+                residual_inputs[slot].get_or_insert_with(|| {
+                    match (&residuals[slot], &tangent_input_types[tangent_input_count + index]) {
+                        (ShardMapResidual::ReferenceSnapshot(_), ArrayIrType::Reference(reference)) => {
+                            builder.add_input(ArrayIrType::Array(reference.referent().clone()))
+                        }
+                        (_, r#type) => builder.add_input(r#type.clone()),
+                    }
+                });
+            }
+            let residual_inputs = residual_inputs
+                .into_iter()
+                .zip(&residuals)
+                .map(|(input, residual)| match residual {
+                    ShardMapResidual::ReferenceSnapshot(_) => {
+                        let operation = ReferenceNewOperation::<ArrayType, ArrayIrType>::new();
+                        Ok(builder.add_instruction(operation, Vec::new(), vec![input.unwrap()], None)?[0])
+                    }
+                    _ => Ok(input.unwrap()),
+                })
+                .collect::<Result<Vec<_>, ProgramError>>()?;
+            tangent_inputs.extend(residual_slots.iter().map(|&slot| residual_inputs[slot]));
+            let outputs = builder.splice_program(&tangent_program, tangent_inputs.as_slice())?;
+            let output_count = outputs.len();
+            builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+                outputs,
+                vec![Placeholder; tangent_input_count + residuals.len()],
+                vec![Placeholder; output_count],
+            )?
+        };
+
+        let mut tangent_input_types = tangent_program.input_types().into_owned();
+        for (r#type, residual) in tangent_input_types[tangent_input_count..].iter_mut().zip(&residuals) {
+            if let ShardMapResidual::Edge(edge) | ShardMapResidual::ReferenceSnapshot(edge) = residual {
+                *r#type = edge_local_types[*edge].clone();
+            }
+        }
+
+        let tangent_output_types = tangent_program.output_types().into_owned();
+        let tangent_program = reshape_program_boundary(&tangent_program, tangent_input_types, tangent_output_types)?;
+
+        let primal_operation = ShardMapOperation::from_boundary(
+            ShardMapBoundary::from_validated_shardings(
+                mesh.clone(),
+                boundary.input_shardings().to_vec(),
+                boundary.output_shardings().iter().cloned().chain(edge_shardings.iter().cloned()).collect(),
+                boundary.manual_axes().to_vec(),
+            )
+            .with_caller_mesh(boundary.caller_mesh.clone())
+            .with_manual_variation_checks(boundary.manual_variation_checks),
+            self.input_types.clone(),
+            self.output_types.iter().cloned().chain(edge_global_types.iter().cloned()).collect::<Vec<_>>(),
+        )
+        .with_output_forwarding(
+            self.output_forwarding.iter().copied().chain(vec![None; edge_global_types.len()]).collect(),
+        )
+        .map_err(ProgramError::from)?;
+
+        // The tangent boundary compacts the inputs by the activity mask, so a forwarded reference output must be
+        // remapped onto the tangent position of the input it forwards. Each residual crosses under the global type
+        // and sharding of the primal boundary input, primal boundary output, or residual edge that it comes from.
+        let mut tangent_positions = vec![None; activity.len()];
+        let mut tangent_input_shardings = Vec::with_capacity(activity.len() + residuals.len());
+        let mut tangent_input_types = Vec::with_capacity(activity.len() + residuals.len());
+        for (index, _) in activity.iter().enumerate().filter(|(_, active)| **active) {
+            tangent_positions[index] = Some(tangent_input_types.len());
+            tangent_input_shardings.push(boundary.input_shardings()[index].clone());
+            tangent_input_types.push(self.input_types[index].tangent()?);
+        }
+
+        for residual in &residuals {
+            let (sharding, r#type) = match *residual {
+                ShardMapResidual::Input(index) => (&boundary.input_shardings()[index], &self.input_types[index]),
+                ShardMapResidual::Output(index) => (&boundary.output_shardings()[index], &self.output_types[index]),
+                ShardMapResidual::Edge(edge) | ShardMapResidual::ReferenceSnapshot(edge) => {
+                    (&edge_shardings[edge], &edge_global_types[edge])
+                }
+            };
+            tangent_input_shardings.push(sharding.clone());
+            tangent_input_types.push(r#type.clone());
+        }
+
+        let tangent_output_types = self
+            .output_types
+            .iter()
+            .zip(&output_activity)
+            .filter(|(_, active)| **active)
+            .map(|(r#type, _)| r#type.tangent())
+            .collect::<Result<Vec<_>, _>>()?;
+        let tangent_forwarding = self
+            .output_forwarding
+            .iter()
+            .zip(&output_activity)
+            .filter(|(_, active)| **active)
+            .map(|(forwarded, _)| forwarded.map(|index| tangent_positions[index].unwrap()))
+            .collect();
+        let tangent_output_shardings = boundary
+            .output_shardings()
+            .iter()
+            .zip(&output_activity)
+            .filter(|(_, active)| **active)
+            .map(|(sharding, _)| sharding.clone())
+            .collect();
+        let tangent_operation = ShardMapOperation::from_boundary(
+            ShardMapBoundary::from_validated_shardings(
+                mesh.clone(),
+                tangent_input_shardings,
+                tangent_output_shardings,
+                boundary.manual_axes().to_vec(),
+            )
+            .with_caller_mesh(boundary.caller_mesh.clone())
+            .with_manual_variation_checks(boundary.manual_variation_checks),
+            tangent_input_types,
+            tangent_output_types,
+        )
+        .with_output_forwarding(tangent_forwarding)
+        .map_err(ProgramError::from)?;
+
+        Ok(ShardMapBodies {
+            primal_operation,
+            primal_body: primal_program,
+            tangent: Some(ShardMapTangent { operation: tangent_operation, body: tangent_program, residuals }),
+            output_activity,
+        })
+    }
+
+    /// Binds the fused forward mode `shard_map` of this operation in the shared primal and tangent context of `context`
+    /// (refer to the forward mode rule of [`ShardMapOperation`]) and returns the output duals, or [`None`] when no
+    /// output tangent is live, in which case nothing is bound. The fused body is the fused JVP program of `body` with
+    /// respect to the inputs that `activity` marks as active, which maps `[inputs..., active(input_tangents)...]` to
+    /// `[outputs..., output_tangents...]`, projected onto the outputs followed by the live output tangents with its
+    /// dead work removed (refer to [`Program::with_outputs`] and [`Program::into_simplified`]). An output tangent is
+    /// live when it depends on some active input tangent (JAX's `which_nz_out`), and every other output receives a
+    /// structurally zero tangent. Each input tangent crosses the boundary under the input sharding of its primal,
+    /// and each output tangent under the output sharding of its primal, as in JAX's `_shard_map_jvp`.
+    fn fused_jvp<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        body: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: &[DifferentiationDual<C::Value>],
+        activity: &[bool],
+    ) -> Result<Option<Vec<DifferentiationDual<C::Value>>>, DifferentiationError>
+    where
+        C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation>> + Zero<C::Value>,
+    {
+        let input_count = inputs.len();
+        let output_count = self.output_types.len();
+        let input_indices = activity
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &active)| active.then_some(index))
+            .collect::<Vec<_>>();
+        let tangent_slots = body.tangent_output_mask(&input_indices)?;
+        let fused_body = driver.jvp_program(body, &input_indices)?;
+        check_count!("input", fused_body.input_types(), input_count + input_indices.len(), ProgramError);
+        let tangent_inputs = (input_count..fused_body.input_count()).collect::<Vec<_>>();
+        let mut dependence = fused_body.output_dependence(&tangent_inputs)?.into_iter().skip(output_count);
+        let output_activity = tangent_slots.iter().map(|&slot| slot && dependence.next().unwrap()).collect::<Vec<_>>();
+        if !output_activity.contains(&true) {
+            return Ok(None);
+        }
+
+        let live_tangent_outputs =
+            (0..output_count).filter(|&index| tangent_slots[index]).map(|index| output_activity[index]);
+        let live_outputs = std::iter::repeat_n(true, output_count).chain(live_tangent_outputs).collect::<Vec<_>>();
+
+        // The boundary keeps every primal output followed by the live tangent slots, retaining all inputs to match the
+        // input shardings below. Simplification also removes dead work inside nested regions (e.g., unused tangent
+        // allocations passed only to composites), while preserving observable effects and deferred work.
+        let output_indices = live_outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &live)| live.then_some(index))
+            .collect::<Vec<_>>();
+        let fused_body = Arc::unwrap_or_clone(fused_body).with_outputs(&output_indices)?;
+        let simplified_body = fused_body.clone().into_simplified()?;
+
+        // A no-op cleanup keeps the staged order and existing transform caches instead of adopting the instruction
+        // order that simplification derives from the outputs. Removing instructions remains necessary even when every
+        // output is live.
+        let instruction_count = fused_body.regions().iter().map(|region| region.instructions().len()).sum::<usize>();
+        let fused_body = if simplified_body.regions().iter().map(|region| region.instructions().len()).sum::<usize>()
+            < instruction_count
+        {
+            simplified_body
+        } else {
+            fused_body
+        };
+
+        let boundary = self.boundary();
+        let mut input_shardings = boundary.input_shardings().to_vec();
+        let mut input_types = self.input_types.clone();
+        let mut fused_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        for &index in &input_indices {
+            input_shardings.push(boundary.input_shardings()[index].clone());
+            input_types.push(self.input_types[index].tangent()?);
+            fused_inputs.push(inputs[index].tangent().clone().materialize(context.tangent())?);
+        }
+
+        let mut output_shardings = boundary.output_shardings().to_vec();
+        let mut output_types = self.output_types.clone();
+        for index in (0..output_count).filter(|&index| output_activity[index]) {
+            output_shardings.push(boundary.output_shardings()[index].clone());
+            output_types.push(self.output_types[index].tangent()?);
+        }
+
+        let fused_operation = ShardMapOperation::from_boundary(
+            ShardMapBoundary::from_validated_shardings(
+                boundary.mesh().clone(),
+                input_shardings,
+                output_shardings,
+                boundary.manual_axes().to_vec(),
+            )
+            .with_caller_mesh(boundary.caller_mesh.clone())
+            .with_manual_variation_checks(boundary.manual_variation_checks),
+            input_types,
+            output_types,
+        );
+
+        let mut outputs = context.primal().bind(fused_operation, vec![fused_body], &fused_inputs)?;
+        let live_output_count = live_outputs.iter().filter(|live| **live).count();
+        check_count!("output", outputs, live_output_count, ProgramError);
+        let mut tangent_outputs = outputs.split_off(output_count).into_iter();
+        outputs
+            .into_iter()
+            .zip(output_activity)
+            .map(|(primal, active)| {
+                if active {
+                    DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
+                } else {
+                    DifferentiationDual::new_with_zero_tangent(primal)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Some)
+    }
 }
 
 impl Display for ShardMapOperation {
@@ -2580,7 +3282,10 @@ where
         // because splitting would spread the accesses to one root across two manual regions whose known side runs
         // first. The default rule preserves effect order by placing the whole application on one side. The contract
         // is validated first so a malformed body is reported as such rather than residualized silently.
-        if body_has_references(body_program) {
+        if body_program.input_types().iter().any(Type::is_reference)
+            || body_program.output_types().iter().any(Type::is_reference)
+            || body_program.contains_reference_accesses_in_closure()
+        {
             self.validate_body(body_program)?;
             return context.fold_or_residualize(self.clone(), vec![body_program.to_program()], inputs);
         }
@@ -2601,7 +3306,7 @@ where
             })
             .collect::<Vec<_>>();
         if forwarded_inputs.iter().all(Option::is_none) {
-            return partially_evaluate_split_shard_map(self, context, driver, body_program, inputs);
+            return self.partially_evaluate_split(context, driver, body_program, inputs);
         }
         let kept_outputs =
             (0..self.output_types.len()).filter(|&index| forwarded_inputs[index].is_none()).collect::<Vec<_>>();
@@ -2628,7 +3333,7 @@ where
         let outputs = if kept_outputs.is_empty() && !body.effects().is_retained_when_unused() {
             Vec::new()
         } else {
-            partially_evaluate_split_shard_map(&operation, context, driver, body.entry_region_ref(), inputs)?
+            operation.partially_evaluate_split(context, driver, body.entry_region_ref(), inputs)?
         };
         let mut outputs = outputs.into_iter();
         Ok(forwarded_inputs
@@ -3179,15 +3884,18 @@ where
 
         // A fused context (i.e., one whose primal and tangent contexts are the same context, as for `jvp` and for the
         // fused programs that the rules of higher-order operations derive) binds one `shard_map` whose body is the
-        // fused JVP program of the body (refer to `fused_shard_map_jvp`), as JAX's `_shard_map_jvp` does, so an eager
-        // context runs one manual computation and materializes no residual edges. A fused program that is later
-        // partitioned (e.g., by the `while`, `scan`, `condition`, rematerialization, or composite rules) is split by
-        // the partial evaluation rule of this operation, which must keep every output known. A body that the partial
+        // fused JVP program of the body (refer to `ShardMapOperation::fused_jvp`), as JAX's `_shard_map_jvp` does,
+        // so an eager context runs one manual computation and materializes no residual edges. A fused program that is
+        // later partitioned (e.g., by the `while`, `scan`, `condition`, rematerialization, or composite rules) is split
+        // by the partial evaluation rule of this operation, which must keep every output known. A body that the partial
         // evaluation rule keeps whole therefore keeps the two-map form even in a fused context, which is a body with
         // references or with a dynamically shaped value anywhere in its region closure (which could be a residual that
         // cannot cross the static boundary). A body none of whose output tangents is live also keeps the two-map form,
         // which then binds no tangent map at all.
-        let fused = std::ptr::eq(context.primal(), context.tangent()) && !body_has_references(body_program);
+        let has_references = body_program.input_types().iter().any(Type::is_reference)
+            || body_program.output_types().iter().any(Type::is_reference)
+            || body_program.contains_reference_accesses_in_closure();
+        let fused = std::ptr::eq(context.primal(), context.tangent()) && !has_references;
         let has_dynamically_shaped_values = body_program.region_ids_in_closure().into_iter().any(|region_id| {
             body_program.arena()[region_id.index()].atoms().iter().any(
                 |atom| matches!(atom.r#type().as_ref(), ArrayIrType::Array(r#type) if r#type.static_shape().is_none()),
@@ -3195,19 +3903,19 @@ where
         });
         if fused
             && !has_dynamically_shaped_values
-            && let Some(outputs) = fused_shard_map_jvp(self, context, driver, body_program, inputs, &activity)?
+            && let Some(outputs) = self.fused_jvp(context, driver, body_program, inputs, &activity)?
         {
             return Ok(outputs);
         }
 
         // The two-map form, which a partitioned differentiation context (i.e., a linearization) needs, as in JAX's
-        // `_shard_map_linearize`, linearizes the body through `linearize_shard_map_body` under the activity mask. That
-        // gives a primal body `inputs -> [outputs..., residual_edges...]` and a tangent body
+        // `_shard_map_linearize`, linearizes the body through `ShardMapOperation::linearize_body` under the activity
+        // mask. That gives a primal body `inputs -> [outputs..., residual_edges...]` and a tangent body
         // `[active(input_tangents)..., residuals...] -> [live(output_tangents)...]`, whose residuals cross between the
         // two maps as plain primal edges (refer to `ShardMapResidual`), so no symbolic capture is introduced, and the
         // enclosing partial evaluation split discovers them structurally.
         let ShardMapBodies { primal_operation, primal_body, tangent, output_activity } =
-            match linearize_shard_map_body(self, driver, body_program, activity.as_slice()) {
+            match self.linearize_body(driver, body_program, activity.as_slice()) {
                 // A dynamically shaped residual cannot cross the static boundary between two maps, but the fused map
                 // needs no residuals, so a fused context binds it instead of failing.
                 Err(DifferentiationError::Program(error))
@@ -3217,7 +3925,7 @@ where
                             ShardMapError::DynamicResidualNotSupported { .. },
                         ) =>
                 {
-                    return match fused_shard_map_jvp(self, context, driver, body_program, inputs, &activity)? {
+                    return match self.fused_jvp(context, driver, body_program, inputs, &activity)? {
                         Some(outputs) => Ok(outputs),
                         None => Err(DifferentiationError::Program(error)),
                     };
@@ -4273,7 +4981,15 @@ where
             .enumerate()
             .map(|(input_index, (input, axis))| {
                 let rank = input.r#type().rank();
-                sharding_along(&mesh, axis_name, axis, rank, ShardMapValueKind::Input, input_index)
+                Sharding::along(mesh.clone(), axis_name, axis, rank).map_err(|error| match error {
+                    ShardingError::DimensionOutOfBounds { dimension, rank } => ShardMapError::MappedAxisOutOfBounds {
+                        value_kind: ShardMapValueKind::Input,
+                        value_index: input_index,
+                        axis: dimension,
+                        rank,
+                    },
+                    error => error.into(),
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         let output_paths = output_axes.parameter_paths().collect::<Vec<_>>();
@@ -5797,14 +6513,14 @@ struct ShardMapBatchPlacement {
     gathered_axes: Vec<String>,
 }
 
-/// Source of one residual input of the tangent `shard_map` that [`linearize_shard_map_body`] derives, which determines
-/// how the residual crosses the boundary between the primal and tangent maps. A residual that is a primal body input or
-/// a primal body output needs no residual edge, and a residual that repeats another one shares its tangent input, as
-/// under the residual forwarding (`in_fwd` and `out_fwd`) and deduplication of JAX's `_shard_map_linearize`. Only the
-/// remaining residuals become residual edges of the primal boundary, and a reference residual crosses either by
-/// identity, as the reference input that it denotes (directly or through an alias), or as a snapshot of its final
-/// state, when the body allocates it. Any other reference residual is rejected with [`ProgramError::MalformedProgram`],
-/// because every reference of a valid body is an input or an allocation.
+/// Source of one residual input of the tangent `shard_map` that [`ShardMapOperation::linearize_body`] derives, which
+/// determines how the residual crosses the boundary between the primal and tangent maps. A residual that is a primal
+/// body input or a primal body output needs no residual edge, and a residual that repeats another one shares its
+/// tangent input, as under the residual forwarding (`in_fwd` and `out_fwd`) and deduplication of JAX's
+/// `_shard_map_linearize`. Only the remaining residuals become residual edges of the primal boundary, and a reference
+/// residual crosses either by identity, as the reference input that it denotes (directly or through an alias), or as a
+/// snapshot of its final state, when the body allocates it. Any other reference residual is rejected with
+/// [`ProgramError::MalformedProgram`], because every reference of a valid body is an input or an allocation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum ShardMapResidual {
     /// Residual that is primal body input `index` itself. The tangent `shard_map` receives it directly from the
@@ -5841,7 +6557,7 @@ enum ShardMapResidual {
     ReferenceSnapshot(usize),
 }
 
-/// Primal and tangent `shard_map` boundaries and bodies into which [`linearize_shard_map_body`] splits one
+/// Primal and tangent `shard_map` boundaries and bodies into which [`ShardMapOperation::linearize_body`] splits one
 /// `shard_map` body.
 struct ShardMapBodies<C: Domain> {
     /// Primal boundary, which keeps every input and output of the source boundary and gains the residual edges as
@@ -5859,8 +6575,8 @@ struct ShardMapBodies<C: Domain> {
     output_activity: Vec<bool>,
 }
 
-/// Tangent `shard_map` boundary and body that [`linearize_shard_map_body`] derives, together with the sources of its
-/// residual inputs.
+/// Tangent `shard_map` boundary and body that [`ShardMapOperation::linearize_body`] derives, together with the sources
+/// of its residual inputs.
 struct ShardMapTangent<C: Domain> {
     /// Tangent boundary, which consumes the active input tangents followed by the residuals and produces the live
     /// output tangents.
@@ -5927,17 +6643,6 @@ fn boundary_array_type(r#type: &ArrayIrType) -> Result<&ArrayType, TypeError> {
 }
 
 // TODO(eaplatanios): Review from here onwards.
-
-/// Returns `true` when a `shard_map` body has a reference input or output or accesses a reference anywhere in its
-/// region closure. The partial evaluation rule of [`ShardMapOperation`] keeps the boundary of such a body whole, so its
-/// forward mode rule never fuses it.
-fn body_has_references<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
-    body: RegionRef<'_, V, O>,
-) -> bool {
-    body.input_types().iter().any(Type::is_reference)
-        || body.output_types().iter().any(Type::is_reference)
-        || body.contains_reference_accesses_in_closure()
-}
 
 /// Rewraps a body's boundary with element-preserving conversions. Arrays only change their shape (e.g., between a
 /// varying scalar residual and its promoted type), and reference positions must remain unchanged. A first-class
@@ -6044,685 +6749,6 @@ where
         .map(|(output, (source, target))| reshape(&mut builder, output, source, target))
         .collect::<Result<Vec<_>, _>>()?;
     builder.build(outputs, vec![Placeholder; inputs.len()], vec![Placeholder; output_types.len()])
-}
-
-/// Splits the *local* `body` of a `shard_map` with mixed known and unknown inputs through the shared
-/// `PartitionedProgram` machinery and returns the reassembled outputs of `operation`. The known side becomes a
-/// `shard_map` over the known boundary inputs that it uses, whose outputs are the fully known boundary outputs followed
-/// by the residual edges (each with the global type and sharding that `ShardMapResidualEdge::new` derives), and which
-/// is bound in the known side context. The residual side becomes a `shard_map` over the unknown boundary inputs, the
-/// forwarded known boundary inputs and outputs, and the residual edges, which is emitted into the residual program. A
-/// split that would hoist no work or that would carry a dynamically shaped residual across the boundary keeps
-/// `operation` whole instead.
-fn partially_evaluate_split_shard_map<C, D: PartialEvaluationDriver<C>>(
-    operation: &ShardMapOperation,
-    context: &PartialEvaluationContext<C>,
-    driver: &D,
-    body: RegionRef<'_, C::Constant, C::Operation>,
-    inputs: &[PartialEvaluationValue<C::Value>],
-) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError>
-where
-    C: Context<
-            Type = ArrayIrType,
-            Operation: From<ShardMapOperation>
-                           + OperationProjection<
-                ArrayType,
-                Projected: From<ReshapeOperation> + From<BroadcastOperation> + From<ParallelVaryOperation>,
-            > + From<DimensionToScalarOperation>
-                           + From<DimensionFromScalarOperation>
-                           + OperationPayloadProjection,
-        >,
-{
-    let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
-    let partition = driver.partition_program(context, body, input_known.as_slice())?;
-    // A trivial partition hoists no work, so keep the original boundary and let the default materialize the knowns
-    // directly as residual feeders. A partition is trivial when it determines no known output and its known program
-    // only converts known inputs between representations (i.e., reshapes them or redefines first-class dimensions from
-    // their integer scalar values), because its known side could then only convert known inputs into residual edges,
-    // which the residual side would read through the same free conversions. In particular, the tangent map of a
-    // partitioned linearization (refer to `linearize_shard_map_body`) is bound in a partial evaluation context in which
-    // its residual edges are known, and its body starts by unpacking the varying scalar and first-class dimension
-    // residuals from their edges (refer to `reshape_program_boundary`). Hoisting those unpacking conversions would only
-    // split off a known map that unpacks and repacks the same edges. A known output keeps the split even without known
-    // instructions, so that it stays known (as in JAX, which always binds the known `shard_map`).
-    if partition.outputs().iter().all(|output| output.is_unknown())
-        && partition.known_program().instructions().iter().all(|instruction| {
-            let operation = instruction.operation();
-            operation.projected_payload::<ReshapeOperation>().is_some()
-                || operation.projected_payload::<DimensionFromScalarOperation>().is_some()
-        })
-    {
-        return context.fold_or_residualize(operation.clone(), vec![body.to_program()], inputs);
-    }
-    // Feed the residual side directly from the known boundary inputs and known boundary outputs that residual edges
-    // would merely repeat (JAX's `in_fwd` and `out_fwd`), so that the known `shard_map` returns each value once.
-    // An output whose replication is trusted loses local variation at its public boundary. Forwarding that output as
-    // a residual would then feed an invariant local input into a residual body that expects a varying one. Keep the
-    // original residual edges in that case, so that their tiled shardings preserve every per-device residual value.
-    // The same holds for an unchecked output with reduction state along an active manual axis, whose summands could
-    // only return as an unreduced input, which an unchecked map does not accept.
-    let keeps_residual_edges = partition.outputs().iter().enumerate().any(|(index, output)| {
-        output.is_known()
-            && ((!operation.boundary.checks_output_replication()
-                && boundary_array_type(&body.output_types()[index]).is_ok_and(|r#type| {
-                    !operation.boundary.unproven_output_replication_axes(index, r#type).is_empty()
-                }))
-                || operation.boundary.has_unchecked_output_reduction_state(index))
-    });
-    let partition = if keeps_residual_edges { partition } else { partition.forward_residuals()? };
-    let known_output_indices = partition
-        .outputs()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, output)| output.is_known().then_some(index))
-        .collect::<Vec<_>>();
-
-    // Derive each residual edge's global boundary type and sharding from its local type. A dynamically shaped
-    // residual cannot cross the boundary (refer to the `# Static Boundaries` section of the documentation of
-    // `ShardMapOperation`), so a split that needs one keeps the original boundary whole, like a trivial partition.
-    let mesh = operation.boundary.mesh();
-    let residual_edges = match partition.known_program().output_types()[known_output_indices.len()..]
-        .iter()
-        .enumerate()
-        .map(|(index, edge_type)| ShardMapResidualEdge::new(index, edge_type, &operation.boundary))
-        .collect::<Result<Vec<_>, _>>()
-    {
-        Err(ShardMapError::DynamicResidualNotSupported { .. }) => {
-            return context.fold_or_residualize(operation.clone(), vec![body.to_program()], inputs);
-        }
-        residual_edges => residual_edges?,
-    };
-
-    // Gather the boundary metadata of the known side, which consists of the shardings and global types per original
-    // index, with the residual edges appended.
-    let known_global_input_types = partition
-        .known_input_indices()
-        .iter()
-        .map(|&index| operation.input_types[index].clone())
-        .collect::<Vec<_>>();
-    let known_input_shardings = partition
-        .known_input_indices()
-        .iter()
-        .map(|&index| operation.boundary.input_shardings()[index].clone())
-        .collect::<Vec<_>>();
-    let mut known_global_output_types =
-        known_output_indices.iter().map(|&index| operation.output_types[index].clone()).collect::<Vec<_>>();
-    let mut known_output_shardings = known_output_indices
-        .iter()
-        .map(|&index| operation.boundary.output_shardings()[index].clone())
-        .collect::<Vec<_>>();
-    for edge in &residual_edges {
-        known_global_output_types.push(edge.global_type.clone().into());
-        known_output_shardings.push(edge.sharding.clone());
-    }
-
-    // Gather the boundary metadata of the staged side, which consists of the unknown and forwarded known boundary
-    // inputs, the forwarded known boundary outputs, and the residual edges, in residual input order, and the outputs
-    // that the residual side owns.
-    let mut staged_global_input_types = Vec::with_capacity(partition.residual_inputs().len());
-    let mut staged_input_shardings = Vec::with_capacity(partition.residual_inputs().len());
-    for source in partition.residual_inputs().iter() {
-        match *source {
-            // An unknown or forwarded known boundary input crosses under its declared global type and input sharding.
-            ResidualInputSource::UnknownInput(index) | ResidualInputSource::KnownInput(index) => {
-                staged_global_input_types.push(operation.input_types[index].clone());
-                staged_input_shardings.push(operation.boundary.input_shardings()[index].clone());
-            }
-            // A forwarded known boundary output crosses under its declared global type, with its output sharding as
-            // the input sharding, which places exactly the local value that the known body returns for it.
-            ResidualInputSource::KnownOutput(index) => {
-                let output_index = known_output_indices[index];
-                staged_global_input_types.push(operation.output_types[output_index].clone());
-                staged_input_shardings.push(operation.boundary.output_shardings()[output_index].clone());
-            }
-            ResidualInputSource::ResidualEdge(edge) => {
-                staged_global_input_types.push(residual_edges[edge].global_type.clone().into());
-                staged_input_shardings.push(residual_edges[edge].sharding.clone());
-            }
-        }
-    }
-    let mut staged_global_output_types = Vec::new();
-    let mut staged_output_shardings = Vec::new();
-    for (index, output) in partition.outputs().iter().enumerate() {
-        if output.is_unknown() {
-            staged_global_output_types.push(operation.output_types[index].clone());
-            staged_output_shardings.push(operation.boundary.output_shardings()[index].clone());
-        }
-    }
-
-    // Both bodies convert each residual edge between its local type and its local boundary type, which differ only for
-    // varying scalars and for first-class dimensions (refer to `ShardMapResidualEdge::new`).
-    let known_program = partition.known_program().clone();
-    let mut known_output_types = known_program.output_types().into_owned();
-    for (r#type, edge) in known_output_types[known_output_indices.len()..].iter_mut().zip(&residual_edges) {
-        *r#type = edge.local_type.clone().into();
-    }
-    let known_input_types = known_program.input_types().into_owned();
-    let known_body = reshape_program_boundary(&known_program, known_input_types, known_output_types)?;
-    let residual_program = partition.residual_program().clone();
-    let mut residual_input_types = residual_program.input_types().into_owned();
-    for (source, r#type) in partition.residual_inputs().iter().zip(&mut residual_input_types) {
-        if let ResidualInputSource::ResidualEdge(edge) = source {
-            *r#type = residual_edges[*edge].local_type.clone().into();
-        }
-    }
-    let residual_output_types = residual_program.output_types().into_owned();
-    let residual_body = reshape_program_boundary(&residual_program, residual_input_types, residual_output_types)?;
-
-    // Bind the known side `shard_map` into the enclosing known side context, emit the residual `shard_map` over its
-    // residual sources, and reassemble the original outputs. The global inputs do not enter the body directly, whose
-    // declared types are local, and the static boundary types relate no inputs through identities (refer to the
-    // `# Static Boundaries` section of the documentation of `ShardMapOperation`), so there is no entry to guard.
-    context.inline_partitioned_program(
-        partition,
-        None,
-        inputs,
-        |_known_program| {
-            let known_boundary = ShardMapBoundary::from_validated_shardings(
-                mesh.clone(),
-                known_input_shardings,
-                known_output_shardings,
-                operation.boundary.manual_axes().to_vec(),
-            )
-            .with_caller_mesh(operation.boundary.caller_mesh.clone())
-            .with_manual_variation_checks(operation.boundary.manual_variation_checks);
-            let known_operation =
-                ShardMapOperation::from_boundary(known_boundary, known_global_input_types, known_global_output_types);
-            (known_operation, vec![known_body])
-        },
-        |_residual_program| {
-            let staged_boundary = ShardMapBoundary::from_validated_shardings(
-                mesh.clone(),
-                staged_input_shardings,
-                staged_output_shardings,
-                operation.boundary.manual_axes().to_vec(),
-            )
-            .with_caller_mesh(operation.boundary.caller_mesh.clone())
-            .with_manual_variation_checks(operation.boundary.manual_variation_checks);
-            let staged_operation = ShardMapOperation::from_boundary(
-                staged_boundary,
-                staged_global_input_types,
-                staged_global_output_types,
-            );
-            (staged_operation, vec![residual_body])
-        },
-    )
-}
-
-/// Linearizes a `shard_map` body capture-free under the inputs' activity mask into a primal body and a tangent body
-/// that thread residuals as plain input edges across the `shard_map` boundary, which is the unfused form that
-/// partitioned differentiation contexts need. Returns both bodies with their boundary operations, the sources of the
-/// tangent body's residuals, and the output activity mask used to reconstruct the caller's output duals (refer to
-/// [`ShardMapBodies`]).
-///
-/// The borrowed `body` region is linearized once through `driver`, yielding a primal sub-program
-/// `local_inputs -> [local_outputs..., local_residuals...]` and a tangent sub-program
-/// `[active(local_input_tangents)..., local_residuals...] -> [local_output_tangents...]` together with the residual
-/// count. The tangent sub-program keeps only the live output tangents, and the returned output activity mask marks the
-/// outputs that have one. An output whose tangent depends on no active input tangent (e.g., one computed only from
-/// inputs with structurally zero tangents) has no tangent boundary slot and receives a structurally zero tangent, as
-/// under JAX's `which_nz_out`. When no output tangent is live and the tangent sub-program has no observable effects
-/// (e.g., when every active tangent only reaches integer outputs), no tangent `shard_map` is returned and the primal
-/// one is the source boundary with its body.
-///
-/// Otherwise, each residual is classified by [`ShardMapResidual`], which describes how it crosses the boundary, and the
-/// residuals that become residual edges are tiled along the manual axes along which they vary by
-/// [`ShardMapResidualEdge::new`] (so that the local shard of each is the residual itself). The primal boundary keeps
-/// every input and gains the residual edges as trailing outputs, and the tangent boundary consumes the active inputs'
-/// tangents (for an active reference input, a tangent reference `ref<tangent(T)>` under the primal's input sharding)
-/// followed by the residuals. A reference output that forwards an active reference input forwards that input's tangent
-/// reference in the tangent boundary, and one that forwards an inactive reference input keeps its primal handle and has
-/// no tangent boundary slot. This implements `jvp(shard_map(f)) = shard_map(jvp f)` without introducing symbolic
-/// captures.
-///
-/// # Parameters
-///
-///   - `operation`: Boundary metadata of the primal shard map being linearized.
-///   - `driver`: Call-scoped access to the active differentiation machinery.
-///   - `body`: Borrowed `body` region of that shard map.
-///   - `activity`: One entry per input recording whether the tangent body receives a tangent at that position.
-fn linearize_shard_map_body<C, D: DifferentiationDriver<C>>(
-    operation: &ShardMapOperation,
-    driver: &D,
-    body: RegionRef<'_, C::Constant, C::Operation>,
-    activity: &[bool],
-) -> Result<ShardMapBodies<C>, DifferentiationError>
-where
-    TracingContext<C::Constant, C::Operation>:
-        StagingContext<Type = ArrayIrType, Constant = C::Constant, Operation = C::Operation>,
-    C: Context<
-            Type = ArrayIrType,
-            Operation: OperationProjection<
-                ArrayType,
-                Projected: From<ReshapeOperation> + From<BroadcastOperation> + From<ParallelVaryOperation>,
-            > + From<DimensionToScalarOperation>
-                           + From<DimensionFromScalarOperation>
-                           + From<ReferenceNewOperation<ArrayType, ArrayIrType>>
-                           + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>,
-        >,
-{
-    let output_count = operation.output_types.len();
-    check_count!("input", activity, operation.input_types.len(), ProgramError);
-    let input_indices = activity
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &active)| active.then_some(index))
-        .collect::<Vec<_>>();
-    let linearization = driver.linearize_program(body, &input_indices, Some(&[]))?;
-    let (primal_program, tangent_program, residual_count, tangent_slots) = linearization.into_parts();
-
-    // Linearization validates this partition, in which the tangent inputs precede the trailing primal residuals.
-    // Dependence must start from that compact prefix of tangent inputs, not from the original primal input indices or
-    // the residuals.
-    let tangent_input_count = tangent_program.input_count() - residual_count;
-
-    // Map compact tangent outputs back to primal output order, excluding the primal program's trailing residuals.
-    // Zero differential spaces and inactive reference outputs have no tangent slot and consume no dependence entry.
-    // Every remaining output that depends on no tangent input is a structural zero, so it does not cross the boundary.
-    let mut dependence = tangent_program.output_dependence(&(0..tangent_input_count).collect::<Vec<_>>())?.into_iter();
-    let output_activity = tangent_slots[..output_count]
-        .iter()
-        .map(|&slot| slot && dependence.next().unwrap())
-        .collect::<Vec<_>>();
-    let live_tangent_slots = (0..output_count)
-        .filter(|&index| tangent_slots[index])
-        .enumerate()
-        .filter_map(|(slot, index)| output_activity[index].then_some(slot))
-        .collect::<Vec<_>>();
-    // Output projection keeps the complete tangent/residual input boundary and instructions with observable effects.
-    // When all outputs are live, consume the original program handle without rebuilding its boundary.
-    let tangent_program = if live_tangent_slots.len() == tangent_program.output_count() {
-        Arc::unwrap_or_clone(tangent_program)
-    } else {
-        Arc::unwrap_or_clone(tangent_program).with_outputs(&live_tangent_slots)?
-    };
-
-    // A tangent body without live outputs is linear and computes nothing observable unless it has effects (e.g., a
-    // write into a tangent reference), so no tangent `shard_map` is bound, and the primal `shard_map` is the source
-    // one, whose residuals nothing would consume.
-    if !output_activity.contains(&true) && !tangent_program.effects().is_retained_when_unused() {
-        return Ok(ShardMapBodies {
-            primal_operation: operation.clone(),
-            primal_body: body.to_program(),
-            tangent: None,
-            output_activity,
-        });
-    }
-
-    // Classify the residuals as `ShardMapResidual` describes (JAX's `in_fwd`, `out_fwd`, and residual deduplication).
-    // A reference residual preserves the identity of the primal reference rather than a snapshot of its state (refer to
-    // the documentation of `Linearization::tangent`), so the reference analysis of the primal program resolves the
-    // input that it denotes or the allocation whose final state it snapshots, with one edge per allocation. The
-    // analysis resolves constants, so that any other reference residual (i.e., one that refers to state outside the
-    // body, which no valid body does) is rejected precisely. That is a defensive check for programs assembled without
-    // the usual validations, because the only other root that the analysis can report is an external constant, which
-    // program builders reject, and the primal program's explicitly empty capture scope rejects unbound captures.
-    let primal_input_ids = primal_program.input_ids();
-    let primal_output_ids = primal_program.output_ids();
-    let primal_output_types = primal_program.output_types();
-    let mut residuals = Vec::new();
-    let mut residual_slots = Vec::with_capacity(residual_count);
-    let mut edge_positions = Vec::new();
-    let mut edge_roots = Vec::new();
-    let mut reference_analysis = None;
-    for position in output_count..output_count + residual_count {
-        let atom = primal_output_ids[position];
-        let is_reference = primal_output_types[position].is_reference();
-        let input_index = primal_input_ids.iter().position(|input| *input == atom);
-        let output_index = primal_output_ids[..output_count]
-            .iter()
-            .position(|output| *output == atom)
-            .filter(|&index| !is_reference && !operation.output_types[index].is_reference())
-            .filter(|&index| {
-                boundary_array_type(&primal_output_types[index])
-                    .is_ok_and(|r#type| operation.boundary.unproven_output_replication_axes(index, r#type).is_empty())
-                    && !operation.boundary.has_unchecked_output_reduction_state(index)
-            });
-        let residual = match (input_index, output_index) {
-            (Some(index), _) => ShardMapResidual::Input(index),
-            (None, Some(index)) => ShardMapResidual::Output(index),
-            (None, None) if is_reference => {
-                if reference_analysis.is_none() {
-                    let analysis = primal_program
-                        .entry_region_ref()
-                        .reference_analysis_with_configuration(Some(0), true, &[])
-                        .map_err(ProgramError::from)?;
-                    reference_analysis = Some(analysis);
-                }
-                match reference_analysis.as_ref().unwrap().output_roots()[position] {
-                    Some(ReferenceRoot::RegionInput { input_index, .. }) => ShardMapResidual::Input(input_index),
-                    Some(root @ ReferenceRoot::Allocation { .. }) => {
-                        match edge_roots.iter().position(|edge_root| *edge_root == Some(root)) {
-                            Some(edge) => ShardMapResidual::ReferenceSnapshot(edge),
-                            None => {
-                                edge_positions.push(position);
-                                edge_roots.push(Some(root));
-                                ShardMapResidual::ReferenceSnapshot(edge_positions.len() - 1)
-                            }
-                        }
-                    }
-                    _ => {
-                        let residual_index = position - output_count;
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "`{SHARD_MAP_OPERATION_NAME}` residual #{residual_index} is a reference that is neither a \
-                             body input nor allocated in the body",
-                        ))
-                        .into());
-                    }
-                }
-            }
-            (None, None) => match edge_positions.iter().position(|&edge| primal_output_ids[edge] == atom) {
-                Some(edge) => ShardMapResidual::Edge(edge),
-                None => {
-                    edge_positions.push(position);
-                    edge_roots.push(None);
-                    ShardMapResidual::Edge(edge_positions.len() - 1)
-                }
-            },
-        };
-        let slot = residuals.iter().position(|candidate| *candidate == residual).unwrap_or_else(|| {
-            residuals.push(residual);
-            residuals.len() - 1
-        });
-        residual_slots.push(slot);
-    }
-
-    // The local types of the residual edges are authoritative and back their boundary types on both bodies. The edge of
-    // a reference snapshot carries the referent of that reference.
-    let boundary = operation.boundary();
-    let mesh = boundary.mesh();
-    let mut edge_global_types = Vec::with_capacity(edge_positions.len());
-    let mut edge_shardings = Vec::with_capacity(edge_positions.len());
-    let mut edge_local_types = Vec::with_capacity(edge_positions.len());
-    for &position in &edge_positions {
-        let edge = ShardMapResidualEdge::new(position - output_count, &primal_output_types[position], boundary)
-            .map_err(ProgramError::from)?;
-        edge_global_types.push(ArrayIrType::Array(edge.global_type));
-        edge_shardings.push(edge.sharding);
-        edge_local_types.push(ArrayIrType::Array(edge.local_type));
-    }
-
-    // The primal body returns the original outputs followed by the residual edges only, each converted to its local
-    // boundary type (which only promotes varying scalars and recovers the integer scalars of dimensions). The edge of a
-    // reference snapshot is the complete referent, read after the last instruction of the body. A read leaves the
-    // allocation usable, so the snapshot stays valid even when the read is later scheduled ahead of uses of the
-    // reference that do not access it (e.g., passing it to an opaque call), while the declared read effect keeps it
-    // ordered after every access.
-    let primal_program = Arc::unwrap_or_clone(primal_program)
-        .with_outputs(&(0..output_count).chain(edge_positions).collect::<Vec<_>>())?;
-    let primal_program = if edge_roots.iter().any(Option::is_some) {
-        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-        let inputs = primal_program
-            .input_types()
-            .into_owned()
-            .into_iter()
-            .map(|r#type| builder.add_input(r#type))
-            .collect::<Vec<_>>();
-        let mut outputs = builder.splice_program(&primal_program, inputs.as_slice())?;
-        for (output, root) in outputs[output_count..].iter_mut().zip(&edge_roots) {
-            if root.is_some() {
-                let operation = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
-                *output = builder.add_instruction(operation, Vec::new(), vec![*output], None)?[0];
-            }
-        }
-        let output_count = outputs.len();
-        builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-            outputs,
-            vec![Placeholder; inputs.len()],
-            vec![Placeholder; output_count],
-        )?
-    } else {
-        primal_program
-    };
-    let mut primal_output_types = primal_program.output_types().into_owned();
-    primal_output_types[output_count..].clone_from_slice(&edge_local_types);
-    let primal_input_types = primal_program.input_types().into_owned();
-    let primal_program = reshape_program_boundary(&primal_program, primal_input_types, primal_output_types)?;
-
-    // The tangent body receives one residual input per distinct residual, in order of first use, so it is rebuilt over
-    // those inputs whenever forwarding, deduplication, or a reference snapshot changed its residual inputs, and the
-    // residual edges are converted back to their local types on entry. A reference snapshot enters as its referent,
-    // from which the tangent body allocates the reference that it uses in place of the primal one before its first
-    // instruction.
-    let tangent_program = if residuals.iter().copied().eq((0..residual_count).map(ShardMapResidual::Edge)) {
-        tangent_program
-    } else {
-        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
-        let tangent_input_types = tangent_program.input_types();
-        let mut tangent_inputs = tangent_input_types[..tangent_input_count]
-            .iter()
-            .cloned()
-            .map(|r#type| builder.add_input(r#type))
-            .collect::<Vec<_>>();
-        let mut residual_inputs = vec![None; residuals.len()];
-        for (index, &slot) in residual_slots.iter().enumerate() {
-            residual_inputs[slot].get_or_insert_with(|| {
-                match (&residuals[slot], &tangent_input_types[tangent_input_count + index]) {
-                    (ShardMapResidual::ReferenceSnapshot(_), ArrayIrType::Reference(reference)) => {
-                        builder.add_input(ArrayIrType::Array(reference.referent().clone()))
-                    }
-                    (_, r#type) => builder.add_input(r#type.clone()),
-                }
-            });
-        }
-        let residual_inputs = residual_inputs
-            .into_iter()
-            .zip(&residuals)
-            .map(|(input, residual)| match residual {
-                ShardMapResidual::ReferenceSnapshot(_) => {
-                    let operation = ReferenceNewOperation::<ArrayType, ArrayIrType>::new();
-                    Ok(builder.add_instruction(operation, Vec::new(), vec![input.unwrap()], None)?[0])
-                }
-                _ => Ok(input.unwrap()),
-            })
-            .collect::<Result<Vec<_>, ProgramError>>()?;
-        tangent_inputs.extend(residual_slots.iter().map(|&slot| residual_inputs[slot]));
-        let outputs = builder.splice_program(&tangent_program, tangent_inputs.as_slice())?;
-        let output_count = outputs.len();
-        builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
-            outputs,
-            vec![Placeholder; tangent_input_count + residuals.len()],
-            vec![Placeholder; output_count],
-        )?
-    };
-    let mut tangent_input_types = tangent_program.input_types().into_owned();
-    for (r#type, residual) in tangent_input_types[tangent_input_count..].iter_mut().zip(&residuals) {
-        if let ShardMapResidual::Edge(edge) | ShardMapResidual::ReferenceSnapshot(edge) = residual {
-            *r#type = edge_local_types[*edge].clone();
-        }
-    }
-    let tangent_output_types = tangent_program.output_types().into_owned();
-    let tangent_program = reshape_program_boundary(&tangent_program, tangent_input_types, tangent_output_types)?;
-
-    let primal_operation = ShardMapOperation::from_boundary(
-        ShardMapBoundary::from_validated_shardings(
-            mesh.clone(),
-            boundary.input_shardings().to_vec(),
-            boundary.output_shardings().iter().cloned().chain(edge_shardings.iter().cloned()).collect(),
-            boundary.manual_axes().to_vec(),
-        )
-        .with_caller_mesh(boundary.caller_mesh.clone())
-        .with_manual_variation_checks(boundary.manual_variation_checks),
-        operation.input_types.clone(),
-        operation.output_types.iter().cloned().chain(edge_global_types.iter().cloned()).collect::<Vec<_>>(),
-    )
-    .with_output_forwarding(
-        operation.output_forwarding.iter().copied().chain(vec![None; edge_global_types.len()]).collect(),
-    )
-    .map_err(ProgramError::from)?;
-
-    // The tangent boundary compacts the inputs by the activity mask, so a forwarded reference output must be remapped
-    // onto the tangent position of the input it forwards. Each residual crosses under the global type and sharding of
-    // the primal boundary input, primal boundary output, or residual edge that it comes from.
-    let mut tangent_positions = vec![None; activity.len()];
-    let mut tangent_input_shardings = Vec::with_capacity(activity.len() + residuals.len());
-    let mut tangent_input_types = Vec::with_capacity(activity.len() + residuals.len());
-    for (index, _) in activity.iter().enumerate().filter(|(_, active)| **active) {
-        tangent_positions[index] = Some(tangent_input_types.len());
-        tangent_input_shardings.push(boundary.input_shardings()[index].clone());
-        tangent_input_types.push(operation.input_types[index].tangent()?);
-    }
-    for residual in &residuals {
-        let (sharding, r#type) = match *residual {
-            ShardMapResidual::Input(index) => (&boundary.input_shardings()[index], &operation.input_types[index]),
-            ShardMapResidual::Output(index) => (&boundary.output_shardings()[index], &operation.output_types[index]),
-            ShardMapResidual::Edge(edge) | ShardMapResidual::ReferenceSnapshot(edge) => {
-                (&edge_shardings[edge], &edge_global_types[edge])
-            }
-        };
-        tangent_input_shardings.push(sharding.clone());
-        tangent_input_types.push(r#type.clone());
-    }
-    let tangent_output_types = operation
-        .output_types
-        .iter()
-        .zip(&output_activity)
-        .filter(|(_, active)| **active)
-        .map(|(r#type, _)| r#type.tangent())
-        .collect::<Result<Vec<_>, _>>()?;
-    let tangent_forwarding = operation
-        .output_forwarding
-        .iter()
-        .zip(&output_activity)
-        .filter(|(_, active)| **active)
-        .map(|(forwarded, _)| forwarded.map(|index| tangent_positions[index].unwrap()))
-        .collect();
-    let tangent_output_shardings = boundary
-        .output_shardings()
-        .iter()
-        .zip(&output_activity)
-        .filter(|(_, active)| **active)
-        .map(|(sharding, _)| sharding.clone())
-        .collect();
-    let tangent_operation = ShardMapOperation::from_boundary(
-        ShardMapBoundary::from_validated_shardings(
-            mesh.clone(),
-            tangent_input_shardings,
-            tangent_output_shardings,
-            boundary.manual_axes().to_vec(),
-        )
-        .with_caller_mesh(boundary.caller_mesh.clone())
-        .with_manual_variation_checks(boundary.manual_variation_checks),
-        tangent_input_types,
-        tangent_output_types,
-    )
-    .with_output_forwarding(tangent_forwarding)
-    .map_err(ProgramError::from)?;
-
-    Ok(ShardMapBodies {
-        primal_operation,
-        primal_body: primal_program,
-        tangent: Some(ShardMapTangent { operation: tangent_operation, body: tangent_program, residuals }),
-        output_activity,
-    })
-}
-
-/// Binds the fused forward mode `shard_map` of `operation` in the shared primal and tangent context of `context` (refer
-/// to the forward mode rule of [`ShardMapOperation`]) and returns the output duals, or [`None`] when no output tangent
-/// is live, in which case nothing is bound. The fused body is the fused JVP program of `body` with respect to the
-/// inputs that `activity` marks as active, which maps `[inputs..., active(input_tangents)...]` to
-/// `[outputs..., output_tangents...]`, projected onto the outputs followed by the live output tangents with its dead
-/// work removed (refer to [`Program::with_outputs`] and [`Program::into_simplified`]). An output tangent is live when
-/// it depends on some active input tangent (JAX's `which_nz_out`), and every other output receives a structurally zero
-/// tangent. Each input tangent crosses the boundary under the input sharding of its primal, and each output tangent
-/// under the output sharding of its primal, as in JAX's `_shard_map_jvp`.
-fn fused_shard_map_jvp<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-    operation: &ShardMapOperation,
-    context: &DifferentiationContext<C, P>,
-    driver: &D,
-    body: RegionRef<'_, C::Constant, C::Operation>,
-    inputs: &[DifferentiationDual<C::Value>],
-    activity: &[bool],
-) -> Result<Option<Vec<DifferentiationDual<C::Value>>>, DifferentiationError>
-where
-    C: Context<Type = ArrayIrType, Operation: From<ShardMapOperation>> + Zero<C::Value>,
-{
-    let input_count = inputs.len();
-    let output_count = operation.output_types.len();
-    let input_indices = activity
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &active)| active.then_some(index))
-        .collect::<Vec<_>>();
-    let tangent_slots = body.tangent_output_mask(&input_indices)?;
-    let fused_body = driver.jvp_program(body, &input_indices)?;
-    check_count!("input", fused_body.input_types(), input_count + input_indices.len(), ProgramError);
-    let tangent_inputs = (input_count..fused_body.input_count()).collect::<Vec<_>>();
-    let mut dependence = fused_body.output_dependence(&tangent_inputs)?.into_iter().skip(output_count);
-    let output_activity = tangent_slots.iter().map(|&slot| slot && dependence.next().unwrap()).collect::<Vec<_>>();
-    if !output_activity.contains(&true) {
-        return Ok(None);
-    }
-    let live_tangent_outputs =
-        (0..output_count).filter(|&index| tangent_slots[index]).map(|index| output_activity[index]);
-    let live_outputs = std::iter::repeat_n(true, output_count).chain(live_tangent_outputs).collect::<Vec<_>>();
-
-    // The boundary keeps every primal output followed by the live tangent slots, retaining all inputs to match the
-    // input shardings below. Simplification also removes dead work inside nested regions (e.g., unused tangent
-    // allocations passed only to composites), while preserving observable effects and deferred work.
-    let output_indices = live_outputs
-        .iter()
-        .enumerate()
-        .filter_map(|(index, &live)| live.then_some(index))
-        .collect::<Vec<_>>();
-    let fused_body = Arc::unwrap_or_clone(fused_body).with_outputs(&output_indices)?;
-    let simplified_body = fused_body.clone().into_simplified()?;
-
-    // A no-op cleanup keeps the staged order and existing transform caches instead of adopting the instruction order
-    // that simplification derives from the outputs. Removing instructions remains necessary even when every output is
-    // live.
-    let instruction_count = fused_body.regions().iter().map(|region| region.instructions().len()).sum::<usize>();
-    let fused_body = if simplified_body.regions().iter().map(|region| region.instructions().len()).sum::<usize>()
-        < instruction_count
-    {
-        simplified_body
-    } else {
-        fused_body
-    };
-
-    let boundary = operation.boundary();
-    let mut input_shardings = boundary.input_shardings().to_vec();
-    let mut input_types = operation.input_types.clone();
-    let mut fused_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-    for &index in &input_indices {
-        input_shardings.push(boundary.input_shardings()[index].clone());
-        input_types.push(operation.input_types[index].tangent()?);
-        fused_inputs.push(inputs[index].tangent().clone().materialize(context.tangent())?);
-    }
-    let mut output_shardings = boundary.output_shardings().to_vec();
-    let mut output_types = operation.output_types.clone();
-    for index in (0..output_count).filter(|&index| output_activity[index]) {
-        output_shardings.push(boundary.output_shardings()[index].clone());
-        output_types.push(operation.output_types[index].tangent()?);
-    }
-    let fused_operation = ShardMapOperation::from_boundary(
-        ShardMapBoundary::from_validated_shardings(
-            boundary.mesh().clone(),
-            input_shardings,
-            output_shardings,
-            boundary.manual_axes().to_vec(),
-        )
-        .with_caller_mesh(boundary.caller_mesh.clone())
-        .with_manual_variation_checks(boundary.manual_variation_checks),
-        input_types,
-        output_types,
-    );
-    let mut outputs = context.primal().bind(fused_operation, vec![fused_body], &fused_inputs)?;
-    let live_output_count = live_outputs.iter().filter(|live| **live).count();
-    check_count!("output", outputs, live_output_count, ProgramError);
-    let mut tangent_outputs = outputs.split_off(output_count).into_iter();
-    outputs
-        .into_iter()
-        .zip(output_activity)
-        .map(|(primal, active)| {
-            if active {
-                DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
-            } else {
-                DifferentiationDual::new_with_zero_tangent(primal)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
 }
 
 /// Reconciles the cotangent `contribution` that a transposed `shard_map` assembled for input `input_index` with the
@@ -6888,30 +6914,6 @@ fn validate_parameter_structure<P: Parameter, Value: Parameterized<P>>(
     Ok(())
 }
 
-/// Returns the sharding over `mesh` of a rank-`rank` value that the `shard_map_along` function of [`ShardMap`] places
-/// along `axis_name` at dimension `axis`, which replicates every other dimension, or replicates the whole value when
-/// `axis` is [`None`].
-fn sharding_along(
-    mesh: &LogicalMesh,
-    axis_name: &str,
-    axis: Option<usize>,
-    rank: usize,
-    value_kind: ShardMapValueKind,
-    value_index: usize,
-) -> Result<Sharding, ShardMapError> {
-    let mut dimensions = vec![ShardingDimension::Replicated; rank];
-    if let Some(axis) = axis {
-        let dimension = dimensions.get_mut(axis).ok_or(ShardMapError::MappedAxisOutOfBounds {
-            value_kind,
-            value_index,
-            axis,
-            rank,
-        })?;
-        *dimension = ShardingDimension::sharded([axis_name]);
-    }
-    Ok(Sharding::new(mesh.clone(), dimensions)?)
-}
-
 /// Traces `function` as the local body of a `shard_map` over `mesh` on `inputs` in `context` and binds it there,
 /// which is the shared implementation of the `shard_map` and `shard_map_along` functions of [`ShardMap`]. The boundary
 /// of a map whose output shardings are [`ShardMapOutputShardings::Along`] starts without outputs, since the output
@@ -6995,7 +6997,17 @@ where
                 .enumerate()
                 .map(|(output_index, (axis, output_type))| {
                     let rank = output_type.rank();
-                    sharding_along(&mesh, &axis_name, *axis, rank, ShardMapValueKind::Output, output_index)
+                    Sharding::along(mesh.clone(), &axis_name, *axis, rank).map_err(|error| match error {
+                        ShardingError::DimensionOutOfBounds { dimension, rank } => {
+                            ShardMapError::MappedAxisOutOfBounds {
+                                value_kind: ShardMapValueKind::Output,
+                                value_index: output_index,
+                                axis: dimension,
+                                rank,
+                            }
+                        }
+                        error => error.into(),
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let (boundary, _) = shard_map_within_named_axes(
@@ -21103,9 +21115,7 @@ mod tests {
                 .unwrap()
         };
         let driver = TestDifferentiationDriver { source: source.clone(), primal, tangent, residual_count: 6 };
-        let bodies =
-            linearize_shard_map_body::<TestContext, _>(&operation, &driver, source.entry_region_ref(), &[true])
-                .unwrap();
+        let bodies = operation.linearize_body::<TestContext, _>(&driver, source.entry_region_ref(), &[true]).unwrap();
         let tangent = bodies.tangent.unwrap();
         assert_eq!(
             tangent.residuals,
@@ -21205,9 +21215,9 @@ mod tests {
                 .unwrap()
         };
         let driver = TestDifferentiationDriver { source: source.clone(), primal, tangent, residual_count: 1 };
-        let bodies =
-            linearize_shard_map_body::<TestContext, _>(&operation, &driver, source.entry_region_ref(), &[false, true])
-                .unwrap();
+        let bodies = operation
+            .linearize_body::<TestContext, _>(&driver, source.entry_region_ref(), &[false, true])
+            .unwrap();
         assert_eq!(bodies.tangent.unwrap().residuals, vec![ShardMapResidual::Input(0)]);
 
         // Binding both maps through the rule transfers the primal reference to the tangent context by identity and
@@ -21323,9 +21333,9 @@ mod tests {
                 .unwrap()
         };
         let driver = TestDifferentiationDriver { source: source.clone(), primal, tangent, residual_count: 1 };
-        let bodies =
-            linearize_shard_map_body::<TestContext, _>(&operation, &driver, source.entry_region_ref(), &[false, true])
-                .unwrap();
+        let bodies = operation
+            .linearize_body::<TestContext, _>(&driver, source.entry_region_ref(), &[false, true])
+            .unwrap();
         let tangent = bodies.tangent.unwrap();
         assert_eq!(tangent.residuals, vec![ShardMapResidual::ReferenceSnapshot(0)]);
         let global = ArrayIrType::Array(f32_vector_type(4).with_sharding(sharded_along_x()).unwrap());
