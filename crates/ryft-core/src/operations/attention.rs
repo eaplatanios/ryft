@@ -20,14 +20,14 @@
 //! with [`AttentionKey::from_composite_key`] and then either lowers the portable body of the definition or replaces
 //! the call with its own implementation, as the [`AttentionImplementation`] of the configuration requests.
 //!
-//! The portable bodies are written once over an [`AttentionUniverse`] and compute on array views with ordinary value
-//! capabilities. Their constants, coordinates, and broadcasts take the runtime shapes of existing values (refer to
-//! [`FillLike`], [`IotaLike`], and [`BroadcastLike`]), and their reshapes keep the batch and sequence dimensions, so
-//! they support static and dynamic batch and sequence extents for values typed by [`ArrayType`] and for array IR
-//! values (i.e., values typed by [`ArrayIrType`]) alike. Only the batching rule constructs shapes that no existing
-//! value has, and it takes their extents from the universe, which supports dynamic extents there only for array IR
-//! values, whose extents are first-class dimension values. Dropout is the exception in both universes, because it
-//! draws the random bits of its mask for static extents.
+//! The portable bodies are written once with ordinary value capabilities (refer to [`AttentionOperations`]). Their
+//! constants, coordinates, and broadcasts take the runtime shapes of existing values (refer to [`FillLike`],
+//! [`IotaLike`], and [`BroadcastLike`]), and their reshapes keep the batch and sequence dimensions, so they support
+//! static and dynamic batch and sequence extents for values typed by [`ArrayType`] and for array IR values (i.e.,
+//! values typed by [`ArrayIrType`]) alike. Only the batching rule constructs shapes that no existing value has, and it
+//! takes their extents from the [`AttentionUniverse`] of the values, which supports dynamic extents there only for
+//! array IR values, whose extents are first-class dimension values. Dropout is the exception in both universes,
+//! because it draws the random bits of its mask for static extents.
 //!
 //! # Ownership and Lifecycle
 //!
@@ -93,6 +93,7 @@ use crate::batching::{BatchAxis, BatchableType, BatchingLevelExtent};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::DifferentiableType;
 use crate::macros::check_count;
+use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, Div, Mul, Sub};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::{Compare, ComparisonDirection};
@@ -119,35 +120,93 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::random::{Dropout, RandomAlgorithm};
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::parameters::{Parameter, Parameterized};
-use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value, ValueProjection};
+use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
-/// Type universe in which the portable attention bodies run, which provides the array views that they compute on and
-/// the extents of the arrays whose shapes no existing value has. The bodies are written once over a value `V` whose
-/// [`Type`] implements this trait. They project their inputs once to array views of type [`Self::ArrayValue`] and
-/// compute on those with ordinary value capabilities. These include the exemplar-relative [`FillLike`], [`IotaLike`],
-/// and [`BroadcastLike`] capabilities, which read the runtime shape of an existing value, so the constants,
-/// coordinates, and broadcasts of the bodies support static and dynamic shapes in both universes. Only the batching
-/// rule of the named definitions constructs shapes that no existing value has, because it folds a possibly dynamic
-/// mapped extent into the batch axis and restores it on the outputs, and it takes their extents from this trait.
+/// Value capabilities with which the portable attention bodies compute. The bodies are written once over the values of
+/// a type universe and compute on them directly. Their capabilities include the exemplar-relative [`FillLike`],
+/// [`IotaLike`], and [`BroadcastLike`], which read the runtime shape of an existing value, so the constants,
+/// coordinates, and broadcasts of the bodies support static and dynamic shapes. This bundle is implemented
+/// automatically for every value that implements all of its members, and so it must never be implemented manually. It
+/// is public because it bounds [`dot_product_attention`] and [`differentiable_dot_product_attention`].
+///
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
+/// [`ArrayIrType`] by applying the capabilities to their array members.
+pub trait AttentionOperations<T = <Self as Capability>::Universe>:
+    Value
+    + Add<T>
+    + And<T>
+    + Broadcast<T>
+    + BroadcastLike<T>
+    + Compare<Self, T>
+    + ConvertElementType<T>
+    + Div<T>
+    + Dot<T>
+    + Dropout<T>
+    + Exp<T>
+    + FillLike<T>
+    + IotaLike<T>
+    + Log<T>
+    + Mul<T>
+    + Reduce<T>
+    + Reshape<T>
+    + Select<T>
+    + StopGradient<T>
+    + Sub<T>
+    + Transpose<T>
+{
+}
+
+impl<
+    T,
+    V: Value
+        + Add<T>
+        + And<T>
+        + Broadcast<T>
+        + BroadcastLike<T>
+        + Compare<V, T>
+        + ConvertElementType<T>
+        + Div<T>
+        + Dot<T>
+        + Dropout<T>
+        + Exp<T>
+        + FillLike<T>
+        + IotaLike<T>
+        + Log<T>
+        + Mul<T>
+        + Reduce<T>
+        + Reshape<T>
+        + Select<T>
+        + StopGradient<T>
+        + Sub<T>
+        + Transpose<T>,
+> AttentionOperations<T> for V
+{
+}
+
+/// Type universe that provides the extents with which the batching rule of the named attention definitions constructs
+/// shapes that no existing value has. The rule folds a possibly dynamic mapped extent into the batch axis and restores
+/// it on the outputs, so it multiplies extents and broadcasts and reshapes values to them, and the universes represent
+/// an extent differently. The portable bodies do not need this trait, because they take every shape from an existing
+/// value (refer to [`AttentionOperations`]).
 ///
 /// The following universes implement it:
 ///
-///   - [`ArrayType`] implements it for homogeneous array values, whose extents are static host numbers. The array
-///     view is the value itself. Dynamically shaped attention is therefore supported in a homogeneous array family,
-///     except with batched calls whose batching rule needs a dynamic extent (e.g., a dynamic mapped extent, or a
-///     dynamic extent of a rank-4 input whose mapped axis is folded into its batch axis, of a bias or mask, or of a
-///     replicated input that is broadcast along the mapped axis). A dynamic mapped extent fails with an error that
-///     says that attention over homogeneous arrays cannot be batched with a dynamic extent, and every other case
-///     fails with an error that names the dynamic axis (e.g., "attention over homogeneous arrays requires static
-///     extents, but axis 2 of `f32[2, 1, length, 1, 1]` has extent `length`; use array IR values for dynamic
-///     extents"). Such programs stage attention in an array IR family instead, which is how backends support bounded
-///     dynamic shapes (e.g., XLA tracers).
+///   - [`ArrayType`] implements it for homogeneous array values, whose extents are static host numbers. A homogeneous
+///     array family therefore supports dynamically shaped attention except with batched calls whose batching rule
+///     needs a dynamic extent (e.g., a dynamic mapped extent, or a dynamic extent of a rank-4 input whose mapped axis
+///     is folded into its batch axis, of a bias or mask, or of a replicated input that is broadcast along the mapped
+///     axis). A dynamic mapped extent fails with an error that says that attention over homogeneous arrays cannot be
+///     batched with a dynamic extent, and every other case fails with an error that names the dynamic axis (e.g.,
+///     "attention over homogeneous arrays requires static extents, but axis 2 of `f32[2, 1, length, 1, 1]` has extent
+///     `length`; use array IR values for dynamic extents"). Such programs stage attention in an array IR family
+///     instead, which is how backends support bounded dynamic shapes (e.g., XLA tracers).
 ///   - [`ArrayIrType`] implements it for array IR values, whose extents are first-class dimension values, so the
 ///     batching rule supports static and dynamic extents as well.
 ///
-/// The supertraits relate the types of a universe to the array types of their array views, through which the bodies
-/// and the output type rules of the definitions validate their inputs.
+/// The supertraits relate the types of a universe to array types, through which the output type rules of the
+/// definitions validate their inputs.
 ///
 /// The implementations are on the type universes rather than on the values, which keeps them coherent for every value
 /// type. Both are blanket implementations over every value of their universe whose capabilities satisfy their bounds,
@@ -156,37 +215,8 @@ use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 /// new type universe participates by implementing this trait for its own type. The trait is public because it bounds
 /// [`dot_product_attention`] and [`differentiable_dot_product_attention`].
 pub trait AttentionUniverse<V>: Type + ArrayMemberType + From<ArrayType> {
-    /// Array view of `V` on which the attention mathematics computes.
-    type ArrayValue: Value<Type = ArrayType>
-        + Add
-        + And
-        + Broadcast
-        + BroadcastLike
-        + Compare
-        + ConvertElementType
-        + Div
-        + Dot
-        + Dropout
-        + Exp
-        + FillLike
-        + IotaLike
-        + Log
-        + Mul
-        + Reduce
-        + Reshape
-        + Select
-        + StopGradient
-        + Sub
-        + Transpose;
-
     /// Extent of one axis (e.g., `usize` for static extents or a dimension value for first-class extents).
     type Extent: Clone;
-
-    /// Returns the array view of `value`.
-    fn into_array(value: V) -> Result<Self::ArrayValue, ProgramError>;
-
-    /// Returns the value whose array view is `array`.
-    fn from_array(array: Self::ArrayValue) -> V;
 
     /// Returns the extent of the batching level whose extent is `extent`, constructed next to `value` (i.e., in its
     /// context).
@@ -217,42 +247,8 @@ pub trait AttentionUniverse<V>: Type + ArrayMemberType + From<ArrayType> {
     fn reshape(value: &V, extents: &[Self::Extent]) -> Result<V, ProgramError>;
 }
 
-impl<A> AttentionUniverse<A> for ArrayType
-where
-    A: Value<Type = ArrayType>
-        + Add
-        + And
-        + Broadcast
-        + BroadcastLike
-        + Compare
-        + ConvertElementType
-        + Div
-        + Dot
-        + Dropout
-        + Exp
-        + FillLike
-        + IotaLike
-        + Log
-        + Mul
-        + Reduce
-        + Reshape
-        + Select
-        + StopGradient
-        + Sub
-        + Transpose,
-{
-    type ArrayValue = A;
+impl<A: Value<Type = ArrayType> + Broadcast + Reshape> AttentionUniverse<A> for ArrayType {
     type Extent = usize;
-
-    #[inline]
-    fn into_array(value: A) -> Result<A, ProgramError> {
-        Ok(value)
-    }
-
-    #[inline]
-    fn from_array(array: A) -> A {
-        array
-    }
 
     fn batch_extent(_value: &A, extent: &BatchingLevelExtent<A>) -> Result<usize, ProgramError> {
         match extent {
@@ -313,47 +309,10 @@ where
 
 impl<V> AttentionUniverse<V> for ArrayIrType
 where
-    V: Value<Type = ArrayIrType>
-        + DimensionSize
-        + DynamicBroadcast
-        + DynamicReshape
-        + ValueProjection<ArrayType>
-        + ValueProjection<DimensionType>,
-    <V as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType>
-        + Add
-        + And
-        + Broadcast
-        + BroadcastLike
-        + Compare
-        + ConvertElementType
-        + Div
-        + Dot
-        + Dropout
-        + Exp
-        + FillLike
-        + IotaLike
-        + Log
-        + Mul
-        + Reduce
-        + Reshape
-        + Select
-        + StopGradient
-        + Sub
-        + Transpose,
+    V: Value<Type = ArrayIrType> + DimensionSize + DynamicBroadcast + DynamicReshape,
     V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionMulOperation>> + DimensionConstant,
 {
-    type ArrayValue = <V as ValueProjection<ArrayType>>::Projected;
     type Extent = V;
-
-    #[inline]
-    fn into_array(value: V) -> Result<Self::ArrayValue, ProgramError> {
-        ValueProjection::<ArrayType>::into_projected(value).map_err(Into::into)
-    }
-
-    #[inline]
-    fn from_array(array: Self::ArrayValue) -> V {
-        <V as ValueProjection<ArrayType>>::from_projected(array)
-    }
 
     fn batch_extent(value: &V, extent: &BatchingLevelExtent<V>) -> Result<V, ProgramError> {
         match extent {
@@ -1128,6 +1087,7 @@ where
     C::Constant: 'static,
     C::Operation: 'static,
     C::Type: AttentionUniverse<DomainTracer<C>> + BatchableType,
+    DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>,
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
         + CompositeCallContext<Type = C::Type, Value = DomainTracer<C>, Constant = C::Constant, Operation = C::Operation>,
@@ -1151,7 +1111,7 @@ where
         Caller: CompositeCallContext<Type = C::Type, Value = X, Constant = C::Constant, Operation = C::Operation>,
         X: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
     {
-        let inputs = align_attention_inputs::<C::Type, DomainTracer<C>, X>(inputs)?;
+        let inputs = align_attention_inputs(inputs)?;
         let return_residual = self.definitions.configuration().return_residual();
         let mut outputs = self.definitions.forward(inputs, return_residual)?.into_iter();
         let output = outputs.next().ok_or(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })?;
@@ -1176,6 +1136,7 @@ where
     C::Constant: 'static,
     C::Operation: 'static,
     C::Type: AttentionUniverse<DomainTracer<C>> + BatchableType,
+    DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>,
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
         + CompositeCallContext<Type = C::Type, Value = DomainTracer<C>, Constant = C::Constant, Operation = C::Operation>,
@@ -1228,6 +1189,7 @@ where
     C::Constant: 'static,
     C::Operation: 'static,
     C::Type: AttentionUniverse<DomainTracer<C>> + BatchableType + DifferentiableType,
+    DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>
         + CompositeVjp<
             AttentionVjp<C::Constant, C::Operation>,
@@ -1262,7 +1224,7 @@ where
         }
 
         let signature = inputs.signature();
-        let inputs = align_attention_inputs::<C::Type, DomainTracer<C>, X>(inputs)?;
+        let inputs = align_attention_inputs(inputs)?;
         let function = self
             .functions
             .lock()
@@ -1406,6 +1368,7 @@ where
     C::Constant: 'static,
     C::Operation: 'static,
     C::Type: AttentionUniverse<DomainTracer<C>> + BatchableType + DifferentiableType,
+    DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>
         + CompositeVjp<
             AttentionVjp<C::Constant, C::Operation>,
@@ -1428,9 +1391,6 @@ where
 
 /// [`CustomRuleTracer`] of the operation family `(V, O)`.
 type RuleTracer<V, O> = CustomRuleTracer<V, O>;
-
-/// Array view of a value of an [`AttentionUniverse`].
-type ArrayOf<V> = <<V as Typed>::Type as AttentionUniverse<V>>::ArrayValue;
 
 /// Borrowed canonical view of attention input types.
 struct AttentionInputTypes<'o> {
@@ -1566,6 +1526,7 @@ where
     V: 'static,
     O: 'static,
     V::Type: AttentionUniverse<RuleTracer<V, O>> + BatchableType,
+    RuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
@@ -1668,19 +1629,19 @@ type BackwardFunction<V, O> = AttentionFunction<
 type TrainingFunction<V, O> =
     Composite<V, O, AttentionInputs<RuleTracer<V, O>>, RuleTracer<V, O>, DefaultJvp, AttentionVjp<V, O>>;
 
-/// Shared normalized inputs and masked logits consumed by the forward and backward attention bodies, as array views.
-struct PreparedAttention<V: Value<Type: AttentionUniverse<V>>> {
+/// Shared normalized inputs and masked logits consumed by the forward and backward attention bodies.
+struct PreparedAttention<V> {
     /// Normalized query.
-    query: ArrayOf<V>,
+    query: V,
 
     /// Normalized key expanded from key/value heads to query heads.
-    expanded_key: ArrayOf<V>,
+    expanded_key: V,
 
     /// Normalized value expanded from key/value heads to query heads.
-    expanded_value: ArrayOf<V>,
+    expanded_value: V,
 
     /// Masked logits converted to the data type used by softmax.
-    logits: ArrayOf<V>,
+    logits: V,
 
     /// Shared query/key/value data type.
     data_type: DataType,
@@ -1755,10 +1716,9 @@ fn attention_composite_key(
 /// which precedes every call of the functions that stage attention. Alignment is the identity when every input already
 /// varies over the same manual axes (e.g., outside manual regions), and so those inputs are returned unchanged without
 /// staging the alignment.
-fn align_attention_inputs<U, R, X>(inputs: AttentionInputs<X>) -> Result<AttentionInputs<X>, ProgramError>
+fn align_attention_inputs<X>(inputs: AttentionInputs<X>) -> Result<AttentionInputs<X>, ProgramError>
 where
-    U: AttentionUniverse<R>,
-    X: Value<Type = U> + ManualVariationAlignment<U>,
+    X: Value<Type: ArrayMemberType> + ManualVariationAlignment<X::Type>,
 {
     let mut varying_manual_axes = None;
     let mut aligned = true;
@@ -2130,11 +2090,11 @@ fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayT
 
 /// Returns the named composite of the forward definition with the provided configuration and optional input signature.
 ///
-/// The body of the definition evaluates portable scaled dot-product attention with ordinary array operations on the
-/// array views of its inputs and returns the attended output, followed by the log-sum-exp residual when
-/// `configuration` requests it. Its constants, coordinates, and broadcasts take their shapes from existing values, and
-/// only the grouped key/value head expansion takes its extents from the [`AttentionUniverse`] of the values, so the
-/// same body supports static and dynamic extents and backends need no attention mathematics of their own.
+/// The body of the definition evaluates portable scaled dot-product attention with ordinary array operations and
+/// returns the attended output, followed by the log-sum-exp residual when `configuration` requests it. Its constants,
+/// coordinates, and broadcasts take their shapes from existing values, and its reshapes keep the batch and sequence
+/// dimensions, so the same body supports static and dynamic extents and backends need no attention mathematics of
+/// their own.
 fn forward_function<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
     signature: AttentionInputSignature,
@@ -2143,6 +2103,7 @@ where
     V: 'static,
     O: 'static,
     V::Type: AttentionUniverse<RuleTracer<V, O>> + BatchableType,
+    RuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
@@ -2215,7 +2176,7 @@ where
         let mut output = attended.transpose([0, 2, 1, 3])?;
         // Query rows at or beyond the query length of their batch item are exact zeros.
         if let Some(query_lengths) = &inputs.query_sequence_lengths {
-            output = zero_query_rows::<RuleTracer<V, O>>(output, query_lengths, 1)?;
+            output = zero_query_rows(output, query_lengths, 1)?;
         }
         let output = denormalize_attention_output(output, query_rank)?;
         // The residual is the logarithm of the sum of the exponentiated logits of every row, which is the row maximum
@@ -2233,10 +2194,7 @@ where
         } else {
             None
         };
-        Ok(std::iter::once(output)
-            .chain(residual)
-            .map(<V::Type as AttentionUniverse<RuleTracer<V, O>>>::from_array)
-            .collect())
+        Ok(std::iter::once(output).chain(residual).collect())
     };
     let function = composite(body)
         .with_name(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME)
@@ -2328,6 +2286,7 @@ where
     V: 'static,
     O: 'static,
     V::Type: AttentionUniverse<RuleTracer<V, O>> + BatchableType,
+    RuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
@@ -2380,7 +2339,7 @@ where
             inputs.mask.as_ref().map(|_| &input_types[3 + usize::from(inputs.bias.is_some())]),
         )?;
         let prepared = prepare_attention(inputs, configuration, &dimensions)?;
-        let output_cotangent = normalize_attention_input(V::Type::into_array(output_cotangent.clone())?)?;
+        let output_cotangent = normalize_attention_input(output_cotangent.clone())?;
         // The public residual and output have the query data type, which can lose the normalization correction in
         // narrow formats. Recompute probabilities in the softmax type instead of recovering them from those values.
         let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
@@ -2404,10 +2363,10 @@ where
         // output cotangents contribute nothing.
         let output_cotangent = match &inputs.query_sequence_lengths {
             None => output_cotangent,
-            Some(query_lengths) => zero_query_rows::<RuleTracer<V, O>>(output_cotangent, query_lengths, 1)?,
+            Some(query_lengths) => zero_query_rows(output_cotangent, query_lengths, 1)?,
         };
         // The backward mathematics runs in the softmax data type, like the recomputed probabilities.
-        let convert = |array: ArrayOf<RuleTracer<V, O>>| -> Result<ArrayOf<RuleTracer<V, O>>, ProgramError> {
+        let convert = |array: RuleTracer<V, O>| -> Result<RuleTracer<V, O>, ProgramError> {
             if prepared.data_type == prepared.softmax_type {
                 Ok(array)
             } else {
@@ -2453,7 +2412,7 @@ where
             .dot(&softmax_key, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?
             .transpose([0, 2, 1, 3])?;
         if let Some(query_lengths) = &inputs.query_sequence_lengths {
-            query_cotangent = zero_query_rows::<RuleTracer<V, O>>(query_cotangent, query_lengths, 1)?;
+            query_cotangent = zero_query_rows(query_cotangent, query_lengths, 1)?;
         }
         let key_cotangent = scaled_logit_cotangents
             .dot(&softmax_query, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))?
@@ -2478,12 +2437,12 @@ where
             .zip(input_types[..3].iter().zip(input_ranks))
             .map(|(cotangent, (input_type, rank))| {
                 let cotangent_data_type = input_type.cotangent()?.data_type();
-                let cotangent = if cotangent.r#type().data_type() == cotangent_data_type {
+                let cotangent = if cotangent.r#type().as_array_type()?.data_type() == cotangent_data_type {
                     cotangent
                 } else {
                     cotangent.convert_element_type(cotangent_data_type)?
                 };
-                denormalize_attention_output(cotangent, rank).map(V::Type::from_array)
+                denormalize_attention_output(cotangent, rank)
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         if let Some(bias) = &inputs.bias {
@@ -2498,7 +2457,7 @@ where
             let bias_dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - bias_type.rank())
                 .chain(bias_type.shape().dimensions().iter().cloned())
                 .collect::<Vec<_>>();
-            let logit_type = logit_cotangents.r#type().into_owned();
+            let logit_type = logit_cotangents.r#type().as_array_type()?.clone();
             let reduce_axes = bias_dimensions
                 .iter()
                 .zip(logit_type.shape().dimensions())
@@ -2518,7 +2477,7 @@ where
             } else {
                 bias_cotangent.convert_element_type(bias_cotangent_type.data_type())?
             };
-            cotangents.push(V::Type::from_array(bias_cotangent));
+            cotangents.push(bias_cotangent);
         }
         Ok(cotangents)
     };
@@ -2572,14 +2531,14 @@ where
 }
 
 /// Normalizes attention inputs and constructs the masked score logits shared by the forward and backward bodies.
-fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
+fn prepare_attention<V: Value<Type: ArrayMemberType> + AttentionOperations>(
     inputs: &AttentionInputs<V>,
     configuration: AttentionConfiguration,
     dimensions: &AttentionDimensions,
 ) -> Result<PreparedAttention<V>, ProgramError> {
-    let query = normalize_attention_input(V::Type::into_array(inputs.query.clone())?)?;
-    let key = normalize_attention_input(V::Type::into_array(inputs.key.clone())?)?;
-    let value_input = normalize_attention_input(V::Type::into_array(inputs.value.clone())?)?;
+    let query = normalize_attention_input(inputs.query.clone())?;
+    let key = normalize_attention_input(inputs.key.clone())?;
+    let value_input = normalize_attention_input(inputs.value.clone())?;
     let expanded_key = expand_key_value_heads(key, dimensions)?;
     let expanded_value = expand_key_value_heads(value_input, dimensions)?;
     let data_type = dimensions.data_type;
@@ -2597,9 +2556,12 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
     // A bias is right-aligned to `BNTS`, converted to the data type of the scores, and broadcast to their shape. Every
     // axis of the normalized bias either has the extent of the corresponding score axis or is a unit axis.
     if let Some(bias) = &inputs.bias {
-        let bias = normalize_attention_score_input(V::Type::into_array(bias.clone())?)?;
-        let bias =
-            if bias.r#type().data_type() == logits_type { bias } else { bias.convert_element_type(logits_type)? };
+        let bias = normalize_attention_score_input(bias.clone())?;
+        let bias = if bias.r#type().as_array_type()?.data_type() == logits_type {
+            bias
+        } else {
+            bias.convert_element_type(logits_type)?
+        };
         let bias = bias.broadcast_like(&scores, &[0, 1, 2, 3])?;
         scores = scores.add(&bias)?;
     }
@@ -2620,7 +2582,7 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
         let mut visible = match &inputs.mask {
             None => None,
             Some(mask) => {
-                let mask = normalize_attention_score_input(V::Type::into_array(mask.clone())?)?;
+                let mask = normalize_attention_score_input(mask.clone())?;
                 Some(mask.broadcast_like(&scores, &[0, 1, 2, 3])?)
             }
         };
@@ -2651,7 +2613,7 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
         // Query rows at or beyond the query length of their batch item see no key/value position at all.
         if let Some(lengths) = &inputs.query_sequence_lengths {
             let rows = scores.iota_like(2, DataType::I32)?;
-            let bounds = V::Type::into_array(lengths.clone())?.broadcast_like(&rows, &[0])?;
+            let bounds = lengths.broadcast_like(&rows, &[0])?;
             let in_range = rows.compare(&bounds, ComparisonDirection::LessThan)?;
             visible = Some(match visible {
                 None => in_range,
@@ -2660,7 +2622,7 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
         }
         // Key/value columns at or beyond the key/value length of their batch item are invisible to every row.
         if let Some(lengths) = &inputs.key_value_sequence_lengths {
-            let bounds = V::Type::into_array(lengths.clone())?.broadcast_like(&columns, &[0])?;
+            let bounds = lengths.broadcast_like(&columns, &[0])?;
             let in_range = columns.compare(&bounds, ComparisonDirection::LessThan)?;
             visible = Some(match visible {
                 None => in_range,
@@ -2670,8 +2632,11 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
         // Invisible scores use a finite large negative value rather than negative infinity, so that a row without
         // any visible position still has a finite maximum and a finite log-sum-exp residual. At least one of the
         // masks above is present on this path, so the visibility is known.
-        let large_negative =
-            if scores.r#type().data_type() == DataType::F64 { -0.7 * f64::MAX } else { -0.7 * f32::MAX as f64 };
+        let large_negative = if scores.r#type().as_array_type()?.data_type() == DataType::F64 {
+            -0.7 * f64::MAX
+        } else {
+            -0.7 * f32::MAX as f64
+        };
         let masked = scores.fill_like(large_negative)?;
         visible.unwrap().select(&scores, &masked)?
     };
@@ -2681,8 +2646,8 @@ fn prepare_attention<V: Value<Type: AttentionUniverse<V>>>(
 
 /// Adds the implicit batch axis used to evaluate one unbatched `TNH` attention input (i.e., a query, key, value,
 /// forward output, or output cotangent). Inserting a unit axis preserves the dynamic extents of the input.
-fn normalize_attention_input<A: Value<Type = ArrayType> + Reshape>(input: A) -> Result<A, ProgramError> {
-    if input.r#type().rank() == 4 {
+fn normalize_attention_input<V: Value<Type: ArrayMemberType> + Reshape>(input: V) -> Result<V, ProgramError> {
+    if input.r#type().as_array_type()?.rank() == 4 {
         return Ok(input);
     }
     input.expand_dimensions(0)
@@ -2691,19 +2656,20 @@ fn normalize_attention_input<A: Value<Type = ArrayType> + Reshape>(input: A) -> 
 /// Expands grouped key/value heads to the query heads. The `BSKH` input is replicated along a new group axis, which
 /// gives the `BSKGH` form, and its key/value head and group axes are then merged into the query head axis of the
 /// `BSNH` form. Both steps keep the batch and sequence dimensions, so they support dynamic extents along them.
-fn expand_key_value_heads<A: Value<Type = ArrayType> + Broadcast + Reshape>(
-    key_or_value: A,
+fn expand_key_value_heads<V: Value<Type: ArrayMemberType> + Broadcast + Reshape>(
+    key_or_value: V,
     dimensions: &AttentionDimensions,
-) -> Result<A, ProgramError> {
+) -> Result<V, ProgramError> {
     if dimensions.key_value_heads == dimensions.query_heads {
         return Ok(key_or_value);
     }
     let group = dimensions.query_heads / dimensions.key_value_heads;
     let r#type = key_or_value.r#type();
+    let r#type = r#type.as_array_type()?;
     let [batch, length, _, head_dimension] = r#type.shape().dimensions() else {
         return Err(TypeError::invalid(format!(
             "attention key or value type `{}` does not have the normalized rank 4",
-            r#type.as_ref(),
+            r#type,
         ))
         .into());
     };
@@ -2729,12 +2695,13 @@ fn expand_key_value_heads<A: Value<Type = ArrayType> + Broadcast + Reshape>(
 /// Sums the `BSNH` key or value cotangent of grouped query heads back to the `BSKH` form of the key/value heads that
 /// those query heads share, by splitting its query head axis into the key/value head and group axes of the `BSKGH`
 /// form and summing over the group axis. Like [`expand_key_value_heads`], it keeps the batch and sequence dimensions.
-fn sum_key_value_head_groups<A: Value<Type = ArrayType> + Reduce + Reshape>(
-    cotangent: A,
+fn sum_key_value_head_groups<V: Value<Type: ArrayMemberType> + Reduce + Reshape>(
+    cotangent: V,
     dimensions: &AttentionDimensions,
-) -> Result<A, ProgramError> {
+) -> Result<V, ProgramError> {
     let group = dimensions.query_heads / dimensions.key_value_heads;
     let r#type = cotangent.r#type();
+    let r#type = r#type.as_array_type()?;
     let grouped_dimensions = vec![
         r#type.dimension(0),
         r#type.dimension(1),
@@ -2747,13 +2714,13 @@ fn sum_key_value_head_groups<A: Value<Type = ArrayType> + Reduce + Reshape>(
 
 /// Prepends unit axes until one bias or mask input has the normalized `BNTS` score rank, which preserves the dynamic
 /// extents of the input.
-fn normalize_attention_score_input<A: Value<Type = ArrayType> + Reshape>(input: A) -> Result<A, ProgramError> {
-    let rank = input.r#type().rank();
+fn normalize_attention_score_input<V: Value<Type: ArrayMemberType> + Reshape>(input: V) -> Result<V, ProgramError> {
+    let rank = input.r#type().as_array_type()?.rank();
     if rank == 4 {
         return Ok(input);
     }
     let dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - rank)
-        .chain(input.r#type().shape().dimensions().iter().cloned())
+        .chain(input.r#type().as_array_type()?.shape().dimensions().iter().cloned())
         .collect::<Vec<_>>();
     input.reshape(Shape::new(dimensions))
 }
@@ -2761,26 +2728,25 @@ fn normalize_attention_score_input<A: Value<Type = ArrayType> + Reshape>(input: 
 /// Applies the configured dropout to `probabilities`, whose shape is the normalized `BNTS` score shape, using the
 /// dropout random state of `inputs` (refer to [`AttentionInputs::dropout_state`]). The forward and backward bodies call
 /// this with arrays of the same shape and the same state, so they apply the same mask.
-fn apply_dropout<V: Value<Type: AttentionUniverse<V>>>(
-    probabilities: ArrayOf<V>,
+fn apply_dropout<V: Value + Dropout>(
+    probabilities: V,
     inputs: &AttentionInputs<V>,
     configuration: AttentionConfiguration,
-) -> Result<ArrayOf<V>, ProgramError> {
+) -> Result<V, ProgramError> {
     let Some(rate) = configuration.dropout() else {
         return Ok(probabilities);
     };
-    let state = inputs.dropout_state.clone().map(V::Type::into_array).transpose()?;
-    Ok(probabilities.dropout(rate, state.as_ref())?.0)
+    Ok(probabilities.dropout(rate, inputs.dropout_state.as_ref())?.0)
 }
 
 /// Zeros query rows outside each batch item's logical sequence length.
-fn zero_query_rows<V: Value<Type: AttentionUniverse<V>>>(
-    rows_value: ArrayOf<V>,
+fn zero_query_rows<V: Value + BroadcastLike + Compare + FillLike + IotaLike + Select>(
+    rows_value: V,
     query_lengths: &V,
     row_axis: usize,
-) -> Result<ArrayOf<V>, ProgramError> {
+) -> Result<V, ProgramError> {
     let rows = rows_value.iota_like(row_axis, DataType::I32)?;
-    let lengths = V::Type::into_array(query_lengths.clone())?.broadcast_like(&rows, &[0])?;
+    let lengths = query_lengths.broadcast_like(&rows, &[0])?;
     let in_range = rows.compare(&lengths, ComparisonDirection::LessThan)?;
     let zero = rows_value.fill_like(0.0)?;
     in_range.select(&rows_value, &zero)
@@ -2788,10 +2754,10 @@ fn zero_query_rows<V: Value<Type: AttentionUniverse<V>>>(
 
 /// Removes the implicit batch axis after evaluating unbatched attention. The removed axis is the unit axis that
 /// [`normalize_attention_input`] inserts, which every output and cotangent inherits from the query or the key.
-fn denormalize_attention_output<A: Value<Type = ArrayType> + Reshape>(
-    output: A,
+fn denormalize_attention_output<V: Value<Type: ArrayMemberType> + Reshape>(
+    output: V,
     rank: usize,
-) -> Result<A, ProgramError> {
+) -> Result<V, ProgramError> {
     if rank == 4 {
         return Ok(output);
     }
@@ -2809,7 +2775,7 @@ fn denormalize_attention_output<A: Value<Type = ArrayType> + Reshape>(
 /// Every extent comes from the values' [`AttentionUniverse`], so this supports static extents and, in array IR
 /// families, first-class dynamic extents (i.e., a dynamic mapped extent, logical batch, or sequence length never
 /// becomes host metadata). Calls whose inputs are all replicated stage the unbatched definition.
-fn batch_attention<V: Value<Type: AttentionUniverse<V>>>(
+fn batch_attention<V: Value<Type: AttentionUniverse<V>> + Reduce + Transpose>(
     inputs: Vec<V>,
     axes: Vec<BatchAxis>,
     extent: &BatchingLevelExtent<V>,
@@ -2840,7 +2806,7 @@ fn batch_attention<V: Value<Type: AttentionUniverse<V>>>(
                     }
                     let permutation =
                         std::iter::once(position).chain((0..rank).filter(|axis| *axis != position)).collect::<Vec<_>>();
-                    Ok(V::Type::from_array(V::Type::into_array(input.clone())?.transpose(permutation)?))
+                    input.transpose(permutation)
                 }
                 None => {
                     let output_extents =
@@ -2956,9 +2922,8 @@ fn batch_attention<V: Value<Type: AttentionUniverse<V>>>(
                         .map(|axis| axis + 1)
                         .collect::<Vec<_>>();
                     let normalized = V::Type::reshape(&output, &score_extents()?.0)?;
-                    let reduced =
-                        V::Type::into_array(normalized)?.reduce(reduction_axes.as_slice(), ReductionKind::Sum)?;
-                    V::Type::reshape(&V::Type::from_array(reduced), V::Type::extents(&aligned[input_index])?.as_slice())
+                    let reduced = normalized.reduce(reduction_axes.as_slice(), ReductionKind::Sum)?;
+                    V::Type::reshape(&reduced, V::Type::extents(&aligned[input_index])?.as_slice())
                 }
             }
         })
@@ -3027,10 +2992,6 @@ mod tests {
     fn test_attention_universe() {
         let array = f32_array(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
-        // Homogeneous array values are their own array views.
-        assert_eq!(<ArrayType as AttentionUniverse<Array>>::into_array(array.clone()), Ok(array.clone()));
-        assert_eq!(<ArrayType as AttentionUniverse<Array>>::from_array(array.clone()), array);
-
         // Extents are static host numbers, so dynamic batching extents and overflowing products are rejected.
         assert_eq!(
             <ArrayType as AttentionUniverse<Array>>::batch_extent(&array, &BatchingLevelExtent::Static(4)),
@@ -3065,16 +3026,8 @@ mod tests {
 
     #[test]
     fn test_attention_universe_array_ir() {
-        let array = f32_array(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let value = ArrayIrValue::Array(array.clone());
+        let value = ArrayIrValue::Array(f32_array(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
         let dimension = |extent| ArrayIrValue::<Array>::Dimension(DimensionValue::constant(extent).unwrap());
-
-        // Array IR values project to their array members.
-        assert_eq!(
-            <ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::into_array(value.clone()),
-            Ok(array.clone()),
-        );
-        assert_eq!(<ArrayIrType as AttentionUniverse<ArrayIrValue<Array>>>::from_array(array), value);
 
         // Extents are first-class dimension values, which include dynamic batching extents.
         assert_eq!(

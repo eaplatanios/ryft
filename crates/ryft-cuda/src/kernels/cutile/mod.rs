@@ -564,7 +564,7 @@ fn launch_grid(kernel: &VerifiedKernel<'_, NoKernelExtension>) -> Result<[u32; 3
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{ReferenceRead, ReferenceWrite};
+    use ryft_core::{LogicalMesh, MeshAxis, ReferenceRead, ReferenceWrite, Sharding, ShardingError};
     use ryft_kernels::{Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, whole_array_parameter};
 
     use super::*;
@@ -778,22 +778,24 @@ mod tests {
     }
     #[test]
     fn test_parameter_from_type_manual_sharding() {
-        use ryft_core::{LogicalMesh, MeshAxis, Sharding};
         let base = ArrayType::new_static(DataType::F32, [4]);
-        for axis_type in [MeshAxisType::Manual, MeshAxisType::Auto, MeshAxisType::Explicit] {
+        let sharding = |axis_type: MeshAxisType| {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
-            let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-            let array_type = base.clone().with_sharding(sharding).unwrap();
-            if axis_type == MeshAxisType::Manual {
-                assert_eq!(Parameter::from_type(&array_type).unwrap(), Parameter::from_type(&base).unwrap());
-                assert_eq!(array_type.sharding().unwrap().mesh().axis_type("x"), Some(MeshAxisType::Manual));
-            } else {
-                assert_eq!(
-                    Parameter::from_type(&array_type).unwrap_err().to_string(),
-                    "cuTile cannot lower `parameter`: requires local manual-only sharding"
-                );
-            }
-        }
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap()
+        };
+        let manual = base.clone().with_sharding(sharding(MeshAxisType::Manual)).unwrap();
+        assert_eq!(Parameter::from_type(&manual).unwrap(), Parameter::from_type(&base).unwrap());
+        assert_eq!(manual.sharding().unwrap().mesh().axis_type("x"), Some(MeshAxisType::Manual));
+        let explicit = base.clone().with_sharding(sharding(MeshAxisType::Explicit)).unwrap();
+        assert_eq!(
+            Parameter::from_type(&explicit).unwrap_err().to_string(),
+            "cuTile cannot lower `parameter`: requires local manual-only sharding"
+        );
+        // Types cannot record placement over auto mesh axes, so no parameter type is partitioned over one.
+        assert_eq!(
+            base.clone().with_sharding(sharding(MeshAxisType::Auto)),
+            Err(ShardingError::AutoAxisInArrayType { sharding: sharding(MeshAxisType::Auto) }),
+        );
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh, 1).with_varying_manual_axes(["x"]).unwrap();
         assert_eq!(
