@@ -515,9 +515,19 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
         let axes = context.collective_axes(self)?;
         let (arrays, extents) = context.collective_arrays(inputs)?;
         let name = self.name();
+
         if let Some(payload_axis_size) = self.axis_size() {
             context.validate_collective_axis_size(self, &axes, payload_axis_size)?;
         }
+
+        // A mesh reduction records the mesh that it was staged over, whose participants must be the devices of the
+        // manual region that actually binds each reduced axis.
+        if let Some(mesh) = self.mesh() {
+            for axis_name in self.axes().names() {
+                context.validate_collective_mesh(self, axis_name, Some(mesh))?;
+            }
+        }
+
         let outputs = context.grid().map_devices(|device| {
             let (participants, _) = context.grid().participants(device, &axes, self.axis_index_groups())?;
             let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
@@ -526,6 +536,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
                 &context.collective_output_type(self, arrays[device], extents, device)?,
             )
         })?;
+
         Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }

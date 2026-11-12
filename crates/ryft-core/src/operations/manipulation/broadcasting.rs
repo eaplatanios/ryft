@@ -5675,7 +5675,10 @@ mod tests {
             program.to_string(),
             formatdoc! {"
                 lambda %0:{input_type} .
-                let %1:{output_type} = broadcast [output_type={output_type}, output_axes=[1]] %0
+                let %1:{output_type} = broadcast [
+                    output_type={output_type},
+                    output_axes=[1],
+                ] %0
                 in (%1)"},
         );
     }

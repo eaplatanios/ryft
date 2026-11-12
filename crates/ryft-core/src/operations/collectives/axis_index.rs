@@ -240,6 +240,12 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
     ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
         let axes = context.collective_axes(self)?;
         check_count!("input", inputs, 0, ProgramError);
+
+        // The coordinates differ across the devices, so the manual region that owns the axis must agree with this
+        // operation on whether that variation is tracked. Otherwise, a checked region would accept the output of the
+        // meshless form as replicated.
+        context.validate_collective_mesh(self, &self.axis_name, self.mesh.as_ref())?;
+
         let output_type = self.infer_output_types(&[], &[])?.remove(0);
         let outputs = context.grid().map_devices(|device| {
             let position = Array::scalar(context.grid().position(device, &axes) as u64)?;
