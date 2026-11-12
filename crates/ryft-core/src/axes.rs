@@ -547,6 +547,25 @@ pub trait MeshContext: Context {
         let _ = (mesh, retyped_mesh);
         function()
     }
+
+    /// Returns the mesh axes that the manual regions enclosing this context made manual, as their names paired with
+    /// their [`NamedAxis::Mesh`] bindings, innermost first and with each name once. Functions that must not make such
+    /// an axis manual again (e.g., [`shard_map`](fn@crate::shard_map), which selects its manual axes among the
+    /// remaining ones) use it.
+    ///
+    /// Like the default mesh, the manual axes are owned explicitly by the contexts that introduce them rather than
+    /// derived from their [named axes](NamedAxes::named_axes). A named batching level that shadows a manual mesh axis
+    /// hides the binding of that axis from [`NamedAxes`], so that collectives over the name communicate along the
+    /// batch axis, but the computation is still inside the manual region that made the axis manual, which still runs
+    /// one device per coordinate along it. Root traces are seeded with the manual axes (e.g., a `shard_map` body is
+    /// seeded with the manual axes of its map and of the regions that enclose that map), nested traces add the ones
+    /// they are seeded with to those of their parent, and transform contexts (e.g., batching and differentiation)
+    /// delegate to their parent. The default implementation returns no axes, which is correct for contexts that are
+    /// never inside a manual region (e.g., eager contexts).
+    #[inline]
+    fn manual_axes(&self) -> Vec<(String, NamedAxis)> {
+        Vec::new()
+    }
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> MeshContext for EagerContext<V, O>
@@ -572,6 +591,11 @@ where
     fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
         self.parent().with_retyped_mesh(mesh, retyped_mesh, function)
     }
+
+    #[inline]
+    fn manual_axes(&self) -> Vec<(String, NamedAxis)> {
+        self.parent().manual_axes()
+    }
 }
 
 impl<V: Value, O: Operation<Type = V::Type>, Capture> MeshContext for TracingContext<V, O, Capture>
@@ -586,6 +610,18 @@ where
     #[inline]
     fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
         self.local_mesh_retypings().with_retyped_mesh(mesh, retyped_mesh, function)
+    }
+
+    fn manual_axes(&self) -> Vec<(String, NamedAxis)> {
+        // A `TracingContext` is a leaf, so it reports only the manual axes that it was seeded with,
+        // with the first of several seeded bindings of one name.
+        let mut axes = Vec::<(String, NamedAxis)>::new();
+        for (name, axis) in self.local_manual_axes() {
+            if !axes.iter().any(|(visible, _)| visible == name) {
+                axes.push((name.clone(), self.local_mesh_retypings().retype_named_axis(axis.clone())));
+            }
+        }
+        axes
     }
 }
 
@@ -605,6 +641,18 @@ where
     fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
         self.local_mesh_retypings().with_retyped_mesh(mesh, retyped_mesh, function)
     }
+
+    fn manual_axes(&self) -> Vec<(String, NamedAxis)> {
+        // The manual regions that enclose the parent context also enclose this nested trace,
+        // so the seeded manual axes come ahead of the parent's manual axes of other names.
+        let mut axes = Vec::<(String, NamedAxis)>::new();
+        for (name, axis) in self.local_manual_axes().iter().cloned().chain(self.parent().manual_axes()) {
+            if !axes.iter().any(|(visible, _)| visible == &name) {
+                axes.push((name, self.local_mesh_retypings().retype_named_axis(axis)));
+            }
+        }
+        axes
+    }
 }
 
 impl<C: MeshContext> MeshContext for PartialEvaluationContext<C>
@@ -619,6 +667,11 @@ where
     #[inline]
     fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
         self.parent().with_retyped_mesh(mesh, retyped_mesh, function)
+    }
+
+    #[inline]
+    fn manual_axes(&self) -> Vec<(String, NamedAxis)> {
+        self.parent().manual_axes()
     }
 }
 
@@ -637,6 +690,13 @@ where
     fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
         self.parent().with_retyped_mesh(mesh, retyped_mesh, function)
     }
+
+    #[inline]
+    fn manual_axes(&self) -> Vec<(String, NamedAxis)> {
+        // A batching level makes no mesh axis manual and ends no manual region, so the manual axes of its parent stay
+        // manual even when its axis shadows the name of one of them.
+        self.parent().manual_axes()
+    }
 }
 
 impl<C: MeshContext, P: DifferentiationPolicy<C>> MeshContext for DifferentiationContext<C, P>
@@ -651,6 +711,11 @@ where
     #[inline]
     fn with_retyped_mesh<R, F: FnOnce() -> R>(&self, mesh: &LogicalMesh, retyped_mesh: &LogicalMesh, function: F) -> R {
         self.primal().with_retyped_mesh(mesh, retyped_mesh, function)
+    }
+
+    #[inline]
+    fn manual_axes(&self) -> Vec<(String, NamedAxis)> {
+        self.primal().manual_axes()
     }
 }
 
@@ -1207,6 +1272,141 @@ mod tests {
             });
             assert_eq!(partitioned.default_mesh(), Some(mesh.clone()));
             assert_eq!(context.default_mesh(), Some(mesh.clone()));
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_manual_axes() {
+        assert_eq!(TestArrayContext::new().manual_axes(), Vec::new());
+    }
+
+    #[test]
+    fn test_mesh_context_manual_axes_projected_context() {
+        assert_eq!(ProjectedContext::<_, ArrayType>::new(TestArrayContext::new()).manual_axes(), Vec::new());
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let axes = vec![(
+            "x".to_string(),
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+        )];
+        with_mesh_context(Some(mesh), axes.clone(), |context| {
+            assert_eq!(ProjectedContext::<_, ArrayType>::new(context.clone()).manual_axes(), axes);
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_manual_axes_tracing_context() {
+        assert_eq!(TestArrayTracingContext::new().manual_axes(), Vec::new());
+
+        // A scope built from named axes makes its mesh bindings manual, while its batched bindings and its default
+        // mesh make no axis manual.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let binding = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        let rows = NamedAxis::Batched { size: Some(5) };
+        with_mesh_context(Some(mesh.clone()), vec![("rows".to_string(), rows)], |context| {
+            assert_eq!(context.manual_axes(), Vec::new());
+        });
+        with_mesh_context(None, vec![("x".to_string(), binding.clone())], |context| {
+            assert_eq!(context.manual_axes(), vec![("x".to_string(), binding.clone())]);
+        });
+
+        // Explicit manual axes need no named axis bindings, which is how a scope carries a manual axis whose name
+        // a batching level shadows.
+        let shadowing = vec![("x".to_string(), NamedAxis::Batched { size: Some(3) })];
+        let scope =
+            TracingScope::new(shadowing.clone(), None).with_manual_axes(vec![("x".to_string(), binding.clone())]);
+        let context = TestArrayTracingContext::new().with_scope(scope);
+        assert_eq!(context.named_axes(), shadowing);
+        assert_eq!(context.manual_axes(), vec![("x".to_string(), binding)]);
+    }
+
+    #[test]
+    fn test_mesh_context_manual_axes_nested_tracing_context() {
+        assert_eq!(NestedTracingContext::new(TestArrayContext::new()).manual_axes(), Vec::new());
+
+        // The manual axes that a nested trace is seeded with come ahead of those of its parent.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let outer = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        let inner = NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 3, checks_manual_variation: true };
+        with_mesh_context(Some(mesh.clone()), vec![("x".to_string(), outer.clone())], |parent| {
+            let inherited = NestedTracingContext::new(parent.clone());
+            assert_eq!(inherited.manual_axes(), vec![("x".to_string(), outer.clone())]);
+
+            let (_, program) = NestedTracingContext::trace_in_scope(
+                inherited,
+                |inputs: Vec<Tracer<_>>| {
+                    assert_eq!(
+                        inputs[0].context().manual_axes(),
+                        vec![("y".to_string(), inner.clone()), ("x".to_string(), outer.clone())],
+                    );
+                    Ok(inputs)
+                },
+                vec![ArrayType::scalar(DataType::F64)],
+                TracingScope::new(vec![("y".to_string(), inner.clone())], None),
+            )
+            .unwrap();
+            assert_eq!(
+                program.to_string(),
+                indoc! {"
+                    lambda %0:f64[] .
+                    in (%0)
+                "}
+                .trim_end(),
+            );
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_manual_axes_partial_evaluation_context() {
+        assert_eq!(PartialEvaluationContext::new(TestArrayContext::new()).manual_axes(), Vec::new());
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let axes = vec![(
+            "x".to_string(),
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+        )];
+        with_mesh_context(Some(mesh), axes.clone(), |context| {
+            assert_eq!(PartialEvaluationContext::new(context.clone()).manual_axes(), axes);
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_manual_axes_batching_context() {
+        assert_eq!(BatchingContext::new(TestArrayContext::new(), 3).manual_axes(), Vec::new());
+
+        // Shadowing the manual axis with a batching axis hides its named binding, but the batching level is still
+        // inside the manual region that made the axis manual.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let binding = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        with_mesh_context(Some(mesh.clone()), vec![("x".to_string(), binding.clone())], |context| {
+            let batched = BatchingContext::new(context.clone(), 3).with_axis_name(Some("x".to_string()));
+            assert_eq!(batched.named_axes(), vec![("x".to_string(), NamedAxis::Batched { size: Some(3) })]);
+            assert_eq!(batched.manual_axes(), vec![("x".to_string(), binding.clone())]);
+
+            // A scope captured from the shadowing level keeps the manual axis for the traces that it seeds.
+            let scope = TracingScope::from_context(&batched);
+            assert_eq!(scope.named_axes(), batched.named_axes().as_slice());
+            assert_eq!(scope.manual_axes(), batched.manual_axes().as_slice());
+        });
+    }
+
+    #[test]
+    fn test_mesh_context_manual_axes_differentiation_context() {
+        assert_eq!(DifferentiationContext::fused(TestArrayContext::new()).manual_axes(), Vec::new());
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let axes = vec![(
+            "x".to_string(),
+            NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+        )];
+        with_mesh_context(Some(mesh), axes.clone(), |context| {
+            assert_eq!(DifferentiationContext::fused(context.clone()).manual_axes(), axes);
+            let primal = PartialEvaluationContext::new(context.clone());
+            assert_eq!(DifferentiationContext::partitioned(primal).manual_axes(), axes);
         });
     }
 

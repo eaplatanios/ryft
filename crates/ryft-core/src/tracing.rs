@@ -275,10 +275,11 @@ where
     }
 }
 
-/// Scope that a function is being traced in (i.e., the named axes that it can refer to and the default mesh that it
-/// uses when no mesh is given explicitly). A function that is traced in a fresh trace rather than inlined into the
-/// context that calls it (e.g., a staged callee) is traced in the scope of that context, so that it resolves named axes
-/// and the default mesh as it would if it were inlined there. The default scope has no named axes and no default mesh.
+/// Scope that a function is being traced in (i.e., the named axes that it can refer to, the default mesh that it uses
+/// when no mesh is given explicitly, and the mesh axes that the manual regions enclosing it made manual). A function
+/// that is traced in a fresh trace rather than inlined into the context that calls it (e.g., a staged callee) is traced
+/// in the scope of that context, so that it resolves named axes, the default mesh, and the enclosing manual axes as it
+/// would if it were inlined there. The default scope has no named axes, no default mesh, and no manual axes.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TracingScope {
     /// Named axes in scope, in the order that [`NamedAxes::named_axes`] reports them.
@@ -286,20 +287,38 @@ pub struct TracingScope {
 
     /// Default mesh in scope. Refer to [`MeshContext`] for more information.
     default_mesh: Option<LogicalMesh>,
+
+    /// Mesh axes that the enclosing manual regions made manual, in the order that [`MeshContext::manual_axes`]
+    /// reports them.
+    manual_axes: Vec<(String, NamedAxis)>,
 }
 
 impl TracingScope {
     /// Creates a new [`TracingScope`] with `named_axes` (in the order that [`NamedAxes::named_axes`] reports them)
-    /// and `default_mesh`.
+    /// and `default_mesh`. Its manual axes are the [`NamedAxis::Mesh`] bindings of `named_axes`, which are all of the
+    /// enclosing manual axes unless a named batching level shadows one of them. Use [`Self::with_manual_axes`] to
+    /// provide the manual axes of a context in which that may be the case, or [`Self::from_context`] to capture the
+    /// whole scope of a context.
     #[inline]
     pub fn new(named_axes: Vec<(String, NamedAxis)>, default_mesh: Option<LogicalMesh>) -> Self {
-        Self { named_axes, default_mesh }
+        let manual_axes =
+            named_axes.iter().filter(|(_, axis)| matches!(axis, NamedAxis::Mesh { .. })).cloned().collect();
+        Self { named_axes, default_mesh, manual_axes }
     }
 
-    /// Creates the [`TracingScope`] of `context` (i.e., the named axes and the default mesh that it has in scope).
+    /// Creates the [`TracingScope`] of `context` (i.e., the named axes, the default mesh, and the enclosing manual
+    /// axes that it has in scope).
     #[inline]
     pub fn from_context<C: NamedAxes + MeshContext>(context: &C) -> Self {
-        Self::new(context.named_axes(), context.default_mesh())
+        Self::new(context.named_axes(), context.default_mesh()).with_manual_axes(context.manual_axes())
+    }
+
+    /// Returns this [`TracingScope`] with its manual axes replaced by `manual_axes` (in the order that
+    /// [`MeshContext::manual_axes`] reports them).
+    #[inline]
+    pub fn with_manual_axes(mut self, manual_axes: Vec<(String, NamedAxis)>) -> Self {
+        self.manual_axes = manual_axes;
+        self
     }
 
     /// Returns the named axes in this [`TracingScope`].
@@ -312,6 +331,13 @@ impl TracingScope {
     #[inline]
     pub fn default_mesh(&self) -> Option<&LogicalMesh> {
         self.default_mesh.as_ref()
+    }
+
+    /// Returns the mesh axes that the manual regions enclosing this [`TracingScope`] made manual. Refer to
+    /// [`MeshContext::manual_axes`] for more information.
+    #[inline]
+    pub fn manual_axes(&self) -> &[(String, NamedAxis)] {
+        &self.manual_axes
     }
 }
 
@@ -399,23 +425,25 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
                 captures: Rc::new(RefCell::new(Vec::new())),
                 named_axes: Rc::new(Vec::new()),
                 default_mesh: None,
+                manual_axes: Rc::new(Vec::new()),
                 mesh_retypings: MeshRetypings::default(),
                 provenance: Rc::new(ProvenanceState::new()),
             }),
         }
     }
 
-    /// Returns this fresh [`TracingContext`] seeded with the named axes and the default mesh of `scope`, which its
-    /// [`NamedAxes`] and [`MeshContext`] implementations resolve. Staging uses it to trace a function in the scope
-    /// of the context that calls it, so that the function resolves them as it would if it were inlined there. Seed a
-    /// context before tracing anything into it, because the named axes and the default mesh are fixed for its lifetime
-    /// and shared by its clones.
+    /// Returns this fresh [`TracingContext`] seeded with the named axes, the default mesh, and the manual axes of
+    /// `scope`, which its [`NamedAxes`] and [`MeshContext`] implementations resolve. Staging uses it to trace a
+    /// function in the scope of the context that calls it, so that the function resolves them as it would if it were
+    /// inlined there. Seed a context before tracing anything into it, because the scope is fixed for its lifetime and
+    /// shared by its clones.
     #[inline]
     pub(crate) fn with_scope(mut self, scope: TracingScope) -> Self {
-        let TracingScope { named_axes, default_mesh } = scope;
+        let TracingScope { named_axes, default_mesh, manual_axes } = scope;
         let state = Rc::make_mut(&mut self.state);
         state.named_axes = Rc::new(named_axes);
         state.default_mesh = default_mesh.map(Rc::new);
+        state.manual_axes = Rc::new(manual_axes);
         self
     }
 
@@ -444,6 +472,12 @@ impl<V: Value, O: Operation<Type = V::Type>, C> TracingContext<V, O, C> {
     #[inline]
     pub(crate) fn local_default_mesh(&self) -> Option<&LogicalMesh> {
         self.state.default_mesh.as_deref()
+    }
+
+    /// Returns the manual axes this trace was seeded with, resolved by its [`MeshContext`] implementation.
+    #[inline]
+    pub(crate) fn local_manual_axes(&self) -> &[(String, NamedAxis)] {
+        self.state.manual_axes.as_slice()
     }
 
     /// Returns this trace's own mesh retyping stack, shared across its clones.
@@ -654,8 +688,7 @@ where
                 Input::To<Tracer<TracingContext<V, O, C>>>,
             ) -> Result<Output, ProgramError>,
             input_type: Input,
-            named_axes: Vec<(String, NamedAxis)>,
-            default_mesh: Option<LogicalMesh>,
+            scope: TracingScope,
         ) -> Result<(Output::To<V::Type>, Program<V, O, Input::To<V>, Output::To<V>>, usize), ProgramError>
         where
             TracingContext<V, O, C>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -665,12 +698,14 @@ where
             let input_structure = input_type.parameter_structure();
 
             let (output_types, outputs, output_structure) = {
+                let TracingScope { named_axes, default_mesh, manual_axes } = scope;
                 let context = TracingContext {
                     state: Rc::new(TracingContextState {
                         builder: builder.clone(),
                         captures: captures.clone(),
                         named_axes: Rc::new(named_axes),
                         default_mesh: default_mesh.map(Rc::new),
+                        manual_axes: Rc::new(manual_axes),
                         mesh_retypings: MeshRetypings::default(),
                         provenance: Rc::new(ProvenanceState::new()),
                     }),
@@ -697,12 +732,10 @@ where
         }
 
         let mut function = Some(function);
-        let TracingScope { named_axes, default_mesh } = scope;
         inner(
             &mut |context: &Self, input: Input::To<Tracer<Self>>| function.take().unwrap()(context, input),
             input_type,
-            named_axes,
-            default_mesh,
+            scope,
         )
     }
 }
@@ -864,6 +897,12 @@ struct TracingContextState<V: Value, O: Operation<Type = V::Type>, C> {
     /// mesh of that map.
     default_mesh: Option<Rc<LogicalMesh>>,
 
+    /// Manual axes this [`TracingContext`] was seeded with, resolved by its [`MeshContext`] implementation. They are
+    /// owned explicitly rather than derived from [`Self::named_axes`], because a named batching level that shadows a
+    /// manual mesh axis hides its binding there (refer to [`MeshContext::manual_axes`]). The list is immutable for the
+    /// [`TracingContext`]'s lifetime and shared across cloned contexts.
+    manual_axes: Rc<Vec<(String, NamedAxis)>>,
+
     /// Mesh retypings that are active in this trace (added via [`MeshContext::with_retyped_mesh`]), which its
     /// [`NamedAxes`] and [`MeshContext`] implementations apply to the bindings and the default mesh that they report.
     /// They are shared across cloned contexts.
@@ -884,6 +923,7 @@ impl<V: Value, O: Operation<Type = V::Type>, C> Clone for TracingContextState<V,
             captures: self.captures.clone(),
             named_axes: self.named_axes.clone(),
             default_mesh: self.default_mesh.clone(),
+            manual_axes: self.manual_axes.clone(),
             mesh_retypings: self.mesh_retypings.clone(),
             provenance: self.provenance.clone(),
         }
@@ -916,6 +956,10 @@ pub struct NestedTracingContext<C: Context> {
     /// implementation. When it is [`None`], the default mesh of the parent context applies.
     default_mesh: Option<Rc<LogicalMesh>>,
 
+    /// Manual axes this [`NestedTracingContext`] was seeded with, resolved by its [`MeshContext`] implementation ahead
+    /// of the manual axes of the parent context.
+    manual_axes: Rc<Vec<(String, NamedAxis)>>,
+
     /// Mesh retypings that are active in this nested trace (refer to [`MeshContext::with_retyped_mesh`]), which its
     /// [`NamedAxes`] and [`MeshContext`] implementations apply to the bindings and the default mesh that they report,
     /// including those of the parent context. They are shared across cloned contexts.
@@ -937,6 +981,7 @@ impl<C: Context> NestedTracingContext<C> {
             builder: Rc::new(RefCell::new(ProgramBuilder::new())),
             named_axes: Rc::new(Vec::new()),
             default_mesh: None,
+            manual_axes: Rc::new(Vec::new()),
             mesh_retypings: MeshRetypings::default(),
             provenance,
         }
@@ -965,6 +1010,13 @@ impl<C: Context> NestedTracingContext<C> {
     #[inline]
     pub(crate) fn local_default_mesh(&self) -> Option<&LogicalMesh> {
         self.default_mesh.as_deref()
+    }
+
+    /// Returns the manual axes this nested trace was seeded with, resolved by its [`MeshContext`] implementation
+    /// ahead of the parent context's manual axes.
+    #[inline]
+    pub(crate) fn local_manual_axes(&self) -> &[(String, NamedAxis)] {
+        self.manual_axes.as_slice()
     }
 
     /// Returns this nested trace's own mesh retyping stack, shared across its clones. These retypings also apply to
@@ -1048,8 +1100,7 @@ impl<C: Context> NestedTracingContext<C> {
             parent: C,
             function: &mut dyn FnMut(Vec<Tracer<NestedTracingContext<C>>>) -> Result<Output, ProgramError>,
             input_types: Vec<C::Type>,
-            named_axes: Vec<(String, NamedAxis)>,
-            default_mesh: Option<LogicalMesh>,
+            scope: TracingScope,
         ) -> Result<
             (Output::ParameterStructure, Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>),
             ProgramError,
@@ -1060,12 +1111,17 @@ impl<C: Context> NestedTracingContext<C> {
         {
             let input_count = input_types.len();
             let builder = Rc::new(RefCell::new(ProgramBuilder::new()));
-            let named_axes = Rc::new(named_axes);
+            let TracingScope { named_axes, default_mesh, manual_axes } = scope;
             let provenance = Rc::new(ProvenanceState::seeded(parent.provenance()));
-            let default_mesh = default_mesh.map(Rc::new);
-            let mesh_retypings = MeshRetypings::default();
-            let context =
-                NestedTracingContext { parent, builder, named_axes, default_mesh, mesh_retypings, provenance };
+            let context = NestedTracingContext {
+                parent,
+                builder,
+                named_axes: Rc::new(named_axes),
+                default_mesh: default_mesh.map(Rc::new),
+                manual_axes: Rc::new(manual_axes),
+                mesh_retypings: MeshRetypings::default(),
+                provenance,
+            };
 
             let (output_structure, output_atoms) = {
                 let input_tracers = input_types.into_iter().map(|r#type| context.input(r#type)).collect::<Vec<_>>();
@@ -1101,8 +1157,7 @@ impl<C: Context> NestedTracingContext<C> {
 
         let mut function = Some(function);
         let function = &mut |inputs: Vec<Tracer<Self>>| function.take().unwrap()(inputs);
-        let TracingScope { named_axes, default_mesh } = scope;
-        inner(parent, function, input_types, named_axes, default_mesh)
+        inner(parent, function, input_types, scope)
     }
 }
 
@@ -1114,6 +1169,7 @@ impl<C: Context> Clone for NestedTracingContext<C> {
             builder: self.builder.clone(),
             named_axes: self.named_axes.clone(),
             default_mesh: self.default_mesh.clone(),
+            manual_axes: self.manual_axes.clone(),
             mesh_retypings: self.mesh_retypings.clone(),
             provenance: self.provenance.clone(),
         }
@@ -1927,11 +1983,26 @@ mod tests {
         let scope = TracingScope::new(named_axes.clone(), Some(mesh.clone()));
         assert_eq!(scope.named_axes(), named_axes.as_slice());
         assert_eq!(scope.default_mesh(), Some(&mesh));
+        assert_eq!(scope.manual_axes(), &[]);
         assert_eq!(TracingScope::default(), TracingScope::new(Vec::new(), None));
 
-        // The scope of a context consists of exactly the named axes and the default mesh that it resolves.
+        // The mesh bindings among the named axes are manual axes, and a manual axis whose binding a batching level
+        // shadows is provided explicitly.
+        let devices = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        let manual_axes = vec![("devices".to_string(), devices)];
+        let manual_scope = TracingScope::new(manual_axes.clone(), Some(mesh.clone()));
+        assert_eq!(manual_scope.manual_axes(), manual_axes.as_slice());
+        let shadowed_scope = scope.clone().with_manual_axes(manual_axes.clone());
+        assert_eq!(shadowed_scope.named_axes(), named_axes.as_slice());
+        assert_eq!(shadowed_scope.manual_axes(), manual_axes.as_slice());
+        assert_ne!(shadowed_scope, scope);
+
+        // The scope of a context consists of exactly the named axes, the default mesh, and the manual axes that it
+        // resolves.
         let context = TestArrayTracingContext::new().with_scope(scope.clone());
         assert_eq!(TracingScope::from_context(&context), scope);
+        let context = TestArrayTracingContext::new().with_scope(shadowed_scope.clone());
+        assert_eq!(TracingScope::from_context(&context), shadowed_scope);
         assert_eq!(TracingScope::from_context(&TestArrayTracingContext::new()), TracingScope::default());
     }
 
