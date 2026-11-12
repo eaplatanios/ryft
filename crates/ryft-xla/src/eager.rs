@@ -5,8 +5,7 @@ use ryft_core::{
     ShapeChangingCollectiveValue, Sub, Typed, WhilePredicate, Xor,
 };
 
-use crate::arrays_v0::host::materialize_dense_array_bytes;
-use crate::{Array, ArrayShard};
+use crate::{Array, Error};
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -20,46 +19,18 @@ use crate::{Array, ArrayShard};
 // `WhilePredicate`. Backend arrays opt into the shared shape-changing collective capabilities through
 // `ShapeChangingCollectiveValue`.
 
-/// Copies the dense payload bytes of one addressable [`ArrayShard`] to the host, surfacing missing buffers and PJRT
-/// transfer failures as [`ProgramError::Concretization`] errors.
-fn shard_host_bytes(shard: &ArrayShard<'_>) -> Result<Vec<u8>, ProgramError> {
-    let concretization = |message: String| ProgramError::Concretization { message };
-    let buffer = shard
-        .buffer()
-        .ok_or_else(|| concretization("cannot read a non-addressable array shard from the current process".into()))?;
-    buffer
-        .copy_to_host(None)
-        .map_err(|error| concretization(error.to_string()))?
-        .r#await()
-        .map_err(|error| concretization(error.to_string()))
-}
-
-/// Copies the dense payload bytes of the rank-zero `array` to the host from its addressable `shard`, unless the
-/// sharding of `array` has unreduced axes, along which the devices hold per-device values (e.g., summands) of the
-/// value, in which case every shard is copied and those values are combined with the unreduced kind of the sharding
-/// (refer to `materialize_dense_array_bytes`).
-fn scalar_host_bytes(array: &Array<'_>, shard: &ArrayShard<'_>) -> Result<Vec<u8>, ProgramError> {
-    if array.sharding().unreduced_axes().is_empty() {
-        shard_host_bytes(shard)
-    } else {
-        materialize_dense_array_bytes(array)
-            .map_err(|error| ProgramError::Concretization { message: error.to_string() })
-    }
+/// Reports a failed host readback of an [`Array`] as a [`ProgramError::Concretization`] error.
+fn concretization_error(error: Error) -> ProgramError {
+    ProgramError::Concretization { message: error.to_string() }
 }
 
 impl Concretizable<bool> for Array<'_> {
-    /// Extracts a concrete scalar Rust Boolean by copying one addressable shard of a rank-0 Boolean-typed [`Array`]
-    /// to the host. Higher-rank or non-Boolean arrays error because they cannot collapse to a single Boolean, and
-    /// arrays with no addressable shards error because the current process cannot read their payload.
+    /// Extracts a concrete scalar Rust Boolean by copying the value of a rank-0 Boolean-typed [`Array`] to the host
+    /// with [`Array::copy_to_host`]. Higher-rank or non-Boolean arrays error because they cannot collapse to a single
+    /// Boolean, and arrays whose value the current process does not hold error because it cannot read their payload.
     fn concretize(&self) -> Result<bool, ProgramError> {
         if self.r#type().rank() == 0 && self.data_type().is_boolean() {
-            let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
-                message: format!(
-                    "cannot extract a concrete boolean from an array of type {} with no addressable shards",
-                    self.r#type().as_ref(),
-                ),
-            })?;
-            let bytes = shard_host_bytes(shard)?;
+            let bytes = self.copy_to_host().map_err(concretization_error)?;
             return Ok(bytes.iter().any(|byte| *byte != 0));
         }
         Err(ProgramError::Concretization {
@@ -73,32 +44,20 @@ impl Concretizable<bool> for Array<'_> {
 
 impl Concretizable<i128> for Array<'_> {
     fn concretize(&self) -> Result<i128, ProgramError> {
-        let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
-            message: format!(
-                "cannot read an index from an array of type `{}` with no addressable shards",
-                self.r#type()
-            ),
-        })?;
-        // Decode through the CPU capability to preserve every signed and unsigned integer value. Rank-zero
-        // arrays are replicated, so reading one addressable shard provides the complete scalar.
-        ryft_core::Array::new(self.r#type().into_owned(), scalar_host_bytes(self, shard)?)?.concretize()
+        // Decode through the CPU capability to preserve every signed and unsigned integer value.
+        let bytes = self.copy_to_host().map_err(concretization_error)?;
+        ryft_core::Array::new(self.r#type().into_owned(), bytes)?.concretize()
     }
 }
 
 impl AssertionValue for Array<'_> {
     fn assertion_observation(&self) -> Result<String, ProgramError> {
-        let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
-            message: format!(
-                "cannot read an assertion observation from an array of type `{}` with no addressable shards",
-                self.r#type()
-            ),
-        })?;
-        ryft_core::Array::new(self.r#type().into_owned(), scalar_host_bytes(self, shard)?)?.assertion_observation()
+        let bytes = self.copy_to_host().map_err(concretization_error)?;
+        ryft_core::Array::new(self.r#type().into_owned(), bytes)?.assertion_observation()
     }
 
     fn assertion_array(&self) -> Result<Option<ryft_core::Array>, ProgramError> {
-        let bytes = materialize_dense_array_bytes(self)
-            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        let bytes = self.copy_to_host().map_err(concretization_error)?;
         Ok(Some(ryft_core::Array::new(ArrayType::new(self.data_type(), self.shape().into()), bytes)?))
     }
 }
@@ -129,13 +88,7 @@ impl DimensionFromScalar<DimensionValue, ArrayType> for Array<'_> {
         let operation = DimensionFromScalarOperation::new(output.into());
         let mut output_types = operation.infer_output_types(&[ArrayIrType::Array(self.r#type().into_owned())], &[])?;
         let output_type = <&DimensionType>::try_from(&output_types.remove(0))?.clone();
-        let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
-            message: format!(
-                "cannot convert an array of type {} with no addressable shards to a dimension",
-                self.r#type().as_ref(),
-            ),
-        })?;
-        let bytes = scalar_host_bytes(self, shard)?;
+        let bytes = self.copy_to_host().map_err(concretization_error)?;
         let invalid_extent = |value: String| ProgramError::InvalidArgument {
             message: format!(
                 "`{}` scalar input must be a nonnegative host-representable extent but is {value}",
@@ -265,6 +218,13 @@ impl WhilePredicate for Array<'_> {
                 message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type()),
             });
         }
+
+        // The shards are read one at a time, so the whole execution that produced this array is observed first to
+        // surface its errors, including those that are not tied to an individual shard buffer.
+        if let Some(fence) = self.execution_fence() {
+            fence.block_until_ready().map_err(|error| concretization_error(error.into()))?;
+        }
+
         // Reading every addressable shard covers all elements for both sharded placements (the shards partition the
         // payload) and replicated placements (`or` is idempotent over duplicates). Non-addressable shards would leave
         // remote elements unobserved, so they surface as concretization errors instead of a silently partial answer.
@@ -273,9 +233,10 @@ impl WhilePredicate for Array<'_> {
         for shard in self.addressable_shards() {
             addressable_count += 1;
             if !any {
-                any = shard_host_bytes(shard)?.iter().any(|byte| *byte != 0);
+                any = shard.copy_to_host().map_err(concretization_error)?.iter().any(|byte| *byte != 0);
             }
         }
+
         if addressable_count != self.shards().len() {
             return Err(ProgramError::Concretization {
                 message: format!(
@@ -300,6 +261,7 @@ impl WhilePredicate for Array<'_> {
                 ),
             });
         }
+
         // Broadcast a prefix-shaped predicate up to the operands' full shape (its axes map to the leading output
         // axes) so the staged select receives shape-congruent operands.
         let condition = if self.r#type().shape() == on_true.r#type().shape() {
@@ -309,6 +271,7 @@ impl WhilePredicate for Array<'_> {
             let output_axes = (0..self.r#type().rank()).collect::<Vec<_>>();
             self.broadcast(output_type, output_axes.as_slice())?
         };
+
         Select::select(&condition, on_true, on_false)
     }
 }
@@ -422,7 +385,7 @@ mod tests {
         let count = dimensions.iter().product();
         let mut coordinates = vec![None; count];
         for shard in array.addressable_shards() {
-            let bytes = shard_host_bytes(shard).unwrap();
+            let bytes = shard.copy_to_host().unwrap();
             let values = match array.data_type() {
                 DataType::BF16 => bytes
                     .chunks_exact(2)
@@ -530,71 +493,32 @@ mod tests {
             let right =
                 Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[4]), mesh.clone(), &[0, 1, 0, 1])
                     .unwrap();
-            assert_eq!(
-                shard_host_bytes(left.add(&right).unwrap().addressable_shards().next().unwrap()).unwrap(),
-                vec![0, 1, 1, 0],
-            );
-            assert_eq!(
-                shard_host_bytes(left.sub(&right).unwrap().addressable_shards().next().unwrap()).unwrap(),
-                vec![0, 1, 1, 0],
-            );
-            assert_eq!(
-                shard_host_bytes(left.mul(&right).unwrap().addressable_shards().next().unwrap()).unwrap(),
-                vec![0, 0, 0, 1],
-            );
-            assert_eq!(
-                shard_host_bytes(left.neg().unwrap().addressable_shards().next().unwrap()).unwrap(),
-                vec![0, 0, 1, 1],
-            );
+            assert_eq!(left.add(&right).unwrap().copy_to_host().unwrap(), vec![0, 1, 1, 0],);
+            assert_eq!(left.sub(&right).unwrap().copy_to_host().unwrap(), vec![0, 1, 1, 0],);
+            assert_eq!(left.mul(&right).unwrap().copy_to_host().unwrap(), vec![0, 0, 0, 1],);
+            assert_eq!(left.neg().unwrap().copy_to_host().unwrap(), vec![0, 0, 1, 1],);
             let divisor =
                 Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[]), mesh.clone(), &[1]).unwrap();
-            assert_eq!(
-                shard_host_bytes(left.div(&divisor).unwrap().addressable_shards().next().unwrap()).unwrap(),
-                vec![0, 0, 1, 1],
-            );
-            assert_eq!(
-                shard_host_bytes(left.rem(&divisor).unwrap().addressable_shards().next().unwrap()).unwrap(),
-                vec![0, 0, 0, 0],
-            );
+            assert_eq!(left.div(&divisor).unwrap().copy_to_host().unwrap(), vec![0, 0, 1, 1],);
+            assert_eq!(left.rem(&divisor).unwrap().copy_to_host().unwrap(), vec![0, 0, 0, 0],);
             // The CPU backend's division-by-zero sentinel also narrows to the single set bit.
             let zero =
                 Array::from_host_buffer(&domain, replicated_type(&mesh, data_type, &[]), mesh.clone(), &[0]).unwrap();
-            assert_eq!(
-                shard_host_bytes(left.div(&zero).unwrap().addressable_shards().next().unwrap()).unwrap(),
-                vec![1, 1, 1, 1],
-            );
-            assert_eq!(
-                shard_host_bytes(left.rem(&zero).unwrap().addressable_shards().next().unwrap()).unwrap(),
-                vec![0, 0, 1, 1],
-            );
+            assert_eq!(left.div(&zero).unwrap().copy_to_host().unwrap(), vec![1, 1, 1, 1],);
+            assert_eq!(left.rem(&zero).unwrap().copy_to_host().unwrap(), vec![0, 0, 1, 1],);
         }
         let signed =
             Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::I1, &[2]), mesh.clone(), &[1, 0])
                 .unwrap();
-        assert_eq!(shard_host_bytes(signed.sign().unwrap().addressable_shards().next().unwrap()).unwrap(), vec![1, 0]);
+        assert_eq!(signed.sign().unwrap().copy_to_host().unwrap(), vec![1, 0]);
         // Implicit promotion must interpret a signed set bit as minus one before doing wider arithmetic.
         let two =
             Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::I8, &[]), mesh.clone(), &[2]).unwrap();
-        assert_eq!(
-            shard_host_bytes(signed.add(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
-            vec![1, 2],
-        );
-        assert_eq!(
-            shard_host_bytes(signed.sub(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
-            vec![253, 254],
-        );
-        assert_eq!(
-            shard_host_bytes(signed.mul(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
-            vec![254, 0],
-        );
-        assert_eq!(
-            shard_host_bytes(signed.div(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
-            vec![0, 0],
-        );
-        assert_eq!(
-            shard_host_bytes(signed.rem(&two).unwrap().addressable_shards().next().unwrap()).unwrap(),
-            vec![255, 0],
-        );
+        assert_eq!(signed.add(&two).unwrap().copy_to_host().unwrap(), vec![1, 2],);
+        assert_eq!(signed.sub(&two).unwrap().copy_to_host().unwrap(), vec![253, 254],);
+        assert_eq!(signed.mul(&two).unwrap().copy_to_host().unwrap(), vec![254, 0],);
+        assert_eq!(signed.div(&two).unwrap().copy_to_host().unwrap(), vec![0, 0],);
+        assert_eq!(signed.rem(&two).unwrap().copy_to_host().unwrap(), vec![255, 0],);
     }
 
     #[test]
@@ -618,11 +542,7 @@ mod tests {
         )
         .unwrap();
         let output = input.floor().unwrap();
-        let values = shard_host_bytes(output.addressable_shards().next().unwrap())
-            .unwrap()
-            .into_iter()
-            .map(f8e8m0fnu::from_bits)
-            .collect::<Vec<_>>();
+        let values = output.copy_to_host().unwrap().into_iter().map(f8e8m0fnu::from_bits).collect::<Vec<_>>();
         assert_eq!(values.iter().copied().map(f8e8m0fnu::is_nan).collect::<Vec<_>>(), [true, true, false, true]);
         assert_eq!(values[2], f8e8m0fnu::from_bits(127));
     }
@@ -648,11 +568,7 @@ mod tests {
         )
         .unwrap();
         let output = input.ceil().unwrap();
-        let values = shard_host_bytes(output.addressable_shards().next().unwrap())
-            .unwrap()
-            .into_iter()
-            .map(f8e8m0fnu::from_bits)
-            .collect::<Vec<_>>();
+        let values = output.copy_to_host().unwrap().into_iter().map(f8e8m0fnu::from_bits).collect::<Vec<_>>();
         assert_eq!(&values[..3], &[f8e8m0fnu::from_bits(127); 3]);
         assert!(values[3].is_nan());
     }
@@ -678,11 +594,7 @@ mod tests {
         )
         .unwrap();
         let output = input.round().unwrap();
-        let values = shard_host_bytes(output.addressable_shards().next().unwrap())
-            .unwrap()
-            .into_iter()
-            .map(f8e8m0fnu::from_bits)
-            .collect::<Vec<_>>();
+        let values = output.copy_to_host().unwrap().into_iter().map(f8e8m0fnu::from_bits).collect::<Vec<_>>();
         assert_eq!(values.iter().copied().map(f8e8m0fnu::is_nan).collect::<Vec<_>>(), [true, true, false, true]);
         assert_eq!(values[2], f8e8m0fnu::from_bits(127));
     }
@@ -702,7 +614,7 @@ mod tests {
         )
         .unwrap();
         let output = input.sin().unwrap();
-        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let values = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
         assert_eq!(values[0], 0.0);
         assert!((values[1] / 1.1169973830808555e308 - 1.0).abs() < 2e-15);
         assert_eq!(values[2], 0.0);
@@ -712,7 +624,7 @@ mod tests {
 
         let input = c64_scalar(&domain, &mesh, num_complex::Complex::new(0.0, 89.0));
         let output = input.sin().unwrap();
-        let values = values_from_bytes::<f32>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let values = values_from_bytes::<f32>(&output.copy_to_host().unwrap());
         assert_eq!(values[0], 0.0);
         assert!((values[1] / 2.2448064e38 - 1.0).abs() < 2e-7);
     }
@@ -730,7 +642,7 @@ mod tests {
         )
         .unwrap();
         let output = input.cos().unwrap();
-        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let values = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
         assert!((values[0] / 1.1169973830808555e308 - 1.0).abs() < 2e-15);
         assert_eq!(values[1], 0.0);
         assert!((values[2] / 1.1169973830808555e308 - 1.0).abs() < 2e-15);
@@ -740,7 +652,7 @@ mod tests {
 
         let input = c64_scalar(&domain, &mesh, num_complex::Complex::new(0.0, 89.0));
         let output = input.cos().unwrap();
-        let values = values_from_bytes::<f32>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let values = values_from_bytes::<f32>(&output.copy_to_host().unwrap());
         assert!((values[0] / 2.2448064e38 - 1.0).abs() < 2e-7);
         assert_eq!(values[1], 0.0);
     }
@@ -766,7 +678,7 @@ mod tests {
                 (),
             )
             .unwrap();
-        let values = values_from_bytes::<f64>(&shard_host_bytes(tangent.addressable_shards().next().unwrap()).unwrap());
+        let values = values_from_bytes::<f64>(&tangent.copy_to_host().unwrap());
         assert!((values[0] / 5e-201 - 1.0).abs() < 2e-15);
         assert!((values[1] / 5e199 - 1.0).abs() < 2e-15);
     }
@@ -788,18 +700,12 @@ mod tests {
         let reference = CoreArray::vector(values.to_vec()).unwrap();
         let tolerance = ryft_core::Accuracy::Tolerance(ryft_core::Tolerance::new(1e-6, 0.0, 0).unwrap());
         for accuracy in [ryft_core::Accuracy::Highest, tolerance] {
-            let output = values_from_bytes::<f32>(
-                &shard_host_bytes(input.sin_with_accuracy(accuracy).unwrap().addressable_shards().next().unwrap())
-                    .unwrap(),
-            );
+            let output = values_from_bytes::<f32>(&input.sin_with_accuracy(accuracy).unwrap().copy_to_host().unwrap());
             let expected = reference.sin().unwrap().elements::<f32>().unwrap();
             for (output, expected) in output.iter().zip(expected) {
                 assert!((output - expected).abs() <= 1e-6, "{output} vs {expected}");
             }
-            let output = values_from_bytes::<f32>(
-                &shard_host_bytes(input.tanh_with_accuracy(accuracy).unwrap().addressable_shards().next().unwrap())
-                    .unwrap(),
-            );
+            let output = values_from_bytes::<f32>(&input.tanh_with_accuracy(accuracy).unwrap().copy_to_host().unwrap());
             let expected = reference.tanh().unwrap().elements::<f32>().unwrap();
             for (output, expected) in output.iter().zip(expected) {
                 assert!((output - expected).abs() <= 1e-6, "{output} vs {expected}");
@@ -820,7 +726,7 @@ mod tests {
         )
         .unwrap();
         let output = input.tanh().unwrap();
-        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let values = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
         assert_eq!(values, [1.0, 0.0, 1.0, 0.0, -1.0, 0.0]);
     }
 
@@ -836,7 +742,7 @@ mod tests {
         assert_eq!(&reference.logical_bytes()[..3], &[1, 1, 2]);
         let input = Array::from_host_buffer(&domain, input_type, mesh, bytes).unwrap();
         let output = input.erf().unwrap();
-        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), reference.logical_bytes(),);
+        assert_eq!(output.copy_to_host().unwrap(), reference.logical_bytes(),);
     }
 
     #[test]
@@ -857,7 +763,7 @@ mod tests {
         )
         .unwrap();
         let output = input.exp_m1().unwrap();
-        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let values = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
         assert_eq!(values[..2], [1e-20, 1e-20]);
         assert!((values[2] + 5e-21).abs() < 1e-35);
         assert_eq!(values[3], 1e-10);
@@ -895,9 +801,8 @@ mod tests {
         )
         .unwrap();
         let (output, derivative) = differentiate_at(input).jvp(tangent, |input| input.logistic()).unwrap();
-        let output = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
-        let derivative =
-            values_from_bytes::<f64>(&shard_host_bytes(derivative.addressable_shards().next().unwrap()).unwrap());
+        let output = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
+        let derivative = values_from_bytes::<f64>(&derivative.copy_to_host().unwrap());
         let expected = (-700.0f64).exp();
         assert!(output[0] > 0.0 && (output[0] / expected - 1.0).abs() < 1e-12);
         assert!((derivative[0] / expected - 1.0).abs() < 1e-12);
@@ -918,9 +823,8 @@ mod tests {
         )
         .unwrap();
         let (output, derivative) = differentiate_at(input).jvp(tangent, |input| input.logistic()).unwrap();
-        let output = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
-        let derivative =
-            values_from_bytes::<f64>(&shard_host_bytes(derivative.addressable_shards().next().unwrap()).unwrap());
+        let output = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
+        let derivative = values_from_bytes::<f64>(&derivative.copy_to_host().unwrap());
         assert!(output[0] > 0.0 && (output[0] / expected - 1.0).abs() < 1e-12);
         assert_eq!([output[1], output[2], output[3]], [0.0, 1.0, 0.0]);
         assert!((derivative[0] / expected - 1.0).abs() < 1e-12);
@@ -1030,7 +934,7 @@ mod tests {
             Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[127])
                 .unwrap();
         let output = input.log().unwrap();
-        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), [255]);
+        assert_eq!(output.copy_to_host().unwrap(), [255]);
     }
 
     #[test]
@@ -1047,7 +951,7 @@ mod tests {
         )
         .unwrap();
         let output = input.ln_1p().unwrap();
-        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let values = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
         assert!((values[0] - 1e-20).abs() < 1e-35);
         assert!((values[1] - 1e-20).abs() < 1e-35);
         assert_eq!(&values[2..6], &[0.0, std::f64::consts::PI, 0.0, -std::f64::consts::PI]);
@@ -1071,7 +975,7 @@ mod tests {
         )
         .unwrap();
         let output = input.cumulative_log_sum_exp(0).unwrap();
-        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), vec![0xff; 3001]);
+        assert_eq!(output.copy_to_host().unwrap(), vec![0xff; 3001]);
     }
 
     #[test]
@@ -1126,11 +1030,7 @@ mod tests {
             )
             .unwrap()
         };
-        let read = |array: Array<'_>| {
-            values_from_bytes::<num_complex::Complex<f64>>(
-                &shard_host_bytes(array.addressable_shards().next().unwrap()).unwrap(),
-            )
-        };
+        let read = |array: Array<'_>| values_from_bytes::<num_complex::Complex<f64>>(&array.copy_to_host().unwrap());
         let reference = |values: &[num_complex::Complex<f64>]| CoreArray::vector(values.to_vec()).unwrap();
 
         // Components must agree to a small relative tolerance, which cannot hide a lost tiny correction the way an
@@ -1235,9 +1135,7 @@ mod tests {
             }
             expected
         };
-        let read = |array: Array<'_>| {
-            values_from_bytes::<f32>(&shard_host_bytes(array.addressable_shards().next().unwrap()).unwrap())
-        };
+        let read = |array: Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
         assert_eq!(read(input.cumulative_sum(1).unwrap()), scan(false));
         assert_eq!(read(input.reverse_cumulative_sum(1).unwrap()), scan(true));
 
@@ -1250,10 +1148,7 @@ mod tests {
         )
         .unwrap();
         let output = integers.cumulative_sum(0).unwrap();
-        assert_eq!(
-            values_from_bytes::<i32>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap()),
-            vec![1, -2, 4, 2, -1, 8, 6, 0],
-        );
+        assert_eq!(values_from_bytes::<i32>(&output.copy_to_host().unwrap()), vec![1, -2, 4, 2, -1, 8, 6, 0],);
     }
 
     #[test]
@@ -1311,7 +1206,7 @@ mod tests {
             Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::F8E8M0FNU, &[1]), mesh.clone(), &[126])
                 .unwrap();
         let output = left.log_add_exp(&right).unwrap();
-        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), [127]);
+        assert_eq!(output.copy_to_host().unwrap(), [127]);
         let left = Array::from_host_buffer(
             &domain,
             replicated_type(&mesh, DataType::F16, &[2]),
@@ -1328,7 +1223,7 @@ mod tests {
         .unwrap();
         let output = left.log_add_exp(&right).unwrap();
         assert_eq!(
-            values_from_bytes::<f16>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap()),
+            values_from_bytes::<f16>(&output.copy_to_host().unwrap()),
             [f16::from_f32(1.4736328125), f16::from_f32(-4.30859375)],
         );
 
@@ -1341,7 +1236,7 @@ mod tests {
         )
         .unwrap();
         let output = input.log_add_exp(&input).unwrap();
-        let values = values_from_bytes::<f64>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let values = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
         assert!((values[0] - std::f64::consts::LN_2).abs() < 1e-15);
         assert!((values[1] - (4.0 - 2.0 * std::f64::consts::PI)).abs() < 1e-15);
         // Already-principal tiny phases must not disappear through an unnecessary add/subtract of pi.
@@ -1353,7 +1248,7 @@ mod tests {
         )
         .unwrap();
         let output = input.log_add_exp(&input).unwrap();
-        let values = values_from_bytes::<f32>(&shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap());
+        let values = values_from_bytes::<f32>(&output.copy_to_host().unwrap());
         assert_eq!(values[1], 1e-20);
     }
 
@@ -1472,7 +1367,7 @@ mod tests {
         // Element-type conversion agrees, including the exact `f8e4m3fn` encodings: the device payload bytes match
         // the reference backend's encoded bits bit for bit.
         let converted = left.convert_element_type(DataType::F8E4M3FN).unwrap();
-        let converted_bytes = shard_host_bytes(&converted.addressable_shards().next().unwrap()).unwrap();
+        let converted_bytes = converted.copy_to_host().unwrap();
         let reference_bits = reference_left.convert_element_type(DataType::F8E4M3FN).unwrap().logical_bytes();
         assert_eq!(converted_bytes, reference_bits);
 
@@ -1554,7 +1449,7 @@ mod tests {
         .unwrap();
         let output = input.convert_element_type(DataType::BF16).unwrap();
         let expected = values_to_bytes(&[0x5d80u16, 0x5d80, 0x5d81, 0x5f80]);
-        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), expected);
+        assert_eq!(output.copy_to_host().unwrap(), expected);
         let reference = CoreArray::from_elements(
             ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(values.len())])),
             &values,
@@ -1573,10 +1468,7 @@ mod tests {
         )
         .unwrap();
         let output = input.convert_element_type(DataType::BF16).unwrap();
-        assert_eq!(
-            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
-            values_to_bytes(&[0xdd81u16, 0xdd80, 0xdd80, 0xdf00, 0x5f00]),
-        );
+        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[0xdd81u16, 0xdd80, 0xdd80, 0xdf00, 0x5f00]),);
 
         let midpoint = 3_u64 << 60;
         let values = [midpoint - 1, midpoint, midpoint + 1];
@@ -1588,7 +1480,7 @@ mod tests {
         )
         .unwrap();
         let output = input.convert_element_type(DataType::F8E8M0FNU).unwrap();
-        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), vec![0xbc, 0xbd, 0xbd]);
+        assert_eq!(output.copy_to_host().unwrap(), vec![0xbc, 0xbd, 0xbd]);
     }
 
     #[test]
@@ -1607,7 +1499,7 @@ mod tests {
         for data_type in [DataType::F4E2M1FN, DataType::F6E2M3FN, DataType::F6E3M2FN, DataType::F8E8M0FNU] {
             let output = input.convert_element_type(data_type).unwrap();
             assert_eq!(
-                shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+                output.copy_to_host().unwrap(),
                 reference.convert_element_type(data_type).unwrap().logical_bytes(),
                 "{data_type}",
             );
@@ -1625,10 +1517,7 @@ mod tests {
         )
         .unwrap();
         let output = input.convert_element_type(DataType::F8E8M0FNU).unwrap();
-        assert_eq!(
-            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
-            vec![0, 0, 1, 128, 129, 129]
-        );
+        assert_eq!(output.copy_to_host().unwrap(), vec![0, 0, 1, 128, 129, 129]);
     }
 
     #[test]
@@ -1665,11 +1554,7 @@ mod tests {
                     .infer_output_types(&[input_type], &[]),
                 Ok(vec![output.r#type().into_owned()]),
             );
-            assert_eq!(
-                shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
-                values_to_bytes(&expected),
-                "{data_type}",
-            );
+            assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&expected), "{data_type}",);
         }
     }
 
@@ -1716,11 +1601,7 @@ mod tests {
             )
             .unwrap();
             let output = input.convert_element_type(data_type).unwrap();
-            assert_eq!(
-                shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
-                values_to_bytes(&expected),
-                "{data_type}",
-            );
+            assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&expected), "{data_type}",);
         }
     }
 
@@ -1739,7 +1620,7 @@ mod tests {
         )
         .unwrap();
         let output = input.convert_element_type(DataType::Boolean).unwrap();
-        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), vec![0, 1, 1, 1, 1, 0]);
+        assert_eq!(output.copy_to_host().unwrap(), vec![0, 1, 1, 1, 1, 0]);
     }
 
     #[test]
@@ -1764,7 +1645,7 @@ mod tests {
             (DataType::Boolean, vec![0, 1, 1, 1, 1, 1, 1, 1]),
         ] {
             let output = input.convert_element_type(data_type).unwrap();
-            assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), expected);
+            assert_eq!(output.copy_to_host().unwrap(), expected);
         }
         let integers = [-129i32, -2, -1, 0, 1, 2, 128, 129];
         let input = Array::from_host_buffer(
@@ -1776,10 +1657,7 @@ mod tests {
         .unwrap();
         for data_type in [DataType::I1, DataType::U1] {
             let output = input.convert_element_type(data_type).unwrap();
-            assert_eq!(
-                shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
-                vec![1, 0, 1, 0, 1, 0, 0, 1]
-            );
+            assert_eq!(output.copy_to_host().unwrap(), vec![1, 0, 1, 0, 1, 0, 0, 1]);
         }
     }
 
@@ -1817,7 +1695,7 @@ mod tests {
         for data_type in [DataType::I2, DataType::I4, DataType::U2, DataType::U4] {
             let output = input.convert_element_type(data_type).unwrap();
             assert_eq!(
-                shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+                output.copy_to_host().unwrap(),
                 reference.convert_element_type(data_type).unwrap().logical_bytes(),
                 "{data_type}",
             );
@@ -1838,10 +1716,7 @@ mod tests {
         assert_eq!(halves.shape().dimensions(), &[2, 2]);
         let restored = halves.bitcast_element_type(DataType::F32).unwrap();
         assert_eq!(restored.shape().dimensions(), &[2]);
-        assert_eq!(
-            shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(),
-            values_to_bytes(&[1.0f32, -0.0]),
-        );
+        assert_eq!(restored.copy_to_host().unwrap(), values_to_bytes(&[1.0f32, -0.0]),);
     }
 
     #[test]
@@ -1854,19 +1729,16 @@ mod tests {
         for data_type in [DataType::I1, DataType::U1] {
             let bits = input.bitcast_element_type(data_type).unwrap();
             assert_eq!(bits.shape().dimensions(), &[8]);
-            assert_eq!(
-                shard_host_bytes(bits.addressable_shards().next().unwrap()).unwrap(),
-                vec![1, 1, 0, 1, 0, 1, 0, 1]
-            );
+            assert_eq!(bits.copy_to_host().unwrap(), vec![1, 1, 0, 1, 0, 1, 0, 1]);
             let restored = bits.bitcast_element_type(DataType::U8).unwrap();
-            assert_eq!(shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(), vec![0xab]);
+            assert_eq!(restored.copy_to_host().unwrap(), vec![0xab]);
         }
         let pair =
             Array::from_host_buffer(&domain, replicated_type(&mesh, DataType::U2, &[]), mesh.clone(), &[3]).unwrap();
         let bits = pair.bitcast_element_type(DataType::U1).unwrap();
-        assert_eq!(shard_host_bytes(bits.addressable_shards().next().unwrap()).unwrap(), vec![1, 1]);
+        assert_eq!(bits.copy_to_host().unwrap(), vec![1, 1]);
         let restored = bits.bitcast_element_type(DataType::U2).unwrap();
-        assert_eq!(shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(), vec![3]);
+        assert_eq!(restored.copy_to_host().unwrap(), vec![3]);
     }
 
     #[test]
@@ -1888,7 +1760,7 @@ mod tests {
                     .infer_output_types(&[input_type.clone()], &[]),
                 Ok(vec![output.r#type().into_owned()]),
             );
-            assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), encodings);
+            assert_eq!(output.copy_to_host().unwrap(), encodings);
 
             // Packing uses six logical bits, not the eight-bit host carrier. Splitting appends exactly six one-bit
             // or three two-bit elements, ordered from the least significant bits, and widening removes that axis.
@@ -1907,11 +1779,7 @@ mod tests {
                         .infer_output_types(&[input_type.clone()], &[]),
                     Ok(vec![pieces.r#type().into_owned()]),
                 );
-                assert_eq!(
-                    shard_host_bytes(pieces.addressable_shards().next().unwrap()).unwrap(),
-                    expected,
-                    "{data_type} to {pieces_type}",
-                );
+                assert_eq!(pieces.copy_to_host().unwrap(), expected, "{data_type} to {pieces_type}",);
                 let restored = pieces.bitcast_element_type(data_type).unwrap();
                 assert_eq!(restored.shape().dimensions(), &[64]);
                 assert_eq!(restored.r#type().as_ref(), &input_type);
@@ -1920,11 +1788,7 @@ mod tests {
                         .infer_output_types(&[pieces.r#type().into_owned()], &[]),
                     Ok(vec![input_type.clone()]),
                 );
-                assert_eq!(
-                    shard_host_bytes(restored.addressable_shards().next().unwrap()).unwrap(),
-                    encodings,
-                    "{data_type} from {pieces_type}",
-                );
+                assert_eq!(restored.copy_to_host().unwrap(), encodings, "{data_type} from {pieces_type}",);
             }
         }
     }
@@ -2015,7 +1879,7 @@ mod tests {
                 let device_output = device_input.reduce_precision(exponent_bits, mantissa_bits).unwrap();
                 let device_output = CoreArray::from_logical_bytes(
                     ArrayType::new_static(data_type, [count]),
-                    &shard_host_bytes(device_output.addressable_shards().next().unwrap()).unwrap(),
+                    &device_output.copy_to_host().unwrap(),
                 )
                 .unwrap();
                 let reference_output = reference_input.reduce_precision(exponent_bits, mantissa_bits).unwrap();
@@ -2071,15 +1935,9 @@ mod tests {
         let reference_left = CoreArray::vector(left_values.to_vec()).unwrap();
         let reference_right = CoreArray::vector(right_values.to_vec()).unwrap();
         let output = left.min(&right).unwrap();
-        assert_eq!(
-            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
-            reference_left.min(&reference_right).unwrap().logical_bytes(),
-        );
+        assert_eq!(output.copy_to_host().unwrap(), reference_left.min(&reference_right).unwrap().logical_bytes(),);
         let reversed = right.min(&left).unwrap();
-        assert_eq!(
-            shard_host_bytes(reversed.addressable_shards().next().unwrap()).unwrap(),
-            reference_right.min(&reference_left).unwrap().logical_bytes(),
-        );
+        assert_eq!(reversed.copy_to_host().unwrap(), reference_right.min(&reference_left).unwrap().logical_bytes(),);
 
         // A real scalar broadcasts into a complex vector after promotion to complex double precision.
         let complex_values = [num_complex::Complex::new(1.0f64, 2.0), num_complex::Complex::new(3.0, 4.0)];
@@ -2101,7 +1959,7 @@ mod tests {
         assert_eq!(output.data_type(), DataType::C128);
         assert_eq!(output.shape().dimensions(), &[2]);
         assert_eq!(
-            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+            output.copy_to_host().unwrap(),
             CoreArray::vector(complex_values.to_vec())
                 .unwrap()
                 .min(&CoreArray::scalar(2.0f64).unwrap())
@@ -2152,15 +2010,9 @@ mod tests {
         let reference_left = CoreArray::vector(left_values.to_vec()).unwrap();
         let reference_right = CoreArray::vector(right_values.to_vec()).unwrap();
         let output = left.max(&right).unwrap();
-        assert_eq!(
-            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
-            reference_left.max(&reference_right).unwrap().logical_bytes(),
-        );
+        assert_eq!(output.copy_to_host().unwrap(), reference_left.max(&reference_right).unwrap().logical_bytes(),);
         let reversed = right.max(&left).unwrap();
-        assert_eq!(
-            shard_host_bytes(reversed.addressable_shards().next().unwrap()).unwrap(),
-            reference_right.max(&reference_left).unwrap().logical_bytes(),
-        );
+        assert_eq!(reversed.copy_to_host().unwrap(), reference_right.max(&reference_left).unwrap().logical_bytes(),);
 
         // A real scalar broadcasts into a complex vector after promotion to complex double precision.
         let complex_values = [num_complex::Complex::new(1.0f64, 2.0), num_complex::Complex::new(3.0, 4.0)];
@@ -2182,7 +2034,7 @@ mod tests {
         assert_eq!(output.data_type(), DataType::C128);
         assert_eq!(output.shape().dimensions(), &[2]);
         assert_eq!(
-            shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+            output.copy_to_host().unwrap(),
             CoreArray::vector(complex_values.to_vec())
                 .unwrap()
                 .max(&CoreArray::scalar(2.0f64).unwrap())
@@ -2214,11 +2066,11 @@ mod tests {
         let reference_lower = CoreArray::scalar(-1.0f32).unwrap();
         let reference_upper = CoreArray::scalar(1.0f32).unwrap();
         assert_eq!(
-            shard_host_bytes(input.clamp(&lower, &upper).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            input.clamp(&lower, &upper).unwrap().copy_to_host().unwrap(),
             reference_input.clamp(&reference_lower, &reference_upper).unwrap().logical_bytes(),
         );
         assert_eq!(
-            shard_host_bytes(input.clamp(&upper, &lower).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            input.clamp(&upper, &lower).unwrap().copy_to_host().unwrap(),
             reference_input.clamp(&reference_upper, &reference_lower).unwrap().logical_bytes(),
         );
 
@@ -2227,10 +2079,7 @@ mod tests {
         let integer_lower = array(DataType::I32, &[], values_to_bytes(&[0i32]).as_slice());
         let integer_upper = array(DataType::I32, &[], values_to_bytes(&[5i32]).as_slice());
         assert_eq!(
-            shard_host_bytes(
-                integers.clamp(&integer_lower, &integer_upper).unwrap().addressable_shards().next().unwrap()
-            )
-            .unwrap(),
+            integers.clamp(&integer_lower, &integer_upper).unwrap().copy_to_host().unwrap(),
             values_to_bytes(&[0i32, 2, 5]),
         );
 
@@ -2238,7 +2087,7 @@ mod tests {
         let bound_values = [0.0f32, 1.0, 2.0, 3.0];
         let bounds = array(DataType::F32, &[bound_values.len()], values_to_bytes(&bound_values).as_slice());
         assert_eq!(
-            shard_host_bytes(input.clamp(&lower, &bounds).unwrap().addressable_shards().next().unwrap()).unwrap(),
+            input.clamp(&lower, &bounds).unwrap().copy_to_host().unwrap(),
             reference_input
                 .clamp(&reference_lower, &CoreArray::vector(bound_values.to_vec()).unwrap())
                 .unwrap()
@@ -2261,7 +2110,7 @@ mod tests {
             .unwrap();
         assert_eq!(output.data_type(), DataType::F64);
         assert_eq!(reference.elements::<f64>().unwrap(), vec![16777217f64]);
-        assert_eq!(shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(), reference.logical_bytes(),);
+        assert_eq!(output.copy_to_host().unwrap(), reference.logical_bytes(),);
 
         // Complex inputs compose the lexicographic extrema, so the imaginary part decides between equal real parts.
         let complex_values = [
@@ -3185,11 +3034,7 @@ mod tests {
                     expected.into_iter().map(|index| index as f64).collect::<Vec<_>>(),
                     "{data_type}",
                 );
-                assert_eq!(
-                    shard_host_bytes(device_output.addressable_shards().next().unwrap()).unwrap(),
-                    reference_output.storage_bytes(),
-                    "{data_type}",
-                );
+                assert_eq!(device_output.copy_to_host().unwrap(), reference_output.storage_bytes(), "{data_type}",);
             }
         }
     }
@@ -3307,16 +3152,12 @@ mod tests {
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u32_output_type).unwrap();
         let (reference_new_state, reference_bits) =
             reference_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u32_output_type).unwrap();
-        let device_words = values_from_bytes::<u32>(
-            shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
-        );
+        let device_words = values_from_bytes::<u32>(device_bits.copy_to_host().unwrap().as_slice());
         let reference_words = reference_bits.elements::<u32>().unwrap();
         assert_eq!(device_words, reference_words);
         // Generating five `u32` words runs three cipher invocations, and the counter advances by that invocation
         // count (`7 + 3 = 10`).
-        let device_state_words = values_from_bytes::<u64>(
-            shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
-        );
+        let device_state_words = values_from_bytes::<u64>(device_state.copy_to_host().unwrap().as_slice());
         assert_eq!(device_state_words, vec![42u64, 10u64]);
         assert_eq!(reference_new_state.elements::<u64>().unwrap(), vec![42, 10]);
 
@@ -3324,13 +3165,9 @@ mod tests {
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u64_output_type).unwrap();
         let (reference_new_state, reference_bits) =
             reference_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &u64_output_type).unwrap();
-        let device_state_words = values_from_bytes::<u64>(
-            shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
-        );
+        let device_state_words = values_from_bytes::<u64>(device_state.copy_to_host().unwrap().as_slice());
         assert_eq!(device_state_words, reference_new_state.elements::<u64>().unwrap(),);
-        let device_words = values_from_bytes::<u64>(
-            shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
-        );
+        let device_words = values_from_bytes::<u64>(device_bits.copy_to_host().unwrap().as_slice());
         let reference_words = reference_bits.elements::<u64>().unwrap();
         assert_eq!(device_words, reference_words);
     }
@@ -3371,11 +3208,9 @@ mod tests {
             let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type).unwrap();
             let (reference_state, reference_bits) =
                 reference_state.rng_bit_generator(RandomAlgorithm::ThreeFry, &output_type).unwrap();
-            let device_state = values_from_bytes::<u64>(
-                shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
-            );
+            let device_state = values_from_bytes::<u64>(device_state.copy_to_host().unwrap().as_slice());
             assert_eq!(device_state, reference_state.elements::<u64>().unwrap(), "state for {output_type}");
-            let device_bits = shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap();
+            let device_bits = device_bits.copy_to_host().unwrap();
             assert_eq!(device_bits, reference_bits.storage_bytes(), "bits for {output_type}");
         }
     }
@@ -3414,16 +3249,12 @@ mod tests {
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u32_output_type).unwrap();
         let (reference_new_state, reference_bits) =
             reference_state.rng_bit_generator(RandomAlgorithm::Philox, &u32_output_type).unwrap();
-        let device_words = values_from_bytes::<u32>(
-            shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
-        );
+        let device_words = values_from_bytes::<u32>(device_bits.copy_to_host().unwrap().as_slice());
         let reference_words = reference_bits.elements::<u32>().unwrap();
         assert_eq!(device_words, reference_words);
         // Generating five `u32` words runs two cipher invocations, and the low counter half advances by that
         // invocation count (`7 + 2 = 9`) while the key and high counter half are unchanged.
-        let device_state_words = values_from_bytes::<u64>(
-            shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
-        );
+        let device_state_words = values_from_bytes::<u64>(device_state.copy_to_host().unwrap().as_slice());
         assert_eq!(device_state_words, vec![42u64, 9u64, 9u64]);
         assert_eq!(reference_new_state.elements::<u64>().unwrap(), vec![42, 9, 9]);
 
@@ -3431,13 +3262,9 @@ mod tests {
         let (device_state, device_bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u64_output_type).unwrap();
         let (reference_new_state, reference_bits) =
             reference_state.rng_bit_generator(RandomAlgorithm::Philox, &u64_output_type).unwrap();
-        let device_state_words = values_from_bytes::<u64>(
-            shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
-        );
+        let device_state_words = values_from_bytes::<u64>(device_state.copy_to_host().unwrap().as_slice());
         assert_eq!(device_state_words, reference_new_state.elements::<u64>().unwrap(),);
-        let device_words = values_from_bytes::<u64>(
-            shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap().as_slice(),
-        );
+        let device_words = values_from_bytes::<u64>(device_bits.copy_to_host().unwrap().as_slice());
         let reference_words = reference_bits.elements::<u64>().unwrap();
         assert_eq!(device_words, reference_words);
     }
@@ -3485,12 +3312,10 @@ mod tests {
                     if algorithm == RandomAlgorithm::Philox {
                         expected_state.push(state_values[2].wrapping_add(u64::from(carry)));
                     }
-                    let device_state = values_from_bytes::<u64>(
-                        shard_host_bytes(&device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
-                    );
+                    let device_state = values_from_bytes::<u64>(device_state.copy_to_host().unwrap().as_slice());
                     assert_eq!(device_state, expected_state, "{algorithm} state for {output_type}");
                     assert_eq!(reference_state.elements::<u64>().unwrap(), expected_state);
-                    let device_bits = shard_host_bytes(&device_bits.addressable_shards().next().unwrap()).unwrap();
+                    let device_bits = device_bits.copy_to_host().unwrap();
                     assert_eq!(device_bits, reference_bits.storage_bytes(), "{algorithm} bits for {output_type}");
                 }
             }
@@ -3562,9 +3387,7 @@ mod tests {
         let (_, device_keys) = state.split_rng_key(2).unwrap();
         let (_, reference_keys) = reference_state.split_rng_key(2).unwrap();
         for (device_key, reference_key) in device_keys.iter().zip(reference_keys.iter()) {
-            let device_words = values_from_bytes::<u64>(
-                shard_host_bytes(&device_key.addressable_shards().next().unwrap()).unwrap().as_slice(),
-            );
+            let device_words = values_from_bytes::<u64>(device_key.copy_to_host().unwrap().as_slice());
             let reference_words = reference_key.elements::<u64>().unwrap();
             assert_eq!(device_words, reference_words);
         }
@@ -3592,14 +3415,9 @@ mod tests {
             let (device_state, device_samples) = state.random_uniform(&sample_type).unwrap();
             let (reference_state, reference_samples) = reference_state.random_uniform(&sample_type).unwrap();
             assert_eq!(device_samples.data_type(), data_type);
+            assert_eq!(device_samples.copy_to_host().unwrap(), reference_samples.storage_bytes(),);
             assert_eq!(
-                shard_host_bytes(device_samples.addressable_shards().next().unwrap()).unwrap(),
-                reference_samples.storage_bytes(),
-            );
-            assert_eq!(
-                values_from_bytes::<u64>(
-                    shard_host_bytes(device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
-                ),
+                values_from_bytes::<u64>(device_state.copy_to_host().unwrap().as_slice(),),
                 reference_state.elements::<u64>().unwrap(),
             );
         }
@@ -3627,7 +3445,7 @@ mod tests {
             let (device_state, device_samples) = state.random_normal(&sample_type).unwrap();
             let (reference_state, reference_samples) = reference_state.random_normal(&sample_type).unwrap();
             assert_eq!(device_samples.data_type(), data_type);
-            let device_bytes = shard_host_bytes(device_samples.addressable_shards().next().unwrap()).unwrap();
+            let device_bytes = device_samples.copy_to_host().unwrap();
             let reference_bytes = reference_samples.logical_bytes();
             let (device_components, reference_components, tolerance) = if data_type == DataType::C64 {
                 (
@@ -3647,9 +3465,7 @@ mod tests {
                 );
             }
             assert_eq!(
-                values_from_bytes::<u64>(
-                    shard_host_bytes(device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
-                ),
+                values_from_bytes::<u64>(device_state.copy_to_host().unwrap().as_slice(),),
                 reference_state.elements::<u64>().unwrap(),
             );
         }
@@ -3697,9 +3513,7 @@ mod tests {
                 assert_eq!(read_i32s(&device_samples), vec![1, 2]);
                 assert_eq!(reference_samples.elements::<i32>().unwrap(), vec![1, 2]);
                 assert_eq!(
-                    values_from_bytes::<u64>(
-                        shard_host_bytes(device_state.addressable_shards().next().unwrap()).unwrap().as_slice(),
-                    ),
+                    values_from_bytes::<u64>(device_state.copy_to_host().unwrap().as_slice(),),
                     reference_state.elements::<u64>().unwrap(),
                 );
             }
@@ -4101,7 +3915,7 @@ mod tests {
                     let output = input.cumulative(0, kind, reverse).unwrap();
                     assert_eq!(output.data_type(), data_type);
                     assert_eq!(
-                        shard_host_bytes(output.addressable_shards().next().unwrap()).unwrap(),
+                        output.copy_to_host().unwrap(),
                         reference.cumulative(0, kind, reverse).unwrap().logical_bytes(),
                     );
                 }

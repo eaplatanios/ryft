@@ -1046,6 +1046,27 @@ impl<'o> Array<'o> {
         Ok(())
     }
 
+    /// Copies the value of this [`Array`] to the host and returns its dense row-major bytes, irrespective of the
+    /// physical [`Layout`] of its shard buffers. This is an explicit synchronization boundary. It blocks the current
+    /// thread until the copies and the whole execution that produced this array complete, so it also surfaces the
+    /// errors of that execution.
+    ///
+    /// One shard is copied for each distinct tile of the array, so a replicated array is read from a single device.
+    /// When the [`Sharding`] of this array has unreduced axes, along which the devices hold separate values of each
+    /// tile (e.g., summands), every shard is copied and those values are combined with the [`UnreducedKind`] of the
+    /// sharding. Arrays with no elements and [`DataType::Zero`] arrays produce no bytes and issue no copies. Use
+    /// [`ArrayShard::copy_to_host`] to read the bytes that a single device holds instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrayError::MissingShardBuffer`] when the current process does not hold the whole value. That is
+    /// the case when a shard lives in another process and either the addressable shards do not cover the array or its
+    /// sharding has unreduced axes. PJRT transfer failures and the errors of the producing execution are returned
+    /// unchanged.
+    pub fn copy_to_host(&self) -> Result<Vec<u8>, Error> {
+        crate::arrays_v0::host::materialize_dense_array_bytes(self)
+    }
+
     /// Validates one addressable `buffer` of an array of type `r#type` whose shards are described by `descriptors` and
     /// `shard_index_by_device`, returning the identifier of the device that owns it. The buffer must be owned by
     /// `client`, live on a device of the mesh in the process that the mesh expects, live in the memory that `r#type`
@@ -1400,6 +1421,43 @@ impl<'o> ArrayShard<'o> {
     #[inline]
     pub fn is_addressable(&self) -> bool {
         !matches!(self.storage, ArrayShardStorage::Remote)
+    }
+
+    /// Copies the bytes that the device of this [`ArrayShard`] holds to the host and returns them in dense row-major
+    /// order, irrespective of the physical layout of the shard's [`Buffer`]. This function blocks the current thread
+    /// until the copy completes. Bufferless [`DataType::Zero`] shards and shards with no elements produce no bytes and
+    /// issue no copy.
+    ///
+    /// These bytes are a tile of the [`Array`] that this shard belongs to, unless the [`Sharding`] of that array has
+    /// unreduced axes, in which case they are the separate value that this device holds for that tile (e.g., a
+    /// summand). This function also observes only this shard's buffer. Use [`Array::copy_to_host`] to read the whole
+    /// value of an array and to surface the errors of the whole execution that produced it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArrayError::MissingShardBuffer`] when this shard lives in another process. PJRT transfer failures
+    /// are returned unchanged.
+    pub fn copy_to_host(&self) -> Result<Vec<u8>, Error> {
+        let buffer = match &self.storage {
+            ArrayShardStorage::Buffer(buffer) => buffer,
+            ArrayShardStorage::Zero => return Ok(Vec::new()),
+            ArrayShardStorage::Remote => {
+                return Err(Error::from(ArrayError::MissingShardBuffer {
+                    shard_index: self.index(),
+                    device_id: self.device().id(),
+                }));
+            }
+        };
+
+        // Avoid asking PJRT for a zero byte copy of a dynamically sized buffer, whose size query fallback can expose
+        // the bound allocation and its trailer instead of the empty logical value.
+        let shape = self.shape();
+        if shape.as_slice().contains(&0) {
+            return Ok(Vec::new());
+        }
+
+        // Request row-major bytes explicitly, because the device buffer may have another physical layout.
+        Ok(buffer.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(shape.rank())))?.r#await()?)
     }
 
     /// Compares this shard's storage identity with `other`.
@@ -1846,8 +1904,7 @@ mod tests {
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
         )
         .unwrap();
-        let replicated_type =
-            array_type.clone().with_sharding(Sharding::replicated(explicit_mesh.clone(), 2)).unwrap();
+        let replicated_type = array_type.clone().with_sharding(Sharding::replicated(explicit_mesh.clone(), 2)).unwrap();
         let explicit_device_mesh = DeviceMesh::new(explicit_mesh, devices.clone()).unwrap();
         assert!(matches!(
             Array::from_addressable_buffers_with_sharding(
@@ -2500,8 +2557,9 @@ mod tests {
 
         // Metadata-only arrays with no addressable buffers carry no storage to validate, and still belong to (and live
         // on the client of) the provided domain.
-        let array = Array::from_addressable_buffers_with_sharding(&other_domain, array_type, sharding, mesh, Vec::new())
-            .unwrap();
+        let array =
+            Array::from_addressable_buffers_with_sharding(&other_domain, array_type, sharding, mesh, Vec::new())
+                .unwrap();
         assert_eq!(array.addressable_shards().count(), 0);
         assert!(std::ptr::eq(array.client(), &other_client));
     }
@@ -2574,8 +2632,9 @@ mod tests {
         let sharding =
             Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, shape);
-        let array = Array::from_addressable_buffers_with_sharding(&domain, array_type, sharding, device_mesh, Vec::new())
-            .unwrap();
+        let array =
+            Array::from_addressable_buffers_with_sharding(&domain, array_type, sharding, device_mesh, Vec::new())
+                .unwrap();
 
         // The type records no placement over the auto mesh axis, while the runtime placement does.
         assert_eq!(
