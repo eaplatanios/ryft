@@ -1154,10 +1154,18 @@ impl_differentiable_operation! {
 /// whose input and output physical capacities cannot be represented by their runtime reshape support; equal logical
 /// element counts alone do not guarantee that every bounded shape can be compiled.
 ///
+/// The parameter `Extent` is the representation of one output extent. It defaults to the implementor, which is what
+/// array IR values use, because their extents are their first-class dimension members. Tracers of homogeneous array
+/// programs implement this capability for `usize` extents, where it is the ordinary [`Reshape`] to the static shape
+/// that the extents describe, so that code that is generic over the extent representation of its values (refer to
+/// [`DimensionSize::Extent`]) can reshape values of both universes. The functions that construct dimension values
+/// are only available for extents that are the implementor.
+///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
-/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
-/// provided functions only require views of the receiver's type (e.g., [`ArrayMemberType`]), so that other universes
-/// with array and dimension members can implement it as well.
+/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents, and
+/// tracers of homogeneous array programs implement it for [`ArrayType`]. Its provided functions only require views of
+/// the receiver's type (e.g., [`ArrayMemberType`]), so that other universes with array and dimension members can
+/// implement it as well.
 ///
 /// # Examples
 ///
@@ -1200,33 +1208,33 @@ impl_differentiable_operation! {
 /// assert_eq!(output.r#type().to_string(), "f32[batch, 2, 3]");
 /// ```
 #[capability]
-pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized {
+pub trait DynamicReshape<Extent = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Reshapes `self` with optional explicit output sharding. Supplying `None` is equivalent to
     /// [`Self::dynamic_reshape`]. Explicit placement resolves ambiguous input-to-output sharding changes
     /// and is attached to the reshape itself for backend lowering.
     ///
     /// # Parameters
     ///
-    ///   - `output_dimensions`: Non-negative first-class dimension values in output-axis order. Their product must
-    ///     equal the input element count. An empty slice requests a scalar. Exact values infer static axes, while
-    ///     non-exact values retain their dimension identities and bounds.
+    ///   - `output_dimensions`: Non-negative extents in output-axis order (i.e., first-class dimension values for
+    ///     array IR values). Their product must equal the input element count. An empty slice requests a scalar.
+    ///     Exact values infer static axes, while non-exact values retain their dimension identities and bounds.
     ///   - `output_sharding`: Requested placement for the output axes. When absent, compatible input placement is
     ///     propagated. Ambiguous placement changes require an explicit sharding.
     fn dynamic_reshape_with_output_sharding(
         &self,
-        output_dimensions: &[Self],
+        output_dimensions: &[Extent],
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>;
 
-    /// Reshapes `self` to the output shape described by `output_dimensions`, one first-class value per output axis.
+    /// Reshapes `self` to the output shape described by `output_dimensions`, one extent per output axis.
     ///
     /// # Parameters
     ///
-    ///   - `output_dimensions`: Non-negative first-class dimension values in output-axis order. Their product must
-    ///     equal the input element count. An empty slice requests a scalar. Exact values infer static axes, while
-    ///     non-exact values retain their dimension identities and bounds.
+    ///   - `output_dimensions`: Non-negative extents in output-axis order (i.e., first-class dimension values for
+    ///     array IR values). Their product must equal the input element count. An empty slice requests a scalar.
+    ///     Exact values infer static axes, while non-exact values retain their dimension identities and bounds.
     #[inline]
-    fn dynamic_reshape(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError> {
+    fn dynamic_reshape(&self, output_dimensions: &[Extent]) -> Result<Self, ProgramError> {
         self.dynamic_reshape_with_output_sharding(output_dimensions, None)
     }
 
@@ -1239,7 +1247,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     ///     exact extents rather than capacity bounds. Inferred `-1` sizes belong to [`Reshape::reshape_to_sizes`].
     fn dynamic_reshape_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant>,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DynamicReshape<Self, T>,
     {
         // Validate the requested shape before staging any dimension constant, so that an invalid element count
         // leaves no dead dimension literals behind in a trace.
@@ -1251,7 +1259,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
             .iter()
             .map(|extent| self.domain().dimension_constant(*extent))
             .collect::<Result<Vec<_>, _>>()?;
-        self.dynamic_reshape(output_dimensions.as_slice())
+        DynamicReshape::<Self, T>::dynamic_reshape(self, output_dimensions.as_slice())
     }
 
     /// Returns the input as a vector in logical row-major order. Runtime extents are read from the input and multiplied
@@ -1261,6 +1269,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     where
         Self: Value<Type: ArrayMemberType, Domain: DimensionConstant>
             + DimensionSize<Extent = Self>
+            + DynamicReshape<Self, T>
             + ValueProjection<DimensionType>,
         Self::Projected: Mul,
     {
@@ -1273,12 +1282,12 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
         if input_type.shape().dimensions().iter().any(|dimension| dimension.value() == Some(0)) {
             // A known zero extent makes the complete product zero, even when an earlier partial product would
             // overflow the dimension ABI. Do not emit arithmetic for dimensions that cannot affect the result.
-            return self.dynamic_reshape_to_sizes(&[0]);
+            return DynamicReshape::<Self, T>::dynamic_reshape_to_sizes(self, &[0]);
         }
 
         if let Some(element_count) = input_type.element_count()? {
             // A static shape needs no runtime size arithmetic.
-            return self.dynamic_reshape_to_sizes(&[element_count]);
+            return DynamicReshape::<Self, T>::dynamic_reshape_to_sizes(self, &[element_count]);
         }
 
         // Seed the product with the leading extent instead of a constant one, so that no multiplication by one is
@@ -1288,7 +1297,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
             size = size.mul(&self.dimension_size(axis)?.into_projected()?)?;
         }
 
-        self.dynamic_reshape(&[Self::from_projected(size)])
+        DynamicReshape::<Self, T>::dynamic_reshape(self, &[Self::from_projected(size)])
     }
 
     /// Inserts a size-one axis while preserving all existing extents, including runtime dimensions. The output
@@ -1300,7 +1309,9 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     ///   - `axis`: Insertion position in the output rank. Zero prepends an axis and negative one appends an axis.
     fn dynamic_expand_dimensions<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DimensionSize<Extent = Self>,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant>
+            + DimensionSize<Extent = Self>
+            + DynamicReshape<Self, T>,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;
@@ -1321,11 +1332,11 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
             })
             .collect::<Result<Vec<_>, _>>()?;
         dimensions.insert(axis, self.domain().dimension_constant(1)?);
-        self.dynamic_reshape(&dimensions)
+        DynamicReshape::<Self, T>::dynamic_reshape(self, &dimensions)
     }
 }
 
-impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape<ArrayIrType> for ArrayIrValue<A> {
+impl<A: Reshape + Value<Type = ArrayType>> DynamicReshape<Self, ArrayIrType> for ArrayIrValue<A> {
     fn dynamic_reshape_with_output_sharding(
         &self,
         output_dimensions: &[Self],
@@ -1351,7 +1362,7 @@ impl<
             Dispatch = ValueDomainDispatch,
             Domain: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>,
         >,
-> DynamicReshape<ArrayIrType> for V
+> DynamicReshape<V, ArrayIrType> for V
 {
     fn dynamic_reshape_with_output_sharding(
         &self,
@@ -1379,6 +1390,22 @@ impl<
         let mut outputs = self.domain().bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+}
+
+impl<C: StagingContext<Type = ArrayType>> DynamicReshape<usize, ArrayType> for Tracer<C>
+where
+    Tracer<C>: Reshape<ArrayType>,
+{
+    #[inline]
+    fn dynamic_reshape_with_output_sharding(
+        &self,
+        output_dimensions: &[usize],
+        output_sharding: Option<Sharding>,
+    ) -> Result<Self, ProgramError> {
+        // Homogeneous array programs have no dimension values, so their extents are host numbers and the reshape
+        // is the ordinary reshape to the static shape that those extents describe.
+        Reshape::<ArrayType>::reshape_with_output_sharding(self, output_dimensions, output_sharding)
     }
 }
 
@@ -5719,6 +5746,26 @@ mod tests {
                 Err(ProgramError::InvalidOutputCount { expected: 1, actual }) if actual == output_count,
             ));
         }
+    }
+
+    #[test]
+    fn test_dynamic_reshape_dynamic_reshape_homogeneous_tracers() {
+        // Tracers of homogeneous array programs take host extents and stage the ordinary reshape to the static shape
+        // that those extents describe.
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |array| array.dynamic_reshape(&[3, 2]),
+            input_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(program.to_string(), "PLACEHOLDER");
+
+        // The extents must describe the element count of the input.
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace(|array| array.dynamic_reshape(&[4, 2]), input_type)
+                .map(|(_, program)| program.to_string()),
+            Err(ProgramError::Type(TypeError::invalid("PLACEHOLDER"))),
+        );
     }
 
     #[test]

@@ -173,8 +173,8 @@ impl<
 /// so that array IR values implement this bundle for [`ArrayIrType`](crate::ArrayIrType).
 pub trait DynamicManipulationOperations<T = <Self as Capability>::Universe>:
     Capability
-    + DynamicReshape<T>
-    + DynamicBroadcast<T>
+    + DynamicReshape<Self, T>
+    + DynamicBroadcast<Self, T>
     + DynamicPad<T>
     + DynamicConcatenate<T>
     + DynamicSliceWithDimensions<T>
@@ -183,7 +183,11 @@ pub trait DynamicManipulationOperations<T = <Self as Capability>::Universe>:
 
 impl<
     T,
-    V: DynamicReshape<T> + DynamicBroadcast<T> + DynamicPad<T> + DynamicConcatenate<T> + DynamicSliceWithDimensions<T>,
+    V: DynamicReshape<V, T>
+        + DynamicBroadcast<V, T>
+        + DynamicPad<T>
+        + DynamicConcatenate<T>
+        + DynamicSliceWithDimensions<T>,
 > DynamicManipulationOperations<T> for V
 {
 }

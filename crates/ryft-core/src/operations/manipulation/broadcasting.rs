@@ -1476,10 +1476,18 @@ impl_differentiable_operation! {
 /// [`DynamicBroadcast`] fills the same role for [`DynamicBroadcastOperation`] that [`std::ops::Add`] and
 /// [`std::ops::Neg`] fill for their corresponding arithmetic [`Operation`]s.
 ///
+/// The parameter `Extent` is the representation of one output extent. It defaults to the implementor, which is what
+/// array IR values use, because their extents are their first-class dimension members. Tracers of homogeneous array
+/// programs implement this capability for `usize` extents, where it is the ordinary [`Broadcast`] to the static shape
+/// that the extents describe, so that code that is generic over the extent representation of its values (refer to
+/// [`DimensionSize::Extent`]) can broadcast values of both universes. The functions that construct dimension values
+/// are only available for extents that are the implementor.
+///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that array IR values
-/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents. Its
-/// provided functions only require views of the receiver's type (e.g., [`ArrayMemberType`]), so that other universes
-/// with array and dimension members can implement it as well.
+/// implement this capability for [`ArrayIrType`], whose first-class dimension members supply the dynamic extents, and
+/// tracers of homogeneous array programs implement it for [`ArrayType`]. Its provided functions only require views of
+/// the receiver's type (e.g., [`ArrayMemberType`]), so that other universes with array and dimension members can
+/// implement it as well.
 ///
 /// # Examples
 ///
@@ -1522,7 +1530,7 @@ impl_differentiable_operation! {
 /// # }
 /// ```
 #[capability]
-pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Sized {
+pub trait DynamicBroadcast<Extent = Self, T = <Self as Capability>::Universe>: Capability + Sized {
     /// Replicates or reorders `self` into the shape supplied by dimension values. Each mapped input extent must equal
     /// its output extent or be statically one; new axes may have static or dynamic extents. Sharding follows the axis
     /// mapping and new axes are replicated. Invalid value kinds, axis mappings, or incompatible extents yield a
@@ -1537,7 +1545,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     ///     rank and its entries must be distinct and less than `output_dimensions.len()`. For a vector, `[1]` maps its
     ///     sole axis to the columns of a matrix; the unmapped row axis repeats that vector.
     #[inline]
-    fn dynamic_broadcast(&self, output_dimensions: &[Self], output_axes: &[usize]) -> Result<Self, ProgramError> {
+    fn dynamic_broadcast(&self, output_dimensions: &[Extent], output_axes: &[usize]) -> Result<Self, ProgramError> {
         self.dynamic_broadcast_with_output_sharding(output_dimensions, output_axes, None)
     }
 
@@ -1559,7 +1567,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     ///     entries, and making newly introduced axes replicated. `None` does not remove an existing input sharding.
     fn dynamic_broadcast_with_output_sharding(
         &self,
-        output_dimensions: &[Self],
+        output_dimensions: &[Extent],
         output_axes: &[usize],
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>;
@@ -1574,7 +1582,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     ///   - `output_dimensions`: Dimension values describing the complete desired shape, including unchanged trailing
     ///     axes. Use [`DynamicBroadcast::dynamic_broadcast_to_sizes`] when every desired size is a host integer.
     #[inline]
-    fn dynamic_broadcast_to(&self, output_dimensions: &[Self]) -> Result<Self, ProgramError>
+    fn dynamic_broadcast_to(&self, output_dimensions: &[Extent]) -> Result<Self, ProgramError>
     where
         Self: Typed<Type: ArrayMemberType>,
     {
@@ -1591,7 +1599,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     ///   - `output_sharding`: Complete requested result distribution, or `None` to infer it from the input mapping.
     fn dynamic_broadcast_to_with_output_sharding(
         &self,
-        output_dimensions: &[Self],
+        output_dimensions: &[Extent],
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>
     where
@@ -1623,9 +1631,10 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     fn dynamic_broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
         Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant>
-            + DimensionSize<Extent = Self>,
+            + DimensionSize<Extent = Self>
+            + DynamicBroadcast<Self, T>,
     {
-        self.dynamic_broadcast_leading_with_output_sharding(leading_dimensions, None)
+        DynamicBroadcast::<Self, T>::dynamic_broadcast_leading_with_output_sharding(self, leading_dimensions, None)
     }
 
     /// Prepends dimension-valued replication axes with optional output sharding. Existing dimensions are read from
@@ -1643,7 +1652,8 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     ) -> Result<Self, ProgramError>
     where
         Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant>
-            + DimensionSize<Extent = Self>,
+            + DimensionSize<Extent = Self>
+            + DynamicBroadcast<Self, T>,
     {
         let r#type = self.r#type();
         let input_type = r#type.as_array_type()?;
@@ -1675,7 +1685,8 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
             });
         }
 
-        self.dynamic_broadcast_with_output_sharding(
+        DynamicBroadcast::<Self, T>::dynamic_broadcast_with_output_sharding(
+            self,
             output_dimensions.as_slice(),
             output_axes.as_slice(),
             output_sharding,
@@ -1695,13 +1706,13 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     #[inline]
     fn dynamic_broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant>,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DynamicBroadcast<Self, T>,
     {
         let output_dimensions = output_sizes
             .iter()
             .map(|extent| self.domain().dimension_constant(*extent))
             .collect::<Result<Vec<_>, _>>()?;
-        self.dynamic_broadcast_to(output_dimensions.as_slice())
+        DynamicBroadcast::<Self, T>::dynamic_broadcast_to(self, output_dimensions.as_slice())
     }
 
     /// Replicates `self` along new leading axes whose sizes are known on the host. This creates exact dimension
@@ -1717,14 +1728,15 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     fn dynamic_broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
     where
         Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant>
-            + DimensionSize<Extent = Self>,
+            + DimensionSize<Extent = Self>
+            + DynamicBroadcast<Self, T>,
     {
         let context = self.domain();
         let leading_dimensions = leading_sizes
             .iter()
             .map(|extent| context.dimension_constant(*extent))
             .collect::<Result<Vec<_>, _>>()?;
-        self.dynamic_broadcast_leading(leading_dimensions.as_slice())
+        DynamicBroadcast::<Self, T>::dynamic_broadcast_leading(self, leading_dimensions.as_slice())
     }
 
     /// Broadcasts array inputs to a common shape while preserving their order and individual element types. Dynamic
@@ -1757,7 +1769,9 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     ///     identities; distinct unknown dimensions are not assumed to have equal runtime values.
     fn dynamic_broadcast_arrays(inputs: &[Self]) -> Result<Vec<Self>, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DimensionSize<Extent = Self>,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant>
+            + DimensionSize<Extent = Self>
+            + DynamicBroadcast<Self, T>,
     {
         let Some(first) = inputs.first() else {
             return Ok(Vec::new());
@@ -1791,11 +1805,14 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        inputs.iter().map(|input| input.dynamic_broadcast_to(&output_dimensions)).collect()
+        inputs
+            .iter()
+            .map(|input| DynamicBroadcast::<Self, T>::dynamic_broadcast_to(input, &output_dimensions))
+            .collect()
     }
 }
 
-impl<A: Value<Type = ArrayType> + Broadcast> DynamicBroadcast<ArrayIrType> for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + Broadcast> DynamicBroadcast<Self, ArrayIrType> for ArrayIrValue<A> {
     fn dynamic_broadcast_with_output_sharding(
         &self,
         output_dimensions: &[Self],
@@ -1816,7 +1833,7 @@ impl<A: Value<Type = ArrayType> + Broadcast> DynamicBroadcast<ArrayIrType> for A
     }
 }
 
-impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DynamicBroadcast<ArrayIrType> for V
+impl<V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>> DynamicBroadcast<V, ArrayIrType> for V
 where
     V::Domain: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
 {
@@ -1841,6 +1858,25 @@ where
         let mut outputs = self.domain().bind(operation, Vec::new(), inputs.as_slice())?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
+    }
+}
+
+impl<C: StagingContext<Type = ArrayType>> DynamicBroadcast<usize, ArrayType> for Tracer<C>
+where
+    Tracer<C>: Broadcast<ArrayType>,
+{
+    fn dynamic_broadcast_with_output_sharding(
+        &self,
+        output_dimensions: &[usize],
+        output_axes: &[usize],
+        output_sharding: Option<Sharding>,
+    ) -> Result<Self, ProgramError> {
+        // Homogeneous array programs have no dimension values, so their extents are host numbers and the broadcast
+        // is the ordinary broadcast to the static output type, which is inferred like that of the mixed operation.
+        let output_shape = Shape::new(output_dimensions.iter().map(|extent| Dimension::Static(*extent)).collect());
+        let operation = DynamicBroadcastOperation::new(output_axes.to_vec()).with_output_sharding(output_sharding);
+        let output_type = infer_explicit_broadcast_output_type(self.r#type().as_ref(), output_shape, &operation)?;
+        Broadcast::<ArrayType>::broadcast(self, output_type, output_axes)
     }
 }
 
@@ -5582,6 +5618,29 @@ mod tests {
         assert_eq!(
             input.dynamic_broadcast_to(&dimensions),
             Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_broadcast_dynamic_broadcast_homogeneous_tracers() {
+        // Tracers of homogeneous array programs take host extents and stage the ordinary broadcast to the static shape
+        // that those extents describe.
+        let input_type = ArrayType::new_static(DataType::F32, [3]);
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |array| array.dynamic_broadcast(&[2, 3], &[1]),
+            input_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(program.to_string(), "PLACEHOLDER");
+
+        // A mapped input extent must equal its output extent or be one.
+        assert_eq!(
+            TracingContext::<Array, ArrayOperation<Array>>::trace(
+                |array| array.dynamic_broadcast(&[2, 4], &[1]),
+                input_type,
+            )
+            .map(|(_, program)| program.to_string()),
+            Err(ProgramError::Type(TypeError::invalid("PLACEHOLDER"))),
         );
     }
 

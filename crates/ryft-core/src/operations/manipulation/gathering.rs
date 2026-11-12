@@ -1951,7 +1951,7 @@ impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType, Dispatch = Va
     DynamicGather<Stored, ArrayIrType> for V
 where
     V: DimensionSize<Extent = V>
-        + DynamicBroadcast<ArrayIrType>
+        + DynamicBroadcast<V, ArrayIrType>
         + ManualVariationAlignment<ArrayIrType>
         + ValueProjection<ArrayType>,
     V::Projected: Gather<Stored>,
