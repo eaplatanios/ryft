@@ -8,7 +8,7 @@
 //!
 //! A named attention definition is a named composite whose [`CompositeKey`] encodes an [`AttentionKey`], which
 //! identifies the forward or the backward definition and records its value-independent [`AttentionConfiguration`] and
-//! the [`AttentionInputSignature`] of the optional inputs that are present. There are two definitions:
+//! the structure of its [`AttentionInputs`] (i.e., which optional inputs are present). There are two definitions:
 //!
 //!   - **Forward:** Named [`DOT_PRODUCT_ATTENTION_COMPOSITE_NAME`]. It maps the [`AttentionInputs`] to the attended
 //!     output, followed by the log-sum-exp residual of its softmax when its key requests it.
@@ -34,10 +34,10 @@
 //! Named composites are owned by their callers, so attention is staged through functions that are created once and
 //! called many times, which are the [`DotProductAttention`] that [`dot_product_attention`] creates for inference and
 //! the [`DifferentiableDotProductAttention`] that [`differentiable_dot_product_attention`] creates for training. Each
-//! function owns one cache of definitions with one named composite per definition, residual request, and optional
-//! input signature, each created on first use. Its calls therefore share the traced bodies, their lowering,
-//! and their rule specializations for as long as the function lives. Programs that contain staged calls remain valid
-//! after their function is dropped, and batching such a program stages an equivalent definition.
+//! function owns one cache of definitions with one named composite per definition, residual request, and input
+//! structure, each created on first use. Its calls therefore share the traced bodies, their lowering, and their rule
+//! specializations for as long as the function lives. Programs that contain staged calls remain valid after their
+//! function is dropped, and batching such a program stages an equivalent definition.
 //!
 //! # Transforms
 //!
@@ -118,7 +118,7 @@ use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::random::{Dropout, RandomAlgorithm};
 use crate::operations::reductions::{Reduce, ReductionKind};
-use crate::parameters::{Parameter, Parameterized};
+use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
@@ -448,7 +448,7 @@ pub const DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME: &str = "ryft.dot_produc
 pub const DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION: u32 = 1;
 
 /// Semantic identity of one named attention definition, which identifies the forward or the backward definition and
-/// records its value-independent configuration and the signature of its optional inputs. It converts losslessly to
+/// records its value-independent configuration and the structure of its inputs. It converts losslessly to
 /// and from the [`CompositeKey`] of the definition's named composite, which is how backends recognize attention calls
 /// (e.g., to replace them with fused kernels). The key's attributes are, in order:
 ///
@@ -469,8 +469,8 @@ pub enum AttentionKey {
         /// Value-independent configuration of the definition.
         configuration: AttentionConfiguration,
 
-        /// Signature of the optional inputs of the definition.
-        signature: AttentionInputSignature,
+        /// Structure of the [`AttentionInputs`] of the definition (i.e., which optional inputs are present).
+        input_structure: AttentionInputs<Placeholder>,
 
         /// Whether the definition also returns the log-sum-exp residual of its softmax.
         return_residual: bool,
@@ -483,8 +483,8 @@ pub enum AttentionKey {
         /// Value-independent configuration of the definition.
         configuration: AttentionConfiguration,
 
-        /// Signature of the optional inputs of the definition.
-        signature: AttentionInputSignature,
+        /// Structure of the [`AttentionInputs`] of the definition (i.e., which optional inputs are present).
+        input_structure: AttentionInputs<Placeholder>,
     },
 }
 
@@ -554,17 +554,19 @@ impl AttentionKey {
             .with_local_window(local_window)
             .with_implementation(implementation)
             .with_dropout(optional_float("dropout_rate")?);
-        let signature = AttentionInputSignature::new(
-            boolean("bias")?,
-            boolean("mask")?,
-            boolean("query_sequence_lengths")?,
-            boolean("key_value_sequence_lengths")?,
-        )
-        .with_dropout_state(boolean("dropout_state")?);
+        let present = |name: &str| boolean(name).map(|present| present.then_some(Placeholder));
+        let input_structure = AttentionInputs {
+            bias: present("bias")?,
+            mask: present("mask")?,
+            query_sequence_lengths: present("query_sequence_lengths")?,
+            key_value_sequence_lengths: present("key_value_sequence_lengths")?,
+            dropout_state: present("dropout_state")?,
+            ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+        };
         let decoded = if name == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME {
-            Self::Forward { configuration, signature, return_residual: boolean("residual")? }
+            Self::Forward { configuration, input_structure, return_residual: boolean("residual")? }
         } else {
-            Self::Backward { configuration, signature }
+            Self::Backward { configuration, input_structure }
         };
         if &decoded.to_composite_key() != key {
             return Err(malformed());
@@ -580,38 +582,41 @@ impl AttentionKey {
         }
     }
 
-    /// Returns the signature of the optional inputs of the definition.
+    /// Returns the structure of the [`AttentionInputs`] of the definition (i.e., which optional inputs are present).
     #[inline]
-    pub fn signature(&self) -> AttentionInputSignature {
+    pub fn input_structure(&self) -> AttentionInputs<Placeholder> {
         match self {
-            Self::Forward { signature, .. } | Self::Backward { signature, .. } => *signature,
+            Self::Forward { input_structure, .. } | Self::Backward { input_structure, .. } => *input_structure,
         }
     }
 
     /// Returns the [`CompositeKey`] of the named composite of this definition.
     pub fn to_composite_key(&self) -> CompositeKey {
         match *self {
-            Self::Forward { configuration, signature, return_residual } => attention_composite_key(
+            Self::Forward { configuration, input_structure, return_residual } => attention_composite_key(
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 configuration,
-                signature,
+                input_structure,
                 Some(return_residual),
             ),
-            Self::Backward { configuration, signature } => {
-                attention_composite_key(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, configuration, signature, None)
-            }
+            Self::Backward { configuration, input_structure } => attention_composite_key(
+                DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+                configuration,
+                input_structure,
+                None,
+            ),
         }
     }
 
     /// Returns the batching roles of the canonical inputs of this definition. Dropout states never reach batching
     /// rules, because definitions with dropout are batched structurally.
     fn batch_input_roles(&self) -> Vec<AttentionBatchInput> {
-        let signature = self.signature();
+        let input_structure = self.input_structure();
         let mut roles = vec![AttentionBatchInput::Tensor; 3];
-        roles.extend(signature.has_bias().then_some(AttentionBatchInput::Score));
-        roles.extend(signature.has_mask().then_some(AttentionBatchInput::Score));
-        roles.extend(signature.has_query_sequence_lengths().then_some(AttentionBatchInput::Length));
-        roles.extend(signature.has_key_value_sequence_lengths().then_some(AttentionBatchInput::Length));
+        roles.extend(input_structure.bias.is_some().then_some(AttentionBatchInput::Score));
+        roles.extend(input_structure.mask.is_some().then_some(AttentionBatchInput::Score));
+        roles.extend(input_structure.query_sequence_lengths.is_some().then_some(AttentionBatchInput::Length));
+        roles.extend(input_structure.key_value_sequence_lengths.is_some().then_some(AttentionBatchInput::Length));
         if matches!(self, Self::Backward { .. }) {
             roles.extend([AttentionBatchInput::Tensor, AttentionBatchInput::Residual, AttentionBatchInput::Tensor]);
         }
@@ -627,13 +632,13 @@ impl AttentionKey {
                 .into_iter()
                 .take(output_count)
                 .collect(),
-            Self::Backward { signature, .. } => {
+            Self::Backward { input_structure, .. } => {
                 let mut roles = vec![
                     AttentionBatchOutput::Tensor(0),
                     AttentionBatchOutput::Tensor(1),
                     AttentionBatchOutput::Tensor(2),
                 ];
-                if signature.has_bias() && output_count == 4 {
+                if input_structure.bias.is_some() && output_count == 4 {
                     roles.push(AttentionBatchOutput::Score(3));
                 }
                 roles
@@ -803,83 +808,10 @@ impl Hash for AttentionConfiguration {
     }
 }
 
-/// Presence metadata for the optional attention inputs (i.e., the bias, mask, sequence lengths, and dropout state) in
-/// their canonical order.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct AttentionInputSignature {
-    /// Whether an additive bias follows query, key, and value.
-    bias: bool,
-
-    /// Whether an arbitrary Boolean visibility mask follows the bias.
-    mask: bool,
-
-    /// Whether the query sequence lengths of every batch item follow the mask.
-    query_sequence_lengths: bool,
-
-    /// Whether the key/value sequence lengths of every batch item follow the query sequence lengths.
-    key_value_sequence_lengths: bool,
-
-    /// Whether a dropout random state follows key/value sequence lengths.
-    dropout_state: bool,
-}
-
-impl AttentionInputSignature {
-    /// Creates an optional input signature without a dropout random state.
-    #[inline]
-    pub fn new(bias: bool, mask: bool, query_sequence_lengths: bool, key_value_sequence_lengths: bool) -> Self {
-        Self { bias, mask, query_sequence_lengths, key_value_sequence_lengths, dropout_state: false }
-    }
-
-    /// Returns this signature with the provided presence of a dropout random state.
-    #[inline]
-    pub fn with_dropout_state(mut self, dropout_state: bool) -> Self {
-        self.dropout_state = dropout_state;
-        self
-    }
-
-    /// Returns whether an additive bias is present.
-    #[inline]
-    pub fn has_bias(&self) -> bool {
-        self.bias
-    }
-
-    /// Returns whether an arbitrary Boolean visibility mask is present.
-    #[inline]
-    pub fn has_mask(&self) -> bool {
-        self.mask
-    }
-
-    /// Returns whether the query sequence lengths of every batch item are present.
-    #[inline]
-    pub fn has_query_sequence_lengths(&self) -> bool {
-        self.query_sequence_lengths
-    }
-
-    /// Returns whether the key/value sequence lengths of every batch item are present.
-    #[inline]
-    pub fn has_key_value_sequence_lengths(&self) -> bool {
-        self.key_value_sequence_lengths
-    }
-
-    /// Returns whether a dropout random state is present.
-    #[inline]
-    pub fn has_dropout_state(&self) -> bool {
-        self.dropout_state
-    }
-
-    /// Returns the number of optional inputs described by this signature.
-    #[inline]
-    pub fn count(&self) -> usize {
-        usize::from(self.bias)
-            + usize::from(self.mask)
-            + usize::from(self.query_sequence_lengths)
-            + usize::from(self.key_value_sequence_lengths)
-            + usize::from(self.dropout_state)
-    }
-}
-
-/// Query, key, value, and optional inputs supplied to scaled dot-product attention.
-#[derive(Clone, Debug, PartialEq, Parameterized)]
+/// Query, key, value, and optional inputs supplied to scaled dot-product attention. Their canonical order is the order
+/// of the fields, which is the order of [`Parameterized::parameters`], and their structure (i.e.,
+/// [`Parameterized::parameter_structure`]) records which optional inputs are present.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameterized)]
 pub struct AttentionInputs<P: Parameter> {
     /// Query array in `TNH` or `BTNH` layout.
     pub query: P,
@@ -926,69 +858,12 @@ impl<P: Parameter> AttentionInputs<P> {
             dropout_state: None,
         }
     }
-
-    /// Creates the [`AttentionInputs`] whose values in canonical attention input order are `values`.
-    ///
-    /// # Parameters
-    ///
-    ///   - `signature`: Presence metadata for the optional inputs.
-    ///   - `values`: Query, key, value, and the present optional inputs in canonical order.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] when the number of values does not match `signature`.
-    pub fn from_values(signature: AttentionInputSignature, values: &[P]) -> Result<Self, TypeError>
-    where
-        P: Clone,
-    {
-        let expected_count = 3 + signature.count();
-        if values.len() != expected_count {
-            return Err(TypeError::invalid(format!(
-                "attention input signature expects {expected_count} values but got {}",
-                values.len(),
-            )));
-        }
-        let mut values = values.iter().cloned();
-        Ok(Self {
-            query: values.next().unwrap(),
-            key: values.next().unwrap(),
-            value: values.next().unwrap(),
-            bias: signature.has_bias().then(|| values.next().unwrap()),
-            mask: signature.has_mask().then(|| values.next().unwrap()),
-            query_sequence_lengths: signature.has_query_sequence_lengths().then(|| values.next().unwrap()),
-            key_value_sequence_lengths: signature.has_key_value_sequence_lengths().then(|| values.next().unwrap()),
-            dropout_state: signature.has_dropout_state().then(|| values.next().unwrap()),
-        })
-    }
-
-    /// Returns the optional input signature of these inputs.
-    #[inline]
-    pub fn signature(&self) -> AttentionInputSignature {
-        AttentionInputSignature::new(
-            self.bias.is_some(),
-            self.mask.is_some(),
-            self.query_sequence_lengths.is_some(),
-            self.key_value_sequence_lengths.is_some(),
-        )
-        .with_dropout_state(self.dropout_state.is_some())
-    }
-
-    /// Returns the values in canonical attention input order.
-    pub fn into_values(self) -> Vec<P> {
-        vec![self.query, self.key, self.value]
-            .into_iter()
-            .chain(self.bias)
-            .chain(self.mask)
-            .chain(self.query_sequence_lengths)
-            .chain(self.key_value_sequence_lengths)
-            .chain(self.dropout_state)
-            .collect()
-    }
 }
 
 /// Inputs of the backward attention definition, consisting of the forward [`AttentionInputs`], the attended forward
 /// output, its log-sum-exp residual, and the incoming cotangent of the output. Their canonical order is that of the
-/// forward inputs followed by the output, the residual, and the output cotangent.
+/// forward inputs followed by the output, the residual, and the output cotangent, which is the order of
+/// [`Parameterized::parameters`].
 #[derive(Clone, Debug, PartialEq, Parameterized)]
 pub struct AttentionBackwardInputs<P: Parameter> {
     /// Forward inputs, including the present optional inputs.
@@ -1004,44 +879,9 @@ pub struct AttentionBackwardInputs<P: Parameter> {
     pub output_cotangent: P,
 }
 
-impl<P: Parameter> AttentionBackwardInputs<P> {
-    /// Returns the [`AttentionBackwardInputs`] whose canonical values are `values`, for forward inputs with the
-    /// provided optional input signature.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`TypeError`] when the number of values does not match `signature`.
-    pub fn from_values(signature: AttentionInputSignature, values: &[P]) -> Result<Self, TypeError>
-    where
-        P: Clone,
-    {
-        let input_count = 3 + signature.count();
-        if values.len() != input_count + 3 {
-            return Err(TypeError::invalid(format!(
-                "attention backward inputs for signature {signature:?} have {} values but got {}",
-                input_count + 3,
-                values.len(),
-            )));
-        }
-        Ok(Self {
-            inputs: AttentionInputs::from_values(signature, &values[..input_count])?,
-            output: values[input_count].clone(),
-            residual: values[input_count + 1].clone(),
-            output_cotangent: values[input_count + 2].clone(),
-        })
-    }
-
-    /// Returns the values of these inputs in their canonical order.
-    pub fn into_values(self) -> Vec<P> {
-        let mut values = self.inputs.into_values();
-        values.extend([self.output, self.residual, self.output_cotangent]);
-        values
-    }
-}
-
 /// Scaled dot-product attention inference function, built by [`dot_product_attention`]. Each call stages one call of
-/// the named forward attention definition (refer to [`AttentionKey`]) for the optional input signature of its inputs,
-/// which backends may replace with their own implementation of the definition (e.g., a fused kernel). The function
+/// the named forward attention definition (refer to [`AttentionKey`]) for the structure of its inputs, which
+/// backends may replace with their own implementation of the definition (e.g., a fused kernel). The function
 /// owns its definitions, so it should be created once and called many times, which traces each definition's body once
 /// per input types and shares it, together with its lowering, across those calls.
 ///
@@ -1199,7 +1039,7 @@ pub type AttentionVjp<V, O> =
 /// transitions of the inputs precede the composite boundary, which lets their transposes accumulate the cotangent
 /// contributions of invariant inputs exactly once.
 ///
-/// The function owns its named composites, one per optional input signature, together with their definitions, so it
+/// The function owns its named composites, one per input structure, together with their definitions, so it
 /// should be created once and called many times. Its primal and its definitions' bodies are then traced once per input
 /// types, and its rules once per specialization, for as long as the function lives.
 pub struct DifferentiableDotProductAttention<C: Domain>
@@ -1209,8 +1049,8 @@ where
     /// Named attention definitions called by the rules of this function.
     definitions: Arc<AttentionDefinitions<C::Constant, C::Operation>>,
 
-    /// Named composites that stage the calls of this function, by optional input signature.
-    functions: Mutex<HashMap<AttentionInputSignature, Arc<TrainingFunction<C::Constant, C::Operation>>>>,
+    /// Named composites that stage the calls of this function, by input structure.
+    functions: Mutex<HashMap<AttentionInputs<Placeholder>, Arc<TrainingFunction<C::Constant, C::Operation>>>>,
 }
 
 impl<C: Domain> DifferentiableDotProductAttention<C>
@@ -1252,29 +1092,28 @@ where
             Ok(MaybeZero::Zero(value.r#type().cotangent()?))
         }
 
-        let signature = inputs.signature();
+        let input_structure = inputs.parameter_structure();
         let inputs = align_attention_inputs(inputs)?;
         let function = self
             .functions
             .lock()
             .expect("attention functions mutex is poisoned")
-            .entry(signature)
+            .entry(input_structure)
             .or_insert_with(|| {
-                // The named composite of an optional input signature is created on its first call. Its primal and
+                // The named composite of an input structure is created on its first call. Its primal and
                 // its rules call the definitions that this function owns.
                 let definitions = self.definitions.clone();
                 let configuration = definitions.configuration();
                 // The composite returns only the attended output, whose type the forward boundary determines.
                 let output_types = move |input_types: AttentionInputs<C::Type>| -> Result<C::Type, ProgramError> {
                     let input_types = input_types
-                        .into_values()
-                        .iter()
+                        .parameters()
                         .map(|r#type| r#type.as_array_type().cloned())
                         .collect::<Result<Vec<_>, _>>()?;
                     let mut output_types = attention_forward_output_types(
                         DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                         configuration,
-                        signature,
+                        input_structure,
                         false,
                         input_types.as_slice(),
                     )?;
@@ -1352,7 +1191,7 @@ where
                             attention_composite_key(
                                 DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME,
                                 configuration,
-                                signature,
+                                input_structure,
                                 None,
                             ),
                             output_types,
@@ -1460,32 +1299,32 @@ struct AttentionInputTypes<'o> {
 
 impl<'o> AttentionInputTypes<'o> {
     /// Parses one forward operation boundary.
-    fn forward(signature: AttentionInputSignature, input_types: &'o [ArrayType]) -> Result<Self, TypeError> {
+    fn forward(input_structure: AttentionInputs<Placeholder>, input_types: &'o [ArrayType]) -> Result<Self, TypeError> {
         let [query, key, value, optional @ ..] = input_types else {
             return Err(TypeError::invalid("attention requires query, key, and value inputs"));
         };
         let mut index = 0;
-        let bias = signature.has_bias().then(|| {
+        let bias = input_structure.bias.is_some().then(|| {
             let value = &optional[index];
             index += 1;
             value
         });
-        let mask = signature.has_mask().then(|| {
+        let mask = input_structure.mask.is_some().then(|| {
             let value = &optional[index];
             index += 1;
             value
         });
-        let query_sequence_lengths = signature.has_query_sequence_lengths().then(|| {
+        let query_sequence_lengths = input_structure.query_sequence_lengths.is_some().then(|| {
             let value = &optional[index];
             index += 1;
             value
         });
-        let key_value_sequence_lengths = signature.has_key_value_sequence_lengths().then(|| {
+        let key_value_sequence_lengths = input_structure.key_value_sequence_lengths.is_some().then(|| {
             let value = &optional[index];
             index += 1;
             value
         });
-        let dropout_state = signature.has_dropout_state().then(|| &optional[index]);
+        let dropout_state = input_structure.dropout_state.is_some().then(|| &optional[index]);
         Ok(Self {
             query,
             key,
@@ -1502,12 +1341,15 @@ impl<'o> AttentionInputTypes<'o> {
     }
 
     /// Parses one backward operation boundary.
-    fn backward(signature: AttentionInputSignature, input_types: &'o [ArrayType]) -> Result<Self, TypeError> {
-        let optional_count = signature.count();
-        let mut types = Self::forward(signature, &input_types[..3 + optional_count])?;
-        types.output = Some(&input_types[3 + optional_count]);
-        types.residual = Some(&input_types[4 + optional_count]);
-        types.output_cotangent = Some(&input_types[5 + optional_count]);
+    fn backward(
+        input_structure: AttentionInputs<Placeholder>,
+        input_types: &'o [ArrayType],
+    ) -> Result<Self, TypeError> {
+        let input_count = input_structure.parameter_count();
+        let mut types = Self::forward(input_structure, &input_types[..input_count])?;
+        types.output = Some(&input_types[input_count]);
+        types.residual = Some(&input_types[input_count + 1]);
+        types.output_cotangent = Some(&input_types[input_count + 2]);
         Ok(types)
     }
 }
@@ -1534,7 +1376,7 @@ struct AttentionDimensions {
 }
 
 /// Named attention definitions of one operation family `(V, O)` and one [`AttentionConfiguration`], with one named
-/// composite per [`AttentionKey`] (i.e., per definition, residual request, and optional input signature), each
+/// composite per [`AttentionKey`] (i.e., per definition, residual request, and input structure), each
 /// created on first use. The functions that stage attention own this cache, so its definitions, their traced bodies,
 /// and their rule specializations live exactly as long as those functions.
 struct AttentionDefinitions<V: Value, O: Operation<Type = V::Type>>
@@ -1544,11 +1386,11 @@ where
     /// Configuration of every definition in this cache.
     configuration: AttentionConfiguration,
 
-    /// Forward definitions by residual request and optional input signature.
-    forward: Mutex<HashMap<(bool, AttentionInputSignature), ForwardFunction<V, O>>>,
+    /// Forward definitions by residual request and input structure.
+    forward: Mutex<HashMap<(bool, AttentionInputs<Placeholder>), ForwardFunction<V, O>>>,
 
-    /// Backward definitions by optional input signature.
-    backward: Mutex<HashMap<AttentionInputSignature, BackwardFunction<V, O>>>,
+    /// Backward definitions by input structure.
+    backward: Mutex<HashMap<AttentionInputs<Placeholder>, BackwardFunction<V, O>>>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> AttentionDefinitions<V, O>
@@ -1579,13 +1421,13 @@ where
         C: CompositeCallContext<Type = V::Type, Value = X, Constant = V, Operation = O>,
         X: Value<Type = V::Type, Domain = C>,
     {
-        let signature = inputs.signature();
+        let input_structure = inputs.parameter_structure();
         let function = self
             .forward
             .lock()
             .expect("attention definitions mutex is poisoned")
-            .entry((return_residual, signature))
-            .or_insert_with(|| forward_function(self.configuration, signature, return_residual))
+            .entry((return_residual, input_structure))
+            .or_insert_with(|| forward_function(self.configuration, input_structure, return_residual))
             .clone();
         match function {
             AttentionFunction::Folding(function) => function.call(inputs),
@@ -1600,13 +1442,13 @@ where
         C: CompositeCallContext<Type = V::Type, Value = X, Constant = V, Operation = O>,
         X: Value<Type = V::Type, Domain = C>,
     {
-        let signature = inputs.inputs.signature();
+        let input_structure = inputs.inputs.parameter_structure();
         let function = self
             .backward
             .lock()
             .expect("attention definitions mutex is poisoned")
-            .entry(signature)
-            .or_insert_with(|| backward_function(self.configuration, signature))
+            .entry(input_structure)
+            .or_insert_with(|| backward_function(self.configuration, input_structure))
             .clone();
         match function {
             AttentionFunction::Folding(function) => function.call(inputs),
@@ -1655,7 +1497,7 @@ type BackwardFunction<V, O> = AttentionFunction<
     Composite<V, O, AttentionBackwardInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>,
 >;
 
-/// Named composite that stages differentiable attention for one optional input signature.
+/// Named composite that stages differentiable attention for one input structure.
 type TrainingFunction<V, O> =
     Composite<V, O, AttentionInputs<RuleTracer<V, O>>, RuleTracer<V, O>, DefaultJvp, AttentionVjp<V, O>>;
 
@@ -1712,12 +1554,12 @@ enum AttentionBatchOutput {
     Score(usize),
 }
 
-/// Returns the [`CompositeKey`] named `name` with the attributes of `configuration` and `signature`, including the
-/// `residual` attribute when `residual` is present (refer to [`AttentionKey`] for the encoding).
+/// Returns the [`CompositeKey`] named `name` with the attributes of `configuration` and `input_structure`, including
+/// the `residual` attribute when `residual` is present (refer to [`AttentionKey`] for the encoding).
 fn attention_composite_key(
     name: &'static str,
     configuration: AttentionConfiguration,
-    signature: AttentionInputSignature,
+    input_structure: AttentionInputs<Placeholder>,
     residual: Option<bool>,
 ) -> CompositeKey {
     let implementation = match configuration.implementation() {
@@ -1735,11 +1577,11 @@ fn attention_composite_key(
         Some(residual) => key.with_attribute("residual", residual),
         None => key,
     };
-    key.with_attribute("bias", signature.has_bias())
-        .with_attribute("mask", signature.has_mask())
-        .with_attribute("query_sequence_lengths", signature.has_query_sequence_lengths())
-        .with_attribute("key_value_sequence_lengths", signature.has_key_value_sequence_lengths())
-        .with_attribute("dropout_state", signature.has_dropout_state())
+    key.with_attribute("bias", input_structure.bias.is_some())
+        .with_attribute("mask", input_structure.mask.is_some())
+        .with_attribute("query_sequence_lengths", input_structure.query_sequence_lengths.is_some())
+        .with_attribute("key_value_sequence_lengths", input_structure.key_value_sequence_lengths.is_some())
+        .with_attribute("dropout_state", input_structure.dropout_state.is_some())
 }
 
 /// Returns `inputs` with their manual variation aligned through [`ManualVariationAlignment::align_manual_variation`],
@@ -1764,12 +1606,12 @@ where
     if aligned {
         return Ok(inputs);
     }
-    let signature = inputs.signature();
-    let inputs = ManualVariationAlignment::align_manual_variation(&inputs.into_values())?;
-    Ok(AttentionInputs::from_values(signature, inputs.as_slice())?)
+    let input_structure = inputs.parameter_structure();
+    let inputs = ManualVariationAlignment::align_manual_variation(&inputs.into_parameters().collect::<Vec<_>>())?;
+    Ok(AttentionInputs::from_parameters(input_structure, inputs)?)
 }
 
-/// Validates one forward attention boundary (i.e., the [`AttentionInputs`] of `signature` in canonical order) and
+/// Validates one forward attention boundary (i.e., the [`AttentionInputs`] of `input_structure` in canonical order) and
 /// returns the types of its outputs. The first output is the attended output, which has the query type and therefore
 /// propagates the query's metadata (e.g., its sharding), and it is followed by the log-sum-exp residual when
 /// `return_residual` is set. Every input must have matching manual variation, and reduced and unreduced inputs are
@@ -1778,18 +1620,18 @@ where
 fn attention_forward_output_types(
     operation_name: &str,
     configuration: AttentionConfiguration,
-    signature: AttentionInputSignature,
+    input_structure: AttentionInputs<Placeholder>,
     return_residual: bool,
     input_types: &[ArrayType],
 ) -> Result<Vec<ArrayType>, TypeError> {
-    if input_types.len() != 3 + signature.count() {
+    if input_types.len() != input_structure.parameter_count() {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` expects {} inputs for its optional-input signature but got {}",
-            3 + signature.count(),
+            "`{operation_name}` expects {} inputs for its input structure but got {}",
+            input_structure.parameter_count(),
             input_types.len(),
         )));
     }
-    let types = AttentionInputTypes::forward(signature, input_types)?;
+    let types = AttentionInputTypes::forward(input_structure, input_types)?;
     let dimensions = validate_attention_boundary(operation_name, configuration, &types, input_types)?;
     let mut output_types = vec![types.query.clone()];
     if return_residual {
@@ -1798,7 +1640,7 @@ fn attention_forward_output_types(
     Ok(output_types)
 }
 
-/// Validates one backward attention boundary (i.e., the [`AttentionInputs`] of `signature` in canonical order,
+/// Validates one backward attention boundary (i.e., the [`AttentionInputs`] of `input_structure` in canonical order,
 /// followed by the forward output, the log-sum-exp residual, and the output cotangent) and returns the types of its
 /// outputs, which are the cotangents of the query, key, and value, followed by that of a present bias whose cotangent
 /// space is not zero-dimensional. The forward output, residual, and output cotangent are compared by data type and
@@ -1806,17 +1648,17 @@ fn attention_forward_output_types(
 fn attention_backward_output_types(
     operation_name: &str,
     configuration: AttentionConfiguration,
-    signature: AttentionInputSignature,
+    input_structure: AttentionInputs<Placeholder>,
     input_types: &[ArrayType],
 ) -> Result<Vec<ArrayType>, TypeError> {
-    if input_types.len() != 6 + signature.count() {
+    if input_types.len() != input_structure.parameter_count() + 3 {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` expects {} inputs for its optional-input signature but got {}",
-            6 + signature.count(),
+            "`{operation_name}` expects {} inputs for its input structure but got {}",
+            input_structure.parameter_count() + 3,
             input_types.len(),
         )));
     }
-    let types = AttentionInputTypes::backward(signature, input_types)?;
+    let types = AttentionInputTypes::backward(input_structure, input_types)?;
     let dimensions = validate_attention_boundary(operation_name, configuration, &types, input_types)?;
     let matches_expected = |actual: &ArrayType, expected: &ArrayType| -> bool {
         actual.data_type() == expected.data_type() && actual.shape() == expected.shape()
@@ -2119,7 +1961,7 @@ fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayT
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
-/// Returns the named composite of the forward definition with the provided configuration, optional input signature,
+/// Returns the named composite of the forward definition with the provided configuration, input structure,
 /// and residual request.
 ///
 /// The body of the definition evaluates portable scaled dot-product attention with ordinary array operations and
@@ -2129,7 +1971,7 @@ fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayT
 /// their own.
 fn forward_function<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
-    signature: AttentionInputSignature,
+    input_structure: AttentionInputs<Placeholder>,
     return_residual: bool,
 ) -> ForwardFunction<V, O>
 where
@@ -2141,26 +1983,25 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
 {
-    let key = AttentionKey::Forward { configuration, signature, return_residual };
+    let key = AttentionKey::Forward { configuration, input_structure, return_residual };
     let output_types = move |input_types: AttentionInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
-        // Every definition is specialized to the optional input signature that its key records.
-        if input_types.signature() != signature {
+        // Every definition is specialized to the input structure that its key records.
+        if input_types.parameter_structure() != input_structure {
             return Err(TypeError::invalid(format!(
-                "named composite `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` was defined for the optional-input \
-                 signature {signature:?} but was called with {:?}",
-                input_types.signature(),
+                "named composite `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` was defined for the input structure \
+                 {input_structure:?} but was called with {:?}",
+                input_types.parameter_structure(),
             ))
             .into());
         }
         let input_types = input_types
-            .into_values()
-            .iter()
+            .parameters()
             .map(|r#type| r#type.as_array_type().cloned())
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = attention_forward_output_types(
             DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
             configuration,
-            signature,
+            input_structure,
             return_residual,
             input_types.as_slice(),
         )?;
@@ -2170,9 +2011,7 @@ where
         // The output type rule above has already validated this boundary, so the types are only needed for the
         // validated dimensions and the rank of the query.
         let input_types = inputs
-            .clone()
-            .into_values()
-            .iter()
+            .parameters()
             .map(|input| -> Result<ArrayType, ProgramError> { Ok(input.r#type().as_array_type()?.clone()) })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         let query_rank = input_types[0].rank();
@@ -2266,25 +2105,24 @@ where
             // dropped, in which case the folded call stages an equivalent definition.
             let function = match weak.upgrade() {
                 Some(function) => function,
-                None => match forward_function::<V, O>(configuration, signature, return_residual) {
+                None => match forward_function::<V, O>(configuration, input_structure, return_residual) {
                     AttentionFunction::Folding(function) => function,
                     AttentionFunction::Structural(_) => unreachable!("definitions without dropout batch by folding"),
                 },
             };
             batch_attention(
-                inputs.into_values(),
-                axes.into_values(),
+                inputs.into_parameters().collect(),
+                axes.into_parameters().collect(),
                 &extent,
                 input_roles.as_slice(),
                 |output_count| key.batch_output_roles(output_count),
-                |inputs| function.call(AttentionInputs::from_values(signature, inputs.as_slice())?),
+                |inputs| function.call(AttentionInputs::from_parameters(input_structure, inputs)?),
             )
         })
     }))
 }
 
-/// Returns the named composite of the backward definition with the provided configuration and optional input
-/// signature.
+/// Returns the named composite of the backward definition with the provided configuration and input structure.
 ///
 /// The body of the definition evaluates the portable attention backward pass using the same extents and mask
 /// construction as the forward body (refer to [`forward_function`]), and returns the cotangents of the query, key, and
@@ -2314,7 +2152,7 @@ where
 /// reproduce.
 fn backward_function<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
-    signature: AttentionInputSignature,
+    input_structure: AttentionInputs<Placeholder>,
 ) -> BackwardFunction<V, O>
 where
     V: 'static,
@@ -2325,26 +2163,25 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
 {
-    let key = AttentionKey::Backward { configuration, signature };
+    let key = AttentionKey::Backward { configuration, input_structure };
     let output_types = move |input_types: AttentionBackwardInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
-        // Every definition is specialized to the optional input signature that its key records.
-        if input_types.inputs.signature() != signature {
+        // Every definition is specialized to the input structure that its key records.
+        if input_types.inputs.parameter_structure() != input_structure {
             return Err(TypeError::invalid(format!(
-                "named composite `{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` was defined for the \
-                 optional-input signature {signature:?} but was called with {:?}",
-                input_types.inputs.signature(),
+                "named composite `{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` was defined for the input \
+                 structure {input_structure:?} but was called with {:?}",
+                input_types.inputs.parameter_structure(),
             ))
             .into());
         }
         let input_types = input_types
-            .into_values()
-            .iter()
+            .parameters()
             .map(|r#type| r#type.as_array_type().cloned())
             .collect::<Result<Vec<_>, _>>()?;
         let output_types = attention_backward_output_types(
             DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
             configuration,
-            signature,
+            input_structure,
             input_types.as_slice(),
         )?;
         Ok(output_types.into_iter().map(Into::into).collect())
@@ -2357,9 +2194,7 @@ where
         // The output type rule above has already validated this boundary, so the types are only needed for the
         // validated dimensions and the ranks of the query, key, and value.
         let input_types = inputs
-            .clone()
-            .into_values()
-            .iter()
+            .parameters()
             .map(|input| -> Result<ArrayType, ProgramError> { Ok(input.r#type().as_array_type()?.clone()) })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         let input_ranks = [input_types[0].rank(), input_types[1].rank(), input_types[2].rank()];
@@ -2546,18 +2381,26 @@ where
             // Refer to the forward definition for when the function may have been dropped.
             let function = match weak.upgrade() {
                 Some(function) => function,
-                None => match backward_function::<V, O>(configuration, signature) {
+                None => match backward_function::<V, O>(configuration, input_structure) {
                     AttentionFunction::Folding(function) => function,
                     AttentionFunction::Structural(_) => unreachable!("definitions without dropout batch by folding"),
                 },
             };
             batch_attention(
-                inputs.into_values(),
-                axes.into_values(),
+                inputs.into_parameters().collect(),
+                axes.into_parameters().collect(),
                 &extent,
                 input_roles.as_slice(),
                 |output_count| key.batch_output_roles(output_count),
-                |inputs| function.call(AttentionBackwardInputs::from_values(signature, inputs.as_slice())?),
+                |inputs| {
+                    let structure = AttentionBackwardInputs {
+                        inputs: input_structure,
+                        output: Placeholder,
+                        residual: Placeholder,
+                        output_cotangent: Placeholder,
+                    };
+                    function.call(AttentionBackwardInputs::from_parameters(structure, inputs)?)
+                },
             )
         })
     }))
@@ -2982,7 +2825,7 @@ mod tests {
     use crate::differentiation::{DifferentiationError, differentiate_at};
     use crate::macros::check_gradient;
     use crate::operations::manipulation::slicing::Slice;
-    use crate::parameters::Placeholder;
+    use crate::parameters::{ParameterError, Placeholder};
     use crate::tests::hash_of;
     use crate::tracing::Trace;
 
@@ -3139,18 +2982,23 @@ mod tests {
     #[test]
     fn test_attention_key() {
         let configuration = AttentionConfiguration::new().with_causal(true).with_dropout(0.25);
-        let signature = AttentionInputSignature::new(true, false, true, false).with_dropout_state(true);
-        let key = AttentionKey::Forward { configuration, signature, return_residual: true };
+        let input_structure = AttentionInputs {
+            bias: Some(Placeholder),
+            query_sequence_lengths: Some(Placeholder),
+            dropout_state: Some(Placeholder),
+            ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+        };
+        let key = AttentionKey::Forward { configuration, input_structure, return_residual: true };
         assert_eq!(key.configuration(), configuration);
-        assert_eq!(key.signature(), signature);
+        assert_eq!(key.input_structure(), input_structure);
 
         // Forward keys with different residual requests identify different definitions.
-        assert_ne!(key, AttentionKey::Forward { configuration, signature, return_residual: false });
+        assert_ne!(key, AttentionKey::Forward { configuration, input_structure, return_residual: false });
 
         // Backward definitions have no residual request.
-        let key = AttentionKey::Backward { configuration, signature };
+        let key = AttentionKey::Backward { configuration, input_structure };
         assert_eq!(key.configuration(), configuration);
-        assert_eq!(key.signature(), signature);
+        assert_eq!(key.input_structure(), input_structure);
     }
 
     #[test]
@@ -3161,22 +3009,30 @@ mod tests {
             .with_causal(true)
             .with_local_window((2, 0))
             .with_dropout(0.25);
-        let signature = AttentionInputSignature::new(true, false, true, false).with_dropout_state(true);
+        let input_structure = AttentionInputs {
+            bias: Some(Placeholder),
+            query_sequence_lengths: Some(Placeholder),
+            dropout_state: Some(Placeholder),
+            ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+        };
         for implementation in
             [AttentionImplementation::Automatic, AttentionImplementation::Portable, AttentionImplementation::Fused]
         {
             let default_configuration = AttentionConfiguration::new().with_implementation(implementation);
-            let default_signature = AttentionInputSignature::default();
+            let default_input_structure = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
             let configuration = configuration.with_implementation(implementation);
             for key in [
-                AttentionKey::Forward { configuration, signature, return_residual: true },
+                AttentionKey::Forward { configuration, input_structure, return_residual: true },
                 AttentionKey::Forward {
                     configuration: default_configuration,
-                    signature: default_signature,
+                    input_structure: default_input_structure,
                     return_residual: false,
                 },
-                AttentionKey::Backward { configuration, signature },
-                AttentionKey::Backward { configuration: default_configuration, signature: default_signature },
+                AttentionKey::Backward { configuration, input_structure },
+                AttentionKey::Backward {
+                    configuration: default_configuration,
+                    input_structure: default_input_structure,
+                },
             ] {
                 assert_eq!(AttentionKey::from_composite_key(&key.to_composite_key()), Ok(Some(key)));
             }
@@ -3196,7 +3052,7 @@ mod tests {
         );
         let forward_key = AttentionKey::Forward {
             configuration: AttentionConfiguration::new(),
-            signature: AttentionInputSignature::default(),
+            input_structure: AttentionInputs::new(Placeholder, Placeholder, Placeholder),
             return_residual: false,
         }
         .to_composite_key();
@@ -3254,10 +3110,15 @@ mod tests {
             .with_local_window((2, 0))
             .with_implementation(AttentionImplementation::Fused)
             .with_dropout(0.25);
-        let signature = AttentionInputSignature::new(true, false, true, false).with_dropout_state(true);
+        let input_structure = AttentionInputs {
+            bias: Some(Placeholder),
+            query_sequence_lengths: Some(Placeholder),
+            dropout_state: Some(Placeholder),
+            ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+        };
 
         // Forward keys encode every configuration attribute and their residual request.
-        let key = AttentionKey::Forward { configuration, signature, return_residual: true }.to_composite_key();
+        let key = AttentionKey::Forward { configuration, input_structure, return_residual: true }.to_composite_key();
         assert_eq!(key.name(), DOT_PRODUCT_ATTENTION_COMPOSITE_NAME);
         assert_eq!(key.version(), DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION);
         assert_eq!(
@@ -3268,7 +3129,7 @@ mod tests {
         );
 
         // Backward keys have no residual request, so they omit its attribute.
-        let key = AttentionKey::Backward { configuration, signature }.to_composite_key();
+        let key = AttentionKey::Backward { configuration, input_structure }.to_composite_key();
         assert_eq!(key.name(), DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME);
         assert_eq!(key.version(), DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION);
         assert_eq!(
@@ -3333,10 +3194,10 @@ mod tests {
         let both = configuration.with_local_window((2, 3));
         assert_eq!(left, both);
         assert_eq!(hash_of(&left), hash_of(&both));
-        let signature = AttentionInputSignature::default();
+        let input_structure = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
         assert_eq!(
-            AttentionKey::Backward { configuration: left, signature }.to_composite_key(),
-            AttentionKey::Backward { configuration: both, signature }.to_composite_key(),
+            AttentionKey::Backward { configuration: left, input_structure }.to_composite_key(),
+            AttentionKey::Backward { configuration: both, input_structure }.to_composite_key(),
         );
         assert_ne!(left.with_causal(false), both.with_causal(false));
         let configurations = HashMap::from([(configuration, "configuration")]);
@@ -3350,26 +3211,6 @@ mod tests {
         assert_ne!(AttentionConfiguration::new().with_scale(-0.0), AttentionConfiguration::new().with_scale(0.0));
         assert_ne!(AttentionConfiguration::new().with_scale(0.0), AttentionConfiguration::new());
         assert_ne!(AttentionConfiguration::new().with_dropout(-0.0), AttentionConfiguration::new().with_dropout(0.0));
-    }
-
-    #[test]
-    fn test_attention_input_signature() {
-        let signature = AttentionInputSignature::new(true, false, true, false);
-        assert!(signature.has_bias());
-        assert!(!signature.has_mask());
-        assert!(signature.has_query_sequence_lengths());
-        assert!(!signature.has_key_value_sequence_lengths());
-        assert!(!signature.has_dropout_state());
-        assert_eq!(signature.count(), 2);
-
-        let signature = AttentionInputSignature::new(false, true, false, true).with_dropout_state(true);
-        assert!(!signature.has_bias());
-        assert!(signature.has_mask());
-        assert!(!signature.has_query_sequence_lengths());
-        assert!(signature.has_key_value_sequence_lengths());
-        assert!(signature.has_dropout_state());
-        assert_eq!(signature.count(), 3);
-        assert_eq!(AttentionInputSignature::default().count(), 0);
     }
 
     #[test]
@@ -3391,109 +3232,79 @@ mod tests {
     }
 
     #[test]
-    fn test_attention_inputs_from_values() {
-        let values = (0..8).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
-        assert_eq!(
-            AttentionInputs::from_values(AttentionInputSignature::default(), &values[..3]),
-            Ok(AttentionInputs::new(values[0].clone(), values[1].clone(), values[2].clone())),
-        );
-
-        // The present optional inputs follow the query, key, and value in canonical order.
-        let signature = AttentionInputSignature::new(false, true, false, true);
-        assert_eq!(
-            AttentionInputs::from_values(signature, &values[..5]),
-            Ok(AttentionInputs {
-                mask: Some(values[3].clone()),
-                key_value_sequence_lengths: Some(values[4].clone()),
-                ..AttentionInputs::new(values[0].clone(), values[1].clone(), values[2].clone())
-            }),
-        );
-        let signature = AttentionInputSignature::new(true, true, true, true).with_dropout_state(true);
-        assert_eq!(
-            AttentionInputs::from_values(signature, values.as_slice()),
-            Ok(AttentionInputs {
-                query: values[0].clone(),
-                key: values[1].clone(),
-                value: values[2].clone(),
-                bias: Some(values[3].clone()),
-                mask: Some(values[4].clone()),
-                query_sequence_lengths: Some(values[5].clone()),
-                key_value_sequence_lengths: Some(values[6].clone()),
-                dropout_state: Some(values[7].clone()),
-            }),
-        );
-        assert!(matches!(
-            AttentionInputs::from_values(signature, &values[..7]),
-            Err(TypeError::Invalid { message, .. })
-                if message == "attention input signature expects 8 values but got 7",
-        ));
-    }
-
-    #[test]
-    fn test_attention_inputs_signature() {
-        let r#type = ArrayType::new_static(DataType::F32, [1]);
-        let inputs = AttentionInputs::new(r#type.clone(), r#type.clone(), r#type.clone());
-        assert_eq!(inputs.signature(), AttentionInputSignature::default());
-        let inputs = AttentionInputs { mask: Some(r#type.clone()), dropout_state: Some(r#type.clone()), ..inputs };
-        assert_eq!(
-            inputs.signature(),
-            AttentionInputSignature::new(false, true, false, false).with_dropout_state(true),
-        );
-        let inputs = AttentionInputs {
-            bias: Some(r#type.clone()),
-            query_sequence_lengths: Some(r#type.clone()),
-            key_value_sequence_lengths: Some(r#type),
-            ..inputs
-        };
-        assert_eq!(inputs.signature(), AttentionInputSignature::new(true, true, true, true).with_dropout_state(true));
-    }
-
-    #[test]
-    fn test_attention_inputs_into_values() {
+    fn test_attention_inputs_parameters() {
+        // The parameters of the inputs are their values in canonical order, in which the present optional inputs
+        // follow the query, key, and value, and their structure records which optional inputs are present.
         let values = (0..8).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
         let inputs = AttentionInputs::new(values[0].clone(), values[1].clone(), values[2].clone());
-        assert_eq!(inputs.clone().into_values(), values[..3].to_vec());
+        assert_eq!(inputs.parameter_structure(), AttentionInputs::new(Placeholder, Placeholder, Placeholder));
+        assert_eq!(inputs.parameter_count(), 3);
+        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), values[..3].to_vec());
+        assert_eq!(
+            AttentionInputs::from_parameters(
+                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                values[..3].iter().cloned()
+            ),
+            Ok(inputs.clone()),
+        );
 
-        // The present optional inputs follow the query, key, and value in canonical order.
         let inputs = AttentionInputs {
+            mask: Some(values[3].clone()),
+            key_value_sequence_lengths: Some(values[4].clone()),
+            ..inputs
+        };
+        let structure = AttentionInputs {
+            mask: Some(Placeholder),
+            key_value_sequence_lengths: Some(Placeholder),
+            ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+        };
+        assert_eq!(inputs.parameter_structure(), structure);
+        assert_eq!(inputs.parameter_count(), 5);
+        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), values[..5].to_vec());
+        assert_eq!(AttentionInputs::from_parameters(structure, values[..5].iter().cloned()), Ok(inputs));
+
+        let inputs = AttentionInputs {
+            query: values[0].clone(),
+            key: values[1].clone(),
+            value: values[2].clone(),
             bias: Some(values[3].clone()),
             mask: Some(values[4].clone()),
             query_sequence_lengths: Some(values[5].clone()),
             key_value_sequence_lengths: Some(values[6].clone()),
             dropout_state: Some(values[7].clone()),
-            ..inputs
         };
-        assert_eq!(inputs.into_values(), values);
-    }
+        let structure = AttentionInputs {
+            query: Placeholder,
+            key: Placeholder,
+            value: Placeholder,
+            bias: Some(Placeholder),
+            mask: Some(Placeholder),
+            query_sequence_lengths: Some(Placeholder),
+            key_value_sequence_lengths: Some(Placeholder),
+            dropout_state: Some(Placeholder),
+        };
+        assert_eq!(inputs.parameter_structure(), structure);
+        assert_eq!(inputs.parameter_count(), 8);
+        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), values);
+        assert_eq!(AttentionInputs::from_parameters(structure, values.iter().cloned()), Ok(inputs));
 
-    #[test]
-    fn test_attention_backward_inputs_from_values() {
-        // Backward inputs append the forward output, its residual, and the output cotangent to the forward inputs.
-        let signature = AttentionInputSignature::new(false, true, false, false);
-        let values = (0..7).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
+        // A structure only accepts as many values as it has parameters.
         assert_eq!(
-            AttentionBackwardInputs::from_values(signature, values.as_slice()),
-            Ok(AttentionBackwardInputs {
-                inputs: AttentionInputs {
-                    mask: Some(values[3].clone()),
-                    ..AttentionInputs::new(values[0].clone(), values[1].clone(), values[2].clone())
-                },
-                output: values[4].clone(),
-                residual: values[5].clone(),
-                output_cotangent: values[6].clone(),
-            }),
+            AttentionInputs::from_parameters(structure, values[..7].iter().cloned()),
+            Err(ParameterError::MissingParameters { expected_count: 8, paths: None }),
         );
-        assert!(matches!(
-            AttentionBackwardInputs::from_values(signature, &values[..6]),
-            Err(TypeError::Invalid { message, .. })
-                if message == "attention backward inputs for signature AttentionInputSignature { bias: false, mask: \
-                               true, query_sequence_lengths: false, key_value_sequence_lengths: false, dropout_state: \
-                               false } have 7 values but got 6",
-        ));
+        assert_eq!(
+            AttentionInputs::from_parameters(
+                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                values[..4].iter().cloned()
+            ),
+            Err(ParameterError::UnusedParameters { paths: None }),
+        );
     }
 
     #[test]
-    fn test_attention_backward_inputs_into_values() {
+    fn test_attention_backward_inputs_parameters() {
+        // Backward inputs append the forward output, its residual, and the output cotangent to the forward inputs.
         let values = (0..7).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
         let inputs = AttentionBackwardInputs {
             inputs: AttentionInputs {
@@ -3504,7 +3315,19 @@ mod tests {
             residual: values[5].clone(),
             output_cotangent: values[6].clone(),
         };
-        assert_eq!(inputs.into_values(), values);
+        let structure = AttentionBackwardInputs {
+            inputs: AttentionInputs {
+                mask: Some(Placeholder),
+                ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+            },
+            output: Placeholder,
+            residual: Placeholder,
+            output_cotangent: Placeholder,
+        };
+        assert_eq!(inputs.parameter_structure(), structure);
+        assert_eq!(inputs.parameter_count(), 7);
+        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), values);
+        assert_eq!(AttentionBackwardInputs::from_parameters(structure, values.iter().cloned()), Ok(inputs));
     }
 
     #[test]
@@ -3584,11 +3407,11 @@ mod tests {
             function.call_with_residual(inputs),
             Ok((output, f32_array(&[1, 2, 1], &[1.0, 1.0 + std::f32::consts::LN_2]))),
         );
-        let signature = AttentionInputSignature::default();
+        let input_structure = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
         let definitions = function.definitions.forward.lock().unwrap();
         assert_eq!(definitions.len(), 2);
-        assert!(definitions.contains_key(&(false, signature)));
-        assert!(definitions.contains_key(&(true, signature)));
+        assert!(definitions.contains_key(&(false, input_structure)));
+        assert!(definitions.contains_key(&(true, input_structure)));
     }
 
     #[test]
@@ -3755,7 +3578,13 @@ mod tests {
         let query = ArrayType::new_static(DataType::F32, [2, 2, 2]);
         let key_value = ArrayType::new_static(DataType::F32, [3, 1, 2]);
         let lengths = ArrayType::new_static(DataType::I32, [1]);
-        let signature = AttentionInputSignature::new(true, true, true, true);
+        let input_structure = AttentionInputs {
+            bias: Some(Placeholder),
+            mask: Some(Placeholder),
+            query_sequence_lengths: Some(Placeholder),
+            key_value_sequence_lengths: Some(Placeholder),
+            ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+        };
         let configuration = AttentionConfiguration::new().with_local_window((0, 0));
         let input_types = vec![
             query.clone(),
@@ -3772,7 +3601,7 @@ mod tests {
             attention_forward_output_types(
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 configuration,
-                signature,
+                input_structure,
                 true,
                 input_types.as_slice(),
             ),
@@ -3782,16 +3611,34 @@ mod tests {
             attention_forward_output_types(
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 configuration,
-                signature,
+                input_structure,
                 false,
                 input_types.as_slice(),
             ),
             Ok(vec![query.clone()]),
         );
 
+        // The number of input types must match the input structure.
+        assert!(matches!(
+            attention_forward_output_types(
+                DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                configuration,
+                input_structure,
+                false,
+                &input_types[..6],
+            ),
+            Err(TypeError::Invalid { message, .. })
+                if message == format!(
+                    "`{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` expects 7 inputs for its input structure but got 6",
+                ),
+        ));
+
         // Dropout requires a rate in the open unit interval and a valid random state when a state is present.
         let plain_types = vec![query.clone(), key_value.clone(), key_value];
-        let stateful = AttentionInputSignature::default().with_dropout_state(true);
+        let stateful = AttentionInputs {
+            dropout_state: Some(Placeholder),
+            ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+        };
         let mut stateful_types = plain_types.clone();
         stateful_types.push(ArrayType::new_static(DataType::U64, [2]));
         assert_eq!(
@@ -3808,7 +3655,7 @@ mod tests {
             attention_forward_output_types(
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 AttentionConfiguration::new().with_dropout(0.5),
-                AttentionInputSignature::default(),
+                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
                 false,
                 plain_types.as_slice(),
             ),
@@ -3875,7 +3722,7 @@ mod tests {
             attention_forward_output_types(
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 AttentionConfiguration::new(),
-                AttentionInputSignature::default(),
+                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
                 false,
                 &[varying, invariant.clone(), invariant.clone()],
             ),
@@ -3889,7 +3736,7 @@ mod tests {
             attention_forward_output_types(
                 DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
                 AttentionConfiguration::new(),
-                AttentionInputSignature::default(),
+                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
                 false,
                 &[reduced, invariant.clone(), invariant],
             ),
@@ -3924,11 +3771,38 @@ mod tests {
             attention_backward_output_types(
                 DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
                 configuration,
-                AttentionInputSignature::new(true, true, true, true),
+                AttentionInputs {
+                    bias: Some(Placeholder),
+                    mask: Some(Placeholder),
+                    query_sequence_lengths: Some(Placeholder),
+                    key_value_sequence_lengths: Some(Placeholder),
+                    ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+                },
                 input_types.as_slice(),
             ),
             Ok(vec![query.clone(), key_value.clone(), key_value.clone(), bias]),
         );
+
+        // The number of input types must match the input structure and the three inputs that follow it.
+        assert!(matches!(
+            attention_backward_output_types(
+                DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+                configuration,
+                AttentionInputs {
+                    bias: Some(Placeholder),
+                    mask: Some(Placeholder),
+                    query_sequence_lengths: Some(Placeholder),
+                    key_value_sequence_lengths: Some(Placeholder),
+                    ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+                },
+                &input_types[..9],
+            ),
+            Err(TypeError::Invalid { message, .. })
+                if message == format!(
+                    "`{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` expects 10 inputs for its input structure but \
+                     got 9",
+                ),
+        ));
 
         // An integer bias remains a legal forward input, but its cotangent space is zero-dimensional and so it
         // contributes no backward output.
@@ -3945,7 +3819,10 @@ mod tests {
             attention_backward_output_types(
                 DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
                 configuration,
-                AttentionInputSignature::new(true, false, false, false),
+                AttentionInputs {
+                    bias: Some(Placeholder),
+                    ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+                },
                 input_types.as_slice(),
             ),
             Ok(vec![query, key_value.clone(), key_value]),
