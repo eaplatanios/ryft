@@ -25,7 +25,7 @@ impl FromPjrt<&PjrtDevice<'_>> for Device {
 }
 
 /// Canonical symbol name used for emitted Shardy [`LogicalMesh`] declarations and references.
-pub(crate) const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
+pub const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
 
 impl ToMlir for LogicalMesh {
     type Output<'c, 't: 'c> = shardy::DetachedMeshOperation<'c, 't>;
@@ -86,188 +86,194 @@ impl ToMlir for UnreducedKind {
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// Recovers the [`Sharding`] over `mesh` of a rank-`rank` array that the partitioner placed as `op_sharding` describes
-/// (e.g., an executable output whose placement over auto mesh axes the compiler chose), or returns [`None`] when no
-/// such sharding exists. The device identifiers of `op_sharding` are the logical identifiers of an executable compiled
-/// for `mesh`, whose `i`-th device is the `i`-th device of `mesh` in row-major mesh order. A tiled dimension is sharded
-/// over the mesh axes whose coordinates, in major-to-minor order, determine the tile index of every device along that
-/// dimension, and the mesh axes that tile no dimension are replicated. This mirrors how JAX recovers a `NamedSharding`
-/// from the `HloSharding` of a compiled executable (`parse_flatten_op_sharding`).
-pub(crate) fn sharding_from_op_sharding(op_sharding: &OpSharding, mesh: &LogicalMesh, rank: usize) -> Option<Sharding> {
-    /// Extends `prefix` to an ordered list of unused mesh axes whose sizes multiply to `size` and whose coordinates,
-    /// read from major to minor, give the tile index of every device along `dimension`, and returns whether such a
-    /// list exists. The axes of a matching list stay marked in `used`, so that no other dimension can use them. This
-    /// is a backtracking search over the ordered subsets of the unused axes, which is cheap because meshes have few
-    /// axes.
-    fn match_axes(
-        dimension: usize,
-        size: usize,
-        prefix: &mut Vec<usize>,
-        used: &mut [bool],
-        axis_sizes: &[usize],
-        tiles: &[(Vec<usize>, Vec<usize>)],
-    ) -> bool {
-        // Once the axes of the prefix span all the tiles of the dimension, the prefix matches if the index that the
-        // mesh coordinates of every device form along those axes is the tile index of that device.
-        let product = prefix.iter().map(|axis| axis_sizes[*axis]).product::<usize>();
-        if product == size {
-            return tiles.iter().all(|(tile, coordinates)| {
-                prefix.iter().fold(0, |index, axis| index * axis_sizes[*axis] + coordinates[*axis]) == tile[dimension]
-            });
-        }
+/// Extension of [`OpSharding`], which is how XLA describes the placement of a value over the devices of an executable,
+/// with conversions to the corresponding `ryft` types. [`OpSharding`] is a Protobuf message that `ryft` does not own,
+/// so its `ryft` specific functions are provided by this trait.
+pub trait OpShardingExtension {
+    /// Recovers the [`Sharding`] over `mesh` of a rank-`rank` array that the partitioner placed as this [`OpSharding`]
+    /// describes (e.g., an executable output whose placement over auto mesh axes the compiler chose), or returns
+    /// [`None`] when no such sharding exists. The device identifiers of this [`OpSharding`] are the logical identifiers
+    /// of an executable compiled for `mesh`, whose `i`-th device is the `i`-th device of `mesh` in row-major mesh
+    /// order. A tiled dimension is sharded over the mesh axes whose coordinates, in major-to-minor order, determine
+    /// the tile index of every device along that dimension, and the mesh axes that tile no dimension are replicated.
+    fn to_sharding(&self, mesh: &LogicalMesh, rank: usize) -> Option<Sharding>;
+}
 
-        // Try every axis that can still complete the prefix. An axis of size one cannot change the tile index, and
-        // an axis whose size does not divide the remaining tile count would overshoot it.
-        for axis in 0..axis_sizes.len() {
-            if used[axis] || axis_sizes[axis] == 1 || size % (product * axis_sizes[axis]) != 0 {
-                continue;
+impl OpShardingExtension for OpSharding {
+    fn to_sharding(&self, mesh: &LogicalMesh, rank: usize) -> Option<Sharding> {
+        /// Extends `prefix` to an ordered list of unused mesh axes whose sizes multiply to `size` and whose
+        /// coordinates, read from major to minor, give the tile index of every device along `dimension`, and returns
+        /// whether such a list exists. The axes of a matching list stay marked in `used`, so that no other dimension
+        /// can use them. This is a backtracking search over the ordered subsets of the unused axes, which is cheap
+        /// because meshes have few axes.
+        fn match_axes(
+            dimension: usize,
+            size: usize,
+            prefix: &mut Vec<usize>,
+            used: &mut [bool],
+            axis_sizes: &[usize],
+            tiles: &[(Vec<usize>, Vec<usize>)],
+        ) -> bool {
+            // Once the axes of the prefix span all the tiles of the dimension, the prefix matches if the index that the
+            // mesh coordinates of every device form along those axes is the tile index of that device.
+            let product = prefix.iter().map(|axis| axis_sizes[*axis]).product::<usize>();
+            if product == size {
+                return tiles.iter().all(|(tile, coordinates)| {
+                    let index = prefix.iter().fold(0, |index, axis| index * axis_sizes[*axis] + coordinates[*axis]);
+                    index == tile[dimension]
+                });
             }
-            used[axis] = true;
-            prefix.push(axis);
-            if match_axes(dimension, size, prefix, used, axis_sizes, tiles) {
-                return true;
+
+            // Try every axis that can still complete the prefix. An axis of size one cannot change the tile index, and
+            // an axis whose size does not divide the remaining tile count would overshoot it.
+            for axis in 0..axis_sizes.len() {
+                if used[axis] || axis_sizes[axis] == 1 || size % (product * axis_sizes[axis]) != 0 {
+                    continue;
+                }
+                used[axis] = true;
+                prefix.push(axis);
+                if match_axes(dimension, size, prefix, used, axis_sizes, tiles) {
+                    return true;
+                }
+                prefix.pop();
+                used[axis] = false;
             }
-            prefix.pop();
-            used[axis] = false;
+            false
         }
-        false
-    }
 
-    // Placements without tiles are either replicated or not representable. A maximal placement puts the whole array
-    // on one device, which is a replicated placement only over a mesh with a single device, and a tuple with a single
-    // element describes the placement of that element. Only tiled placements (i.e., `Other`) need the steps below.
-    let replicated = || Some(Sharding::replicated(mesh.clone(), rank));
-    let device_count = mesh.axes().iter().map(|axis| axis.size()).product::<usize>();
-    match OpShardingType::try_from(op_sharding.r#type).ok()? {
-        OpShardingType::Replicated => return replicated(),
-        OpShardingType::Maximal if device_count == 1 => return replicated(),
-        OpShardingType::Tuple if op_sharding.tuple_shardings.len() == 1 => {
-            return sharding_from_op_sharding(&op_sharding.tuple_shardings[0], mesh, rank);
+        // Placements without tiles are either replicated or not representable. A maximal placement puts the whole array
+        // on one device, which is a replicated placement only over a mesh with a single device, and a tuple with a
+        // single element describes the placement of that element. Only tiled placements (i.e., `Other`) need the steps
+        // below.
+        let replicated = || Some(Sharding::replicated(mesh.clone(), rank));
+        let device_count = mesh.axes().iter().map(|axis| axis.size()).product::<usize>();
+        match OpShardingType::try_from(self.r#type).ok()? {
+            OpShardingType::Replicated => return replicated(),
+            OpShardingType::Maximal if device_count == 1 => return replicated(),
+            OpShardingType::Tuple if self.tuple_shardings.len() == 1 => {
+                return self.tuple_shardings[0].to_sharding(mesh, rank);
+            }
+            OpShardingType::Other => {}
+            _ => return None,
         }
-        OpShardingType::Other => {}
-        _ => return None,
-    }
 
-    // The tile assignment is an array of device identifiers with one dimension for each array dimension, followed
-    // by the subgroup dimensions, and the devices that differ only in their subgroup coordinates hold the same tile.
-    // Only replicated subgroups (i.e., trailing tile dimensions over which devices hold copies) are representable.
-    let replicated_subgroup = op_sharding
-        .last_tile_dims
-        .iter()
-        .all(|kind| OpShardingType::try_from(*kind) == Ok(OpShardingType::Replicated));
-    if !replicated_subgroup {
-        return None;
-    }
-
-    // The tile assignment must have one dimension for each array dimension and each subgroup, and it must hold every
-    // device of the mesh.
-    let tile_dimensions = op_sharding
-        .tile_assignment_dimensions
-        .iter()
-        .map(|size| usize::try_from(*size).ok())
-        .collect::<Option<Vec<_>>>()?;
-    let subgroup_count = op_sharding.last_tile_dims.len() + usize::from(op_sharding.replicate_on_last_tile_dim);
-    if tile_dimensions.len() != rank + subgroup_count || tile_dimensions.iter().product::<usize>() != device_count {
-        return None;
-    }
-
-    // The device identifiers of the tile assignment are either listed in its row-major order or given in iota form.
-    let devices = if op_sharding.iota_reshape_dims.is_empty() {
-        op_sharding
-            .tile_assignment_devices
+        // The tile assignment is an array of device identifiers with one dimension for each array dimension, followed
+        // by the subgroup dimensions, and the devices that differ only in their subgroup coordinates hold the same
+        // tile. Only replicated subgroups (i.e., trailing tile dimensions over which devices hold copies) are
+        // representable.
+        let replicated_subgroup = self
+            .last_tile_dims
             .iter()
-            .map(|device| usize::try_from(*device).ok())
-            .collect::<Option<Vec<_>>>()?
-    } else {
-        // The iota form stands for the identifiers `0..n` reshaped to `iota_reshape_dims`, transposed by
-        // `iota_transpose_perm` (i.e., by the identity permutation when it is empty), and flattened in row-major
-        // order.
-        let sizes = op_sharding
-            .iota_reshape_dims
+            .all(|kind| OpShardingType::try_from(*kind) == Ok(OpShardingType::Replicated));
+        if !replicated_subgroup {
+            return None;
+        }
+
+        // The tile assignment must have one dimension for each array dimension and each subgroup, and it must hold
+        // every device of the mesh.
+        let tile_dimensions = self
+            .tile_assignment_dimensions
             .iter()
             .map(|size| usize::try_from(*size).ok())
             .collect::<Option<Vec<_>>>()?;
-        let permutation = if op_sharding.iota_transpose_perm.is_empty() {
-            (0..sizes.len()).collect::<Vec<_>>()
-        } else {
-            op_sharding
-                .iota_transpose_perm
+        let subgroup_count = self.last_tile_dims.len() + usize::from(self.replicate_on_last_tile_dim);
+        if tile_dimensions.len() != rank + subgroup_count || tile_dimensions.iter().product::<usize>() != device_count {
+            return None;
+        }
+
+        // The device identifiers of the tile assignment are either listed in its row-major order or given in iota form.
+        let devices = if self.iota_reshape_dims.is_empty() {
+            self.tile_assignment_devices
                 .iter()
-                .map(|axis| usize::try_from(*axis).ok())
+                .map(|device| usize::try_from(*device).ok())
                 .collect::<Option<Vec<_>>>()?
+        } else {
+            // The iota form stands for the identifiers `0..n` reshaped to `iota_reshape_dims`, transposed by
+            // `iota_transpose_perm` (i.e., by the identity permutation when it is empty), and flattened in row-major
+            // order.
+            let sizes =
+                self.iota_reshape_dims.iter().map(|size| usize::try_from(*size).ok()).collect::<Option<Vec<_>>>()?;
+            let permutation = if self.iota_transpose_perm.is_empty() {
+                (0..sizes.len()).collect::<Vec<_>>()
+            } else {
+                self.iota_transpose_perm
+                    .iter()
+                    .map(|axis| usize::try_from(*axis).ok())
+                    .collect::<Option<Vec<_>>>()?
+            };
+
+            if permutation.len() != sizes.len() {
+                return None;
+            }
+
+            // Dimension `index` of the transposed array is dimension `permutation[index]` of the reshaped array. The
+            // identifier at a position of the transposed array is therefore the row-major index of the same position in
+            // the reshaped array, which the row-major strides of the reshaped array compute.
+            let strides = sizes.iter().rev().scan(1, |stride, size| {
+                let current = *stride;
+                *stride *= size;
+                Some(current)
+            });
+            let mut strides = strides.collect::<Vec<_>>();
+            strides.reverse();
+            let transposed_sizes =
+                permutation.iter().map(|axis| sizes.get(*axis).copied()).collect::<Option<Vec<_>>>()?;
+            let count = sizes.iter().product::<usize>();
+            let mut devices = Vec::with_capacity(count);
+            for position in 0..count {
+                let mut remainder = position;
+                let mut device = 0;
+                for (index, size) in transposed_sizes.iter().enumerate().rev() {
+                    device += (remainder % size) * strides[permutation[index]];
+                    remainder /= size;
+                }
+                devices.push(device);
+            }
+            devices
         };
 
-        if permutation.len() != sizes.len() {
+        if devices.len() != device_count || devices.iter().any(|device| *device >= device_count) {
             return None;
         }
 
-        // Dimension `index` of the transposed array is dimension `permutation[index]` of the reshaped array. The
-        // identifier at a position of the transposed array is therefore the row-major index of the same position in
-        // the reshaped array, which the row-major strides of the reshaped array compute.
-        let strides = sizes.iter().rev().scan(1, |stride, size| {
-            let current = *stride;
-            *stride *= size;
-            Some(current)
-        });
-        let mut strides = strides.collect::<Vec<_>>();
-        strides.reverse();
-        let transposed_sizes = permutation.iter().map(|axis| sizes.get(*axis).copied()).collect::<Option<Vec<_>>>()?;
-        let count = sizes.iter().product::<usize>();
-        let mut devices = Vec::with_capacity(count);
-        for position in 0..count {
-            let mut remainder = position;
-            let mut device = 0;
-            for (index, size) in transposed_sizes.iter().enumerate().rev() {
-                device += (remainder % size) * strides[permutation[index]];
-                remainder /= size;
+        // Pair the tile coordinates of every position of the tile assignment with the mesh coordinates of the device at
+        // that position. Both are row-major coordinates, because device `i` is the `i`-th device of the mesh in
+        // row-major order.
+        let axis_sizes = mesh.axes().iter().map(|axis| axis.size()).collect::<Vec<_>>();
+        let unravel = |mut index: usize, sizes: &[usize]| {
+            let mut coordinates = vec![0; sizes.len()];
+            for (coordinate, size) in coordinates.iter_mut().zip(sizes).rev() {
+                *coordinate = index % size;
+                index /= size;
             }
-            devices.push(device);
-        }
-        devices
-    };
+            coordinates
+        };
+        let tiles = devices
+            .iter()
+            .enumerate()
+            .map(|(position, device)| (unravel(position, &tile_dimensions), unravel(*device, &axis_sizes)))
+            .collect::<Vec<_>>();
 
-    if devices.len() != device_count || devices.iter().any(|device| *device >= device_count) {
-        return None;
+        // A dimension with a single tile is replicated, and every other dimension is sharded over the ordered mesh axes
+        // that determine its tile index. The mesh axes that no dimension uses, including the ones that the subgroup
+        // dimensions span, are the replicated axes of the resulting sharding.
+        let mut used = vec![false; axis_sizes.len()];
+        let mut dimensions = Vec::with_capacity(rank);
+        for (dimension, size) in tile_dimensions[..rank].iter().copied().enumerate() {
+            if size == 1 {
+                dimensions.push(ShardingDimension::Replicated);
+                continue;
+            }
+            let mut axes = Vec::new();
+            if !match_axes(dimension, size, &mut axes, &mut used, &axis_sizes, &tiles) {
+                return None;
+            }
+            let axis_names = axes.iter().map(|axis| mesh.axes()[*axis].name().to_string()).collect();
+            dimensions.push(ShardingDimension::Sharded(axis_names));
+        }
+
+        Sharding::new(mesh.clone(), dimensions).ok()
     }
-
-    // Pair the tile coordinates of every position of the tile assignment with the mesh coordinates of the device at
-    // that position. Both are row-major coordinates, because device `i` is the `i`-th device of the mesh in row-major
-    // order.
-    let axis_sizes = mesh.axes().iter().map(|axis| axis.size()).collect::<Vec<_>>();
-    let unravel = |mut index: usize, sizes: &[usize]| {
-        let mut coordinates = vec![0; sizes.len()];
-        for (coordinate, size) in coordinates.iter_mut().zip(sizes).rev() {
-            *coordinate = index % size;
-            index /= size;
-        }
-        coordinates
-    };
-    let tiles = devices
-        .iter()
-        .enumerate()
-        .map(|(position, device)| (unravel(position, &tile_dimensions), unravel(*device, &axis_sizes)))
-        .collect::<Vec<_>>();
-
-    // A dimension with a single tile is replicated, and every other dimension is sharded over the ordered mesh axes
-    // that determine its tile index. The mesh axes that no dimension uses, including the ones that the subgroup
-    // dimensions span, are the replicated axes of the resulting sharding.
-    let mut used = vec![false; axis_sizes.len()];
-    let mut dimensions = Vec::with_capacity(rank);
-    for (dimension, size) in tile_dimensions[..rank].iter().copied().enumerate() {
-        if size == 1 {
-            dimensions.push(ShardingDimension::Replicated);
-            continue;
-        }
-        let mut axes = Vec::new();
-        if !match_axes(dimension, size, &mut axes, &mut used, &axis_sizes, &tiles) {
-            return None;
-        }
-        dimensions
-            .push(ShardingDimension::Sharded(axes.iter().map(|axis| mesh.axes()[*axis].name().to_string()).collect()));
-    }
-
-    Sharding::new(mesh.clone(), dimensions).ok()
 }
 
 /// Lowering of a [`Sharding`] to its Shardy tensor sharding attribute. The replicated and sharded dimensions of the
@@ -348,7 +354,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::MeshAxis;
-    use ryft_mlir::{Block, Context as MlirContext};
+    use ryft_mlir::Context as MlirContext;
 
     use crate::tests::{device_mesh_2x2, execution_client, logical_mesh_2x2, logical_mesh_3x2x1};
 
@@ -443,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_from_op_sharding() {
+    fn test_op_sharding_to_sharding() {
         let mesh = logical_mesh_2x2();
         let replicated = Some(Sharding::replicated(mesh.clone(), 2));
         let dimensions = vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
@@ -454,11 +460,11 @@ mod tests {
         // A replicated placement has no tiles, a maximal placement is replicated over a mesh with a single device,
         // and a tuple with a single element has the placement of that element.
         let op_sharding = OpSharding { r#type: OpShardingType::Replicated as i32, ..Default::default() };
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), replicated);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), replicated);
         let single_device_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let op_sharding = OpSharding { r#type: OpShardingType::Maximal as i32, ..Default::default() };
         assert_eq!(
-            sharding_from_op_sharding(&op_sharding, &single_device_mesh, 2),
+            op_sharding.to_sharding(&single_device_mesh, 2),
             Some(Sharding::replicated(single_device_mesh.clone(), 2)),
         );
         let op_sharding = OpSharding {
@@ -466,71 +472,71 @@ mod tests {
             tuple_shardings: vec![tiled_op_sharding(vec![2, 1, 2], vec![0, 1, 2, 3], true)],
             ..Default::default()
         };
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), along_x);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), along_x);
 
         // Tiling the first dimension along one axis replicates over the other axis on the last tile dimension. Device
         // `i` has the mesh coordinates `(i / 2, i % 2)`.
         let op_sharding = tiled_op_sharding(vec![2, 1, 2], vec![0, 1, 2, 3], true);
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), along_x);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), along_x);
         let op_sharding = tiled_op_sharding(vec![2, 1, 2], vec![0, 2, 1, 3], true);
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), along_y);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), along_y);
 
         // The iota form lists the same devices, in the order of the identity permutation unless it is transposed.
         let op_sharding =
             OpSharding { iota_reshape_dims: vec![2, 2], ..tiled_op_sharding(vec![2, 1, 2], vec![], true) };
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), along_x);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), along_x);
         let op_sharding = OpSharding { iota_transpose_perm: vec![1, 0], ..op_sharding };
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), along_y);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), along_y);
 
         // A dimension that is tiled over both axes lists them in major-to-minor order.
         let op_sharding = tiled_op_sharding(vec![4], vec![0, 1, 2, 3], false);
         assert_eq!(
-            sharding_from_op_sharding(&op_sharding, &mesh, 1),
+            op_sharding.to_sharding(&mesh, 1),
             Some(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap()),
         );
         let op_sharding = tiled_op_sharding(vec![4], vec![0, 2, 1, 3], false);
         assert_eq!(
-            sharding_from_op_sharding(&op_sharding, &mesh, 1),
+            op_sharding.to_sharding(&mesh, 1),
             Some(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y", "x"])]).unwrap()),
         );
     }
 
     #[test]
-    fn test_sharding_from_op_sharding_with_unrepresentable_placements() {
+    fn test_op_sharding_to_sharding_with_unrepresentable_placements() {
         let mesh = logical_mesh_2x2();
 
         // Placements without tiles that are not replicated have no sharding.
         let op_sharding = OpSharding { r#type: OpShardingType::Maximal as i32, ..Default::default() };
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), None);
         let op_sharding = OpSharding { r#type: OpShardingType::Manual as i32, ..Default::default() };
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), None);
         let op_sharding = OpSharding { r#type: i32::MAX, ..Default::default() };
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), None);
         let element = tiled_op_sharding(vec![2, 1, 2], vec![0, 1, 2, 3], true);
         let op_sharding = OpSharding {
             r#type: OpShardingType::Tuple as i32,
             tuple_shardings: vec![element.clone(), element],
             ..Default::default()
         };
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), None);
 
         // Only replicated subgroups are representable.
         let op_sharding = OpSharding {
             last_tile_dims: vec![OpShardingType::Manual as i32],
             ..tiled_op_sharding(vec![2, 2], vec![0, 1, 2, 3], false)
         };
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 1), None);
 
         // The tile assignment must have one dimension for each array dimension and subgroup, and it must hold every
         // device of the mesh exactly as the mesh identifies it.
         let op_sharding = tiled_op_sharding(vec![2, 2], vec![0, 1, 2, 3], false);
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 1), None);
         let op_sharding = tiled_op_sharding(vec![2], vec![0, 1], false);
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 1), None);
         let op_sharding = tiled_op_sharding(vec![4], vec![0, 1, 2, 4], false);
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 1), None);
         let op_sharding = tiled_op_sharding(vec![4], vec![0, 1, 2, -1], false);
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 1), None);
 
         // An iota form whose permutation does not have one entry for each reshaped dimension is malformed.
         let op_sharding = OpSharding {
@@ -538,11 +544,11 @@ mod tests {
             iota_transpose_perm: vec![0],
             ..tiled_op_sharding(vec![2, 1, 2], vec![], true)
         };
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 2), None);
 
         // An assignment that no order of the mesh axes explains has no sharding.
         let op_sharding = tiled_op_sharding(vec![4], vec![0, 3, 1, 2], false);
-        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+        assert_eq!(op_sharding.to_sharding(&mesh, 1), None);
     }
 
     #[test]

@@ -22,8 +22,7 @@ use crate::experimental::lowering::{
     collect_session_constants, contains_unresolved_references, contains_unresolved_state,
 };
 use crate::experimental::ops::{Constant, FlatProgram, Operation};
-use crate::sharding::sharding_from_op_sharding;
-use crate::{Error, Value};
+use crate::{Error, OpShardingExtension, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -922,7 +921,8 @@ fn resolve_output_shardings(
             let op_sharding = op_shardings.get(physical_index).ok_or_else(|| {
                 incompatible(format!("the executable reports no sharding for output {physical_index}"))
             })?;
-            sharding_from_op_sharding(op_sharding, declared.mesh(), declared.rank())
+            op_sharding
+                .to_sharding(declared.mesh(), declared.rank())
                 .filter(|sharding| sharding.without_auto_axes() == declared.without_auto_axes())
                 .ok_or_else(|| {
                     incompatible(format!(

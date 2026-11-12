@@ -41,6 +41,7 @@ pub use profile_guided::{
     AdaptiveProfileGuidedFunction, AdaptiveProfileGuidedOptions, AdaptiveProfileGuidedState,
     AdaptiveProfileGuidedStatistics,
 };
+pub use sharding::OpShardingExtension;
 pub use telemetry::{constructed_array_count, dropped_array_count, live_array_count};
 pub use values::{Dimension, Reference, Value};
 
