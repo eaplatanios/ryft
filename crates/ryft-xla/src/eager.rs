@@ -104,12 +104,6 @@ impl Concretizable<i128> for Array<'_> {
 }
 
 impl AssertionValue for Array<'_> {
-    fn assertion_array(&self) -> Result<Option<ryft_core::Array>, ProgramError> {
-        let bytes = materialize_dense_array_bytes(self)
-            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
-        Ok(Some(ryft_core::Array::new(ArrayType::new(self.data_type(), self.shape().into()), bytes)?))
-    }
-
     fn assertion_observation(&self) -> Result<String, ProgramError> {
         let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
             message: format!(
@@ -118,6 +112,12 @@ impl AssertionValue for Array<'_> {
             ),
         })?;
         ryft_core::Array::new(self.r#type().into_owned(), scalar_host_bytes(self, shard)?)?.assertion_observation()
+    }
+
+    fn assertion_array(&self) -> Result<Option<ryft_core::Array>, ProgramError> {
+        let bytes = materialize_dense_array_bytes(self)
+            .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        Ok(Some(ryft_core::Array::new(ArrayType::new(self.data_type(), self.shape().into()), bytes)?))
     }
 }
 
@@ -190,68 +190,6 @@ impl DimensionFromScalar<DimensionValue, ArrayType> for Array<'_> {
         Ok(DimensionValue::new(output_type, extent)?)
     }
 }
-
-// Batched while-predicate semantics for [`Array`], mirroring the reference semantics of
-// [`Array`](ryft_core::arrays::Array): [`WhilePredicate::any_true`] reduces the whole Boolean payload with
-// `or` via device-to-host readback of every shard, and [`WhilePredicate::select`] broadcasts the predicate
-// against the operands along its leading (prefix) axes on device before selecting.
-impl WhilePredicate for Array<'_> {
-    fn any_true(&self) -> Result<bool, ProgramError> {
-        if !self.data_type().is_boolean() {
-            return Err(ProgramError::Concretization {
-                message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type()),
-            });
-        }
-        // Reading every addressable shard covers all elements for both sharded placements (the shards partition the
-        // payload) and replicated placements (`or` is idempotent over duplicates). Non-addressable shards would leave
-        // remote elements unobserved, so they surface as concretization errors instead of a silently partial answer.
-        let mut addressable_count = 0usize;
-        let mut any = false;
-        for shard in self.addressable_shards() {
-            addressable_count += 1;
-            if !any {
-                any = shard_host_bytes(shard)?.iter().any(|byte| *byte != 0);
-            }
-        }
-        if addressable_count != self.shards().len() {
-            return Err(ProgramError::Concretization {
-                message: format!(
-                    "cannot decide a while predicate for an array of type {} whose shards are not all addressable \
-                     from the current process",
-                    self.r#type().as_ref(),
-                ),
-            });
-        }
-        Ok(any)
-    }
-
-    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
-        if !self.data_type().is_boolean() || on_true.r#type() != on_false.r#type() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "select requires a Boolean prefix-shaped predicate and congruent inputs, but got \
-                     predicate {} with inputs {} and {}",
-                    self.r#type().as_ref(),
-                    on_true.r#type().as_ref(),
-                    on_false.r#type().as_ref(),
-                ),
-            });
-        }
-        // Broadcast a prefix-shaped predicate up to the operands' full shape (its axes map to the leading output
-        // axes) so the staged select receives shape-congruent operands.
-        let condition = if self.r#type().shape() == on_true.r#type().shape() {
-            self.clone()
-        } else {
-            let output_type = on_true.r#type().with_element_type(DataType::Boolean);
-            let output_axes = (0..self.r#type().rank()).collect::<Vec<_>>();
-            self.broadcast(output_type, output_axes.as_slice())?
-        };
-        Select::select(&condition, on_true, on_false)
-    }
-}
-
-// Backend arrays opt into the shared homogeneous collective staging rules of `ryft-core`.
-impl ShapeChangingCollectiveValue for Array<'_> {}
 
 // The `std::ops` operator traits are foreign, so the blanket tracer implementations in `ryft-core` cannot cover
 // concrete backend values; these per-type implementations provide the ergonomic panicking sugar by delegating to
@@ -327,6 +265,68 @@ impl std::ops::Not for Array<'_> {
 
     fn not(self) -> Self {
         bind_single_output(NotOperation::new(), &[self]).expect("`not` operation failed")
+    }
+}
+
+// Backend arrays opt into the shared homogeneous collective staging rules of `ryft-core`.
+impl ShapeChangingCollectiveValue for Array<'_> {}
+
+// Batched while-predicate semantics for [`Array`], mirroring the reference semantics of
+// [`Array`](ryft_core::arrays::Array): [`WhilePredicate::any_true`] reduces the whole Boolean payload with
+// `or` via device-to-host readback of every shard, and [`WhilePredicate::select`] broadcasts the predicate
+// against the operands along its leading (prefix) axes on device before selecting.
+impl WhilePredicate for Array<'_> {
+    fn any_true(&self) -> Result<bool, ProgramError> {
+        if !self.data_type().is_boolean() {
+            return Err(ProgramError::Concretization {
+                message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type()),
+            });
+        }
+        // Reading every addressable shard covers all elements for both sharded placements (the shards partition the
+        // payload) and replicated placements (`or` is idempotent over duplicates). Non-addressable shards would leave
+        // remote elements unobserved, so they surface as concretization errors instead of a silently partial answer.
+        let mut addressable_count = 0usize;
+        let mut any = false;
+        for shard in self.addressable_shards() {
+            addressable_count += 1;
+            if !any {
+                any = shard_host_bytes(shard)?.iter().any(|byte| *byte != 0);
+            }
+        }
+        if addressable_count != self.shards().len() {
+            return Err(ProgramError::Concretization {
+                message: format!(
+                    "cannot decide a while predicate for an array of type {} whose shards are not all addressable \
+                     from the current process",
+                    self.r#type().as_ref(),
+                ),
+            });
+        }
+        Ok(any)
+    }
+
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        if !self.data_type().is_boolean() || on_true.r#type() != on_false.r#type() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "select requires a Boolean prefix-shaped predicate and congruent inputs, but got \
+                     predicate {} with inputs {} and {}",
+                    self.r#type().as_ref(),
+                    on_true.r#type().as_ref(),
+                    on_false.r#type().as_ref(),
+                ),
+            });
+        }
+        // Broadcast a prefix-shaped predicate up to the operands' full shape (its axes map to the leading output
+        // axes) so the staged select receives shape-congruent operands.
+        let condition = if self.r#type().shape() == on_true.r#type().shape() {
+            self.clone()
+        } else {
+            let output_type = on_true.r#type().with_element_type(DataType::Boolean);
+            let output_axes = (0..self.r#type().rank()).collect::<Vec<_>>();
+            self.broadcast(output_type, output_axes.as_slice())?
+        };
+        Select::select(&condition, on_true, on_false)
     }
 }
 

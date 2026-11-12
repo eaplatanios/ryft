@@ -95,6 +95,48 @@ impl ToMlir for UnreducedKind {
 /// dimension, and the mesh axes that tile no dimension are replicated. This mirrors how JAX recovers a `NamedSharding`
 /// from the `HloSharding` of a compiled executable (`parse_flatten_op_sharding`).
 pub(crate) fn sharding_from_op_sharding(op_sharding: &OpSharding, mesh: &LogicalMesh, rank: usize) -> Option<Sharding> {
+    /// Extends `prefix` to an ordered list of unused mesh axes whose sizes multiply to `size` and whose coordinates,
+    /// read from major to minor, give the tile index of every device along `dimension`, and returns whether such a
+    /// list exists. The axes of a matching list stay marked in `used`, so that no other dimension can use them. This
+    /// is a backtracking search over the ordered subsets of the unused axes, which is cheap because meshes have few
+    /// axes.
+    fn match_axes(
+        dimension: usize,
+        size: usize,
+        prefix: &mut Vec<usize>,
+        used: &mut [bool],
+        axis_sizes: &[usize],
+        tiles: &[(Vec<usize>, Vec<usize>)],
+    ) -> bool {
+        // Once the axes of the prefix span all the tiles of the dimension, the prefix matches if the index that the
+        // mesh coordinates of every device form along those axes is the tile index of that device.
+        let product = prefix.iter().map(|axis| axis_sizes[*axis]).product::<usize>();
+        if product == size {
+            return tiles.iter().all(|(tile, coordinates)| {
+                prefix.iter().fold(0, |index, axis| index * axis_sizes[*axis] + coordinates[*axis]) == tile[dimension]
+            });
+        }
+
+        // Try every axis that can still complete the prefix. An axis of size one cannot change the tile index, and
+        // an axis whose size does not divide the remaining tile count would overshoot it.
+        for axis in 0..axis_sizes.len() {
+            if used[axis] || axis_sizes[axis] == 1 || size % (product * axis_sizes[axis]) != 0 {
+                continue;
+            }
+            used[axis] = true;
+            prefix.push(axis);
+            if match_axes(dimension, size, prefix, used, axis_sizes, tiles) {
+                return true;
+            }
+            prefix.pop();
+            used[axis] = false;
+        }
+        false
+    }
+
+    // Placements without tiles are either replicated or not representable. A maximal placement puts the whole array
+    // on one device, which is a replicated placement only over a mesh with a single device, and a tuple with a single
+    // element describes the placement of that element. Only tiled placements (i.e., `Other`) need the steps below.
     let replicated = || Some(Sharding::replicated(mesh.clone(), rank));
     let device_count = mesh.axes().iter().map(|axis| axis.size()).product::<usize>();
     match OpShardingType::try_from(op_sharding.r#type).ok()? {
@@ -107,6 +149,8 @@ pub(crate) fn sharding_from_op_sharding(op_sharding: &OpSharding, mesh: &Logical
         _ => return None,
     }
 
+    // The tile assignment is an array of device identifiers with one dimension for each array dimension, followed
+    // by the subgroup dimensions, and the devices that differ only in their subgroup coordinates hold the same tile.
     // Only replicated subgroups (i.e., trailing tile dimensions over which devices hold copies) are representable.
     let replicated_subgroup = op_sharding
         .last_tile_dims
@@ -115,6 +159,9 @@ pub(crate) fn sharding_from_op_sharding(op_sharding: &OpSharding, mesh: &Logical
     if !replicated_subgroup {
         return None;
     }
+
+    // The tile assignment must have one dimension for each array dimension and each subgroup, and it must hold every
+    // device of the mesh.
     let tile_dimensions = op_sharding
         .tile_assignment_dimensions
         .iter()
@@ -124,6 +171,8 @@ pub(crate) fn sharding_from_op_sharding(op_sharding: &OpSharding, mesh: &Logical
     if tile_dimensions.len() != rank + subgroup_count || tile_dimensions.iter().product::<usize>() != device_count {
         return None;
     }
+
+    // The device identifiers of the tile assignment are either listed in its row-major order or given in iota form.
     let devices = if op_sharding.iota_reshape_dims.is_empty() {
         op_sharding
             .tile_assignment_devices
@@ -131,13 +180,60 @@ pub(crate) fn sharding_from_op_sharding(op_sharding: &OpSharding, mesh: &Logical
             .map(|device| usize::try_from(*device).ok())
             .collect::<Option<Vec<_>>>()?
     } else {
-        iota_tile_assignment(&op_sharding.iota_reshape_dims, &op_sharding.iota_transpose_perm)?
+        // The iota form stands for the identifiers `0..n` reshaped to `iota_reshape_dims`, transposed by
+        // `iota_transpose_perm` (i.e., by the identity permutation when it is empty), and flattened in row-major
+        // order.
+        let sizes = op_sharding
+            .iota_reshape_dims
+            .iter()
+            .map(|size| usize::try_from(*size).ok())
+            .collect::<Option<Vec<_>>>()?;
+        let permutation = if op_sharding.iota_transpose_perm.is_empty() {
+            (0..sizes.len()).collect::<Vec<_>>()
+        } else {
+            op_sharding
+                .iota_transpose_perm
+                .iter()
+                .map(|axis| usize::try_from(*axis).ok())
+                .collect::<Option<Vec<_>>>()?
+        };
+
+        if permutation.len() != sizes.len() {
+            return None;
+        }
+
+        // Dimension `index` of the transposed array is dimension `permutation[index]` of the reshaped array. The
+        // identifier at a position of the transposed array is therefore the row-major index of the same position in
+        // the reshaped array, which the row-major strides of the reshaped array compute.
+        let strides = sizes.iter().rev().scan(1, |stride, size| {
+            let current = *stride;
+            *stride *= size;
+            Some(current)
+        });
+        let mut strides = strides.collect::<Vec<_>>();
+        strides.reverse();
+        let transposed_sizes = permutation.iter().map(|axis| sizes.get(*axis).copied()).collect::<Option<Vec<_>>>()?;
+        let count = sizes.iter().product::<usize>();
+        let mut devices = Vec::with_capacity(count);
+        for position in 0..count {
+            let mut remainder = position;
+            let mut device = 0;
+            for (index, size) in transposed_sizes.iter().enumerate().rev() {
+                device += (remainder % size) * strides[permutation[index]];
+                remainder /= size;
+            }
+            devices.push(device);
+        }
+        devices
     };
+
     if devices.len() != device_count || devices.iter().any(|device| *device >= device_count) {
         return None;
     }
 
-    // Row-major coordinates of every device along every mesh axis and along every tile dimension.
+    // Pair the tile coordinates of every position of the tile assignment with the mesh coordinates of the device at
+    // that position. Both are row-major coordinates, because device `i` is the `i`-th device of the mesh in row-major
+    // order.
     let axis_sizes = mesh.axes().iter().map(|axis| axis.size()).collect::<Vec<_>>();
     let unravel = |mut index: usize, sizes: &[usize]| {
         let mut coordinates = vec![0; sizes.len()];
@@ -153,36 +249,9 @@ pub(crate) fn sharding_from_op_sharding(op_sharding: &OpSharding, mesh: &Logical
         .map(|(position, device)| (unravel(position, &tile_dimensions), unravel(*device, &axis_sizes)))
         .collect::<Vec<_>>();
 
-    // Each tiled dimension is matched to the ordered mesh axes that determine its tile index, by a search over the
-    // ordered subsets of the axes that no other dimension uses (meshes have few axes, so this search is cheap).
-    fn match_axes(
-        dimension: usize,
-        size: usize,
-        prefix: &mut Vec<usize>,
-        used: &mut [bool],
-        axis_sizes: &[usize],
-        tiles: &[(Vec<usize>, Vec<usize>)],
-    ) -> bool {
-        let product = prefix.iter().map(|axis| axis_sizes[*axis]).product::<usize>();
-        if product == size {
-            return tiles.iter().all(|(tile, coordinates)| {
-                prefix.iter().fold(0, |index, axis| index * axis_sizes[*axis] + coordinates[*axis]) == tile[dimension]
-            });
-        }
-        for axis in 0..axis_sizes.len() {
-            if used[axis] || axis_sizes[axis] == 1 || size % (product * axis_sizes[axis]) != 0 {
-                continue;
-            }
-            used[axis] = true;
-            prefix.push(axis);
-            if match_axes(dimension, size, prefix, used, axis_sizes, tiles) {
-                return true;
-            }
-            prefix.pop();
-            used[axis] = false;
-        }
-        false
-    }
+    // A dimension with a single tile is replicated, and every other dimension is sharded over the ordered mesh axes
+    // that determine its tile index. The mesh axes that no dimension uses, including the ones that the subgroup
+    // dimensions span, are the replicated axes of the resulting sharding.
     let mut used = vec![false; axis_sizes.len()];
     let mut dimensions = Vec::with_capacity(rank);
     for (dimension, size) in tile_dimensions[..rank].iter().copied().enumerate() {
@@ -197,16 +266,17 @@ pub(crate) fn sharding_from_op_sharding(op_sharding: &OpSharding, mesh: &Logical
         dimensions
             .push(ShardingDimension::Sharded(axes.iter().map(|axis| mesh.axes()[*axis].name().to_string()).collect()));
     }
+
     Sharding::new(mesh.clone(), dimensions).ok()
 }
 
 /// Lowering of a [`Sharding`] to its Shardy tensor sharding attribute. The replicated and sharded dimensions of the
 /// attribute are closed (i.e., Shardy cannot shard them along further axes) unless the lowering is open over auto axes
 /// and the mesh of the sharding has an [`Auto`](MeshAxisType::Auto) axis, in which case every dimension is open. The
-/// axes that the sharding governs but does not use are listed as replicated either way (refer to
-/// [`Sharding::replicated_axes`]), so open dimensions can only gain auto axes. This is how JAX lowers the shardings of
-/// types over meshes with auto axes (i.e., `NamedSharding._to_sdy_sharding` with `modify_wrt_axis_types=True`), whose
-/// placement along those axes the type does not describe and the compiler chooses.
+/// axes that the sharding governs but does not use are listed as replicated either way, so open dimensions can only
+/// gain auto axes. This is how JAX lowers the shardings of types over meshes with auto axes (i.e.,
+/// `NamedSharding._to_sdy_sharding` with `modify_wrt_axis_types=True`), whose placement along those
+/// axes the type does not describe and the compiler chooses.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ShardyTensorSharding<'s> {
     /// [`Sharding`] that is being lowered.
@@ -271,41 +341,6 @@ impl ToMlir for ShardyTensorSharding<'_> {
             sharding.unreduced_kind().to_mlir(location)?,
         )
     }
-}
-
-// TODO(eaplatanios): Review this.
-/// Returns the device list of an iota tile assignment: `0..n` reshaped to `reshape_dimensions`, transposed by
-/// `transpose_permutation`, and flattened in row-major order.
-fn iota_tile_assignment(reshape_dimensions: &[i64], transpose_permutation: &[i32]) -> Option<Vec<usize>> {
-    let sizes = reshape_dimensions.iter().map(|size| usize::try_from(*size).ok()).collect::<Option<Vec<_>>>()?;
-    let permutation = if transpose_permutation.is_empty() {
-        (0..sizes.len()).collect::<Vec<_>>()
-    } else {
-        transpose_permutation.iter().map(|axis| usize::try_from(*axis).ok()).collect::<Option<Vec<_>>>()?
-    };
-    if permutation.len() != sizes.len() {
-        return None;
-    }
-    let strides = sizes.iter().rev().scan(1, |stride, size| {
-        let current = *stride;
-        *stride *= size;
-        Some(current)
-    });
-    let mut strides = strides.collect::<Vec<_>>();
-    strides.reverse();
-    let transposed_sizes = permutation.iter().map(|axis| sizes.get(*axis).copied()).collect::<Option<Vec<_>>>()?;
-    let count = sizes.iter().product::<usize>();
-    let mut devices = Vec::with_capacity(count);
-    for position in 0..count {
-        let mut remainder = position;
-        let mut device = 0;
-        for (index, size) in transposed_sizes.iter().enumerate().rev() {
-            device += (remainder % size) * strides[permutation[index]];
-            remainder /= size;
-        }
-        devices.push(device);
-    }
-    Some(devices)
 }
 
 #[cfg(test)]
