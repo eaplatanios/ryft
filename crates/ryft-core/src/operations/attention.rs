@@ -20,15 +20,14 @@
 //! with [`AttentionKey::from_composite_key`] and then either lowers the portable body of the definition or replaces
 //! the call with its own implementation, as the [`AttentionImplementation`] of the configuration requests.
 //!
-//! The portable bodies are written once with ordinary value capabilities (refer to [`AttentionOperations`]). Their
-//! constants, coordinates, and broadcasts take the runtime shapes of existing values (refer to [`FillLike`],
+//! The portable bodies are written once with ordinary value capabilities (refer to [`AttentionOperations`]).
+//! Their constants, coordinates, and broadcasts take the runtime shapes of existing values (i.e., using [`FillLike`],
 //! [`IotaLike`], and [`BroadcastLike`]), and their reshapes keep the batch and sequence dimensions, so they support
 //! static and dynamic batch and sequence extents for values typed by [`ArrayType`] and for array IR values (i.e.,
 //! values typed by [`ArrayIrType`](crate::ArrayIrType)) alike. Only the batching rule constructs shapes that no
-//! existing value has, and it computes their extents with the extent capabilities of the values (refer to
-//! [`AttentionOperations`]), which support dynamic extents there only for array IR values, whose extents are
-//! first-class dimension values. Dropout is the exception in both universes, because it draws the random bits of its
-//! mask for static extents.
+//! existing value has, and it computes their extents with the extent capabilities of the values, which support dynamic
+//! extents there only for array IR values, whose extents are first-class dimension values. Dropout is the exception in
+//! both universes, because it draws the random bits of its mask for static extents.
 //!
 //! # Ownership and Lifecycle
 //!
@@ -45,12 +44,12 @@
 //!   - **Manual Variation:** Both functions align the manual variation of their inputs before the composite boundary
 //!     (refer to [`ManualVariationAlignment`]), so that the transposes of those alignments accumulate the cotangent
 //!     contributions of invariant inputs exactly once.
-//!   - **Batching:** A batched call folds its mapped axis into attention's batch axis and calls the same definition at
-//!     the folded boundary, which keeps backend implementations for batched calls. Definitions with dropout are
+//!   - **Batching:** A batched call folds its mapped axis into attention's batch axis and calls the same definition
+//!     at the folded boundary, which keeps backend implementations for batched calls. Definitions with dropout are
 //!     batched structurally instead, so that every batch item keeps the dropout mask of its unbatched call, and
 //!     definitions with dropout and the fused implementation reject batching.
-//!   - **Differentiation:** The forward and backward definitions have no derivative rules, so differentiating a call
-//!     of the inference function fails. The training function stages a third named composite, named
+//!   - **Differentiation:** The forward and backward definitions have no derivative rules, so differentiating
+//!     a call of the inference function fails. The training function stages a third named composite, named
 //!     [`DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME`], whose reverse mode rule calls the forward definition with
 //!     its residual and then the backward definition. Reverse mode over dynamic shapes with integer inputs (e.g.,
 //!     sequence lengths) needs an array IR family, because homogeneous array programs cannot materialize the
@@ -67,19 +66,19 @@
 //! let attention = dot_product_attention::<EagerContext<Array, ArrayOperation<Array>>>(
 //!     AttentionConfiguration::new().with_causal(true),
 //! );
+//!
 //! // Two query positions attend over two key/value positions with one head and a head dimension of one.
 //! let r#type = ArrayType::new_static(DataType::F32, [2, 1, 1]);
 //! let query = Array::from_elements(r#type.clone(), &[1.0f32, 1.0])?;
 //! let key = Array::from_elements(r#type.clone(), &[1.0f32, 1.0])?;
 //! let value = Array::from_elements(r#type, &[3.0f32, 5.0])?;
 //! let output = attention.call(AttentionInputs::new(query, key, value))?;
+//!
 //! // The first position sees only the first value, and the second position weighs both values equally.
 //! assert_eq!(output.to_f64s(), vec![3.0, 4.0]);
 //! # Ok(())
 //! # }
 //! ```
-
-// TODO(eaplatanios): Review this module.
 
 use std::collections::HashMap;
 use std::fmt::Display;
@@ -121,13 +120,13 @@ use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Value capabilities that staging attention requires, collected so that the functions that stage it (e.g.,
 /// [`dot_product_attention`]) state one bound. Those functions create the portable bodies and the batching rule of the
 /// named definitions, so they need every capability that either of them uses, while each helper of the bodies bounds
-/// only what it calls. The members are listed in the order of the corresponding
-/// [`ArrayOperation`](crate::arrays::ArrayOperation) variants, followed by the extent capabilities of the batching
-/// rule (refer to the section below). This bundle is implemented automatically for every value that implements all of
-/// its members, and so it must never be implemented manually.
+/// only what it calls. This bundle is implemented automatically for every value that implements all of its members,
+/// and so it must never be implemented manually.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that tracers of homogeneous array programs implement this bundle for [`ArrayType`] and array IR values implement
@@ -1270,7 +1269,7 @@ where
             .lock()
             .expect("attention definitions mutex is poisoned")
             .entry((return_residual, input_structure))
-            .or_insert_with(|| forward_function(self.configuration, input_structure, return_residual))
+            .or_insert_with(|| forward_definition(self.configuration, input_structure, return_residual))
             .clone();
         match function {
             AttentionFunction::Folding(function) => function.call(inputs),
@@ -1291,7 +1290,7 @@ where
             .lock()
             .expect("attention definitions mutex is poisoned")
             .entry(input_structure)
-            .or_insert_with(|| backward_function(self.configuration, input_structure))
+            .or_insert_with(|| backward_definition(self.configuration, input_structure))
             .clone();
         match function {
             AttentionFunction::Folding(function) => function.call(inputs),
@@ -1305,7 +1304,7 @@ where
 /// therefore any backend implementation of it) for batched calls. Definitions with dropout are batched structurally
 /// instead, because folding would change the shape of the dropout mask and therefore the mask of every batch item,
 /// except that definitions with dropout and the fused implementation reject batching (refer to
-/// [`forward_function`]).
+/// [`forward_definition`]).
 enum AttentionFunction<Folding, Structural> {
     /// Definition that folds mapped axes into attention's batch axis.
     Folding(Arc<Folding>),
@@ -1628,9 +1627,9 @@ fn validate_attention_inputs(
     bias_type: Option<&ArrayType>,
     mask_type: Option<&ArrayType>,
 ) -> Result<AttentionDimensions, TypeError> {
-    let query = attention_dimensions(operation_name, "query", query_type)?;
-    let key = attention_dimensions(operation_name, "key", key_type)?;
-    let value = attention_dimensions(operation_name, "value", value_type)?;
+    let query = infer_attention_dimensions(operation_name, "query", query_type)?;
+    let key = infer_attention_dimensions(operation_name, "key", key_type)?;
+    let value = infer_attention_dimensions(operation_name, "value", value_type)?;
     let data_type = query_type.data_type();
     if !data_type.is_floating_point() {
         return Err(TypeError::invalid(format!(
@@ -1767,7 +1766,7 @@ fn validate_attention_inputs(
 }
 
 /// Returns canonical `[batch, sequence, heads, head_dimension]` dimensions for a `TNH` or `BTNH` input.
-fn attention_dimensions(
+fn infer_attention_dimensions(
     operation_name: &str,
     descriptor: &str,
     value_type: &ArrayType,
@@ -1804,6 +1803,223 @@ fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayT
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
+/// Normalizes attention inputs and constructs the masked score logits shared by the forward and backward bodies.
+fn prepare_attention<
+    V: Value<Type: ArrayMemberType>
+        + FillLike
+        + IotaLike
+        + Add
+        + Sub
+        + Mul
+        + And
+        + Dot
+        + Compare
+        + Select
+        + Reshape
+        + Broadcast
+        + BroadcastLike
+        + ConvertElementType,
+>(
+    inputs: &AttentionInputs<V>,
+    configuration: AttentionConfiguration,
+    dimensions: &AttentionDimensions,
+) -> Result<PreparedAttention<V>, ProgramError> {
+    /// Prepends unit axes until one bias or mask input has the normalized `BNTS` score rank, which preserves the
+    /// dynamic extents of the input.
+    fn normalize_attention_score_input<V: Value<Type: ArrayMemberType> + Reshape>(input: V) -> Result<V, ProgramError> {
+        let rank = input.r#type().as_array_type()?.rank();
+        if rank == 4 {
+            return Ok(input);
+        }
+        let dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - rank)
+            .chain(input.r#type().as_array_type()?.shape().dimensions().iter().cloned())
+            .collect::<Vec<_>>();
+        input.reshape(Shape::new(dimensions))
+    }
+
+    let query = normalize_attention_input(inputs.query.clone())?;
+    let key = normalize_attention_input(inputs.key.clone())?;
+    let value_input = normalize_attention_input(inputs.value.clone())?;
+    let expanded_key = expand_key_value_heads(key, dimensions)?;
+    let expanded_value = expand_key_value_heads(value_input, dimensions)?;
+    let data_type = dimensions.data_type;
+    // Dot products, scaling, bias, and masking promote low precision inputs to `f32`, while `f64` remains `f64`.
+    // The stable softmax itself always runs in `f32`, matching the public attention contract.
+    let logits_type = if data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
+    let softmax_type = DataType::F32;
+    // The scores contract the head dimension of the query and of the expanded key for every batch item and head,
+    // which gives the `BNTS` score form.
+    let scores = query.dot(&expanded_key, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?;
+    let scores = if data_type == logits_type { scores } else { scores.convert_element_type(logits_type)? };
+    let scale = configuration.scale().unwrap_or(1.0 / (dimensions.head_dimension as f64).sqrt());
+    let scale_value = scores.fill_like(scale)?;
+    let mut scores = scores.mul(&scale_value)?;
+    // A bias is right-aligned to `BNTS`, converted to the data type of the scores, and broadcast to their shape. Every
+    // axis of the normalized bias either has the extent of the corresponding score axis or is a unit axis.
+    if let Some(bias) = &inputs.bias {
+        let bias = normalize_attention_score_input(bias.clone())?;
+        let bias = if bias.r#type().as_array_type()?.data_type() == logits_type {
+            bias
+        } else {
+            bias.convert_element_type(logits_type)?
+        };
+        let bias = bias.broadcast_like(&scores, &[0, 1, 2, 3])?;
+        scores = scores.add(&bias)?;
+    }
+
+    // Visibility is the conjunction of the explicit mask, causal ordering, the local window, and both sequence
+    // length predicates. Attention without any of them keeps its scores as they are.
+    let logits = if inputs.mask.is_none()
+        && !configuration.causal()
+        && configuration.local_window().is_none()
+        && inputs.query_sequence_lengths.is_none()
+        && inputs.key_value_sequence_lengths.is_none()
+    {
+        scores
+    } else {
+        // The row and column coordinates of the scores are integer constants that cannot carry tangents. They take the
+        // runtime shape of the scores, and so do the broadcasts of the mask and of the sequence lengths below.
+        let columns = scores.iota_like(3, DataType::I32)?;
+        let mut visible = match &inputs.mask {
+            None => None,
+            Some(mask) => {
+                let mask = normalize_attention_score_input(mask.clone())?;
+                Some(mask.broadcast_like(&scores, &[0, 1, 2, 3])?)
+            }
+        };
+        // Causal masking lets query position `i` attend only to key/value positions `j <= i`.
+        if configuration.causal() {
+            let rows = scores.iota_like(2, DataType::I32)?;
+            let causal = columns.compare(&rows, ComparisonDirection::LessThanOrEqual)?;
+            visible = Some(match visible {
+                None => causal,
+                Some(visible) => visible.and(&causal)?,
+            });
+        }
+        // The local window keeps the key/value positions `j` with `i - left <= j <= i + right`.
+        if let Some((left, right)) = configuration.local_window() {
+            let rows = scores.iota_like(2, DataType::I32)?;
+            let left = rows.fill_like(left as f64)?;
+            let right = rows.fill_like(right as f64)?;
+            let lower = rows.sub(&left)?;
+            let upper = rows.add(&right)?;
+            let in_window = columns
+                .compare(&lower, ComparisonDirection::GreaterThanOrEqual)?
+                .and(&columns.compare(&upper, ComparisonDirection::LessThanOrEqual)?)?;
+            visible = Some(match visible {
+                None => in_window,
+                Some(visible) => visible.and(&in_window)?,
+            });
+        }
+        // Query rows at or beyond the query length of their batch item see no key/value position at all.
+        if let Some(lengths) = &inputs.query_sequence_lengths {
+            let rows = scores.iota_like(2, DataType::I32)?;
+            let bounds = lengths.broadcast_like(&rows, &[0])?;
+            let in_range = rows.compare(&bounds, ComparisonDirection::LessThan)?;
+            visible = Some(match visible {
+                None => in_range,
+                Some(visible) => visible.and(&in_range)?,
+            });
+        }
+        // Key/value columns at or beyond the key/value length of their batch item are invisible to every row.
+        if let Some(lengths) = &inputs.key_value_sequence_lengths {
+            let bounds = lengths.broadcast_like(&columns, &[0])?;
+            let in_range = columns.compare(&bounds, ComparisonDirection::LessThan)?;
+            visible = Some(match visible {
+                None => in_range,
+                Some(visible) => visible.and(&in_range)?,
+            });
+        }
+        // Invisible scores use a finite large negative value rather than negative infinity, so that a row without
+        // any visible position still has a finite maximum and a finite log-sum-exp residual. At least one of the
+        // masks above is present on this path, so the visibility is known.
+        let large_negative = if scores.r#type().as_array_type()?.data_type() == DataType::F64 {
+            -0.7 * f64::MAX
+        } else {
+            -0.7 * f32::MAX as f64
+        };
+        let masked = scores.fill_like(large_negative)?;
+        visible.unwrap().select(&scores, &masked)?
+    };
+    let logits = if logits_type == softmax_type { logits } else { logits.convert_element_type(softmax_type)? };
+    Ok(PreparedAttention { query, expanded_key, expanded_value, logits, data_type, softmax_type, scale })
+}
+
+/// Adds the implicit batch axis used to evaluate one unbatched `TNH` attention input (i.e., a query, key, value,
+/// forward output, or output cotangent). Inserting a unit axis preserves the dynamic extents of the input.
+fn normalize_attention_input<V: Value<Type: ArrayMemberType> + Reshape>(input: V) -> Result<V, ProgramError> {
+    if input.r#type().as_array_type()?.rank() == 4 {
+        return Ok(input);
+    }
+    input.expand_dimensions(0)
+}
+
+/// Expands grouped key/value heads to the query heads. The `BSKH` input is replicated along a new group axis, which
+/// gives the `BSKGH` form, and its key/value head and group axes are then merged into the query head axis of the
+/// `BSNH` form. Both steps keep the batch and sequence dimensions, so they support dynamic extents along them.
+fn expand_key_value_heads<V: Value<Type: ArrayMemberType> + Reshape + Broadcast>(
+    key_or_value: V,
+    dimensions: &AttentionDimensions,
+) -> Result<V, ProgramError> {
+    if dimensions.key_value_heads == dimensions.query_heads {
+        return Ok(key_or_value);
+    }
+    let group = dimensions.query_heads / dimensions.key_value_heads;
+    let r#type = key_or_value.r#type();
+    let r#type = r#type.as_array_type()?;
+    let [batch, length, _, head_dimension] = r#type.shape().dimensions() else {
+        return Err(TypeError::invalid(format!(
+            "attention key or value type `{}` does not have the normalized rank 4",
+            r#type,
+        ))
+        .into());
+    };
+    // The output keeps the memory space and the placement of the input along the mapped axes, and its group axis is
+    // replicated, because a broadcast cannot change manual variation.
+    let axes = [0, 1, 2, 4];
+    let sharding = r#type
+        .sharding()
+        .map(|sharding| sharding.with_broadcasted_dimensions(5, &axes))
+        .transpose()
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let grouped_dimensions =
+        vec![batch.clone(), length.clone(), dimensions.key_value_heads.into(), group.into(), head_dimension.clone()];
+    let grouped_type = ArrayType::new(r#type.data_type(), Shape::new(grouped_dimensions))
+        .with_memory(r#type.memory())
+        .with_sharding(sharding)
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let expanded_dimensions =
+        vec![batch.clone(), length.clone(), dimensions.query_heads.into(), head_dimension.clone()];
+    key_or_value.broadcast(grouped_type, &axes)?.reshape(Shape::new(expanded_dimensions))
+}
+
+/// Zeros query rows outside each batch item's logical sequence length.
+fn zero_query_rows<V: Value + FillLike + IotaLike + Compare + Select + BroadcastLike>(
+    rows_value: V,
+    query_lengths: &V,
+    row_axis: usize,
+) -> Result<V, ProgramError> {
+    let rows = rows_value.iota_like(row_axis, DataType::I32)?;
+    let lengths = query_lengths.broadcast_like(&rows, &[0])?;
+    let in_range = rows.compare(&lengths, ComparisonDirection::LessThan)?;
+    let zero = rows_value.fill_like(0.0)?;
+    in_range.select(&rows_value, &zero)
+}
+
+/// Applies the configured dropout to `probabilities`, whose shape is the normalized `BNTS` score shape, using the
+/// dropout random state of `inputs` (refer to [`AttentionInputs::dropout_state`]). The forward and backward bodies call
+/// this with arrays of the same shape and the same state, so they apply the same mask.
+fn apply_dropout<V: Value + Dropout>(
+    probabilities: V,
+    inputs: &AttentionInputs<V>,
+    configuration: AttentionConfiguration,
+) -> Result<V, ProgramError> {
+    let Some(rate) = configuration.dropout() else {
+        return Ok(probabilities);
+    };
+    Ok(probabilities.dropout(rate, inputs.dropout_state.as_ref())?.0)
+}
+
 /// Returns the named composite of the forward definition with the provided configuration, input structure,
 /// and residual request.
 ///
@@ -1812,7 +2028,7 @@ fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayT
 /// coordinates, and broadcasts take their shapes from existing values, and its reshapes keep the batch and sequence
 /// dimensions, so the same body supports static and dynamic extents and backends need no attention mathematics of
 /// their own.
-fn forward_function<V: Value, O: Operation<Type = V::Type>>(
+fn forward_definition<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
     input_structure: AttentionInputs<Placeholder>,
     return_residual: bool,
@@ -1950,7 +2166,7 @@ where
             // dropped, in which case the folded call stages an equivalent definition.
             let function = match weak.upgrade() {
                 Some(function) => function,
-                None => match forward_function::<V, O>(configuration, input_structure, return_residual) {
+                None => match forward_definition::<V, O>(configuration, input_structure, return_residual) {
                     AttentionFunction::Folding(function) => function,
                     AttentionFunction::Structural(_) => unreachable!("definitions without dropout batch by folding"),
                 },
@@ -1969,11 +2185,11 @@ where
 /// Returns the named composite of the backward definition with the provided configuration and input structure.
 ///
 /// The body of the definition evaluates the portable attention backward pass using the same extents and mask
-/// construction as the forward body (refer to [`forward_function`]), and returns the cotangents of the query, key, and
-/// value, followed by that of a present bias whose cotangent space is not zero-dimensional. Its inputs are the forward
-/// inputs followed by the attended output, its `TN` or `BTN` log-sum-exp residual, and the output cotangent. Boolean
-/// masks, integer sequence lengths, dropout states, and a bias whose cotangent space is zero-dimensional have no
-/// cotangent outputs.
+/// construction as the forward body (refer to [`forward_definition`]), and returns the cotangents of the query, key,
+/// and value, followed by that of a present bias whose cotangent space is not zero-dimensional. Its inputs are the
+/// forward inputs followed by the attended output, its `TN` or `BTN` log-sum-exp residual, and the output cotangent.
+/// Boolean masks, integer sequence lengths, dropout states, and a bias whose cotangent space is zero-dimensional have
+/// no cotangent outputs.
 ///
 /// The body recomputes the normalized probabilities `P` from the masked logits in `f32`, which avoids the precision
 /// that rounding the output or the residual to a narrower query data type loses, and so the output and the residual
@@ -1994,7 +2210,7 @@ where
 /// query rows are zeroed. With dropout, `P` is the dropped probabilities in `dV`, and the cotangent of the dropped
 /// probabilities is mapped back through the same dropout mask, which the same random state and probability shape
 /// reproduce.
-fn backward_function<V: Value, O: Operation<Type = V::Type>>(
+fn backward_definition<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
     input_structure: AttentionInputs<Placeholder>,
 ) -> BackwardFunction<V, O>
@@ -2007,6 +2223,27 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
 {
+    /// Sums the `BSNH` key or value cotangent of grouped query heads back to the `BSKH` form of the key/value heads
+    /// that those query heads share, by splitting its query head axis into the key/value head and group axes of the
+    /// `BSKGH` form and summing over the group axis. Like [`expand_key_value_heads`], it keeps the batch and sequence
+    /// dimensions.
+    fn sum_key_value_head_groups<V: Value<Type: ArrayMemberType> + Reduce + Reshape>(
+        cotangent: V,
+        dimensions: &AttentionDimensions,
+    ) -> Result<V, ProgramError> {
+        let group = dimensions.query_heads / dimensions.key_value_heads;
+        let r#type = cotangent.r#type();
+        let r#type = r#type.as_array_type()?;
+        let grouped_dimensions = vec![
+            r#type.dimension(0),
+            r#type.dimension(1),
+            dimensions.key_value_heads.into(),
+            group.into(),
+            dimensions.head_dimension.into(),
+        ];
+        cotangent.reshape(Shape::new(grouped_dimensions))?.reduce(&[3], ReductionKind::Sum)
+    }
+
     let key = AttentionKey::Backward { configuration, input_structure };
     let output_types = move |input_types: AttentionBackwardInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
         // Every definition is specialized to the input structure that its key records.
@@ -2225,7 +2462,7 @@ where
             // Refer to the forward definition for when the function may have been dropped.
             let function = match weak.upgrade() {
                 Some(function) => function,
-                None => match backward_function::<V, O>(configuration, input_structure) {
+                None => match backward_definition::<V, O>(configuration, input_structure) {
                     AttentionFunction::Folding(function) => function,
                     AttentionFunction::Structural(_) => unreachable!("definitions without dropout batch by folding"),
                 },
@@ -2247,243 +2484,6 @@ where
             )
         })
     }))
-}
-
-/// Normalizes attention inputs and constructs the masked score logits shared by the forward and backward bodies.
-fn prepare_attention<
-    V: Value<Type: ArrayMemberType>
-        + FillLike
-        + IotaLike
-        + Add
-        + Sub
-        + Mul
-        + And
-        + Dot
-        + Compare
-        + Select
-        + Reshape
-        + Broadcast
-        + BroadcastLike
-        + ConvertElementType,
->(
-    inputs: &AttentionInputs<V>,
-    configuration: AttentionConfiguration,
-    dimensions: &AttentionDimensions,
-) -> Result<PreparedAttention<V>, ProgramError> {
-    let query = normalize_attention_input(inputs.query.clone())?;
-    let key = normalize_attention_input(inputs.key.clone())?;
-    let value_input = normalize_attention_input(inputs.value.clone())?;
-    let expanded_key = expand_key_value_heads(key, dimensions)?;
-    let expanded_value = expand_key_value_heads(value_input, dimensions)?;
-    let data_type = dimensions.data_type;
-    // Dot products, scaling, bias, and masking promote low precision inputs to `f32`, while `f64` remains `f64`.
-    // The stable softmax itself always runs in `f32`, matching the public attention contract.
-    let logits_type = if data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
-    let softmax_type = DataType::F32;
-    // The scores contract the head dimension of the query and of the expanded key for every batch item and head,
-    // which gives the `BNTS` score form.
-    let scores = query.dot(&expanded_key, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?;
-    let scores = if data_type == logits_type { scores } else { scores.convert_element_type(logits_type)? };
-    let scale = configuration.scale().unwrap_or(1.0 / (dimensions.head_dimension as f64).sqrt());
-    let scale_value = scores.fill_like(scale)?;
-    let mut scores = scores.mul(&scale_value)?;
-    // A bias is right-aligned to `BNTS`, converted to the data type of the scores, and broadcast to their shape. Every
-    // axis of the normalized bias either has the extent of the corresponding score axis or is a unit axis.
-    if let Some(bias) = &inputs.bias {
-        let bias = normalize_attention_score_input(bias.clone())?;
-        let bias = if bias.r#type().as_array_type()?.data_type() == logits_type {
-            bias
-        } else {
-            bias.convert_element_type(logits_type)?
-        };
-        let bias = bias.broadcast_like(&scores, &[0, 1, 2, 3])?;
-        scores = scores.add(&bias)?;
-    }
-
-    // Visibility is the conjunction of the explicit mask, causal ordering, the local window, and both sequence
-    // length predicates. Attention without any of them keeps its scores as they are.
-    let logits = if inputs.mask.is_none()
-        && !configuration.causal()
-        && configuration.local_window().is_none()
-        && inputs.query_sequence_lengths.is_none()
-        && inputs.key_value_sequence_lengths.is_none()
-    {
-        scores
-    } else {
-        // The row and column coordinates of the scores are integer constants that cannot carry tangents. They take the
-        // runtime shape of the scores, and so do the broadcasts of the mask and of the sequence lengths below.
-        let columns = scores.iota_like(3, DataType::I32)?;
-        let mut visible = match &inputs.mask {
-            None => None,
-            Some(mask) => {
-                let mask = normalize_attention_score_input(mask.clone())?;
-                Some(mask.broadcast_like(&scores, &[0, 1, 2, 3])?)
-            }
-        };
-        // Causal masking lets query position `i` attend only to key/value positions `j <= i`.
-        if configuration.causal() {
-            let rows = scores.iota_like(2, DataType::I32)?;
-            let causal = columns.compare(&rows, ComparisonDirection::LessThanOrEqual)?;
-            visible = Some(match visible {
-                None => causal,
-                Some(visible) => visible.and(&causal)?,
-            });
-        }
-        // The local window keeps the key/value positions `j` with `i - left <= j <= i + right`.
-        if let Some((left, right)) = configuration.local_window() {
-            let rows = scores.iota_like(2, DataType::I32)?;
-            let left = rows.fill_like(left as f64)?;
-            let right = rows.fill_like(right as f64)?;
-            let lower = rows.sub(&left)?;
-            let upper = rows.add(&right)?;
-            let in_window = columns
-                .compare(&lower, ComparisonDirection::GreaterThanOrEqual)?
-                .and(&columns.compare(&upper, ComparisonDirection::LessThanOrEqual)?)?;
-            visible = Some(match visible {
-                None => in_window,
-                Some(visible) => visible.and(&in_window)?,
-            });
-        }
-        // Query rows at or beyond the query length of their batch item see no key/value position at all.
-        if let Some(lengths) = &inputs.query_sequence_lengths {
-            let rows = scores.iota_like(2, DataType::I32)?;
-            let bounds = lengths.broadcast_like(&rows, &[0])?;
-            let in_range = rows.compare(&bounds, ComparisonDirection::LessThan)?;
-            visible = Some(match visible {
-                None => in_range,
-                Some(visible) => visible.and(&in_range)?,
-            });
-        }
-        // Key/value columns at or beyond the key/value length of their batch item are invisible to every row.
-        if let Some(lengths) = &inputs.key_value_sequence_lengths {
-            let bounds = lengths.broadcast_like(&columns, &[0])?;
-            let in_range = columns.compare(&bounds, ComparisonDirection::LessThan)?;
-            visible = Some(match visible {
-                None => in_range,
-                Some(visible) => visible.and(&in_range)?,
-            });
-        }
-        // Invisible scores use a finite large negative value rather than negative infinity, so that a row without
-        // any visible position still has a finite maximum and a finite log-sum-exp residual. At least one of the
-        // masks above is present on this path, so the visibility is known.
-        let large_negative = if scores.r#type().as_array_type()?.data_type() == DataType::F64 {
-            -0.7 * f64::MAX
-        } else {
-            -0.7 * f32::MAX as f64
-        };
-        let masked = scores.fill_like(large_negative)?;
-        visible.unwrap().select(&scores, &masked)?
-    };
-    let logits = if logits_type == softmax_type { logits } else { logits.convert_element_type(softmax_type)? };
-    Ok(PreparedAttention { query, expanded_key, expanded_value, logits, data_type, softmax_type, scale })
-}
-
-/// Adds the implicit batch axis used to evaluate one unbatched `TNH` attention input (i.e., a query, key, value,
-/// forward output, or output cotangent). Inserting a unit axis preserves the dynamic extents of the input.
-fn normalize_attention_input<V: Value<Type: ArrayMemberType> + Reshape>(input: V) -> Result<V, ProgramError> {
-    if input.r#type().as_array_type()?.rank() == 4 {
-        return Ok(input);
-    }
-    input.expand_dimensions(0)
-}
-
-/// Expands grouped key/value heads to the query heads. The `BSKH` input is replicated along a new group axis, which
-/// gives the `BSKGH` form, and its key/value head and group axes are then merged into the query head axis of the
-/// `BSNH` form. Both steps keep the batch and sequence dimensions, so they support dynamic extents along them.
-fn expand_key_value_heads<V: Value<Type: ArrayMemberType> + Reshape + Broadcast>(
-    key_or_value: V,
-    dimensions: &AttentionDimensions,
-) -> Result<V, ProgramError> {
-    if dimensions.key_value_heads == dimensions.query_heads {
-        return Ok(key_or_value);
-    }
-    let group = dimensions.query_heads / dimensions.key_value_heads;
-    let r#type = key_or_value.r#type();
-    let r#type = r#type.as_array_type()?;
-    let [batch, length, _, head_dimension] = r#type.shape().dimensions() else {
-        return Err(TypeError::invalid(format!(
-            "attention key or value type `{}` does not have the normalized rank 4",
-            r#type,
-        ))
-        .into());
-    };
-    // The output keeps the memory space and the placement of the input along the mapped axes, and its group axis is
-    // replicated, because a broadcast cannot change manual variation.
-    let axes = [0, 1, 2, 4];
-    let sharding = r#type
-        .sharding()
-        .map(|sharding| sharding.with_broadcasted_dimensions(5, &axes))
-        .transpose()
-        .map_err(|error| TypeError::invalid(error.to_string()))?;
-    let grouped_dimensions =
-        vec![batch.clone(), length.clone(), dimensions.key_value_heads.into(), group.into(), head_dimension.clone()];
-    let grouped_type = ArrayType::new(r#type.data_type(), Shape::new(grouped_dimensions))
-        .with_memory(r#type.memory())
-        .with_sharding(sharding)
-        .map_err(|error| TypeError::invalid(error.to_string()))?;
-    let expanded_dimensions =
-        vec![batch.clone(), length.clone(), dimensions.query_heads.into(), head_dimension.clone()];
-    key_or_value.broadcast(grouped_type, &axes)?.reshape(Shape::new(expanded_dimensions))
-}
-
-/// Sums the `BSNH` key or value cotangent of grouped query heads back to the `BSKH` form of the key/value heads that
-/// those query heads share, by splitting its query head axis into the key/value head and group axes of the `BSKGH`
-/// form and summing over the group axis. Like [`expand_key_value_heads`], it keeps the batch and sequence dimensions.
-fn sum_key_value_head_groups<V: Value<Type: ArrayMemberType> + Reduce + Reshape>(
-    cotangent: V,
-    dimensions: &AttentionDimensions,
-) -> Result<V, ProgramError> {
-    let group = dimensions.query_heads / dimensions.key_value_heads;
-    let r#type = cotangent.r#type();
-    let r#type = r#type.as_array_type()?;
-    let grouped_dimensions = vec![
-        r#type.dimension(0),
-        r#type.dimension(1),
-        dimensions.key_value_heads.into(),
-        group.into(),
-        dimensions.head_dimension.into(),
-    ];
-    cotangent.reshape(Shape::new(grouped_dimensions))?.reduce(&[3], ReductionKind::Sum)
-}
-
-/// Prepends unit axes until one bias or mask input has the normalized `BNTS` score rank, which preserves the dynamic
-/// extents of the input.
-fn normalize_attention_score_input<V: Value<Type: ArrayMemberType> + Reshape>(input: V) -> Result<V, ProgramError> {
-    let rank = input.r#type().as_array_type()?.rank();
-    if rank == 4 {
-        return Ok(input);
-    }
-    let dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - rank)
-        .chain(input.r#type().as_array_type()?.shape().dimensions().iter().cloned())
-        .collect::<Vec<_>>();
-    input.reshape(Shape::new(dimensions))
-}
-
-/// Applies the configured dropout to `probabilities`, whose shape is the normalized `BNTS` score shape, using the
-/// dropout random state of `inputs` (refer to [`AttentionInputs::dropout_state`]). The forward and backward bodies call
-/// this with arrays of the same shape and the same state, so they apply the same mask.
-fn apply_dropout<V: Value + Dropout>(
-    probabilities: V,
-    inputs: &AttentionInputs<V>,
-    configuration: AttentionConfiguration,
-) -> Result<V, ProgramError> {
-    let Some(rate) = configuration.dropout() else {
-        return Ok(probabilities);
-    };
-    Ok(probabilities.dropout(rate, inputs.dropout_state.as_ref())?.0)
-}
-
-/// Zeros query rows outside each batch item's logical sequence length.
-fn zero_query_rows<V: Value + FillLike + IotaLike + Compare + Select + BroadcastLike>(
-    rows_value: V,
-    query_lengths: &V,
-    row_axis: usize,
-) -> Result<V, ProgramError> {
-    let rows = rows_value.iota_like(row_axis, DataType::I32)?;
-    let lengths = query_lengths.broadcast_like(&rows, &[0])?;
-    let in_range = rows.compare(&lengths, ComparisonDirection::LessThan)?;
-    let zero = rows_value.fill_like(0.0)?;
-    in_range.select(&rows_value, &zero)
 }
 
 /// Batches one attention call by folding its mapped axis into attention's batch axis, staging the definition once at
