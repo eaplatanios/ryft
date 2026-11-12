@@ -347,15 +347,36 @@ impl ToMlir for ShardyTensorSharding<'_> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType, UnreducedKind};
+    use ryft_core::MeshAxis;
     use ryft_mlir::{Block, Context as MlirContext};
 
-    use crate::tests::{device_mesh_2x2, logical_mesh_3x2x1};
+    use crate::tests::{device_mesh_2x2, execution_client, logical_mesh_2x2, logical_mesh_3x2x1};
 
     use super::*;
 
+    /// Returns a tiled [`OpSharding`] whose tile assignment has the provided `dimensions` and lists `devices` in
+    /// row-major order. Its last tile dimension is a replicated subgroup if `replicate_on_last_tile_dim` is set.
+    fn tiled_op_sharding(dimensions: Vec<i64>, devices: Vec<i64>, replicate_on_last_tile_dim: bool) -> OpSharding {
+        OpSharding {
+            r#type: OpShardingType::Other as i32,
+            tile_assignment_dimensions: dimensions,
+            tile_assignment_devices: devices,
+            replicate_on_last_tile_dim,
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn test_logical_mesh_to_shardy() {
+    fn test_device_from_pjrt() {
+        let client = execution_client();
+        let devices = client.addressable_devices().unwrap();
+        let expected = Device::new(devices[0].id().unwrap(), devices[0].process_index().unwrap());
+        assert_eq!(Device::from_pjrt(&devices[0]), Ok(expected));
+        assert_eq!(Device::from_pjrt(devices[0].clone()), Ok(expected));
+    }
+
+    #[test]
+    fn test_logical_mesh_to_mlir() {
         let mesh = logical_mesh_3x2x1();
         let context = MlirContext::new();
         let module = context.module(context.unknown_location()).unwrap();
@@ -371,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_device_mesh_to_shardy() {
+    fn test_device_mesh_to_mlir() {
         let mesh = device_mesh_2x2();
         let context = MlirContext::new();
         let module = context.module(context.unknown_location()).unwrap();
@@ -387,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_to_shardy() {
+    fn test_sharding_to_mlir() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 6, MeshAxisType::Explicit).unwrap(),
@@ -398,23 +419,22 @@ mod tests {
             .with_unreduced_axes(["y"])
             .unwrap();
         let context = MlirContext::new();
+        let location = context.unknown_location();
         assert_eq!(
-            sharding.to_mlir(context.unknown_location()).unwrap().to_string(),
+            sharding.to_mlir(location).unwrap().to_string(),
             "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced={\"y\"}>",
         );
 
         // Kinds other than a sum lower to the reduction operation of the unreduced axes.
-        let attribute = sharding.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
-        let attribute = attribute.to_mlir(context.unknown_location()).unwrap();
-        assert_eq!(attribute.reduction_operation().unwrap(), shardy::ReductionOperation::Max);
-        assert_eq!(attribute.to_string(), "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced=max{\"y\"}>");
-        let attribute = sharding.with_unreduced_kind(UnreducedKind::Min).unwrap();
-        let attribute = attribute.to_mlir(context.unknown_location()).unwrap();
-        assert_eq!(attribute.reduction_operation().unwrap(), shardy::ReductionOperation::Min);
+        let sharding = sharding.with_unreduced_kind(UnreducedKind::Max).unwrap();
+        assert_eq!(
+            sharding.to_mlir(location).unwrap().to_string(),
+            "#sdy.sharding<@mesh, [{\"x\"}, {}], unreduced=max{\"y\"}>",
+        );
     }
 
     #[test]
-    fn test_unreduced_kind_to_shardy() {
+    fn test_unreduced_kind_to_mlir() {
         let context = MlirContext::new();
         let location = context.unknown_location();
         assert_eq!(UnreducedKind::Sum.to_mlir(location), Ok(shardy::ReductionOperation::Sum));
@@ -424,54 +444,109 @@ mod tests {
 
     #[test]
     fn test_sharding_from_op_sharding() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        let tiled = |dimensions: Vec<i64>, devices: Vec<i64>, replicate_on_last_tile_dim: bool| OpSharding {
-            r#type: OpShardingType::Other as i32,
-            tile_assignment_dimensions: dimensions,
-            tile_assignment_devices: devices,
-            replicate_on_last_tile_dim,
+        let mesh = logical_mesh_2x2();
+        let replicated = Some(Sharding::replicated(mesh.clone(), 2));
+        let dimensions = vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()];
+        let along_x = Some(Sharding::new(mesh.clone(), dimensions).unwrap());
+        let dimensions = vec![ShardingDimension::sharded(["y"]), ShardingDimension::replicated()];
+        let along_y = Some(Sharding::new(mesh.clone(), dimensions).unwrap());
+
+        // A replicated placement has no tiles, a maximal placement is replicated over a mesh with a single device,
+        // and a tuple with a single element has the placement of that element.
+        let op_sharding = OpSharding { r#type: OpShardingType::Replicated as i32, ..Default::default() };
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), replicated);
+        let single_device_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let op_sharding = OpSharding { r#type: OpShardingType::Maximal as i32, ..Default::default() };
+        assert_eq!(
+            sharding_from_op_sharding(&op_sharding, &single_device_mesh, 2),
+            Some(Sharding::replicated(single_device_mesh.clone(), 2)),
+        );
+        let op_sharding = OpSharding {
+            r#type: OpShardingType::Tuple as i32,
+            tuple_shardings: vec![tiled_op_sharding(vec![2, 1, 2], vec![0, 1, 2, 3], true)],
             ..Default::default()
         };
-        let sharding = |dimensions: Vec<ShardingDimension>| Some(Sharding::new(mesh.clone(), dimensions).unwrap());
-        let replicated = OpSharding { r#type: OpShardingType::Replicated as i32, ..Default::default() };
-        assert_eq!(sharding_from_op_sharding(&replicated, &mesh, 2), Some(Sharding::replicated(mesh.clone(), 2)));
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), along_x);
 
-        // Tiling the first dimension along `x` (or `y`) replicates over the other axis on the last tile dimension, in
-        // either listed or iota form. Device `i` has mesh coordinates `(i / 2, i % 2)`.
-        let along_x = sharding(vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
-        let along_y = sharding(vec![ShardingDimension::sharded(["y"]), ShardingDimension::Replicated]);
-        assert_eq!(sharding_from_op_sharding(&tiled(vec![2, 1, 2], vec![0, 1, 2, 3], true), &mesh, 2), along_x);
-        assert_eq!(sharding_from_op_sharding(&tiled(vec![2, 1, 2], vec![0, 2, 1, 3], true), &mesh, 2), along_y);
-        let iota = OpSharding {
-            iota_reshape_dims: vec![2, 2],
-            iota_transpose_perm: vec![1, 0],
-            ..tiled(vec![2, 1, 2], vec![], true)
-        };
-        assert_eq!(sharding_from_op_sharding(&iota, &mesh, 2), along_y);
+        // Tiling the first dimension along one axis replicates over the other axis on the last tile dimension. Device
+        // `i` has the mesh coordinates `(i / 2, i % 2)`.
+        let op_sharding = tiled_op_sharding(vec![2, 1, 2], vec![0, 1, 2, 3], true);
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), along_x);
+        let op_sharding = tiled_op_sharding(vec![2, 1, 2], vec![0, 2, 1, 3], true);
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), along_y);
 
-        // A dimension tiled over both axes lists them in major-to-minor order, and an assignment that no axis order
-        // explains has no sharding.
+        // The iota form lists the same devices, in the order of the identity permutation unless it is transposed.
+        let op_sharding =
+            OpSharding { iota_reshape_dims: vec![2, 2], ..tiled_op_sharding(vec![2, 1, 2], vec![], true) };
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), along_x);
+        let op_sharding = OpSharding { iota_transpose_perm: vec![1, 0], ..op_sharding };
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), along_y);
+
+        // A dimension that is tiled over both axes lists them in major-to-minor order.
+        let op_sharding = tiled_op_sharding(vec![4], vec![0, 1, 2, 3], false);
         assert_eq!(
-            sharding_from_op_sharding(&tiled(vec![4], vec![0, 1, 2, 3], false), &mesh, 1),
-            sharding(vec![ShardingDimension::sharded(["x", "y"])]),
+            sharding_from_op_sharding(&op_sharding, &mesh, 1),
+            Some(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap()),
         );
+        let op_sharding = tiled_op_sharding(vec![4], vec![0, 2, 1, 3], false);
         assert_eq!(
-            sharding_from_op_sharding(&tiled(vec![4], vec![0, 2, 1, 3], false), &mesh, 1),
-            sharding(vec![ShardingDimension::sharded(["y", "x"])]),
+            sharding_from_op_sharding(&op_sharding, &mesh, 1),
+            Some(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["y", "x"])]).unwrap()),
         );
-        assert_eq!(sharding_from_op_sharding(&tiled(vec![4], vec![0, 3, 1, 2], false), &mesh, 1), None);
-        assert_eq!(sharding_from_op_sharding(&tiled(vec![2, 2], vec![0, 1, 2, 3], false), &mesh, 1), None);
     }
 
     #[test]
-    fn test_shardy_tensor_sharding() {
-        // Over a mesh with an auto axis, an open lowering leaves every dimension open, so the compiler can only add
-        // auto axes, since the unused explicit axes stay replicated. A closed lowering, and an open lowering over a
-        // mesh without auto axes, close every dimension.
+    fn test_sharding_from_op_sharding_with_unrepresentable_placements() {
+        let mesh = logical_mesh_2x2();
+
+        // Placements without tiles that are not replicated have no sharding.
+        let op_sharding = OpSharding { r#type: OpShardingType::Maximal as i32, ..Default::default() };
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), None);
+        let op_sharding = OpSharding { r#type: OpShardingType::Manual as i32, ..Default::default() };
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), None);
+        let op_sharding = OpSharding { r#type: i32::MAX, ..Default::default() };
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), None);
+        let element = tiled_op_sharding(vec![2, 1, 2], vec![0, 1, 2, 3], true);
+        let op_sharding = OpSharding {
+            r#type: OpShardingType::Tuple as i32,
+            tuple_shardings: vec![element.clone(), element],
+            ..Default::default()
+        };
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), None);
+
+        // Only replicated subgroups are representable.
+        let op_sharding = OpSharding {
+            last_tile_dims: vec![OpShardingType::Manual as i32],
+            ..tiled_op_sharding(vec![2, 2], vec![0, 1, 2, 3], false)
+        };
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+
+        // The tile assignment must have one dimension for each array dimension and subgroup, and it must hold every
+        // device of the mesh exactly as the mesh identifies it.
+        let op_sharding = tiled_op_sharding(vec![2, 2], vec![0, 1, 2, 3], false);
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+        let op_sharding = tiled_op_sharding(vec![2], vec![0, 1], false);
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+        let op_sharding = tiled_op_sharding(vec![4], vec![0, 1, 2, 4], false);
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+        let op_sharding = tiled_op_sharding(vec![4], vec![0, 1, 2, -1], false);
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+
+        // An iota form whose permutation does not have one entry for each reshaped dimension is malformed.
+        let op_sharding = OpSharding {
+            iota_reshape_dims: vec![2, 2],
+            iota_transpose_perm: vec![0],
+            ..tiled_op_sharding(vec![2, 1, 2], vec![], true)
+        };
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 2), None);
+
+        // An assignment that no order of the mesh axes explains has no sharding.
+        let op_sharding = tiled_op_sharding(vec![4], vec![0, 3, 1, 2], false);
+        assert_eq!(sharding_from_op_sharding(&op_sharding, &mesh, 1), None);
+    }
+
+    #[test]
+    fn test_shardy_tensor_sharding_to_mlir() {
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -482,6 +557,9 @@ mod tests {
             Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])]).unwrap();
         let context = MlirContext::new();
         let location = context.unknown_location();
+
+        // Over a mesh with an auto axis, an open lowering leaves every dimension open, so the compiler can only add
+        // auto axes, because the unused explicit axes stay replicated. A closed lowering closes every dimension.
         assert_eq!(
             ShardyTensorSharding::new(&sharding, true).to_mlir(location).unwrap().to_string(),
             "#sdy.sharding<@mesh, [{?}, {\"y\", ?}], replicated={\"z\"}>",
@@ -490,14 +568,22 @@ mod tests {
             ShardyTensorSharding::new(&sharding, false).to_mlir(location).unwrap().to_string(),
             "#sdy.sharding<@mesh, [{}, {\"y\"}], replicated={\"z\"}>",
         );
-        let explicit_sharding = Sharding::new(
-            sharding.mesh().with_axis_types(["x"], MeshAxisType::Explicit).unwrap(),
-            sharding.dimensions().to_vec(),
-        )
-        .unwrap();
+
+        // An open lowering over a mesh without auto axes closes every dimension too.
+        let explicit_mesh = sharding.mesh().with_axis_types(["x"], MeshAxisType::Explicit).unwrap();
+        let explicit_sharding = Sharding::new(explicit_mesh.clone(), sharding.dimensions().to_vec()).unwrap();
         assert_eq!(
             ShardyTensorSharding::new(&explicit_sharding, true).to_mlir(location).unwrap().to_string(),
             "#sdy.sharding<@mesh, [{}, {\"y\"}], replicated={\"x\", \"z\"}>",
+        );
+
+        // An unconstrained dimension stays open in a closed lowering.
+        let unconstrained_sharding =
+            Sharding::new(explicit_mesh, vec![ShardingDimension::unconstrained(), ShardingDimension::sharded(["y"])])
+                .unwrap();
+        assert_eq!(
+            ShardyTensorSharding::new(&unconstrained_sharding, false).to_mlir(location).unwrap().to_string(),
+            "#sdy.sharding<@mesh, [{?}, {\"y\"}], replicated={\"x\", \"z\"}>",
         );
     }
 }

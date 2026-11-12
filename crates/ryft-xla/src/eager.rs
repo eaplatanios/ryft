@@ -1,42 +1,24 @@
-use ryft_core::macros::check_count;
 use ryft_core::{
-    Add, AndOperation, ArrayIrType, ArrayOperation, ArrayType, AssertionValue, Broadcast, Concretizable, Context,
-    DataType, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType,
-    DimensionValue, DimensionVariable, Div, ElementType, Mul, Neg, NotOperation, Operation as CoreOperation,
-    OrOperation, ProgramError, Select, ShapeChangingCollectiveValue, Sub, Typed, Value as CoreValue, WhilePredicate,
-    XorOperation,
+    Add, And, ArrayIrType, ArrayType, AssertionValue, Broadcast, Concretizable, DataType, DimensionFromScalar,
+    DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType, DimensionValue,
+    DimensionVariable, Div, ElementType, Mul, Neg, Not, Operation as CoreOperation, Or, ProgramError, Select,
+    ShapeChangingCollectiveValue, Sub, Typed, WhilePredicate, Xor,
 };
 
 use crate::arrays_v0::host::materialize_dense_array_bytes;
-use crate::experimental::ops::ArrayConstant;
 use crate::{Array, ArrayShard};
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Eagerly executes one `operation` over `inputs` through the first input's recovered
-/// [`Domain`](crate::Domain) and extracts the operation's single output.
-///
-/// This is the JAX-style op-by-op dispatch shape behind every eager value capability of [`Array`]. The blanket
-/// capability implementations in `ryft-core` (arithmetic, comparison, selection, manipulation, reductions, ...)
-/// already follow it through [`CoreValue::domain`](ryft_core::Value::domain), which for a concrete [`Array`] recovers the PJRT-backed
-/// [`Domain`](crate::Domain) that the array belongs to. That domain executes the operation through a
-/// single-operation program that its session caches per operation application, so a repeated eager operation skips
-/// tracing and lowering. This module therefore only implements the capabilities those blankets cannot cover: the
-/// foreign `std::ops` operator sugar (per-type implementations required by the orphan rule), host-readback
-/// capabilities such as [`Concretizable`] and [`WhilePredicate`]. Backend arrays opt into the shared shape-changing
-/// collective capabilities through [`ShapeChangingCollectiveValue`]. This helper is the shared bind-and-unwrap step
-/// of the operator and host-readback implementations.
-/// Callers must pass at least one input, and the first input determines the domain (and thereby the session, its
-/// caches, and the effect scope) that the operation executes in.
-fn bind_single_output<'o, P: Into<ArrayOperation<ArrayConstant>>>(
-    operation: P,
-    inputs: &[Array<'o>],
-) -> Result<Array<'o>, ProgramError> {
-    let domain = inputs.first().unwrap().domain();
-    let mut outputs = domain.bind(operation, Vec::new(), inputs)?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
+// Every eager value capability of `Array` follows the JAX-style op-by-op dispatch shape. The blanket capability
+// implementations in `ryft-core` (arithmetic, logical, comparison, selection, manipulation, reductions, ...) bind
+// each operation through `ryft_core::Value::domain`, which for a concrete `Array` recovers the PJRT-backed `Domain`
+// that the array belongs to. That domain executes the operation through a single-operation program that its session
+// caches per operation application, so a repeated eager operation skips tracing and lowering. This module therefore
+// only implements the capabilities those blankets cannot cover: the foreign `std::ops` operator sugar (per-type
+// implementations required by the orphan rule) and host-readback capabilities such as `Concretizable` and
+// `WhilePredicate`. Backend arrays opt into the shared shape-changing collective capabilities through
+// `ShapeChangingCollectiveValue`.
 
 /// Copies the dense payload bytes of one addressable [`ArrayShard`] to the host, surfacing missing buffers and PJRT
 /// transfer failures as [`ProgramError::Concretization`] errors.
@@ -121,7 +103,9 @@ impl AssertionValue for Array<'_> {
     }
 }
 
-impl DimensionSize<usize, ArrayType> for Array<'_> {
+impl DimensionSize<ArrayType> for Array<'_> {
+    type Extent = usize;
+
     /// Returns the concrete global extent of `axis` from this array's complete shard metadata.
     ///
     /// The descriptor list includes remote shards, so taking the greatest exclusive slice end recovers the global
@@ -192,9 +176,8 @@ impl DimensionFromScalar<DimensionValue, ArrayType> for Array<'_> {
 }
 
 // The `std::ops` operator traits are foreign, so the blanket tracer implementations in `ryft-core` cannot cover
-// concrete backend values; these per-type implementations provide the ergonomic panicking sugar by delegating to
-// the fallible `ryft` capabilities (and, for the logical operators that have no fallible `ryft` counterpart
-// traits, by binding the logical operations directly).
+// concrete backend values. These per-type implementations provide the ergonomic panicking sugar by delegating to
+// the fallible `ryft` capabilities.
 
 impl std::ops::Add for Array<'_> {
     type Output = Self;
@@ -240,7 +223,7 @@ impl std::ops::BitAnd for Array<'_> {
     type Output = Self;
 
     fn bitand(self, rhs: Self) -> Self {
-        bind_single_output(AndOperation::new(), &[self, rhs]).expect("`and` operation failed")
+        And::and(&self, &rhs).expect("`and` operation failed")
     }
 }
 
@@ -248,7 +231,7 @@ impl std::ops::BitOr for Array<'_> {
     type Output = Self;
 
     fn bitor(self, rhs: Self) -> Self {
-        bind_single_output(OrOperation::new(), &[self, rhs]).expect("`or` operation failed")
+        Or::or(&self, &rhs).expect("`or` operation failed")
     }
 }
 
@@ -256,7 +239,7 @@ impl std::ops::BitXor for Array<'_> {
     type Output = Self;
 
     fn bitxor(self, rhs: Self) -> Self {
-        bind_single_output(XorOperation::new(), &[self, rhs]).expect("`xor` operation failed")
+        Xor::xor(&self, &rhs).expect("`xor` operation failed")
     }
 }
 
@@ -264,7 +247,7 @@ impl std::ops::Not for Array<'_> {
     type Output = Self;
 
     fn not(self) -> Self {
-        bind_single_output(NotOperation::new(), &[self]).expect("`not` operation failed")
+        Not::not(&self).expect("`not` operation failed")
     }
 }
 
@@ -339,7 +322,7 @@ mod tests {
 
     use ryft_core::{
         Abs, Array as CoreArray, ArrayType, Atan2, BatchAxis, Ceil, Clamp, Compare, ComparisonDirection, Concatenate,
-        ConvertElementType, ConvertElementTypeOperation, Cos, Cumulative, CumulativeKind, CustomCall,
+        Context, ConvertElementType, ConvertElementTypeOperation, Cos, Cumulative, CumulativeKind, CustomCall,
         CustomCallAttribute, CustomCallOperation, DenseDifferentiableType, Device, DeviceMesh, Differentiate,
         Dimension as CoreDimension, DimensionBounds, Dot, EffectClass, Erf, Exp, ExpM1, Floor,
         ForwardModeDifferentiate, Gather, GatherDimensionNumbers, GatherMode, GatherOptions, Layout, Ln1p, Log,
@@ -347,7 +330,8 @@ mod tests {
         Reduce, ReducePrecision, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter,
         ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin,
         Slice, Softmax, Sqrt, StaticShape, StopGradient, Tag, Tanh, TiledLayout, Transpose, TypeError, UpdateSlice,
-        ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu, softmax_cross_entropy_with_target_logits,
+        Value as CoreValue, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
+        softmax_cross_entropy_with_target_logits,
     };
     use ryft_pjrt::extensions::ffi::{
         FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId,
