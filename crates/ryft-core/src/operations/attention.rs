@@ -273,22 +273,22 @@ where
 {
 }
 
-// TODO(eaplatanios): Review from here onwards.
+/// Version of the attention definitions, which changes whenever their semantics or the encoding of their keys changes.
+pub const DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION: u32 = 1;
 
-/// Name of the forward named attention definition (refer to [`AttentionKey`]).
+/// Name of the forward named attention definition. Refer to the documentation of [`AttentionKey`]
+/// for more information.
 pub const DOT_PRODUCT_ATTENTION_COMPOSITE_NAME: &str = "ryft.dot_product_attention";
 
-/// Name of the backward named attention definition (refer to [`AttentionKey`]).
+/// Name of the backward named attention definition. Refer to the documentation of [`AttentionKey`]
+/// for more information.
 pub const DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME: &str = "ryft.dot_product_attention_backward";
 
-/// Name of the named composite that stages differentiable attention (refer to
-/// [`differentiable_dot_product_attention`]). Its key has the attributes of the forward definition's key except for
-/// `residual` (refer to [`AttentionKey`]).
+/// Name of the named composite that stages a differentiable attention operation. Its key has the attributes of the
+/// forward definition's key except for `residual`. Refer to the documentation of [`AttentionKey`] for more information.
 pub const DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME: &str = "ryft.dot_product_attention_training";
 
-/// Version of the named attention definitions, which changes whenever their semantics or the encoding of their keys
-/// changes.
-pub const DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION: u32 = 1;
+// TODO(eaplatanios): Review from here onwards.
 
 /// Semantic identity of one named attention definition, which identifies the forward or the backward definition and
 /// records its value-independent configuration and the structure of its inputs. It converts losslessly to
