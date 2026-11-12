@@ -273,9 +273,81 @@ impl ArithmeticDimensionOperationMetadata {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, DimensionValue};
+    use crate::operations::arithmetic::{Add, Div, Mul, Pow, Rem, SaturatingSub, Sub};
+    use crate::operations::extrema::{Max, Min};
+    use crate::programs::ProgramError;
+    use crate::tracing::{Tracer, TracingContext};
+
     use super::*;
+
+    #[test]
+    fn test_array_ir_dimension_arithmetic() {
+        type ArrayIrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // Array IR tracers stage the dimension operation of every arithmetic capability for two first-class
+        // dimensions.
+        let (_, program) = ArrayIrContext::trace(
+            |(rows, columns): (Tracer<ArrayIrContext>, Tracer<ArrayIrContext>)| {
+                Ok(vec![
+                    rows.add(&columns)?,
+                    rows.sub(&columns)?,
+                    rows.saturating_sub(&columns)?,
+                    rows.mul(&columns)?,
+                    rows.div(&columns)?,
+                    rows.rem(&columns)?,
+                    rows.pow(&columns)?,
+                    rows.min(&columns)?,
+                    rows.max(&columns)?,
+                ])
+            },
+            (
+                ArrayIrType::Dimension(DimensionType::new("rows", DimensionBounds::new(2, Some(9)).unwrap())),
+                ArrayIrType::Dimension(DimensionType::new("columns", DimensionBounds::new(1, Some(5)).unwrap())),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<rows ∈ [2, 9)>, %1:dimension<columns ∈ [1, 5)> .
+                let %2:dimension<rows + columns ∈ [3, 13)> = dimension_add %0 %1
+                    %3:dimension<rows - columns ∈ [0, 8)> = dimension_sub [requires_runtime_assertion=true] %0 %1
+                    %4:dimension<max(0, rows - columns) ∈ [0, 8)> = saturating_sub %0 %1
+                    %5:dimension<rows * columns ∈ [2, 33)> = dimension_mul %0 %1
+                    %6:dimension<rows / columns ∈ [0, 9)> = dimension_div %0 %1
+                    %7:dimension<rows % columns ∈ [0, 4)> = dimension_rem %0 %1
+                    %8:dimension<rows ^ columns ∈ [2, 4097)> = dimension_pow %0 %1
+                    %9:dimension<min(rows, columns) ∈ [1, 5)> = dimension_min %0 %1
+                    %10:dimension<max(rows, columns) ∈ [2, 9)> = dimension_max %0 %1
+                in (%2, %3, %4, %5, %6, %7, %8, %9, %10)"
+            },
+        );
+
+        // Concrete array IR values use the capabilities of their dimension members.
+        let (left, right) = (DimensionValue::constant(7).unwrap(), DimensionValue::constant(3).unwrap());
+        let ir_left = ArrayIrValue::<Array>::Dimension(left.clone());
+        let ir_right = ArrayIrValue::<Array>::Dimension(right.clone());
+        assert_eq!(ir_left.add(&ir_right), left.add(&right).map(ArrayIrValue::Dimension));
+        assert_eq!(ir_left.sub(&ir_right), left.sub(&right).map(ArrayIrValue::Dimension));
+        assert_eq!(ir_left.saturating_sub(&ir_right), left.saturating_sub(&right).map(ArrayIrValue::Dimension));
+        assert_eq!(ir_left.mul(&ir_right), left.mul(&right).map(ArrayIrValue::Dimension));
+        assert_eq!(ir_left.div(&ir_right), left.div(&right).map(ArrayIrValue::Dimension));
+        assert_eq!(ir_left.rem(&ir_right), left.rem(&right).map(ArrayIrValue::Dimension));
+        assert_eq!(ir_left.pow(&ir_right), left.dimension_pow(&right).map(ArrayIrValue::Dimension));
+        assert_eq!(ir_left.min(&ir_right), left.dimension_min(&right).map(ArrayIrValue::Dimension));
+        assert_eq!(ir_left.max(&ir_right), left.dimension_max(&right).map(ArrayIrValue::Dimension));
+        assert!(matches!(ir_left.mul(&ir_right), Ok(ArrayIrValue::Dimension(product)) if product.extent() == 21));
+
+        // A dimension that is paired with an array is projected onto the array members, which rejects it.
+        let array = ArrayIrValue::Array(Array::scalar(2.0f32).unwrap());
+        let error = ProgramError::Type(TypeError::invalid("expected array type but got dimension type"));
+        assert_eq!(ir_left.mul(&array), Err(error.clone()));
+        assert_eq!(array.mul(&ir_left), Err(error));
+    }
 
     #[test]
     fn test_arithmetic_dimension_operation_infer_output_types() {

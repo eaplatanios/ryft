@@ -1259,7 +1259,9 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     /// becomes a vector of size one, and an empty array becomes a vector of size zero.
     fn dynamic_flatten(&self) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DimensionSize + ValueProjection<DimensionType>,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant>
+            + DimensionSize<Extent = Self>
+            + ValueProjection<DimensionType>,
         Self::Projected: Mul,
     {
         let input_type = self.r#type();
@@ -1298,7 +1300,7 @@ pub trait DynamicReshape<T = <Self as Capability>::Universe>: Capability + Sized
     ///   - `axis`: Insertion position in the output rank. Zero prepends an axis and negative one appends an axis.
     fn dynamic_expand_dimensions<A: Into<Axis>>(&self, axis: A) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DimensionSize<Extent = Self>,
     {
         let input_type = self.r#type();
         let input_type = input_type.as_array_type()?;

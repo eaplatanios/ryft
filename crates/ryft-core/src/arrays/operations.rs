@@ -549,7 +549,7 @@ pub trait ArrayIrOperations:
     + ArrayOperations<ArrayIrType>
     + ValueProjection<ArrayType, Projected: ArrayOperations<ArrayType>>
     + ValueProjection<DimensionType, Projected: DimensionOperations<DimensionType>>
-    + DimensionSize
+    + DimensionSize<Extent = Self>
     + DimensionFromScalar
     + DimensionToScalar
     + ReferenceOperations<ArrayReferenceTransform, ArrayIrType>
@@ -563,7 +563,7 @@ impl<
         + ArrayOperations<ArrayIrType>
         + ValueProjection<ArrayType>
         + ValueProjection<DimensionType>
-        + DimensionSize
+        + DimensionSize<Extent = V>
         + DimensionFromScalar
         + DimensionToScalar
         + ReferenceOperations<ArrayReferenceTransform, ArrayIrType>

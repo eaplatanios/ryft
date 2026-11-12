@@ -1138,7 +1138,7 @@ impl<
 impl<
     V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant>
         + ValueProjection<ArrayType>
-        + DimensionSize
+        + DimensionSize<Extent = V>
         + DimensionToScalar
         + DynamicGather
         + DynamicReshape,
@@ -1212,7 +1212,7 @@ where
 impl<
     V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant>
         + ValueProjection<ArrayType>
-        + DimensionSize
+        + DimensionSize<Extent = V>
         + DimensionToScalar
         + DynamicScatter
         + DynamicReshape
@@ -1648,7 +1648,7 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + DimensionSize + DimensionToScalar + ValueProjection<ArrayType>>
+impl<V: Value<Type = ArrayIrType> + DimensionSize<Extent = V> + DimensionToScalar + ValueProjection<ArrayType>>
     Indexed<'_, '_, '_, V, ArrayIrType>
 where
     V::Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>

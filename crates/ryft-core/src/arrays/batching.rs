@@ -917,7 +917,7 @@ impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> BatchingPolicy<Project
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>>
     for DynamicArrayExtentBatchingPolicy
 where
-    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    C::Value: DimensionSize<Extent = C::Value> + DynamicBroadcast + ValueProjection<ArrayType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     C::Operation:
         From<ConstantOperation<DimensionValue>> + From<DimensionSizeOperation> + OperationProjection<ArrayType>,
@@ -1448,7 +1448,7 @@ impl<C: ContextProjection<DimensionType, Type = ArrayIrType>> ReplicatedBatching
 
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> RecursiveBatchingPolicy<C> for ArrayIrBatchingPolicy
 where
-    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    C::Value: DimensionSize<Extent = C::Value> + DynamicBroadcast + ValueProjection<ArrayType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
@@ -1709,7 +1709,7 @@ where
 
 impl<C: Context<Type = ArrayIrType> + DynamicIota<C::Value>> DiagonalBatchingPolicy<C> for ArrayIrBatchingPolicy
 where
-    C::Value: DimensionSize + ValueProjection<ArrayType>,
+    C::Value: DimensionSize<Extent = C::Value> + ValueProjection<ArrayType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Gather,
 {
     fn diagonal(
@@ -1740,7 +1740,11 @@ where
 
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> BatchingEntrypointPolicy<C> for ArrayIrBatchingPolicy
 where
-    C::Value: DimensionSize + Assert + DynamicBroadcast + ValueProjection<ArrayType> + ValueProjection<DimensionType>,
+    C::Value: DimensionSize<Extent = C::Value>
+        + Assert
+        + DynamicBroadcast
+        + ValueProjection<ArrayType>
+        + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     <C::Value as ValueProjection<DimensionType>>::Projected: Compare<C::Value>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
@@ -1972,7 +1976,7 @@ where
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>, T: Type> ValueProjection<T>
     for BatchingTracer<C, ArrayIrBatchingPolicy>
 where
-    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    C::Value: DimensionSize<Extent = C::Value> + DynamicBroadcast + ValueProjection<ArrayType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
@@ -2904,7 +2908,7 @@ fn normalized_batch_axis_type(
 ///   - `position`: Normalized position of the inserted mapped axis in the broadcast output.
 ///   - `axis_extent`: First-class extent of the transform's mapped axis.
 ///   - `axis_sharding`: Sharding placement of the transform's mapped axis.
-fn broadcast_replicated_array<V: Clone + DimensionSize + DynamicBroadcast>(
+fn broadcast_replicated_array<V: Clone + DimensionSize<Extent = V> + DynamicBroadcast>(
     value: V,
     r#type: &ArrayType,
     position: usize,

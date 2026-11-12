@@ -945,7 +945,7 @@ impl<
         >,
 > BatchableOperation<C, ArrayIrBatchingPolicy> for ConditionOperation<ArrayIrType>
 where
-    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    C::Value: DimensionSize<Extent = C::Value> + DynamicBroadcast + ValueProjection<ArrayType>,
     <C::Value as ValueProjection<ArrayType>>::Projected:
         Broadcast + Select + StopGradient + Transpose + ManualVariationAlignment<ArrayType> + Value<Type = ArrayType>,
 {

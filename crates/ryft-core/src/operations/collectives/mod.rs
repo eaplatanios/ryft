@@ -818,7 +818,8 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError>
     where
-        <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + Reshape + DimensionSize<usize>,
+        <C::Value as ValueProjection<ArrayType>>::Projected:
+            Value<Type = ArrayType> + Reshape + DimensionSize<Extent = usize>,
     {
         // The array IR collective consumes one array followed by a dimension value for each result axis.
         let Some((input, output_extents)) = inputs.split_first() else {
@@ -994,8 +995,11 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
     where
-        C::Value:
-            Assert + DimensionSize + DynamicBroadcast + ValueProjection<ArrayType> + ValueProjection<DimensionType>,
+        C::Value: Assert
+            + DimensionSize<Extent = C::Value>
+            + DynamicBroadcast
+            + ValueProjection<ArrayType>
+            + ValueProjection<DimensionType>,
         <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
         <C::Value as ValueProjection<DimensionType>>::Projected:
             Value<Type = DimensionType> + Mul + Div + Rem + DimensionMax + Compare<C::Value>,
@@ -1205,7 +1209,11 @@ impl<
         >,
 > CollectiveArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
 where
-    C::Value: Assert + DimensionSize + DynamicBroadcast + ValueProjection<ArrayType> + ValueProjection<DimensionType>,
+    C::Value: Assert
+        + DimensionSize<Extent = C::Value>
+        + DynamicBroadcast
+        + ValueProjection<ArrayType>
+        + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
         Value<Type = DimensionType> + Mul + Div + Rem + DimensionMax + Compare<C::Value>,

@@ -1950,7 +1950,7 @@ where
 impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>>
     DynamicGather<Stored, ArrayIrType> for V
 where
-    V: DimensionSize
+    V: DimensionSize<Extent = V>
         + DynamicBroadcast<ArrayIrType>
         + ManualVariationAlignment<ArrayIrType>
         + ValueProjection<ArrayType>,

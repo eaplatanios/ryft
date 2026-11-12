@@ -2300,7 +2300,7 @@ pub trait DynamicScatter<T = <Self as Capability>::Universe>: Capability + Sized
 
 impl<V: Value<Type = ArrayIrType>> DynamicScatter<ArrayIrType> for V
 where
-    V: DimensionSize + DynamicReshape<ArrayIrType> + ValueProjection<ArrayType>,
+    V: DimensionSize<Extent = V> + DynamicReshape<ArrayIrType> + ValueProjection<ArrayType>,
     V::Projected: Scatter,
     V::Domain: Context<Type = ArrayIrType> + DimensionConstant,
 {

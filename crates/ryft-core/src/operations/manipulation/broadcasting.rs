@@ -1622,7 +1622,8 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     #[inline]
     fn dynamic_broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant>
+            + DimensionSize<Extent = Self>,
     {
         self.dynamic_broadcast_leading_with_output_sharding(leading_dimensions, None)
     }
@@ -1641,7 +1642,8 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
         output_sharding: Option<Sharding>,
     ) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant>
+            + DimensionSize<Extent = Self>,
     {
         let r#type = self.r#type();
         let input_type = r#type.as_array_type()?;
@@ -1714,7 +1716,8 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     #[inline]
     fn dynamic_broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant>
+            + DimensionSize<Extent = Self>,
     {
         let context = self.domain();
         let leading_dimensions = leading_sizes
@@ -1754,7 +1757,7 @@ pub trait DynamicBroadcast<T = <Self as Capability>::Universe>: Capability + Siz
     ///     identities; distinct unknown dimensions are not assumed to have equal runtime values.
     fn dynamic_broadcast_arrays(inputs: &[Self]) -> Result<Vec<Self>, ProgramError>
     where
-        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DimensionSize,
+        Self: Value<Type: ArrayMemberType, Domain: DimensionConstant> + DimensionSize<Extent = Self>,
     {
         let Some(first) = inputs.first() else {
             return Ok(Vec::new());

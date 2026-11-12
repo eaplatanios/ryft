@@ -1116,7 +1116,7 @@ where
 // input still has its axis and extent validated.
 impl<V: Value<Type = ArrayIrType> + DynamicConcatenate<ArrayIrType>> Concatenate<ArrayIrType> for V
 where
-    V: DimensionSize + ValueProjection<DimensionType>,
+    V: DimensionSize<Extent = V> + ValueProjection<DimensionType>,
     V::Projected: Add,
 {
     fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
@@ -1239,7 +1239,7 @@ pub trait DynamicConcatenate<T = <Self as Capability>::Universe>: Capability + S
     }
 }
 
-impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>> DynamicConcatenate<ArrayIrType>
+impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<Extent = usize>> DynamicConcatenate<ArrayIrType>
     for ArrayIrValue<A>
 {
     fn concatenate_with_known_extent<'i, I: IntoIterator<Item = &'i Self>, AxisValue: Into<Axis>>(

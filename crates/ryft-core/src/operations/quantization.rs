@@ -372,7 +372,7 @@ impl<V> BlockQuantize<ArrayIrType> for V
 where
     V: Value<Type = ArrayIrType>
         + Assert
-        + DimensionSize
+        + DimensionSize<Extent = V>
         + DynamicBroadcast
         + DynamicReshape
         + ValueProjection<ArrayType>
@@ -879,7 +879,7 @@ impl<V> BlockDequantize<ArrayIrType> for BlockQuantizedValue<V>
 where
     V: Value<Type = ArrayIrType>
         + Assert
-        + DimensionSize
+        + DimensionSize<Extent = V>
         + DynamicBroadcast
         + DynamicReshape
         + ValueProjection<ArrayType>
@@ -1599,7 +1599,7 @@ where
 
 impl<V> ScaledDot<ArrayIrType, V> for BlockQuantizedValue<V>
 where
-    V: Value<Type = ArrayIrType> + DimensionSize + DynamicBroadcast + Mul + ValueProjection<ArrayType>,
+    V: Value<Type = ArrayIrType> + DimensionSize<Extent = V> + DynamicBroadcast + Mul + ValueProjection<ArrayType>,
     V::Projected: Value<Type = ArrayType> + ConvertElementType,
     BlockQuantizedValue<V::Projected>: ScaledDot<ArrayType, V::Projected>,
 {

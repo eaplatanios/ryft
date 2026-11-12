@@ -571,7 +571,7 @@ where
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy>
     for PadOperation<ArrayIrType>
 where
-    C::Value: DimensionSize + ValueProjection<ArrayType>,
+    C::Value: DimensionSize<Extent = C::Value> + ValueProjection<ArrayType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Broadcast + Transpose + Value<Type = ArrayType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
@@ -1729,7 +1729,7 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
     ) -> Result<Self, ProgramError>
     where
         Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant + DynamicIota<Self>>
-            + DimensionSize
+            + DimensionSize<Extent = Self>
             + Assert
             + DimensionToScalar
             + DynamicBroadcast
@@ -1833,7 +1833,7 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
     }
 }
 
-impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad<ArrayIrType> for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + Pad + DimensionSize<Extent = usize>> DynamicPad<ArrayIrType> for ArrayIrValue<A> {
     fn dynamic_pad(
         &self,
         padding_value: &Self,

@@ -1496,7 +1496,8 @@ impl<
         >,
 > MemberInterpretableOperation<C> for CustomCallOperation
 where
-    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>,
+    <C::Value as ValueProjection<ArrayType>>::Projected:
+        Value<Type = ArrayType> + CustomCall + DimensionSize<Extent = usize>,
 {
     fn interpret_in_parent<D: InterpretationDriver<C>>(
         &self,
@@ -1569,7 +1570,7 @@ impl<
         >,
 > MemberBatchableOperation<C, ArrayIrBatchingPolicy> for CustomCallOperation
 where
-    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    C::Value: DimensionSize<Extent = C::Value> + DynamicBroadcast + ValueProjection<ArrayType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + Transpose,
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -1781,7 +1782,9 @@ impl CustomCall for Array {
     }
 }
 
-impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>> CustomCall<ArrayIrType> for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<Extent = usize>> CustomCall<ArrayIrType>
+    for ArrayIrValue<A>
+{
     #[inline]
     fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
         operation: &CustomCallOperation,
@@ -1982,7 +1985,9 @@ mod tests {
         }
     }
 
-    impl DimensionSize<usize> for IdentityKernelArray {
+    impl DimensionSize for IdentityKernelArray {
+        type Extent = usize;
+
         fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
             self.0.dimension_size(axis)
         }

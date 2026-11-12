@@ -284,7 +284,7 @@ impl<A: Value<Type = ArrayType> + Broadcast + Reshape> AttentionType<A> for Arra
 
 impl<V> AttentionType<V> for ArrayIrType
 where
-    V: Value<Type = ArrayIrType> + DimensionSize + DynamicBroadcast + DynamicReshape,
+    V: Value<Type = ArrayIrType> + DimensionSize<Extent = V> + DynamicBroadcast + DynamicReshape,
     V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionMulOperation>> + DimensionConstant,
 {
     type Extent = V;

@@ -1491,7 +1491,7 @@ impl DynamicSliceOperation<ArrayIrType> {
     /// scatter lowering, rather than becoming extra logical updates here.
     fn apply_adjoint<
         V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<V>>
-            + DimensionSize
+            + DimensionSize<Extent = V>
             + DimensionToScalar
             + ValueProjection<ArrayType>
             + ValueProjection<DimensionType>,
@@ -2321,7 +2321,7 @@ impl_differentiable_operation! {
         C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
         C::Operation: From<DynamicSliceOperation<ArrayIrType>> + From<LinearCallOperation<ArrayIrType>>
             + From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
-        Tracer<NestedTracingContext<C>>: DimensionSize + DimensionToScalar
+        Tracer<NestedTracingContext<C>>: DimensionSize<Extent = Tracer<NestedTracingContext<C>>> + DimensionToScalar
             + ValueProjection<ArrayType>
             + ValueProjection<DimensionType>,
         <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::Projected:
@@ -2393,7 +2393,7 @@ impl_differentiable_operation! {
     where
         V: Value<Type = ArrayIrType>,
         O: Operation<Type = ArrayIrType>,
-        Tracer<TracingContext<V, O>>: DimensionSize + DimensionToScalar
+        Tracer<TracingContext<V, O>>: DimensionSize<Extent = Tracer<TracingContext<V, O>>> + DimensionToScalar
             + ValueProjection<ArrayType>
             + ValueProjection<DimensionType>,
         <Tracer<TracingContext<V, O>> as ValueProjection<ArrayType>>::Projected:
@@ -2741,7 +2741,9 @@ impl DynamicSlice for Array {
     }
 }
 
-impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> DynamicSlice for ArrayIrValue<A> {
+impl<A: DimensionSize<Extent = usize> + Slice + DynamicSlice + Value<Type = ArrayType>> DynamicSlice
+    for ArrayIrValue<A>
+{
     fn dynamic_slice_with_negative_indices(
         &self,
         start_indices: &[Self],
@@ -3055,7 +3057,7 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
         Self: Value<Type: ArrayMemberType, Domain: DimensionConstant + DynamicIota<Self>>
             + DynamicGather
             + DynamicReshape
-            + DimensionSize
+            + DimensionSize<Extent = Self>
             + DimensionToScalar
             + ValueProjection<ArrayType>,
         Self::Projected: Add + Mul + Broadcast + TransferToMemory,
@@ -3078,8 +3080,8 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
     }
 }
 
-impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> DynamicSliceWithDimensions<ArrayIrType>
-    for ArrayIrValue<A>
+impl<A: DimensionSize<Extent = usize> + Slice + DynamicSlice + Value<Type = ArrayType>>
+    DynamicSliceWithDimensions<ArrayIrType> for ArrayIrValue<A>
 {
     fn dynamic_slice_with_bounds(
         &self,

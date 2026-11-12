@@ -3023,13 +3023,16 @@ mod tests {
             },
         );
 
-        // Concrete array IR values add their array members, while first-class dimension members are rejected.
+        // Concrete array IR values add their array members or their first-class dimension members, and they reject a
+        // dimension that is paired with an array.
         let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
         let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
         assert_eq!(left.add(&right), Ok(ArrayIrValue::Array(Array::vector(vec![4.0f32, 6.0]).unwrap())));
-        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2).unwrap());
+        let extent = DimensionValue::constant(2).unwrap();
+        let dimension = ArrayIrValue::<Array>::Dimension(extent.clone());
+        assert_eq!(dimension.add(&dimension), extent.add(&extent).map(ArrayIrValue::Dimension));
         assert_eq!(
-            dimension.add(&dimension),
+            left.add(&dimension),
             Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
         );
 
@@ -3109,19 +3112,18 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid("failed to broadcast shape `[3]` to shape `[2]`"))),
         );
 
-        // Array IR parameters add their array members, and first-class dimension members are rejected.
+        // Array IR parameters add their array members or their first-class dimension members.
         let array_ir = |values: Vec<f32>| ArrayIrValue::Array(vector(values));
         let left = Parameterwise::<ArrayIrValue<Array>, _>::from(vec![array_ir(vec![1.0]), array_ir(vec![2.0])]);
         assert_eq!(
             Add::add(&left, &left).map(Parameterwise::into_inner),
             Ok(vec![array_ir(vec![2.0]), array_ir(vec![4.0])]),
         );
-        let dimension = Parameterwise::<ArrayIrValue<Array>, _>::from(vec![ArrayIrValue::Dimension(
-            DimensionValue::constant(2).unwrap(),
-        )]);
+        let extent = DimensionValue::constant(2).unwrap();
+        let dimension = Parameterwise::<ArrayIrValue<Array>, _>::from(vec![ArrayIrValue::Dimension(extent.clone())]);
         assert_eq!(
-            Add::add(&dimension, &dimension),
-            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+            Add::add(&dimension, &dimension).map(Parameterwise::into_inner),
+            Ok(vec![ArrayIrValue::Dimension(extent.add(&extent).unwrap())]),
         );
 
         // The `+` operator adds corresponding parameters or a single parameter to every parameter.
@@ -3912,7 +3914,7 @@ mod tests {
     }
 
     #[test]
-    fn test_saturating_sub_array_ir_projection() {
+    fn test_saturating_sub_array_ir() {
         let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |(left, right)| left.saturating_sub(&right),
             (ArrayIrType::Array(ArrayType::scalar(DataType::I8)), ArrayIrType::Array(ArrayType::scalar(DataType::I8))),
@@ -3932,11 +3934,11 @@ mod tests {
             )),
             Ok(ArrayIrValue::Array(Array::scalar(i8::MAX).unwrap())),
         );
-        let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap());
-        assert_eq!(
-            dimension.saturating_sub(&dimension),
-            Err(TypeError::invalid("expected array type but got dimension type").into()),
-        );
+
+        // Two first-class dimensions use the saturating subtraction of their dimension members.
+        let extent = DimensionValue::constant(3).unwrap();
+        let dimension = ArrayIrValue::<Array>::Dimension(extent.clone());
+        assert_eq!(dimension.saturating_sub(&dimension), extent.saturating_sub(&extent).map(ArrayIrValue::Dimension));
     }
 
     #[test]

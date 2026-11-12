@@ -189,7 +189,7 @@ impl_reference_dischargeable_operation!(@reference_free DimensionSizeOperation);
 
 impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for DimensionSizeOperation
 where
-    C::Value: DimensionSize<C::Value>,
+    C::Value: DimensionSize<Extent = C::Value>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -246,11 +246,11 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 
 /// Reads the runtime extent of one array axis.
 ///
-/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation is
-/// selected by `Output` (e.g., a materialized array backend can return its host extent, while an array IR program value
-/// returns a dimension value that can be passed explicitly to shape-carrying operations and combined with other
-/// dimension operations). A program output is not an integer array; convert it to ordinary scalar data explicitly when
-/// a numerical computation needs the extent as data.
+/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The representation of the extent
+/// is the associated type [`Self::Extent`] of the implementor (e.g., a materialized array backend returns its host
+/// extent, while an array IR program value returns a dimension value that can be passed explicitly to shape-carrying
+/// operations and combined with other dimension operations). A program output is not an integer array; convert it to
+/// ordinary scalar data explicitly when a numerical computation needs the extent as data.
 ///
 /// In an array IR trace, the capability works both on the outer array member and on a [`ProjectedValue<ArrayType, V>`].
 /// The projected form stages into and returns the parent array IR carrier, allowing an array operation output to feed
@@ -288,9 +288,14 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// # }
 /// ```
 #[capability]
-pub trait DimensionSize<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Returns the runtime extent of `axis` in the representation selected by `Output`.
-    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<Output, ProgramError>;
+pub trait DimensionSize<T = <Self as Capability>::Universe>: Capability + Sized {
+    /// Representation of the extent of one axis (e.g., `usize` for values whose extents are host numbers, and a
+    /// first-class dimension value for array IR values). Generic code names it to pass extents to the capabilities
+    /// that accept them (e.g., [`DynamicReshape`](crate::DynamicReshape)).
+    type Extent;
+
+    /// Returns the runtime extent of `axis`.
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<Self::Extent, ProgramError>;
 }
 
 impl<
@@ -302,8 +307,10 @@ impl<
                 Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
             >,
         >,
-> DimensionSize<V, ArrayIrType> for V
+> DimensionSize<ArrayIrType> for V
 {
+    type Extent = V;
+
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
         let r#type = self.r#type();
         let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
@@ -320,7 +327,9 @@ impl<
     }
 }
 
-impl<C: StagingContext<Type = ArrayType>> DimensionSize<usize, ArrayType> for Tracer<C> {
+impl<C: StagingContext<Type = ArrayType>> DimensionSize<ArrayType> for Tracer<C> {
+    type Extent = usize;
+
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
         // Constructing the operation validates and normalizes `axis`. Nothing is staged, because the type of the
         // tracer already records every extent that a homogeneous array program can name.
@@ -341,7 +350,9 @@ impl<C: StagingContext<Type = ArrayType>> DimensionSize<usize, ArrayType> for Tr
     }
 }
 
-impl DimensionSize<usize, ArrayType> for Array {
+impl DimensionSize<ArrayType> for Array {
+    type Extent = usize;
+
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
         let axis = axis.into();
         let position = axis.normalize(self.r#type().rank()).map_err(|_| {
@@ -361,12 +372,14 @@ impl DimensionSize<usize, ArrayType> for Array {
     }
 }
 
-impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize<Self, ArrayIrType> for ArrayIrValue<A> {
+impl<A: DimensionSize<Extent = usize> + Value<Type = ArrayType>> DimensionSize<ArrayIrType> for ArrayIrValue<A> {
+    type Extent = Self;
+
     fn dimension_size<I: Into<Axis>>(&self, axis: I) -> Result<Self, ProgramError> {
         let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let input_type = array.r#type();
         let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
-        let extent = <A as DimensionSize<usize>>::dimension_size(array, operation.axis())?;
+        let extent = array.dimension_size(operation.axis())?;
         Ok(Self::Dimension(DimensionValue::new(operation.output_type().clone(), extent)?))
     }
 }
@@ -380,8 +393,10 @@ impl<
                 Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
             >,
         >,
-> DimensionSize<V, ArrayType> for ProjectedValue<ArrayType, V>
+> DimensionSize<ArrayType> for ProjectedValue<ArrayType, V>
 {
+    type Extent = V;
+
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
         // The projected view stages into and returns the parent array IR carrier, folding static axes exactly like the
         // array IR implementation above.

@@ -803,7 +803,8 @@ impl<
         >,
 > MemberInterpretableOperation<C> for ParallelAllToAllOperation
 where
-    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + DimensionSize<usize> + Reshape,
+    <C::Value as ValueProjection<ArrayType>>::Projected:
+        Value<Type = ArrayType> + DimensionSize<Extent = usize> + Reshape,
 {
     #[inline]
     fn interpret_in_parent<D: InterpretationDriver<C>>(
@@ -888,7 +889,11 @@ impl<
         >,
 > MemberBatchableOperation<C, ArrayIrBatchingPolicy> for ParallelAllToAllOperation
 where
-    C::Value: Assert + DimensionSize + DynamicBroadcast + ValueProjection<ArrayType> + ValueProjection<DimensionType>,
+    C::Value: Assert
+        + DimensionSize<Extent = C::Value>
+        + DynamicBroadcast
+        + ValueProjection<ArrayType>
+        + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Transpose + Value<Type = ArrayType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
         Compare<C::Value> + DimensionMax + Rem + Div + Mul + Value<Type = DimensionType>,
@@ -1167,7 +1172,7 @@ where
                         + NamedAxes
                         + DimensionConstant,
         > + Assert
-        + DimensionSize<V>
+        + DimensionSize<Extent = V>
         + ValueProjection<DimensionType>
         + ValueProjection<ArrayType>,
     <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + Mul + Div + Rem + Compare<V>,
