@@ -5758,13 +5758,21 @@ mod tests {
             input_type.clone(),
         )
         .unwrap();
-        assert_eq!(program.to_string(), "PLACEHOLDER");
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3] .
+                let %1:f32[3, 2] = reshape [shape=[3, 2]] %0
+                in (%1)"},
+        );
 
         // The extents must describe the element count of the input.
         assert_eq!(
             TracingContext::<Array, ArrayOperation<Array>>::trace(|array| array.dynamic_reshape(&[4, 2]), input_type)
                 .map(|(_, program)| program.to_string()),
-            Err(ProgramError::Type(TypeError::invalid("PLACEHOLDER"))),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{RESHAPE_OPERATION_NAME}` changes the number of elements",
+            )))),
         );
     }
 

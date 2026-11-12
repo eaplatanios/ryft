@@ -102,7 +102,7 @@ pub use operations::{
     ArithmeticDimensionOperation, ArithmeticOperations, ArrayAssertionBatchingPolicy, Assert, AssertOperation,
     AssertionError, AssertionFailure, AssertionValue, Atan2, Atan2Operation, AttentionBackwardInputs,
     AttentionConfiguration, AttentionImplementation, AttentionInputs, AttentionKey, AttentionOperations,
-    AttentionResiduals, AttentionRules, AttentionType, AttentionVjp, AxisIndex, AxisIndexOperation, AxisTypesError,
+    AttentionResiduals, AttentionRules, AttentionVjp, AxisIndex, AxisIndexOperation, AxisTypesError,
     BROADCAST_LIKE_OPERATION_NAME, BROADCAST_OPERATION_NAME, BasicIndex, BatchedComposite, BlockDequantize,
     BlockQuantize, BlockQuantizedValue, BlockScaleFormat, BlockScaledDot, BlockScaledDotConfiguration,
     BlockScaledGlobalScaling, Broadcast, BroadcastInvariantBatching, BroadcastLike, BroadcastLikeOperation,

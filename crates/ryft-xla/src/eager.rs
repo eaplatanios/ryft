@@ -1,12 +1,3 @@
-use ryft_core::{
-    Add, And, ArrayIrType, ArrayType, AssertionValue, Broadcast, Concretizable, DataType, DimensionFromScalar,
-    DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation, DimensionType, DimensionValue,
-    DimensionVariable, Div, ElementType, Mul, Neg, Not, Operation as CoreOperation, Or, ProgramError, Select,
-    ShapeChangingCollectiveValue, Sub, Typed, WhilePredicate, Xor,
-};
-
-use crate::{Array, Error};
-
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
@@ -15,16 +6,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        Abs, Array as CoreArray, ArrayType, Atan2, BatchAxis, Ceil, Clamp, Compare, ComparisonDirection, Concatenate,
-        Context, ConvertElementType, ConvertElementTypeOperation, Cos, Cumulative, CumulativeKind, CustomCall,
-        CustomCallAttribute, CustomCallOperation, DenseDifferentiableType, Device, DeviceMesh, Differentiate,
-        Dimension as CoreDimension, DimensionBounds, Dot, EffectClass, Erf, Exp, ExpM1, Floor,
+        Abs, Add, Array as CoreArray, ArrayType, AssertionValue, Atan2, BatchAxis, Broadcast, Ceil, Clamp, Compare,
+        ComparisonDirection, Concatenate, Concretizable, Context, ConvertElementType, ConvertElementTypeOperation, Cos,
+        Cumulative, CumulativeKind, CustomCall, CustomCallAttribute, CustomCallOperation, DataType,
+        DenseDifferentiableType, Device, DeviceMesh, Differentiate, Dimension as CoreDimension, DimensionBounds,
+        DimensionFromScalar, DimensionSize, DimensionVariable, Div, Dot, EffectClass, Erf, Exp, ExpM1, Floor,
         ForwardModeDifferentiate, Gather, GatherDimensionNumbers, GatherMode, GatherOptions, Layout, Ln1p, Log,
-        LogAddExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min, OneLike, Pad, Pow, ProjectedContext,
-        Reduce, ReducePrecision, ReductionKind, Rem, Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter,
-        ScatterDimensionNumbers, ScatterOptions, ScatterReductionKind, Shape, Sharding, ShardingDimension, Sign, Sin,
-        Slice, Softmax, Sqrt, StaticShape, StopGradient, Tag, Tanh, TiledLayout, Transpose, TypeError, UpdateSlice,
-        Value as CoreValue, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
+        LogAddExp, LogicalMesh, Logistic, Max, MeshAxis, MeshAxisType, Min, Mul, Neg, OneLike,
+        Operation as CoreOperation, Pad, Pow, ProgramError, ProjectedContext, Reduce, ReducePrecision, ReductionKind,
+        Rem, Reshape, ReverseModeDifferentiate, Round, Rsqrt, Scatter, ScatterDimensionNumbers, ScatterOptions,
+        ScatterReductionKind, Select, Shape, Sharding, ShardingDimension, Sign, Sin, Slice, Softmax, Sqrt, StaticShape,
+        StopGradient, Sub, Tag, Tanh, TiledLayout, Transpose, TypeError, Typed, UpdateSlice, Value as CoreValue,
+        WhilePredicate, ZeroLike, batch, differentiate_at, f4e2m1fn, f8e4m3fn, f8e8m0fnu,
         softmax_cross_entropy_with_target_logits,
     };
     use ryft_pjrt::extensions::ffi::{
@@ -38,8 +31,6 @@ mod tests {
         values_to_bytes,
     };
     use crate::{Array, Domain, FromPjrt, Session, Value};
-
-    use super::*;
 
     fn cpu_mesh(client: &Client<'_>) -> DeviceMesh {
         cpu_mesh_with_axis_size(client, 1)

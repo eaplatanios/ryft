@@ -5631,7 +5631,13 @@ mod tests {
             input_type.clone(),
         )
         .unwrap();
-        assert_eq!(program.to_string(), "PLACEHOLDER");
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3] .
+                let %1:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[1]] %0
+                in (%1)"},
+        );
 
         // A mapped input extent must equal its output extent or be one.
         assert_eq!(
@@ -5640,7 +5646,9 @@ mod tests {
                 input_type,
             )
             .map(|(_, program)| program.to_string()),
-            Err(ProgramError::Type(TypeError::invalid("PLACEHOLDER"))),
+            Err(ProgramError::Type(TypeError::invalid(
+                "broadcasting input axis 0 has size 3, which is neither 4 nor 1",
+            ))),
         );
     }
 

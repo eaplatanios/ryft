@@ -24,10 +24,10 @@
 //! constants, coordinates, and broadcasts take the runtime shapes of existing values (refer to [`FillLike`],
 //! [`IotaLike`], and [`BroadcastLike`]), and their reshapes keep the batch and sequence dimensions, so they support
 //! static and dynamic batch and sequence extents for values typed by [`ArrayType`] and for array IR values (i.e.,
-//! values typed by [`ArrayIrType`]) alike. Only the batching rule constructs shapes that no existing value has, and it
-//! computes their extents through the [`AttentionType`] implementation of the type universe, which supports dynamic
-//! extents there only for array IR values, whose extents are first-class dimension values. Dropout is the exception in
-//! both universes, because it draws the random bits of its mask for static extents.
+//! values typed by [`ArrayIrType`](crate::ArrayIrType)) alike. Only the batching rule constructs shapes that no existing value has, and it
+//! computes their extents with the extent capabilities of the values (refer to [`AttentionOperations`]), which support
+//! dynamic extents there only for array IR values, whose extents are first-class dimension values. Dropout is the
+//! exception in both universes, because it draws the random bits of its mask for static extents.
 //!
 //! # Ownership and Lifecycle
 //!
@@ -87,9 +87,9 @@ use std::sync::{Arc, Mutex, Weak};
 
 use ryft_macros::Parameterized;
 
-use crate::arrays::{ArrayIrType, ArrayMemberType, ArrayType, DataType, Dimension, DimensionType, Shape};
-use crate::batching::{BatchAxis, BatchableType, BatchingLevelExtent};
-use crate::contexts::{Context, Domain, StagingContext};
+use crate::arrays::{ArrayMemberType, ArrayType, DataType, Dimension, Shape};
+use crate::batching::{BatchAxis, BatchableType};
+use crate::contexts::{Domain, StagingContext};
 use crate::differentiation::DifferentiableType;
 use crate::macros::check_count;
 use crate::operations::Capability;
@@ -102,12 +102,10 @@ use crate::operations::composites::configurations::{
 };
 use crate::operations::composites::rules::CustomRuleTracer;
 use crate::operations::composites::rules::definitions::{CompositeAttribute, CompositeKey, CustomRuleDefinition};
-use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::fill_like::FillLike;
 use crate::operations::constants::iota_like::IotaLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::stop_gradient::StopGradient;
-use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::dot::{Dot, DotDimensionNumbers};
 use crate::operations::exponential::{Exp, Log};
@@ -119,15 +117,22 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::random::{Dropout, RandomAlgorithm};
 use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::parameters::{Parameter, Parameterized, Placeholder};
-use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
+use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
-/// Type-family extent arithmetic for the named attention definitions, with which their batching rule constructs
-/// shapes that no existing value has. It is the only part of attention that each type universe implements separately.
-/// The portable bodies take every shape from an existing value, so they need only ordinary value capabilities (refer
-/// to [`AttentionOperations`]).
+/// Value capabilities with which attention computes. The portable bodies are written once over the values of a type
+/// universe and compute on them directly. Their capabilities include the exemplar-relative [`FillLike`],
+/// [`IotaLike`], and [`BroadcastLike`], which read the runtime shape of an existing value, so the constants,
+/// coordinates, and broadcasts of the bodies support static and dynamic shapes. The batching rule of the named
+/// definitions also needs the extent capabilities that the section below describes. This bundle is implemented
+/// automatically for every value that implements all of its members, and so it must never be implemented manually. It
+/// is public because it bounds [`dot_product_attention`] and [`differentiable_dot_product_attention`].
 ///
-/// # Why Batching Needs Extents
+/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
+/// so that tracers of homogeneous array programs implement this bundle for [`ArrayType`] and array IR values implement
+/// it for [`ArrayIrType`](crate::ArrayIrType).
+///
+/// # Extents
 ///
 /// Batching an attention call gives its inputs a mapped axis (i.e., an additional axis that holds the batch items),
 /// which is one axis more than a definition accepts. The batching rule does not batch the operations of the body one
@@ -149,198 +154,29 @@ use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 ///   | Fold      | Sequence lengths                    | `[v, B]`           | `[v · B]`          |
 ///   | Unfold    | Outputs                             | `[v · B, T, N, H]` | `[v, B, T, N, H]`  |
 ///
-/// A call whose inputs have no batch axis needs no product, because its mapped axis becomes the batch axis.
+/// A call whose inputs have no batch axis needs no product, because its mapped axis becomes the batch axis, and its
+/// biases and masks are normalized to `[v, N, T, S]`.
 ///
 /// The rule constructs every shape in the last column, and in general no value has that shape beforehand. The
 /// exemplar-relative capabilities (e.g., [`BroadcastLike`]) copy the shape of an existing value, so they cannot
 /// produce it. [`Reshape`] can regroup static dimensions next to the dynamic dimensions that it keeps, but `v · B` is
-/// a new extent whenever `v` or `B` is dynamic. The rule therefore reads extents, multiplies two of them, and
-/// broadcasts and reshapes values to the results, which are the functions of this trait. Batching the body one
-/// operation at a time needs none of them, and definitions with dropout are batched that way, but such a call is no
-/// longer a call of the named definition.
+/// a new extent whenever `v` or `B` is dynamic. The rule therefore reads extents with [`DimensionSize`], multiplies
+/// two of them with [`Mul`], and broadcasts and reshapes values to the results with [`DynamicBroadcast`] and
+/// [`DynamicReshape`]. Batching the body one operation at a time needs none of them, and definitions with dropout are
+/// batched that way, but such a call is no longer a call of the named definition.
 ///
-/// # Implementations
+/// The representation of an extent is [`DimensionSize::Extent`], which differs between the universes:
 ///
-/// The two built-in universes represent an extent differently, which is why the rule is written once over this trait
-/// instead of over one set of capabilities.
-///
-///   - [`ArrayType`] implements it for homogeneous array values. Their extents are static host numbers (i.e.,
-///     [`Self::Extent`] is `usize`) that are read from their types, and their broadcasts and reshapes are the static
-///     [`Broadcast`] and [`Reshape`]. A dynamic extent has no host number, so a homogeneous array family supports
-///     dynamically shaped attention except with batched calls whose batching rule needs a dynamic extent (e.g., a
-///     dynamic mapped extent, or a dynamic extent of a rank-4 input whose mapped axis is folded into its batch axis,
-///     of a bias or mask, or of a replicated input that is broadcast along the mapped axis). A dynamic mapped extent
-///     fails with an error that says that attention over homogeneous arrays cannot be batched with a dynamic extent,
-///     and every other case fails with an error that names the dynamic axis (e.g., "attention over homogeneous arrays
-///     requires static extents, but axis 2 of `f32[2, 1, length, 1, 1]` has extent `length`; use array IR values for
-///     dynamic extents"). Such programs stage attention in an array IR family instead, which is how backends support
-///     bounded dynamic shapes (e.g., XLA tracers).
-///   - [`ArrayIrType`] implements it for array IR values. Their extents are first-class dimension values (i.e.,
-///     [`Self::Extent`] is the value type itself) that are read with [`DimensionSize`], multiplied with
-///     [`DimensionMulOperation`], and passed to [`DynamicBroadcast`] and [`DynamicReshape`], so the batching rule
-///     supports static and dynamic extents.
-///
-/// The supertraits relate the types of a universe to array types, through which the output type rules of the
-/// definitions validate their inputs.
-///
-/// The implementations are on the type universes rather than on the values, which keeps them coherent for every value
-/// type. Both are blanket implementations over every value of their universe whose capabilities satisfy their bounds,
-/// so a value of these universes (e.g., a backend tracer) participates by providing those capabilities rather than by
-/// implementing this trait, which coherence permits only for values that the blanket implementations do not cover. A
-/// new type universe participates by implementing this trait for its own type. The trait is public because it bounds
-/// [`dot_product_attention`] and [`differentiable_dot_product_attention`].
-pub trait AttentionType<V>: Type + ArrayMemberType + From<ArrayType> {
-    /// Extent of one axis (e.g., `usize` for static extents or a dimension value for first-class extents).
-    type Extent: Clone;
-
-    /// Returns the extent of the batching level whose extent is `extent`, constructed next to `value` (i.e., in its
-    /// context).
-    fn batch_extent(value: &V, extent: &BatchingLevelExtent<V>) -> Result<Self::Extent, ProgramError>;
-
-    /// Returns the extent of `value` along `axis`.
-    fn extent(value: &V, axis: usize) -> Result<Self::Extent, ProgramError>;
-
-    /// Returns the extent of every axis of `value`, in axis order.
-    fn extents(value: &V) -> Result<Vec<Self::Extent>, ProgramError>
-    where
-        V: Typed<Type = Self>,
-    {
-        let r#type = value.r#type();
-        (0..r#type.as_array_type()?.rank()).map(|axis| Self::extent(value, axis)).collect()
-    }
-
-    /// Returns the constant extent `extent`, constructed next to `value` (i.e., in its context).
-    fn constant_extent(value: &V, extent: usize) -> Result<Self::Extent, ProgramError>;
-
-    /// Returns the product of two extents, constructed next to `value` (i.e., in its context).
-    fn multiply_extents(value: &V, left: &Self::Extent, right: &Self::Extent) -> Result<Self::Extent, ProgramError>;
-
-    /// Broadcasts `value` to the provided output extents, where `axes` names the output axis of every input axis.
-    fn broadcast(value: &V, extents: &[Self::Extent], axes: &[usize]) -> Result<V, ProgramError>;
-
-    /// Reshapes `value` to the provided output extents.
-    fn reshape(value: &V, extents: &[Self::Extent]) -> Result<V, ProgramError>;
-}
-
-impl<A: Value<Type = ArrayType> + Broadcast + Reshape> AttentionType<A> for ArrayType {
-    type Extent = usize;
-
-    fn batch_extent(_value: &A, extent: &BatchingLevelExtent<A>) -> Result<usize, ProgramError> {
-        match extent {
-            BatchingLevelExtent::Static(extent) => Ok(*extent),
-            BatchingLevelExtent::Dynamic(_) => Err(TypeError::invalid(
-                "attention over homogeneous arrays cannot be batched with a dynamic extent; use array IR values for \
-                 dynamic extents",
-            )
-            .into()),
-        }
-    }
-
-    fn extent(value: &A, axis: usize) -> Result<usize, ProgramError> {
-        let r#type = value.r#type();
-        let dimension = r#type.dimension(axis);
-        dimension.value().ok_or_else(|| {
-            TypeError::invalid(format!(
-                "attention over homogeneous arrays requires static extents, but axis {axis} of `{}` has extent \
-                 `{dimension}`; use array IR values for dynamic extents",
-                r#type.as_ref(),
-            ))
-            .into()
-        })
-    }
-
-    #[inline]
-    fn constant_extent(_value: &A, extent: usize) -> Result<usize, ProgramError> {
-        Ok(extent)
-    }
-
-    fn multiply_extents(_value: &A, left: &usize, right: &usize) -> Result<usize, ProgramError> {
-        left.checked_mul(*right).ok_or_else(|| {
-            TypeError::invalid(format!("attention extent product {left} × {right} overflows `usize`")).into()
-        })
-    }
-
-    fn broadcast(value: &A, extents: &[usize], axes: &[usize]) -> Result<A, ProgramError> {
-        // The output keeps the memory space and the placement of the input along the mapped axes, and its new axes are
-        // replicated, because a broadcast cannot change manual variation.
-        let r#type = value.r#type();
-        let sharding = r#type
-            .sharding()
-            .map(|sharding| sharding.with_broadcasted_dimensions(extents.len(), axes))
-            .transpose()
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        let output_type = ArrayType::new(r#type.data_type(), Shape::from(extents))
-            .with_memory(r#type.memory())
-            .with_sharding(sharding)
-            .map_err(|error| TypeError::invalid(error.to_string()))?;
-        Broadcast::broadcast(value, output_type, axes)
-    }
-
-    #[inline]
-    fn reshape(value: &A, extents: &[usize]) -> Result<A, ProgramError> {
-        value.reshape(extents)
-    }
-}
-
-impl<V> AttentionType<V> for ArrayIrType
-where
-    V: Value<Type = ArrayIrType> + DimensionSize<Extent = V> + DynamicBroadcast + DynamicReshape,
-    V::Domain: Context<Type = ArrayIrType, Operation: From<DimensionMulOperation>> + DimensionConstant,
-{
-    type Extent = V;
-
-    fn batch_extent(value: &V, extent: &BatchingLevelExtent<V>) -> Result<V, ProgramError> {
-        match extent {
-            BatchingLevelExtent::Static(extent) => value.domain().dimension_constant(*extent),
-            BatchingLevelExtent::Dynamic(extent) => Ok(extent.clone()),
-        }
-    }
-
-    #[inline]
-    fn extent(value: &V, axis: usize) -> Result<V, ProgramError> {
-        value.dimension_size(axis)
-    }
-
-    #[inline]
-    fn constant_extent(value: &V, extent: usize) -> Result<V, ProgramError> {
-        value.domain().dimension_constant(extent)
-    }
-
-    fn multiply_extents(value: &V, left: &V, right: &V) -> Result<V, ProgramError> {
-        let left_type = left.r#type();
-        let left_type = <&DimensionType>::try_from(left_type.as_ref())?;
-        let right_type = right.r#type();
-        let right_type = <&DimensionType>::try_from(right_type.as_ref())?;
-        let mut outputs = value.domain().bind(
-            DimensionMulOperation::new(left_type, right_type)?,
-            Vec::new(),
-            &[left.clone(), right.clone()],
-        )?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    }
-
-    #[inline]
-    fn broadcast(value: &V, extents: &[V], axes: &[usize]) -> Result<V, ProgramError> {
-        value.dynamic_broadcast(extents, axes)
-    }
-
-    #[inline]
-    fn reshape(value: &V, extents: &[V]) -> Result<V, ProgramError> {
-        value.clone().dynamic_reshape(extents)
-    }
-}
-
-/// Value capabilities with which the portable attention bodies compute. The bodies are written once over the values of
-/// a type universe and compute on them directly. Their capabilities include the exemplar-relative [`FillLike`],
-/// [`IotaLike`], and [`BroadcastLike`], which read the runtime shape of an existing value, so the constants,
-/// coordinates, and broadcasts of the bodies support static and dynamic shapes. This bundle is implemented
-/// automatically for every value that implements all of its members, and so it must never be implemented manually. It
-/// is public because it bounds [`dot_product_attention`] and [`differentiable_dot_product_attention`].
-///
-/// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
-/// so that homogeneous array values implement this bundle for [`ArrayType`] and array IR values implement it for
-/// [`ArrayIrType`] by applying the capabilities to their array members.
+///   - Tracers of homogeneous array programs use static host numbers that are read from their types, and they
+///     broadcast and reshape to static shapes. A dynamic extent has no host number, so a homogeneous array family
+///     supports dynamically shaped attention except with batched calls whose batching rule needs a dynamic extent
+///     (e.g., a dynamic mapped extent, or a dynamic extent of a rank-4 input whose mapped axis is folded into its
+///     batch axis, of a bias or mask, or of a replicated input that is broadcast along the mapped axis). Such a call
+///     fails with an error that names the dynamic axis (e.g., "`dimension_size` cannot return the dynamic extent
+///     `length` of axis 2 of `f32[2, 1, length, 1, 1]` as a host extent; use array IR values for dynamic extents"),
+///     and such programs stage attention in an array IR family instead, which is how backends support bounded
+///     dynamic shapes (e.g., XLA tracers).
+///   - Array IR values use first-class dimension values, so the batching rule supports static and dynamic extents.
 pub trait AttentionOperations<T = <Self as Capability>::Universe>:
     Capability
     + Add<T>
@@ -363,6 +199,9 @@ pub trait AttentionOperations<T = <Self as Capability>::Universe>:
     + StopGradient<T>
     + Sub<T>
     + Transpose<T>
+    + DimensionSize<T, Extent: Clone + Mul>
+    + DynamicBroadcast<<Self as DimensionSize<T>>::Extent, T>
+    + DynamicReshape<<Self as DimensionSize<T>>::Extent, T>
 {
 }
 
@@ -387,7 +226,10 @@ impl<
         + Select<T>
         + StopGradient<T>
         + Sub<T>
-        + Transpose<T>,
+        + Transpose<T>
+        + DimensionSize<T, Extent: Clone + Mul>
+        + DynamicBroadcast<<V as DimensionSize<T>>::Extent, T>
+        + DynamicReshape<<V as DimensionSize<T>>::Extent, T>,
 > AttentionOperations<T> for V
 {
 }
@@ -939,7 +781,7 @@ impl<C: Domain> DotProductAttention<C>
 where
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: AttentionType<DomainTracer<C>> + BatchableType,
+    C::Type: ArrayMemberType + From<ArrayType> + BatchableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>,
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
@@ -995,7 +837,7 @@ where
 /// (e.g., the XLA backend replaces it with cuDNN's fused attention kernels when the configuration and the input types
 /// are eligible). Array IR domains support dynamic batch and sequence extents (e.g., in bounded dynamic programs).
 /// Homogeneous array domains support them as well, except in batching rules that need a dynamic extent (refer to
-/// [`AttentionType`]).
+/// [`AttentionOperations`]).
 ///
 /// # Parameters
 ///
@@ -1004,7 +846,7 @@ pub fn dot_product_attention<C: Domain>(configuration: AttentionConfiguration) -
 where
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: AttentionType<DomainTracer<C>> + BatchableType,
+    C::Type: ArrayMemberType + From<ArrayType> + BatchableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>,
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
@@ -1057,7 +899,7 @@ impl<C: Domain> DifferentiableDotProductAttention<C>
 where
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: AttentionType<DomainTracer<C>> + BatchableType + DifferentiableType,
+    C::Type: ArrayMemberType + From<ArrayType> + BatchableType + DifferentiableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>
         + CompositeVjp<
@@ -1236,7 +1078,7 @@ pub fn differentiable_dot_product_attention<C: Domain>(
 where
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: AttentionType<DomainTracer<C>> + BatchableType + DifferentiableType,
+    C::Type: ArrayMemberType + From<ArrayType> + BatchableType + DifferentiableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>
         + CompositeVjp<
@@ -1397,7 +1239,7 @@ impl<V: Value, O: Operation<Type = V::Type>> AttentionDefinitions<V, O>
 where
     V: 'static,
     O: 'static,
-    V::Type: AttentionType<RuleTracer<V, O>> + BatchableType,
+    V::Type: ArrayMemberType + From<ArrayType> + BatchableType,
     RuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
@@ -1977,7 +1819,7 @@ fn forward_function<V: Value, O: Operation<Type = V::Type>>(
 where
     V: 'static,
     O: 'static,
-    V::Type: AttentionType<RuleTracer<V, O>> + BatchableType,
+    V::Type: ArrayMemberType + From<ArrayType> + BatchableType,
     RuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
@@ -2100,7 +1942,7 @@ where
     AttentionFunction::Folding(Arc::new_cyclic(|weak: &Weak<ForwardFolding<V, O>>| {
         let weak = weak.clone();
         let input_roles = key.batch_input_roles();
-        function.with_batching(move |inputs, axes: AttentionInputs<BatchAxis>, extent| {
+        function.with_batching(move |inputs, axes: AttentionInputs<BatchAxis>, _| {
             // A staged call outlives the function that staged it when its program is batched after the function is
             // dropped, in which case the folded call stages an equivalent definition.
             let function = match weak.upgrade() {
@@ -2113,7 +1955,6 @@ where
             batch_attention(
                 inputs.into_parameters().collect(),
                 axes.into_parameters().collect(),
-                &extent,
                 input_roles.as_slice(),
                 |output_count| key.batch_output_roles(output_count),
                 |inputs| function.call(AttentionInputs::from_parameters(input_structure, inputs)?),
@@ -2157,7 +1998,7 @@ fn backward_function<V: Value, O: Operation<Type = V::Type>>(
 where
     V: 'static,
     O: 'static,
-    V::Type: AttentionType<RuleTracer<V, O>> + BatchableType,
+    V::Type: ArrayMemberType + From<ArrayType> + BatchableType,
     RuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
@@ -2377,7 +2218,7 @@ where
     AttentionFunction::Folding(Arc::new_cyclic(|weak: &Weak<BackwardFolding<V, O>>| {
         let weak = weak.clone();
         let input_roles = key.batch_input_roles();
-        function.with_batching(move |inputs, axes: AttentionBackwardInputs<BatchAxis>, extent| {
+        function.with_batching(move |inputs, axes: AttentionBackwardInputs<BatchAxis>, _| {
             // Refer to the forward definition for when the function may have been dropped.
             let function = match weak.upgrade() {
                 Some(function) => function,
@@ -2389,7 +2230,6 @@ where
             batch_attention(
                 inputs.into_parameters().collect(),
                 axes.into_parameters().collect(),
-                &extent,
                 input_roles.as_slice(),
                 |output_count| key.batch_output_roles(output_count),
                 |inputs| {
@@ -2646,75 +2486,93 @@ fn denormalize_attention_output<V: Value<Type: ArrayMemberType> + Reshape>(
 /// Every input is first aligned to a leading mapped axis and then folded into the logical batch axis. Rank-3
 /// attention has an implicit logical batch of one, so `[v, T, N, H]` already has the canonical rank-4 form, while
 /// rank-4 attention folds `[v, B, T, N, H]` to `[v · B, T, N, H]`. Biases and masks are first materialized to
-/// `[v, B, N, T, S]`, which handles every broadcastable rank and preserves mapped bias and mask inputs. Outputs reverse
-/// the normalization, and a bias cotangent is reduced over precisely the axes that its logical bias input broadcasts.
-/// Every extent comes from the [`AttentionType`] implementation of the values' type universe, so this supports static
-/// extents and, in array IR families, first-class dynamic extents (i.e., a dynamic mapped extent, logical batch, or
-/// sequence length never becomes host metadata). Calls whose inputs are all replicated stage the unbatched definition.
-fn batch_attention<V: Value<Type: AttentionType<V>> + Reduce + Transpose>(
+/// `[v, B, N, T, S]` (or to `[v, N, T, S]` for rank-3 attention), which handles every broadcastable rank and preserves
+/// mapped bias and mask inputs. Outputs reverse the normalization, and a bias cotangent is reduced over precisely the
+/// axes that its logical bias input broadcasts. Every extent is read from an input with [`DimensionSize`] in the
+/// representation of the values (refer to [`AttentionOperations`]), so this supports static extents and, in array IR
+/// families, first-class dynamic extents (i.e., a dynamic mapped extent, logical batch, or sequence length never
+/// becomes host metadata). Calls whose inputs are all replicated stage the unbatched definition.
+fn batch_attention<V: Value<Type: ArrayMemberType> + AttentionOperations>(
     inputs: Vec<V>,
     axes: Vec<BatchAxis>,
-    extent: &BatchingLevelExtent<V>,
     input_roles: &[AttentionBatchInput],
     output_roles: impl FnOnce(usize) -> Vec<AttentionBatchOutput>,
     call: impl FnOnce(Vec<V>) -> Result<Vec<V>, ProgramError>,
 ) -> Result<(Vec<V>, Vec<BatchAxis>), ProgramError> {
     check_count!("input", input_roles, inputs.len(), ProgramError);
     check_count!("input", axes, inputs.len(), ProgramError);
-    if axes.iter().all(BatchAxis::is_replicated) {
+    let rank = |value: &V| -> Result<usize, ProgramError> { Ok(value.r#type().as_array_type()?.rank()) };
+    let extents = |value: &V, start: usize| {
+        (start..rank(value)?)
+            .map(|axis| value.dimension_size(axis))
+            .collect::<Result<Vec<_>, ProgramError>>()
+    };
+    let mapped_axes = inputs
+        .iter()
+        .zip(&axes)
+        .map(|(input, axis)| match axis.axis() {
+            Some(axis) => {
+                Ok(Some(axis.normalize(rank(input)?).map_err(|error| TypeError::invalid(error.to_string()))?))
+            }
+            None => Ok(None),
+        })
+        .collect::<Result<Vec<_>, ProgramError>>()?;
+    // The mapped extent is the extent of every mapped input along its mapped axis.
+    let Some((mapped_input, mapped_axis)) =
+        inputs.iter().zip(&mapped_axes).find_map(|(input, axis)| axis.map(|axis| (input, axis)))
+    else {
         let outputs = call(inputs)?;
         let output_axes = vec![BatchAxis::replicated(); outputs.len()];
         return Ok((outputs, output_axes));
-    }
+    };
+    let mapped_extent = mapped_input.dimension_size(mapped_axis)?;
 
     // Align every input to a leading mapped axis, moving mapped axes and broadcasting replicated inputs.
-    let mapped_extent = V::Type::batch_extent(&inputs[0], extent)?;
     let aligned = inputs
         .iter()
-        .zip(&axes)
-        .map(|(input, axis)| {
-            let rank = input.r#type().as_array_type()?.rank();
-            match axis.axis() {
-                Some(axis) => {
-                    let position = axis.normalize(rank).map_err(|error| TypeError::invalid(error.to_string()))?;
-                    if position == 0 {
-                        return Ok(input.clone());
-                    }
+        .zip(&mapped_axes)
+        .map(|(input, mapped_axis)| {
+            let rank = rank(input)?;
+            match *mapped_axis {
+                Some(0) => Ok(input.clone()),
+                Some(position) => {
                     let permutation =
                         std::iter::once(position).chain((0..rank).filter(|axis| *axis != position)).collect::<Vec<_>>();
                     input.transpose(permutation)
                 }
                 None => {
                     let output_extents =
-                        std::iter::once(mapped_extent.clone()).chain(V::Type::extents(input)?).collect::<Vec<_>>();
-                    V::Type::broadcast(input, output_extents.as_slice(), (1..=rank).collect::<Vec<_>>().as_slice())
+                        std::iter::once(mapped_extent.clone()).chain(extents(input, 0)?).collect::<Vec<_>>();
+                    input.dynamic_broadcast(output_extents.as_slice(), (1..=rank).collect::<Vec<_>>().as_slice())
                 }
             }
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
-    let logical_rank = |value: &V| -> Result<usize, ProgramError> { Ok(value.r#type().as_array_type()?.rank() - 1) };
-    let query_rank = logical_rank(&aligned[0])?;
-    let key_rank = logical_rank(&aligned[1])?;
-    let batch_extent =
-        if query_rank == 4 { V::Type::extent(&aligned[0], 1)? } else { V::Type::constant_extent(&aligned[0], 1)? };
-    let folded_batch_extent = V::Type::multiply_extents(&aligned[0], &mapped_extent, &batch_extent)?;
+    let query_rank = rank(&aligned[0])? - 1;
+    let key_rank = rank(&aligned[1])? - 1;
+    // Rank-3 attention has no batch axis, so its mapped axis becomes the batch axis without a product.
+    let batch_extent = if query_rank == 4 { Some(aligned[0].dimension_size(1)?) } else { None };
+    let folded_batch_extent = match &batch_extent {
+        Some(batch_extent) => mapped_extent.mul(batch_extent)?,
+        None => mapped_extent.clone(),
+    };
 
-    // Biases and masks are normalized to the canonical `[v, B, N, T, S]` score shape, whose extents are obtained only
-    // when the call has such inputs (and therefore possibly a bias cotangent output).
+    // Biases and masks are normalized to the canonical `[v, B, N, T, S]` score shape (or to `[v, N, T, S]` for rank-3
+    // attention), whose extents are obtained only when the call has such inputs (and therefore possibly a bias
+    // cotangent output). The folded score shape differs from the normalized one only for rank-4 attention.
     let score_extents = if input_roles.iter().any(|role| matches!(role, AttentionBatchInput::Score)) {
-        let query_sequence_extent = V::Type::extent(&aligned[0], query_rank - 2)?;
-        let head_extent = V::Type::extent(&aligned[0], query_rank - 1)?;
-        let key_sequence_extent = V::Type::extent(&aligned[1], key_rank - 2)?;
-        Some((
-            [
-                mapped_extent.clone(),
-                batch_extent.clone(),
-                head_extent.clone(),
-                query_sequence_extent.clone(),
-                key_sequence_extent.clone(),
-            ],
-            [folded_batch_extent.clone(), head_extent, query_sequence_extent, key_sequence_extent],
-        ))
+        let query_sequence_extent = aligned[0].dimension_size(query_rank - 2)?;
+        let head_extent = aligned[0].dimension_size(query_rank - 1)?;
+        let key_sequence_extent = aligned[1].dimension_size(key_rank - 2)?;
+        let score_extents = [head_extent, query_sequence_extent, key_sequence_extent];
+        let normalized = std::iter::once(mapped_extent.clone())
+            .chain(batch_extent.clone())
+            .chain(score_extents.iter().cloned())
+            .collect::<Vec<_>>();
+        let folded = batch_extent
+            .as_ref()
+            .map(|_| std::iter::once(folded_batch_extent.clone()).chain(score_extents).collect::<Vec<_>>());
+        Some((normalized, folded))
     } else {
         None
     };
@@ -2729,29 +2587,32 @@ fn batch_attention<V: Value<Type: AttentionType<V>> + Reduce + Transpose>(
         .iter()
         .zip(input_roles)
         .map(|(value, role)| {
-            let rank = value.r#type().as_array_type()?.rank();
-            let trailing_extents = |start: usize| {
-                (start..rank).map(|axis| V::Type::extent(value, axis)).collect::<Result<Vec<_>, ProgramError>>()
-            };
+            let rank = rank(value)?;
             match role {
                 AttentionBatchInput::Tensor if rank == 5 => {
-                    let batch_extent = V::Type::multiply_extents(value, &mapped_extent, &V::Type::extent(value, 1)?)?;
-                    let folded_extents = std::iter::once(batch_extent).chain(trailing_extents(2)?).collect::<Vec<_>>();
-                    V::Type::reshape(value, folded_extents.as_slice())
+                    let batch_extent = mapped_extent.mul(&value.dimension_size(1)?)?;
+                    let folded_extents = std::iter::once(batch_extent).chain(extents(value, 2)?).collect::<Vec<_>>();
+                    value.dynamic_reshape(folded_extents.as_slice())
                 }
                 AttentionBatchInput::Tensor => Ok(value.clone()),
                 AttentionBatchInput::Score => {
-                    let (score_extents, folded_score_extents) = score_extents()?;
-                    let output_axes =
-                        std::iter::once(0).chain((1..rank).map(|axis| 5 - rank + axis)).collect::<Vec<_>>();
-                    let normalized = V::Type::broadcast(value, score_extents, output_axes.as_slice())?;
-                    V::Type::reshape(&normalized, folded_score_extents)
+                    let (normalized_extents, folded_extents) = score_extents()?;
+                    // A rank-4 bias or mask of rank-3 attention has a unit batch axis, which the normalized score
+                    // shape of rank-3 attention does not have.
+                    let value = if rank == normalized_extents.len() + 1 { value.squeeze(1)? } else { value.clone() };
+                    let offset = normalized_extents.len() + 1 - rank.min(normalized_extents.len());
+                    let output_axes = std::iter::once(0).chain(offset..normalized_extents.len()).collect::<Vec<_>>();
+                    let normalized = value.dynamic_broadcast(normalized_extents.as_slice(), output_axes.as_slice())?;
+                    match folded_extents {
+                        Some(folded_extents) => normalized.dynamic_reshape(folded_extents.as_slice()),
+                        None => Ok(normalized),
+                    }
                 }
-                AttentionBatchInput::Length => V::Type::reshape(value, std::slice::from_ref(&folded_batch_extent)),
+                AttentionBatchInput::Length => value.dynamic_reshape(std::slice::from_ref(&folded_batch_extent)),
                 AttentionBatchInput::Residual if rank == 4 => {
                     let folded_extents =
-                        std::iter::once(folded_batch_extent.clone()).chain(trailing_extents(2)?).collect::<Vec<_>>();
-                    V::Type::reshape(value, folded_extents.as_slice())
+                        std::iter::once(folded_batch_extent.clone()).chain(extents(value, 2)?).collect::<Vec<_>>();
+                    value.dynamic_reshape(folded_extents.as_slice())
                 }
                 AttentionBatchInput::Residual => Ok(value.clone()),
             }
@@ -2765,42 +2626,45 @@ fn batch_attention<V: Value<Type: AttentionType<V>> + Reduce + Transpose>(
     let outputs = outputs
         .into_iter()
         .zip(output_roles)
-        .map(|(output, role)| {
-            let trailing_extents = |output: &V| {
-                let rank = output.r#type().as_array_type()?.rank();
-                (1..rank).map(|axis| V::Type::extent(output, axis)).collect::<Result<Vec<_>, ProgramError>>()
-            };
-            match role {
-                AttentionBatchOutput::Tensor(input_index) if logical_rank(&aligned[input_index])? == 4 => {
-                    let input_batch_extent = V::Type::extent(&aligned[input_index], 1)?;
-                    let unfolded_extents = [mapped_extent.clone(), input_batch_extent]
-                        .into_iter()
-                        .chain(trailing_extents(&output)?)
-                        .collect::<Vec<_>>();
-                    V::Type::reshape(&output, unfolded_extents.as_slice())
-                }
-                AttentionBatchOutput::Tensor(_) => Ok(output),
-                AttentionBatchOutput::Residual if query_rank == 4 => {
+        .map(|(output, role)| match role {
+            AttentionBatchOutput::Tensor(input_index) if rank(&aligned[input_index])? == 5 => {
+                let unfolded_extents = [mapped_extent.clone(), aligned[input_index].dimension_size(1)?]
+                    .into_iter()
+                    .chain(extents(&output, 1)?)
+                    .collect::<Vec<_>>();
+                output.dynamic_reshape(unfolded_extents.as_slice())
+            }
+            AttentionBatchOutput::Tensor(_) => Ok(output),
+            AttentionBatchOutput::Residual => match &batch_extent {
+                Some(batch_extent) => {
                     let unfolded_extents = [mapped_extent.clone(), batch_extent.clone()]
                         .into_iter()
-                        .chain(trailing_extents(&output)?)
+                        .chain(extents(&output, 1)?)
                         .collect::<Vec<_>>();
-                    V::Type::reshape(&output, unfolded_extents.as_slice())
+                    output.dynamic_reshape(unfolded_extents.as_slice())
                 }
-                AttentionBatchOutput::Residual => Ok(output),
-                AttentionBatchOutput::Score(input_index) => {
-                    let bias_type = aligned[input_index].r#type().as_array_type()?.clone();
-                    let offset = 5 - bias_type.rank();
-                    let reduction_axes = (0..4)
-                        .filter(|&axis| {
-                            axis < offset || matches!(bias_type.shape()[axis - offset + 1], Dimension::Static(1))
-                        })
-                        .map(|axis| axis + 1)
-                        .collect::<Vec<_>>();
-                    let normalized = V::Type::reshape(&output, &score_extents()?.0)?;
-                    let reduced = normalized.reduce(reduction_axes.as_slice(), ReductionKind::Sum)?;
-                    V::Type::reshape(&reduced, V::Type::extents(&aligned[input_index])?.as_slice())
-                }
+                None => Ok(output),
+            },
+            AttentionBatchOutput::Score(input_index) => {
+                let (normalized_extents, folded_extents) = score_extents()?;
+                let normalized = match folded_extents {
+                    Some(_) => output.dynamic_reshape(normalized_extents.as_slice())?,
+                    None => output,
+                };
+                // The logical bias is right-aligned to the score axes that follow the mapped axis, without the unit
+                // batch axis that a rank-4 bias of rank-3 attention has.
+                let bias = &aligned[input_index];
+                let bias_type = bias.r#type().as_array_type()?.clone();
+                let score_axis_count = normalized_extents.len() - 1;
+                let bias_dimensions = &bias_type.shape().dimensions()[1..];
+                let bias_dimensions = &bias_dimensions[bias_dimensions.len().saturating_sub(score_axis_count)..];
+                let offset = score_axis_count - bias_dimensions.len();
+                let reduction_axes = (0..score_axis_count)
+                    .filter(|&axis| axis < offset || matches!(bias_dimensions[axis - offset], Dimension::Static(1)))
+                    .map(|axis| axis + 1)
+                    .collect::<Vec<_>>();
+                let reduced = normalized.reduce(reduction_axes.as_slice(), ReductionKind::Sum)?;
+                reduced.dynamic_reshape(extents(bias, 0)?.as_slice())
             }
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
@@ -2862,121 +2726,6 @@ mod tests {
         differentiate_at(inputs)
             .value_and_gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum))
             .unwrap()
-    }
-
-    #[test]
-    fn test_attention_type() {
-        let array = f32_array(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-
-        // Extents are static host numbers, so dynamic batching extents and overflowing products are rejected.
-        assert_eq!(<ArrayType as AttentionType<Array>>::batch_extent(&array, &BatchingLevelExtent::Static(4)), Ok(4));
-        assert!(matches!(
-            <ArrayType as AttentionType<Array>>::batch_extent(&array, &BatchingLevelExtent::Dynamic(array.clone())),
-            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "attention over homogeneous arrays cannot be batched with a dynamic extent; use array IR \
-                               values for dynamic extents",
-        ));
-        assert_eq!(<ArrayType as AttentionType<Array>>::extent(&array, 1), Ok(3));
-        assert_eq!(<ArrayType as AttentionType<Array>>::extents(&array), Ok(vec![2, 3]));
-        assert_eq!(<ArrayType as AttentionType<Array>>::constant_extent(&array, 7), Ok(7));
-        assert_eq!(<ArrayType as AttentionType<Array>>::multiply_extents(&array, &2, &3), Ok(6));
-        assert!(matches!(
-            <ArrayType as AttentionType<Array>>::multiply_extents(&array, &usize::MAX, &2),
-            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == format!("attention extent product {} × 2 overflows `usize`", usize::MAX),
-        ));
-
-        // Broadcasts and reshapes take static extents.
-        assert_eq!(
-            <ArrayType as AttentionType<Array>>::broadcast(&f32_array(&[3], &[1.0, 2.0, 3.0]), &[2, 3], &[1]),
-            Ok(f32_array(&[2, 3], &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0])),
-        );
-        assert_eq!(
-            <ArrayType as AttentionType<Array>>::reshape(&array, &[3, 2]),
-            Ok(f32_array(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
-        );
-    }
-
-    #[test]
-    fn test_attention_type_array_ir() {
-        let value = ArrayIrValue::Array(f32_array(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
-        let dimension = |extent| ArrayIrValue::<Array>::Dimension(DimensionValue::constant(extent).unwrap());
-
-        // Extents are first-class dimension values, which include dynamic batching extents.
-        assert_eq!(
-            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::batch_extent(&value, &BatchingLevelExtent::Static(4)),
-            Ok(dimension(4)),
-        );
-        assert_eq!(
-            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::batch_extent(
-                &value,
-                &BatchingLevelExtent::Dynamic(dimension(5)),
-            ),
-            Ok(dimension(5)),
-        );
-        assert_eq!(<ArrayIrType as AttentionType<ArrayIrValue<Array>>>::extent(&value, 1), Ok(dimension(3)));
-        assert_eq!(
-            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::extents(&value),
-            Ok(vec![dimension(2), dimension(3)]),
-        );
-        assert_eq!(<ArrayIrType as AttentionType<ArrayIrValue<Array>>>::constant_extent(&value, 7), Ok(dimension(7)));
-        assert_eq!(
-            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::multiply_extents(&value, &dimension(2), &dimension(3)),
-            Ok(dimension(6)),
-        );
-
-        // Broadcasts and reshapes take their extents from dimension values.
-        assert_eq!(
-            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::broadcast(
-                &ArrayIrValue::Array(f32_array(&[3], &[1.0, 2.0, 3.0])),
-                &[dimension(2), dimension(3)],
-                &[1],
-            ),
-            Ok(ArrayIrValue::Array(f32_array(&[2, 3], &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]))),
-        );
-        assert_eq!(
-            <ArrayIrType as AttentionType<ArrayIrValue<Array>>>::reshape(&value, &[dimension(3), dimension(2)]),
-            Ok(ArrayIrValue::Array(f32_array(&[3, 2], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))),
-        );
-    }
-
-    #[test]
-    fn test_attention_type_array_ir_dynamic_extents() {
-        // Staged array IR values read their dynamic extents as dimension values and fold their static extents into
-        // dimension constants, and broadcasts take one dimension input per output axis.
-        type IrTracer = DomainTracer<ArrayIrContext>;
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let (output_type, program) = ArrayIrContext::trace(
-            |value: IrTracer| {
-                let mut extents = <ArrayIrType as AttentionType<IrTracer>>::extents(&value)?;
-                extents.push(<ArrayIrType as AttentionType<IrTracer>>::constant_extent(&value, 2)?);
-                <ArrayIrType as AttentionType<IrTracer>>::broadcast(&value, &extents, &[0, 1])
-            },
-            ArrayIrType::Array(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Static(3)]),
-            )),
-        )
-        .unwrap();
-        assert_eq!(
-            output_type,
-            ArrayIrType::Array(ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3), Dimension::Static(2)]),
-            )),
-        );
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[batch, 3] .
-                let %1:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %0
-                    %2:dimension<3> = constant [value=3]
-                    %3:dimension<2> = constant [value=2]
-                    %4:f32[batch, 3, 2] = broadcast [output_axes=[0, 1]] %0 %1 %2 %3
-                in (%4)
-            "}
-            .trim_end(),
-        );
     }
 
     #[test]
