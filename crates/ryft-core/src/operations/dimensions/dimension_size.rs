@@ -8,7 +8,7 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
@@ -21,6 +21,7 @@ use crate::programs::{
     Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError,
     TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
+use crate::tracing::Tracer;
 
 /// Canonical operation name for [`DimensionSizeOperation`].
 pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
@@ -262,6 +263,10 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// and staged programs therefore contain no `dimension_size` reads whose outputs the type system already knows. Eager
 /// implementations return the host extent either way.
 ///
+/// Note that homogeneous array programs have no dimension values, so their tracers return the static extent that their
+/// type records as a host extent without staging anything, and they report an error for dynamic axes, whose extents
+/// have no corresponding host value representation before the program runs.
+///
 /// During batching, each item shares the array axis extent, so the resulting dimension remains replicated.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
@@ -312,6 +317,27 @@ impl<
         }
 
         Ok(self.domain().bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
+    }
+}
+
+impl<C: StagingContext<Type = ArrayType>> DimensionSize<usize, ArrayType> for Tracer<C> {
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
+        // Constructing the operation validates and normalizes `axis`. Nothing is staged, because the type of the
+        // tracer already records every extent that a homogeneous array program can name.
+        let r#type = self.r#type();
+        let operation = DimensionSizeOperation::new(r#type.as_ref(), axis)?;
+        match operation.input_dimension() {
+            Dimension::Static(extent) => Ok(*extent),
+            dimension => Err(TypeError::invalid(format!(
+                "`{}` cannot return the dynamic extent `{}` of axis {} of `{}` as a host extent; \
+                 use array IR values for dynamic extents",
+                DIMENSION_SIZE_OPERATION_NAME,
+                dimension,
+                operation.axis(),
+                r#type.as_ref(),
+            ))
+            .into()),
+        }
     }
 }
 
@@ -373,7 +399,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionOperation, DimensionValue, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionOperation,
+        DimensionValue, Shape,
     };
     use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
@@ -500,6 +527,45 @@ mod tests {
         assert!(matches!(read.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 0));
         assert!(matches!(literal.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
         assert!(literal.inputs().is_empty());
+    }
+
+    #[test]
+    fn test_dimension_size_homogeneous_tracers() {
+        // Tracers of homogeneous array programs return the static extents that their types record as host extents,
+        // and they stage nothing.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(3)]));
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |array| {
+                assert_eq!(array.dimension_size(1), Ok(3));
+                assert_eq!(array.dimension_size(-1), Ok(3));
+
+                // A dynamic extent has no host value before the program runs.
+                assert_eq!(
+                    array.dimension_size(0),
+                    Err(ProgramError::Type(TypeError::invalid(format!(
+                        "`{DIMENSION_SIZE_OPERATION_NAME}` cannot return the dynamic extent `rows` of axis 0 of \
+                         `f32[rows, 3]` as a host extent; use array IR values for dynamic extents",
+                    )))),
+                );
+                assert_eq!(
+                    array.dimension_size(2),
+                    Err(ProgramError::Type(TypeError::invalid(format!(
+                        "`{DIMENSION_SIZE_OPERATION_NAME}` axis 2 is out of bounds for rank 2",
+                    )))),
+                );
+                Ok(array)
+            },
+            input_type,
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[rows, 3] .
+                in (%0)"},
+        );
     }
 
     #[test]
