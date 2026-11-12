@@ -39,7 +39,7 @@ use crate::operations::jit_call::{JitCallFunctionMap, collect_jit_call_functions
 use crate::operations::manipulation::broadcasting::broadcast_changes_explicit_sharding;
 use crate::operations::manipulation::conversions::cast_changes_explicit_placement;
 use crate::operations::manipulation::memory::memory_placement_kind;
-use crate::sharding::{SHARDY_MESH_SYMBOL_NAME, shardy_tensor_sharding_attribute};
+use crate::sharding::{SHARDY_MESH_SYMBOL_NAME, ShardyTensorSharding};
 use crate::{Error, RaggedDotLoweringStrategy, ToMlir};
 
 #[cfg(test)]
@@ -1591,7 +1591,7 @@ where
         .map(|sharding| sharding.as_ref().map(|sharding| sharding.to_mlir(location)).transpose())
         .collect::<Result<Vec<_>, _>>()?;
     // Results whose placement over auto mesh axes the compiler chooses are open over those axes, like JAX lowers the
-    // shardings of output types without `out_shardings` (refer to `shardy_tensor_sharding_attribute`).
+    // shardings of output types without `out_shardings` (refer to `ShardyTensorSharding`).
     let physical_open_results =
         if open_results.is_empty() { Vec::new() } else { signature.project_outputs(open_results) };
     let mut result_sharding_attributes = signature
@@ -1600,7 +1600,7 @@ where
         .enumerate()
         .map(|(index, sharding)| {
             let open = physical_open_results.get(index).copied().unwrap_or(false);
-            sharding.as_ref().map(|sharding| shardy_tensor_sharding_attribute(sharding, location, open)).transpose()
+            sharding.as_ref().map(|sharding| ShardyTensorSharding::new(sharding, open).to_mlir(location)).transpose()
         })
         .collect::<Result<Vec<_>, _>>()?;
     // The effect token of a signature side is annotated when any value of that side is, as each device threads its

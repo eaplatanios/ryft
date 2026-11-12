@@ -65,6 +65,7 @@ use crate::operations::complex::{Complex, Conjugate, Imaginary, Real};
 use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
+use crate::operations::dimensions::dimension_pow::DimensionPow;
 use crate::operations::exponential::Log;
 use crate::operations::rounding::Floor;
 use crate::operations::{Accuracy, Capability};
@@ -545,6 +546,7 @@ define_elementwise_capability!(
     /// Adds `right` to this value.
     add(right),
     AddOperation,
+    dimension = Add::add,
 );
 
 impl_array_elementwise_operation!(
@@ -642,6 +644,7 @@ define_elementwise_capability!(
     /// Subtracts `right` from this value.
     sub(right),
     SubOperation,
+    dimension = Sub::sub,
 );
 
 impl_array_elementwise_operation!(
@@ -822,6 +825,7 @@ define_elementwise_capability!(
     /// Subtracts `right` from this value, saturating at its numeric bounds.
     saturating_sub(right),
     SaturatingSubOperation,
+    dimension = SaturatingSub::saturating_sub,
 );
 
 impl_array_elementwise_operation!(
@@ -1365,6 +1369,7 @@ define_elementwise_capability!(
     /// Divides this value by `right`.
     div(right),
     DivOperation,
+    dimension = Div::div,
 );
 
 impl Div for Array {
@@ -1495,6 +1500,7 @@ define_elementwise_capability!(
     /// the sign of the dividend.
     rem(right),
     RemOperation,
+    dimension = Rem::rem,
 );
 
 impl_array_elementwise_operation!(
@@ -1621,6 +1627,7 @@ define_elementwise_capability!(
     /// complex element type.
     pow(exponent),
     PowOperation,
+    dimension = DimensionPow::dimension_pow,
 );
 
 impl_array_elementwise_operation!(

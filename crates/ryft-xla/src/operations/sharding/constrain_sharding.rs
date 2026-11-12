@@ -5,13 +5,13 @@ use ryft_core::{
 use ryft_mlir::dialects::shardy;
 use ryft_mlir::{Block, BlockRef, LocationRef, Operation as MlirOperation, Value as MlirValue, ValueRef};
 
-use crate::sharding::shardy_tensor_sharding_attribute;
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::sharding::ShardyTensorSharding;
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir};
 
 /// Lowers the tracked placement `sharding` of a value's type as a tensor placement constraint after excluding mesh axes
 /// bound by enclosing manual regions. A type does not fully describe the placement along
 /// [`Auto`](ryft_core::MeshAxisType::Auto) axes, so the constraint leaves the compiler free to place the value along
-/// them further (refer to [`shardy_tensor_sharding_attribute`]).
+/// them further (refer to [`ShardyTensorSharding`]).
 pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     sharding: &Sharding,
@@ -23,7 +23,7 @@ pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Lowers a tensor placement constraint after excluding mesh axes bound by enclosing manual regions, whose dimensions
-/// are open over auto axes when `open_over_auto_axes` is set (refer to [`shardy_tensor_sharding_attribute`]).
+/// are open over auto axes when `open_over_auto_axes` is set (refer to [`ShardyTensorSharding`]).
 fn lower_constraint<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     sharding: &Sharding,
@@ -77,7 +77,7 @@ fn lower_constraint<'b, 'c: 'b, 't: 'c>(
         local_sharding = projected().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         &local_sharding
     };
-    let sharding_attribute = shardy_tensor_sharding_attribute(sharding, location, open_over_auto_axes)?;
+    let sharding_attribute = ShardyTensorSharding::new(sharding, open_over_auto_axes).to_mlir(location)?;
     let operation =
         block.append_operation(shardy::sharding_constraint(input_values[0], sharding_attribute, location)?)?;
     Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])

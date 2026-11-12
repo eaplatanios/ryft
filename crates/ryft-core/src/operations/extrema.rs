@@ -62,6 +62,8 @@ use crate::operations::complex::{Imaginary, Real};
 use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
+use crate::operations::dimensions::dimension_max::DimensionMax;
+use crate::operations::dimensions::dimension_min::DimensionMin;
 use crate::operations::logical::And;
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::{Capability, ElementwiseOperation};
@@ -121,6 +123,7 @@ define_elementwise_capability!(
     /// error if the input types or metadata are unsupported.
     min(right),
     MinOperation,
+    dimension = DimensionMin::dimension_min,
 );
 
 impl_array_elementwise_operation!(
@@ -241,6 +244,7 @@ define_elementwise_capability!(
     /// error if the input types or metadata are unsupported.
     max(right),
     MaxOperation,
+    dimension = DimensionMax::dimension_max,
 );
 
 impl_array_elementwise_operation!(
