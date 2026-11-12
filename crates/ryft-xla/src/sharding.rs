@@ -1,28 +1,9 @@
-use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxisType, Sharding, ShardingDimension, UnreducedKind};
+use ryft_core::{DeviceMesh, LogicalMesh, MeshAxisType, Sharding, ShardingDimension, UnreducedKind};
 use ryft_mlir::Location;
 use ryft_mlir::dialects::shardy;
-use ryft_pjrt::Device as PjrtDevice;
 use ryft_pjrt::protos::{OpSharding, OpShardingType};
 
-use crate::{FromPjrt, ToMlir};
-
-impl FromPjrt<PjrtDevice<'_>> for Device {
-    type Output = Result<Self, ryft_pjrt::Error>;
-
-    #[inline]
-    fn from_pjrt(value: PjrtDevice<'_>) -> Self::Output {
-        Self::from_pjrt(&value)
-    }
-}
-
-impl FromPjrt<&PjrtDevice<'_>> for Device {
-    type Output = Result<Self, ryft_pjrt::Error>;
-
-    #[inline]
-    fn from_pjrt(value: &PjrtDevice<'_>) -> Self::Output {
-        Ok(Self::new(value.id()?, value.process_index()?))
-    }
-}
+use crate::ToMlir;
 
 /// Canonical symbol name used for emitted Shardy [`LogicalMesh`] declarations and references.
 pub const SHARDY_MESH_SYMBOL_NAME: &str = "mesh";
@@ -356,7 +337,7 @@ mod tests {
     use ryft_core::MeshAxis;
     use ryft_mlir::{Block, Context as MlirContext};
 
-    use crate::tests::{device_mesh_2x2, execution_client, logical_mesh_2x2, logical_mesh_3x2x1};
+    use crate::tests::{device_mesh_2x2, logical_mesh_2x2, logical_mesh_3x2x1};
 
     use super::*;
 
@@ -370,15 +351,6 @@ mod tests {
             replicate_on_last_tile_dim,
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn test_device_from_pjrt() {
-        let client = execution_client();
-        let devices = client.addressable_devices().unwrap();
-        let expected = Device::new(devices[0].id().unwrap(), devices[0].process_index().unwrap());
-        assert_eq!(Device::from_pjrt(&devices[0]), Ok(expected));
-        assert_eq!(Device::from_pjrt(devices[0].clone()), Ok(expected));
     }
 
     #[test]

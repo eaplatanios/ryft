@@ -1,6 +1,7 @@
 pub mod arrays;
 pub mod arrays_v0;
 pub mod compilation;
+pub mod devices;
 pub mod distributed;
 pub mod domains;
 pub mod eager;
