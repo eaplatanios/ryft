@@ -1230,8 +1230,9 @@ macro_rules! define_elementwise_operation {
 /// The generated trait is parameterized by its universe (i.e., `$capability<T = <Self as Capability>::Universe>`; refer
 /// to the documentation of [`Capability`](crate::Capability) for more information on that), its generic implementation
 /// covers every [`ValueDomainDispatch`](crate::ValueDomainDispatch) value whose domain can bind the operation for that
-/// value's own universe, and array IR values implement it through their array members (refer to the
-/// `#[capability]` attribute documented on [`Capability`](crate::Capability)). [`Parameterwise`](crate::Parameterwise)
+/// value's own universe, and array IR values implement it through their array members (refer to the `#[capability]`
+/// attribute documented on [`Capability`](crate::Capability)), or by member kind for binary capabilities that name a
+/// dimension capability function (refer to the `dimension` parameter below). [`Parameterwise`](crate::Parameterwise)
 /// structures implement it parameter-by-parameter (i.e., by zipping the parameters of both inputs for binary
 /// capabilities).
 ///
@@ -1288,8 +1289,11 @@ macro_rules! define_elementwise_operation {
 ///   - `dimension = $dimension_capability::$dimension_method`: Optional dimension capability function
 ///     of a `@binary` capability that also has a first-class dimension operation (e.g., `dimension = Mul::mul`
 ///     or `dimension = DimensionMin::dimension_min`). Array IR values then implement the capability by member kind
-///     instead of through their array members alone: two first-class dimensions use this function of their dimension
-///     members, and every other pair of inputs uses the capability of its array members.
+///     instead of through their array members alone. Two first-class dimensions use this function of their dimension
+///     members, and every other pair of inputs uses the capability of its array members. An array IR value therefore
+///     implements the capability only when it projects onto both [`ArrayType`](crate::ArrayType) and
+///     [`DimensionType`](crate::DimensionType) (refer to [`ValueProjection`](crate::ValueProjection)), its
+///     array member implements the capability, and its dimension member implements `$dimension_capability`.
 #[macro_export]
 macro_rules! define_elementwise_capability {
     // This branch defines a unary capability whose operation carries a result accuracy. The accuracy-free function
@@ -1475,9 +1479,10 @@ macro_rules! define_elementwise_capability {
         #[doc = "The universe parameter `T` defaults to the [`Capability`](crate::Capability) universe"]
         #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
         #[doc = "[`ArrayType`](crate::ArrayType) and array IR values implement it for"]
-        #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their members (i.e., two first-class"]
-        #[doc = "dimensions use their dimension members and every other pair of inputs uses its array"]
-        #[doc = "members)."]
+        #[doc = "[`ArrayIrType`](crate::ArrayIrType) by member kind. Two first-class dimensions use the"]
+        #[doc = "corresponding dimension capability of their dimension members, in the"]
+        #[doc = "[`DimensionType`](crate::DimensionType) universe, and every other pair of inputs uses"]
+        #[doc = "this capability of its array members."]
         #[::ryft_macros::capability]
         pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
             $crate::operations::Capability + Sized

@@ -32,8 +32,13 @@ different role; inspect their existing contract instead of mechanically giving t
 - Except for the explicit `T, V` APIs above, capability traits carry the `#[capability]` attribute that checks those
   conventions. Every capability declares exactly one array IR strategy: a projection through
   `#[capability(projection(ArrayIrType => ArrayType))]` (S1), lifting the operation into the array IR family plus an
-  eager `ArrayIrValue` delegation (S2), an existing family-native path (S3), or member-kind dispatch through an
-  operation provider (S4).
+  eager `ArrayIrValue` delegation (S2), an existing family-native path (S3), member-kind dispatch through an
+  operation provider (S4), or member-kind dispatch through member projections (S5). S5 is what the `dimension = ...`
+  form of `define_elementwise_capability!` generates for binary capabilities that also have a dimension operation
+  (e.g., `Add` and `Max`): two first-class dimensions use the named dimension capability of their dimension members and
+  every other pair of inputs uses the capability of its array members. An array IR value then needs
+  `ValueProjection<ArrayType>` and `ValueProjection<DimensionType>`, with the capability on the array member and the
+  dimension capability on the dimension member, so backend array IR values must provide both projections.
 - Give capability functions default bodies only when the default is correct for every implementor (e.g., by composing
   required functions), and make implementor-dependent functions required instead.
 - Only elementwise capabilities lift to `Parameterized` structures, through the `Parameterwise<P, S>` implementations

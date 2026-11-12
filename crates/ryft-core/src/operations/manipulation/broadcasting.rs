@@ -1531,16 +1531,17 @@ impl_differentiable_operation! {
 /// ```
 #[capability]
 pub trait DynamicBroadcast<Extent = Self, T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Replicates or reorders `self` into the shape supplied by dimension values. Each mapped input extent must equal
+    /// Replicates or reorders `self` into the shape supplied by `output_dimensions`. Each mapped input extent must equal
     /// its output extent or be statically one; new axes may have static or dynamic extents. Sharding follows the axis
     /// mapping and new axes are replicated. Invalid value kinds, axis mappings, or incompatible extents yield a
     /// [`TypeError`]. Use [`DynamicBroadcast::dynamic_broadcast_to`] for the usual trailing-axis alignment.
     ///
     /// # Parameters
     ///
-    ///   - `output_dimensions`: One dimension value per output axis, in output-axis order. Exact dimension types yield
-    ///     static extents; other dimension types retain their dynamic identity and bounds in the result. These values
-    ///     are inputs of the staged operation, so runtime sizes remain available during execution.
+    ///   - `output_dimensions`: One extent per output axis, in output-axis order (i.e., first-class dimension values
+    ///     for array IR values and host extents for homogeneous tracers). Exact dimension types and host extents yield
+    ///     static extents, while other dimension types retain their dynamic identity and bounds in the result.
+    ///     Dimension values are inputs of the staged operation, so runtime sizes remain available during execution.
     ///   - `output_axes`: Output axis receiving each input axis, in input-axis order. Its length must equal the input
     ///     rank and its entries must be distinct and less than `output_dimensions.len()`. For a vector, `[1]` maps its
     ///     sole axis to the columns of a matrix; the unmapped row axis repeats that vector.
@@ -1557,9 +1558,10 @@ pub trait DynamicBroadcast<Extent = Self, T = <Self as Capability>::Universe>: C
     ///
     /// # Parameters
     ///
-    ///   - `output_dimensions`: One dimension value per output axis, in output-axis order. These determine the complete
-    ///     output shape, including axes corresponding to unchanged input extents. A scalar broadcast into a matrix
-    ///     therefore still supplies both row and column dimensions.
+    ///   - `output_dimensions`: One extent per output axis, in output-axis order (i.e., first-class dimension values
+    ///     for array IR values and host extents for homogeneous tracers). These determine the complete output shape,
+    ///     including axes corresponding to unchanged input extents. A scalar broadcast into a matrix therefore still
+    ///     supplies both row and column dimensions.
     ///   - `output_axes`: Distinct output axis indices, one per input axis. An empty mapping broadcasts a scalar; `[1]`
     ///     broadcasts a vector along a matrix's rows. Mapped extents must match or expand an input extent of one.
     ///   - `output_sharding`: Requested distribution of the output axes. `Some(sharding)` supplies the complete result
@@ -1579,8 +1581,9 @@ pub trait DynamicBroadcast<Extent = Self, T = <Self as Capability>::Universe>: C
     ///
     /// # Parameters
     ///
-    ///   - `output_dimensions`: Dimension values describing the complete desired shape, including unchanged trailing
-    ///     axes. Use [`DynamicBroadcast::dynamic_broadcast_to_sizes`] when every desired size is a host integer.
+    ///   - `output_dimensions`: Extents describing the complete desired shape, including unchanged trailing axes. Use
+    ///     [`DynamicBroadcast::dynamic_broadcast_to_sizes`] when the extents are dimension values and every desired
+    ///     size is a host integer.
     #[inline]
     fn dynamic_broadcast_to(&self, output_dimensions: &[Extent]) -> Result<Self, ProgramError>
     where
@@ -1589,13 +1592,13 @@ pub trait DynamicBroadcast<Extent = Self, T = <Self as Capability>::Universe>: C
         self.dynamic_broadcast_to_with_output_sharding(output_dimensions, None)
     }
 
-    /// Broadcasts to explicit dimension values using trailing-axis alignment and optional output sharding. Dimensions
+    /// Broadcasts to explicit extents using trailing-axis alignment and optional output sharding. Dimensions
     /// and validation follow [`Self::dynamic_broadcast_to`]; distribution follows
     /// [`Self::dynamic_broadcast_with_output_sharding`], including when the result shape is unchanged.
     ///
     /// # Parameters
     ///
-    ///   - `output_dimensions`: One dimension value per output axis, including unchanged input axes.
+    ///   - `output_dimensions`: One extent per output axis, including unchanged input axes.
     ///   - `output_sharding`: Complete requested result distribution, or `None` to infer it from the input mapping.
     fn dynamic_broadcast_to_with_output_sharding(
         &self,

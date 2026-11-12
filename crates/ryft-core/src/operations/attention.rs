@@ -49,11 +49,11 @@
 //!     Definitions with dropout are batched structurally instead, so that every batch item keeps the dropout mask
 //!     of its unbatched call, and definitions with dropout and the fused implementation reject batching.
 //!   - **Differentiation:** The forward and backward definitions have no derivative rules, so differentiating
-//!     a call of the inference function fails. The training function stages a third named composite, named
-//!     [`DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME`], whose reverse mode rule calls the forward definition with
-//!     its residual and then the backward definition. Reverse mode over dynamic shapes with integer inputs (e.g.,
-//!     sequence lengths) needs an array IR family, because homogeneous array programs cannot materialize the
-//!     structurally zero tangents of such inputs for a dynamic shape.
+//!     a call of the inference function fails. The differentiable function stages a third named composite, named
+//!     [`DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME`], whose reverse mode rule calls the forward definition
+//!     with its residual and then the backward definition. Reverse mode over dynamic shapes with integer inputs
+//!     (e.g., sequence lengths) needs an array IR family, because homogeneous array programs cannot materialize
+//!     the structurally zero tangents of such inputs for a dynamic shape.
 //!
 //! ## Batching
 //!
@@ -286,7 +286,7 @@ pub const DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME: &str = "ryft.dot_produc
 
 /// Name of the named composite that stages a differentiable attention operation. Its key has the attributes of the
 /// forward definition's key except for `residual`. Refer to the documentation of [`AttentionKey`] for more information.
-pub const DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME: &str = "ryft.dot_product_attention_training";
+pub const DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME: &str = "ryft.dot_product_attention_differentiable";
 
 // TODO(eaplatanios): Review from here onwards.
 
@@ -875,8 +875,8 @@ pub struct AttentionResiduals<P: Parameter> {
 pub type AttentionVjp<V, O> =
     SymbolicZeroVjp<V, O, AttentionInputs<RuleTracer<V, O>>, RuleTracer<V, O>, AttentionResiduals<RuleTracer<V, O>>>;
 
-/// Differentiable scaled dot-product attention training function, built by [`differentiable_dot_product_attention`].
-/// Each call stages one call of a named composite (refer to [`DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME`]) with
+/// Differentiable scaled dot-product attention function, built by [`differentiable_dot_product_attention`]. Each
+/// call stages one call of a named composite (refer to [`DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME`]) with
 /// reverse mode rules, whose primal calls the forward attention definition and whose rules call the forward
 /// definition with its residual and the backward definition (refer to [`AttentionKey`]). The manual variation
 /// transitions of the inputs precede the composite boundary, which lets their transposes accumulate the cotangent
@@ -893,7 +893,7 @@ where
     definitions: Arc<AttentionDefinitions<C::Constant, C::Operation>>,
 
     /// Named composites that stage the calls of this function, by input structure.
-    functions: Mutex<HashMap<AttentionInputs<Placeholder>, Arc<TrainingFunction<C::Constant, C::Operation>>>>,
+    functions: Mutex<HashMap<AttentionInputs<Placeholder>, Arc<DifferentiableFunction<C::Constant, C::Operation>>>>,
 }
 
 impl<C: Domain> DifferentiableDotProductAttention<C>
@@ -1029,10 +1029,10 @@ where
                 Arc::new(
                     composite(primal)
                         .with_symbolic_zero_vjp(forward, backward)
-                        .with_name(DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME)
+                        .with_name(DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME)
                         .with_named_composite(
                             attention_composite_key(
-                                DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME,
+                                DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME,
                                 configuration,
                                 input_structure,
                                 None,
@@ -1046,8 +1046,8 @@ where
     }
 }
 
-/// Creates the differentiable scaled dot-product attention training function with the provided configuration for the
-/// values of the domain `C`, for one canonical [`AttentionInputs`] tree.
+/// Creates the differentiable scaled dot-product attention function with the provided configuration for the values
+/// of the domain `C`, for one canonical [`AttentionInputs`] tree.
 ///
 /// The primal path returns only the attended output. Reverse mode differentiation runs the forward definition with its
 /// log-sum-exp residual and then applies the backward definition, whose portable body recomputes the normalization
@@ -1341,7 +1341,7 @@ type BackwardFunction<V, O> = AttentionFunction<
 >;
 
 /// Named composite that stages differentiable attention for one input structure.
-type TrainingFunction<V, O> =
+type DifferentiableFunction<V, O> =
     Composite<V, O, AttentionInputs<RuleTracer<V, O>>, RuleTracer<V, O>, DefaultJvp, AttentionVjp<V, O>>;
 
 /// Shared normalized inputs and masked logits consumed by the forward and backward attention bodies.
@@ -4454,8 +4454,8 @@ mod tests {
 
     #[test]
     fn test_differentiable_dot_product_attention_implementation_selection() {
-        // The training function selects the portable implementation for automatic requests and keeps explicit ones,
-        // which the keys of its staged training composite and of the forward definition record.
+        // The differentiable function selects the portable implementation for automatic requests and keeps explicit
+        // ones, which the keys of its staged composite and of the forward definition record.
         let r#type = ArrayType::new_static(DataType::F32, [1, 1, 1, 1]);
         for (requested, selected, code) in [
             (AttentionImplementation::Automatic, AttentionImplementation::Portable, 1),
@@ -4475,7 +4475,7 @@ mod tests {
                 formatdoc! {"
                     lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1] .
                     let %3:f32[1, 1, 1, 1] = composite [
-                        key=\"ryft.dot_product_attention_training.v1 {{scale = none, causal = false, \
+                        key=\"ryft.dot_product_attention_differentiable.v1 {{scale = none, causal = false, \
                             local_window = none, implementation = {code}, dropout_rate = none, bias = false, \
                             mask = false, query_sequence_lengths = false, key_value_sequence_lengths = false, \
                             dropout_state = false}}\",
@@ -4559,7 +4559,7 @@ mod tests {
                 let %3:f32[1, 1, 1, 1]{varying_rank_4} = parallel_vary [axis_name=\"x\"] %0
                     %4:f32[1, 1, 1, 1]{varying_rank_4} = parallel_vary [axis_name=\"x\"] %2
                     %5:f32[1, 1, 1, 1]{varying_rank_4} = composite [
-                        key=\"ryft.dot_product_attention_training.v1 {{scale = none, causal = false, \
+                        key=\"ryft.dot_product_attention_differentiable.v1 {{scale = none, causal = false, \
                             local_window = none, implementation = 1, dropout_rate = none, bias = false, mask = false, \
                             query_sequence_lengths = false, key_value_sequence_lengths = false, \
                             dropout_state = false}}\",
