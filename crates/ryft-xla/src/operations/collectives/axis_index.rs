@@ -19,7 +19,10 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 /// [`lower_collective_to_all_reduce`](crate::operations::collectives::parallel_reduce::lower_collective_to_all_reduce)
 /// uses for replica groups) and `size` is the named axis's size. `partition_id` yields the executing device's linear
 /// id; it is converted to `u64` and the coordinate arithmetic is emitted as scalar StableHLO divide/remainder. A
-/// single-device axis collapses to the constant `0`.
+/// single-device axis collapses to the constant `0`. A declared mesh must have the topology of the binding region's
+/// mesh and make the same axes manual (i.e., satisfy
+/// [`LogicalMesh::has_same_manual_axes`](ryft_core::LogicalMesh::has_same_manual_axes)), so that `auto_axes` and
+/// `explicit_axes` may retype the region's free axes, and the coordinate arithmetic uses the region's mesh.
 pub(crate) fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
     operation: &AxisIndexOperation,
     collective_state: &CollectiveLoweringState,
@@ -49,7 +52,7 @@ pub(crate) fn lower_axis_index_to_coordinate<'b, 'c: 'b, 't: 'c>(
         }
         .into());
     }
-    if operation.mesh().is_some_and(|declared| declared != mesh) {
+    if operation.mesh().is_some_and(|declared| !declared.has_same_manual_axes(mesh)) {
         return Err(ProgramError::MalformedProgram(
             "`axis_index` mesh does not match its active manual binding".to_string(),
         )

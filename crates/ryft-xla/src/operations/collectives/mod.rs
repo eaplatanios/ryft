@@ -191,15 +191,19 @@ pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayOperation, DataType, DimensionBounds, DimensionType, LogicalMesh, MeshAxis,
-        MeshAxisType, Operation as CoreOperation, ParallelAllToAllOperation, ParallelCastOperation, ParallelCastTarget,
-        ParallelPermuteOperation, ParallelVaryOperation, Shape, ShardMapBoundary, Sharding,
+        Add, Array as CoreArray, ArrayOperation, AxisIndex, ConvertElementType, DataType, DimensionBounds,
+        DimensionType, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, ParallelAllGather,
+        ParallelAllToAllOperation, ParallelCastOperation, ParallelCastTarget, ParallelPermuteOperation, ParallelReduce,
+        ParallelVaryOperation, ReductionKind, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension,
+        Value as CoreValue, auto_axes,
     };
     use ryft_mlir::{Block, Location, Value as MlirValue};
 
-    use crate::experimental::lowering::tests::{test_manual_mesh, test_vector_type};
+    use crate::experimental::ArrayTracer;
+    use crate::experimental::lowering::tests::{shard_map_module, test_manual_mesh, test_vector_type};
     use crate::experimental::lowering::types::lower_array_ir_type;
     use crate::experimental::ops::Operation;
     use crate::{LowerableOperation, Lowerer, MemberLowerableOperation};
@@ -477,5 +481,184 @@ mod tests {
                     if *message == "collective over axis `x` records size 2, but the enclosing mesh axis has size 3",
             ),
         ));
+
+        // A payload mesh that retypes only a free axis of the binder mesh (e.g., inside `auto_axes`) is accepted and
+        // returned, while a payload mesh that retypes a manual axis or has another topology is still rejected.
+        let binder_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let binder = ShardMapBoundary::new(binder_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let state = CollectiveLoweringState::new().enter_manual_region(binder);
+        let free_axis_retyped_mesh = binder_mesh.with_axis_types(["y"], MeshAxisType::Auto).unwrap();
+        let manual_axis_retyped_mesh = binder_mesh.with_axis_types(["x"], MeshAxisType::Explicit).unwrap();
+        let other_topology_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 4, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(state.checked_collective_mesh("parallel_permute", "x", 2, None).unwrap(), &binder_mesh);
+        assert_eq!(
+            state.checked_collective_mesh("parallel_permute", "x", 2, Some(&free_axis_retyped_mesh)).unwrap(),
+            &free_axis_retyped_mesh,
+        );
+        for payload_mesh in [&manual_axis_retyped_mesh, &other_topology_mesh] {
+            assert!(matches!(
+                state.checked_collective_mesh("parallel_permute", "x", 2, Some(payload_mesh)),
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                        if *message == "`parallel_permute` operation mesh does not match the enclosing manual axis `x` mesh",
+                ),
+            ));
+        }
+    }
+
+    #[test]
+    fn test_collective_lowering_accepts_free_axes_retyped_by_auto_axes() {
+        // Inside a `shard_map` over `x`, `auto_axes` retypes only the free axis `y`, so the collectives over `x` that
+        // it stages record the retyped mesh while their binder records the mesh with `y` explicit. Both meshes make
+        // the same axes manual, so the collectives lower with the replica groups and coordinates of the binder.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4, 2]);
+        let input_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
+                .unwrap();
+        let local_sharding =
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
+                .unwrap();
+
+        // `parallel_reduce` over `x`.
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
+            |_, input| {
+                Ok(auto_axes(
+                    |input: ArrayTracer| input.parallel_reduce(ReductionKind::Sum, "x"),
+                    input,
+                    Some(&["y"]),
+                    local_sharding.clone(),
+                )?)
+            },
+            input_type.clone(),
+            mesh.clone(),
+            input_sharding.clone(),
+            local_sharding.clone(),
+            ShardMapOptions::new(),
+        );
+        assert_eq!(
+            module.unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2, "y"=2]>
+                  func.func @main(%arg0: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {"y"}]>}) -> (tensor<2x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {"y"}], replicated={"x"}>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {"y", ?}]>] out_shardings=[<@mesh, [{}, {"y", ?}], replicated={"x"}>] manual_axes={"x"} (%arg1: tensor<2x2xf32>) {
+                      %1 = sdy.sharding_constraint %arg1 <@mesh, [{?}, {?}]> : tensor<2x2xf32>
+                      %2 = "stablehlo.all_reduce"(%1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 2], [1, 3]]> : tensor<2x2xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                        %4 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                        stablehlo.return %4 : tensor<f32>
+                      }) : (tensor<2x2xf32>) -> tensor<2x2xf32>
+                      %3 = sdy.sharding_constraint %2 <@mesh, [{}, {"y"}]> : tensor<2x2xf32>
+                      sdy.return %3 : tensor<2x2xf32>
+                    } : (tensor<4x2xf32>) -> tensor<2x2xf32>
+                    return %0 : tensor<2x2xf32>
+                  }
+                }
+            "#},
+        );
+
+        // `axis_index` along `x`.
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
+            |_, input| {
+                Ok(auto_axes(
+                    |input: ArrayTracer| {
+                        let coordinate = input.domain().axis_index("x")?.convert_element_type(DataType::F32)?;
+                        input.add(&coordinate)
+                    },
+                    input,
+                    Some(&["y"]),
+                    local_sharding.clone(),
+                )?)
+            },
+            input_type.clone(),
+            mesh.clone(),
+            input_sharding.clone(),
+            input_sharding.clone(),
+            ShardMapOptions::new(),
+        );
+        assert_eq!(
+            module.unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2, "y"=2]>
+                  func.func @main(%arg0: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {"y"}]>}) -> (tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {"y"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {"y", ?}]>] out_shardings=[<@mesh, [{"x"}, {"y", ?}]>] manual_axes={"x"} (%arg1: tensor<2x2xf32>) {
+                      %1 = sdy.sharding_constraint %arg1 <@mesh, [{?}, {?}]> : tensor<2x2xf32>
+                      %2 = stablehlo.partition_id : tensor<ui32>
+                      %3 = stablehlo.convert %2 : (tensor<ui32>) -> tensor<ui64>
+                      %c = stablehlo.constant dense<2> : tensor<ui64>
+                      %4 = stablehlo.divide %3, %c : tensor<ui64>
+                      %c_0 = stablehlo.constant dense<2> : tensor<ui64>
+                      %5 = stablehlo.remainder %4, %c_0 : tensor<ui64>
+                      %6 = stablehlo.convert %5 : (tensor<ui64>) -> tensor<f32>
+                      %7 = stablehlo.broadcast_in_dim %6, dims = [] : (tensor<f32>) -> tensor<2x2xf32>
+                      %8 = stablehlo.add %1, %7 : tensor<2x2xf32>
+                      %9 = sdy.sharding_constraint %8 <@mesh, [{}, {"y"}]> : tensor<2x2xf32>
+                      sdy.return %9 : tensor<2x2xf32>
+                    } : (tensor<4x2xf32>) -> tensor<4x2xf32>
+                    return %0 : tensor<4x2xf32>
+                  }
+                }
+            "#},
+        );
+
+        // `parallel_all_gather` over `x`.
+        let gathered_local_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
+        )
+        .unwrap();
+        let gathered_sharding = Sharding::new(
+            mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
+        )
+        .unwrap();
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
+            |_, input| {
+                Ok(auto_axes(
+                    |input: ArrayTracer| input.parallel_all_gather("x", 0),
+                    input,
+                    Some(&["y"]),
+                    gathered_local_sharding,
+                )?)
+            },
+            input_type,
+            mesh,
+            input_sharding,
+            gathered_sharding,
+            ShardMapOptions::new(),
+        );
+        assert_eq!(
+            module.unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2, "y"=2]>
+                  func.func @main(%arg0: tensor<4x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {"y"}]>}) -> (tensor<4x2x2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}, {}, {"y"}]>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{"x"}, {"y", ?}]>] out_shardings=[<@mesh, [{"x"}, {}, {"y", ?}]>] manual_axes={"x"} (%arg1: tensor<2x2xf32>) {
+                      %1 = sdy.sharding_constraint %arg1 <@mesh, [{?}, {?}]> : tensor<2x2xf32>
+                      %2 = stablehlo.broadcast_in_dim %1, dims = [1, 2] : (tensor<2x2xf32>) -> tensor<1x2x2xf32>
+                      %3 = "stablehlo.all_gather"(%2) <{all_gather_dim = 0 : i64, channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 2], [1, 3]]> : tensor<2x2xi64>, use_global_device_ids}> : (tensor<1x2x2xf32>) -> tensor<2x2x2xf32>
+                      %4 = sdy.sharding_constraint %3 <@mesh, [{}, {}, {"y"}]> : tensor<2x2x2xf32>
+                      sdy.return %4 : tensor<2x2x2xf32>
+                    } : (tensor<4x2xf32>) -> tensor<4x2x2xf32>
+                    return %0 : tensor<4x2x2xf32>
+                  }
+                }
+            "#},
+        );
     }
 }

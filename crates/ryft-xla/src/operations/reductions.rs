@@ -1233,6 +1233,32 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_plain_program_lowers_boolean_and_complex_reduce_max() {
+        assert_eq!(
+            lowered_reduce_module(DataType::Boolean, ReductionKind::Max, vec![0], vec![0]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<0xi1>) -> tensor<i1> {
+                    %c = stablehlo.constant dense<false> : tensor<i1>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.maximum across dimensions = [0] : (tensor<0xi1>, tensor<i1>) -> tensor<i1>
+                    return %0 : tensor<i1>
+                  }
+                }
+            "#},
+        );
+
+        // StableHLO has no primitive with JAX's complex ordering contract, so the reduction body explicitly compares
+        // real components first and imaginary components only when the real components are equal.
+        let stablehlo = lowered_reduce_module(DataType::C64, ReductionKind::Max, vec![0], vec![0]).unwrap();
+        assert!(stablehlo.contains("tensor<complex<f32>>"), "{stablehlo}");
+        assert!(stablehlo.contains("stablehlo.reduce"), "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.real").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.imag").count(), 2, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.compare").count(), 3, "{stablehlo}");
+        assert_eq!(stablehlo.matches("stablehlo.select").count(), 2, "{stablehlo}");
+    }
+
+    #[test]
     fn test_to_mlir_module_for_plain_program_supports_f8e8m0fnu_extrema_but_rejects_sum() {
         assert!(matches!(
             lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Sum, vec![0], vec![4]).unwrap_err(),

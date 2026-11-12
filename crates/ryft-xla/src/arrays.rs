@@ -1251,6 +1251,8 @@ impl<'o> CoreValue for Array<'o> {
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 // Every eager value capability of `Array` follows the JAX-style op-by-op dispatch shape. The blanket capability
 // implementations in `ryft-core` (arithmetic, logical, comparison, selection, manipulation, reductions, ...) bind
 // each operation through `ryft_core::Value::domain`, which for a concrete `Array` recovers the PJRT-backed `Domain`

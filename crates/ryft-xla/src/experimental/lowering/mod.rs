@@ -957,41 +957,51 @@ impl CollectiveLoweringState {
             .map(Rc::as_ref)
     }
 
-    /// Resolves a collective's actual manual binder and checks any payload mesh against it before communication.
-    /// A payload without a mesh is valid only when the owning operation's inference accepts the actual binder.
-    pub(crate) fn checked_collective_mesh<A: Into<CollectiveAxes>>(
-        &self,
+    /// Resolves a collective's actual manual binder and checks any payload mesh against it before communication, and
+    /// returns the mesh over which the collective's types are expressed. A payload mesh is accepted when it has the
+    /// binder mesh's topology and makes the same axes manual (i.e., when [`LogicalMesh::has_same_manual_axes`] holds),
+    /// because `auto_axes` and `explicit_axes` retype only the free axes of a manual region, and it is then the
+    /// returned mesh. A payload without a mesh yields the binder mesh and is valid only when the owning operation's
+    /// inference accepts that binder. Both meshes share their topology, so either one determines axis sizes and replica
+    /// groups.
+    pub(crate) fn checked_collective_mesh<'s, A: Into<CollectiveAxes>>(
+        &'s self,
         operation_name: &str,
         axis_name: A,
         axis_size: usize,
-        payload_mesh: Option<&LogicalMesh>,
-    ) -> Result<&LogicalMesh, Error> {
+        payload_mesh: Option<&'s LogicalMesh>,
+    ) -> Result<&'s LogicalMesh, Error> {
         // Resolve the binding and recorded size first, preserving the replica-group diagnostics and the nearest
         // enclosing binder when another manual region shadows the axis name. That resolution also requires every named
         // axis to be bound on one mesh.
         let axis_name = axis_name.into();
         collective_replica_groups(self, &axis_name, axis_size, None)?;
         let mesh = self.manual_axis_region(&axis_name.names()[0]).unwrap().mesh();
-        if payload_mesh.is_some_and(|payload_mesh| payload_mesh != mesh) {
-            return Err(ProgramError::MalformedProgram(format!(
+        match payload_mesh {
+            Some(payload_mesh) if payload_mesh.has_same_manual_axes(mesh) => Ok(payload_mesh),
+            Some(_) => Err(ProgramError::MalformedProgram(format!(
                 "`{operation_name}` operation mesh does not match the enclosing manual axis `{axis_name}` mesh",
             ))
-            .into());
+            .into()),
+            None => Ok(mesh),
         }
-        Ok(mesh)
     }
 
     /// Revalidates a collective against the policy of its actual enclosing binder before it emits cross-device
-    /// communication. A checked binder passes its mesh to `infer_output_types`, so a mesh-free payload cannot bypass
-    /// its variation and pending-sum contract. An unchecked binder requires an ordinary mesh-free payload and passes
-    /// `None`, preserving ordinary collective inference and adjoints. In either mode, inference must reproduce the
-    /// recorded `output_types`, and the physical mesh and participant count remain checked.
+    /// communication. A checked binder passes the mesh that [`Self::checked_collective_mesh`] returns to
+    /// `infer_output_types`. That is the payload mesh when the payload records one, because it may retype the free axes
+    /// of the binder mesh (e.g., inside `auto_axes`) and the recorded `output_types` are expressed over it. Otherwise
+    /// it is the binder mesh, so a mesh-free payload cannot bypass the binder's variation and pending sum contract. An
+    /// unchecked binder requires an ordinary mesh-free payload and passes `None`, preserving ordinary collective
+    /// inference and adjoints. In either mode, inference must reproduce the recorded `output_types`, and the physical
+    /// mesh and participant count remain checked.
     ///
     /// # Errors
     ///
-    /// Returns a [`Error`] if no enclosing manual region binds `axis_name`, if the recorded axis size or a
-    /// payload mesh disagrees with that region, if a tracked payload is used in an unchecked binding, if re-inference
-    /// fails, or if it produces different output types.
+    /// Returns a [`Error`] if no enclosing manual region binds `axis_name`, if the recorded axis size disagrees with
+    /// that region, if a payload mesh differs from that region's mesh in its topology or in the axes it makes manual,
+    /// if a tracked payload is used in an unchecked binding, if re-inference fails, or if it produces different output
+    /// types.
     pub(crate) fn check_manual_collective<T: PartialEq, A: Into<CollectiveAxes>>(
         &self,
         operation_name: &str,

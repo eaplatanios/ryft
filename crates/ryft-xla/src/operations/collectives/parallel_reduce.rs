@@ -32,7 +32,10 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 /// volume. A `LogSumExp` has no single combiner and is rejected, because the
 /// [`ParallelReduce`](ryft_core::ParallelReduce) capability composes it from a mesh maximum and a mesh sum instead. A
 /// collective lowered outside any manual region, or naming an axis the innermost region does not bind as a manual mesh
-/// axis, is an error.
+/// axis, is an error. A recorded mesh must have the topology of the binding region's mesh and make the same axes manual
+/// (i.e., satisfy [`LogicalMesh::has_same_manual_axes`](ryft_core::LogicalMesh::has_same_manual_axes)), so that
+/// `auto_axes` and `explicit_axes` may retype the region's free axes, and the replica groups come from the region's
+/// mesh.
 pub(crate) fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
     operation: &ParallelReduceOperation,
     collective_state: &CollectiveLoweringState,
@@ -45,7 +48,7 @@ pub(crate) fn lower_collective_to_all_reduce<'b, 'c: 'b, 't: 'c>(
     if let Some(mesh) = operation.mesh()
         && collective_state
             .manual_axis_region(operation.axis_name())
-            .is_some_and(|region| region.mesh() != mesh)
+            .is_some_and(|region| !mesh.has_same_manual_axes(region.mesh()))
     {
         return Err(ProgramError::MalformedProgram(format!(
             "`{}` mesh does not match its active manual binding",

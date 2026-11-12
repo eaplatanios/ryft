@@ -241,15 +241,12 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
-    use ryft_core::{Clamp, DeviceMesh, Max, Min, Placeholder, ReductionKind, Shape};
+    use ryft_core::{Clamp, DeviceMesh, Max, Min, Placeholder, Shape};
 
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{
-        MixedValue, dynamic_dimension, execute_mixed_program, lowered_reduce_module,
-    };
+    use crate::experimental::lowering::tests::{MixedValue, dynamic_dimension, execute_mixed_program};
     use crate::experimental::ops::{Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
     use crate::{Array, Domain, Session};
@@ -454,32 +451,6 @@ mod tests {
             complex.clamp(&complex_lower, &complex_upper).unwrap().copy_to_host().unwrap(),
             values_to_bytes(&[Complex::new(1f32, 0.0), Complex::new(1.0, 1.0), Complex::new(1.0, 2.0)]),
         );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_boolean_and_complex_extrema() {
-        assert_eq!(
-            lowered_reduce_module(DataType::Boolean, ReductionKind::Max, vec![0], vec![0]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<0xi1>) -> tensor<i1> {
-                    %c = stablehlo.constant dense<false> : tensor<i1>
-                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.maximum across dimensions = [0] : (tensor<0xi1>, tensor<i1>) -> tensor<i1>
-                    return %0 : tensor<i1>
-                  }
-                }
-            "#},
-        );
-
-        // StableHLO has no primitive with JAX's complex ordering contract, so the reduction body explicitly compares
-        // real components first and imaginary components only when the real components are equal.
-        let stablehlo = lowered_reduce_module(DataType::C64, ReductionKind::Max, vec![0], vec![0]).unwrap();
-        assert!(stablehlo.contains("tensor<complex<f32>>"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.reduce"), "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.real").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.imag").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.compare").count(), 3, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.select").count(), 2, "{stablehlo}");
     }
 
     #[test]
