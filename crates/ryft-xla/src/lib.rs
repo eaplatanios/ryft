@@ -54,10 +54,15 @@ pub(crate) mod tests {
     use std::mem::MaybeUninit;
     use std::sync::Once;
 
-    use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType};
+    use ryft_core::{
+        ArrayType, DataType, Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, StaticShape,
+    };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
+
     #[cfg(feature = "cuda-13")]
     use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+
+    use crate::{Array, Domain};
 
     /// Creates an execution client selected by `RYFT_TEST_EXECUTION_PLATFORM`.
     ///
@@ -115,6 +120,21 @@ pub(crate) mod tests {
             vec![Device::new(0, 0), Device::new(1, 0), Device::new(2, 1), Device::new(3, 1)],
         )
         .unwrap()
+    }
+
+    /// Uploads `bytes` as an [`Array`] of element type `data_type` and shape `dimensions` that is replicated over
+    /// `mesh`. Read it back with [`Array::copy_to_host`] and [`values_from_bytes`].
+    pub(crate) fn replicated_array<'c>(
+        domain: &Domain<'c>,
+        mesh: &DeviceMesh,
+        data_type: DataType,
+        dimensions: &[usize],
+        bytes: &[u8],
+    ) -> Array<'c> {
+        let r#type = ArrayType::new(data_type, StaticShape::new(dimensions.to_vec()).into())
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
+            .unwrap();
+        Array::from_host_buffer(domain, r#type, mesh.clone(), bytes).unwrap()
     }
 
     pub(crate) fn values_to_bytes<V: Copy>(values: &[V]) -> Vec<u8> {

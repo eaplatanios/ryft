@@ -24,10 +24,11 @@
 //! constants, coordinates, and broadcasts take the runtime shapes of existing values (refer to [`FillLike`],
 //! [`IotaLike`], and [`BroadcastLike`]), and their reshapes keep the batch and sequence dimensions, so they support
 //! static and dynamic batch and sequence extents for values typed by [`ArrayType`] and for array IR values (i.e.,
-//! values typed by [`ArrayIrType`](crate::ArrayIrType)) alike. Only the batching rule constructs shapes that no existing value has, and it
-//! computes their extents with the extent capabilities of the values (refer to [`AttentionOperations`]), which support
-//! dynamic extents there only for array IR values, whose extents are first-class dimension values. Dropout is the
-//! exception in both universes, because it draws the random bits of its mask for static extents.
+//! values typed by [`ArrayIrType`](crate::ArrayIrType)) alike. Only the batching rule constructs shapes that no
+//! existing value has, and it computes their extents with the extent capabilities of the values (refer to
+//! [`AttentionOperations`]), which support dynamic extents there only for array IR values, whose extents are
+//! first-class dimension values. Dropout is the exception in both universes, because it draws the random bits of its
+//! mask for static extents.
 //!
 //! # Ownership and Lifecycle
 //!
@@ -120,13 +121,13 @@ use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
-/// Value capabilities with which attention computes. The portable bodies are written once over the values of a type
-/// universe and compute on them directly. Their capabilities include the exemplar-relative [`FillLike`],
-/// [`IotaLike`], and [`BroadcastLike`], which read the runtime shape of an existing value, so the constants,
-/// coordinates, and broadcasts of the bodies support static and dynamic shapes. The batching rule of the named
-/// definitions also needs the extent capabilities that the section below describes. This bundle is implemented
-/// automatically for every value that implements all of its members, and so it must never be implemented manually. It
-/// is public because it bounds [`dot_product_attention`] and [`differentiable_dot_product_attention`].
+/// Value capabilities that staging attention requires, collected so that the functions that stage it (e.g.,
+/// [`dot_product_attention`]) state one bound. Those functions create the portable bodies and the batching rule of the
+/// named definitions, so they need every capability that either of them uses, while each helper of the bodies bounds
+/// only what it calls. The members are listed in the order of the corresponding
+/// [`ArrayOperation`](crate::arrays::ArrayOperation) variants, followed by the extent capabilities of the batching
+/// rule (refer to the section below). This bundle is implemented automatically for every value that implements all of
+/// its members, and so it must never be implemented manually.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that tracers of homogeneous array programs implement this bundle for [`ArrayType`] and array IR values implement
@@ -179,67 +180,67 @@ use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 ///   - Array IR values use first-class dimension values, so the batching rule supports static and dynamic extents.
 pub trait AttentionOperations<T = <Self as Capability>::Universe>:
     Capability
-    + Add<T>
-    + And<T>
-    + Broadcast<T>
-    + BroadcastLike<T>
-    + Compare<Self, T>
-    + ConvertElementType<T>
-    + Div<T>
-    + Dot<T>
-    + Dropout<T>
-    + Exp<T>
     + FillLike<T>
     + IotaLike<T>
-    + Log<T>
-    + Mul<T>
-    + Reduce<T>
-    + Reshape<T>
-    + Select<T>
-    + StopGradient<T>
+    + Add<T>
     + Sub<T>
+    + Mul<T>
+    + Div<T>
+    + Exp<T>
+    + Log<T>
+    + And<T>
+    + Reduce<T>
+    + Dot<T>
+    + Compare<Self, T>
+    + Select<T>
     + Transpose<T>
+    + Reshape<T>
+    + Broadcast<T>
+    + BroadcastLike<T>
+    + ConvertElementType<T>
+    + StopGradient<T>
+    + Dropout<T>
     + DimensionSize<T, Extent: Clone + Mul>
-    + DynamicBroadcast<<Self as DimensionSize<T>>::Extent, T>
     + DynamicReshape<<Self as DimensionSize<T>>::Extent, T>
+    + DynamicBroadcast<<Self as DimensionSize<T>>::Extent, T>
 {
 }
 
 impl<
     T,
-    V: Add<T>
+    V: FillLike<T>
+        + IotaLike<T>
+        + Add<T>
+        + Sub<T>
+        + Mul<T>
+        + Div<T>
+        + Exp<T>
+        + Log<T>
         + And<T>
+        + Reduce<T>
+        + Dot<T>
+        + Compare<V, T>
+        + Select<T>
+        + Transpose<T>
+        + Reshape<T>
         + Broadcast<T>
         + BroadcastLike<T>
-        + Compare<V, T>
         + ConvertElementType<T>
-        + Div<T>
-        + Dot<T>
-        + Dropout<T>
-        + Exp<T>
-        + FillLike<T>
-        + IotaLike<T>
-        + Log<T>
-        + Mul<T>
-        + Reduce<T>
-        + Reshape<T>
-        + Select<T>
         + StopGradient<T>
-        + Sub<T>
-        + Transpose<T>
+        + Dropout<T>
         + DimensionSize<T, Extent: Clone + Mul>
-        + DynamicBroadcast<<V as DimensionSize<T>>::Extent, T>
-        + DynamicReshape<<V as DimensionSize<T>>::Extent, T>,
+        + DynamicReshape<<V as DimensionSize<T>>::Extent, T>
+        + DynamicBroadcast<<V as DimensionSize<T>>::Extent, T>,
 > AttentionOperations<T> for V
 {
 }
 
-/// Rule configurations that the named attention definitions of the operation family `(V, O)` require, which collects
-/// the bounds of their batching rules so that generic callers state one bound. It is implemented for every
-/// [`CustomRuleDefinition`] that supports them, which holds for every operation family whose operations support
-/// partial evaluation and differentiation (e.g., the [`ArrayOperation`](crate::arrays::ArrayOperation) family and
-/// backend families). That blanket implementation covers every type that satisfies the collected bounds, so this trait
-/// is never implemented directly.
+/// Rule configurations that staging attention requires of the [`CustomRuleDefinition`] of the operation family
+/// `(V, O)`, collected so that the functions that stage it state one bound. They are the custom batching rules of the
+/// forward and of the backward named definition, which fold batched calls (refer to [`AttentionOperations`]). Every
+/// operation family whose operations support partial evaluation and differentiation satisfies them (e.g., the
+/// [`ArrayOperation`](crate::arrays::ArrayOperation) family and backend families). This bundle is implemented
+/// automatically for every type that satisfies its bounds, and so it must never be implemented manually.
 pub trait AttentionRules<V: Value, O: Operation<Type = V::Type>>:
     CompositeBatching<
         BroadcastInvariantBatching<V, O, AttentionInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>,
@@ -1893,7 +1894,8 @@ where
         if let Some(query_lengths) = &inputs.query_sequence_lengths {
             output = zero_query_rows(output, query_lengths, 1)?;
         }
-        let output = denormalize_attention_output(output, query_rank)?;
+        // Unbatched attention was evaluated with an implicit unit batch axis, which its outputs do not have.
+        let output = if query_rank == 4 { output } else { output.squeeze(0)? };
         // The residual is the logarithm of the sum of the exponentiated logits of every row, which is the row maximum
         // plus the logarithm of the sum of the shifted exponentials. It is a statistic of the forward pass rather
         // than a differentiable output, so it stops gradients.
@@ -1905,7 +1907,8 @@ where
                 residual.convert_element_type(prepared.data_type)?
             };
             let residual = residual.transpose([0, 2, 1])?;
-            Some(denormalize_attention_output(residual, query_rank)?.stop_gradient()?)
+            let residual = if query_rank == 4 { residual } else { residual.squeeze(0)? };
+            Some(residual.stop_gradient()?)
         } else {
             None
         };
@@ -2151,7 +2154,7 @@ where
                 } else {
                     cotangent.convert_element_type(cotangent_data_type)?
                 };
-                denormalize_attention_output(cotangent, rank)
+                if rank == 4 { Ok(cotangent) } else { cotangent.squeeze(0) }
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         if let Some(bias) = &inputs.bias {
@@ -2247,7 +2250,22 @@ where
 }
 
 /// Normalizes attention inputs and constructs the masked score logits shared by the forward and backward bodies.
-fn prepare_attention<V: Value<Type: ArrayMemberType> + AttentionOperations>(
+fn prepare_attention<
+    V: Value<Type: ArrayMemberType>
+        + FillLike
+        + IotaLike
+        + Add
+        + Sub
+        + Mul
+        + And
+        + Dot
+        + Compare
+        + Select
+        + Reshape
+        + Broadcast
+        + BroadcastLike
+        + ConvertElementType,
+>(
     inputs: &AttentionInputs<V>,
     configuration: AttentionConfiguration,
     dimensions: &AttentionDimensions,
@@ -2372,7 +2390,7 @@ fn normalize_attention_input<V: Value<Type: ArrayMemberType> + Reshape>(input: V
 /// Expands grouped key/value heads to the query heads. The `BSKH` input is replicated along a new group axis, which
 /// gives the `BSKGH` form, and its key/value head and group axes are then merged into the query head axis of the
 /// `BSNH` form. Both steps keep the batch and sequence dimensions, so they support dynamic extents along them.
-fn expand_key_value_heads<V: Value<Type: ArrayMemberType> + Broadcast + Reshape>(
+fn expand_key_value_heads<V: Value<Type: ArrayMemberType> + Reshape + Broadcast>(
     key_or_value: V,
     dimensions: &AttentionDimensions,
 ) -> Result<V, ProgramError> {
@@ -2456,7 +2474,7 @@ fn apply_dropout<V: Value + Dropout>(
 }
 
 /// Zeros query rows outside each batch item's logical sequence length.
-fn zero_query_rows<V: Value + BroadcastLike + Compare + FillLike + IotaLike + Select>(
+fn zero_query_rows<V: Value + FillLike + IotaLike + Compare + Select + BroadcastLike>(
     rows_value: V,
     query_lengths: &V,
     row_axis: usize,
@@ -2466,18 +2484,6 @@ fn zero_query_rows<V: Value + BroadcastLike + Compare + FillLike + IotaLike + Se
     let in_range = rows.compare(&lengths, ComparisonDirection::LessThan)?;
     let zero = rows_value.fill_like(0.0)?;
     in_range.select(&rows_value, &zero)
-}
-
-/// Removes the implicit batch axis after evaluating unbatched attention. The removed axis is the unit axis that
-/// [`normalize_attention_input`] inserts, which every output and cotangent inherits from the query or the key.
-fn denormalize_attention_output<V: Value<Type: ArrayMemberType> + Reshape>(
-    output: V,
-    rank: usize,
-) -> Result<V, ProgramError> {
-    if rank == 4 {
-        return Ok(output);
-    }
-    output.squeeze(0)
 }
 
 /// Batches one attention call by folding its mapped axis into attention's batch axis, staging the definition once at
@@ -2492,7 +2498,15 @@ fn denormalize_attention_output<V: Value<Type: ArrayMemberType> + Reshape>(
 /// representation of the values (refer to [`AttentionOperations`]), so this supports static extents and, in array IR
 /// families, first-class dynamic extents (i.e., a dynamic mapped extent, logical batch, or sequence length never
 /// becomes host metadata). Calls whose inputs are all replicated stage the unbatched definition.
-fn batch_attention<V: Value<Type: ArrayMemberType> + AttentionOperations>(
+fn batch_attention<
+    V: Value<Type: ArrayMemberType>
+        + Reduce
+        + Transpose
+        + Reshape
+        + DimensionSize<Extent: Clone + Mul>
+        + DynamicReshape<<V as DimensionSize>::Extent>
+        + DynamicBroadcast<<V as DimensionSize>::Extent>,
+>(
     inputs: Vec<V>,
     axes: Vec<BatchAxis>,
     input_roles: &[AttentionBatchInput],
@@ -2680,7 +2694,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionValue, DimensionVariable,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionVariable,
         LogicalMesh, MeshAxis, MeshAxisType, Sharding,
     };
     use crate::axes::NamedAxis;
@@ -4025,8 +4039,8 @@ mod tests {
         assert!(matches!(
             result,
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "attention over homogeneous arrays requires static extents, but axis 2 of \
-                               `f32[2, 1, length, 1, 1]` has extent `length`; use array IR values for dynamic extents",
+                if message == "`dimension_size` cannot return the dynamic extent `length` of axis 2 of \
+                               `f32[2, 1, length, 1, 1]` as a host extent; use array IR values for dynamic extents",
         ));
     }
 
@@ -4062,7 +4076,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_type, varying(vec![2, 1, 1, 1]));
-        let varying_rank_5 = rendered_sharding(5, true);
         let varying_rank_4 = rendered_sharding(4, true);
         let varying_rank_3 = rendered_sharding(3, true);
         let varying_rank_0 = rendered_sharding(0, true);
@@ -4086,17 +4099,16 @@ mod tests {
                             %1:f32[2, 2, 1, 1]{varying_rank_4}, \
                             %2:f32[2, 2, 1, 1]{varying_rank_4}, \
                             %3:f32[2, 1, 2]{varying_rank_3} .
-                        let %4:f32[2, 1, 1, 1, 2]{varying_rank_5} = broadcast [
-                            output_type=f32[2, 1, 1, 1, 2]{varying_rank_5},
-                            output_axes=[0, 3, 4],
+                        let %4:f32[2, 1, 1, 2]{varying_rank_4} = broadcast [
+                            output_type=f32[2, 1, 1, 2]{varying_rank_4},
+                            output_axes=[0, 2, 3],
                         ] %3
-                            %5:f32[2, 1, 1, 2]{varying_rank_4} = reshape [shape=[2, 1, 1, 2]] %4
-                            %6:f32[2, 1, 1, 1]{varying_rank_4} = composite [
+                            %5:f32[2, 1, 1, 1]{varying_rank_4} = composite [
                                 key=\"ryft.dot_product_attention.v1 {{scale = none, causal = false, \
                                     local_window = none, implementation = 0, dropout_rate = none, residual = false, \
                                     bias = true, mask = false, query_sequence_lengths = false, \
                                     key_value_sequence_lengths = false, dropout_state = false}}\",
-                            ] %0 %1 %2 %5 [
+                            ] %0 %1 %2 %4 [
                                 primal={{
                                     lambda \
                                         %0:f32[2, 1, 1, 1]{varying_rank_4}, \
@@ -4135,7 +4147,7 @@ mod tests {
                                     in (%17)
                                 }},
                             ]
-                        in (%6)
+                        in (%5)
                     }},
                 ]
                 in (%4)
@@ -4146,7 +4158,8 @@ mod tests {
 
     #[test]
     fn test_dot_product_attention_batching_dynamic_extent() {
-        // Array IR families fold dynamic mapped extents with first-class dimension values.
+        // Array IR families fold dynamic mapped extents with first-class dimension values, which the rule reads from
+        // the mapped axis of a mapped input.
         let function = dot_product_attention::<ArrayIrContext>(AttentionConfiguration::new());
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
@@ -4206,28 +4219,29 @@ mod tests {
                                 %1:f32[batch, 1, 1, 1, 1], \
                                 %2:f32[batch, 1, 1, 1, 1], \
                                 %3:f32[batch, 1, 1, 1, 1] .
-                            let %4:dimension<1> = constant [value=1]
+                            let %4:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %1
                                 %5:dimension<1> = constant [value=1]
                                 %6:dimension<1> = constant [value=1]
                                 %7:dimension<1> = constant [value=1]
                                 %8:dimension<1> = constant [value=1]
-                                %9:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %1 %0 %6 %7 %8
-                                %10:dimension<1> = constant [value=1]
+                                %9:dimension<1> = constant [value=1]
+                                %10:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %1 %4 %7 %8 %9
                                 %11:dimension<1> = constant [value=1]
                                 %12:dimension<1> = constant [value=1]
                                 %13:dimension<1> = constant [value=1]
-                                %14:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %2 %0 %11 %12 %13
-                                %15:dimension<1> = constant [value=1]
+                                %14:dimension<1> = constant [value=1]
+                                %15:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %2 %4 %12 %13 %14
                                 %16:dimension<1> = constant [value=1]
                                 %17:dimension<1> = constant [value=1]
                                 %18:dimension<1> = constant [value=1]
-                                %19:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %3 %0 %16 %17 %18
-                                %20:f32[batch, 1, 1, 1] = composite [
+                                %19:dimension<1> = constant [value=1]
+                                %20:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %3 %4 %17 %18 %19
+                                %21:f32[batch, 1, 1, 1] = composite [
                                     key=\"ryft.dot_product_attention.v1 {scale = none, causal = false, \
                                         local_window = none, implementation = 0, dropout_rate = none, \
                                         residual = false, bias = false, mask = false, query_sequence_lengths = false, \
                                         key_value_sequence_lengths = false, dropout_state = false}\",
-                                ] %9 %14 %19 [
+                                ] %10 %15 %20 [
                                     primal={
                                         lambda %0:f32[batch, 1, 1, 1], %1:f32[batch, 1, 1, 1], %2:f32[batch, 1, 1, 1] .
                                         let %3:f32[batch, 1, 1, 1] = dot [
@@ -4253,13 +4267,13 @@ mod tests {
                                         in (%14)
                                     },
                                 ]
-                                %21:dimension<1> = constant [value=1]
                                 %22:dimension<1> = constant [value=1]
                                 %23:dimension<1> = constant [value=1]
                                 %24:dimension<1> = constant [value=1]
-                                %25:f32[batch, 1, 1, 1, 1] = \
-                                    reshape [requires_runtime_assertion=false] %20 %0 %21 %22 %23 %24
-                            in (%25)
+                                %25:dimension<1> = constant [value=1]
+                                %26:f32[batch, 1, 1, 1, 1] = \
+                                    reshape [requires_runtime_assertion=false] %21 %4 %22 %23 %24 %25
+                            in (%26)
                         },
                     ]
                 in (%8)
@@ -4658,6 +4672,49 @@ mod tests {
                 (&batched.key, &expected.key, 6),
                 (&batched.value, &expected.value, 6),
                 (batched.bias.as_ref().unwrap(), expected.bias.as_ref().unwrap(), 3),
+            ] {
+                actual.to_f64s()[size * item..size * (item + 1)]
+                    .iter()
+                    .zip(expected.to_f64s())
+                    .for_each(|(actual, expected)| assert_abs_diff_eq!(*actual, expected, epsilon = 1e-6));
+            }
+        }
+
+        // Rank-3 attention has no batch axis, so its mapped axis becomes the batch axis without a product, and a
+        // rank-4 bias with a unit batch axis is normalized without that axis.
+        let bias = [0.25, -0.5, 1.0, -0.75, 0.5, 0.0, 0.1, 0.2, -0.3, 0.4, -0.6, 0.8];
+        let inputs = AttentionInputs {
+            bias: Some(array(&[2, 1, 1, 2, 3], &bias)),
+            ..AttentionInputs::new(
+                array(&[2, 2, 1, 2], &query),
+                array(&[2, 3, 1, 2], &key),
+                array(&[2, 3, 1, 2], &value),
+            )
+        };
+        let batched = differentiate_at(inputs)
+            .gradient(|inputs| {
+                let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                    .map_err(ProgramError::from)?;
+                outputs.reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+            })
+            .unwrap();
+        for item in 0..2 {
+            let inputs = AttentionInputs {
+                bias: Some(array(&[1, 1, 2, 3], &bias[6 * item..6 * item + 6])),
+                ..AttentionInputs::new(
+                    array(&[2, 1, 2], &query[4 * item..4 * item + 4]),
+                    array(&[3, 1, 2], &key[6 * item..6 * item + 6]),
+                    array(&[3, 1, 2], &value[6 * item..6 * item + 6]),
+                )
+            };
+            let expected = differentiate_at(inputs)
+                .gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2], ReductionKind::Sum))
+                .unwrap();
+            for (actual, expected, size) in [
+                (&batched.query, &expected.query, 4),
+                (&batched.key, &expected.key, 6),
+                (&batched.value, &expected.value, 6),
+                (batched.bias.as_ref().unwrap(), expected.bias.as_ref().unwrap(), 6),
             ] {
                 actual.to_f64s()[size * item..size * (item + 1)]
                     .iter()
