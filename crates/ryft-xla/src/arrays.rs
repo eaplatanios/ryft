@@ -5,9 +5,12 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use ryft_core::{
-    ArrayType, DataType, Device, DeviceId, DeviceMesh, DimensionError, Layout, LayoutError, Memory, Parameter,
-    Parameterized, ProjectedContext, Shape, Sharding, ShardingDimension, ShardingError, StaticShape, Typed,
-    UnreducedKind, Value as CoreValue, ValueDomainDispatch, check_sharding,
+    Add, And, ArrayIrType, ArrayType, AssertionValue, Broadcast, Concretizable, DataType, Device, DeviceId, DeviceMesh,
+    DimensionError, DimensionFromScalar, DimensionFromScalarOperation, DimensionSize, DimensionSizeOperation,
+    DimensionType, DimensionValue, DimensionVariable, Div, ElementType, Layout, LayoutError, Memory, Mul, Neg, Not,
+    Operation as CoreOperation, Or, Parameter, Parameterized, ProgramError, ProjectedContext, Select, Shape,
+    ShapeChangingCollectiveValue, Sharding, ShardingDimension, ShardingError, StaticShape, Sub, Typed, UnreducedKind,
+    Value as CoreValue, ValueDomainDispatch, WhilePredicate, Xor, check_sharding,
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::{Buffer, BufferType, Client, Error as PjrtError, ExecutionFence};
@@ -276,42 +279,6 @@ impl<'o> RetainedArray<'o> {
             execution_fence: self.execution_fence.clone(),
             domain: domain.clone(),
         }
-    }
-}
-
-// `Array` equality is *storage identity*, not element-wise value equality: ordinary arrays are equal only when they
-// have the same type and every materialized shard references the same underlying `Buffer` (by `Arc` pointer identity),
-// while bufferless zero-space shards compare equal because their type admits exactly one value. Arrays holding equal
-// ordinary data in distinct buffers deliberately compare unequal, which is the conservative answer that analyses
-// comparing flowing values need (mirroring `Tracer`'s staging-identity `PartialEq`). Element-wise equality would
-// require device-to-host transfers and is deliberately not what this implements.
-impl PartialEq for Array<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        let (left, right) = (&self.parts, &other.parts);
-        Arc::ptr_eq(left, right)
-            || (left.r#type == right.r#type
-                && left.sharding == right.sharding
-                && left.shards.len() == right.shards.len()
-                && left.shards.iter().zip(right.shards.iter()).all(|(left, right)| left.storage_eq(right)))
-    }
-}
-
-// TODO(eaplatanios): Review this.
-impl<'o> Clone for Array<'o> {
-    fn clone(&self) -> Self {
-        crate::telemetry::array_constructed();
-        Self {
-            parts: Arc::clone(&self.parts),
-            execution_fence: self.execution_fence.clone(),
-            domain: self.domain.clone(),
-        }
-    }
-}
-
-// TODO(eaplatanios): Review this.
-impl<'o> Drop for Array<'o> {
-    fn drop(&mut self) {
-        crate::telemetry::array_dropped();
     }
 }
 
@@ -1204,6 +1171,25 @@ pub fn block_until_ready<'o, Values: Parameterized<Array<'o>>>(values: &Values) 
     Ok(())
 }
 
+// TODO(eaplatanios): Review this.
+impl<'o> Clone for Array<'o> {
+    fn clone(&self) -> Self {
+        crate::telemetry::array_constructed();
+        Self {
+            parts: Arc::clone(&self.parts),
+            execution_fence: self.execution_fence.clone(),
+            domain: self.domain.clone(),
+        }
+    }
+}
+
+// TODO(eaplatanios): Review this.
+impl<'o> Drop for Array<'o> {
+    fn drop(&mut self) {
+        crate::telemetry::array_dropped();
+    }
+}
+
 impl Debug for Array<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -1221,30 +1207,21 @@ impl Display for Array<'_> {
     }
 }
 
-/// Returns the [`ArrayType`] and runtime placement of an array of type `r#type` that is constructed on `mesh` with the
-/// optional placement `sharding`. Types never record placement over auto mesh axes, so the returned type carries the
-/// placement without its auto mesh axes. Without `sharding`, the placement is the sharding of `r#type`, or, when it
-/// has none and `implicit_replication` holds, the replicated placement over `mesh`.
-fn placement(
-    r#type: ArrayType,
-    sharding: Option<Sharding>,
-    mesh: &DeviceMesh,
-    implicit_replication: bool,
-) -> Result<(ArrayType, Sharding), Error> {
-    let sharding = match (sharding, r#type.sharding()) {
-        (Some(sharding), Some(type_sharding)) if *type_sharding != sharding.without_auto_axes() => {
-            return Err(Error::from(ArrayError::PlacementTypeMismatch {
-                type_sharding: type_sharding.clone(),
-                sharding,
-            }));
-        }
-        (Some(sharding), _) => sharding,
-        (None, Some(type_sharding)) => type_sharding.clone(),
-        (None, None) if implicit_replication => Sharding::replicated(mesh.logical_mesh().clone(), r#type.rank()),
-        (None, None) => return Err(Error::from(ArrayError::MissingSharding)),
-    };
-    let r#type = r#type.with_sharding(sharding.without_auto_axes())?;
-    Ok((r#type, sharding))
+// `Array` equality is *storage identity*, not element-wise value equality: ordinary arrays are equal only when they
+// have the same type and every materialized shard references the same underlying `Buffer` (by `Arc` pointer identity),
+// while bufferless zero-space shards compare equal because their type admits exactly one value. Arrays holding equal
+// ordinary data in distinct buffers deliberately compare unequal, which is the conservative answer that analyses
+// comparing flowing values need (mirroring `Tracer`'s staging-identity `PartialEq`). Element-wise equality would
+// require device-to-host transfers and is deliberately not what this implements.
+impl PartialEq for Array<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        let (left, right) = (&self.parts, &other.parts);
+        Arc::ptr_eq(left, right)
+            || (left.r#type == right.r#type
+                && left.sharding == right.sharding
+                && left.shards.len() == right.shards.len()
+                && left.shards.iter().zip(right.shards.iter()).all(|(left, right)| left.storage_eq(right)))
+    }
 }
 
 impl Typed for Array<'_> {
@@ -1260,8 +1237,8 @@ impl<'o> CoreValue for Array<'o> {
     // `ValueDomainDispatch`, so the blanket value capabilities in `ryft-core` (arithmetic, comparison, selection,
     // manipulation, reductions, ...) bind their operations through `domain()` and execute them eagerly, op by op,
     // through the domain recovered below, and free transform entry points (e.g., `ryft_core::batching::batch`) recover
-    // the same domain. Only capabilities without operation-binding blankets (`Concretizable<bool>`, `WhilePredicate`,
-    // and the foreign `std::ops` sugar) get direct implementations in `crate::eager`.
+    // the same domain. Only capabilities without operation-binding blankets (e.g., `Concretizable<bool>`,
+    // `WhilePredicate`, and the foreign `std::ops` sugar) get the direct implementations that follow.
     type Dispatch = ValueDomainDispatch;
     type Domain = ProjectedContext<Domain<'o>, ArrayType>;
 
@@ -1271,6 +1248,274 @@ impl<'o> CoreValue for Array<'o> {
     /// numerical values match. Fork scopes at task boundaries rather than inside expressions.
     fn domain(&self) -> Self::Domain {
         ProjectedContext::new(self.domain.clone())
+    }
+}
+
+// Every eager value capability of `Array` follows the JAX-style op-by-op dispatch shape. The blanket capability
+// implementations in `ryft-core` (arithmetic, logical, comparison, selection, manipulation, reductions, ...) bind
+// each operation through `ryft_core::Value::domain`, which for a concrete `Array` recovers the PJRT-backed `Domain`
+// that the array belongs to. That domain executes the operation through a single-operation program that its session
+// caches per operation application, so a repeated eager operation skips tracing and lowering. The implementations
+// that follow therefore only cover the capabilities those blankets cannot: host-readback capabilities such as
+// `Concretizable` and `WhilePredicate`, and the foreign `std::ops` operator sugar (per-type implementations required
+// by the orphan rule). Backend arrays opt into the shared shape-changing collective capabilities through
+// `ShapeChangingCollectiveValue`.
+
+impl Concretizable<bool> for Array<'_> {
+    /// Extracts a concrete scalar Rust Boolean by copying the value of a rank-0 Boolean-typed [`Array`] to the host
+    /// with [`Array::copy_to_host`]. Higher-rank or non-Boolean arrays error because they cannot collapse to a single
+    /// Boolean, and arrays whose value the current process does not hold error because it cannot read their payload.
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        if self.r#type().rank() == 0 && self.data_type().is_boolean() {
+            let bytes =
+                self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+            return Ok(bytes.iter().any(|byte| *byte != 0));
+        }
+        Err(ProgramError::Concretization {
+            message: format!(
+                "cannot extract a concrete boolean from a value of type `{}`; expected `bool[]`",
+                self.r#type().as_ref(),
+            ),
+        })
+    }
+}
+
+impl Concretizable<i128> for Array<'_> {
+    fn concretize(&self) -> Result<i128, ProgramError> {
+        // Decode through the CPU capability to preserve every signed and unsigned integer value.
+        let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        ryft_core::Array::new(self.r#type().into_owned(), bytes)?.concretize()
+    }
+}
+
+// Batched while-predicate semantics for [`Array`], mirroring the reference semantics of
+// [`Array`](ryft_core::arrays::Array): [`WhilePredicate::any_true`] reduces the whole Boolean payload with
+// `or` via device-to-host readback of every shard, and [`WhilePredicate::select`] broadcasts the predicate
+// against the operands along its leading (prefix) axes on device before selecting.
+impl WhilePredicate for Array<'_> {
+    fn any_true(&self) -> Result<bool, ProgramError> {
+        if !self.data_type().is_boolean() {
+            return Err(ProgramError::Concretization {
+                message: format!("cannot use a value of type {} as a Boolean while predicate", self.r#type()),
+            });
+        }
+
+        // The shards are read one at a time, so the whole execution that produced this array is observed first to
+        // surface its errors, including those that are not tied to an individual shard buffer.
+        if let Some(fence) = self.execution_fence() {
+            fence
+                .block_until_ready()
+                .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        }
+
+        // Reading every addressable shard covers all elements for both sharded placements (the shards partition the
+        // payload) and replicated placements (`or` is idempotent over duplicates). Non-addressable shards would leave
+        // remote elements unobserved, so they surface as concretization errors instead of a silently partial answer.
+        let mut addressable_count = 0usize;
+        let mut any = false;
+        for shard in self.addressable_shards() {
+            addressable_count += 1;
+            if !any {
+                let bytes = shard
+                    .copy_to_host()
+                    .map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+                any = bytes.iter().any(|byte| *byte != 0);
+            }
+        }
+
+        if addressable_count != self.shards().len() {
+            return Err(ProgramError::Concretization {
+                message: format!(
+                    "cannot decide a while predicate for an array of type {} whose shards are not all addressable \
+                     from the current process",
+                    self.r#type().as_ref(),
+                ),
+            });
+        }
+        Ok(any)
+    }
+
+    fn select(&self, on_true: &Self, on_false: &Self) -> Result<Self, ProgramError> {
+        if !self.data_type().is_boolean() || on_true.r#type() != on_false.r#type() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "select requires a Boolean prefix-shaped predicate and congruent inputs, but got \
+                     predicate {} with inputs {} and {}",
+                    self.r#type().as_ref(),
+                    on_true.r#type().as_ref(),
+                    on_false.r#type().as_ref(),
+                ),
+            });
+        }
+
+        // Broadcast a prefix-shaped predicate up to the operands' full shape (its axes map to the leading output
+        // axes) so the staged select receives shape-congruent operands.
+        let condition = if self.r#type().shape() == on_true.r#type().shape() {
+            self.clone()
+        } else {
+            let output_type = on_true.r#type().with_element_type(DataType::Boolean);
+            let output_axes = (0..self.r#type().rank()).collect::<Vec<_>>();
+            self.broadcast(output_type, output_axes.as_slice())?
+        };
+
+        Select::select(&condition, on_true, on_false)
+    }
+}
+
+impl AssertionValue for Array<'_> {
+    fn assertion_observation(&self) -> Result<String, ProgramError> {
+        let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        ryft_core::Array::new(self.r#type().into_owned(), bytes)?.assertion_observation()
+    }
+
+    fn assertion_array(&self) -> Result<Option<ryft_core::Array>, ProgramError> {
+        let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        Ok(Some(ryft_core::Array::new(ArrayType::new(self.data_type(), self.shape().into()), bytes)?))
+    }
+}
+
+impl DimensionSize<ArrayType> for Array<'_> {
+    type Extent = usize;
+
+    /// Returns the concrete global extent of `axis` from this array's complete shard metadata.
+    ///
+    /// The descriptor list includes remote shards, so taking the greatest exclusive slice end recovers the global
+    /// extent without synchronizing a device buffer. Constructing a [`DimensionValue`] validates that extent against
+    /// the selected declared axis's identity and bounds before the host integer is returned.
+    fn dimension_size<AxisValue: Into<ryft_core::Axis>>(&self, axis: AxisValue) -> Result<usize, ProgramError> {
+        let operation = DimensionSizeOperation::new(self.r#type().as_ref(), axis)?;
+        let extent = self.shards().iter().map(|shard| shard.slice()[operation.axis()].end).max().ok_or_else(|| {
+            ProgramError::Concretization {
+                message: format!("cannot read the extent of an array of type {} with no shard metadata", self.r#type()),
+            }
+        })?;
+        DimensionValue::new(operation.output_type().clone(), extent)?;
+        Ok(extent)
+    }
+}
+
+impl DimensionFromScalar<DimensionValue, ArrayType> for Array<'_> {
+    /// Copies this rank-zero integer array to the host and grants its checked value first-class dimension authority.
+    fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
+        let operation = DimensionFromScalarOperation::new(output.into());
+        let mut output_types = operation.infer_output_types(&[ArrayIrType::Array(self.r#type().into_owned())], &[])?;
+        let output_type = <&DimensionType>::try_from(&output_types.remove(0))?.clone();
+        let bytes = self.copy_to_host().map_err(|error| ProgramError::Concretization { message: error.to_string() })?;
+        let invalid_extent = |value: String| ProgramError::InvalidArgument {
+            message: format!(
+                "`{}` scalar input must be a nonnegative host-representable extent but is {value}",
+                operation.name(),
+            ),
+        };
+        let extent = match self.data_type() {
+            DataType::I8 => {
+                let value = i8::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::I16 => {
+                let value = i16::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::I32 => {
+                let value = i32::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::I64 => {
+                let value = i64::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::U8 => usize::from(u8::from_ne_bytes(bytes.as_slice().try_into().unwrap())),
+            DataType::U16 => usize::from(u16::from_ne_bytes(bytes.as_slice().try_into().unwrap())),
+            DataType::U32 => {
+                let value = u32::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            DataType::U64 => {
+                let value = u64::from_ne_bytes(bytes.as_slice().try_into().unwrap());
+                usize::try_from(value).map_err(|_| invalid_extent(value.to_string()))?
+            }
+            _ => unreachable!("dimension_from_scalar input type is validated before reading its payload"),
+        };
+        Ok(DimensionValue::new(output_type, extent)?)
+    }
+}
+
+// Backend arrays opt into the shared homogeneous collective staging rules of `ryft-core`.
+impl ShapeChangingCollectiveValue for Array<'_> {}
+
+// The `std::ops` operator traits are foreign, so the blanket tracer implementations in `ryft-core` cannot cover
+// concrete backend values. These per-type implementations provide the ergonomic panicking sugar by delegating to
+// the fallible `ryft` capabilities.
+
+impl std::ops::Neg for Array<'_> {
+    type Output = Self;
+
+    fn neg(self) -> Self {
+        Neg::neg(&self).expect("`neg` operation failed")
+    }
+}
+
+impl std::ops::Add for Array<'_> {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self {
+        Add::add(&self, &rhs).expect("`add` operation failed")
+    }
+}
+
+impl std::ops::Sub for Array<'_> {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self {
+        Sub::sub(&self, &rhs).expect("`sub` operation failed")
+    }
+}
+
+impl std::ops::Mul for Array<'_> {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self {
+        Mul::mul(&self, &rhs).expect("`mul` operation failed")
+    }
+}
+
+impl std::ops::Div for Array<'_> {
+    type Output = Self;
+
+    fn div(self, rhs: Self) -> Self {
+        Div::div(&self, &rhs).expect("`div` operation failed")
+    }
+}
+
+impl std::ops::Not for Array<'_> {
+    type Output = Self;
+
+    fn not(self) -> Self {
+        Not::not(&self).expect("`not` operation failed")
+    }
+}
+
+impl std::ops::BitAnd for Array<'_> {
+    type Output = Self;
+
+    fn bitand(self, rhs: Self) -> Self {
+        And::and(&self, &rhs).expect("`and` operation failed")
+    }
+}
+
+impl std::ops::BitOr for Array<'_> {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Or::or(&self, &rhs).expect("`or` operation failed")
+    }
+}
+
+impl std::ops::BitXor for Array<'_> {
+    type Output = Self;
+
+    fn bitxor(self, rhs: Self) -> Self {
+        Xor::xor(&self, &rhs).expect("`xor` operation failed")
     }
 }
 
@@ -1771,6 +2016,32 @@ impl ArrayTypeExtension for ArrayType {
             ),
         })
     }
+}
+
+/// Returns the [`ArrayType`] and runtime placement of an array of type `r#type` that is constructed on `mesh` with the
+/// optional placement `sharding`. Types never record placement over auto mesh axes, so the returned type carries the
+/// placement without its auto mesh axes. Without `sharding`, the placement is the sharding of `r#type`, or, when it
+/// has none and `implicit_replication` holds, the replicated placement over `mesh`.
+fn placement(
+    r#type: ArrayType,
+    sharding: Option<Sharding>,
+    mesh: &DeviceMesh,
+    implicit_replication: bool,
+) -> Result<(ArrayType, Sharding), Error> {
+    let sharding = match (sharding, r#type.sharding()) {
+        (Some(sharding), Some(type_sharding)) if *type_sharding != sharding.without_auto_axes() => {
+            return Err(Error::from(ArrayError::PlacementTypeMismatch {
+                type_sharding: type_sharding.clone(),
+                sharding,
+            }));
+        }
+        (Some(sharding), _) => sharding,
+        (None, Some(type_sharding)) => type_sharding.clone(),
+        (None, None) if implicit_replication => Sharding::replicated(mesh.logical_mesh().clone(), r#type.rank()),
+        (None, None) => return Err(Error::from(ArrayError::MissingSharding)),
+    };
+    let r#type = r#type.with_sharding(sharding.without_auto_axes())?;
+    Ok((r#type, sharding))
 }
 
 #[cfg(test)]
