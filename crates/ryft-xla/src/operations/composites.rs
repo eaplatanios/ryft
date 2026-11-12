@@ -2,10 +2,10 @@ use std::hash::Hash;
 use std::rc::Rc;
 
 use ryft_core::{
-    ArrayIrType, ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputSignature,
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation,
-    CompositeTransposeOperation, CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
-    DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DifferentiableType, Operation as CoreOperation, Parameter, ProgramError,
+    ArrayIrType, ArrayType, AttentionConfiguration, AttentionImplementation, AttentionInputs, COMPOSITE_OPERATION_NAME,
+    COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeKey, CompositeOperation, CompositeTransposeOperation,
+    CustomRuleSource, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+    DifferentiableType, Operation as CoreOperation, Parameter, Placeholder, ProgramError,
     RematerializationOptimizationBarrier, Typed,
 };
 use ryft_mlir::ValueRef;
@@ -50,8 +50,8 @@ pub(crate) enum NamedCompositeImplementation {
         /// Configuration of the definition.
         configuration: AttentionConfiguration,
 
-        /// Optional-input signature of the definition.
-        signature: AttentionInputSignature,
+        /// Structure of the inputs of the definition (i.e., which optional inputs are present).
+        input_structure: AttentionInputs<Placeholder>,
 
         /// Whether the definition also returns the log-sum-exp residual of its softmax.
         return_residual: bool,
@@ -63,8 +63,8 @@ pub(crate) enum NamedCompositeImplementation {
         /// Configuration of the definition.
         configuration: AttentionConfiguration,
 
-        /// Optional-input signature of the definition.
-        signature: AttentionInputSignature,
+        /// Structure of the inputs of the definition (i.e., which optional inputs are present).
+        input_structure: AttentionInputs<Placeholder>,
     },
 
     /// Implementation of an attention definition that requests the fused kernels for a call that they cannot
@@ -142,9 +142,9 @@ impl NamedCompositeImplementation {
                 .map_err(ProgramError::from)
         };
         match self {
-            Self::Attention { configuration, signature, return_residual } => lower_fused_attention(
+            Self::Attention { configuration, input_structure, return_residual } => lower_fused_attention(
                 *configuration,
-                *signature,
+                *input_structure,
                 *return_residual,
                 input_values,
                 array_types(input_types)?.as_slice(),
@@ -153,9 +153,9 @@ impl NamedCompositeImplementation {
                 lowerer.context,
                 lowerer.location,
             ),
-            Self::AttentionBackward { configuration, signature } => lower_fused_attention_backward(
+            Self::AttentionBackward { configuration, input_structure } => lower_fused_attention_backward(
                 *configuration,
-                *signature,
+                *input_structure,
                 input_values,
                 array_types(input_types)?.as_slice(),
                 array_types(output_types)?.as_slice(),

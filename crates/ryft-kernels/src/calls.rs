@@ -1260,7 +1260,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrOperation, ArrayOperation, ArrayReferenceTransformIndex, AtomId, AttentionConfiguration,
-        AttentionInputSignature, AttentionKey, CompositeAttribute, CompositeJvpRule, CompositeKey, CompositeOperation,
+        AttentionInputs, AttentionKey, CompositeAttribute, CompositeJvpRule, CompositeKey, CompositeOperation,
         CompositeTransposeOperation, ConditionOperation, Context, CustomRuleDefinition, CustomRuleRegistration,
         DataType, DimensionError, DimensionType, DimensionValue, EffectClasses, Layout, LogicalMesh, Memory, MeshAxis,
         MeshAxisType, NamedComposite, Placeholder, ProgramBuilder, ReferenceAddUpdateOperation,
@@ -2430,7 +2430,7 @@ mod tests {
             let keys = configurations.map(|configuration| {
                 let key = AttentionKey::Forward {
                     configuration,
-                    signature: AttentionInputSignature::default(),
+                    input_structure: AttentionInputs::new(Placeholder, Placeholder, Placeholder),
                     return_residual: false,
                 }
                 .to_composite_key();
