@@ -1087,6 +1087,7 @@ define_elementwise_capability!(
     /// Multiplies `self` by `right`.
     mul(right),
     MulOperation,
+    dimension = Mul::mul,
 );
 
 impl Mul for Array {

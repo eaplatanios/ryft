@@ -22,8 +22,8 @@ use crate::experimental::lowering::{
 };
 use crate::experimental::ops::{Constant, Program};
 use crate::operations::control_flow::lowered_effect_classes;
-use crate::sharding::{SHARDY_MESH_SYMBOL_NAME, shardy_reduction_operation};
-use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
+use crate::sharding::SHARDY_MESH_SYMBOL_NAME;
+use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, ToMlir};
 
 /// Lowers one `sdy.manual_computation` operation, threading per-device effect tokens across its boundary. Assertions
 /// remain local to an executable, and the only ordered I/O that reaches this function is per-device
@@ -291,7 +291,7 @@ fn manual_computation_tensor_sharding<'c, 't>(
         dimension_shardings.as_slice(),
         replicated_axes.as_slice(),
         unreduced_axes.as_slice(),
-        shardy_reduction_operation(sharding.unreduced_kind()),
+        sharding.unreduced_kind().to_mlir(context.unknown_location())?,
     )?)
 }
 

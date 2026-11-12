@@ -1285,6 +1285,11 @@ macro_rules! define_elementwise_operation {
 ///     configuration. Stateless operations provide themselves through the blanket implementation, while type families
 ///     whose operations carry type-derived metadata (e.g., checked dimension arithmetic) override the provider for the
 ///     marker.
+///   - `dimension = $dimension_capability::$dimension_method`: Optional dimension capability function
+///     of a `@binary` capability that also has a first-class dimension operation (e.g., `dimension = Mul::mul`
+///     or `dimension = DimensionMin::dimension_min`). Array IR values then implement the capability by member kind
+///     instead of through their array members alone: two first-class dimensions use this function of their dimension
+///     members, and every other pair of inputs uses the capability of its array members.
 #[macro_export]
 macro_rules! define_elementwise_capability {
     // This branch defines a unary capability whose operation carries a result accuracy. The accuracy-free function
@@ -1425,7 +1430,7 @@ macro_rules! define_elementwise_capability {
     };
 
     // This branch defines a two-input capability whose binary operation is provided by the value type family,
-    // using the caller-provided name for the right input.
+    // using the caller-provided name for the right input. Array IR values implement it through their array members.
     (
         @binary
         $(#[$capability_documentation:meta])*
@@ -1448,6 +1453,83 @@ macro_rules! define_elementwise_capability {
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError>;
         }
 
+        $crate::define_elementwise_capability!(@binary_implementations $capability, $method($argument), $operation);
+    };
+
+    // This branch defines a two-input capability that array IR values implement by member kind. Two first-class
+    // dimensions use the provided dimension capability function of their dimension members, and every other pair
+    // of inputs uses this capability on their array members, which rejects inputs that are not arrays. The trait
+    // is declared here rather than in a shared branch, because the `#[capability]` attribute must be applied in
+    // the same macro expansion as the trait that it annotates.
+    (
+        @binary
+        $(#[$capability_documentation:meta])*
+        $capability:ident,
+        $(#[$method_documentation:meta])+
+        $method:ident($argument:ident),
+        $operation:ident,
+        dimension = $dimension_capability:ident :: $dimension_method:ident $(,)?
+    ) => {
+        $(#[$capability_documentation])*
+        #[doc = ""]
+        #[doc = "The universe parameter `T` defaults to the [`Capability`](crate::Capability) universe"]
+        #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
+        #[doc = "[`ArrayType`](crate::ArrayType) and array IR values implement it for"]
+        #[doc = "[`ArrayIrType`](crate::ArrayIrType) through their members (i.e., two first-class"]
+        #[doc = "dimensions use their dimension members and every other pair of inputs uses its array"]
+        #[doc = "members)."]
+        #[::ryft_macros::capability]
+        pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
+            $crate::operations::Capability + Sized
+        {
+            $(#[$method_documentation])+
+            fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError>;
+        }
+
+        $crate::define_elementwise_capability!(@binary_implementations $capability, $method($argument), $operation);
+
+        impl<
+            __V: $crate::Value<Type = $crate::arrays::ArrayIrType>
+                + $crate::ValueProjection<$crate::arrays::ArrayType>
+                + $crate::ValueProjection<$crate::arrays::DimensionType>,
+        > $capability<$crate::arrays::ArrayIrType> for __V
+        where
+            <__V as $crate::ValueProjection<$crate::arrays::ArrayType>>::Projected:
+                $capability<$crate::arrays::ArrayType>,
+            <__V as $crate::ValueProjection<$crate::arrays::DimensionType>>::Projected:
+                $dimension_capability<$crate::arrays::DimensionType>,
+        {
+            fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError> {
+                // Only a pair of dimensions selects the dimension members. Every other pair is projected onto its
+                // array members, so that an input of another kind reports the error of that projection.
+                if let ($crate::arrays::ArrayIrType::Dimension(_), $crate::arrays::ArrayIrType::Dimension(_)) =
+                    ($crate::Typed::r#type(self).as_ref(), $crate::Typed::r#type($argument).as_ref())
+                {
+                    let left = <__V as $crate::ValueProjection<$crate::arrays::DimensionType>>::into_projected(
+                        ::core::clone::Clone::clone(self),
+                    )?;
+                    let right = <__V as $crate::ValueProjection<$crate::arrays::DimensionType>>::into_projected(
+                        ::core::clone::Clone::clone($argument),
+                    )?;
+                    return Ok(<__V as $crate::ValueProjection<$crate::arrays::DimensionType>>::from_projected(
+                        $dimension_capability::<$crate::arrays::DimensionType>::$dimension_method(&left, &right)?,
+                    ));
+                }
+                let left = <__V as $crate::ValueProjection<$crate::arrays::ArrayType>>::into_projected(
+                    ::core::clone::Clone::clone(self),
+                )?;
+                let right = <__V as $crate::ValueProjection<$crate::arrays::ArrayType>>::into_projected(
+                    ::core::clone::Clone::clone($argument),
+                )?;
+                Ok(<__V as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected(
+                    $capability::<$crate::arrays::ArrayType>::$method(&left, &right)?,
+                ))
+            }
+        }
+    };
+
+    // This internal branch generates the implementations that both public binary forms share.
+    (@binary_implementations $capability:ident, $method:ident($argument:ident), $operation:ident $(,)?) => {
         impl<
             __T: $crate::Type,
             __V: $crate::Value<

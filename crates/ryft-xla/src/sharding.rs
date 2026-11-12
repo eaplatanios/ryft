@@ -70,6 +70,22 @@ impl ToMlir for Sharding {
     }
 }
 
+impl ToMlir for UnreducedKind {
+    type Output<'c, 't: 'c> = shardy::ReductionOperation;
+
+    #[inline]
+    fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(
+        &self,
+        _location: L,
+    ) -> Result<shardy::ReductionOperation, ryft_mlir::Error> {
+        Ok(match self {
+            Self::Sum => shardy::ReductionOperation::Sum,
+            Self::Max => shardy::ReductionOperation::Max,
+            Self::Min => shardy::ReductionOperation::Min,
+        })
+    }
+}
+
 /// Returns the Shardy attribute of `sharding`. Its replicated and sharded dimensions are closed (i.e., Shardy
 /// cannot shard them along further axes) unless `open_over_auto_axes` is set and the mesh of `sharding` has an
 /// [`Auto`](MeshAxisType::Auto) axis, in which case every dimension is open. The axes that `sharding` governs but does
@@ -116,17 +132,8 @@ pub(crate) fn shardy_tensor_sharding_attribute<'c, 't: 'c, L: Location<'c, 't>>(
         dimensions.as_slice(),
         replicated_axes.as_slice(),
         unreduced_axes.as_slice(),
-        shardy_reduction_operation(sharding.unreduced_kind()),
+        sharding.unreduced_kind().to_mlir(location)?,
     )
-}
-
-/// Returns the Shardy reduction operation of the unreduced axes of a sharding whose [`UnreducedKind`] is `kind`.
-pub(crate) fn shardy_reduction_operation(kind: UnreducedKind) -> shardy::ReductionOperation {
-    match kind {
-        UnreducedKind::Sum => shardy::ReductionOperation::Sum,
-        UnreducedKind::Max => shardy::ReductionOperation::Max,
-        UnreducedKind::Min => shardy::ReductionOperation::Min,
-    }
 }
 
 // TODO(eaplatanios): Review this.
@@ -346,6 +353,15 @@ mod tests {
         let attribute = sharding.with_unreduced_kind(UnreducedKind::Min).unwrap();
         let attribute = attribute.to_mlir(context.unknown_location()).unwrap();
         assert_eq!(attribute.reduction_operation().unwrap(), shardy::ReductionOperation::Min);
+    }
+
+    #[test]
+    fn test_unreduced_kind_to_shardy() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        assert_eq!(UnreducedKind::Sum.to_mlir(location), Ok(shardy::ReductionOperation::Sum));
+        assert_eq!(UnreducedKind::Max.to_mlir(location), Ok(shardy::ReductionOperation::Max));
+        assert_eq!(UnreducedKind::Min.to_mlir(location), Ok(shardy::ReductionOperation::Min));
     }
 
     #[test]
