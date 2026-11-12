@@ -354,7 +354,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::MeshAxis;
-    use ryft_mlir::Context as MlirContext;
+    use ryft_mlir::{Block, Context as MlirContext};
 
     use crate::tests::{device_mesh_2x2, execution_client, logical_mesh_2x2, logical_mesh_3x2x1};
 
