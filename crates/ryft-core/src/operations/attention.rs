@@ -45,15 +45,61 @@
 //!     (refer to [`ManualVariationAlignment`]), so that the transposes of those alignments accumulate the cotangent
 //!     contributions of invariant inputs exactly once.
 //!   - **Batching:** A batched call folds its mapped axis into attention's batch axis and calls the same definition
-//!     at the folded boundary, which keeps backend implementations for batched calls. Definitions with dropout are
-//!     batched structurally instead, so that every batch item keeps the dropout mask of its unbatched call, and
-//!     definitions with dropout and the fused implementation reject batching.
+//!     at the folded boundary, which keeps backend implementations for batched calls (refer to the section below).
+//!     Definitions with dropout are batched structurally instead, so that every batch item keeps the dropout mask
+//!     of its unbatched call, and definitions with dropout and the fused implementation reject batching.
 //!   - **Differentiation:** The forward and backward definitions have no derivative rules, so differentiating
 //!     a call of the inference function fails. The training function stages a third named composite, named
 //!     [`DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME`], whose reverse mode rule calls the forward definition with
 //!     its residual and then the backward definition. Reverse mode over dynamic shapes with integer inputs (e.g.,
 //!     sequence lengths) needs an array IR family, because homogeneous array programs cannot materialize the
 //!     structurally zero tangents of such inputs for a dynamic shape.
+//!
+//! ## Batching
+//!
+//! Batching an attention call gives its inputs a mapped axis (i.e., an additional axis that holds the batch items),
+//! which is one axis more than a definition accepts. The batching rule does not batch the operations of the body one
+//! by one. It folds the mapped axis into the batch axis that attention already has, calls the same definition once on
+//! the folded inputs, and unfolds the outputs. A batched call therefore remains a call of the named definition, which
+//! lets a backend keep using its own implementation of that definition (e.g., a fused kernel).
+//!
+//! The shapes below name one extent per letter. `v` is the mapped extent (i.e., the number of batch items), `B` is the
+//! batch extent of attention, `T` and `S` are the query and key/value sequence lengths, `N` is the number of query
+//! heads, `H` is the head dimension, and `v · B` is the product of two extents. For a call whose inputs have a batch
+//! axis, the rule takes the steps in the following table, in which keys and values are treated like the query.
+//!
+//!   | Step      | Values                              | From               | To                 |
+//!   |-----------|-------------------------------------|--------------------|--------------------|
+//!   | Align     | Inputs that every batch item shares | `[B, T, N, H]`     | `[v, B, T, N, H]`  |
+//!   | Normalize | Biases and masks                    | e.g., `[v, T, S]`  | `[v, B, N, T, S]`  |
+//!   | Fold      | Queries, keys, and values           | `[v, B, T, N, H]`  | `[v · B, T, N, H]` |
+//!   | Fold      | Biases and masks                    | `[v, B, N, T, S]`  | `[v · B, N, T, S]` |
+//!   | Fold      | Sequence lengths                    | `[v, B]`           | `[v · B]`          |
+//!   | Unfold    | Outputs                             | `[v · B, T, N, H]` | `[v, B, T, N, H]`  |
+//!
+//! A call whose inputs have no batch axis needs no product, because its mapped axis becomes the batch axis, and its
+//! biases and masks are normalized to `[v, N, T, S]`.
+//!
+//! The rule constructs every shape in the last column, and in general no value has that shape beforehand. The
+//! exemplar-relative capabilities (e.g., [`BroadcastLike`]) copy the shape of an existing value, so they cannot
+//! produce it. [`Reshape`] can regroup static dimensions next to the dynamic dimensions that it keeps, but `v · B`
+//! is a new extent whenever `v` or `B` is dynamic. The rule therefore reads extents with [`DimensionSize`], multiplies
+//! two of them with [`Mul`], and broadcasts and reshapes values to the results with [`DynamicBroadcast`] and
+//! [`DynamicReshape`]. Batching the body one operation at a time needs none of them, and definitions with
+//! dropout are batched that way, but such a call is no longer a call of the named definition.
+//!
+//! The representation of an extent is [`DimensionSize::Extent`], which differs between the universes:
+//!
+//!   - Tracers of homogeneous array programs use static host numbers that are read from their types, and they
+//!     broadcast and reshape to static shapes. A dynamic extent has no host number, so a homogeneous array family
+//!     supports dynamically shaped attention except with batched calls whose batching rule needs a dynamic extent
+//!     (e.g., a dynamic mapped extent, or a dynamic extent of a rank-4 input whose mapped axis is folded into its
+//!     batch axis, of a bias or mask, or of a replicated input that is broadcast along the mapped axis). Such a call
+//!     fails with an error that names the dynamic axis (e.g., "`dimension_size` cannot return the dynamic extent
+//!     `length` of axis 2 of `f32[2, 1, length, 1, 1]` as a host extent; use array IR values for dynamic extents"),
+//!     and such programs stage attention in an array IR family instead, which is how backends support bounded
+//!     dynamic shapes (e.g., XLA tracers).
+//!   - Array IR values use first-class dimension values, so the batching rule supports static and dynamic extents.
 //!
 //! # Example
 //!
@@ -120,63 +166,16 @@ use crate::parameters::{Parameter, Parameterized, Placeholder};
 use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Value capabilities that staging attention requires, collected so that the functions that stage it (e.g.,
 /// [`dot_product_attention`]) state one bound. Those functions create the portable bodies and the batching rule of the
 /// named definitions, so they need every capability that either of them uses, while each helper of the bodies bounds
-/// only what it calls. This bundle is implemented automatically for every value that implements all of its members,
-/// and so it must never be implemented manually.
+/// only what it calls. The last three members are the extent capabilities with which the batching rule folds batched
+/// calls (refer to the [module documentation](self#batching)). This bundle is implemented automatically for every
+/// value that implements all of its members, and so it must never be implemented manually.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that tracers of homogeneous array programs implement this bundle for [`ArrayType`] and array IR values implement
 /// it for [`ArrayIrType`](crate::ArrayIrType).
-///
-/// # Extents
-///
-/// Batching an attention call gives its inputs a mapped axis (i.e., an additional axis that holds the batch items),
-/// which is one axis more than a definition accepts. The batching rule does not batch the operations of the body one
-/// by one. It folds the mapped axis into the batch axis that attention already has, calls the same definition once on
-/// the folded inputs, and unfolds the outputs. A batched call therefore remains a call of the named definition, which
-/// lets a backend keep using its own implementation of that definition (e.g., a fused kernel).
-///
-/// The shapes below name one extent per letter. `v` is the mapped extent (i.e., the number of batch items), `B` is the
-/// batch extent of attention, `T` and `S` are the query and key/value sequence lengths, `N` is the number of query
-/// heads, `H` is the head dimension, and `v · B` is the product of two extents. For a call whose inputs have a batch
-/// axis, the rule takes the steps in the following table, in which keys and values are treated like the query.
-///
-///   | Step      | Values                              | From               | To                 |
-///   |-----------|-------------------------------------|--------------------|--------------------|
-///   | Align     | Inputs that every batch item shares | `[B, T, N, H]`     | `[v, B, T, N, H]`  |
-///   | Normalize | Biases and masks                    | e.g., `[v, T, S]`  | `[v, B, N, T, S]`  |
-///   | Fold      | Queries, keys, and values           | `[v, B, T, N, H]`  | `[v · B, T, N, H]` |
-///   | Fold      | Biases and masks                    | `[v, B, N, T, S]`  | `[v · B, N, T, S]` |
-///   | Fold      | Sequence lengths                    | `[v, B]`           | `[v · B]`          |
-///   | Unfold    | Outputs                             | `[v · B, T, N, H]` | `[v, B, T, N, H]`  |
-///
-/// A call whose inputs have no batch axis needs no product, because its mapped axis becomes the batch axis, and its
-/// biases and masks are normalized to `[v, N, T, S]`.
-///
-/// The rule constructs every shape in the last column, and in general no value has that shape beforehand. The
-/// exemplar-relative capabilities (e.g., [`BroadcastLike`]) copy the shape of an existing value, so they cannot
-/// produce it. [`Reshape`] can regroup static dimensions next to the dynamic dimensions that it keeps, but `v · B` is
-/// a new extent whenever `v` or `B` is dynamic. The rule therefore reads extents with [`DimensionSize`], multiplies
-/// two of them with [`Mul`], and broadcasts and reshapes values to the results with [`DynamicBroadcast`] and
-/// [`DynamicReshape`]. Batching the body one operation at a time needs none of them, and definitions with dropout are
-/// batched that way, but such a call is no longer a call of the named definition.
-///
-/// The representation of an extent is [`DimensionSize::Extent`], which differs between the universes:
-///
-///   - Tracers of homogeneous array programs use static host numbers that are read from their types, and they
-///     broadcast and reshape to static shapes. A dynamic extent has no host number, so a homogeneous array family
-///     supports dynamically shaped attention except with batched calls whose batching rule needs a dynamic extent
-///     (e.g., a dynamic mapped extent, or a dynamic extent of a rank-4 input whose mapped axis is folded into its
-///     batch axis, of a bias or mask, or of a replicated input that is broadcast along the mapped axis). Such a call
-///     fails with an error that names the dynamic axis (e.g., "`dimension_size` cannot return the dynamic extent
-///     `length` of axis 2 of `f32[2, 1, length, 1, 1]` as a host extent; use array IR values for dynamic extents"),
-///     and such programs stage attention in an array IR family instead, which is how backends support bounded
-///     dynamic shapes (e.g., XLA tracers).
-///   - Array IR values use first-class dimension values, so the batching rule supports static and dynamic extents.
 pub trait AttentionOperations<T = <Self as Capability>::Universe>:
     Capability
     + FillLike<T>
@@ -238,8 +237,8 @@ impl<
 /// `(V, O)`, collected so that the functions that stage it state one bound. They are the custom batching rules of the
 /// forward and of the backward named definition, which fold batched calls (refer to [`AttentionOperations`]). Every
 /// operation family whose operations support partial evaluation and differentiation satisfies them (e.g., the
-/// [`ArrayOperation`](crate::arrays::ArrayOperation) family and backend families). This bundle is implemented
-/// automatically for every type that satisfies its bounds, and so it must never be implemented manually.
+/// [`ArrayOperation`](crate::ArrayOperation) family and backend families). This bundle is implemented automatically
+/// for every type that satisfies its bounds, and so it must never be implemented manually.
 pub trait AttentionRules<V: Value, O: Operation<Type = V::Type>>:
     CompositeBatching<
         BroadcastInvariantBatching<V, O, AttentionInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>,
@@ -273,6 +272,8 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Name of the forward named attention definition (refer to [`AttentionKey`]).
 pub const DOT_PRODUCT_ATTENTION_COMPOSITE_NAME: &str = "ryft.dot_product_attention";
@@ -2489,15 +2490,11 @@ where
 /// Batches one attention call by folding its mapped axis into attention's batch axis, staging the definition once at
 /// the folded boundary through `call`, and restoring the outputs, which are all mapped at axis `0`.
 ///
-/// Every input is first aligned to a leading mapped axis and then folded into the logical batch axis. Rank-3
-/// attention has an implicit logical batch of one, so `[v, T, N, H]` already has the canonical rank-4 form, while
-/// rank-4 attention folds `[v, B, T, N, H]` to `[v · B, T, N, H]`. Biases and masks are first materialized to
-/// `[v, B, N, T, S]` (or to `[v, N, T, S]` for rank-3 attention), which handles every broadcastable rank and preserves
-/// mapped bias and mask inputs. Outputs reverse the normalization, and a bias cotangent is reduced over precisely the
-/// axes that its logical bias input broadcasts. Every extent is read from an input with [`DimensionSize`] in the
-/// representation of the values (refer to [`AttentionOperations`]), so this supports static extents and, in array IR
-/// families, first-class dynamic extents (i.e., a dynamic mapped extent, logical batch, or sequence length never
-/// becomes host metadata). Calls whose inputs are all replicated stage the unbatched definition.
+/// The [module documentation](self#batching) describes the steps and their shapes. Normalizing biases and masks to
+/// the score shape handles every broadcastable rank and preserves mapped bias and mask inputs, and a bias cotangent is
+/// reduced over precisely the axes that its logical bias input broadcasts. Every extent is read from an input with
+/// [`DimensionSize`], so a dynamic mapped extent, logical batch, or sequence length never becomes host metadata. Calls
+/// whose inputs are all replicated stage the unbatched definition.
 fn batch_attention<
     V: Value<Type: ArrayMemberType>
         + Reduce
