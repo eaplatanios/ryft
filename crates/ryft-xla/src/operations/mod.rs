@@ -221,14 +221,17 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AndOperation, ArrayOperation, Atan2Operation, CompareOperation, ComparisonDirection, DataType, DivOperation,
-        OrOperation, Placeholder, SelectOperation, Shape, SinOperation, TypedProgram, XorOperation,
+        Abs, AndOperation, Array as CoreArray, ArrayOperation, Atan2, Atan2Operation, CompareOperation,
+        ComparisonDirection, Cos, DataType, DivOperation, Exp, Log, OrOperation, Placeholder, Pow, Rem, Rsqrt,
+        SelectOperation, Shape, Sign, Sin, SinOperation, Sqrt, Tanh, TypedProgram, XorOperation,
     };
 
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{PlainProgram, ProgramBuilder, lowered_unary_module};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{ArrayConstant, Constant, Operation};
-    use crate::to_mlir_module_for_program;
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::{Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -327,6 +330,48 @@ mod tests {
     }
 
     #[test]
+    fn test_elementwise_lowering_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let left_values = [0.5f32, 1.25, 2.0, 3.75];
+        let right_values = [4.0f32, 0.25, -1.5, 2.5];
+        let left = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&left_values));
+        let right = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&right_values));
+        let reference_left = CoreArray::vector(left_values.to_vec()).unwrap();
+        let reference_right = CoreArray::vector(right_values.to_vec()).unwrap();
+
+        // Each of these operations lowers to a single StableHLO operation, so agreement with the reference backend
+        // pins the operation that the lowering selects. Both backends compute in `f32` and may round transcendental
+        // functions differently in the last unit of precision, so results are compared within a relative tolerance.
+        let cases = [
+            ("abs", right.abs().unwrap(), reference_right.abs().unwrap()),
+            ("sign", right.sign().unwrap(), reference_right.sign().unwrap()),
+            ("sin", left.sin().unwrap(), reference_left.sin().unwrap()),
+            ("cos", left.cos().unwrap(), reference_left.cos().unwrap()),
+            ("tanh", left.tanh().unwrap(), reference_left.tanh().unwrap()),
+            ("exp", left.exp().unwrap(), reference_left.exp().unwrap()),
+            ("log", left.log().unwrap(), reference_left.log().unwrap()),
+            ("sqrt", left.sqrt().unwrap(), reference_left.sqrt().unwrap()),
+            ("rsqrt", left.rsqrt().unwrap(), reference_left.rsqrt().unwrap()),
+            ("atan2", left.atan2(&right).unwrap(), reference_left.atan2(&reference_right).unwrap()),
+            ("pow", left.pow(&right).unwrap(), reference_left.pow(&reference_right).unwrap()),
+            ("rem", left.rem(&right).unwrap(), reference_left.rem(&reference_right).unwrap()),
+        ];
+        for (name, output, reference) in cases {
+            let values = values_from_bytes::<f32>(&output.copy_to_host().unwrap());
+            let expected = reference.elements::<f32>().unwrap();
+            assert_eq!(values.len(), expected.len(), "`{name}`");
+            for (&value, &expected) in values.iter().zip(&expected) {
+                assert!(
+                    f32::abs(value - expected) <= 1e-5 * f32::abs(expected).max(1.0),
+                    "`{name}` computed {value} but the reference backend computed {expected}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn test_to_mlir_module_for_plain_program_lowers_result_accuracies() {
         // The default accuracy keeps the default StableHLO result accuracy, while other accuracies request theirs.
         assert_eq!(
@@ -375,5 +420,33 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_lower_accuracy_execution() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let values = [0.5f32, -1.0, 2.0];
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
+        let reference = CoreArray::vector(values.to_vec()).unwrap();
+        let expected_sine = reference.sin().unwrap().elements::<f32>().unwrap();
+        let expected_tanh = reference.tanh().unwrap().elements::<f32>().unwrap();
+
+        // XLA compiles every requested result accuracy. Each one only bounds the error of the implementation XLA
+        // selects, so results are compared with the reference within that bound.
+        let tolerance = ryft_core::Accuracy::Tolerance(ryft_core::Tolerance::new(1e-6, 0.0, 0).unwrap());
+        for accuracy in [ryft_core::Accuracy::Highest, tolerance] {
+            let sine = values_from_bytes::<f32>(&input.sin_with_accuracy(accuracy).unwrap().copy_to_host().unwrap());
+            assert_eq!(sine.len(), expected_sine.len());
+            for (sine, expected) in sine.iter().zip(&expected_sine) {
+                assert!((sine - expected).abs() <= 1e-6, "{accuracy:?}: {sine} vs {expected}");
+            }
+            let tanh = values_from_bytes::<f32>(&input.tanh_with_accuracy(accuracy).unwrap().copy_to_host().unwrap());
+            assert_eq!(tanh.len(), expected_tanh.len());
+            for (tanh, expected) in tanh.iter().zip(&expected_tanh) {
+                assert!((tanh - expected).abs() <= 1e-6, "{accuracy:?}: {tanh} vs {expected}");
+            }
+        }
     }
 }

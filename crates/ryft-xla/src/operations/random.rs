@@ -232,16 +232,30 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayType, Axes, ConvertElementTypeOperation, DataType, Dimension as CoreDimension,
-        Dropout, DropoutOperation, Placeholder, Shape, TypedProgram, ZeroOperation,
+        Array as CoreArray, ArrayType, Axes, CategoricalSamplingMode, ConvertElementType, ConvertElementTypeOperation,
+        DataType, DeviceMesh, Dimension as CoreDimension, Dropout, DropoutOperation, Placeholder, Random,
+        RandomAlgorithm, RngBitGenerator, Shape, TypedProgram, ZeroOperation,
     };
 
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{
         MixedValue, ProgramBuilder, execute_mixed_program, unproject_plain_program,
     };
     use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::tests::execution_client;
-    use crate::to_mlir_module_for_program;
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::{Array, Domain, Session, to_mlir_module_for_program};
+
+    // Uploads one generator state to the device and builds the same state on the reference backend.
+    fn rng_states<'c>(
+        domain: &Domain<'c>,
+        mesh: &DeviceMesh,
+        algorithm: RandomAlgorithm,
+        state_values: &[u64],
+    ) -> (Array<'c>, CoreArray) {
+        let bytes = values_to_bytes(state_values);
+        let state = replicated_array(domain, mesh, DataType::U64, &[state_values.len()], bytes.as_slice());
+        (state, CoreArray::from_elements(algorithm.state_type(), state_values).unwrap())
+    }
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_rng_bit_generator() {
@@ -469,6 +483,249 @@ mod tests {
                 ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
             ),
         ));
+    }
+
+    #[test]
+    fn test_lower_rng_bit_generator_matches_reference_backend() {
+        // Bits and advanced states are byte-identical on both backends. Five 32-bit words exercise the padded counter
+        // blocks and the truncated word layout. For outputs narrower than 64 bits, XLA's ThreeFry expansion splits the
+        // first even-sized axis of the output (or else its first largest axis) and advances the counter by the size
+        // of the resulting half shape, which the last group covers at several shapes and every narrow width.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        for (algorithm, state_values, outputs) in [
+            (RandomAlgorithm::ThreeFry, vec![42u64, 7], vec![(DataType::U32, vec![5]), (DataType::U64, vec![3])]),
+            (RandomAlgorithm::Philox, vec![42u64, 7, 9], vec![(DataType::U32, vec![5]), (DataType::U64, vec![3])]),
+            (
+                RandomAlgorithm::ThreeFry,
+                vec![(1u64 << 32) | 42, u64::from(u32::MAX)],
+                vec![
+                    (DataType::U32, vec![]),
+                    (DataType::U32, vec![2, 3]),
+                    (DataType::U32, vec![3, 4]),
+                    (DataType::U32, vec![3, 5]),
+                    (DataType::U32, vec![3, 3]),
+                    (DataType::U32, vec![3, 2, 5]),
+                    (DataType::U16, vec![2, 3]),
+                    (DataType::U8, vec![3, 3]),
+                ],
+            ),
+        ] {
+            let (state, reference_state) = rng_states(&domain, &mesh, algorithm, &state_values);
+            for (data_type, dimensions) in outputs {
+                let output_type = ArrayType::new_static(data_type, dimensions);
+                let (device_advanced_state, device_bits) = state.rng_bit_generator(algorithm, &output_type).unwrap();
+                let (reference_advanced_state, reference_bits) =
+                    reference_state.rng_bit_generator(algorithm, &output_type).unwrap();
+                assert_eq!(
+                    device_advanced_state.copy_to_host().unwrap(),
+                    reference_advanced_state.logical_bytes(),
+                    "{algorithm} state for {output_type}",
+                );
+                assert_eq!(
+                    device_bits.copy_to_host().unwrap(),
+                    reference_bits.logical_bytes(),
+                    "{algorithm} bits for {output_type}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_rng_bit_generator_matches_reference_backend_at_counter_boundaries() {
+        // Empty outputs preserve the state, and counter advancement wraps at the counter width of the algorithm while
+        // the bits stay byte-identical with the reference backend for every output width.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        for (algorithm, state_values) in [
+            (RandomAlgorithm::ThreeFry, vec![42u64, u64::MAX - 1]),
+            (RandomAlgorithm::Philox, vec![42u64, u64::MAX - 1, 7]),
+            (RandomAlgorithm::Philox, vec![42u64, u64::MAX - 1, u64::MAX]),
+        ] {
+            let (state, reference_state) = rng_states(&domain, &mesh, algorithm, &state_values);
+            for data_type in [DataType::U8, DataType::U16, DataType::U32, DataType::U64] {
+                for dimensions in [vec![2, 0, 3], vec![5]] {
+                    // The empty shape runs no cipher invocations. Five elements run enough invocations to cross the
+                    // low counter boundary, and Philox carries into the high half, which can itself wrap to zero.
+                    let element_count = dimensions.iter().product::<usize>();
+                    let invocation_count = match (algorithm, data_type) {
+                        (RandomAlgorithm::ThreeFry, DataType::U64) => element_count,
+                        (RandomAlgorithm::ThreeFry, _) => element_count.div_ceil(2),
+                        (RandomAlgorithm::Philox, DataType::U64) => element_count.div_ceil(2),
+                        (RandomAlgorithm::Philox, _) => element_count.div_ceil(4),
+                    };
+                    let (low_counter, carry) = state_values[1].overflowing_add(invocation_count as u64);
+                    let mut expected_state = vec![state_values[0], low_counter];
+                    if algorithm == RandomAlgorithm::Philox {
+                        expected_state.push(state_values[2].wrapping_add(u64::from(carry)));
+                    }
+
+                    let output_type = ArrayType::new_static(data_type, dimensions);
+                    let (device_advanced_state, device_bits) =
+                        state.rng_bit_generator(algorithm, &output_type).unwrap();
+                    let (_, reference_bits) = reference_state.rng_bit_generator(algorithm, &output_type).unwrap();
+                    assert_eq!(
+                        values_from_bytes::<u64>(&device_advanced_state.copy_to_host().unwrap()),
+                        expected_state,
+                        "{algorithm} state for {output_type}",
+                    );
+                    assert_eq!(
+                        device_bits.copy_to_host().unwrap(),
+                        reference_bits.logical_bytes(),
+                        "{algorithm} bits for {output_type}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_split_rng_key_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let (state, reference_state) = rng_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        let (device_advanced_state, device_keys) = state.split_rng_key(2).unwrap();
+        let (reference_advanced_state, reference_keys) = reference_state.split_rng_key(2).unwrap();
+        assert_eq!(device_advanced_state.copy_to_host().unwrap(), reference_advanced_state.logical_bytes());
+        assert_eq!(
+            device_keys.iter().map(|key| key.copy_to_host().unwrap()).collect::<Vec<_>>(),
+            reference_keys.iter().map(CoreArray::logical_bytes).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_random_uniform_matches_reference_backend() {
+        // Every step of the composition is exact arithmetic over byte-identical ThreeFry bits, so the samples keep
+        // their exact encodings on both backends, including the narrow floating-point types.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let (state, reference_state) = rng_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        for data_type in [DataType::F32, DataType::BF16, DataType::F16] {
+            let sample_type = ArrayType::new_static(data_type, [8]);
+            let (device_advanced_state, device_samples) = state.random_uniform(&sample_type).unwrap();
+            let (reference_advanced_state, reference_samples) = reference_state.random_uniform(&sample_type).unwrap();
+            assert_eq!(device_samples.data_type(), data_type);
+            assert_eq!(device_samples.copy_to_host().unwrap(), reference_samples.logical_bytes(), "{data_type}");
+            assert_eq!(
+                device_advanced_state.copy_to_host().unwrap(),
+                reference_advanced_state.logical_bytes(),
+                "{data_type}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_random_normal_matches_reference_backend() {
+        // The Box-Muller transform goes through transcendental functions, whose last bits may differ between the
+        // backends. Complex samples consist of two independently drawn components.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let (state, reference_state) = rng_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        for (data_type, component_count, tolerance) in
+            [(DataType::F32, 8, 1e-5f64), (DataType::C64, 16, 1e-5), (DataType::C128, 16, 1e-12)]
+        {
+            let sample_type = ArrayType::new_static(data_type, [8]);
+            let (device_advanced_state, device_samples) = state.random_normal(&sample_type).unwrap();
+            let (reference_advanced_state, reference_samples) = reference_state.random_normal(&sample_type).unwrap();
+            assert_eq!(device_samples.data_type(), data_type);
+            assert_eq!(
+                device_advanced_state.copy_to_host().unwrap(),
+                reference_advanced_state.logical_bytes(),
+                "{data_type}",
+            );
+            let device_bytes = device_samples.copy_to_host().unwrap();
+            let reference_bytes = reference_samples.logical_bytes();
+            let (device_components, reference_components) = if data_type == DataType::C128 {
+                (values_from_bytes::<f64>(&device_bytes), values_from_bytes::<f64>(&reference_bytes))
+            } else {
+                (
+                    values_from_bytes::<f32>(&device_bytes).into_iter().map(f64::from).collect::<Vec<_>>(),
+                    values_from_bytes::<f32>(&reference_bytes).into_iter().map(f64::from).collect::<Vec<_>>(),
+                )
+            };
+            assert_eq!(device_components.len(), component_count);
+            assert_eq!(reference_components.len(), component_count);
+            for (index, (device_component, reference_component)) in
+                device_components.iter().zip(&reference_components).enumerate()
+            {
+                assert!(
+                    (device_component - reference_component).abs() < tolerance,
+                    "{data_type} component {index} is {device_component} but the reference backend computed \
+                     {reference_component}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_random_categorical_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let (state, reference_state) = rng_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        let logit_values = [0f32, 10.0, -3.0, 2.0];
+        let logits = replicated_array(&domain, &mesh, DataType::F32, &[4], values_to_bytes(&logit_values).as_slice());
+        let reference_logits =
+            CoreArray::from_elements(ArrayType::new_static(DataType::F32, [4]), &logit_values).unwrap();
+        let (device_advanced_state, device_samples) = state.random_categorical(&logits, 0).unwrap();
+        let (reference_advanced_state, reference_samples) =
+            reference_state.random_categorical(&reference_logits, 0).unwrap();
+        assert_eq!(values_from_bytes::<i32>(&device_samples.copy_to_host().unwrap()), vec![1]);
+        assert_eq!(device_samples.copy_to_host().unwrap(), reference_samples.logical_bytes());
+        assert_eq!(device_advanced_state.copy_to_host().unwrap(), reference_advanced_state.logical_bytes());
+    }
+
+    #[test]
+    fn test_random_categorical_with_mode_matches_reference_backend() {
+        // High-precision sampling never selects a category masked with `-inf` and advances the same state on both
+        // backends.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        for (algorithm, state_values) in
+            [(RandomAlgorithm::ThreeFry, vec![11u64, 3]), (RandomAlgorithm::Philox, vec![11u64, 3, 0])]
+        {
+            let (state, reference_state) = rng_states(&domain, &mesh, algorithm, &state_values);
+            for data_type in [DataType::F32, DataType::F64] {
+                let reference_logits =
+                    CoreArray::matrix(2, 3, vec![f64::NEG_INFINITY, 2000.0, 0.0, f64::NEG_INFINITY, 0.0, 2000.0])
+                        .unwrap()
+                        .convert_element_type(data_type)
+                        .unwrap();
+                let logits =
+                    replicated_array(&domain, &mesh, data_type, &[2, 3], reference_logits.logical_bytes().as_slice());
+                let (device_advanced_state, device_samples) =
+                    state.random_categorical_with_mode(&logits, -1, CategoricalSamplingMode::HighPrecision).unwrap();
+                let (reference_advanced_state, _) = reference_state
+                    .random_categorical_with_mode(&reference_logits, -1, CategoricalSamplingMode::HighPrecision)
+                    .unwrap();
+                assert_eq!(
+                    values_from_bytes::<i32>(&device_samples.copy_to_host().unwrap()),
+                    vec![1, 2],
+                    "{algorithm} {data_type}",
+                );
+                assert_eq!(
+                    device_advanced_state.copy_to_host().unwrap(),
+                    reference_advanced_state.logical_bytes(),
+                    "{algorithm} {data_type}",
+                );
+            }
+        }
+
+        // A zero first uniform exercises the rare tail where an ordinary `log(1 - x)` loses the distinction from zero.
+        let (state, _) = rng_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[0u64, 0x1badd8a64e5859ae]);
+        let logits = replicated_array(&domain, &mesh, DataType::F32, &[2], values_to_bytes(&[-16f32, 0.0]).as_slice());
+        for (mode, expected) in
+            [(CategoricalSamplingMode::LowPrecision, 1i32), (CategoricalSamplingMode::HighPrecision, 0)]
+        {
+            let (_, samples) = state.random_categorical_with_mode(&logits, 0, mode).unwrap();
+            assert_eq!(values_from_bytes::<i32>(&samples.copy_to_host().unwrap()), vec![expected], "{mode:?}");
+        }
     }
 
     #[test]

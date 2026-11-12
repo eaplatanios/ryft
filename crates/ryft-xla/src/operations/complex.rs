@@ -164,3 +164,31 @@ pub(crate) fn lower_select_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
         .unwrap()
         .as_ref())
 }
+
+#[cfg(test)]
+mod tests {
+    use num_complex::Complex;
+    use pretty_assertions::assert_eq;
+    use ryft_core::{Conjugate, Real, differentiate_at};
+
+    use crate::Session;
+    use crate::domains::tests::domain_mesh;
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+
+    use super::*;
+
+    #[test]
+    fn test_conjugate_operation_lower_differentiation() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let z = Complex::new(0.7f32, -0.3);
+        let input = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[z]));
+
+        // The gradient of the real-valued |z|² = Re(z · conj(z)) is 2 · conj(z). Its pullback lowers `conjugate`
+        // together with `real` and `complex`.
+        let gradient =
+            differentiate_at(input).gradient(|z| (z.clone() * z.conjugate().unwrap()).real().unwrap()).unwrap();
+        assert_eq!(values_from_bytes::<Complex<f32>>(&gradient.copy_to_host().unwrap()), [(z + z).conj()]);
+    }
+}

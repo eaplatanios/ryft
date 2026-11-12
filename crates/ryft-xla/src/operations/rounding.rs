@@ -44,3 +44,68 @@ impl LowerableOperation for RoundOperation<ArrayType> {
         Ok(vec![result.result(0).expect("stablehlo.round_nearest_even should return one result").as_ref()])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use ryft_core::{Ceil, DataType, Floor, Round};
+
+    use crate::Session;
+    use crate::domains::tests::domain_mesh;
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+
+    // Signed zeros, quarters, and ties around zero and one, compared by encoding so that the sign of a zero result and
+    // the rounding direction at ties are both observable.
+    const F32_INPUTS: [f32; 8] = [-0f32, 0.0, -0.25, 0.25, -0.5, 0.5, 1.5, 2.5];
+
+    // The F8E8M0FNU encodings of 0.25, 0.5, 1.0, and NaN.
+    const F8E8M0FNU_INPUTS: [u8; 4] = [125, 126, 127, 255];
+
+    #[test]
+    fn test_floor_operation_lower() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[8], &values_to_bytes(&F32_INPUTS));
+        assert_eq!(
+            values_from_bytes::<u32>(&input.floor().unwrap().copy_to_host().unwrap()),
+            [-0f32, 0.0, -1.0, 0.0, -1.0, 0.0, 1.0, 2.0].map(f32::to_bits),
+        );
+
+        // Exponent-only floats cannot represent zero, so rounding down to zero produces NaN instead of failing.
+        let input = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[4], &F8E8M0FNU_INPUTS);
+        assert_eq!(input.floor().unwrap().copy_to_host().unwrap(), [255, 255, 127, 255]);
+    }
+
+    #[test]
+    fn test_ceil_operation_lower() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[8], &values_to_bytes(&F32_INPUTS));
+        assert_eq!(
+            values_from_bytes::<u32>(&input.ceil().unwrap().copy_to_host().unwrap()),
+            [-0f32, 0.0, -0.0, 1.0, -0.0, 1.0, 2.0, 3.0].map(f32::to_bits),
+        );
+
+        // Rounding up stays representable in the exponent-only format, while NaN remains NaN.
+        let input = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[4], &F8E8M0FNU_INPUTS);
+        assert_eq!(input.ceil().unwrap().copy_to_host().unwrap(), [127, 127, 127, 255]);
+    }
+
+    #[test]
+    fn test_round_operation_lower() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[8], &values_to_bytes(&F32_INPUTS));
+        assert_eq!(
+            values_from_bytes::<u32>(&input.round().unwrap().copy_to_host().unwrap()),
+            [-0f32, 0.0, -0.0, 0.0, -0.0, 0.0, 2.0, 2.0].map(f32::to_bits),
+        );
+
+        // Exponent-only floats cannot represent zero, so rounding to zero produces NaN instead of failing.
+        let input = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[4], &F8E8M0FNU_INPUTS);
+        assert_eq!(input.round().unwrap().copy_to_host().unwrap(), [255, 255, 127, 255]);
+    }
+}

@@ -242,16 +242,219 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
-    use ryft_core::{Placeholder, ReductionKind, Shape};
+    use ryft_core::{Clamp, DeviceMesh, Max, Min, Placeholder, ReductionKind, Shape};
 
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, lowered_reduce_module,
     };
     use crate::experimental::ops::{Constant, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::tests::execution_client;
+    use crate::tests::{execution_client, replicated_array, values_to_bytes};
+    use crate::{Array, Domain, Session};
 
     use super::*;
+
+    /// Uploads complex operands whose lexicographic order is decided by the real components, by the imaginary
+    /// components, by signed zeros that compare equal, and by NaN payloads in either component.
+    fn complex_operands<'c>(
+        domain: &Domain<'c>,
+        mesh: &DeviceMesh,
+    ) -> ([Complex<f32>; 5], [Complex<f32>; 5], Array<'c>, Array<'c>) {
+        let left = [
+            Complex::new(1f32, 100.0),
+            Complex::new(1.0, 2.0),
+            Complex::new(-0.0, 0.0),
+            Complex::new(f32::from_bits(0x7fc0_1234), 1.0),
+            Complex::new(1.0, f32::from_bits(0x7fc0_5678)),
+        ];
+        let right = [
+            Complex::new(2f32, 0.0),
+            Complex::new(1.0, 3.0),
+            Complex::new(0.0, -0.0),
+            Complex::new(2.0, 3.0),
+            Complex::new(1.0, 4.0),
+        ];
+        let left_array = replicated_array(domain, mesh, DataType::C64, &[5], values_to_bytes(&left).as_slice());
+        let right_array = replicated_array(domain, mesh, DataType::C64, &[5], values_to_bytes(&right).as_slice());
+        (left, right, left_array, right_array)
+    }
+
+    #[test]
+    fn test_max_operation_lower() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Boolean maxima are disjunctions.
+        let booleans = replicated_array(&domain, &mesh, DataType::Boolean, &[2], &[0, 1]);
+        let truth = replicated_array(&domain, &mesh, DataType::Boolean, &[], &[1]);
+        assert_eq!(booleans.max(&truth).unwrap().copy_to_host().unwrap(), values_to_bytes(&[true, true]));
+    }
+
+    #[test]
+    fn test_max_operation_lower_complex() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Complete operands compare lexicographically, and ties and unordered comparisons select the right operand.
+        // Exact byte comparisons also check signed zeros and NaN payloads in both operand orders.
+        let (left, right, left_array, right_array) = complex_operands(&domain, &mesh);
+        assert_eq!(
+            left_array.max(&right_array).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[right[0], right[1], right[2], right[3], right[4]]),
+        );
+        assert_eq!(
+            right_array.max(&left_array).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[right[0], right[1], left[2], left[3], left[4]]),
+        );
+
+        // A real rank-0 operand broadcasts into a complex vector after promotion to complex double precision.
+        let complex = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[2],
+            values_to_bytes(&[Complex::new(1f64, 2.0), Complex::new(3.0, 4.0)]).as_slice(),
+        );
+        let real = replicated_array(&domain, &mesh, DataType::F64, &[], values_to_bytes(&[2f64]).as_slice());
+        let output = complex.max(&real).unwrap();
+        assert_eq!(output.data_type(), DataType::C128);
+        assert_eq!(output.shape().dimensions(), &[2]);
+        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[Complex::new(2f64, 0.0), Complex::new(3.0, 4.0)]));
+    }
+
+    #[test]
+    fn test_min_operation_lower() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Boolean minima are conjunctions.
+        let booleans = replicated_array(&domain, &mesh, DataType::Boolean, &[2], &[0, 1]);
+        let truth = replicated_array(&domain, &mesh, DataType::Boolean, &[], &[1]);
+        assert_eq!(booleans.min(&truth).unwrap().copy_to_host().unwrap(), values_to_bytes(&[false, true]));
+    }
+
+    #[test]
+    fn test_min_operation_lower_complex() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Complete operands compare lexicographically, and ties and unordered comparisons select the right operand.
+        // Exact byte comparisons also check signed zeros and NaN payloads in both operand orders.
+        let (left, right, left_array, right_array) = complex_operands(&domain, &mesh);
+        assert_eq!(
+            left_array.min(&right_array).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[left[0], left[1], right[2], right[3], right[4]]),
+        );
+        assert_eq!(
+            right_array.min(&left_array).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[left[0], left[1], left[2], left[3], left[4]]),
+        );
+
+        // A real rank-0 operand broadcasts into a complex vector after promotion to complex double precision.
+        let complex = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[2],
+            values_to_bytes(&[Complex::new(1f64, 2.0), Complex::new(3.0, 4.0)]).as_slice(),
+        );
+        let real = replicated_array(&domain, &mesh, DataType::F64, &[], values_to_bytes(&[2f64]).as_slice());
+        let output = complex.min(&real).unwrap();
+        assert_eq!(output.data_type(), DataType::C128);
+        assert_eq!(output.shape().dimensions(), &[2]);
+        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[Complex::new(1f64, 2.0), Complex::new(2.0, 0.0)]));
+    }
+
+    #[test]
+    fn test_clamp_operation_lower() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Floating-point values below, inside, and above the interval keep their exact bytes, NaN inputs propagate,
+        // and crossed bounds produce the upper bound.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::F32,
+            &[4],
+            values_to_bytes(&[-2.5f32, 0.5, 2.5, f32::NAN]).as_slice(),
+        );
+        let lower = replicated_array(&domain, &mesh, DataType::F32, &[], values_to_bytes(&[-1f32]).as_slice());
+        let upper = replicated_array(&domain, &mesh, DataType::F32, &[], values_to_bytes(&[1f32]).as_slice());
+        assert_eq!(
+            input.clamp(&lower, &upper).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[-1f32, 0.5, 1.0, f32::NAN]),
+        );
+        assert_eq!(
+            input.clamp(&upper, &lower).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[-1f32, -1.0, -1.0, f32::NAN]),
+        );
+
+        // Array bounds broadcast to the result.
+        let bounds =
+            replicated_array(&domain, &mesh, DataType::F32, &[4], values_to_bytes(&[0f32, 1.0, 2.0, 3.0]).as_slice());
+        assert_eq!(
+            input.clamp(&lower, &bounds).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[-1f32, 0.5, 2.0, f32::NAN]),
+        );
+
+        // Integer inputs clamp against rank-0 bounds.
+        let integers =
+            replicated_array(&domain, &mesh, DataType::I32, &[3], values_to_bytes(&[-5i32, 2, 9]).as_slice());
+        let integer_lower = replicated_array(&domain, &mesh, DataType::I32, &[], values_to_bytes(&[0i32]).as_slice());
+        let integer_upper = replicated_array(&domain, &mesh, DataType::I32, &[], values_to_bytes(&[5i32]).as_slice());
+        assert_eq!(
+            integers.clamp(&integer_lower, &integer_upper).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[0i32, 2, 5]),
+        );
+
+        // Boolean inputs clamp with conjunction and disjunction.
+        let booleans = replicated_array(&domain, &mesh, DataType::Boolean, &[2], &[0, 1]);
+        let truth = replicated_array(&domain, &mesh, DataType::Boolean, &[], &[1]);
+        assert_eq!(booleans.clamp(&truth, &truth).unwrap().copy_to_host().unwrap(), values_to_bytes(&[true, true]));
+
+        // All three inputs take part in promotion before selection, preserving integers that would round in `f32`.
+        let input = replicated_array(&domain, &mesh, DataType::I64, &[], values_to_bytes(&[16777217i64]).as_slice());
+        let lower = replicated_array(&domain, &mesh, DataType::F32, &[], values_to_bytes(&[0f32]).as_slice());
+        let upper = replicated_array(&domain, &mesh, DataType::F64, &[], values_to_bytes(&[2e7f64]).as_slice());
+        let output = input.clamp(&lower, &upper).unwrap();
+        assert_eq!(output.data_type(), DataType::F64);
+        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[16777217f64]));
+
+        // Complex inputs compose the lexicographic extrema, so the imaginary part decides between equal real parts.
+        let complex = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[3],
+            values_to_bytes(&[Complex::new(1f32, -1.0), Complex::new(1.0, 1.0), Complex::new(1.0, 3.0)]).as_slice(),
+        );
+        let complex_lower = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[],
+            values_to_bytes(&[Complex::new(1f32, 0.0)]).as_slice(),
+        );
+        let complex_upper = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[],
+            values_to_bytes(&[Complex::new(1f32, 2.0)]).as_slice(),
+        );
+        assert_eq!(
+            complex.clamp(&complex_lower, &complex_upper).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[Complex::new(1f32, 0.0), Complex::new(1.0, 1.0), Complex::new(1.0, 2.0)]),
+        );
+    }
 
     #[test]
     fn test_to_mlir_module_for_plain_program_lowers_boolean_and_complex_extrema() {

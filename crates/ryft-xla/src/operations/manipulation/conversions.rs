@@ -1039,17 +1039,21 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
 
 #[cfg(test)]
 mod tests {
+    use half::{bf16, f16};
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        DimensionBounds, DimensionType, GuardOperation, Operation as CoreOperation, Placeholder, TypeError,
+        Array as CoreArray, ConvertElementType, DimensionBounds, DimensionType, GuardOperation,
+        Operation as CoreOperation, Placeholder, ReducePrecision, TypeError, Typed,
     };
 
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{ProgramBuilder, dynamic_dimension};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{ArrayConstant, Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::to_mlir_module_for_program;
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::{Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1123,6 +1127,308 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_convert_element_type() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[0.5f32, 1.25, 2.0, 3.75]));
+        let output = input.convert_element_type(DataType::F8E4M3FN).unwrap();
+        assert_eq!(output.copy_to_host().unwrap(), vec![0x30, 0x3a, 0x40, 0x47]);
+    }
+
+    #[test]
+    fn test_lower_convert_element_type_integer_rounding() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Integer precision above a BF16 rounding midpoint must survive the conversion.
+        let midpoint = (1u64 << 60) + (1u64 << 52);
+        let values = [midpoint - 1, midpoint, midpoint + 1, u64::MAX];
+        let input = replicated_array(&domain, &mesh, DataType::U64, &[values.len()], &values_to_bytes(&values));
+        let output = input.convert_element_type(DataType::BF16).unwrap();
+        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[0x5d80u16, 0x5d80, 0x5d81, 0x5f80]));
+
+        // Rounding direction is measured by magnitude for negative integers, including the signed extrema.
+        let midpoint = midpoint as i64;
+        let values = [-midpoint - 1, -midpoint, -midpoint + 1, i64::MIN, i64::MAX];
+        let input = replicated_array(&domain, &mesh, DataType::I64, &[values.len()], &values_to_bytes(&values));
+        let output = input.convert_element_type(DataType::BF16).unwrap();
+        assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&[0xdd81u16, 0xdd80, 0xdd80, 0xdf00, 0x5f00]));
+
+        // Exponent-only targets round wide integers once as well.
+        let midpoint = 3u64 << 60;
+        let values = [midpoint - 1, midpoint, midpoint + 1];
+        let input = replicated_array(&domain, &mesh, DataType::U64, &[values.len()], &values_to_bytes(&values));
+        let output = input.convert_element_type(DataType::F8E8M0FNU).unwrap();
+        assert_eq!(output.copy_to_host().unwrap(), vec![0xbc, 0xbd, 0xbd]);
+    }
+
+    #[test]
+    fn test_lower_convert_element_type_f64_rounding() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        // Converting `f64` to a narrower float rounds once, so values just below, at, and just above a rounding
+        // midpoint land on the correct neighbor for both signs, at normal and subnormal midpoints alike.
+        for (data_type, midpoint, expected) in [
+            (DataType::BF16, 1.00390625f64, [0x3f80u16, 0x3f80, 0x3f81]),
+            (DataType::F16, 1.00048828125f64, [0x3c00u16, 0x3c00, 0x3c01]),
+            (DataType::BF16, 2f64.powi(-134), [0, 0, 1]),
+            (DataType::F16, 2f64.powi(-25), [0, 0, 1]),
+        ] {
+            let values = [
+                midpoint.next_down(),
+                midpoint,
+                midpoint.next_up(),
+                -midpoint.next_down(),
+                -midpoint,
+                -midpoint.next_up(),
+                0.0,
+                -0.0,
+                f64::from_bits(1),
+                -f64::from_bits(1),
+            ];
+            let expected = [
+                expected[0],
+                expected[1],
+                expected[2],
+                expected[0] | 0x8000,
+                expected[1] | 0x8000,
+                expected[2] | 0x8000,
+                0,
+                0x8000,
+                0,
+                0x8000,
+            ];
+            let input = replicated_array(&domain, &mesh, DataType::F64, &[values.len()], &values_to_bytes(&values));
+            let output = input.convert_element_type(data_type).unwrap();
+            assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&expected), "{data_type}");
+        }
+    }
+
+    #[test]
+    fn test_lower_convert_element_type_finite_formats() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Formats without infinities or NaNs saturate infinities and finite overflow, and NaNs select the positive
+        // maximum. Unsigned F8E8M0FNU has a NaN but no zero or sign, so zeros, negative values, infinities, and NaNs
+        // all map to its NaN encoding.
+        let values = [0f32, -0.0, 1.0, -1.0, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 100.0, -100.0];
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
+        for (data_type, expected) in [
+            (DataType::F4E2M1FN, vec![0x00u8, 0x08, 0x02, 0x0a, 0x07, 0x07, 0x0f, 0x07, 0x0f]),
+            (DataType::F6E2M3FN, vec![0x00, 0x20, 0x08, 0x28, 0x1f, 0x1f, 0x3f, 0x1f, 0x3f]),
+            (DataType::F6E3M2FN, vec![0x00, 0x20, 0x0c, 0x2c, 0x1f, 0x1f, 0x3f, 0x1f, 0x3f]),
+            (DataType::F8E8M0FNU, vec![0xff, 0xff, 0x7f, 0xff, 0xff, 0xff, 0xff, 0x86, 0xff]),
+        ] {
+            let output = input.convert_element_type(data_type).unwrap();
+            assert_eq!(output.copy_to_host().unwrap(), expected, "{data_type}");
+        }
+
+        // Exponent-only conversion has an upward normal tie and a distinct lowest exponent boundary.
+        let minimum = 2f64.powi(-127);
+        let midpoint = 3f64;
+        let values =
+            [minimum.next_down(), minimum, minimum.next_up(), midpoint.next_down(), midpoint, midpoint.next_up()];
+        let input = replicated_array(&domain, &mesh, DataType::F64, &[values.len()], &values_to_bytes(&values));
+        let output = input.convert_element_type(DataType::F8E8M0FNU).unwrap();
+        assert_eq!(output.copy_to_host().unwrap(), vec![0, 0, 1, 128, 129, 129]);
+    }
+
+    #[test]
+    fn test_lower_convert_element_type_fp6_to_f32() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let encodings = (0u8..64).collect::<Vec<_>>();
+        // Every FP6 encoding is finite. Exact F32 bytes distinguish both zeros and cover the boundary between
+        // subnormal and normal values and the largest exponent, which must not be mistaken for an infinity or NaN.
+        for (data_type, magnitudes) in [
+            (
+                DataType::F6E2M3FN,
+                [
+                    0f32, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.125, 1.25, 1.375, 1.5, 1.625, 1.75,
+                    1.875, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5, 3.75, 4.0, 4.5, 5.0, 5.5, 6.0, 6.5, 7.0, 7.5,
+                ],
+            ),
+            (
+                DataType::F6E3M2FN,
+                [
+                    0f32, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375, 0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5,
+                    1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0, 28.0,
+                ],
+            ),
+        ] {
+            let input = replicated_array(&domain, &mesh, data_type, &[64], &encodings);
+            let output = input.convert_element_type(DataType::F32).unwrap();
+            let expected = magnitudes.into_iter().chain(magnitudes.map(|value| -value)).collect::<Vec<_>>();
+            assert_eq!(output.copy_to_host().unwrap(), values_to_bytes(&expected), "{data_type}");
+        }
+    }
+
+    #[test]
+    fn test_lower_convert_element_type_complex_to_boolean() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        // Purely imaginary values and NaNs in either component are nonzero, whereas signed zeros are false.
+        let components = [0f32, 0.0, 0.0, 1.0, -2.0, 0.0, 0.0, f32::NAN, f32::NAN, 0.0, -0.0, -0.0];
+        let input = replicated_array(&domain, &mesh, DataType::C64, &[6], &values_to_bytes(&components));
+        let output = input.convert_element_type(DataType::Boolean).unwrap();
+        assert_eq!(output.copy_to_host().unwrap(), vec![0, 1, 1, 1, 1, 0]);
+    }
+
+    #[test]
+    fn test_lower_convert_element_type_sub_byte_integers() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // The same physical bit represents -1 for I1 and +1 for U1 and Boolean.
+        for (data_type, expected) in
+            [(DataType::I1, vec![0f32, -1.0]), (DataType::U1, vec![0f32, 1.0]), (DataType::Boolean, vec![0f32, 1.0])]
+        {
+            let input = replicated_array(&domain, &mesh, data_type, &[2], &[0, 1]);
+            let output = input.convert_element_type(DataType::F32).unwrap();
+            assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), expected, "{data_type}");
+        }
+
+        // Real inputs truncate and saturate to the logical one-bit range, unlike Boolean truthiness.
+        let values = [0f32, 1.9, 2.0, 3.0, -1.9, -2.0, 128.0, -129.0];
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
+        for (data_type, expected) in [
+            (DataType::I1, vec![0u8, 0, 0, 0, 1, 1, 0, 1]),
+            (DataType::U1, vec![0, 1, 1, 1, 0, 0, 1, 0]),
+            (DataType::Boolean, vec![0, 1, 1, 1, 1, 1, 1, 1]),
+        ] {
+            let output = input.convert_element_type(data_type).unwrap();
+            assert_eq!(output.copy_to_host().unwrap(), expected, "{data_type}");
+        }
+
+        // Integer inputs keep only their lowest bit.
+        let integers = [-129i32, -2, -1, 0, 1, 2, 128, 129];
+        let input = replicated_array(&domain, &mesh, DataType::I32, &[integers.len()], &values_to_bytes(&integers));
+        for data_type in [DataType::I1, DataType::U1] {
+            let output = input.convert_element_type(data_type).unwrap();
+            assert_eq!(output.copy_to_host().unwrap(), vec![1, 0, 1, 0, 1, 0, 0, 1], "{data_type}");
+        }
+
+        // Wider carriers also saturate at their logical limits, including infinities, and NaNs convert to zero.
+        let values = [
+            -129f32,
+            -9.0,
+            -8.0,
+            -3.0,
+            -2.0,
+            -1.9,
+            0.0,
+            1.0,
+            2.0,
+            3.0,
+            7.0,
+            8.0,
+            15.0,
+            16.0,
+            127.0,
+            128.0,
+            255.0,
+            256.0,
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            f32::NAN,
+        ];
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
+        for (data_type, expected) in [
+            (DataType::I2, vec![2u8, 2, 2, 2, 2, 3, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 1, 0]),
+            (DataType::I4, vec![8, 8, 8, 13, 14, 15, 0, 1, 2, 3, 7, 7, 7, 7, 7, 7, 7, 7, 8, 7, 0]),
+            (DataType::U2, vec![0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 0, 3, 0]),
+            (DataType::U4, vec![0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 7, 8, 15, 15, 15, 15, 15, 15, 0, 15, 0]),
+        ] {
+            let output = input.convert_element_type(data_type).unwrap();
+            assert_eq!(output.copy_to_host().unwrap(), expected, "{data_type}");
+        }
+    }
+
+    #[test]
+    fn test_lower_bitcast_to_mlir() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, -0.0]));
+        let integers = input.bitcast_element_type(DataType::I32).unwrap();
+        assert_eq!(values_from_bytes::<i32>(&integers.copy_to_host().unwrap()), vec![0x3f800000, i32::MIN]);
+
+        // A narrower element type appends a trailing axis that splits each element's bits, starting from the least
+        // significant ones, and widening removes that axis and restores the original bits.
+        let halves = input.bitcast_element_type(DataType::U16).unwrap();
+        assert_eq!(halves.shape().dimensions(), &[2, 2]);
+        assert_eq!(values_from_bytes::<u16>(&halves.copy_to_host().unwrap()), vec![0x0000, 0x3f80, 0x0000, 0x8000]);
+        let restored = halves.bitcast_element_type(DataType::F32).unwrap();
+        assert_eq!(restored.shape().dimensions(), &[2]);
+        assert_eq!(restored.copy_to_host().unwrap(), values_to_bytes(&[1f32, -0.0]));
+    }
+
+    #[test]
+    fn test_lower_bitcast_to_mlir_one_bit() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        // One-bit targets split a byte into eight elements ordered from the least significant bit.
+        let input = replicated_array(&domain, &mesh, DataType::U8, &[], &[0xab]);
+        for data_type in [DataType::I1, DataType::U1] {
+            let bits = input.bitcast_element_type(data_type).unwrap();
+            assert_eq!(bits.shape().dimensions(), &[8]);
+            assert_eq!(bits.copy_to_host().unwrap(), vec![1, 1, 0, 1, 0, 1, 0, 1], "{data_type}");
+            let restored = bits.bitcast_element_type(DataType::U8).unwrap();
+            assert_eq!(restored.copy_to_host().unwrap(), vec![0xab], "{data_type}");
+        }
+        let pair = replicated_array(&domain, &mesh, DataType::U2, &[], &[3]);
+        let bits = pair.bitcast_element_type(DataType::U1).unwrap();
+        assert_eq!(bits.copy_to_host().unwrap(), vec![1, 1]);
+        let restored = bits.bitcast_element_type(DataType::U2).unwrap();
+        assert_eq!(restored.copy_to_host().unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn test_lower_bitcast_to_mlir_fp6() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let encodings = (0u8..64).collect::<Vec<_>>();
+        for (data_type, other_data_type) in
+            [(DataType::F6E2M3FN, DataType::F6E3M2FN), (DataType::F6E3M2FN, DataType::F6E2M3FN)]
+        {
+            let input = replicated_array(&domain, &mesh, data_type, &[64], &encodings);
+
+            // Same-width reinterpretation preserves the complete encoding, including both signed zeros.
+            let output = input.bitcast_element_type(other_data_type).unwrap();
+            assert_eq!(output.shape().dimensions(), &[64]);
+            assert_eq!(output.copy_to_host().unwrap(), encodings, "{data_type} to {other_data_type}");
+
+            // Packing uses six logical bits, not the eight-bit host carrier. Splitting appends exactly six one-bit
+            // or three two-bit elements, ordered from the least significant bits, and widening removes that axis.
+            for (pieces_type, bit_width) in [(DataType::U1, 1), (DataType::U2, 2)] {
+                let pieces = input.bitcast_element_type(pieces_type).unwrap();
+                let piece_count = 6 / bit_width;
+                let expected = encodings
+                    .iter()
+                    .flat_map(|&encoding| {
+                        (0..piece_count).map(move |piece| (encoding >> (piece * bit_width)) & ((1 << bit_width) - 1))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(pieces.shape().dimensions(), &[64, piece_count]);
+                assert_eq!(pieces.copy_to_host().unwrap(), expected, "{data_type} to {pieces_type}");
+                let restored = pieces.bitcast_element_type(data_type).unwrap();
+                assert_eq!(restored.r#type().as_ref(), input.r#type().as_ref());
+                assert_eq!(restored.copy_to_host().unwrap(), encodings, "{data_type} from {pieces_type}");
+            }
+        }
+    }
+
+    #[test]
     fn test_lower_bitcast_to_mlir_unbounded_dimensions() {
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
         let mut builder = ProgramBuilder::new();
@@ -1190,6 +1496,100 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_lower_reduce_precision_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Each case lists element encodings covering ties, rounding carries into the exponent, overflow, underflow,
+        // subnormals, signed zeros, infinities, and NaN payloads, along with the simulated formats to reduce them to.
+        let f16s = [
+            1.125f32,
+            1.375,
+            1.00048828125,
+            65504.0,
+            255.875,
+            256.0,
+            0.015625,
+            0.0078125,
+            -0.0078125,
+            -0.0,
+            f32::INFINITY,
+        ]
+        .map(f16::from_f32)
+        .into_iter()
+        .chain([f16::from_bits(0x0001), f16::from_bits(0x0100), f16::from_bits(0x7c01), f16::from_bits(0xfe00)])
+        .collect::<Vec<_>>();
+        let bf16s = [1.0625f32, 1.1875, 65280.0, 65536.0, 6.1035156e-5, 3.0517578e-5, -3.0517578e-5, f32::NEG_INFINITY]
+            .map(bf16::from_f32)
+            .into_iter()
+            .chain([bf16::from_bits(0x0001), bf16::from_bits(0x0010), bf16::from_bits(0x7f81), bf16::from_bits(0xffc0)])
+            .collect::<Vec<_>>();
+        let f32s = [
+            1.00048828125f32,
+            1.00146484375,
+            f32::from_bits(0x3f801008),
+            65519.0,
+            65520.0,
+            -1e10,
+            6.1035156e-5,
+            3.0517578e-5,
+            -3.0517578e-5,
+            6.1020255e-5,
+            1.5,
+            3.0,
+            -0.0,
+            f32::INFINITY,
+            f32::from_bits(1),
+            f32::from_bits(0x7fc00001),
+            f32::from_bits(0xff800001),
+            f32::from_bits(0x7fffffff),
+        ];
+        let f64s = [
+            1f64 + 2f64.powi(-24),
+            1.0 + 3.0 * 2f64.powi(-24),
+            0.1,
+            f64::from(f32::MAX) + 2f64.powi(103),
+            2f64.powi(-126),
+            2f64.powi(-127),
+            -2f64.powi(-127),
+            f64::NEG_INFINITY,
+            f64::from_bits(1),
+            f64::from_bits(0x7ff0000000000001),
+        ];
+        let cases = [
+            (DataType::F16, values_to_bytes(&f16s), [(5, 2), (4, 10), (3, 1), (5, 0), (5, 10)]),
+            (DataType::BF16, values_to_bytes(&bf16s), [(8, 3), (5, 7), (5, 2), (8, 0), (8, 7)]),
+            (DataType::F32, values_to_bytes(&f32s), [(5, 10), (8, 7), (5, 0), (11, 30), (8, 23)]),
+            (DataType::F64, values_to_bytes(&f64s), [(8, 23), (11, 30), (5, 10), (5, 0), (11, 52)]),
+        ];
+        for (data_type, bytes, formats) in cases {
+            let count = bytes.len() / (data_type.bit_width() / 8);
+            let device_input = replicated_array(&domain, &mesh, data_type, &[count], &bytes);
+            let reference_input =
+                CoreArray::from_logical_bytes(ArrayType::new_static(data_type, [count]), &bytes).unwrap();
+            for (exponent_bits, mantissa_bits) in formats {
+                // NaN payloads are backend defined (e.g., XLA's CPU backend quiets `bf16` NaNs), so NaNs only need to
+                // agree on being NaN, whereas every other encoding, including signed zeros, must agree exactly. The
+                // widening to `f64` is exact for every one of these element types.
+                let device_output = device_input.reduce_precision(exponent_bits, mantissa_bits).unwrap();
+                let device_output = CoreArray::from_logical_bytes(
+                    ArrayType::new_static(data_type, [count]),
+                    &device_output.copy_to_host().unwrap(),
+                )
+                .unwrap();
+                let reference_output = reference_input.reduce_precision(exponent_bits, mantissa_bits).unwrap();
+                let encoding = |value: f64| if value.is_nan() { f64::NAN.to_bits() } else { value.to_bits() };
+                assert_eq!(
+                    device_output.to_f64s().into_iter().map(encoding).collect::<Vec<_>>(),
+                    reference_output.to_f64s().into_iter().map(encoding).collect::<Vec<_>>(),
+                    "`{data_type}` reduced to {exponent_bits} exponent and {mantissa_bits} mantissa bits",
+                );
+            }
+        }
     }
 
     #[test]

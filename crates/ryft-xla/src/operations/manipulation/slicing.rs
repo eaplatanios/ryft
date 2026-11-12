@@ -632,7 +632,7 @@ mod tests {
         Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, Context, DataType, Dimension as CoreDimension,
         DimensionBounds, DimensionFromScalarOperation, DimensionVariable, DynamicSlice, DynamicSliceOperation,
         DynamicUpdateSlice, DynamicUpdateSliceOperation, EagerContext, Linearization, Placeholder,
-        ReverseModeDifferentiate, Shape, TypedProgram, UpdateSliceOperation, ValueProjection,
+        ReverseModeDifferentiate, Shape, Slice, TypedProgram, UpdateSlice, UpdateSliceOperation, ValueProjection,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -645,7 +645,7 @@ mod tests {
         ArrayConstant, Constant, FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder,
     };
     use crate::operations::constants::dynamic_constructor_types;
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, Options, Session, to_mlir_module_for_program};
 
     use super::*;
@@ -845,6 +845,27 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_slice_operation_lower() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
+        let output = input.slice(&[1], &[3], &[1]).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_update_slice_operation_lower() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
+        let update = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[5f32, 6.0]));
+        let output = input.update_slice(&update, &[1]).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![1.0, 5.0, 6.0, 4.0]);
     }
 
     #[test]

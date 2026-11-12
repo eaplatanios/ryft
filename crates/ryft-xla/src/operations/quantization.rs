@@ -545,15 +545,16 @@ mod tests {
         AddOperation, Array as CoreArray, ArrayIrType, ArrayOperation, BlockQuantize, BlockQuantizedValue,
         BlockScaledDotConfiguration, ConvertElementType, Device, DeviceMesh, DimensionBounds, DimensionVariable,
         DotDimensionNumbers, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProjectedContext,
-        RandomAlgorithm, Sharding, block_scaled_dot, differentiate_at,
+        RandomAlgorithm, ScaledDot, Sharding, Typed, block_scaled_dot, differentiate_at, f4e2m1fn, f8e4m3fn,
     };
 
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::{
         MixedValue, ProgramBuilder, add_jit_call, execute_mixed_program, unproject_plain_program,
     };
     use crate::experimental::ops::{ArrayConstant, Constant, Program, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, CompiledFunction, Domain, FromPjrt, Session, compile, to_mlir_module_for_program};
 
     use super::*;
@@ -680,6 +681,46 @@ mod tests {
         assert!(module.contains("stablehlo.optimization_barrier %arg0, %arg1 :"));
         assert!(module.contains("stablehlo.composite \"xla.scaled_dot\" %0#0, %0#1"));
         assert!(!module.contains("func.call @xla.scaled_dot"));
+    }
+
+    #[test]
+    fn test_scaled_dot_operation_lower_matches_reference_backend() {
+        // NVFP4 operands (`f4e2m1fn [2, 16]` elements with one `f8e4m3fn` scale per block of 16) produce the same
+        // `f32` product on both backends. Every element, scale, product, and sum is exact, so the comparison is exact
+        // whether XLA runs the portable decomposition of the `xla.scaled_dot` composite or a native kernel.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let element_candidates = [0f64, 0.5, 1.0, 1.5, 2.0, 3.0, -0.5, -1.0];
+        let elements = |seed: usize| {
+            let values = (0..32)
+                .map(|index| f4e2m1fn::from_f64(element_candidates[(index * 5 + seed) % 8]).unwrap())
+                .collect::<Vec<_>>();
+            CoreArray::from_elements(ArrayType::new_static(DataType::F4E2M1FN, [2, 16]), &values).unwrap()
+        };
+        let scales = |values: [f64; 2]| {
+            let values = values.map(|value| f8e4m3fn::from_f64(value).unwrap());
+            CoreArray::from_elements(ArrayType::new_static(DataType::F8E4M3FN, [2, 1]), &values).unwrap()
+        };
+        let reference_lhs = BlockQuantizedValue::new(elements(0), scales([0.5, 2.0]));
+        let reference_rhs = BlockQuantizedValue::new(elements(3), scales([2.0, 0.5]));
+        let device = |value: &BlockQuantizedValue<CoreArray>| {
+            BlockQuantizedValue::new(
+                replicated_array(&domain, &mesh, DataType::F4E2M1FN, &[2, 16], &value.elements.logical_bytes()),
+                replicated_array(&domain, &mesh, DataType::F8E4M3FN, &[2, 1], &value.scales.logical_bytes()),
+            )
+        };
+
+        let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
+        let product = device(&reference_lhs).scaled_dot(&device(&reference_rhs), Some(&dimensions), None).unwrap();
+        let reference_product = reference_lhs.scaled_dot(&reference_rhs, Some(&dimensions), None).unwrap();
+        assert_eq!(
+            product.r#type().into_owned(),
+            ArrayType::new_static(DataType::F32, [2, 2])
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+                .unwrap(),
+        );
+        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
     }
 
     #[test]

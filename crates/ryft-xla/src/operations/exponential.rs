@@ -722,13 +722,23 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayOperation, Dimension as CoreDimension, Placeholder, Shape};
+    use std::f64::consts::{FRAC_PI_2, LN_2, PI};
 
+    use half::f16;
+    use indoc::indoc;
+    use num_complex::Complex;
+    use pretty_assertions::assert_eq;
+    use ryft_core::{
+        ArrayOperation, Dimension as CoreDimension, ExpM1, Ln1p, Log, LogAddExp, Logistic, Placeholder, Shape,
+        differentiate_at,
+    };
+
+    use crate::Session;
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{ProgramBuilder, dynamic_dimension, lowered_unary_module};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::ArrayConstant;
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
 
     use super::*;
 
@@ -782,6 +792,17 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_log_operation_lower_f8e8m0fnu() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // An exponent-only logarithm of one is an unrepresentable zero and converts to NaN.
+        let input = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[1], &[127]);
+        assert_eq!(input.log().unwrap().copy_to_host().unwrap(), vec![255]);
     }
 
     #[test]
@@ -843,6 +864,53 @@ mod tests {
     }
 
     #[test]
+    fn test_logistic_operation_lower_saturated() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // The derivative `logistic(x) · logistic(-x)` evaluates both sign branches of the lowering, so neither
+        // saturated tail may overflow its exponential. XLA can flush subnormal results, so these tails stay above
+        // the backend's exponential underflow floor. XLA's `exp` is not correctly rounded, hence the relative
+        // tolerances.
+        let expected = (-700f64).exp();
+        let input =
+            replicated_array(&domain, &mesh, DataType::F64, &[2], values_to_bytes(&[-700f64, 700.0]).as_slice());
+        let tangent = replicated_array(&domain, &mesh, DataType::F64, &[2], values_to_bytes(&[1f64, 1.0]).as_slice());
+        let (output, derivative) = differentiate_at(input).jvp(tangent, |input| input.logistic()).unwrap();
+        let output = values_from_bytes::<f64>(&output.copy_to_host().unwrap());
+        let derivative = values_from_bytes::<f64>(&derivative.copy_to_host().unwrap());
+        assert!((output[0] / expected - 1.0).abs() < 1e-12);
+        assert_eq!(output[1], 1.0);
+        assert!((derivative[0] / expected - 1.0).abs() < 1e-12);
+        assert!((derivative[1] / expected - 1.0).abs() < 1e-12);
+
+        // Complex inputs select the branch by their real component and keep exact zero imaginary components.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[2],
+            values_to_bytes(&[Complex::new(-700f64, 0.0), Complex::new(700.0, 0.0)]).as_slice(),
+        );
+        let tangent = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[2],
+            values_to_bytes(&[Complex::new(1f64, 0.0), Complex::new(1.0, 0.0)]).as_slice(),
+        );
+        let (output, derivative) = differentiate_at(input).jvp(tangent, |input| input.logistic()).unwrap();
+        let output = values_from_bytes::<Complex<f64>>(&output.copy_to_host().unwrap());
+        let derivative = values_from_bytes::<Complex<f64>>(&derivative.copy_to_host().unwrap());
+        assert!((output[0].re / expected - 1.0).abs() < 1e-12);
+        assert_eq!([output[0].im, output[1].re, output[1].im], [0.0, 1.0, 0.0]);
+        assert!((derivative[0].re / expected - 1.0).abs() < 1e-12);
+        assert!((derivative[1].re / expected - 1.0).abs() < 1e-12);
+        assert_eq!([derivative[0].im, derivative[1].im], [0.0, 0.0]);
+    }
+
+    #[test]
     fn test_to_mlir_module_for_plain_program_lowers_exp_m1_dynamic_shape() {
         assert_eq!(
             lowered_dynamic_unary_module(ArrayOperation::ExpM1(ExpM1Operation::new()), DataType::C128),
@@ -880,6 +948,63 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_lower_complex_exp_m1_to_mlir() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Tiny arguments keep both tiny components, and the real component keeps the `cos - 1` cancellation through
+        // `-2 sin²(imaginary / 2)`. The imaginary component keeps its tail after the real component has rounded to -1.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[3],
+            values_to_bytes(&[Complex::new(1e-20f64, 1e-20), Complex::new(0.0, 1e-10), Complex::new(-40.0, 1.0)])
+                .as_slice(),
+        );
+        let output = values_from_bytes::<Complex<f64>>(&input.exp_m1().unwrap().copy_to_host().unwrap());
+        assert_eq!(output.len(), 3);
+        assert_eq!(output[..2], [Complex::new(1e-20, 1e-20), Complex::new(-2.0 * (5e-11 * 5e-11), 1e-10)]);
+        assert!((output[2].re + 1.0).abs() <= f64::EPSILON);
+        assert!((output[2].im - (-40f64).exp() * 1f64.sin()).abs() < 1e-32);
+    }
+
+    #[test]
+    fn test_lower_complex_ln_1p_to_mlir() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // A near-zero input keeps both tiny components, and inputs on the negative real branch cut keep their side.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[5],
+            values_to_bytes(&[
+                Complex::new(1e-20f64, 1e-20),
+                Complex::new(-2.0, 0.0),
+                Complex::new(-2.0, -0.0),
+                Complex::new(-1.0, 1e-300),
+                Complex::new(f64::NAN, 0.0),
+            ])
+            .as_slice(),
+        );
+        let output = values_from_bytes::<Complex<f64>>(&input.ln_1p().unwrap().copy_to_host().unwrap());
+        assert_eq!(output.len(), 5);
+        assert_eq!(output[..3], [Complex::new(1e-20, 1e-20), Complex::new(0.0, PI), Complex::new(0.0, -PI)]);
+
+        // A tiny displacement from the branch point does not underflow before the logarithm is taken.
+        assert!((output[3].re + 690.7755278982137).abs() < 1e-12);
+        assert_eq!(output[3].im, FRAC_PI_2);
+
+        // A NaN component makes both output components NaN.
+        assert!(output[4].re.is_nan());
+        assert!(output[4].im.is_nan());
     }
 
     #[test]
@@ -933,5 +1058,108 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_lower_log_add_exp_to_mlir() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Narrow formats evaluate the whole composition in `f32` and round only the final output, here for an
+        // exponent-only format and for a half-precision format.
+        let left = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[1], &[127]);
+        let right = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[1], &[126]);
+        assert_eq!(left.log_add_exp(&right).unwrap().copy_to_host().unwrap(), vec![127]);
+        let left = replicated_array(
+            &domain,
+            &mesh,
+            DataType::F16,
+            &[2],
+            values_to_bytes(&[f16::from_f32(0.5), f16::from_f32(-5.0)]).as_slice(),
+        );
+        let right = replicated_array(
+            &domain,
+            &mesh,
+            DataType::F16,
+            &[2],
+            values_to_bytes(&[f16::ONE, f16::from_f32(-5.0)]).as_slice(),
+        );
+        assert_eq!(
+            values_from_bytes::<f16>(&left.log_add_exp(&right).unwrap().copy_to_host().unwrap()),
+            vec![f16::from_f32(1.4736328125), f16::from_f32(-4.30859375)],
+        );
+
+        // Same-sign infinities and NaN operands take the plain `a + b` arm, so `+∞` absorbs, `-∞` is the identity,
+        // and NaN propagates.
+        let left = replicated_array(
+            &domain,
+            &mesh,
+            DataType::F32,
+            &[4],
+            values_to_bytes(&[f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY, f32::NAN]).as_slice(),
+        );
+        let right = replicated_array(
+            &domain,
+            &mesh,
+            DataType::F32,
+            &[4],
+            values_to_bytes(&[f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY, 1.25]).as_slice(),
+        );
+        let output = values_from_bytes::<f32>(&left.log_add_exp(&right).unwrap().copy_to_host().unwrap());
+        assert_eq!(output.len(), 4);
+        assert_eq!(output[..3], [f32::INFINITY, f32::NEG_INFINITY, f32::INFINITY]);
+        assert!(output[3].is_nan());
+    }
+
+    #[test]
+    fn test_lower_log_add_exp_to_mlir_complex() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let c128_vector = |value: Complex<f64>| {
+            replicated_array(&domain, &mesh, DataType::C128, &[1], values_to_bytes(&[value]).as_slice())
+        };
+
+        // Complex outputs wrap the phase onto the principal logarithm branch. The phase rotation rounds in the last
+        // bits, hence the tolerances.
+        let input = c128_vector(Complex::new(0.0, 4.0));
+        let output = values_from_bytes::<Complex<f64>>(&input.log_add_exp(&input).unwrap().copy_to_host().unwrap());
+        assert!((output[0].re - LN_2).abs() < 1e-15);
+        assert!((output[0].im - (4.0 - 2.0 * PI)).abs() < 1e-15);
+
+        // A tiny phase that is already principal is kept rather than lost by adding and subtracting π.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[1],
+            values_to_bytes(&[Complex::new(0f32, 1e-20)]).as_slice(),
+        );
+        let output = values_from_bytes::<Complex<f32>>(&input.log_add_exp(&input).unwrap().copy_to_host().unwrap());
+        assert!((output[0].re - std::f32::consts::LN_2).abs() <= f32::EPSILON);
+        assert_eq!(output[0].im, 1e-20);
+
+        // A small correction next to a much larger operand survives. XLA's `exp` is not correctly rounded, hence the
+        // relative tolerance.
+        let output = values_from_bytes::<Complex<f64>>(
+            &c128_vector(Complex::new(0.0, 0.0))
+                .log_add_exp(&c128_vector(Complex::new(-40.0, 0.0)))
+                .unwrap()
+                .copy_to_host()
+                .unwrap(),
+        );
+        assert!((output[0].re / (-40f64).exp() - 1.0).abs() < 1e-13);
+        assert_eq!(output[0].im, 0.0);
+
+        // Both phases contribute when the imaginary components differ widely, because the smaller operand is rotated
+        // by the phase of the larger one instead of subtracting the imaginary components.
+        let (left, right) = (Complex::new(0.0, 1e16), Complex::new(-1.0, 1.0));
+        let output = values_from_bytes::<Complex<f64>>(
+            &c128_vector(left).log_add_exp(&c128_vector(right)).unwrap().copy_to_host().unwrap(),
+        );
+        let expected = (left.exp() + right.exp()).ln();
+        assert!((output[0].re - expected.re).abs() <= 1e-13 * expected.re.abs());
+        assert!((output[0].im - expected.im).abs() <= 1e-13 * expected.im.abs());
     }
 }

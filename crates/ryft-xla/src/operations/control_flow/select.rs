@@ -152,13 +152,15 @@ impl LowerableOperation for SelectOperation<ArrayType> {
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{CompareOperation, ComparisonDirection, Placeholder, SelectOperation, Shape};
+    use ryft_core::{CompareOperation, ComparisonDirection, Placeholder, Select, SelectOperation, Shape};
 
+    use crate::Session;
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
     use crate::experimental::ops::ArrayConstant;
-    use crate::tests::execution_client;
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
 
     use super::*;
 
@@ -270,6 +272,27 @@ mod tests {
         assert_eq!(
             execute_mixed_program(&client, &program, &inputs, &[2, 0]).unwrap(),
             vec![MixedValue::Array(Vec::new(), vec![2, 0]), MixedValue::Dimension(2), MixedValue::Dimension(0),],
+        );
+    }
+
+    #[test]
+    fn test_select_lowering_promotes_signed_one_bit_branches() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let condition = replicated_array(&domain, &mesh, DataType::Boolean, &[4], &[1, 0, 1, 0]);
+        let signed = replicated_array(&domain, &mesh, DataType::I1, &[4], &[1, 1, 0, 0]);
+        let wide = replicated_array(&domain, &mesh, DataType::I32, &[4], &values_to_bytes(&[2i32, 3, 4, 5]));
+
+        // A set I1 bit represents -1, even when selection promotes it to a wider branch type. Both branch positions
+        // are exercised so that recovering the sign cannot depend on the selected side.
+        assert_eq!(
+            values_from_bytes::<i32>(&Select::select(&condition, &signed, &wide).unwrap().copy_to_host().unwrap()),
+            [-1, 3, 0, 5],
+        );
+        assert_eq!(
+            values_from_bytes::<i32>(&Select::select(&condition, &wide, &signed).unwrap().copy_to_host().unwrap()),
+            [2, -1, 4, 0],
         );
     }
 }

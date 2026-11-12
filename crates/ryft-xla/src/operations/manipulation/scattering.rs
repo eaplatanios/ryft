@@ -391,13 +391,15 @@ mod tests {
     use std::sync::Arc;
 
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType, BatchAxis,
         BatchableOperation, BatchingContext, ConstantOperation, DataType, Dimension as CoreDimension, DimensionBounds,
         DimensionSize, DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Linearization,
-        Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, ScatterDimensionNumbers, ScatterMode,
-        ScatterOperation, ScatterReductionKind, Shape, TypedProgram, ValueProjection, i1, u1,
+        Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, Scatter, ScatterDimensionNumbers,
+        ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Shape, TypedProgram, ValueProjection,
+        differentiate_at, i1, u1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -407,7 +409,7 @@ mod tests {
     };
     use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
     use crate::experimental::ops::{ArrayConstant, Constant, FlatProgram, Operation};
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, Options, Session, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
@@ -733,6 +735,37 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_scatter_complex_max() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        // Complex extrema compare `(real, imaginary)` lexicographically, so the update `1 + 9i` replaces `1 + 5i`.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[3],
+            &values_to_bytes(&[Complex::new(1f32, 5.0), Complex::new(2.0, -3.0), Complex::new(2.0, 4.0)]),
+        );
+        let indices = replicated_array(&domain, &mesh, DataType::I32, &[1, 1], &values_to_bytes(&[0i32]));
+        let updates =
+            replicated_array(&domain, &mesh, DataType::C64, &[1], &values_to_bytes(&[Complex::new(1f32, 9.0)]));
+        let output = input
+            .scatter(
+                &indices,
+                &updates,
+                &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                ScatterReductionKind::Max,
+                &ScatterOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            values_from_bytes::<Complex<f32>>(&output.copy_to_host().unwrap()),
+            vec![Complex::new(1.0, 9.0), Complex::new(2.0, -3.0), Complex::new(2.0, 4.0)],
+        );
+    }
+
+    #[test]
     fn test_lower_scatter_dynamic_window() {
         let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
@@ -1046,5 +1079,41 @@ mod tests {
             assert_eq!(outputs[1], input_gradient, "min input gradient, n={size}");
             assert_eq!(outputs[2], updates_gradient, "min updates gradient, n={size}");
         }
+    }
+
+    #[test]
+    fn test_lower_scatter_differentiation_duplicate_overwrite() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[2f32, 5.0]));
+        let indices = replicated_array(&domain, &mesh, DataType::I32, &[2, 1], &values_to_bytes(&[0i32, 0]));
+        let updates = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[7f32, 8.0]));
+
+        // Duplicate overwrite may select either update. Its primal and pullback must select the same winner, and
+        // untouched elements must retain their identity derivative regardless of device scheduling.
+        let (value, (input_gradient, updates_gradient)) = differentiate_at((input, updates))
+            .with_captures(indices)
+            .value_and_gradient(|(input, updates), indices| {
+                input
+                    .scatter(
+                        &indices,
+                        &updates,
+                        &ScatterDimensionNumbers::new(vec![], vec![0], vec![0]),
+                        ScatterReductionKind::Overwrite,
+                        &ScatterOptions::default(),
+                    )
+                    .unwrap()
+                    .reduce(&[0], ReductionKind::Sum)
+                    .unwrap()
+            })
+            .unwrap();
+        assert_eq!(values_from_bytes::<f32>(&input_gradient.copy_to_host().unwrap()), vec![0.0, 1.0]);
+        let gradient = values_from_bytes::<f32>(&updates_gradient.copy_to_host().unwrap());
+        assert!(gradient == vec![1.0, 0.0] || gradient == vec![0.0, 1.0], "{gradient:?}");
+        assert_eq!(
+            values_from_bytes::<f32>(&value.copy_to_host().unwrap()),
+            vec![5.0 + 7.0 * gradient[0] + 8.0 * gradient[1]],
+        );
     }
 }

@@ -381,12 +381,16 @@ impl LowerableOperation for TanhOperation<ArrayType> {
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayOperation, Placeholder};
+    use ryft_core::{ArrayOperation, Atan2, Cos, Placeholder, Sin, Tanh, differentiate_at};
 
+    use crate::Session;
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{ProgramBuilder, lowered_unary_module};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::ArrayConstant;
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
 
     use super::*;
 
@@ -416,6 +420,60 @@ mod tests {
         // Select the small-argument, scaled, and logarithmic paths while preserving exact zero components.
         assert_eq!(stablehlo.matches("stablehlo.select").count(), 18, "{stablehlo}");
         assert_eq!(stablehlo.matches("stablehlo.complex").count(), 4, "{stablehlo}");
+    }
+
+    #[test]
+    fn test_lower_complex_sine_or_cosine_large_imaginary() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Hyperbolic factors need not overflow with their exponential intermediates, and a small real factor can keep
+        // one component finite beyond the range of the hyperbolic factor itself. The finite components near overflow
+        // depend on the backend's exponential approximation, so they are compared within a few ulps.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[3],
+            &values_to_bytes(&[Complex::new(0f64, 710.0), Complex::new(0f64, -710.0), Complex::new(1e-300f64, 1400.0)]),
+        );
+        let sine = values_from_bytes::<Complex<f64>>(&input.sin().unwrap().copy_to_host().unwrap());
+        assert_eq!(sine.len(), 3);
+        assert_eq!(sine[0].re, 0.0);
+        assert!((sine[0].im / 1.1169973830808555e308 - 1.0).abs() < 2e-15, "{}", sine[0]);
+        assert_eq!(sine[1].re, 0.0);
+        assert!((sine[1].im / -1.1169973830808555e308 - 1.0).abs() < 2e-15, "{}", sine[1]);
+        assert!((sine[2].re / 5.143333304259947e307 - 1.0).abs() < 2e-15, "{}", sine[2]);
+        assert_eq!(sine[2].im, f64::INFINITY);
+        let cosine = values_from_bytes::<Complex<f64>>(&input.cos().unwrap().copy_to_host().unwrap());
+        assert_eq!(cosine.len(), 3);
+        assert!((cosine[0].re / 1.1169973830808555e308 - 1.0).abs() < 2e-15, "{}", cosine[0]);
+        assert_eq!(cosine[0].im, 0.0);
+        assert!((cosine[1].re / 1.1169973830808555e308 - 1.0).abs() < 2e-15, "{}", cosine[1]);
+        assert_eq!(cosine[1].im, 0.0);
+        assert_eq!(cosine[2].re, f64::INFINITY);
+        assert!((cosine[2].im / -5.143333304259947e307 - 1.0).abs() < 2e-15, "{}", cosine[2]);
+
+        // In single precision, the hyperbolic factor of the first input is finite and that of the second overflows.
+        // Both keep their exact zero component, where a naive `0 * inf` decomposition would produce NaN.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[2],
+            &values_to_bytes(&[Complex::new(0f32, 89.0), Complex::new(0f32, 1000.0)]),
+        );
+        let sine = values_from_bytes::<Complex<f32>>(&input.sin().unwrap().copy_to_host().unwrap());
+        assert_eq!(sine.len(), 2);
+        assert_eq!(sine[0].re, 0.0);
+        assert!((sine[0].im / 2.2448064e38 - 1.0).abs() < 2e-7, "{}", sine[0]);
+        assert_eq!(sine[1], Complex::new(0f32, f32::INFINITY));
+        let cosine = values_from_bytes::<Complex<f32>>(&input.cos().unwrap().copy_to_host().unwrap());
+        assert_eq!(cosine.len(), 2);
+        assert!((cosine[0].re / 2.2448064e38 - 1.0).abs() < 2e-7, "{}", cosine[0]);
+        assert_eq!(cosine[0].im, 0.0);
+        assert_eq!(cosine[1], Complex::new(f32::INFINITY, 0f32));
     }
 
     #[test]
@@ -457,6 +515,57 @@ mod tests {
                   }
                 }
             "#},
+        );
+    }
+
+    #[test]
+    fn test_atan2_operation_lower_complex_differentiation() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let y = Complex::new(0.7f32, -0.2);
+        let x = Complex::new(-0.3f32, 0.4);
+        let y_array = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[y]));
+        let x_array = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[x]));
+
+        // Complex `atan2(y, x)` uses the principal value and its two holomorphic partial derivatives away from
+        // singularities and branch cuts. XLA's complex arithmetic may associate differently than the host's.
+        let (value, (y_gradient, x_gradient)) =
+            differentiate_at((y_array, x_array)).holomorphic().value_and_gradient(|(y, x)| y.atan2(&x)).unwrap();
+        let denominator = x * x + y * y;
+        let imaginary_unit = Complex::new(0f32, 1.0);
+        let expected_value = -imaginary_unit * ((x + imaginary_unit * y) / denominator.sqrt()).ln();
+        let value = values_from_bytes::<Complex<f32>>(&value.copy_to_host().unwrap());
+        assert_eq!(value.len(), 1);
+        assert!((value[0] - expected_value).norm() < 1e-5, "{} vs {expected_value}", value[0]);
+        let y_gradient = values_from_bytes::<Complex<f32>>(&y_gradient.copy_to_host().unwrap());
+        assert_eq!(y_gradient.len(), 1);
+        assert!((y_gradient[0] - x / denominator).norm() < 1e-5, "{}", y_gradient[0]);
+        let x_gradient = values_from_bytes::<Complex<f32>>(&x_gradient.copy_to_host().unwrap());
+        assert_eq!(x_gradient.len(), 1);
+        assert!((x_gradient[0] + y / denominator).norm() < 1e-5, "{}", x_gradient[0]);
+    }
+
+    #[test]
+    fn test_tanh_operation_lower_complex_large_real() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        // Real parts large enough to overflow the intermediate exponentials saturate to `±1 + 0i` without NaN.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[3],
+            &values_to_bytes(&[
+                Complex::new(400f64, 1.0),
+                Complex::new(f64::INFINITY, 1.0),
+                Complex::new(-400f64, 1.0),
+            ]),
+        );
+        assert_eq!(
+            values_from_bytes::<Complex<f64>>(&input.tanh().unwrap().copy_to_host().unwrap()),
+            [Complex::new(1f64, 0.0), Complex::new(1f64, 0.0), Complex::new(-1f64, 0.0)],
         );
     }
 }

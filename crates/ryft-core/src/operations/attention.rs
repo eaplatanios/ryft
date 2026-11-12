@@ -4719,6 +4719,65 @@ mod tests {
                     .for_each(|(actual, expected)| assert_abs_diff_eq!(*actual, expected, epsilon = 1e-6));
             }
         }
+
+        // A replicated rank-2 bias of a rank-3 call with two heads is broadcast over the mapped axis and the heads,
+        // so its batched gradient is the sum of its gradients over the batch items.
+        let bias = &bias[..6];
+        let inputs = AttentionInputs {
+            bias: Some(array(&[2, 3], bias)),
+            ..AttentionInputs::new(
+                array(&[2, 2, 2, 1], &query),
+                array(&[2, 3, 2, 1], &key),
+                array(&[2, 3, 2, 1], &value),
+            )
+        };
+        let axes = AttentionInputs {
+            bias: Some(BatchAxis::replicated()),
+            ..AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0))
+        };
+        let batched = differentiate_at(inputs)
+            .gradient(|inputs| {
+                let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                    .map_err(ProgramError::from)?;
+                outputs.reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+            })
+            .unwrap();
+        let mut expected_bias = [0.0; 6];
+        for item in 0..2 {
+            let inputs = AttentionInputs {
+                bias: Some(array(&[2, 3], bias)),
+                ..AttentionInputs::new(
+                    array(&[2, 2, 1], &query[4 * item..4 * item + 4]),
+                    array(&[3, 2, 1], &key[6 * item..6 * item + 6]),
+                    array(&[3, 2, 1], &value[6 * item..6 * item + 6]),
+                )
+            };
+            let expected = differentiate_at(inputs)
+                .gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2], ReductionKind::Sum))
+                .unwrap();
+            for (actual, expected, size) in [
+                (&batched.query, &expected.query, 4),
+                (&batched.key, &expected.key, 6),
+                (&batched.value, &expected.value, 6),
+            ] {
+                actual.to_f64s()[size * item..size * (item + 1)]
+                    .iter()
+                    .zip(expected.to_f64s())
+                    .for_each(|(actual, expected)| assert_abs_diff_eq!(*actual, expected, epsilon = 1e-6));
+            }
+            expected_bias
+                .iter_mut()
+                .zip(expected.bias.as_ref().unwrap().to_f64s())
+                .for_each(|(sum, gradient)| *sum += gradient);
+        }
+        batched
+            .bias
+            .as_ref()
+            .unwrap()
+            .to_f64s()
+            .iter()
+            .zip(expected_bias)
+            .for_each(|(actual, expected)| assert_abs_diff_eq!(*actual, expected, epsilon = 1e-6));
     }
 
     #[test]

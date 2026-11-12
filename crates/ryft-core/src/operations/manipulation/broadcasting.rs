@@ -1531,7 +1531,7 @@ impl_differentiable_operation! {
 /// ```
 #[capability]
 pub trait DynamicBroadcast<Extent = Self, T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Replicates or reorders `self` into the shape supplied by `output_dimensions`. Each mapped input extent must equal
+    /// Replicates or reorders `self` into the shape given by `output_dimensions`. Each mapped input extent must equal
     /// its output extent or be statically one; new axes may have static or dynamic extents. Sharding follows the axis
     /// mapping and new axes are replicated. Invalid value kinds, axis mappings, or incompatible extents yield a
     /// [`TypeError`]. Use [`DynamicBroadcast::dynamic_broadcast_to`] for the usual trailing-axis alignment.
@@ -2247,7 +2247,7 @@ mod tests {
     use std::fmt::Debug;
     use std::marker::PhantomData;
 
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -5652,6 +5652,31 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid(
                 "broadcasting input axis 0 has size 3, which is neither 4 nor 1",
             ))),
+        );
+
+        // The inferred output placement follows the axis mapping, with new axes replicated, and keeps the memory.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4])
+            .with_sharding(Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true });
+        let output_type = ArrayType::new_static(DataType::F32, [2, 4])
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap(),
+            )
+            .unwrap()
+            .with_memory(Memory::Host { pinned: true });
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |array| array.dynamic_broadcast(&[2, 4], &[1]),
+            input_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{input_type} .
+                let %1:{output_type} = broadcast [output_type={output_type}, output_axes=[1]] %0
+                in (%1)"},
         );
     }
 

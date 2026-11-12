@@ -326,17 +326,19 @@ impl LowerableOperation for CumulativeOperation {
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, CumulativeOperation, DataType,
-        Dimension as CoreDimension, DimensionBounds, DimensionVariable, Instruction, Placeholder, Shape, Sharding,
+        Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, Cumulative, CumulativeOperation, DataType,
+        Dimension as CoreDimension, DimensionBounds, DimensionVariable, Instruction, Max, Placeholder, Shape, Sharding,
+        associative_scan,
     };
 
     use crate::domains::tests::{domain_mesh, read_f32s};
     use crate::experimental::lowering::tests::{ProgramBuilder, lowered_unary_module, unproject_plain_program};
     use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
     use crate::experimental::ops::ArrayConstant;
-    use crate::tests::{execution_client, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, Domain, Options, Session, Value};
 
     use super::*;
@@ -575,6 +577,49 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_cumulative_executes() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let increasing = replicated_array(
+            &domain,
+            &mesh,
+            DataType::F32,
+            &[4],
+            values_to_bytes(&[0.5f32, 1.25, 2.0, 3.75]).as_slice(),
+        );
+        let alternating =
+            replicated_array(&domain, &mesh, DataType::F32, &[4], values_to_bytes(&[4f32, 0.25, -1.5, 2.5]).as_slice());
+        let read = |array: Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+
+        // Dyadic inputs keep every sum and product exact, whatever tree the scan combines them in.
+        assert_eq!(read(increasing.cumulative_sum(0).unwrap()), vec![0.5, 1.75, 3.75, 7.5]);
+        assert_eq!(read(increasing.reverse_cumulative_sum(0).unwrap()), vec![7.5, 7.0, 5.75, 3.75]);
+        assert_eq!(read(increasing.cumulative_product(0).unwrap()), vec![0.5, 0.625, 1.25, 4.6875]);
+        assert_eq!(read(increasing.reverse_cumulative_product(0).unwrap()), vec![4.6875, 9.375, 7.5, 3.75]);
+
+        // A running maximum of an increasing operand distinguishes a prefix from a global maximum, and the extrema of
+        // the alternating operand distinguish them from a pass-through operand in both directions.
+        assert_eq!(read(increasing.cumulative_max(0).unwrap()), vec![0.5, 1.25, 2.0, 3.75]);
+        assert_eq!(read(alternating.reverse_cumulative_max(0).unwrap()), vec![4.0, 2.5, 2.5, 2.5]);
+        assert_eq!(read(alternating.cumulative_min(0).unwrap()), vec![4.0, 0.25, -1.5, -1.5]);
+        assert_eq!(read(alternating.reverse_cumulative_min(0).unwrap()), vec![-1.5, -1.5, -1.5, 2.5]);
+
+        // The log-sum-exp body rounds its transcendental functions differently from the host.
+        let log_sum_exp = read(increasing.cumulative_log_sum_exp(0).unwrap());
+        let expected = [
+            0.5f64,
+            (0.5f64.exp() + 1.25f64.exp()).ln(),
+            (0.5f64.exp() + 1.25f64.exp() + 2f64.exp()).ln(),
+            (0.5f64.exp() + 1.25f64.exp() + 2f64.exp() + 3.75f64.exp()).ln(),
+        ];
+        assert_eq!(log_sum_exp.len(), expected.len());
+        for (actual, expected) in log_sum_exp.into_iter().zip(expected) {
+            assert!((f64::from(actual) - expected).abs() < 1e-5, "{actual} vs {expected}");
+        }
+    }
+
+    #[test]
     fn test_to_mlir_module_for_plain_program_rejects_a_dynamically_sized_scanned_axis() {
         // The window extent of the emitted `reduce_window` is the scanned extent, so the scan has no lowering when
         // that extent is only known at runtime. `ryft-core` type inference already keeps the scanned axis static,
@@ -663,6 +708,42 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_cumulative_sum_matches_sequential_scan() {
+        // Forward real sums lower to `chlo.scan` on GPU targets and to a full-prefix `reduce_window` elsewhere, while
+        // reverse sums keep the `reduce_window` form everywhere. Small integral values keep every `f32` prefix sum
+        // exact, so every form must agree with a sequential scan bit for bit, including along a scanned axis longer
+        // than one thousand elements, which spans several levels of the parallel scan.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let (rows, columns) = (3, 1025);
+        let values = (0..rows * columns).map(|index| (index % 7) as f32).collect::<Vec<_>>();
+        let input =
+            replicated_array(&domain, &mesh, DataType::F32, &[rows, columns], values_to_bytes(&values).as_slice());
+        let mut forward = values.clone();
+        for row in forward.chunks_mut(columns) {
+            (1..columns).for_each(|column| row[column] += row[column - 1]);
+        }
+        let mut reverse = values.clone();
+        for row in reverse.chunks_mut(columns) {
+            (0..columns - 1).rev().for_each(|column| row[column] += row[column + 1]);
+        }
+        assert_eq!(values_from_bytes::<f32>(&input.cumulative_sum(1).unwrap().copy_to_host().unwrap()), forward);
+        assert_eq!(
+            values_from_bytes::<f32>(&input.reverse_cumulative_sum(1).unwrap().copy_to_host().unwrap()),
+            reverse,
+        );
+
+        // Integer sums take the same path as real sums, here along the leading axis.
+        let integers =
+            replicated_array(&domain, &mesh, DataType::I32, &[4, 2], &values_to_bytes(&[1i32, -2, 3, 4, -5, 6, 7, -8]));
+        assert_eq!(
+            values_from_bytes::<i32>(&integers.cumulative_sum(0).unwrap().copy_to_host().unwrap()),
+            vec![1, -2, 4, 2, -1, 8, 6, 0],
+        );
+    }
+
+    #[test]
     fn test_lower_cumulative_one_bit_sum_on_gpu() {
         for data_type in [DataType::I1, DataType::U1] {
             let input_type = ArrayType::new_static(data_type, [2, 4]);
@@ -710,6 +791,31 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_cumulative_one_bit_integers_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let bits = [1, 1, 0, 1];
+        for data_type in [DataType::I1, DataType::U1] {
+            let input = replicated_array(&domain, &mesh, data_type, &[4], &bits);
+            let reference = CoreArray::from_logical_bytes(ArrayType::new_static(data_type, [4]), &bits).unwrap();
+            // Sum must wrap modulo two rather than behave like Boolean OR. Signed extrema reverse the predicate
+            // carrier's order, while unsigned extrema and multiplication use its ordinary order.
+            for kind in [CumulativeKind::Sum, CumulativeKind::Product, CumulativeKind::Max, CumulativeKind::Min] {
+                for reverse in [false, true] {
+                    let output = input.cumulative(0, kind, reverse).unwrap();
+                    assert_eq!(output.data_type(), data_type);
+                    assert_eq!(
+                        output.copy_to_host().unwrap(),
+                        reference.cumulative(0, kind, reverse).unwrap().logical_bytes(),
+                        "{data_type} {kind} reverse={reverse}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_lower_cumulative_structural_zero() {
         for kind in [CumulativeKind::Sum, CumulativeKind::Product] {
             for reverse in [false, true] {
@@ -734,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_cumulative_log_sum_exp_identities() {
+    fn test_lower_cumulative_log_sum_exp_identities() {
         // Invalid unchecked programs still cannot seed a fold with a non-identity value.
         for element_type in [DataType::F8E8M0FNU, DataType::F6E2M3FN] {
             let array_type = ArrayType::new(element_type, Shape::new(vec![CoreDimension::Static(4)]));
@@ -760,24 +866,101 @@ mod tests {
             ));
         }
 
-        // Finite pairwise identities remain neutral beyond the previously imposed scan-length limits.
-        for data_type in [
-            DataType::F4E2M1FN,
-            DataType::F6E3M2FN,
-            DataType::F8E4M3B11FNUZ,
-            DataType::F8E4M3FNUZ,
-            DataType::F8E5M2FNUZ,
-            DataType::F32,
+        // The lowest finite value seeds the windows of formats without infinities. Every rounded pairwise combination
+        // of it with itself returns it again, so a scan of any length over it stays at it, including a scan longer
+        // than the parallel scan's first levels.
+        // The XLA CPU runtime cannot transfer `f6e3m2fn` buffers, so that format is only lowered.
+        assert!(
+            lowered_unary_module(
+                ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::LogSumExp)),
+                DataType::F6E3M2FN,
+                vec![3001],
+            )
+            .is_ok(),
+        );
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        for (data_type, lowest) in [
+            (DataType::F4E2M1FN, vec![0x0f]),
+            (DataType::F8E4M3B11FNUZ, vec![0xff]),
+            (DataType::F8E4M3FNUZ, vec![0xff]),
+            (DataType::F8E5M2FNUZ, vec![0xff]),
+            (DataType::F32, f32::MIN.to_ne_bytes().to_vec()),
         ] {
-            assert!(
-                lowered_unary_module(
-                    ArrayOperation::Cumulative(CumulativeOperation::new(0, CumulativeKind::LogSumExp)),
-                    data_type,
-                    vec![3000],
-                )
-                .is_ok(),
-            );
+            let bytes = lowest.repeat(3001);
+            let input = replicated_array(&domain, &mesh, data_type, &[3001], &bytes);
+            assert_eq!(input.cumulative_log_sum_exp(0).unwrap().copy_to_host().unwrap(), bytes, "{data_type}");
         }
+    }
+
+    #[test]
+    fn test_lower_cumulative_log_sum_exp_complex() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Every window is padded with `-∞ + 0i` initial values, and an operand whose real component is negative
+        // infinity leaves the other operand unchanged. Pairs of such operands therefore never produce the NaN that
+        // the unguarded complex `log_add_exp` expansion computes for them.
+        let first = Complex::new(1f32, 2.0);
+        let doubled = Complex::new(1.0 + std::f32::consts::LN_2, 2.0);
+        let negative_infinity = Complex::new(f32::NEG_INFINITY, 0.0);
+        let rotated_negative_infinity = Complex::new(f32::NEG_INFINITY, 3.0);
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[4],
+            values_to_bytes(&[first, first, negative_infinity, rotated_negative_infinity]).as_slice(),
+        );
+        let forward = input.cumulative_log_sum_exp(0).unwrap();
+        let forward = values_from_bytes::<Complex<f32>>(&forward.copy_to_host().unwrap());
+        assert_eq!(forward.len(), 4);
+        assert_eq!(forward[0], first);
+        for prefix in &forward[1..] {
+            assert!((prefix - doubled).norm() < 1e-5, "{prefix}");
+        }
+        let reverse = input.reverse_cumulative_log_sum_exp(0).unwrap();
+        let reverse = values_from_bytes::<Complex<f32>>(&reverse.copy_to_host().unwrap());
+        assert_eq!(reverse.len(), 4);
+        assert!((reverse[0] - doubled).norm() < 1e-5, "{}", reverse[0]);
+        assert_eq!(reverse[1], first);
+        // Combining two operands with negative infinite real components returns one of them, and the order in which
+        // a window combines its operands and initial values is unspecified.
+        assert!([negative_infinity, rotated_negative_infinity].contains(&reverse[2]), "{}", reverse[2]);
+        assert!([negative_infinity, rotated_negative_infinity].contains(&reverse[3]), "{}", reverse[3]);
+
+        // A prefix that no combination produced is still brought onto the principal branch, and so is one whose phase
+        // is huge.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[2],
+            values_to_bytes(&[Complex::new(1f64, 4.0), Complex::new(f64::NEG_INFINITY, 0.0)]).as_slice(),
+        );
+        // XLA's sine, cosine, and arctangent may differ from the host's in the last bit of the reduced phase.
+        let wrapped = 4f64.sin().atan2(4f64.cos());
+        let prefixes = input.cumulative_log_sum_exp(0).unwrap();
+        let prefixes = values_from_bytes::<Complex<f64>>(&prefixes.copy_to_host().unwrap());
+        assert_eq!(prefixes.iter().map(|prefix| prefix.re).collect::<Vec<_>>(), vec![1f64, 1.0]);
+        for prefix in &prefixes {
+            assert!((prefix.im - wrapped).abs() <= 1e-13 * wrapped.abs(), "{} vs {wrapped}", prefix.im);
+        }
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[1],
+            values_to_bytes(&[Complex::new(1f64, 1e16)]).as_slice(),
+        );
+        let wrapped = 1e16f64.sin().atan2(1e16f64.cos());
+        let prefixes = input.cumulative_log_sum_exp(0).unwrap();
+        let prefixes = values_from_bytes::<Complex<f64>>(&prefixes.copy_to_host().unwrap());
+        assert_eq!(prefixes.len(), 1);
+        assert_eq!(prefixes[0].re, 1f64);
+        assert!((prefixes[0].im - wrapped).abs() <= 1e-13 * wrapped.abs(), "{} vs {wrapped}", prefixes[0].im);
     }
 
     #[test]
@@ -808,8 +991,6 @@ mod tests {
 
     #[test]
     fn test_compiled_associative_scan_over_dynamic_unscanned_axis() {
-        use ryft_core::{Cumulative, Max, associative_scan};
-
         // `associative_scan` keeps every unscanned axis whole, so a bounded dynamic row axis survives its slices, pads,
         // and interleaving, and one compiled program computes the prefix maxima of every row at each logical row
         // count, exactly like the reference backend's cumulative maximum.

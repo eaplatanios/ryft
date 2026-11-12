@@ -219,19 +219,20 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
-    use ryft_core::{Dimension as CoreDimension, Placeholder, Shape};
+    use ryft_core::{Array as CoreArray, Dimension as CoreDimension, Placeholder, Shape, Sort, TopK};
 
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{ProgramBuilder, unproject_plain_program};
     use crate::experimental::ops::ArrayConstant;
-    use crate::to_mlir_module_for_program;
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::{Session, to_mlir_module_for_program};
 
     use super::*;
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_sort_with_synthesized_comparator() {
-        use ryft_core::{SortDirection, SortOperation, SortOrdering};
-
         // A two-operand descending total-order sort (i.e., the top-k idiom) lowers to a stable `stablehlo.sort`
         // whose synthesized comparator compares the key pair with `GT` and `TOTALORDER` semantics, and whose index
         // passenger rides along unexamined.
@@ -276,9 +277,54 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_multi_key_sort_with_lexicographic_comparator() {
-        use ryft_core::{SortDirection, SortOperation};
+    fn test_lower_sort_to_mlir_matches_reference_backend() {
+        // The canonical ordering ties signed zeros and all NaNs, while the total ordering separates them, so both the
+        // sorted keys (compared bit for bit) and the payloads expose any disagreement in tie handling.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let key_values = [3f32, f32::NAN, 1.0, 3.0, -f32::NAN, -0.0, 0.0, 2.0];
+        let payload_values = [10f32, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
+        let keys = replicated_array(&domain, &mesh, DataType::F32, &[8], &values_to_bytes(&key_values));
+        let payloads = replicated_array(&domain, &mesh, DataType::F32, &[8], &values_to_bytes(&payload_values));
+        let reference_keys = CoreArray::vector(key_values.to_vec()).unwrap();
+        let reference_payloads = CoreArray::vector(payload_values.to_vec()).unwrap();
+        for ordering in [SortOrdering::Canonical, SortOrdering::Total] {
+            for direction in [SortDirection::Ascending, SortDirection::Descending] {
+                let sorted =
+                    Sort::sort_with_ordering(&[keys.clone(), payloads.clone()], 0, 1, direction, ordering).unwrap();
+                let reference_sorted = Sort::sort_with_ordering(
+                    &[reference_keys.clone(), reference_payloads.clone()],
+                    0,
+                    1,
+                    direction,
+                    ordering,
+                )
+                .unwrap();
+                assert_eq!(
+                    sorted.iter().map(|output| output.copy_to_host().unwrap()).collect::<Vec<_>>(),
+                    reference_sorted.iter().map(CoreArray::logical_bytes).collect::<Vec<_>>(),
+                    "{ordering} {direction}",
+                );
+            }
+        }
+    }
 
+    #[test]
+    fn test_lower_sort_to_mlir_top_k() {
+        // Ties select the lowest index, so both threes appear before the two and index 0 precedes index 2.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input =
+            replicated_array(&domain, &mesh, DataType::F32, &[6], &values_to_bytes(&[3f32, 1.0, 3.0, -0.0, 0.0, 2.0]));
+        let (values, indices) = input.top_k(3, 0).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&values.copy_to_host().unwrap()), vec![3.0, 3.0, 2.0]);
+        assert_eq!(values_from_bytes::<i32>(&indices.copy_to_host().unwrap()), vec![0, 2, 5]);
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_multi_key_sort_with_lexicographic_comparator() {
         // A two-key ascending canonical sort lowers to a stable `stablehlo.sort` whose synthesized comparator chains
         // the key comparisons lexicographically as `cmp_0 OR (eq_0 AND cmp_1)`, with each key's comparison type
         // derived from that key's data type (`TOTALORDER` for the `f32` primary key, including its equality comparison
@@ -340,9 +386,57 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_complex_sort_with_canonical_comparator() {
-        use ryft_core::{SortDirection, SortOperation};
+    fn test_lower_sort_to_mlir_multiple_keys() {
+        // Duplicates in the `i32` primary key fall through to the `f32` secondary key, full ties keep their original
+        // order because the sort is stable, and the passenger co-permutes.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let primary = replicated_array(&domain, &mesh, DataType::I32, &[6], &values_to_bytes(&[2i32, 1, 2, 1, 2, 1]));
+        let secondary = replicated_array(
+            &domain,
+            &mesh,
+            DataType::F32,
+            &[6],
+            &values_to_bytes(&[0.5f32, 3.0, -1.0, 1.0, 0.5, 2.0]),
+        );
+        let passenger = replicated_array(
+            &domain,
+            &mesh,
+            DataType::F32,
+            &[6],
+            &values_to_bytes(&[10f32, 20.0, 30.0, 40.0, 50.0, 60.0]),
+        );
+        let cases = [
+            // Ascending: primary 1s precede 2s, ties resolve by the secondary key, and the full `(2, 0.5)` tie keeps
+            // element 0 before element 4, as the passenger shows.
+            (
+                SortDirection::Ascending,
+                vec![1, 1, 1, 2, 2, 2],
+                vec![1f32, 2.0, 3.0, -1.0, 0.5, 0.5],
+                vec![40f32, 60.0, 20.0, 30.0, 10.0, 50.0],
+            ),
+            // Descending reverses both key comparisons while keeping the full tie in its original order.
+            (
+                SortDirection::Descending,
+                vec![2, 2, 2, 1, 1, 1],
+                vec![0.5f32, 0.5, -1.0, 3.0, 2.0, 1.0],
+                vec![10f32, 50.0, 30.0, 20.0, 60.0, 40.0],
+            ),
+        ];
+        for (direction, expected_primary, expected_secondary, expected_passenger) in cases {
+            let sorted =
+                Sort::sort_with_key_count(&[primary.clone(), secondary.clone(), passenger.clone()], 0, 2, direction)
+                    .unwrap();
+            assert_eq!(sorted.len(), 3);
+            assert_eq!(values_from_bytes::<i32>(&sorted[0].copy_to_host().unwrap()), expected_primary);
+            assert_eq!(values_from_bytes::<f32>(&sorted[1].copy_to_host().unwrap()), expected_secondary);
+            assert_eq!(values_from_bytes::<f32>(&sorted[2].copy_to_host().unwrap()), expected_passenger);
+        }
+    }
 
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_complex_sort_with_canonical_comparator() {
         // A complex key contributes its real part and then its imaginary part as two lexicographic comparison
         // components, each canonicalized like a real floating-point key.
         let key_type = ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(4)]));
@@ -406,5 +500,33 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_lower_sort_to_mlir_complex_keys() {
+        // Canonical complex keys order lexicographically by their canonicalized real and imaginary parts, so that
+        // signed-zero real parts tie and NaN parts order last, as in JAX's `lax.sort`.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let keys = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[6],
+            &values_to_bytes(&[
+                Complex::new(1f32, f32::NAN),
+                Complex::new(f32::NAN, 0.0),
+                Complex::new(1.0, 2.0),
+                Complex::new(1.0, 1.0),
+                Complex::new(-0.0, 1.0),
+                Complex::new(0.0, 1.0),
+            ]),
+        );
+        let positions =
+            replicated_array(&domain, &mesh, DataType::F32, &[6], &values_to_bytes(&[0f32, 1.0, 2.0, 3.0, 4.0, 5.0]));
+        let sorted = Sort::sort(&[keys, positions], 0, SortDirection::Ascending).unwrap();
+        assert_eq!(sorted.len(), 2);
+        assert_eq!(values_from_bytes::<f32>(&sorted[1].copy_to_host().unwrap()), vec![4.0, 5.0, 3.0, 2.0, 0.0, 1.0]);
     }
 }

@@ -689,19 +689,23 @@ impl LowerableOperation for ArgMinOperation {
 
 #[cfg(test)]
 mod tests {
+    use half::bf16;
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayOperation, Dimension as CoreDimension, DimensionBounds, DimensionVariable, Instruction, Placeholder,
-        ReduceOperation, Shape,
+        ArgMax, ArgMin, ArrayOperation, Cumulative, Dimension as CoreDimension, DimensionBounds, DimensionVariable,
+        Instruction, Placeholder, Reduce, ReduceOperation, Shape,
     };
 
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{
         ProgramBuilder, lowered_reduce_module, lowered_unary_module, unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::ArrayConstant;
-    use crate::to_mlir_module_for_program;
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::{Array, Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -749,6 +753,50 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_lower_log_sum_exp_to_mlir_complex() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Complex operands are shifted by the maximum of their real components, and `-∞ + 0i` padding contributes a
+        // zero exponential. XLA's complex exponential and logarithm round differently from the host's.
+        let first = Complex::new(1f32, 0.5);
+        let second = Complex::new(3f32, -2.0);
+        let shift = Complex::new(3f32, 0.0);
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[3],
+            values_to_bytes(&[first, second, Complex::new(f32::NEG_INFINITY, 0.0)]).as_slice(),
+        );
+        let output = input.reduce_log_sum_exp(&[0]).unwrap();
+        let output = values_from_bytes::<Complex<f32>>(&output.copy_to_host().unwrap());
+        let expected = ((first - shift).exp() + (second - shift).exp()).ln() + shift;
+        assert_eq!(output.len(), 1);
+        assert!((output[0] - expected).norm() < 1e-5, "{} vs {expected}", output[0]);
+
+        // Even without reduced axes, the principal logarithm wraps phases outside its branch.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[2],
+            values_to_bytes(&[Complex::new(1f32, 4.0), Complex::new(2f32, -4.0)]).as_slice(),
+        );
+        let output = input.reduce_log_sum_exp(&[]).unwrap();
+        let output = values_from_bytes::<Complex<f32>>(&output.copy_to_host().unwrap());
+        let expected = [
+            Complex::new(1f32, 4.0 - 2.0 * std::f32::consts::PI),
+            Complex::new(2f32, -4.0 + 2.0 * std::f32::consts::PI),
+        ];
+        assert_eq!(output.len(), expected.len());
+        for (actual, expected) in output.into_iter().zip(expected) {
+            assert!((actual - expected).norm() < 1e-5, "{actual} vs {expected}");
+        }
     }
 
     #[test]
@@ -809,6 +857,52 @@ mod tests {
                   }
                 }
             "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_product_combiner_to_mlir_complex_identity() {
+        // Complex products treat an exact `1 + 0i` operand as the identity, whether it is the identity that seeds a
+        // reduction or pads a scan window, or an input element. Infinite components therefore never meet its zero
+        // imaginary component as `0 · ∞ = NaN`, and a lone signed zero is returned exactly. Reductions and scans share
+        // the combiner.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let vector = |values: &[Complex<f64>]| {
+            replicated_array(&domain, &mesh, DataType::C128, &[values.len()], values_to_bytes(values).as_slice())
+        };
+        let read = |array: Array<'_>| values_from_bytes::<Complex<f64>>(&array.copy_to_host().unwrap());
+
+        let infinite_values = [Complex::new(f64::INFINITY, 1.0), Complex::new(1.0, 1.0)];
+        assert_eq!(
+            read(vector(&infinite_values).reduce_product(&[0]).unwrap()),
+            vec![Complex::new(f64::INFINITY, f64::INFINITY)],
+        );
+        assert_eq!(
+            read(vector(&infinite_values).cumulative_product(0).unwrap()),
+            vec![Complex::new(f64::INFINITY, 1.0), Complex::new(f64::INFINITY, f64::INFINITY)],
+        );
+
+        let identity_values = [Complex::new(f64::INFINITY, 0.0), Complex::new(1.0, 0.0)];
+        assert_eq!(
+            read(vector(&identity_values).reduce_product(&[0]).unwrap()),
+            vec![Complex::new(f64::INFINITY, 0.0)],
+        );
+        assert_eq!(
+            read(vector(&identity_values).cumulative_product(0).unwrap()),
+            vec![Complex::new(f64::INFINITY, 0.0), Complex::new(f64::INFINITY, 0.0)],
+        );
+
+        // Comparing bytes distinguishes the signs of the zero components.
+        let negative_zero = [Complex::new(-0f64, -0.0)];
+        assert_eq!(
+            vector(&negative_zero).reduce_product(&[0]).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&negative_zero),
+        );
+        assert_eq!(
+            vector(&negative_zero).cumulative_product(0).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&negative_zero),
         );
     }
 
@@ -1150,9 +1244,71 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_argmax_with_variadic_reduce() {
-        use ryft_core::ArgMaxOperation;
+    fn test_reduce_operation_lower() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
 
+        // Dyadic inputs keep every floating-point result exact, including the division by the count of `Mean`.
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[0.5f32, 1.25, 2.0, 3.75]));
+        let read =
+            |kind: ReductionKind| values_from_bytes::<f32>(&input.reduce(&[0], kind).unwrap().copy_to_host().unwrap());
+        assert_eq!(read(ReductionKind::Sum), vec![7.5]);
+        assert_eq!(read(ReductionKind::Mean), vec![1.875]);
+        assert_eq!(read(ReductionKind::Max), vec![3.75]);
+        assert_eq!(read(ReductionKind::Min), vec![0.5]);
+
+        // Integer `Mean` divides with truncation.
+        let input = replicated_array(&domain, &mesh, DataType::I32, &[4], &values_to_bytes(&[5i32, -2, 7, 0]));
+        let read =
+            |kind: ReductionKind| values_from_bytes::<i32>(&input.reduce(&[0], kind).unwrap().copy_to_host().unwrap());
+        assert_eq!(read(ReductionKind::Sum), vec![10]);
+        assert_eq!(read(ReductionKind::Mean), vec![2]);
+        assert_eq!(read(ReductionKind::Max), vec![7]);
+        assert_eq!(read(ReductionKind::Min), vec![-2]);
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_extrema() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Boolean extrema use the `false` and `true` identities, including when the reduced axis is empty.
+        let empty_booleans = replicated_array(&domain, &mesh, DataType::Boolean, &[0], &[]);
+        assert_eq!(empty_booleans.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), vec![0]);
+        assert_eq!(empty_booleans.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), vec![1]);
+
+        // Floating-point extrema propagate NaNs and order negative zero below positive zero.
+        let nan = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, f32::NAN]));
+        let maximum = values_from_bytes::<f32>(&nan.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap());
+        assert_eq!(maximum.len(), 1);
+        assert!(maximum[0].is_nan(), "{maximum:?}");
+        let zeros = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[-0f32, 0.0]));
+        assert_eq!(zeros.reduce(&[0], ReductionKind::Max).unwrap().copy_to_host().unwrap(), 0f32.to_ne_bytes());
+        assert_eq!(zeros.reduce(&[0], ReductionKind::Min).unwrap().copy_to_host().unwrap(), (-0f32).to_ne_bytes());
+
+        // Complex extrema compare `(real, imaginary)` lexicographically, and their identity has negative infinite
+        // components.
+        let complex = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[3],
+            &values_to_bytes(&[Complex::new(1f32, 5.0), Complex::new(2.0, -3.0), Complex::new(2.0, 4.0)]),
+        );
+        let read = |array: Array<'_>| values_from_bytes::<Complex<f32>>(&array.copy_to_host().unwrap());
+        assert_eq!(read(complex.reduce(&[0], ReductionKind::Max).unwrap()), vec![Complex::new(2.0, 4.0)]);
+        assert_eq!(read(complex.reduce(&[0], ReductionKind::Min).unwrap()), vec![Complex::new(1.0, 5.0)]);
+        let empty_complex = replicated_array(&domain, &mesh, DataType::C64, &[0], &[]);
+        assert_eq!(
+            read(empty_complex.reduce(&[0], ReductionKind::Max).unwrap()),
+            vec![Complex::new(f32::NEG_INFINITY, f32::NEG_INFINITY)],
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_argmax_with_variadic_reduce() {
         // An argmax lowers to a variadic `stablehlo.reduce` over the input and an index iota, starting from the lowest
         // value paired with index zero. Its comparator picks the left pair when its value is greater or a NaN facing an
         // ordered value, or when the values are equivalent (i.e., equal under `FLOAT` semantics or both NaN) and the
@@ -1204,5 +1360,105 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_lower_index_reduction_to_mlir() {
+        // Narrow floating-point inputs compare in `f32`, signed one-bit inputs compare in a signed byte carrier, and
+        // the expected indices are the ones that JAX's `lax.argmax` and `lax.argmin` return.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let cases = [
+            (
+                DataType::BF16,
+                values_to_bytes(&[
+                    bf16::ONE,
+                    bf16::NAN,
+                    bf16::from_f32(3.0),
+                    bf16::NEG_ZERO,
+                    bf16::ZERO,
+                    bf16::NEG_ONE,
+                ]),
+                1,
+                DataType::U8,
+                values_to_bytes(&[1u8, 0]),
+                values_to_bytes(&[1u8, 2]),
+            ),
+            (
+                DataType::I8,
+                values_to_bytes(&[-3i8, 7, -128, 5, 5, 1]),
+                0,
+                DataType::I64,
+                values_to_bytes(&[1i64, 0, 1]),
+                values_to_bytes(&[0i64, 1, 0]),
+            ),
+            (
+                DataType::U64,
+                values_to_bytes(&[u64::MAX - 1, u64::MAX, 0, u64::MAX, u64::MAX, 1]),
+                1,
+                DataType::I32,
+                values_to_bytes(&[1i32, 0]),
+                values_to_bytes(&[2i32, 2]),
+            ),
+            (
+                DataType::Boolean,
+                vec![0, 1, 1, 0, 0, 0],
+                1,
+                DataType::I32,
+                values_to_bytes(&[1i32, 0]),
+                values_to_bytes(&[0i32, 0]),
+            ),
+            // The set bit of a signed one-bit integer encodes `-1`, so the rows are `[0, -1, 0]` and `[-1, -1, 0]`.
+            (
+                DataType::I1,
+                vec![0, 1, 0, 1, 1, 0],
+                1,
+                DataType::I32,
+                values_to_bytes(&[0i32, 2]),
+                values_to_bytes(&[1i32, 0]),
+            ),
+        ];
+        for (data_type, bytes, axis, index_data_type, expected_argmax, expected_argmin) in cases {
+            let input = replicated_array(&domain, &mesh, data_type, &[2, 3], &bytes);
+            assert_eq!(
+                input.argmax_with_index_data_type(axis, index_data_type).unwrap().copy_to_host().unwrap(),
+                expected_argmax,
+                "{data_type}",
+            );
+            assert_eq!(
+                input.argmin_with_index_data_type(axis, index_data_type).unwrap().copy_to_host().unwrap(),
+                expected_argmin,
+                "{data_type}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_lower_index_reduction_to_mlir_nans_and_signed_zeros() {
+        // An axis that contains a NaN of either sign reports its first NaN, and ties between signed zeros select the
+        // lowest index, as `jnp.argmax` and `jnp.argmin` do.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        for (values, expected_argmax, expected_argmin) in [
+            (vec![1f32, f32::NAN, 3.0], 1i32, 1i32),
+            (vec![1f32, -f32::NAN, f32::NAN], 1, 1),
+            (vec![-0f32, 0.0, 5.0], 2, 0),
+            (vec![0f32, -0.0, -5.0], 0, 2),
+            (vec![-0f32, 0.0], 0, 0),
+        ] {
+            let input = replicated_array(&domain, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
+            assert_eq!(
+                values_from_bytes::<i32>(&input.argmax(0).unwrap().copy_to_host().unwrap()),
+                vec![expected_argmax],
+                "{values:?}",
+            );
+            assert_eq!(
+                values_from_bytes::<i32>(&input.argmin(0).unwrap().copy_to_host().unwrap()),
+                vec![expected_argmin],
+                "{values:?}",
+            );
+        }
     }
 }

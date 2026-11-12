@@ -549,10 +549,10 @@ mod tests {
         Add, ArrayReferenceTransform, ArrayReferenceTransformIndex, Assert, BatchAxis, Compare, ComparisonDirection,
         Concretizable, Context, ConvertElementType, DataType, Device, DeviceMesh, DimensionBounds, DimensionOperation,
         DimensionSize, DimensionSizeOperation, DimensionToScalar, DimensionToScalarOperation, DimensionValue,
-        DimensionVariable, Gather, GatherMode, LogicalMesh, MeshAxis, MeshAxisType, OneOperation, OperationProvider,
-        ParallelPermute, Placeholder, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceFreeze, ReferenceNew,
-        ReferenceRead, ReferenceSwap, ReferenceWrite, Shape, Sharding, Sort, SortDirection, Typed, WhileOperation,
-        WhilePredicate, ZeroOperation, batch, differentiate_at,
+        DimensionVariable, Gather, GatherMode, LogicalMesh, Max, MeshAxis, MeshAxisType, Min, OneOperation,
+        OperationProvider, ParallelPermute, Placeholder, Pow, Reduce, ReductionKind, ReferenceAddUpdate,
+        ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceSwap, ReferenceWrite, Rem, SaturatingSub, Shape,
+        Sharding, Sort, SortDirection, Typed, WhileOperation, WhilePredicate, ZeroOperation, batch, differentiate_at,
     };
     use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -1096,6 +1096,34 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message.starts_with("`compare` inputs must both be arrays or both be first-class dimensions"),
         ));
+    }
+
+    #[test]
+    fn test_value_dimension_arithmetic() {
+        // Arithmetic on two first-class dimensions uses their dimension members and executes eagerly outside any
+        // context, without compiling a program.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = mesh_on(&client, 0);
+        let (two, three) = (dimension(&domain, 2), dimension(&domain, 3));
+        let program_count = domain.program_count();
+        assert_eq!(two.add(&three), Ok(dimension(&domain, 5)));
+        assert_eq!(three.sub(&two), Ok(dimension(&domain, 1)));
+        assert_eq!(two.saturating_sub(&three), Ok(dimension(&domain, 0)));
+        assert_eq!(two.mul(&three), Ok(dimension(&domain, 6)));
+        assert_eq!(three.div(&two), Ok(dimension(&domain, 1)));
+        assert_eq!(three.rem(&two), Ok(dimension(&domain, 1)));
+        assert_eq!(two.pow(&three), Ok(dimension(&domain, 8)));
+        assert_eq!(two.min(&three), Ok(dimension(&domain, 2)));
+        assert_eq!(two.max(&three), Ok(dimension(&domain, 3)));
+        assert_eq!(domain.program_count(), program_count);
+
+        // A dimension paired with an array uses the array members, which rejects the dimension.
+        let scalar = Value::Array(array(&domain, &mesh, DataType::I64, &[2i64], &[]));
+        assert_eq!(
+            two.mul(&scalar),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
     }
 
     #[test]

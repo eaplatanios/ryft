@@ -332,14 +332,19 @@ mod tests {
     use std::sync::Arc;
 
     use indoc::indoc;
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
-    use ryft_core::{ConvertElementTypeOperation, Placeholder};
+    use ryft_core::{
+        Abs, Add, ConvertElementTypeOperation, Div, Mul, Neg, Placeholder, Rem, Sign, Sub, differentiate_at,
+    };
     use ryft_pjrt::{BufferType, Client, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
+    use crate::Session;
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{ProgramBuilder, test_spmd_compilation_options};
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::ArrayConstant;
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
 
     use super::*;
 
@@ -439,6 +444,22 @@ mod tests {
     }
 
     #[test]
+    fn test_normalize_arithmetic_inputs_signed_one_bit_promotion() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let signed = replicated_array(&domain, &mesh, DataType::I1, &[2], &[1, 0]);
+        let two = replicated_array(&domain, &mesh, DataType::I8, &[], &[2]);
+
+        // Implicit promotion interprets a signed set bit as -1 before doing wider arithmetic.
+        assert_eq!(values_from_bytes::<i8>(&signed.add(&two).unwrap().copy_to_host().unwrap()), [1, 2]);
+        assert_eq!(values_from_bytes::<i8>(&signed.sub(&two).unwrap().copy_to_host().unwrap()), [-3, -2]);
+        assert_eq!(values_from_bytes::<i8>(&signed.mul(&two).unwrap().copy_to_host().unwrap()), [-2, 0]);
+        assert_eq!(values_from_bytes::<i8>(&signed.div(&two).unwrap().copy_to_host().unwrap()), [0, 0]);
+        assert_eq!(values_from_bytes::<i8>(&signed.rem(&two).unwrap().copy_to_host().unwrap()), [-1, 0]);
+    }
+
+    #[test]
     fn test_lower_arithmetic_output() {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::scalar(DataType::I1));
@@ -464,6 +485,37 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_lower_arithmetic_output_one_bit() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let cpu = client.platform_name().unwrap().eq_ignore_ascii_case("cpu");
+
+        // One-bit arithmetic wraps modulo two, whereas StableHLO predicate addition would perform Boolean OR. Negation
+        // and the signed sign are the identity on a single bit.
+        for data_type in [DataType::I1, DataType::U1] {
+            let left = replicated_array(&domain, &mesh, data_type, &[4], &[0, 0, 1, 1]);
+            let right = replicated_array(&domain, &mesh, data_type, &[4], &[0, 1, 0, 1]);
+            let one = replicated_array(&domain, &mesh, data_type, &[], &[1]);
+            let zero = replicated_array(&domain, &mesh, data_type, &[], &[0]);
+            assert_eq!(left.add(&right).unwrap().copy_to_host().unwrap(), [0, 1, 1, 0], "{data_type}");
+            assert_eq!(left.sub(&right).unwrap().copy_to_host().unwrap(), [0, 1, 1, 0], "{data_type}");
+            assert_eq!(left.mul(&right).unwrap().copy_to_host().unwrap(), [0, 0, 0, 1], "{data_type}");
+            assert_eq!(left.neg().unwrap().copy_to_host().unwrap(), [0, 0, 1, 1], "{data_type}");
+            if data_type == DataType::I1 {
+                assert_eq!(left.sign().unwrap().copy_to_host().unwrap(), [0, 0, 1, 1]);
+            }
+            assert_eq!(left.div(&one).unwrap().copy_to_host().unwrap(), [0, 0, 1, 1], "{data_type}");
+            assert_eq!(left.rem(&one).unwrap().copy_to_host().unwrap(), [0, 0, 0, 0], "{data_type}");
+            // Division by zero produces a backend-defined value. The CPU sentinel narrows to the single set bit.
+            if cpu {
+                assert_eq!(left.div(&zero).unwrap().copy_to_host().unwrap(), [1, 1, 1, 1], "{data_type}");
+                assert_eq!(left.rem(&zero).unwrap().copy_to_host().unwrap(), [0, 0, 1, 1], "{data_type}");
+            }
+        }
     }
 
     #[test]
@@ -539,5 +591,29 @@ mod tests {
         assert_eq!(execute_saturating_sub(&client, [DataType::I1, DataType::I8], &[-1, 0], &[-128], true), [127, 127],);
         assert_eq!(execute_saturating_sub(&client, [DataType::I1, DataType::I2], &[-1, 0], &[-2], true), [1, 1]);
         assert_eq!(execute_saturating_sub(&client, [DataType::I2, DataType::I4], &[-2, 1], &[-8], true), [6, 7]);
+    }
+
+    #[test]
+    fn test_abs_operation_lower_differentiation_at_zero() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // The JVP of `abs` uses its explicit origin convention after XLA compiles the comparison and selection that
+        // define it, rather than exposing the NaN of the undefined `0 / 0` formula. The real rule picks the right
+        // derivative.
+        let primal = replicated_array(&domain, &mesh, DataType::F32, &[], &values_to_bytes(&[0f32]));
+        let tangent = replicated_array(&domain, &mesh, DataType::F32, &[], &values_to_bytes(&[3f32]));
+        let (value, tangent) = differentiate_at(primal).jvp(tangent, |input| input.abs()).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), [0f32]);
+        assert_eq!(values_from_bytes::<f32>(&tangent.copy_to_host().unwrap()), [3f32]);
+
+        // The complex rule yields a zero tangent at the origin.
+        let primal = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[Complex::new(0f32, 0.0)]));
+        let tangent =
+            replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[Complex::new(1f32, 2.0)]));
+        let (value, tangent) = differentiate_at(primal).jvp(tangent, |input| input.abs()).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), [0f32]);
+        assert_eq!(values_from_bytes::<f32>(&tangent.copy_to_host().unwrap()), [0f32]);
     }
 }

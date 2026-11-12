@@ -2052,15 +2052,20 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use ryft_core::{
-        ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionVariable,
-        Error as CoreError, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Reference as CoreReference, Shape,
-        Sharding, ShardingDimension, ShardingError, StaticShape, TiledLayout, Typed, UnreducedKind,
+        Array as CoreArray, ArrayType, AssertionValue, Concretizable, DataType, Device, DeviceMesh,
+        Dimension as CoreDimension, DimensionBounds, DimensionFromScalar, DimensionSize, DimensionVariable,
+        Error as CoreError, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Neg, ProgramError,
+        Reference as CoreReference, Shape, Sharding, ShardingDimension, ShardingError, StaticShape, TiledLayout,
+        TypeError, Typed, UnreducedKind, Value as CoreValue, WhilePredicate,
     };
     use ryft_pjrt::protos::{CompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Error as PjrtError, ExecutionFence, load_cpu_plugin};
 
-    use crate::tests::{device_mesh_2x2, logical_mesh_2x2, values_from_bytes, values_to_bytes};
-    use crate::{Error, FromPjrt, Session, ToPjrt};
+    use crate::domains::tests::domain_mesh;
+    use crate::tests::{
+        device_mesh_2x2, execution_client, logical_mesh_2x2, replicated_array, values_from_bytes, values_to_bytes,
+    };
+    use crate::{Domain, Error, FromPjrt, Session, ToPjrt};
 
     use super::{
         Array, ArrayError, ArrayOutputLayout, ArrayShard, ArrayTypeExtension, ShardDescriptor, ShardLayout,
@@ -2068,6 +2073,40 @@ mod tests {
     };
 
     fn assert_send_sync<T: Send + Sync>() {}
+
+    // Builds a rank-0 array whose sharding is unreduced along a two-device mesh axis `x`, with `kind` combining the
+    // separate values `device_bytes` that the two devices of the client of `domain` hold.
+    fn unreduced_scalar<'o>(
+        domain: &Domain<'o>,
+        data_type: DataType,
+        kind: UnreducedKind,
+        device_bytes: [&[u8]; 2],
+    ) -> Array<'o> {
+        let client = domain.client();
+        let devices = client.addressable_devices().unwrap();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(
+            logical_mesh.clone(),
+            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+        )
+        .unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 0)
+            .with_unreduced_axes(["x"])
+            .unwrap()
+            .with_unreduced_kind(kind)
+            .unwrap();
+        let r#type = ArrayType::new_static(data_type, []).with_sharding(sharding).unwrap();
+        let buffers = device_bytes
+            .iter()
+            .zip(&devices)
+            .map(|(bytes, device)| {
+                client
+                    .buffer(*bytes, Array::physical_buffer_type(data_type), [], None, device.clone(), None)
+                    .unwrap()
+            })
+            .collect();
+        Array::from_addressable_buffers(domain, r#type, mesh, buffers).unwrap()
+    }
 
     #[test]
     fn test_array_is_send_and_sync() {
@@ -2300,10 +2339,7 @@ mod tests {
             array.addressable_shards().next().unwrap().buffer().unwrap().layout(),
             Ok(layout.to_pjrt().unwrap())
         );
-        assert_eq!(
-            values_from_bytes::<f64>(crate::arrays_v0::host::materialize_dense_array_bytes(&array).unwrap().as_slice()),
-            vec![1., 2., 3., 4., 5., 6.],
-        );
+        assert_eq!(values_from_bytes::<f64>(&array.copy_to_host().unwrap()), vec![1., 2., 3., 4., 5., 6.]);
         let wrong_buffer = client
             .buffer(
                 values_to_bytes(&[1f64, 2., 3., 4., 5., 6.]).as_slice(),
@@ -2460,9 +2496,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let materialize = |array: &Array<'_>| {
-            values_from_bytes::<f32>(crate::arrays_v0::host::materialize_dense_array_bytes(array).unwrap().as_slice())
-        };
+        let materialize = |array: &Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
 
         let uploaded =
             Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2., 3., 4.]))
@@ -2653,7 +2687,7 @@ mod tests {
         let shard = array.addressable_shards().next().unwrap();
         assert!(shard.buffer().is_none());
         assert_eq!(array, array.clone());
-        assert_eq!(crate::arrays_v0::host::materialize_dense_array_bytes(&array).unwrap(), Vec::<u8>::new());
+        assert_eq!(array.copy_to_host().unwrap(), Vec::<u8>::new());
 
         let zero_sized_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(0)]));
         let zero_sized = Array::from_host_buffer(&domain, zero_sized_type, array.mesh().clone(), []).unwrap();
@@ -2876,6 +2910,12 @@ mod tests {
         assert!(std::ptr::eq(reassociated.client(), &client));
         assert_eq!(reassociated, original);
 
+        // Receiver-based operations on the reassociated array compile and execute in the other session.
+        let negated = Neg::neg(&reassociated).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&negated.copy_to_host().unwrap()), vec![-1f32]);
+        assert_eq!(other_session.domain().program_count(), 1);
+        assert_eq!(session.domain().program_count(), 0);
+
         // Re-association never affects the clones that existed beforehand, which keep their original domain.
         assert!(Arc::ptr_eq(original.backend_domain().session(), &session));
         assert!(std::ptr::eq(original.backend_domain().compilation_options(), session.domain().compilation_options()));
@@ -2889,6 +2929,63 @@ mod tests {
                 Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. }))
                     if message == "cannot associate an array with a domain of a different PJRT client",
             ));
+        }
+    }
+
+    #[test]
+    fn test_array_copy_to_host() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let client_devices = client.addressable_devices().unwrap();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
+        let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
+        let values = values_to_bytes(&[1f32, 2., 3., 4.]);
+
+        // Sharded and replicated arrays read back as the dense row-major bytes of their whole value.
+        for sharding in [sharded.clone(), replicated.clone()] {
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+            let array = Array::from_host_buffer(&domain, r#type, mesh.clone(), values.as_slice()).unwrap();
+            assert_eq!(array.copy_to_host().unwrap(), values);
+        }
+
+        // An array with no elements produces no bytes.
+        let r#type = ArrayType::new_static(DataType::F32, [0]).with_sharding(sharded.clone()).unwrap();
+        let empty = Array::from_host_buffer(&domain, r#type, mesh, []).unwrap();
+        assert_eq!(empty.copy_to_host().unwrap(), Vec::<u8>::new());
+
+        // When the second mesh device lives in another process, the current process holds a replicated value in full,
+        // but only half of a sharded value and only one of the summands of an unreduced value.
+        let remote_device =
+            Device::new(devices.iter().map(Device::id).max().unwrap() + 1, client.process_index().unwrap() + 1);
+        let remote_mesh = DeviceMesh::new(logical_mesh, vec![devices[0], remote_device]).unwrap();
+        let with_remote_shard = |sharding: Sharding, local_values: &[f32]| {
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+            let dimensions = [local_values.len() as u64];
+            let bytes = values_to_bytes(local_values);
+            let buffer =
+                client.buffer(bytes.as_slice(), BufferType::F32, dimensions, None, client_devices[0].clone(), None);
+            Array::from_addressable_buffers(&domain, r#type, remote_mesh.clone(), vec![buffer.unwrap()]).unwrap()
+        };
+        assert_eq!(with_remote_shard(replicated, &[1., 2., 3., 4.]).copy_to_host().unwrap(), values);
+        for (sharding, local_values) in [(sharded, [1f32, 2.].as_slice()), (unreduced, [1f32, 2., 3., 4.].as_slice())] {
+            let error = with_remote_shard(sharding, local_values).copy_to_host().unwrap_err();
+            assert!(matches!(
+                &error,
+                Error::Array(error) if matches!(error.as_ref(),
+                    ArrayError::MissingShardBuffer { shard_index: 1, device_id } if *device_id == remote_device.id(),
+                ),
+            ));
+            assert_eq!(
+                error.to_string(),
+                format!("array shard #1 on device {} has no addressable buffer", remote_device.id()),
+            );
         }
     }
 
@@ -2924,6 +3021,272 @@ mod tests {
     }
 
     #[test]
+    fn test_array_domain() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let array = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
+
+        // Arrays recover the domain they were constructed in, together with its session and client.
+        let recovered = CoreValue::domain(&array);
+        assert!(std::ptr::eq(recovered.parent().client(), &client));
+        assert!(Arc::ptr_eq(recovered.parent().session(), domain.session()));
+    }
+
+    #[test]
+    fn test_array_concretize_bool() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let truth = replicated_array(&domain, &mesh, DataType::Boolean, &[], &[1]);
+        let falsity = replicated_array(&domain, &mesh, DataType::Boolean, &[], &[0]);
+        assert_eq!(Concretizable::<bool>::concretize(&truth), Ok(true));
+        assert_eq!(Concretizable::<bool>::concretize(&falsity), Ok(false));
+
+        // Rank-1 arrays cannot collapse to a single Boolean.
+        let vector = replicated_array(&domain, &mesh, DataType::Boolean, &[2], &[1, 0]);
+        assert_eq!(
+            Concretizable::<bool>::concretize(&vector),
+            Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from a value of type \
+                          `bool[2][sharding={mesh<['x'=1:auto]>, [{}]}]`; expected `bool[]`"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_concretize_bool_unreduced() {
+        // The two devices hold the candidates `false` and `true` of a Boolean scalar whose unreduced kind is `max`, so
+        // its value is `true` even though the first addressable shard holds `false`.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let array = unreduced_scalar(&domain, DataType::Boolean, UnreducedKind::Max, [&[0], &[1]]);
+        assert_eq!(Concretizable::<bool>::concretize(&array), Ok(true));
+    }
+
+    #[test]
+    fn test_array_concretize_i128() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let signed = replicated_array(&domain, &mesh, DataType::I64, &[], &i64::MIN.to_ne_bytes());
+        let unsigned = replicated_array(&domain, &mesh, DataType::U64, &[], &u64::MAX.to_ne_bytes());
+
+        // Keep the complete integer range before the caller applies bounds or converts to a host index.
+        assert_eq!(Concretizable::<i128>::concretize(&signed), Ok(i128::from(i64::MIN)));
+        assert_eq!(Concretizable::<i128>::concretize(&unsigned), Ok(i128::from(u64::MAX)));
+
+        // Only rank-0 integer arrays concretize to integers.
+        let float = replicated_array(&domain, &mesh, DataType::F32, &[], &1f32.to_ne_bytes());
+        assert_eq!(
+            Concretizable::<i128>::concretize(&float),
+            Err(ProgramError::Concretization {
+                message: "cannot extract a concrete integer from `f32[][sharding={mesh<['x'=1:auto]>, []}]`; expected \
+                          a scalar integer"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_concretize_i128_unreduced() {
+        // The two devices hold the summands `3` and `4` of a scalar that is unreduced along `x`, so it reads as their
+        // sum rather than as the summand of the first addressable shard.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let array =
+            unreduced_scalar(&domain, DataType::I32, UnreducedKind::Sum, [&3i32.to_ne_bytes(), &4i32.to_ne_bytes()]);
+        assert_eq!(Concretizable::<i128>::concretize(&array), Ok(7));
+    }
+
+    #[test]
+    fn test_array_any_true() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let mixed = replicated_array(&domain, &mesh, DataType::Boolean, &[2], &[0, 1]);
+        let none = replicated_array(&domain, &mesh, DataType::Boolean, &[2], &[0, 0]);
+        assert_eq!(mixed.any_true(), Ok(true));
+        assert_eq!(none.any_true(), Ok(false));
+
+        // Only Boolean arrays are while predicates.
+        let float = replicated_array(&domain, &mesh, DataType::F32, &[1], &1f32.to_ne_bytes());
+        assert_eq!(
+            float.any_true(),
+            Err(ProgramError::Concretization {
+                message: "cannot use a value of type f32[1][sharding={mesh<['x'=1:auto]>, [{}]}] as a Boolean while \
+                          predicate"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_select() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let mixed = replicated_array(&domain, &mesh, DataType::Boolean, &[2], &[0, 1]);
+        let on_true = replicated_array(&domain, &mesh, DataType::F32, &[2, 2], &values_to_bytes(&[1f32, 2., 3., 4.]));
+        let on_false = replicated_array(&domain, &mesh, DataType::F32, &[2, 2], &values_to_bytes(&[5f32, 6., 7., 8.]));
+
+        // The prefix-shaped predicate broadcasts along its leading axes: item 0 keeps the first row of `on_false` and
+        // item 1 takes the second row of `on_true`.
+        let selected = WhilePredicate::select(&mixed, &on_true, &on_false).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&selected.copy_to_host().unwrap()), vec![5f32, 6., 3., 4.]);
+
+        // Non-Boolean predicates are rejected.
+        assert_eq!(
+            WhilePredicate::select(&on_true, &on_true, &on_false).map(|_| ()),
+            Err(ProgramError::UnsupportedOperation {
+                message: "select requires a Boolean prefix-shaped predicate and congruent inputs, but got predicate \
+                          f32[2, 2][sharding={mesh<['x'=1:auto]>, [{}, {}]}] with inputs \
+                          f32[2, 2][sharding={mesh<['x'=1:auto]>, [{}, {}]}] and \
+                          f32[2, 2][sharding={mesh<['x'=1:auto]>, [{}, {}]}]"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_assertion_observation() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let scalar = replicated_array(&domain, &mesh, DataType::F32, &[], &2.5f32.to_ne_bytes());
+        assert_eq!(scalar.assertion_observation(), Ok("2.5".to_string()));
+
+        // Complex observations are not supported.
+        let complex = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[1f32, 2.]));
+        assert_eq!(
+            complex.assertion_observation(),
+            Err(ProgramError::Concretization {
+                message: "unsupported assertion observation type `c64[][sharding={mesh<['x'=1:auto]>, []}]`"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_assertion_observation_unreduced() {
+        // The observation of a scalar that is unreduced along `x` is the sum of the summands `3` and `4`.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let array =
+            unreduced_scalar(&domain, DataType::I32, UnreducedKind::Sum, [&3i32.to_ne_bytes(), &4i32.to_ne_bytes()]);
+        assert_eq!(array.assertion_observation(), Ok("7".to_string()));
+    }
+
+    #[test]
+    fn test_array_assertion_array() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let bytes = values_to_bytes(&[1f32, 2.]);
+        let array = replicated_array(&domain, &mesh, DataType::F32, &[2], &bytes);
+
+        // The observed reference array carries the element type and shape of the array but not its sharding.
+        assert_eq!(
+            array.assertion_array(),
+            Ok(Some(CoreArray::new(ArrayType::new_static(DataType::F32, [2]), bytes).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_array_dimension_size() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 2);
+        let matrix = replicated_array(&domain, &mesh, DataType::F32, &[2, 3], &values_to_bytes(&[0f32; 6]));
+        assert_eq!(matrix.dimension_size(0), Ok(2));
+        assert_eq!(matrix.dimension_size(-1), Ok(3));
+        assert!(matches!(
+            matrix.dimension_size(2),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`dimension_size` axis 2 is out of bounds for rank 2",
+        ));
+
+        // The extent of an unevenly sharded axis is the greatest end of the slices of its shards.
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let sharded = Array::from_host_buffer_with_sharding(
+            &domain,
+            ArrayType::new_static(DataType::F32, [5]),
+            sharding,
+            mesh,
+            values_to_bytes(&[0f32; 5]),
+        )
+        .unwrap();
+        assert_eq!(sharded.dimension_size(0), Ok(5));
+    }
+
+    #[test]
+    fn test_array_to_dimension() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let scalar = replicated_array(&domain, &mesh, DataType::I32, &[], &5i32.to_ne_bytes());
+        assert_eq!(scalar.to_dimension(variable.clone()).unwrap().extent(), 5);
+
+        let negative = replicated_array(&domain, &mesh, DataType::I32, &[], &(-1i32).to_ne_bytes());
+        assert!(matches!(
+            negative.to_dimension(variable),
+            Err(ProgramError::InvalidArgument { message })
+                if message
+                    == "`dimension_from_scalar` scalar input must be a nonnegative host-representable extent but is -1",
+        ));
+    }
+
+    #[test]
+    fn test_array_to_dimension_unreduced() {
+        // The extent read from a scalar that is unreduced along `x` is the sum of the summands `3` and `4`.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let array =
+            unreduced_scalar(&domain, DataType::I32, UnreducedKind::Sum, [&3i32.to_ne_bytes(), &4i32.to_ne_bytes()]);
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        assert_eq!(array.to_dimension(variable).unwrap().extent(), 7);
+    }
+
+    #[test]
+    fn test_array_operators() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let read = |array: Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
+        let a = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.]));
+        let b = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[3f32, 5.]));
+        assert_eq!(read(a.clone() + b.clone()), vec![4f32, 7.]);
+        assert_eq!(read(b.clone() - a.clone()), vec![2f32, 3.]);
+        assert_eq!(read(a.clone() * b.clone()), vec![3f32, 10.]);
+        assert_eq!(read(b / a.clone()), vec![3f32, 2.5]);
+        assert_eq!(read(-a), vec![-1f32, -2.]);
+
+        let truths = replicated_array(&domain, &mesh, DataType::Boolean, &[4], &[1, 1, 0, 0]);
+        let mixed = replicated_array(&domain, &mesh, DataType::Boolean, &[4], &[1, 0, 1, 0]);
+        assert_eq!((truths.clone() & mixed.clone()).copy_to_host().unwrap(), vec![1u8, 0, 0, 0]);
+        assert_eq!((truths.clone() | mixed.clone()).copy_to_host().unwrap(), vec![1u8, 1, 1, 0]);
+        assert_eq!((truths ^ mixed.clone()).copy_to_host().unwrap(), vec![0u8, 1, 1, 0]);
+        assert_eq!((!mixed).copy_to_host().unwrap(), vec![0u8, 1, 0, 1]);
+    }
+
+    #[test]
     fn test_array_shard() {
         let descriptor = ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]);
         let shard = ArrayShard::new(descriptor.clone(), None);
@@ -2937,6 +3300,47 @@ mod tests {
         assert!(!shard.is_addressable());
         assert_eq!(shard.descriptor, descriptor);
         assert!(shard.buffer().is_none());
+    }
+
+    #[test]
+    fn test_array_shard_copy_to_host() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 2);
+
+        // A buffer-backed shard holds only its own tile of the array.
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let array = Array::from_host_buffer_with_sharding(
+            &domain,
+            ArrayType::new_static(DataType::F32, [4]),
+            sharding,
+            mesh.clone(),
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        assert_eq!(values_from_bytes::<f32>(&array.shards()[1].copy_to_host().unwrap()), vec![3f32, 4.]);
+
+        // Bufferless zero shards and buffer-backed shards with no elements produce no bytes.
+        let zero = replicated_array(&domain, &mesh, DataType::Zero, &[3], &[]);
+        assert!(zero.shards()[0].buffer().is_none());
+        assert_eq!(zero.shards()[0].copy_to_host().unwrap(), Vec::<u8>::new());
+        let empty = replicated_array(&domain, &mesh, DataType::F32, &[0], &[]);
+        assert!(empty.shards()[0].buffer().is_some());
+        assert_eq!(empty.shards()[0].copy_to_host().unwrap(), Vec::<u8>::new());
+
+        // A remote shard has no buffer in the current process.
+        let remote = ArrayShard::new(ShardDescriptor::new(3, Device::new(7, 2), vec![2..5, 0..4]), None);
+        let error = remote.copy_to_host().unwrap_err();
+        assert!(matches!(
+            &error,
+            Error::Array(error) if matches!(error.as_ref(),
+                ArrayError::MissingShardBuffer { shard_index: 3, device_id: 7 },
+            ),
+        ));
+        assert_eq!(error.to_string(), "array shard #3 on device 7 has no addressable buffer");
     }
 
     #[test]

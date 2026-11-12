@@ -915,20 +915,41 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION, DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME, Differentiate,
-        DimensionBounds, DimensionVariable, DomainTracingContext, Typed, Value as CoreValue,
+        Array as CoreArray, ArrayOperation, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION,
+        DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, Differentiate, DimensionBounds, DimensionVariable,
+        DomainTracingContext, EagerContext, ProjectedContext, Reduce, Typed, Value as CoreValue,
         differentiable_dot_product_attention, dot_product_attention,
     };
 
     use crate::domains::Tracer;
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::ops::FlatProgram;
-    use crate::{Domain, to_mlir_module_for_program};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::{Array, Domain, Session, to_mlir_module_for_program};
 
     use super::*;
 
     /// Staged program together with its input and output types.
     type StagedProgram = (FlatProgram, Vec<ArrayType>, Vec<ArrayType>);
+
+    /// Context whose values are eager XLA [`Array`]s.
+    type ArrayContext<'c> = ProjectedContext<Domain<'c>, ArrayType>;
+
+    /// Context whose values are reference backend arrays.
+    type ReferenceContext = EagerContext<CoreArray, ArrayOperation<CoreArray>>;
+
+    /// Asserts that `actual` has the shape of `expected` and that their `f32` elements agree up to the rounding of
+    /// the exponentials and divisions in the attention bodies.
+    fn assert_matches_reference(actual: &Array<'_>, expected: &CoreArray) {
+        assert_eq!(actual.r#type().shape(), expected.r#type().shape());
+        let actual = values_from_bytes::<f32>(&actual.copy_to_host().unwrap());
+        let expected = expected.elements::<f32>().unwrap();
+        assert_eq!(actual.len(), expected.len());
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!((actual - expected).abs() < 1e-5, "element {index} is {actual} but the reference is {expected}");
+        }
+    }
 
     /// Returns the array types of `types`.
     fn array_types(types: &[ArrayIrType]) -> Vec<ArrayType> {
@@ -1170,8 +1191,11 @@ mod tests {
             )
             .is_none()
         );
-        let training_key = CompositeKey::new(DOT_PRODUCT_ATTENTION_TRAINING_COMPOSITE_NAME, 1);
-        assert!(select_attention_implementation(&training_key, &forward_types, &forward_types, Some("cuda")).is_none());
+        let differentiable_key = CompositeKey::new(DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, 1);
+        assert!(
+            select_attention_implementation(&differentiable_key, &forward_types, &forward_types, Some("cuda"))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1373,6 +1397,79 @@ mod tests {
     }
 
     #[test]
+    fn test_portable_attention_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let query_values = (0..12).map(|index| (index as f32 - 5.0) * 0.25).collect::<Vec<_>>();
+        let key_values = (0..12).map(|index| ((index * 5 % 13) as f32 - 6.0) * 0.25).collect::<Vec<_>>();
+        let value_values = (0..12).map(|index| ((index * 3 % 7) as f32 - 3.0) * 0.5).collect::<Vec<_>>();
+        let device = |values: &[f32]| {
+            replicated_array(&domain, &mesh, DataType::F32, &[1, 3, 2, 2], values_to_bytes(values).as_slice())
+        };
+        let reference = |values: &[f32]| {
+            CoreArray::from_elements(ArrayType::new_static(DataType::F32, [1, 3, 2, 2]), values).unwrap()
+        };
+        for configuration in [
+            AttentionConfiguration::new().with_scale(0.5),
+            AttentionConfiguration::new().with_scale(0.5).with_causal(true).with_local_window((1, 0)),
+        ] {
+            let output = dot_product_attention::<ArrayContext<'_>>(configuration)
+                .call(AttentionInputs::new(device(&query_values), device(&key_values), device(&value_values)))
+                .unwrap();
+            let reference_output = dot_product_attention::<ReferenceContext>(configuration)
+                .call(AttentionInputs::new(reference(&query_values), reference(&key_values), reference(&value_values)))
+                .unwrap();
+            assert_matches_reference(&output, &reference_output);
+        }
+    }
+
+    #[test]
+    fn test_portable_attention_backward_matches_reference_backend() {
+        // Distinct query, key, and value inputs make a mix-up between their cotangents visible.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let query_values = [0.25f32, -0.5, 0.75, 1.0];
+        let key_values = [-0.75f32, 0.5, 1.25, -0.25];
+        let value_values = [1.5f32, -1.0, 0.5, 2.0];
+        let device = |values: &[f32]| {
+            replicated_array(&domain, &mesh, DataType::F32, &[1, 2, 1, 2], values_to_bytes(values).as_slice())
+        };
+        let reference = |values: &[f32]| {
+            CoreArray::from_elements(ArrayType::new_static(DataType::F32, [1, 2, 1, 2]), values).unwrap()
+        };
+        let configuration = AttentionConfiguration::new().with_scale(0.5).with_causal(true);
+
+        let function = differentiable_dot_product_attention::<ArrayContext<'_>>(configuration);
+        let inputs = AttentionInputs::new(device(&query_values), device(&key_values), device(&value_values));
+        let context = inputs.query.domain();
+        let (loss, gradients) = context
+            .differentiate_at(inputs)
+            .value_and_gradient(|inputs| {
+                function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
+            })
+            .unwrap();
+
+        let reference_function = differentiable_dot_product_attention::<ReferenceContext>(configuration);
+        let (reference_loss, reference_gradients) = ReferenceContext::new()
+            .differentiate_at(AttentionInputs::new(
+                reference(&query_values),
+                reference(&key_values),
+                reference(&value_values),
+            ))
+            .value_and_gradient(|inputs| {
+                reference_function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
+            })
+            .unwrap();
+
+        assert_matches_reference(&loss, &reference_loss);
+        assert_matches_reference(&gradients.query, &reference_gradients.query);
+        assert_matches_reference(&gradients.key, &reference_gradients.key);
+        assert_matches_reference(&gradients.value, &reference_gradients.value);
+    }
+
+    #[test]
     fn test_portable_attention_with_dynamic_extents() {
         // Portable attention obtains every logical extent from the mixed array IR, so bounded-dynamic programs do not
         // need to expose physical padding as sequence-length inputs and support the same grouped-query and window
@@ -1486,5 +1583,61 @@ mod tests {
         let backward = lower(&program, Some("cuda")).unwrap();
         assert!(backward.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmaxBackward("));
         assert_eq!(program.2, vec![query_type.clone(), query_type, key_value_type.clone(), key_value_type]);
+    }
+
+    #[test]
+    fn test_attention_jax_surface_matches_reference_backend() {
+        // A broadcast rank-0 bias, an arbitrary mask, independent length vectors, the default scale, an asymmetric
+        // window, and the residual all agree with the reference backend.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let query_values = (0..12).map(|index| (index as f32 - 5.0) * 0.25).collect::<Vec<_>>();
+        let key_values = (0..12).map(|index| ((index * 5 % 13) as f32 - 6.0) * 0.25).collect::<Vec<_>>();
+        let value_values = (0..12).map(|index| ((index * 3 % 7) as f32 - 3.0) * 0.5).collect::<Vec<_>>();
+        let operand_type = ArrayType::new_static(DataType::F32, [1, 3, 2, 2]);
+        let reference_inputs = AttentionInputs {
+            query: CoreArray::from_elements(operand_type.clone(), &query_values).unwrap(),
+            key: CoreArray::from_elements(operand_type.clone(), &key_values).unwrap(),
+            value: CoreArray::from_elements(operand_type, &value_values).unwrap(),
+            bias: Some(CoreArray::from_elements(ArrayType::scalar(DataType::F32), &[0.25f32]).unwrap()),
+            mask: Some(
+                CoreArray::from_elements(
+                    ArrayType::new_static(DataType::Boolean, [3, 3]),
+                    &[true, false, false, true, true, false, true, true, true],
+                )
+                .unwrap(),
+            ),
+            query_sequence_lengths: Some(
+                CoreArray::from_elements(ArrayType::new_static(DataType::I32, [1]), &[2i32]).unwrap(),
+            ),
+            key_value_sequence_lengths: Some(
+                CoreArray::from_elements(ArrayType::new_static(DataType::I32, [1]), &[3i32]).unwrap(),
+            ),
+            dropout_state: None,
+        };
+        let device = |value: &CoreArray| {
+            let r#type = value.r#type();
+            let dimensions = r#type.static_shape().unwrap().dimensions().to_vec();
+            replicated_array(&domain, &mesh, r#type.data_type(), &dimensions, value.logical_bytes().as_slice())
+        };
+        let device_inputs = AttentionInputs {
+            query: device(&reference_inputs.query),
+            key: device(&reference_inputs.key),
+            value: device(&reference_inputs.value),
+            bias: reference_inputs.bias.as_ref().map(device),
+            mask: reference_inputs.mask.as_ref().map(device),
+            query_sequence_lengths: reference_inputs.query_sequence_lengths.as_ref().map(device),
+            key_value_sequence_lengths: reference_inputs.key_value_sequence_lengths.as_ref().map(device),
+            dropout_state: None,
+        };
+        let configuration = AttentionConfiguration::new().with_causal(true).with_local_window((2, 1));
+        let (output, residual) =
+            dot_product_attention::<ArrayContext<'_>>(configuration).call_with_residual(device_inputs).unwrap();
+        let (reference_output, reference_residual) = dot_product_attention::<ReferenceContext>(configuration)
+            .call_with_residual(reference_inputs)
+            .unwrap();
+        assert_matches_reference(&output, &reference_output);
+        assert_matches_reference(&residual, &reference_residual);
     }
 }

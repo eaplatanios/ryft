@@ -546,23 +546,26 @@ impl MemberLowerableOperation<ArrayIrType> for CustomCallOperation {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, DataType, Dimension as CoreDimension, DimensionBounds, DimensionSizeOperation, DimensionType,
-        DimensionValue, DimensionVariable, Memory, Placeholder, Shape, TiledLayout, TypedProgram,
+        ArrayIrType, BatchAxis, Composite, CustomCall, CustomCallBatching, CustomCallUnrolling, DataType, DeviceMesh,
+        Dimension as CoreDimension, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionValue,
+        DimensionVariable, DomainTracer, Memory, Placeholder, ProjectedContext, Reduce, ReductionKind, Shape, Sharding,
+        StaticShape, TiledLayout, TypedProgram, batch, differentiate_at,
     };
     use ryft_mlir::{Operation as MlirOperation, Value as MlirValue};
     use ryft_pjrt::extensions::ffi::{
-        FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
-        FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
+        FfiAttribute, FfiAttributes, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler,
+        FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::domains::runtimes::builtin_requirement;
+    use crate::domains::tests::domain_mesh;
     use crate::domains::{RuntimeRequirement, with_runtime_requirements};
     use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::{
@@ -571,9 +574,29 @@ mod tests {
     use crate::experimental::ops::{ArrayConstant, Constant, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::kernels::KernelEmbeddingError;
     use crate::operations::assertions::ensure_assertion_handler_registered;
-    use crate::{RuntimeError, to_mlir_module_for_program};
+    use crate::tests::{
+        ADD_ONE_CUSTOM_CALL_TARGET, ensure_add_one_handler_registered, replicated_array, values_from_bytes,
+        values_to_bytes,
+    };
+    use crate::{Array, Domain, RuntimeError, Session, Value, to_mlir_module_for_program};
 
     use super::*;
+
+    // Returns the type of an `f32` array with the provided dimensions that is replicated over `mesh`.
+    fn replicated_f32_type(mesh: &DeviceMesh, dimensions: &[usize]) -> ArrayType {
+        ArrayType::new(DataType::F32, StaticShape::new(dimensions.to_vec()).into())
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
+            .unwrap()
+    }
+
+    // Returns a one-device CPU client. The FFI handlers of the tests that use it access their buffers through host
+    // pointers, so those tests always run on CPU.
+    fn cpu_client() -> ryft_pjrt::Client<'static> {
+        load_cpu_plugin()
+            .unwrap()
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap()
+    }
 
     #[test]
     fn test_custom_call_runtime_metadata_is_consumed_without_changing_native_attributes() {
@@ -1111,6 +1134,381 @@ mod tests {
     }
 
     #[test]
+    fn test_lower_custom_call_executes_registered_ffi_handler() {
+        let client = cpu_client();
+        ensure_add_one_handler_registered(&client).unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Eager dispatch compiles a single `stablehlo.custom_call` that resolves to the registered handler at
+        // execution time.
+        let input =
+            replicated_array(&domain, &mesh, DataType::F32, &[2, 2], &values_to_bytes(&[1.5f32, 2.5, 3.5, 4.5]));
+        let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_f32_type(&mesh, &[2, 2])]);
+        let outputs = CustomCall::custom_call(&operation, [&input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![2.5f32, 3.5, 4.5, 5.5]);
+
+        // A typed `f64` attribute reaches the handler through the `backend_config` dictionary.
+        let operation = operation.with_attribute("increment", 2.5f64);
+        let outputs = CustomCall::custom_call(&operation, [&input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![4f32, 5.0, 6.0, 7.0]);
+
+        // An aliased ordered-I/O call keeps the array-only handler ABI while its lowering threads a hidden token.
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1.5f32, 2.5]));
+        let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_f32_type(&mesh, &[2])])
+            .with_input_output_alias(0, 0)
+            .unwrap()
+            .with_effect_class(EffectClass::OrderedIo);
+        let outputs = CustomCall::custom_call(&operation, [&input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![2.5f32, 3.5]);
+    }
+
+    #[test]
+    fn test_lower_custom_call_passes_attributes_to_ffi_handler() {
+        // This handler records how XLA's typed FFI decodes every attribute of its call, which verifies that each
+        // `CustomCallAttribute` kind reaches handlers with exactly its declared scalar or array element type, and that
+        // bytes that are not valid UTF-8 arrive unchanged. It also rejects any token operand, because an unordered
+        // effectful call uses the same token-free ABI as a pure call.
+        const TARGET: &str = "ryft.test.inspect_attributes";
+        static OBSERVED_ATTRIBUTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
+
+        fn render_entry(name: &str, attribute: FfiAttribute<'_>) -> Result<String, FfiError> {
+            let value = match attribute {
+                FfiAttribute::Scalar { scalar } => format!("{scalar:?}"),
+                FfiAttribute::String { string } => format!("{string:?}"),
+                FfiAttribute::Bytes { bytes } => format!("{bytes:02x?}"),
+                FfiAttribute::Array { array } => format!("{:?}", array.iter().collect::<Result<Vec<_>, _>>()?),
+                FfiAttribute::Dictionary { dictionary } => render_dictionary(&dictionary)?,
+            };
+            Ok(format!("{name}={value}"))
+        }
+
+        fn render_dictionary(dictionary: &FfiAttributes<'_>) -> Result<String, FfiError> {
+            let entries = dictionary
+                .iter()
+                .map(|entry| entry.and_then(|(name, attribute)| render_entry(name, attribute)))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("{{{}}}", entries.join(", ")))
+        }
+
+        fn inspect(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
+            let inputs = call_frame.inputs().collect::<Result<Vec<_>, _>>()?;
+            if inputs.len() != 1
+                || inputs.iter().any(|FfiInput::Buffer { buffer }| buffer.element_type() == FfiBufferType::Token)
+            {
+                return Err(FfiError::invalid_argument("expected exactly one array input and no token input"));
+            }
+            let entries = call_frame
+                .attributes()
+                .map(|entry| entry.and_then(|(name, attribute)| render_entry(name, attribute)))
+                .collect::<Result<Vec<_>, _>>()?;
+            OBSERVED_ATTRIBUTES.lock().unwrap().push(entries.join(", "));
+            Ok(())
+        }
+
+        unsafe extern "C" fn handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+            // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation.
+            unsafe {
+                let Ok(call_frame) = FfiCallFrame::from_c_api(call_frame) else { return std::ptr::null_mut() };
+                if call_frame.register_metadata(FfiTypeId::default())
+                    || call_frame.stage() != FfiExecutionStage::Execution
+                {
+                    return std::ptr::null_mut();
+                }
+                let Ok(api) = call_frame.api() else { return std::ptr::null_mut() };
+                match inspect(&call_frame) {
+                    Ok(()) => std::ptr::null_mut(),
+                    Err(error) => error.to_c_api(api),
+                }
+            }
+        }
+
+        let client = cpu_client();
+        REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    TARGET,
+                    client.platform_name()?.into_owned(),
+                    FfiHandler::from(handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone()
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, 2.0]));
+        let operation = CustomCallOperation::new(TARGET, Vec::new())
+            .with_attribute("boolean", true)
+            .with_attribute("bytes", CustomCallAttribute::Bytes(vec![0x00, 0xff, 0x80]))
+            .with_attribute("i8", -8i8)
+            .with_attribute("i16", -16i16)
+            .with_attribute("i32", -32i32)
+            .with_attribute("i64", -64i64)
+            .with_attribute("u8", 8u8)
+            .with_attribute("u16", 16u16)
+            .with_attribute("u32", 32u32)
+            .with_attribute("u64", u64::MAX)
+            .with_attribute("f32", 2.5f32)
+            .with_attribute("f64", 3.5f64)
+            .with_attribute("string", "x")
+            .with_attribute("i8_array", vec![1i8, -2])
+            .with_attribute("i16_array", vec![1i16, -2])
+            .with_attribute("i32_array", vec![1i32, -2])
+            .with_attribute("i64_array", vec![1i64, -2])
+            .with_attribute("u8_array", CustomCallArrayAttribute::U8(vec![1, 2]))
+            .with_attribute("u16_array", vec![1u16, 2])
+            .with_attribute("u32_array", vec![1u32, 2])
+            .with_attribute("u64_array", vec![1u64, 2])
+            .with_attribute("f32_array", vec![0.5f32, 1.5])
+            .with_attribute("f64_array", vec![0.25f64])
+            .with_attribute(
+                "dictionary",
+                CustomCallAttribute::Dictionary(vec![("size".to_string(), CustomCallAttribute::from(4i32))]),
+            )
+            .with_effect_class(EffectClass::UnorderedIo);
+        assert!(matches!(CustomCall::custom_call(&operation, [&input]), Ok(outputs) if outputs.is_empty()));
+
+        // The call has effects but no outputs, so its completion is only observable through the effects barrier.
+        domain.effects_barrier().unwrap();
+        assert_eq!(
+            *OBSERVED_ATTRIBUTES.lock().unwrap(),
+            vec![
+                "boolean=Predicate(true), bytes=[00, ff, 80], dictionary={size=I32(4)}, f32=F32(2.5), \
+                 f32_array=[F32(0.5), F32(1.5)], f64=F64(3.5), f64_array=[F64(0.25)], i16=I16(-16), \
+                 i16_array=[I16(1), I16(-2)], i32=I32(-32), i32_array=[I32(1), I32(-2)], i64=I64(-64), \
+                 i64_array=[I64(1), I64(-2)], i8=I8(-8), i8_array=[I8(1), I8(-2)], string=\"x\", u16=U16(16), \
+                 u16_array=[U16(1), U16(2)], u32=U32(32), u32_array=[U32(1), U32(2)], u64=U64(18446744073709551615), \
+                 u64_array=[U64(1), U64(2)], u8=U8(8), u8_array=[U8(1), U8(2)]"
+                    .to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_lower_custom_call_passes_declared_input_layout_to_ffi_handler() {
+        const TARGET: &str = "ryft.test.physical_f32_copy";
+        static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
+
+        // Copies the physical storage of the single `f32` input, in memory order, into the rank-1 `f32` output.
+        unsafe extern "C" fn handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+            // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation, and the
+            // operations below declare an output with as many elements as their input.
+            unsafe {
+                let Ok(call_frame) = FfiCallFrame::from_c_api(call_frame) else { return std::ptr::null_mut() };
+                if call_frame.register_metadata(FfiTypeId::default())
+                    || call_frame.stage() != FfiExecutionStage::Execution
+                {
+                    return std::ptr::null_mut();
+                }
+                let Ok(api) = call_frame.api() else { return std::ptr::null_mut() };
+                let (Ok(FfiInput::Buffer { buffer: input }), Ok(FfiOutput::Buffer { buffer: output })) =
+                    (call_frame.input(0), call_frame.output(0))
+                else {
+                    return FfiError::invalid_argument("expected one input and one output buffer").to_c_api(api);
+                };
+                let length = output.dimensions().iter().product::<i64>() as usize;
+                std::ptr::copy(input.data() as *const f32, output.data() as *mut f32, length);
+                std::ptr::null_mut()
+            }
+        }
+
+        let client = cpu_client();
+        REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    TARGET,
+                    client.platform_name()?.into_owned(),
+                    FfiHandler::from(handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone()
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let values = values_to_bytes(&[1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let column_major = Layout::Tiled(TiledLayout::new(vec![0, 1], Vec::new()));
+        let row_major_input = replicated_array(&domain, &mesh, DataType::F32, &[2, 3], &values);
+        let column_major_input = Array::from_host_buffer(
+            &domain,
+            replicated_f32_type(&mesh, &[2, 3]).with_layout(column_major.clone()),
+            mesh.clone(),
+            values.as_slice(),
+        )
+        .unwrap();
+
+        // A declared input layout is the buffer contract of the kernel. The backend converts a row-major input to the
+        // declared column-major layout before invoking the handler, and passes a column-major input as it is.
+        let operation = CustomCallOperation::new(TARGET, vec![replicated_f32_type(&mesh, &[6])])
+            .with_input_layouts([Some(column_major)]);
+        let outputs = CustomCall::custom_call(&operation, [&row_major_input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1f32, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        let outputs = CustomCall::custom_call(&operation, [&column_major_input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1f32, 4.0, 2.0, 5.0, 3.0, 6.0]);
+
+        // Both an omitted declaration and a `None` entry request row-major storage, even for a column-major input.
+        let operation = CustomCallOperation::new(TARGET, vec![replicated_f32_type(&mesh, &[6])]);
+        let outputs = CustomCall::custom_call(&operation, [&column_major_input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let outputs = CustomCall::custom_call(&operation.with_input_layouts([None]), [&column_major_input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // Aliasing applies to the converted row-major buffer. The handler also permits input and output overlap.
+        let operation = CustomCallOperation::new(TARGET, vec![replicated_f32_type(&mesh, &[2, 3])])
+            .with_input_output_alias(0, 0)
+            .unwrap();
+        let outputs = CustomCall::custom_call(&operation, [&column_major_input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(values_from_bytes::<f32>(&outputs[0].copy_to_host().unwrap()), vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_lower_custom_call_executes_nullary_ffi_handler() {
+        const TARGET: &str = "ryft.test.fill_iota";
+        static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
+
+        // Fills the single rank-1 `f32` output with `0, 1, 2, ...`.
+        unsafe extern "C" fn handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut XLA_FFI_Error {
+            // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation, including
+            // the output allocation whose element count its dimensions describe.
+            unsafe {
+                let Ok(call_frame) = FfiCallFrame::from_c_api(call_frame) else { return std::ptr::null_mut() };
+                if call_frame.register_metadata(FfiTypeId::default())
+                    || call_frame.stage() != FfiExecutionStage::Execution
+                {
+                    return std::ptr::null_mut();
+                }
+                let Ok(api) = call_frame.api() else { return std::ptr::null_mut() };
+                if call_frame.input_count() != 0 {
+                    return FfiError::invalid_argument("expected no inputs").to_c_api(api);
+                }
+                let Ok(FfiOutput::Buffer { buffer: output }) = call_frame.output(0) else {
+                    return FfiError::invalid_argument("expected one output buffer").to_c_api(api);
+                };
+                let length = output.dimensions().iter().product::<i64>() as usize;
+                let values = std::slice::from_raw_parts_mut(output.data() as *mut f32, length);
+                for (index, value) in values.iter_mut().enumerate() {
+                    *value = index as f32;
+                }
+                std::ptr::null_mut()
+            }
+        }
+
+        let client = cpu_client();
+        REGISTRATION
+            .get_or_init(|| {
+                client.register_ffi_handler(
+                    TARGET,
+                    client.platform_name()?.into_owned(),
+                    FfiHandler::from(handler as XLA_FFI_Handler),
+                    FfiHandlerTraits::NONE,
+                )
+            })
+            .clone()
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // A call without array inputs binds directly in the eager domain and runs a source kernel that only fills its
+        // output.
+        let operation = CustomCallOperation::new(TARGET, vec![replicated_f32_type(&mesh, &[4])]);
+        let outputs = operation.call(&domain, &[]).unwrap();
+        let [Value::Array(output)] = outputs.as_slice() else {
+            panic!("expected one array output but got {} outputs", outputs.len());
+        };
+        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![0f32, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_lower_custom_call_executes_batched_ffi_handler() {
+        let client = cpu_client();
+        ensure_add_one_handler_registered(&client).unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let row_type = replicated_f32_type(&mesh, &[2]);
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::F32,
+            &[3, 2],
+            &values_to_bytes(&[1.5f32, 2.5, 3.5, 4.5, 5.5, 6.5]),
+        );
+
+        // `CustomCallBatching::BroadcastAll` materializes every operand on the batch axis, so the elementwise handler
+        // receives one buffer with a leading batch axis in a single call.
+        let broadcast_row_type = row_type.clone();
+        let output: Array<'_> = batch(
+            move |row| {
+                let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![broadcast_row_type])
+                    .with_batching(CustomCallBatching::BroadcastAll);
+                Ok(CustomCall::custom_call(&operation, [&row])?.remove(0))
+            },
+            input.clone(),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![2.5f32, 3.5, 4.5, 5.5, 6.5, 7.5]);
+
+        // `CustomCallBatching::Sequential` stages a `scan` that applies the kernel once per batch item. The eager
+        // batching parent is a `ProjectedContext`, which lifts that `scan` and its body region into the array IR family.
+        for unroll in [CustomCallUnrolling::Disabled, CustomCallUnrolling::Factor(2), CustomCallUnrolling::Full] {
+            let sequential_row_type = row_type.clone();
+            let output: Array<'_> = batch(
+                move |row| {
+                    let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![sequential_row_type])
+                        .with_batching(CustomCallBatching::Sequential { unroll });
+                    Ok(CustomCall::custom_call(&operation, [&row])?.remove(0))
+                },
+                input.clone(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
+                vec![2.5f32, 3.5, 4.5, 5.5, 6.5, 7.5],
+            );
+        }
+    }
+
+    #[test]
+    fn test_lower_custom_call_executes_under_composite_differentiation() {
+        let client = cpu_client();
+        ensure_add_one_handler_registered(&client).unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1.5f32, 2.5]));
+
+        // The bare operation rejects differentiation, so a composite supplies its rules. The primal and the forward rule
+        // execute the kernel through the projection of the eager domain onto arrays, and the backward rule passes the
+        // cotangent through because d(x + 1)/dx is the identity.
+        let operation = CustomCallOperation::new(ADD_ONE_CUSTOM_CALL_TARGET, vec![replicated_f32_type(&mesh, &[2])]);
+        let function = Composite::from_custom_call(operation.clone()).with_vjp(
+            move |inputs: Vec<DomainTracer<ProjectedContext<Domain<'_>, ArrayType>>>| {
+                Ok((CustomCall::custom_call(&operation, &inputs)?, ()))
+            },
+            |(), cotangents| Ok(cotangents),
+        );
+        let (value, gradient) = differentiate_at(input)
+            .value_and_gradient(|x| function.call(vec![x]).unwrap().remove(0).reduce(&[0], ReductionKind::Sum).unwrap())
+            .unwrap();
+        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![6f32]);
+        assert_eq!(values_from_bytes::<f32>(&gradient.copy_to_host().unwrap()), vec![1f32, 1.0]);
+    }
+
+    #[test]
     fn test_lower_custom_call_mixed_extents_preserve_dynamic_alias_false_branch() {
         // The mixed output needs a guard, while the independent aliased output shares the static bound-sized operand
         // buffer of its dynamic input. The unreachable branch forwards that buffer, and the logical extent is
@@ -1479,11 +1877,7 @@ mod tests {
             }
         }
 
-        // The handler accesses its buffers through host pointers, so this test always runs on the CPU client.
-        let client = load_cpu_plugin()
-            .unwrap()
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = cpu_client();
         REGISTRATION
             .get_or_init(|| {
                 client.register_ffi_handler(

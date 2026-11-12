@@ -265,10 +265,11 @@ mod tests {
     use ryft_core::{
         Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType, BatchAxis,
         BatchableOperation, BatchingContext, DataType, Dimension as CoreDimension, DimensionBounds, DimensionSize,
-        DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, GatherDimensionNumbers, GatherMode,
-        GatherOperation, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramBuilder as CoreProgramBuilder,
-        ProjectedContext, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding,
-        ShardingDimension, Typed, TypedProgram, ValueProjection, i1,
+        DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Gather, GatherDimensionNumbers,
+        GatherMode, GatherOperation, GatherOptions, LogicalMesh, MeshAxis, MeshAxisType, Placeholder,
+        ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, ReductionKind, ScatterDimensionNumbers,
+        ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Typed, TypedProgram,
+        ValueProjection, differentiate_at, i1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -278,7 +279,7 @@ mod tests {
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::ArrayConstant;
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{Array, Options, Session, to_mlir_module_for_program};
 
     #[test]
@@ -566,6 +567,32 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_lower_gather_fill_differentiation() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[3], &values_to_bytes(&[10f32, 20.0, 30.0]));
+        let indices = replicated_array(&domain, &mesh, DataType::I32, &[4, 1], &values_to_bytes(&[-1i32, 1, 1, 3]));
+        let options = GatherOptions::default()
+            .with_mode(GatherMode::Fill { value: Some(Box::new(CoreArray::scalar(7f32).unwrap())) });
+
+        // Out-of-bounds fill contributes to the primal, but never to an input cotangent. Repeated valid indices
+        // accumulate their cotangents through the inverse scatter on the execution device.
+        let (value, gradient) = differentiate_at(input)
+            .with_captures(indices)
+            .value_and_gradient(|input, indices| {
+                input
+                    .gather(&indices, &GatherDimensionNumbers::new(vec![], vec![0], vec![0]), &[1], &options)
+                    .unwrap()
+                    .reduce(&[0], ReductionKind::Sum)
+                    .unwrap()
+            })
+            .unwrap();
+        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![54.0]);
+        assert_eq!(values_from_bytes::<f32>(&gradient.copy_to_host().unwrap()), vec![0.0, 2.0, 0.0]);
     }
 
     #[test]

@@ -1069,17 +1069,20 @@ pub(super) fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Resu
 /// Default capacity of the eager dispatch cache of a [`Session`](crate::Session).
 #[cfg(test)]
 mod tests {
+    use half::{bf16, f16};
+    use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, AndOperation, Array as CoreArray, ArrayOperation, ArrayReference, Atan2Operation,
-        AttachedRegions, CaptureReference, Cast, CastOperation, CompareOperation, ComparisonDirection,
-        CompilationCacheDomain, CompositeJvpRule, CompositeOperation, ConditionOperation, ConstantOperation,
-        Dimension as CoreDimension, DimensionAddOperation, DimensionBounds, DimensionDivOperation,
-        DimensionSizeOperation, DimensionToScalarOperation, DimensionVariable, DivOperation, DynamicBroadcastOperation,
-        DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, Fill, Memory, MulOperation,
-        NegOperation, OneOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, ScanOperation,
-        SelectOperation, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, StaticShape, SubOperation,
-        Typed, WhileOperation, ZeroOperation,
+        AbsOperation, Add, AddOperation, AndOperation, Array as CoreArray, ArrayOperation, ArrayReference,
+        Atan2Operation, AttachedRegions, BatchAxis, CaptureReference, Cast, CastOperation, CompareOperation,
+        ComparisonDirection, CompilationCacheDomain, CompositeJvpRule, CompositeOperation, ConditionOperation,
+        ConstantOperation, DenseDifferentiableType, Dimension as CoreDimension, DimensionAddOperation, DimensionBounds,
+        DimensionDivOperation, DimensionSizeOperation, DimensionToScalarOperation, DimensionVariable, DivOperation,
+        DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, Fill,
+        Memory, Mul, MulOperation, NegOperation, OneOperation, Reduce, ReductionKind, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceType, ScanOperation, SelectOperation, ShardMapBoundary, ShardMapOperation,
+        Sharding, ShardingDimension, StaticShape, SubOperation, Typed, Value as CoreValue, WhileOperation,
+        ZeroOperation, batch, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, ExecutionFence, load_cpu_plugin};
 
@@ -1090,7 +1093,7 @@ mod tests {
         read_booleans, read_f32s, read_f64s, read_i64s, read_u64s, replicated_scalar_type, replicated_vector_type,
     };
     use crate::operations::jit_call::JitCallOperation;
-    use crate::tests::{execution_client, hash_of, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, hash_of, replicated_array, values_from_bytes, values_to_bytes};
 
     use super::*;
 
@@ -1735,8 +1738,6 @@ mod tests {
 
     #[test]
     fn test_independent_arrays_share_compile_cache() {
-        use ryft_core::Value as CoreValue;
-
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
@@ -1759,6 +1760,16 @@ mod tests {
         assert_eq!(first_domain.parent().compilation_context().statistics().compilations, 1);
         assert_eq!(read_f32s(&client, &first_sum), vec![2.0, 4.0]);
         assert_eq!(read_f32s(&client, &second_sum), vec![6.0, 8.0]);
+
+        // Eager outputs belong to the client and session of their inputs, so they feed further eager operations that
+        // dispatch through the same cache.
+        assert!(std::ptr::eq(first_sum.client(), &client));
+        assert!(Arc::ptr_eq(first_sum.backend_domain().session(), domain.session()));
+        let product = Mul::mul(&first_sum, &second).unwrap();
+        assert_eq!(read_f32s(&client, &product), vec![6.0, 16.0]);
+        assert!(std::ptr::eq(product.client(), &client));
+        assert!(Arc::ptr_eq(product.backend_domain().session(), domain.session()));
+        assert_eq!(domain.program_count(), 2);
     }
 
     #[test]
@@ -2436,6 +2447,36 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shard_values, vec![vec![2.0, 4.0], vec![6.0, 8.0]]);
+
+        // An operation that changes the element type, here the complex absolute value, keeps the runtime placement of
+        // its input while its type records the new element type.
+        let input_type = ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(4)]));
+        let values =
+            [Complex::new(3f32, 4.0), Complex::new(5.0, 12.0), Complex::new(8.0, 15.0), Complex::new(7.0, 24.0)];
+        let input = Array::from_host_buffer_with_sharding(
+            domain.parent(),
+            input_type,
+            sharding.clone(),
+            mesh.clone(),
+            values_to_bytes(&values).as_slice(),
+        )
+        .unwrap();
+        let outputs = domain.bind(AbsOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        let output = &outputs[0];
+        let expected_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_sharding(sharding.without_auto_axes())
+            .unwrap();
+        assert_eq!(output.r#type().as_ref(), &expected_type);
+        assert_eq!(output.sharding(), &sharding);
+
+        // XLA computes complex magnitudes with a scaled square root that may differ from the exact value in the last
+        // bit (for example, `|5 + 12i|` evaluates to `12.999999`).
+        let magnitudes = values_from_bytes::<f32>(&output.copy_to_host().unwrap());
+        assert_eq!(magnitudes.len(), 4);
+        for (actual, expected) in magnitudes.into_iter().zip([5f32, 13.0, 17.0, 25.0]) {
+            assert!((actual - expected).abs() <= 1e-5 * expected, "expected {expected} but got {actual}");
+        }
     }
 
     #[test]
@@ -2827,5 +2868,316 @@ mod tests {
             Err(ProgramError::Type(TypeError::Invalid { message }))
                 if message == "`add` input types are not broadcast-compatible",
         ));
+    }
+
+    #[test]
+    fn test_eager_jvp() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
+        let tangent = f32_vector(&domain, &mesh, &[1.0, 1.0, 1.0]);
+        let (value, tangent): (Array<'_>, Array<'_>) = differentiate_at(x).jvp(tangent, |x| Mul::mul(&x, &x)).unwrap();
+        assert_eq!(read_f32s(&client, &value), vec![1.0, 4.0, 9.0]);
+        assert_eq!(read_f32s(&client, &tangent), vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_eager_value_and_gradient() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
+        let (value, gradient) = differentiate_at(x.clone())
+            .value_and_gradient(|x| Mul::mul(&x, &x).unwrap().reduce(&[0], ReductionKind::Sum).unwrap())
+            .unwrap();
+        assert_eq!(read_f32s(&client, &value), vec![14.0]);
+        assert_eq!(read_f32s(&client, &gradient), vec![2.0, 4.0, 6.0]);
+
+        // An auxiliary output is evaluated at the primal and returned beside the value without being differentiated.
+        let ((value, auxiliary), gradient): ((Array<'_>, Array<'_>), Array<'_>) = differentiate_at(x)
+            .with_auxiliary_output()
+            .value_and_gradient(|x| {
+                let auxiliary = Add::add(&x, &x).unwrap();
+                (Mul::mul(&x, &x).unwrap().reduce(&[0], ReductionKind::Sum).unwrap(), auxiliary)
+            })
+            .unwrap();
+        assert_eq!(read_f32s(&client, &value), vec![14.0]);
+        assert_eq!(read_f32s(&client, &auxiliary), vec![2.0, 4.0, 6.0]);
+        assert_eq!(read_f32s(&client, &gradient), vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_eager_vjp() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
+        let (value, pullback) = differentiate_at(x).vjp(|x| Mul::mul(&x, &x)).unwrap();
+        assert_eq!(read_f32s(&client, &value), vec![1.0, 4.0, 9.0]);
+
+        // The pullback executes in the domain that built it and maps the cotangent `w` to `2x · w`.
+        let cotangent = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
+        let input_cotangent = pullback.apply_materialized(cotangent).unwrap();
+        assert_eq!(read_f32s(&client, &input_cotangent), vec![2.0, 8.0, 18.0]);
+    }
+
+    #[test]
+    fn test_eager_differentiation_preserves_capture_sharding() {
+        // Sharding over two devices requires a CPU client with two devices.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 2);
+        let domain = Session::new(&client).domain();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let primal = Array::from_host_buffer_with_sharding(
+            &domain,
+            r#type.clone(),
+            sharding.clone(),
+            mesh.clone(),
+            values_to_bytes(&[1f32, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let capture = Array::from_host_buffer_with_sharding(
+            &domain,
+            r#type,
+            sharding.clone(),
+            mesh.clone(),
+            values_to_bytes(&[4f32, 5.0, 6.0, 7.0]).as_slice(),
+        )
+        .unwrap();
+
+        // The gradient of `sum(x * c)` is the capture `c`, and it keeps the sharding and session of the capture.
+        let (value, gradient) = differentiate_at(primal.clone())
+            .with_captures(capture.clone())
+            .value_and_gradient(|input, capture| {
+                Mul::mul(&input, &capture).unwrap().reduce(&[0], ReductionKind::Sum).unwrap()
+            })
+            .unwrap();
+        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![60.0]);
+        assert_eq!(values_from_bytes::<f32>(&gradient.copy_to_host().unwrap()), vec![4.0, 5.0, 6.0, 7.0]);
+        assert_eq!(gradient.sharding(), &sharding);
+        assert!(Arc::ptr_eq(gradient.backend_domain().session(), domain.session()));
+
+        // Linearization keeps the capture as a device-resident residual with its sharding and session. Residual order
+        // is not part of the contract, so the residual is found by its contents.
+        let (_, pushforward) = differentiate_at(primal)
+            .with_captures(capture)
+            .linearize(|input, capture| Mul::mul(&input, &capture))
+            .unwrap();
+        let capture_residual = pushforward
+            .residuals()
+            .iter()
+            .find(|residual| values_from_bytes::<f32>(&residual.copy_to_host().unwrap()) == vec![4.0, 5.0, 6.0, 7.0])
+            .unwrap();
+        assert_eq!(capture_residual.sharding(), &sharding);
+        assert!(Arc::ptr_eq(capture_residual.backend_domain().session(), domain.session()));
+    }
+
+    #[test]
+    fn test_eager_coordinate_basis() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+
+        // Low-precision leaves build exact identity bases of their own element type.
+        let values = [f16::from_f32(1.0), f16::from_f32(2.0), f16::from_f32(3.0)];
+        let array = replicated_array(&domain, &mesh, DataType::F16, &[3], values_to_bytes(&values).as_slice());
+        let r#type = array.r#type().into_owned();
+        let basis =
+            <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&array.domain(), &r#type, &r#type, 0, 3)
+                .unwrap()
+                .into_value();
+        let (one, zero) = (f16::ONE, f16::ZERO);
+        assert_eq!(basis.data_type(), DataType::F16);
+        assert_eq!(basis.shape(), StaticShape::new(vec![3, 3]));
+        assert_eq!(
+            values_from_bytes::<f16>(&basis.copy_to_host().unwrap()),
+            vec![one, zero, zero, zero, one, zero, zero, zero, one],
+        );
+
+        let values = [bf16::from_f32(1.0), bf16::from_f32(2.0), bf16::from_f32(3.0)];
+        let array = replicated_array(&domain, &mesh, DataType::BF16, &[3], values_to_bytes(&values).as_slice());
+        let r#type = array.r#type().into_owned();
+        let basis =
+            <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&array.domain(), &r#type, &r#type, 0, 3)
+                .unwrap()
+                .into_value();
+        let (one, zero) = (bf16::ONE, bf16::ZERO);
+        assert_eq!(basis.data_type(), DataType::BF16);
+        assert_eq!(basis.shape(), StaticShape::new(vec![3, 3]));
+        assert_eq!(
+            values_from_bytes::<bf16>(&basis.copy_to_host().unwrap()),
+            vec![one, zero, zero, zero, one, zero, zero, zero, one],
+        );
+
+        // A rank-2 leaf at packed offset 1 of 8 basis items places its six coordinates in items 1 through 6, which
+        // exercises the rectangular basis construction and its final reshape.
+        let values = [1f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let matrix = replicated_array(&domain, &mesh, DataType::F32, &[2, 3], values_to_bytes(&values).as_slice());
+        let r#type = matrix.r#type().into_owned();
+        let basis =
+            <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&matrix.domain(), &r#type, &r#type, 1, 8)
+                .unwrap()
+                .into_value();
+        let mut expected = vec![0f32; 48];
+        for coordinate in 0..6 {
+            expected[(coordinate + 1) * 6 + coordinate] = 1.0;
+        }
+        assert_eq!(basis.shape(), StaticShape::new(vec![8, 2, 3]));
+        assert_eq!(values_from_bytes::<f32>(&basis.copy_to_host().unwrap()), expected);
+
+        // Complex leaves select typed complex ones and zeros.
+        let values = [Complex::new(2f32, 1.0), Complex::new(-1.0, 3.0)];
+        let array = replicated_array(&domain, &mesh, DataType::C64, &[2], values_to_bytes(&values).as_slice());
+        let r#type = array.r#type().into_owned();
+        let basis =
+            <ArrayType as DenseDifferentiableType<_>>::coordinate_basis(&array.domain(), &r#type, &r#type, 0, 2)
+                .unwrap()
+                .into_value();
+        let (one, zero) = (Complex::new(1f32, 0.0), Complex::new(0f32, 0.0));
+        assert_eq!(basis.data_type(), DataType::C64);
+        assert_eq!(values_from_bytes::<Complex<f32>>(&basis.copy_to_host().unwrap()), vec![one, zero, zero, one]);
+    }
+
+    #[test]
+    fn test_eager_jacobian_forward() {
+        // Sharding over two devices requires a CPU client with two devices.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 2);
+        let domain = Session::new(&client).domain();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+
+        // The batched basis tangents carry the sharding of the primal, with a replicated batch axis, so that their
+        // replay matches the sharded input types of the tangent program. The Jacobian stays in the input session.
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let bytes = values_to_bytes(&[1f32, 2.0, 3.0, 4.0]);
+        let x =
+            Array::from_host_buffer_with_sharding(&domain, r#type, sharding.clone(), mesh.clone(), bytes.as_slice())
+                .unwrap();
+        let jacobian = differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
+        assert!(Arc::ptr_eq(block.value().backend_domain().session(), domain.session()));
+        assert_eq!(block.value().shape(), StaticShape::new(vec![4, 4]));
+        assert_eq!(
+            values_from_bytes::<f32>(&block.value().copy_to_host().unwrap()),
+            vec![2.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 8.0],
+        );
+
+        // Half-precision primals produce exact half-precision Jacobians.
+        let r#type = ArrayType::new(DataType::F16, Shape::new(vec![CoreDimension::Static(4)]));
+        let bytes = values_to_bytes(&[1f32, 2.0, 3.0, 4.0].map(f16::from_f32));
+        let x = Array::from_host_buffer_with_sharding(&domain, r#type, sharding, mesh, bytes.as_slice()).unwrap();
+        let jacobian = differentiate_at(x).jacobian_forward(|x| Mul::mul(&x, &x)).unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.value().data_type(), DataType::F16);
+        assert_eq!(
+            values_from_bytes::<f16>(&block.value().copy_to_host().unwrap()),
+            [2f32, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 8.0]
+                .map(f16::from_f32)
+                .to_vec(),
+        );
+    }
+
+    #[test]
+    fn test_eager_jacobian_reverse() {
+        // Sharding over two devices requires a CPU client with two devices.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let mesh = domain_mesh(&client, "x", 2);
+        let domain = Session::new(&client).domain();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let bytes = values_to_bytes(&[1f32, 2.0, 3.0, 4.0]);
+        let x = Array::from_host_buffer_with_sharding(&domain, r#type, sharding, mesh, bytes.as_slice()).unwrap();
+
+        // The one-hot cotangent basis replays through the pullback on the sharded primal.
+        let jacobian = differentiate_at(x).jacobian_reverse(|x| Mul::mul(&x, &x)).unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[4]);
+        assert_eq!(block.input_type().static_shape().unwrap().as_slice(), &[4]);
+        assert_eq!(
+            values_from_bytes::<f32>(&block.value().copy_to_host().unwrap()),
+            vec![2.0, 0.0, 0.0, 0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 0.0, 8.0],
+        );
+    }
+
+    #[test]
+    fn test_eager_hessian() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
+        let hessian = differentiate_at(x).hessian(|x| Ok(Mul::mul(&x, &x)?.reduce(&[0], ReductionKind::Sum)?)).unwrap();
+        let block = hessian.iter_blocks().next().unwrap();
+        assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[] as &[usize]);
+        assert_eq!(block.first_input_type().static_shape().unwrap().as_slice(), &[3]);
+        assert_eq!(block.second_input_type().static_shape().unwrap().as_slice(), &[3]);
+        assert_eq!(
+            values_from_bytes::<f32>(&block.value().copy_to_host().unwrap()),
+            vec![2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0],
+        );
+    }
+
+    #[test]
+    fn test_eager_holomorphic_jacobians() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let z = Complex::new(1f32, 2.0);
+        let input = replicated_array(&domain, &mesh, DataType::C64, &[], values_to_bytes(&[z]).as_slice());
+
+        // The holomorphic gradient seeds the pullback with a complex one and recovers the derivative `2z` of `z²`.
+        let (value, gradient) = differentiate_at(input.clone())
+            .holomorphic()
+            .value_and_gradient(|input| Mul::mul(&input, &input).unwrap())
+            .unwrap();
+        assert_eq!(values_from_bytes::<Complex<f32>>(&value.copy_to_host().unwrap()), vec![z * z]);
+        assert_eq!(values_from_bytes::<Complex<f32>>(&gradient.copy_to_host().unwrap()), vec![z + z]);
+
+        let forward = differentiate_at(input.clone())
+            .holomorphic()
+            .jacobian_forward(|input| Mul::mul(&input, &input))
+            .unwrap();
+        let reverse = differentiate_at(input.clone())
+            .holomorphic()
+            .jacobian_reverse(|input| Mul::mul(&input, &input))
+            .unwrap();
+        let hessian = differentiate_at(input).holomorphic().hessian(|input| Mul::mul(&input, &input)).unwrap();
+        assert_eq!(
+            values_from_bytes::<Complex<f32>>(&forward.iter_blocks().next().unwrap().value().copy_to_host().unwrap()),
+            vec![z + z],
+        );
+        assert_eq!(
+            values_from_bytes::<Complex<f32>>(&reverse.iter_blocks().next().unwrap().value().copy_to_host().unwrap()),
+            vec![z + z],
+        );
+        assert_eq!(
+            values_from_bytes::<Complex<f32>>(&hessian.iter_blocks().next().unwrap().value().copy_to_host().unwrap()),
+            vec![Complex::new(2.0, 0.0)],
+        );
+    }
+
+    #[test]
+    fn test_eager_batch() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let input = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
+
+        // The free `batch` recovers the domain from its array input and squares each batch item through eager dispatch.
+        let output: Array<'_> =
+            batch(|x| Ok(x.clone() * x), input, BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+        assert_eq!(read_f32s(&client, &output), vec![1.0, 4.0, 9.0]);
     }
 }

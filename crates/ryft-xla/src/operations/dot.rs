@@ -456,15 +456,19 @@ impl LowerableOperation for RaggedDotOperation {
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{Array as CoreArray, ArrayOperation, Dimension as CoreDimension, Placeholder, RaggedDot};
+    use ryft_core::{
+        Array as CoreArray, ArrayOperation, Dimension as CoreDimension, Dot, Placeholder, RaggedDot, Sharding, Typed,
+        f8e4m3fn,
+    };
 
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{
         ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
     use crate::experimental::lowering::to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy;
     use crate::experimental::ops::ArrayConstant;
-    use crate::tests::values_to_bytes;
-    use crate::{ToPjrt, to_mlir_module_for_program};
+    use crate::tests::{execution_client, replicated_array, values_to_bytes};
+    use crate::{Session, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1348,5 +1352,40 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_dot_operation_lower_with_accumulation_type_matches_reference_backend() {
+        // The operands stay `f8e4m3fn` on device and the contraction accumulates at `f32`. Every value is exactly
+        // representable in `f8e4m3fn` and every product and sum is exact in `f32`, so both backends are exact.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let operand_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let reference_lhs = CoreArray::from_elements(
+            operand_type.clone(),
+            &[0.5f64, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let reference_rhs = CoreArray::from_elements(
+            operand_type,
+            &[1f64, 0.5, 0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let lhs = replicated_array(&domain, &mesh, DataType::F8E4M3FN, &[2, 2], &reference_lhs.logical_bytes());
+        let rhs = replicated_array(&domain, &mesh, DataType::F8E4M3FN, &[2, 2], &reference_rhs.logical_bytes());
+
+        let product = lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F32).unwrap();
+        let reference_product = reference_lhs
+            .dot_with_accumulation_type(&reference_rhs, &DotDimensionNumbers::matmul(), DataType::F32)
+            .unwrap();
+        assert_eq!(
+            product.r#type().into_owned(),
+            ArrayType::new_static(DataType::F32, [2, 2])
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
+                .unwrap(),
+        );
+        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[1f32, 1.25, 2.5, 2.75]));
+        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
     }
 }

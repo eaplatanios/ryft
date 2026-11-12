@@ -311,15 +311,21 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrType, ArrayType, CompositeJvpRule, CompositeKey, CompositeOperation,
-        CompositeTransposeOperation, CustomRuleDefinition, CustomRuleRegistration, DimensionValue, MulOperation,
-        NamedComposite, Placeholder, PrintOperation, Program as CoreProgram, ProgramError,
+        AddOperation, ArrayIrType, ArrayType, BatchAxis, BatchingLevelExtent, CompositeJvpRule, CompositeKey,
+        CompositeOperation, CompositeTransposeOperation, CustomRuleDefinition, CustomRuleRegistration, DataType,
+        DimensionValue, DomainTracer, MulOperation, NamedComposite, Placeholder, PrintOperation,
+        Program as CoreProgram, ProgramError, ProjectedContext, batch, composite, differentiate_at,
     };
 
+    use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::lower_mlir_module_for_program;
     use crate::experimental::lowering::tests::test_vector_type;
     use crate::experimental::ops::{Constant, FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::{Error, to_mlir_module_for_program};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::{Array, Domain, Error, Session, to_mlir_module_for_program};
+
+    // Value that composite rules see when a composite executes through the projection of the eager domain onto arrays.
+    type ArrayTracer<'c> = DomainTracer<ProjectedContext<Domain<'c>, ArrayType>>;
 
     #[test]
     fn test_composite_lowering_inlines_only_the_primal_program() {
@@ -413,6 +419,82 @@ mod tests {
                 "#},
             );
         }
+    }
+
+    #[test]
+    fn test_composite_lowering_executes_batching_rule() {
+        // A composite with a custom batching rule executes through the projection of the eager domain onto arrays,
+        // which lifts the regions of the calls that it binds. Its unbatched derivative differentiates the primal `x²`,
+        // while batching it, before or after differentiating it, applies the rule, which computes `2x²` so that its use
+        // is observable.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[3], &values_to_bytes(&[0.5f32, 1.0, 1.5]));
+        let tangent = replicated_array(&domain, &mesh, DataType::F32, &[3], &values_to_bytes(&[1f32, 1.0, 1.0]));
+        let function = composite(|x: ArrayTracer<'_>| Ok(x.clone() * x)).with_batching(
+            |x: ArrayTracer<'_>, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer<'_>>| {
+                Ok((x.clone() * x.clone() + x.clone() * x, axis))
+            },
+        );
+
+        let (value, derivative) = differentiate_at(input.clone()).jvp(tangent.clone(), |x| function.call(x)).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![0.25f32, 1.0, 2.25]);
+        assert_eq!(values_from_bytes::<f32>(&derivative.copy_to_host().unwrap()), vec![1f32, 2.0, 3.0]);
+
+        let batched: Array<'_> =
+            batch(|x| Ok(function.call(x)?), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&batched.copy_to_host().unwrap()), vec![0.5f32, 2.0, 4.5]);
+
+        let (value, derivative): (Array<'_>, Array<'_>) = batch(
+            |(x, tangent)| Ok(differentiate_at(x).jvp(tangent, |x| function.call(x))?),
+            (input, tangent),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![0.5f32, 2.0, 4.5]);
+        assert_eq!(values_from_bytes::<f32>(&derivative.copy_to_host().unwrap()), vec![2f32, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_composite_lowering_executes_broadcast_sensitive_batching_rule() {
+        // A broadcast-sensitive batching rule depends on the batch axes of its inputs (`2xy` when both inputs are
+        // mapped and `3xy` otherwise). Batching the derivative with a replicated `y` whose tangent is mapped yields the
+        // exact per-item tangents `3(ẋy + xẏ)`, which requires taking a diagonal on device.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let function = composite(|(x, y): (ArrayTracer<'_>, ArrayTracer<'_>)| Ok(x * y))
+            .with_broadcast_sensitive_batching(
+                |(x, y): (ArrayTracer<'_>, ArrayTracer<'_>),
+                 (x_axis, y_axis): (BatchAxis, BatchAxis),
+                 _: BatchingLevelExtent<ArrayTracer<'_>>| {
+                    let product = x * y;
+                    let scaled = match x_axis.is_replicated() || y_axis.is_replicated() {
+                        true => product.clone() + product.clone() + product,
+                        false => product.clone() + product,
+                    };
+                    Ok((scaled, if x_axis.is_replicated() { y_axis } else { x_axis }))
+                },
+            );
+        let x = replicated_array(&domain, &mesh, DataType::F32, &[3], &values_to_bytes(&[1f32, 2.0, 3.0]));
+        let y = replicated_array(&domain, &mesh, DataType::F32, &[], &values_to_bytes(&[4f32]));
+        let x_tangent = replicated_array(&domain, &mesh, DataType::F32, &[3], &values_to_bytes(&[1f32, 0.5, 0.25]));
+        let y_tangent = replicated_array(&domain, &mesh, DataType::F32, &[3], &values_to_bytes(&[2f32, 3.0, 4.0]));
+        let (value, derivative): (Array<'_>, Array<'_>) = batch(
+            |((x, y), (x_tangent, y_tangent))| {
+                Ok(differentiate_at((x, y)).jvp((x_tangent, y_tangent), |inputs| function.call(inputs))?)
+            },
+            ((x, y), (x_tangent, y_tangent)),
+            ((BatchAxis::new(0), BatchAxis::replicated()), (BatchAxis::new(0), BatchAxis::new(0))),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), vec![12f32, 24.0, 36.0]);
+        assert_eq!(values_from_bytes::<f32>(&derivative.copy_to_host().unwrap()), vec![18f32, 24.0, 39.0]);
     }
 
     #[test]
