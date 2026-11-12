@@ -524,8 +524,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// assert_eq!(left.mul(&right)?, ArrayIrValue::Array(Array::vector(vec![8.0f64, 15.0]).unwrap()));
 ///
 /// // The same array IR universe also holds first-class dimension values representing extents.
-/// let rows = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
-/// let columns = ArrayIrValue::Dimension(DimensionValue::constant(3)?);
+/// let rows = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2)?);
+/// let columns = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3)?);
 ///
 /// // Project those members so that `mul` uses checked dimension arithmetic.
 /// let rows = ValueProjection::<DimensionType>::into_projected(rows)?;

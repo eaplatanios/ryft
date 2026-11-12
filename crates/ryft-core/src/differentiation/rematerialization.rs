@@ -475,11 +475,8 @@ impl<Input, Output, Body, Policy> RematerializedFunction<Input, Output, Body, Po
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
         let policy = self.policy.reference::<C::Type>()?;
-        let (output_types, body) = DomainTracingContext::<C>::trace_in_scope(
-            &self.body,
-            input_types,
-            TracingScope::new(context.named_axes(), context.default_mesh()),
-        )?;
+        let (output_types, body) =
+            DomainTracingContext::<C>::trace_in_scope(&self.body, input_types, TracingScope::from_context(context))?;
         let output_structure = output_types.parameter_structure();
         let operation =
             RematerializeOperation::new(policy).with_optimization_barrier(self.optimization_barrier.clone());

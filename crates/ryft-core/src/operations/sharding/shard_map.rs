@@ -25778,6 +25778,148 @@ mod tests {
             vec![input_type.clone()],
             Vec::new(),
         );
+
+        // The shadowing level hides the name `x` from collectives, but `x` is still manual in the enclosing region,
+        // so the nested map makes only `y` manual instead of making `x` manual again.
+        let value_type = f32_type(&[2, 4], Some(outer_replicated.clone()));
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:f32[2, 4] .
+                let %1:{value_type} = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                    input_shardings=[{outer_replicated}],
+                    output_shardings=[{outer_replicated}],
+                    manual_axes=['x'],
+                    global_input_types=[{value_type}],
+                    global_output_types=[{value_type}],
+                ] %0 [
+                    body={{
+                        lambda %0:{value_type} .
+                        let %1:{value_type} = shard_map [
+                            mesh=['x'=2:manual, 'y'=2:manual],
+                            input_shardings=[{outer_replicated}],
+                            output_shardings=[{outer_replicated}],
+                            manual_axes=['y'],
+                            global_input_types=[{value_type}],
+                            global_output_types=[{value_type}],
+                        ] %0 [
+                            body={{
+                                lambda %0:{value_type} .
+                                let %1:{value_type} = add %0 %0
+                                in (%1)
+                            }},
+                        ]
+                        in (%1)
+                    }},
+                ]
+                in (%1)"},
+        );
+        assert_eq!(
+            program.interpret(vec![f32_value(input_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])]),
+            Ok(vec![f32_value(
+                f32_type(&[2, 4], Some(outer_replicated)),
+                &[2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0],
+            )]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_function_excludes_shadowed_manual_axes_inside_composites() {
+        // A composite traces its primal in a fresh trace in the scope of the context that calls it, which includes the
+        // manual axis `x` of the enclosing map even though a named `batch` level shadows its binding, so a nested map
+        // without a mesh inside the primal makes only `y` manual instead of making `x` manual again.
+        let mesh = manual_mesh_2x2();
+        let outer_replicated = Sharding::replicated(mesh.clone(), 2);
+        let inner_replicated = Sharding::replicated(mesh.clone(), 1);
+        let input_type = ArrayType::new_static(DataType::F32, [2, 4]);
+        let function = composite(move |x: BodyTracer| {
+            let x = ValueProjection::<ArrayType>::into_projected(x)?;
+            let output = shard_map(
+                |w: TestTracer| Ok(w.clone() + w),
+                x,
+                None,
+                inner_replicated.clone(),
+                inner_replicated.clone(),
+                ShardMapOptions::new(),
+            )?;
+            Ok(output.into_value())
+        });
+        let body = |v: TestTracer| -> Result<TestTracer, ProgramError> {
+            let output = batch(
+                |item| function.call(item),
+                v.into_value(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxisSpecification::named("x"),
+            )?;
+            Ok(ValueProjection::<ArrayType>::into_projected(output)?)
+        };
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        body,
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        outer_replicated.clone(),
+                        outer_replicated.clone(),
+                        ShardMapOptions::new().with_manual_axes(["x"]),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![input_type.clone()],
+            Vec::new(),
+        );
+
+        // The composite primal is traced in the scope of the batched context, whose manual axes still include `x`.
+        let value_type = f32_type(&[2, 4], Some(outer_replicated.clone()));
+        let batching = "(extent=dimension<2>, axis_name=\"x\", input_axes=[axis 0], output_axes=[axis 0])";
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:f32[2, 4] .
+                let %1:{value_type} = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                    input_shardings=[{outer_replicated}],
+                    output_shardings=[{outer_replicated}],
+                    manual_axes=['x'],
+                    global_input_types=[{value_type}],
+                    global_output_types=[{value_type}],
+                ] %0 [
+                    body={{
+                        lambda %0:{value_type} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{value_type} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[{batching}],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{value_type} .
+                                    let %2:{value_type} = shard_map [
+                                        mesh=['x'=2:manual, 'y'=2:manual],
+                                        input_shardings=[{outer_replicated}],
+                                        output_shardings=[{outer_replicated}],
+                                        manual_axes=['y'],
+                                        global_input_types=[{value_type}],
+                                        global_output_types=[{value_type}],
+                                    ] %1 [
+                                        body={{
+                                            lambda %0:{value_type} .
+                                            let %1:{value_type} = add %0 %0
+                                            in (%1)
+                                        }},
+                                    ]
+                                    in (%2)
+                                }},
+                            ]
+                        in (%2)
+                    }},
+                ]
+                in (%1)"},
+        );
         assert_eq!(
             program.interpret(vec![f32_value(input_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])]),
             Ok(vec![f32_value(

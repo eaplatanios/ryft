@@ -30,7 +30,7 @@ use crate::programs::{
     MaybeZero, Operation, Program, ProgramBuilder, ProgramError, Type, TypeError, Typed, TypedProgram, Value,
     ValueProjection,
 };
-use crate::tracing::{TracingContext, TracingScope};
+use crate::tracing::TracingContext;
 
 #[cfg(doc)]
 use crate::batching::DiagonalBatchingPolicy;
@@ -417,10 +417,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         Ok(outputs)
                     },
                     rule_input_types,
-                    TracingScope::new(
-                        self.definition().named_axes().to_vec(),
-                        self.definition().default_mesh().cloned(),
-                    ),
+                    self.definition().scope().clone(),
                 )?;
 
                 // A call that keeps only some of the rule's outputs receives only those outputs and their tangents,
@@ -536,10 +533,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         Ok(outputs)
                     },
                     key.input_types.clone(),
-                    TracingScope::new(
-                        self.definition().named_axes().to_vec(),
-                        self.definition().default_mesh().cloned(),
-                    ),
+                    self.definition().scope().clone(),
                 )?;
 
                 let kept_output_indices = key.kept_output_indices(output_count);
@@ -776,7 +770,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     Ok(outputs)
                 },
                 key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
-                TracingScope::new(self.definition().named_axes().to_vec(), self.definition().default_mesh().cloned()),
+                self.definition().scope().clone(),
             )?;
             let program = self.definition().discharge_if(key.discharged, program)?;
             Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
@@ -1463,10 +1457,7 @@ where
                     batched.interpret_in_context(&context, inputs)
                 },
                 program_types,
-                TracingScope::new(
-                    self.source.definition().named_axes().to_vec(),
-                    self.source.definition().default_mesh().cloned(),
-                ),
+                self.source.definition().scope().clone(),
             )?;
             return Ok(CustomRuleSpecialization::new(program, output_axes));
         }
@@ -1565,10 +1556,7 @@ where
                 Ok(outputs)
             },
             program_types,
-            TracingScope::new(
-                self.source.definition().named_axes().to_vec(),
-                self.source.definition().default_mesh().cloned(),
-            ),
+            self.source.definition().scope().clone(),
         )?;
 
         Ok(CustomRuleSpecialization::new(program, output_axes))
@@ -1850,10 +1838,7 @@ where
                 Ok(outputs)
             },
             key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
-            TracingScope::new(
-                self.source.definition().named_axes().to_vec(),
-                self.source.definition().default_mesh().cloned(),
-            ),
+            self.source.definition().scope().clone(),
         )?;
 
         Ok(CustomRuleSpecialization::new(program, all_output_axes))
@@ -2034,9 +2019,9 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     /// Returns a validated specialization of this reference's named composite body for `input_types`, ready to attach
-    /// as the primal region of a composite call. The body is traced with the definition's named axes, and its outputs
-    /// have exactly the types, including the type identities, that the definition's output type rule assigns to those
-    /// calls. The returned [`Arc`] lets callers share the program across calls without copying it.
+    /// as the primal region of a composite call. The body is traced in the definition's scope, and its outputs have
+    /// exactly the types, including the type identities, that the definition's output type rule assigns to those calls.
+    /// The returned [`Arc`] lets callers share the program across calls without copying it.
     ///
     /// Repeated requests reuse the program while it remains in the caches owned by a live
     /// [`CustomRuleRegistration`](crate::CustomRuleRegistration). Requests after eviction or after every registration
@@ -2074,7 +2059,7 @@ where
                     Ok(outputs)
                 },
                 input_types.to_vec(),
-                TracingScope::new(self.definition().named_axes().to_vec(), self.definition().default_mesh().cloned()),
+                self.definition().scope().clone(),
             )?;
             let program = align_rule_output_type_identities(self.name(), "body", program, &output_types, None)?;
 

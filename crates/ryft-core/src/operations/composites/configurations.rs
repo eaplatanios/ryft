@@ -4,8 +4,6 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-use crate::arrays::LogicalMesh;
-use crate::axes::NamedAxis;
 use crate::batching::{BatchAxis, BatchableType, BatchingLevel, BatchingLevelExtent, DiagonalBatchingPolicy};
 use crate::contexts::{EagerContext, StagingContext};
 use crate::differentiation::{
@@ -33,7 +31,7 @@ pub trait CompositeJvp<Jvp, Tracer: Parameter, Input: Parameterized<Tracer>, Out
     Sized
 {
     /// Returns this definition with the provided forward mode differentiation configuration applied. [`DefaultJvp`]
-    /// leaves the definition unchanged. Retained rules use the definition's name and named axes.
+    /// leaves the definition unchanged. Retained rules use the definition's name and scope.
     ///
     /// # Parameters
     ///
@@ -110,8 +108,7 @@ where
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
     ) -> Self {
-        let (jvp, name, named_axes) = (configuration.jvp.clone(), self.name().to_owned(), self.named_axes().to_vec());
-        let default_mesh = self.default_mesh().cloned();
+        let (jvp, name, scope) = (configuration.jvp.clone(), self.name().to_owned(), self.scope().clone());
         let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
         self.with_jvp(move |primals, tangents| {
             let input_types = Input::To::<V::Type>::from_parameters(
@@ -122,15 +119,14 @@ where
                 let name: &str = &name;
                 let jvp = jvp.as_ref();
                 let output_structure = &output_structure;
-                let named_axes = named_axes.clone();
-                let default_mesh = default_mesh.clone();
+                let scope = scope.clone();
                 let input_count = input_types.parameter_count();
                 let input_tangent_types = input_types.clone().try_map_parameters(|r#type| r#type.tangent())?;
                 let ((output_types, tangent_types), program) =
                     DomainTracingContext::<EagerContext<V, O>>::trace_in_scope(
                         |(x, t)| jvp(x, t),
                         (input_types, input_tangent_types),
-                        TracingScope::new(named_axes, default_mesh),
+                        scope,
                     )?;
 
                 // Matching flat types cannot establish the nested output and tangent structures.
@@ -275,8 +271,7 @@ where
         output_structure: &Output::ParameterStructure,
         non_differentiated_count: usize,
     ) -> Self {
-        let (jvp, name, named_axes) = (configuration.jvp.clone(), self.name().to_owned(), self.named_axes().to_vec());
-        let default_mesh = self.default_mesh().cloned();
+        let (jvp, name, scope) = (configuration.jvp.clone(), self.name().to_owned(), self.scope().clone());
         let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
         self.with_symbolic_zero_jvp(move |primals, tangents| {
             let input_types = Input::To::<V::Type>::from_parameters(
@@ -289,8 +284,7 @@ where
                 let jvp = jvp.as_ref();
                 let tangent_activity = tangent_activity.as_slice();
                 let output_structure = &output_structure;
-                let named_axes = named_axes.clone();
-                let default_mesh = default_mesh.clone();
+                let scope = scope.clone();
 
                 // Only active differentiated tangents cross the traced boundary. Non-differentiated and inactive
                 // tangents remain structural zeros inside the rule.
@@ -367,7 +361,7 @@ where
                         Ok((outputs, live_output_tangents))
                     },
                     (input_types, active_tangent_types),
-                    TracingScope::new(named_axes, default_mesh),
+                    scope,
                 )?;
                 let output_type_structure = output_types.parameter_structure();
                 if &output_type_structure != output_structure {
@@ -414,7 +408,7 @@ pub trait CompositeVjp<Vjp, Tracer: Parameter, Input: Parameterized<Tracer>, Out
     Sized
 {
     /// Returns this definition with the provided reverse mode differentiation configuration applied. [`DefaultVjp`]
-    /// leaves the definition unchanged. Retained rules use the definition's name and named axes.
+    /// leaves the definition unchanged. Retained rules use the definition's name and scope.
     ///
     /// # Parameters
     ///
@@ -515,13 +509,11 @@ where
             input_structure,
             output_structure,
             &residual_structures,
-            self.named_axes(),
-            self.default_mesh(),
+            self.scope(),
         );
         let backward = {
-            let (backward, name, named_axes) =
-                (configuration.backward.clone(), self.name().to_owned(), self.named_axes().to_vec());
-            let default_mesh = self.default_mesh().cloned();
+            let (backward, name, scope) =
+                (configuration.backward.clone(), self.name().to_owned(), self.scope().clone());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
             move |context: &TracingContext<V, O>,
                   leading_inputs: &[CustomRuleTracer<V, O>],
@@ -543,8 +535,7 @@ where
                     let output_structure = output_structure.clone();
                     let output_cotangent_types =
                         seeds.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
-                    let named_axes = named_axes.clone();
-                    let default_mesh = default_mesh.clone();
+                    let scope = scope.clone();
                     let non_differentiated_count = non_differentiated_types.len();
                     let residual_types = Residual::To::<V::Type>::from_parameters(residual_structure, residual_types)?;
                     let output_cotangent_types =
@@ -572,7 +563,7 @@ where
                             Ok(cotangents.into_parameters().skip(non_differentiated_count).collect::<Vec<_>>())
                         },
                         (non_differentiated_types, residual_types, output_cotangent_types),
-                        TracingScope::new(named_axes, default_mesh),
+                        scope,
                     )?;
                     program.into_flat_program()
                 };
@@ -668,13 +659,11 @@ where
             input_structure,
             output_structure,
             &residual_structures,
-            self.named_axes(),
-            self.default_mesh(),
+            self.scope(),
         );
         let backward = {
-            let (backward, name, named_axes) =
-                (configuration.backward.clone(), self.name().to_owned(), self.named_axes().to_vec());
-            let default_mesh = self.default_mesh().cloned();
+            let (backward, name, scope) =
+                (configuration.backward.clone(), self.name().to_owned(), self.scope().clone());
             let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
             move |context: &TracingContext<V, O>,
                   leading_inputs: &[CustomRuleTracer<V, O>],
@@ -695,8 +684,7 @@ where
                         .collect::<Vec<_>>();
                     let residual_structure = structure;
                     let output_structure = output_structure.clone();
-                    let named_axes = named_axes.clone();
-                    let default_mesh = default_mesh.clone();
+                    let scope = scope.clone();
                     let non_differentiated_count = non_differentiated_types.len();
                     let residual_types = Residual::To::<V::Type>::from_parameters(residual_structure, residual_types)?;
                     let live_seed_types = seeds
@@ -756,7 +744,7 @@ where
                             Ok(live_cotangents)
                         },
                         (non_differentiated_types, residual_types, live_seed_types),
-                        TracingScope::new(named_axes, default_mesh),
+                        scope,
                     )?;
 
                     // The closure ran exactly once, so the structural zeros are always recorded.
@@ -867,8 +855,7 @@ where
             input_structure,
             output_structure,
             &residual_structures,
-            self.named_axes(),
-            self.default_mesh(),
+            self.scope(),
         );
 
         // The rule is invoked directly while its carrier is transposed, with the carrier's inputs (i.e., the
@@ -1217,10 +1204,8 @@ impl<T, Structure> Clone for CompositeResidualStructures<T, Structure> {
 ///   - `input_structure`: Structure of the call's inputs.
 ///   - `output_structure`: Structure of the call's primal outputs.
 ///   - `residual_structures`: Residual structures shared with the backward rule of the same registration.
-///   - `named_axes`: Named axes with which the closure is traced. Refer to [`CustomRuleDefinition::with_named_axes`]
-///     for more information.
-///   - `default_mesh`: Default mesh with which the closure is traced. Refer to
-///     [`CustomRuleDefinition::with_default_mesh`] for more information.
+///   - `scope`: Scope (i.e., the named axes, the default mesh, and the enclosing manual axes) in which the closure is
+///     traced. Refer to [`CustomRuleDefinition::with_scope`] for more information.
 #[allow(clippy::type_complexity)]
 fn retained_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
     forward: Arc<Forward>,
@@ -1228,8 +1213,7 @@ fn retained_custom_vjp_forward_rule<V, O, Input, Output, Residual, Forward>(
     input_structure: &Input::ParameterStructure,
     output_structure: &Output::ParameterStructure,
     residual_structures: &CompositeResidualStructures<V::Type, Residual::ParameterStructure>,
-    named_axes: &[(String, NamedAxis)],
-    default_mesh: Option<&LogicalMesh>,
+    scope: &TracingScope,
 ) -> impl 'static
 + Fn(&[CustomRuleTracer<V, O>]) -> Result<(Vec<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>), ProgramError>
 + Send
@@ -1251,8 +1235,7 @@ where
     Forward: 'static + ?Sized + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
-    let (name, residual_structures, named_axes) = (name, residual_structures.clone(), named_axes.to_vec());
-    let default_mesh = default_mesh.cloned();
+    let (name, residual_structures, scope) = (name, residual_structures.clone(), scope.clone());
     let (input_structure, output_structure) = (input_structure.clone(), output_structure.clone());
     move |primals: &[CustomRuleTracer<V, O>]| {
         let input_types = Input::To::<V::Type>::from_parameters(
@@ -1264,8 +1247,7 @@ where
             let name: &str = &name;
             let forward = forward.as_ref();
             let output_structure = &output_structure;
-            let named_axes = named_axes.clone();
-            let default_mesh = default_mesh.clone();
+            let scope = scope.clone();
             let mut residual_structure = None;
             let ((forward_output_types, residual_types), program) =
                 DomainTracingContext::<EagerContext<V, O>>::trace_in_scope(
@@ -1275,7 +1257,7 @@ where
                         Ok((outputs, residuals))
                     },
                     input_types,
-                    TracingScope::new(named_axes, default_mesh),
+                    scope,
                 )?;
 
             // Matching flat types cannot establish the nested output structure.

@@ -7,8 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::ThreadId;
 
-use crate::arrays::{ArrayType, DataType, LogicalMesh, ShardingDimension};
-use crate::axes::NamedAxis;
+use crate::arrays::{ArrayType, DataType, ShardingDimension};
 use crate::batching::{
     BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingPolicy, DiagonalBatchingPolicy,
     ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
@@ -35,7 +34,7 @@ use crate::programs::{
     ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType, ReferenceTransform,
     ReferenceType, Type, Typed, Value,
 };
-use crate::tracing::TracingContext;
+use crate::tracing::{TracingContext, TracingScope};
 
 #[cfg(doc)]
 use crate::operations::composites::rules::registrations::{CustomRuleReference, CustomRuleRegistration};
@@ -358,7 +357,7 @@ where
 
 /// Named computation that a [`CustomRuleDefinition`] optionally specifies, analogous to a StableHLO `composite`,
 /// which consists of a [`CompositeKey`] that gives it semantic identity, an output type rule, and a body (i.e.,
-/// its decomposition). Definitions with equal keys in one operation family and with equal named axes are the same
+/// its decomposition). Definitions with equal keys in one operation family and with equal scopes are the same
 /// computation. Their bodies and rules implement one contract, which is an obligation on whoever constructs them
 /// that the key cannot verify. Backends rely on it to replace calls by key and to index the functions that they emit
 /// for calls by key (e.g., the XLA backend), so a computation whose body or rules change requires a new key (e.g., a
@@ -1029,11 +1028,8 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Human-readable label used for rendering and diagnostics.
     name: Cow<'static, str>,
 
-    /// Named axes with which every rule is traced.
-    named_axes: Vec<(String, NamedAxis)>,
-
-    /// Default mesh with which every rule is traced (refer to [`MeshContext`](crate::MeshContext)).
-    default_mesh: Option<LogicalMesh>,
+    /// Scope (i.e., the named axes, the default mesh, and the enclosing manual axes) in which every rule is traced.
+    scope: TracingScope,
 
     /// Optional named computation that the calls of this definition compute, which definitions derived from
     /// this definition never inherit because they describe other computations.
@@ -1119,8 +1115,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         Self {
             id: NEXT_CUSTOM_RULE_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
-            named_axes: Vec::new(),
-            default_mesh: None,
+            scope: TracingScope::default(),
             named_composite: None,
             jvp: None,
             vjp: None,
@@ -1135,13 +1130,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         }
     }
 
-    /// Creates a definition derived from this definition, inheriting its named axes, default mesh, and transform
-    /// support. The derived definition uses its primal region for forward mode and the provided derived batching rule,
-    /// with no reverse mode rules or explicit output batch axes of its own.
+    /// Creates a definition derived from this definition, inheriting its scope and transform support. The derived
+    /// definition uses its primal region for forward mode and the provided derived batching rule, with no reverse mode
+    /// rules or explicit output batch axes of its own.
     pub(super) fn new_derived(&self, name: String, batching_rule: Option<CustomRuleBatching<V, O>>) -> Self {
         Self {
-            named_axes: self.named_axes.clone(),
-            default_mesh: self.default_mesh.clone(),
+            scope: self.scope.clone(),
             jvp: Some(CustomRuleJvp::Derived),
             structural_batcher: self.structural_batcher.clone(),
             sequential_batching_scan: self.sequential_batching_scan.clone(),
@@ -1151,23 +1145,15 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         }
     }
 
-    /// Returns this [`CustomRuleDefinition`] with the provided named axes, with which every rule is traced, so that
-    /// the rules resolve the names bound where the calls that apply them are made (e.g., an `axis_index` over the axis
-    /// of an enclosing batching level). The rules are traced lazily and in fresh traces, which see no enclosing
-    /// bindings otherwise. The definitions that are derived from this definition trace their rules with the same axes.
+    /// Returns this [`CustomRuleDefinition`] with the provided [`TracingScope`] (i.e., the named axes, the default
+    /// mesh, and the enclosing manual axes) in which every rule is traced, so that the rules resolve the names bound,
+    /// the default mesh, and the manual axes where the calls that apply them are made (e.g., an `axis_index` over the
+    /// axis of an enclosing batching level, or a `shard_map` that must not make an enclosing manual axis manual again).
+    /// The rules are traced lazily and in fresh traces, which see an empty scope otherwise. The definitions that are
+    /// derived from this definition trace their rules in the same scope.
     #[inline]
-    pub fn with_named_axes(mut self, named_axes: Vec<(String, NamedAxis)>) -> Self {
-        self.named_axes = named_axes;
-        self
-    }
-
-    /// Returns this [`CustomRuleDefinition`] with the provided default mesh (refer to
-    /// [`MeshContext`](crate::MeshContext)), with which every rule is traced, for the same reason as
-    /// [`Self::with_named_axes`]. The definitions that are derived from this definition trace their rules with the
-    /// same default mesh.
-    #[inline]
-    pub fn with_default_mesh(mut self, default_mesh: Option<LogicalMesh>) -> Self {
-        self.default_mesh = default_mesh;
+    pub fn with_scope(mut self, scope: TracingScope) -> Self {
+        self.scope = scope;
         self
     }
 
@@ -1651,16 +1637,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self.name.as_ref()
     }
 
-    /// Returns the named axes with which the rules of this [`CustomRuleDefinition`] are traced.
+    /// Returns the [`TracingScope`] (i.e., the named axes, the default mesh, and the enclosing manual axes) in which
+    /// the rules of this [`CustomRuleDefinition`] are traced.
     #[inline]
-    pub fn named_axes(&self) -> &[(String, NamedAxis)] {
-        &self.named_axes
-    }
-
-    /// Returns the default mesh with which the rules of this [`CustomRuleDefinition`] are traced.
-    #[inline]
-    pub fn default_mesh(&self) -> Option<&LogicalMesh> {
-        self.default_mesh.as_ref()
+    pub fn scope(&self) -> &TracingScope {
+        &self.scope
     }
 
     /// Returns the named computation that the calls of this [`CustomRuleDefinition`] compute, or [`None`]
@@ -1869,7 +1850,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, ShardingDimension,
     };
-    use crate::axes::AxisError;
+    use crate::axes::{AxisError, NamedAxis};
     use crate::batching::BatchingLevelExtent;
     use crate::differentiation::{CotangentDestinationKind, TransposedProgramCotangent};
     use crate::operations::collectives::axis_index::AxisIndex;
@@ -2227,7 +2208,7 @@ mod tests {
         // A new definition has its label and no rules, so every request for a rule is rejected.
         let definition = TestDefinition::new("cube");
         assert_eq!(definition.name(), "cube");
-        assert!(definition.named_axes().is_empty());
+        assert_eq!(definition.scope(), &TracingScope::default());
         assert!(definition.jvp().is_none());
         assert!(definition.vjp().is_none());
         assert!(!definition.deferred_forward());
@@ -2272,10 +2253,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_rule_definition_with_named_axes() {
-        // Every rule is traced with the named axes, so a forward mode rule that scales its tangent by the index along
-        // the batch axis `batch` resolves that axis.
-        let named_axes = vec![("batch".to_string(), NamedAxis::Batched { size: Some(3) })];
+    fn test_custom_rule_definition_with_scope() {
+        // Every rule is traced in the scope, so a forward mode rule that scales its tangent by the index along the
+        // batch axis `batch` resolves that axis.
+        let scope = TracingScope::new(vec![("batch".to_string(), NamedAxis::Batched { size: Some(3) })], None);
         let definition = || {
             MemberDefinition::new("scaled").with_jvp(|primals, tangents| {
                 let index = primals[0].context().axis_index("batch")?.convert_element_type(DataType::F64)?;
@@ -2284,7 +2265,7 @@ mod tests {
         };
         let scalar_type = ArrayType::scalar(DataType::F64);
         let key = unbatched_key(vec![scalar_type.clone()], vec![scalar_type], vec![true]);
-        let registration = CustomRuleRegistration::new(definition().with_named_axes(named_axes.clone()));
+        let registration = CustomRuleRegistration::new(definition().with_scope(scope.clone()));
         let specialization = registration.reference().jvp_specialization(key.clone()).unwrap();
         assert_eq!(
             specialization.program.to_string(),
@@ -2298,18 +2279,17 @@ mod tests {
             .trim_end(),
         );
 
-        // Without the named axes, the fresh trace of the rule cannot resolve the batch axis.
+        // Without the scope, the fresh trace of the rule cannot resolve the batch axis.
         assert!(matches!(
             CustomRuleRegistration::new(definition()).reference().jvp_specialization(key),
             Err(DifferentiationError::Program(ProgramError::Axis(AxisError::UnboundAxisName { name })))
                 if name == "batch",
         ));
 
-        // The definitions derived from the definition inherit its named axes.
-        let registration =
-            CustomRuleRegistration::new(identity_batching_definition().with_named_axes(named_axes.clone()));
+        // The definitions derived from the definition inherit its scope.
+        let registration = CustomRuleRegistration::new(identity_batching_definition().with_scope(scope.clone()));
         let derived = registration.reference().derived(jvp_derivation_key()).unwrap();
-        assert_eq!(derived.definition().named_axes(), named_axes.as_slice());
+        assert_eq!(derived.definition().scope(), &scope);
     }
 
     #[test]
@@ -2777,10 +2757,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_rule_definition_named_axes() {
-        let named_axes = vec![("batch".to_string(), NamedAxis::Batched { size: Some(3) })];
-        assert!(TestDefinition::new("cube").named_axes().is_empty());
-        assert_eq!(TestDefinition::new("cube").with_named_axes(named_axes.clone()).named_axes(), named_axes.as_slice());
+    fn test_custom_rule_definition_scope() {
+        let scope = TracingScope::new(vec![("batch".to_string(), NamedAxis::Batched { size: Some(3) })], None);
+        assert_eq!(TestDefinition::new("cube").scope(), &TracingScope::default());
+        assert_eq!(TestDefinition::new("cube").with_scope(scope.clone()).scope(), &scope);
     }
 
     #[test]

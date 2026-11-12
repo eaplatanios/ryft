@@ -3,8 +3,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-use crate::arrays::LogicalMesh;
-use crate::axes::{MeshContext, NamedAxes, NamedAxis};
+use crate::axes::{MeshContext, NamedAxes};
 use crate::batching::{BatchAxis, BatchableType, BatchingLevelExtent, RecursiveBatchingPolicy};
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{CotangentAccumulator, CotangentBatchingPolicy, DifferentiableType, TranspositionContext};
@@ -82,9 +81,10 @@ impl<C> CompositeCallContext for C where
 const NAMED_OUTPUT_STRUCTURE_CAPACITY: usize = 16;
 
 /// Retained definitions registered by a [`Composite`] in its selected operation family, one per input and output
-/// parameter structure and visible named axes. Their handles live as long as the composite, so calls with the same
-/// structure and named axes share specialization caches. The mutex synchronizes access to the registration handles,
-/// which are not themselves [`Sync`].
+/// parameter structure and [`TracingScope`] (i.e., the named axes, the default mesh, and the enclosing manual axes)
+/// where the calls are made. Their handles live as long as the composite, so calls with the same structure and scope
+/// share specialization caches. The mutex synchronizes access to the registration handles, which are not themselves
+/// [`Sync`].
 struct CompositeRegistrations<V: Typed + Parameter, O, InputStructure, OutputStructure> {
     /// Registrations for the selected family and parameter structure types.
     entries: Mutex<Vec<CompositeRegistration<V, O, InputStructure, OutputStructure>>>,
@@ -98,37 +98,34 @@ struct CompositeRegistrations<V: Typed + Parameter, O, InputStructure, OutputStr
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
     CompositeRegistrations<V, O, InputStructure, OutputStructure>
 {
-    /// Returns a reference to the [`CustomRuleDefinition`] registered for the provided call structure, named axes, and
-    /// default mesh, registering the definition returned by `register_fn` if there is none yet.
+    /// Returns a reference to the [`CustomRuleDefinition`] registered for the provided call structure and
+    /// [`TracingScope`], registering the definition returned by `register_fn` if there is none yet.
     fn get_or_register<F: FnOnce() -> CustomRuleDefinition<V, O>>(
         &self,
         input_structure: &InputStructure,
         output_structure: &OutputStructure,
-        named_axes: &[(String, NamedAxis)],
-        default_mesh: Option<&LogicalMesh>,
+        scope: &TracingScope,
         register_fn: F,
     ) -> CustomRuleReference<V, O>
     where
         InputStructure: Clone + PartialEq,
         OutputStructure: Clone + PartialEq,
     {
-        let registration =
-            self.get_or_try_register(input_structure, output_structure, named_axes, default_mesh, || {
-                Ok::<_, ProgramError>(CustomRuleRegistration::new(register_fn()))
-            });
+        let registration = self.get_or_try_register(input_structure, output_structure, scope, || {
+            Ok::<_, ProgramError>(CustomRuleRegistration::new(register_fn()))
+        });
 
         // Infallible registration functions never fail.
         registration.unwrap()
     }
 
-    /// Returns a reference to the definition registered for the provided call structure, named axes, and default mesh,
-    /// retaining the registration returned by `register_fn` if there is none yet, and propagating its error otherwise.
+    /// Returns a reference to the definition registered for the provided call structure and [`TracingScope`], retaining
+    /// the registration returned by `register_fn` if there is none yet, and propagating its error otherwise.
     fn get_or_try_register<F: FnOnce() -> Result<CustomRuleRegistration<V, O>, ProgramError>>(
         &self,
         input_structure: &InputStructure,
         output_structure: &OutputStructure,
-        named_axes: &[(String, NamedAxis)],
-        default_mesh: Option<&LogicalMesh>,
+        scope: &TracingScope,
         register_fn: F,
     ) -> Result<CustomRuleReference<V, O>, ProgramError>
     where
@@ -141,8 +138,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
             .find(|entry| {
                 &entry.input_structure == input_structure
                     && &entry.output_structure == output_structure
-                    && entry.named_axes == named_axes
-                    && entry.default_mesh.as_ref() == default_mesh
+                    && &entry.scope == scope
             })
             .map(|entry| entry.registration.reference());
         if let Some(existing) = existing {
@@ -153,23 +149,20 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
         entries.push(CompositeRegistration {
             input_structure: input_structure.clone(),
             output_structure: output_structure.clone(),
-            named_axes: named_axes.to_vec(),
-            default_mesh: default_mesh.cloned(),
+            scope: scope.clone(),
             registration,
         });
         Ok(reference)
     }
 
     /// Returns a reference to the definition registered for named calls with the provided flattened input types, input
-    /// structure, named axes, and default mesh, together with the output structure of those calls, if a call with that
-    /// signature
-    /// was recorded recently with [`Self::record_output_structure`].
+    /// structure, and [`TracingScope`], together with the output structure of those calls, if a call with that
+    /// signature was recorded recently with [`Self::record_output_structure`].
     fn get_by_input_types(
         &self,
         input_types: &[V::Type],
         input_structure: &InputStructure,
-        named_axes: &[(String, NamedAxis)],
-        default_mesh: Option<&LogicalMesh>,
+        scope: &TracingScope,
     ) -> Option<(CustomRuleReference<V, O>, OutputStructure)>
     where
         InputStructure: PartialEq,
@@ -182,8 +175,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
             .find(|output| {
                 output.input_types == input_types
                     && &output.input_structure == input_structure
-                    && output.reference.definition().named_axes() == named_axes
-                    && output.reference.definition().default_mesh() == default_mesh
+                    && output.reference.definition().scope() == scope
             })
             .map(|output| (output.reference.clone(), output.output_structure.clone()))
     }
@@ -230,11 +222,9 @@ struct CompositeRegistration<V: Typed + Parameter, O, InputStructure, OutputStru
     /// Structure of the calls' outputs.
     output_structure: OutputStructure,
 
-    /// Named axes visible where the calls are made, with which the definition traces its rules.
-    named_axes: Vec<(String, NamedAxis)>,
-
-    /// Default mesh of the context where the calls are made, with which the definition traces its rules.
-    default_mesh: Option<LogicalMesh>,
+    /// Scope (i.e., the named axes, the default mesh, and the enclosing manual axes) where the calls are made,
+    /// in which the definition traces its rules.
+    scope: TracingScope,
 
     /// Registration handle, which owns the definition's specialization caches.
     registration: CustomRuleRegistration<V, O>,
@@ -284,11 +274,11 @@ struct NamedCompositeConfiguration<T, InputStructure, OutputStructure> {
 /// primal and each rule is traced once per specialization and cached.
 ///
 /// The function owns the specialization caches of its calls: calls that share a call structure (i.e., input and output
-/// parameter structure) and named axes share one definition, registered in the function's operation family `(V, O)`,
-/// and its caches for as long as the function lives. Once the function is dropped, the derivative requests of calls
-/// that it staged trace their rules again on every request. The rules of a call cannot discharge reference state, so
-/// differentiating a call whose reference state was discharged is rejected when its rule programs contain reference
-/// state. Refer to [`CustomRuleDefinition::with_reference_discharge`] for more information.
+/// parameter structure) and a [`TracingScope`] share one definition, registered in the function's operation family
+/// `(V, O)`, and its caches for as long as the function lives. Once the function is dropped, the derivative requests
+/// of calls that it staged trace their rules again on every request. The rules of a call cannot discharge reference
+/// state, so differentiating a call whose reference state was discharged is rejected when its rule programs contain
+/// reference state. Refer to [`CustomRuleDefinition::with_reference_discharge`] for more information.
 ///
 /// Reconfiguring this function discards its registered definitions because they retain the previous configuration.
 /// Calls staged earlier keep their definitions, but lose the caches owned by this function and retrace their rules on
@@ -388,7 +378,7 @@ where
     /// rule, whose primal closure is its body. The output type rule validates the types of a call's inputs and returns
     /// the types of its outputs, and it must agree with the body for every input it accepts.
     ///
-    /// Calls of a named function share one definition per input and output structure and visible named axes, together
+    /// Calls of a named function share one definition per input and output structure and [`TracingScope`], together
     /// with its rules and its specialization caches, for as long as the caller holds this [`Composite`] value (refer to
     /// [`CustomRuleRegistration`]). The body is traced once per input types and cached with the definition, and each
     /// call attaches it as a shared region, which a staging program imports once however many calls attach it, rather
@@ -1377,12 +1367,13 @@ where
     /// `input`, which is exactly the context the call is staged into. It is therefore never named at a construction or
     /// call site, while the stored closures still pin the tracers that this universe must produce.
     ///
-    /// The primal and the rules are traced in fresh traces rather than in `C` itself, so each trace is seeded with the
-    /// named axes and the default mesh in scope in `C` (refer to [`NamedAxes::named_axes`] and
-    /// [`MeshContext::default_mesh`]). Code in the closures therefore resolves the axes of enclosing transforms (e.g.,
-    /// an `axis_index` or a collective over the axis of an enclosing `batch`) and the mesh of an enclosing manual
-    /// region as it would if it were inlined. Rules traced under different bindings may differ, so calls under
-    /// different named axes or default meshes register separate rule definitions.
+    /// The primal and the rules are traced in fresh traces rather than in `C` itself, so each trace is seeded
+    /// with the [`TracingScope`] of `C` (i.e., the named axes, the default mesh, and the enclosing manual axes that
+    /// [`NamedAxes::named_axes`], [`MeshContext::default_mesh`], and [`MeshContext::manual_axes`] report). Code in the
+    /// closures therefore resolves the axes of enclosing transforms (e.g., an `axis_index` or a collective over the
+    /// axis of an enclosing `batch`), the mesh of an enclosing manual region, and the axes that enclosing manual
+    /// regions made manual (even when a `batch` level shadows one of them) as it would if it were inlined. Rules
+    /// traced in different scopes may differ, so calls in different scopes register separate rule definitions.
     ///
     /// # Errors
     ///
@@ -1438,29 +1429,20 @@ where
         // program imports once, instead of tracing the primal on every call. The output type rule validates the inputs
         // and determines the output structure.
         if let Some(named_configuration) = &self.named_configuration {
-            let named_axes = first.domain().named_axes();
-            let default_mesh = first.domain().default_mesh();
+            let scope = TracingScope::from_context(&first.domain());
             let input_structure = input_types.parameter_structure();
             let flat_input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
 
             // The output type rule determines the output structure, which may depend on the input types, once per typed
             // call signature, and calls whose output structures differ use different definitions.
-            let (rules, output_structure) = match self.registrations.get_by_input_types(
-                &flat_input_types,
-                &input_structure,
-                &named_axes,
-                default_mesh.as_ref(),
-            ) {
+            let registered = self.registrations.get_by_input_types(&flat_input_types, &input_structure, &scope);
+            let (rules, output_structure) = match registered {
                 Some(registered) => registered,
                 None => {
                     let (output_structure, _) =
                         (named_configuration.output_types)(&input_structure, &flat_input_types)?;
-                    let rules = self.registrations.get_or_try_register(
-                        &input_structure,
-                        &output_structure,
-                        &named_axes,
-                        default_mesh.as_ref(),
-                        || {
+                    let rules =
+                        self.registrations.get_or_try_register(&input_structure, &output_structure, &scope, || {
                             let paths = |structure: Vec<(ParameterPath, &Placeholder)>| {
                                 structure.into_iter().map(|(path, _)| path).collect::<Vec<_>>()
                             };
@@ -1509,8 +1491,7 @@ where
                                     )
                                 };
                                 let definition = CustomRuleDefinition::new(self.name.clone())
-                                    .with_named_axes(named_axes.clone())
-                                    .with_default_mesh(default_mesh.clone())
+                                    .with_scope(scope.clone())
                                     .with_batching_support()
                                     .with_named_composite(named_definition);
                                 let definition = definition.configure_jvp(
@@ -1532,8 +1513,7 @@ where
                                 definition.configure_batching(&self.batching, &input_structure, &output_structure)
                             };
                             Ok::<_, ProgramError>(CustomRuleRegistration::new(definition))
-                        },
-                    )?;
+                        })?;
                     self.registrations.record_output_structure(
                         &flat_input_types,
                         &input_structure,
@@ -1554,56 +1534,37 @@ where
         }
 
         // Only the primal is traced now. The rules are registered with the call structure and traced lazily. The primal
-        // and the rules are traced in fresh traces, which are seeded with the named axes that are visible where the
-        // function is called (e.g., the axis of an enclosing batching level), so that they resolve the same names as
-        // the function would if it were inlined. Rules traced under different bindings may differ, so the named axes
-        // are part of the registration key. The same holds for the default mesh of the calling context.
-        let named_axes = first.domain().named_axes();
-        let default_mesh = first.domain().default_mesh();
-        let (output_types, primal) = DomainTracingContext::<C>::trace_in_scope(
-            &*self.primal,
-            input_types.clone(),
-            TracingScope::new(named_axes.clone(), default_mesh.clone()),
-        )?;
+        // and the rules are traced in fresh traces, which are seeded with the scope of the calling context (i.e., the
+        // named axes that are visible where the function is called, such as the axis of an enclosing batching level,
+        // the default mesh, and the enclosing manual axes), so that they resolve the same names, mesh, and manual axes
+        // as the function would if it were inlined. Rules traced in different scopes may differ, so the scope is part
+        // of the registration key.
+        let scope = TracingScope::from_context(&first.domain());
+        let (output_types, primal) =
+            DomainTracingContext::<C>::trace_in_scope(&*self.primal, input_types.clone(), scope.clone())?;
         let input_structure = input_types.parameter_structure();
         let output_structure = output_types.parameter_structure();
-        let rules = self.registrations.get_or_register(
-            &input_structure,
-            &output_structure,
-            &named_axes,
-            default_mesh.as_ref(),
-            || {
-                let definition = CustomRuleDefinition::new(self.name.clone())
-                    .with_named_axes(named_axes.clone())
-                    .with_default_mesh(default_mesh.clone())
-                    .with_batching_support();
-                let definition = definition.configure_jvp(
-                    &self.jvp,
-                    &input_structure,
-                    &output_structure,
-                    self.non_differentiated_count,
-                );
-                let definition = definition.configure_vjp(
-                    &self.vjp,
-                    &input_structure,
-                    &output_structure,
-                    self.non_differentiated_count,
-                );
+        let rules = self.registrations.get_or_register(&input_structure, &output_structure, &scope, || {
+            let definition =
+                CustomRuleDefinition::new(self.name.clone()).with_scope(scope.clone()).with_batching_support();
+            let definition =
+                definition.configure_jvp(&self.jvp, &input_structure, &output_structure, self.non_differentiated_count);
+            let definition =
+                definition.configure_vjp(&self.vjp, &input_structure, &output_structure, self.non_differentiated_count);
 
-                // Every transform without a configured rule treats the primal as it treats any other function, so a
-                // function without derivative rules differentiates its primal. A function with only reverse mode rules
-                // keeps rejecting forward mode instead, because a derived pushforward would contradict its pullback.
-                let definition = match definition.has_derivative_rules() {
-                    true => definition,
-                    false => definition.with_jvp_from_primal(),
-                };
-                let definition = match &self.batched_output_axes {
-                    Some(output_axes) => definition.with_batched_output_axes(output_axes.clone()),
-                    None => definition,
-                };
-                definition.configure_batching(&self.batching, &input_structure, &output_structure)
-            },
-        );
+            // Every transform without a configured rule treats the primal as it treats any other function, so a
+            // function without derivative rules differentiates its primal. A function with only reverse mode rules
+            // keeps rejecting forward mode instead, because a derived pushforward would contradict its pullback.
+            let definition = match definition.has_derivative_rules() {
+                true => definition,
+                false => definition.with_jvp_from_primal(),
+            };
+            let definition = match &self.batched_output_axes {
+                Some(output_axes) => definition.with_batched_output_axes(output_axes.clone()),
+                None => definition,
+            };
+            definition.configure_batching(&self.batching, &input_structure, &output_structure)
+        });
 
         // The call binds through whatever context the input values flow through (e.g., a staging trace, a batching
         // context, or a differentiation context), so the batching or differentiation rule of the bound operation fires
@@ -1873,7 +1834,7 @@ mod tests {
         ArraySliceAxis, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, LogicalMesh,
         MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::axes::AxisError;
+    use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{
         BatchAxis, BatchAxisSpecification, BatchedProgram, BatchingError, ProgramBatchingOutputAxesPolicy, batch,
     };
@@ -6280,6 +6241,55 @@ mod tests {
         assert!(observed.iter().any(|(rule, _)| *rule == "forward"));
         assert!(observed.iter().any(|(rule, _)| *rule == "backward"));
         assert!(observed.iter().all(|(_, default_mesh)| default_mesh.as_ref() == Some(&mesh)), "{observed:?}");
+    }
+
+    #[test]
+    fn test_composite_call_manual_axes() {
+        // The primal and the rules are traced in fresh traces that are seeded with the manual axes of the context where
+        // the function is called (refer to `MeshContext::manual_axes`), including a manual axis whose binding a batch
+        // axis of the same name shadows, so that they never make an enclosing manual axis manual again.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let manual_axis = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        let manual_axes = vec![("x".to_string(), manual_axis)];
+        let scope = TracingScope::new(vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })], Some(mesh))
+            .with_manual_axes(manual_axes.clone());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let record = {
+            let observed = observed.clone();
+            move |rule: &'static str, x: &ArrayTracer| observed.lock().unwrap().push((rule, x.context().manual_axes()))
+        };
+        let function = {
+            let (primal, forward, backward) = (record.clone(), record.clone(), record);
+            composite(move |x: ArrayTracer| {
+                primal("primal", &x);
+                x.sin()
+            })
+            .with_vjp(
+                move |x: ArrayTracer| {
+                    forward("forward", &x);
+                    Ok((x.sin()?, x.cos()?))
+                },
+                move |cosine: ArrayTracer, cotangent: ArrayTracer| {
+                    backward("backward", &cosine);
+                    Ok(cosine * cotangent)
+                },
+            )
+        };
+        let input_type = ArrayType::new_static(DataType::F64, [2]);
+        DomainTracingContext::<ArrayContext>::trace_in_scope(
+            |(x, seed): (ArrayTracer, ArrayTracer)| {
+                let (y, pullback) = differentiate_at(x).vjp(|x| function.call(x))?;
+                Ok((y, pullback.apply_materialized(seed)?))
+            },
+            (input_type.clone(), input_type),
+            scope,
+        )
+        .unwrap();
+        let observed = observed.lock().unwrap().clone();
+        assert!(observed.iter().any(|(rule, _)| *rule == "primal"));
+        assert!(observed.iter().any(|(rule, _)| *rule == "forward"));
+        assert!(observed.iter().any(|(rule, _)| *rule == "backward"));
+        assert!(observed.iter().all(|(_, observed_axes)| observed_axes == &manual_axes), "{observed:?}");
     }
 
     #[test]
