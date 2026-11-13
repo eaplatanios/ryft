@@ -50,7 +50,8 @@
 //!   - **Batching:** A batched call folds its mapped axis into attention's batch axis and calls the same definition
 //!     at the folded boundary, which keeps backend implementations for batched calls (refer to the section below).
 //!     Definitions with dropout are batched structurally instead, so that every batch item keeps the dropout mask
-//!     of its unbatched call, and definitions with dropout and the fused implementation reject batching.
+//!     of its unbatched call, and definitions with dropout and the fused implementation reject batched calls that
+//!     have a mapped input.
 //!   - **Differentiation:** The forward and backward definitions have no derivative rules, so differentiating
 //!     a call of the inference function fails. The differentiable function stages a third named composite, named
 //!     [`DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME`], whose reverse mode rule calls the forward definition
@@ -857,8 +858,9 @@ pub struct AttentionResiduals<P: Parameter> {
 ///
 /// Batching a call folds its mapped axis into the logical batch axis and calls the same definition at the folded
 /// boundary, which keeps backend implementations for batched calls, while calls with dropout are batched structurally
-/// and calls with dropout and the fused implementation cannot be batched. The named definitions have no derivative
-/// rules, so differentiating a call fails. Use [`differentiable_dot_product_attention`] for the differentiable path.
+/// and calls with dropout and the fused implementation cannot be batched, unless all of their inputs are replicated.
+/// The named definitions have no derivative rules, so differentiating a call fails. Use
+/// [`differentiable_dot_product_attention`] for the differentiable path.
 pub struct DotProductAttention<C: Domain>
 where
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1327,7 +1329,8 @@ where
 /// into attention's batch axis and calling the same definition at the folded boundary, which keeps the definition (and
 /// therefore any backend implementation of it) for batched calls. Definitions with dropout are batched structurally
 /// instead, because folding would change the shape of the dropout mask and therefore the mask of every batch item,
-/// except that definitions with dropout and the fused implementation reject batching.
+/// except that definitions with dropout and the fused implementation reject batched calls that have a mapped input.
+/// In every definition with a batching rule, a call whose inputs are all replicated stages the unbatched definition.
 enum AttentionFunction<Folding, Structural> {
     /// Definition that folds mapped axes into the attention's batch axis.
     Folding(Arc<Folding>),
@@ -2163,29 +2166,16 @@ where
     );
 
     if configuration.dropout().is_some() {
-        return match configuration.implementation() {
+        match configuration.implementation() {
             AttentionImplementation::Fused => {
-                // A batched call loses the identity of its definition (i.e., it lowers its structurally batched body),
-                // so batching a fused call with dropout would silently replace the fused kernels and their dropout mask
-                // with the portable body and its mask. That would both change the requested numerics and break the
-                // agreement between the dropout masks of the forward and backward definitions when only one of them
-                // is batched (e.g., when the pullback of an unbatched call is batched).
-                AttentionFunction::Folding(Arc::new(function.with_batching(|_, _, _| {
-                    Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "named composite `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` with dropout cannot be batched \
-                             with the fused implementation, because a batched call cannot use the fused kernels or \
-                             reproduce their dropout mask; use the portable implementation or a dropout state",
-                        ),
-                    })
-                })))
+                // These definitions batch through the rule below, which rejects every call that has a mapped input.
             }
             AttentionImplementation::Automatic | AttentionImplementation::Portable => {
                 // Folding would change the shape of the dropout mask and therefore the mask of every batch item,
                 // so these definitions keep the structural batching of their bodies.
-                AttentionFunction::Structural(Arc::new(function))
+                return AttentionFunction::Structural(Arc::new(function));
             }
-        };
+        }
     }
 
     AttentionFunction::Folding(Arc::new_cyclic(
@@ -2199,10 +2189,35 @@ where
                     None => match forward_definition::<V, O>(configuration, return_residual) {
                         AttentionFunction::Folding(function) => function,
                         AttentionFunction::Structural(_) => {
-                            unreachable!("definitions without dropout batch by folding")
+                            unreachable!("structurally batched definitions have no batching rule")
                         }
                     },
                 };
+
+                if configuration.dropout().is_some() {
+                    // Only definitions with dropout and the fused implementation reach this rule with dropout. A
+                    // batched call loses the identity of its definition (i.e., it lowers its structurally batched
+                    // body), so batching a fused call with dropout would silently replace the fused kernels and
+                    // their dropout mask with the portable body and its mask. That would both change the requested
+                    // numerics and break the agreement between the dropout masks of the forward and backward
+                    // definitions when only one of them is batched (e.g., when the pullback of an unbatched call is
+                    // batched). A call whose inputs are all replicated computes one result that every batch item
+                    // shares, so it stages the unbatched definition and keeps the fused kernels and their mask.
+                    if axes.parameters().any(|axis| axis.axis().is_some()) {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "named composite `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` with dropout cannot be \
+                                 batched with the fused implementation, because a batched call cannot use the fused \
+                                 kernels or reproduce their dropout mask; use the portable implementation or a \
+                                 dropout state",
+                            ),
+                        });
+                    }
+                    let outputs = function.call(inputs)?;
+                    let output_axes = vec![BatchAxis::replicated(); outputs.len()];
+                    return Ok((outputs, output_axes));
+                }
+
                 let input_structure = axes.parameter_structure();
                 let key = AttentionKey::Forward { configuration, input_structure, return_residual };
                 batch_attention(
@@ -2482,26 +2497,16 @@ where
         },
     );
     if configuration.dropout().is_some() {
-        return match configuration.implementation() {
+        match configuration.implementation() {
             AttentionImplementation::Fused => {
-                // Refer to the forward definition for why a batched fused call with dropout is rejected.
-                AttentionFunction::Folding(Arc::new(function.with_batching(|_, _, _| {
-                    Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "named composite `{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` with dropout cannot be \
-                             batched with the fused implementation, because a batched call cannot use the fused \
-                             kernels or reproduce their dropout mask; use the portable implementation or a dropout \
-                             state",
-                        ),
-                    })
-                })))
+                // These definitions batch through the rule below, which rejects every call that has a mapped input.
             }
             AttentionImplementation::Automatic | AttentionImplementation::Portable => {
                 // Folding would change the shape of the dropout mask and therefore the mask of every batch item,
                 // so these definitions keep the structural batching of their bodies.
-                AttentionFunction::Structural(Arc::new(function))
+                return AttentionFunction::Structural(Arc::new(function));
             }
-        };
+        }
     }
 
     AttentionFunction::Folding(Arc::new_cyclic(
@@ -2521,10 +2526,29 @@ where
                     None => match backward_definition::<V, O>(configuration) {
                         AttentionFunction::Folding(function) => function,
                         AttentionFunction::Structural(_) => {
-                            unreachable!("definitions without dropout batch by folding")
+                            unreachable!("structurally batched definitions have no batching rule")
                         }
                     },
                 };
+
+                if configuration.dropout().is_some() {
+                    // Refer to the forward definition for why a fused call with dropout and a mapped input is
+                    // rejected, and for why a call whose inputs are all replicated stages the unbatched definition.
+                    if axes.parameters().any(|axis| axis.axis().is_some()) {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "named composite `{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` with dropout \
+                                 cannot be batched with the fused implementation, because a batched call cannot use \
+                                 the fused kernels or reproduce their dropout mask; use the portable implementation \
+                                 or a dropout state",
+                            ),
+                        });
+                    }
+                    let outputs = function.call(inputs)?;
+                    let output_axes = vec![BatchAxis::replicated(); outputs.len()];
+                    return Ok((outputs, output_axes));
+                }
+
                 let input_structure = axes.0.inputs.parameter_structure();
                 let key = AttentionKey::Backward { configuration, input_structure };
                 batch_attention(
@@ -4856,7 +4880,7 @@ mod tests {
     #[test]
     fn test_dot_product_attention_batching_fused_dropout() {
         // Batching a call with dropout and the fused implementation would silently replace the fused kernels and
-        // their dropout mask with the portable body, so it is rejected.
+        // their dropout mask with the portable body, so a call with a mapped input is rejected.
         let configuration =
             AttentionConfiguration::new().with_dropout(0.5).with_implementation(AttentionImplementation::Fused);
         let function = dot_product_attention::<ArrayContext>(configuration);
@@ -4877,6 +4901,24 @@ mod tests {
                      their dropout mask; use the portable implementation or a dropout state",
                 ),
         ));
+
+        // A call whose inputs are all replicated computes one result that every batch item shares, so it stages the
+        // unbatched definition and its result equals that of the unbatched call.
+        let ones = f32_array(&[1, 1, 1, 1], &[1.0]);
+        let inputs = AttentionInputs::new(ones.clone(), ones, f32_array(&[1, 1, 1, 1], &[3.0]));
+        let attended = function.call(inputs.clone()).unwrap().to_f64s()[0] as f32;
+        let output = batch(
+            |(inputs, offsets): (AttentionInputs<_>, _)| function.call(inputs)?.add(&offsets),
+            (inputs, f32_array(&[2, 1, 1, 1, 1], &[10.0, 20.0])),
+            (
+                AttentionInputs::new(BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::replicated()),
+                BatchAxis::new(0),
+            ),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output, f32_array(&[2, 1, 1, 1, 1], &[10.0 + attended, 20.0 + attended]));
     }
 
     #[test]
@@ -5565,30 +5607,31 @@ mod tests {
             assert_eq!(batched.value.to_f64s()[4 * item..4 * item + 4], expected.value.to_f64s());
         }
 
-        // A batched call of the backward definition with dropout and the fused implementation is rejected, for the
-        // same reason as a batched call of the forward definition.
+        // Batching the pullback of an unbatched call with dropout and the fused implementation leaves the forward
+        // definition unbatched, because its inputs are replicated, and batches only the backward definition, which
+        // is rejected for the same reason as a batched forward definition.
         let configuration =
             AttentionConfiguration::new().with_dropout(0.5).with_implementation(AttentionImplementation::Fused);
-        let AttentionFunction::Folding(backward) = backward_definition::<Array, ArrayOperation<Array>>(configuration)
-        else {
-            panic!("expected a folding backward definition for dropout with the fused implementation");
-        };
+        let function = differentiable_dot_product_attention::<ArrayContext>(configuration);
+        let r#type = ArrayType::new_static(DataType::F32, [1, 1, 1, 1]);
+        let (_, program) = ArrayContext::trace(
+            |(inputs, cotangent): (AttentionInputs<_>, _)| {
+                let (_, pullback) = differentiate_at(inputs).vjp(|inputs| function.call(inputs))?;
+                Ok(cotangent_value(pullback.apply(cotangent)?.value))
+            },
+            (AttentionInputs::new(r#type.clone(), r#type.clone(), r#type.clone()), r#type),
+        )
+        .unwrap();
+        let program = program.into_flat_program();
         let ones = f32_array(&[1, 1, 1, 1], &[1.0]);
-        let residuals = AttentionResiduals {
-            inputs: AttentionInputs::new(ones.clone(), ones.clone(), ones.clone()),
-            output: ones,
-            residual: f32_array(&[1, 1, 1], &[1.0]),
-        };
-        let axes = AttentionResiduals {
-            inputs: AttentionInputs::new(BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::replicated()),
-            output: BatchAxis::replicated(),
-            residual: BatchAxis::replicated(),
-        };
         let result = batch(
-            |inputs: (AttentionResiduals<_>, _)| backward.call(inputs),
-            (residuals, f32_array(&[2, 1, 1, 1, 1], &[1.0, 1.0])),
-            (axes, BatchAxis::new(0)),
-            vec![BatchAxis::new(0); 3],
+            |inputs: Vec<_>| {
+                let context = inputs[0].domain();
+                Ok(program.entry_region_ref().interpret_in_context(&context, inputs)?.remove(0))
+            },
+            vec![ones.clone(), ones.clone(), ones, f32_array(&[2, 1, 1, 1, 1], &[1.0, 1.0])],
+            vec![BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::new(0)],
+            BatchAxis::new(0),
             None,
         );
         assert!(matches!(
