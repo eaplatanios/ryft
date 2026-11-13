@@ -24,12 +24,6 @@ use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFa
 use crate::programs::{AttachedRegions, MaybeZero, Operation, Program, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracingContext, TracingContext, TracingScope};
 
-#[cfg(doc)]
-use crate::operations::control_flow::scan::{ScanOperation, ScanType};
-
-#[cfg(doc)]
-use crate::programs::EffectClass;
-
 /// Collects the [`Context`] bounds required by [`Composite::call`], so that wrappers can reuse them. Implemented for
 /// every context that satisfies these bounds. The call's input, output, and rule configuration bounds remain separate.
 pub trait CompositeCallContext:
@@ -582,11 +576,13 @@ where
     ///
     /// The declaration exists only to let batching release manual axes, so it promises everything that releasing
     /// another manual axis requires of the rules. They communicate only along the declared mesh axes, and they have
-    /// no I/O effect (i.e., no [`EffectClass::OrderedIo`], [`EffectClass::DeviceOrderedIo`], or
-    /// [`EffectClass::UnorderedIo`] effect), because every device along a manual axis runs its own occurrence of such
-    /// an effect, which releasing the axis would eliminate. A body with per device I/O can never have an axis released,
-    /// so a function whose rules have I/O (e.g., a backward rule that prints) gains nothing from a declaration and must
-    /// leave its rule axes undeclared. Its axes then stay manual and its effects keep running once per device.
+    /// no I/O effect (i.e., no [`EffectClass::OrderedIo`](crate::EffectClass::OrderedIo),
+    /// [`EffectClass::DeviceOrderedIo`](crate::EffectClass::DeviceOrderedIo), or
+    /// [`EffectClass::UnorderedIo`](crate::EffectClass::UnorderedIo) effect), because every device along a manual axis
+    /// runs its own occurrence of such an effect, which releasing the axis would eliminate. A body with per device I/O
+    /// can never have an axis released, so a function whose rules have I/O (e.g., a backward rule that prints) gains
+    /// nothing from a declaration and must leave its rule axes undeclared. Its axes then stay manual and its effects
+    /// keep running once per device.
     ///
     /// # Errors
     ///
@@ -1454,16 +1450,16 @@ where
     }
 
     /// Returns this function with sequential batching, which batches its calls by looping over the batch items with a
-    /// scan (refer to [`ScanOperation`]) whose body applies the unbatched call to one item at a time, instead of
-    /// structurally batching its primal. This is the Ryft analogue of JAX's
+    /// scan (refer to [`ScanOperation`](crate::ScanOperation)) whose body applies the unbatched call to one item at a
+    /// time, instead of structurally batching its primal. This is the Ryft analogue of JAX's
     /// [`custom_batching.sequential_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html),
     /// and a convenience over [`Self::with_batching`] for primals that have no batched form (e.g., a foreign kernel
     /// called by [`Self::from_custom_call`] that processes one item at a time): the mapped inputs are moved to axis
     /// `0` and sliced by the scan, the replicated inputs are passed to every iteration unchanged, and every output is
     /// mapped at axis `0`. The batch extent must be statically known, including when represented by a first-class
-    /// dimension, and the context's family must support scans (i.e., its types implement [`ScanType`] and its
-    /// operations contain [`ScanOperation`]). The batch axis must be unnamed because the scan does not bind
-    /// named collectives across its items for the primal or derivative rules.
+    /// dimension, and the context's family must support scans (i.e., its types implement [`ScanType`](crate::ScanType)
+    /// and its operations contain [`ScanOperation`](crate::ScanOperation)). The batch axis must be unnamed because the
+    /// scan does not bind named collectives across its items for the primal or derivative rules.
     ///
     /// Unlike a custom batching rule, which replaces the call's primal while preserving the call, batching replaces
     /// the call with the scan, whose body calls the unbatched function. The function's derivative rules therefore keep
