@@ -127,10 +127,9 @@
 //! # }
 //! ```
 
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 use ryft_macros::Parameterized;
 
@@ -955,18 +954,19 @@ where
 /// transitions of the inputs precede the composite boundary, which lets their transposes accumulate the cotangent
 /// contributions of invariant inputs exactly once.
 ///
-/// The function owns its named composites, one per input structure, together with their definitions, so it
+/// The function owns its named composite together with the definitions that its primal and its rules call, so it
 /// should be created once and called many times. Its primal and its definitions' bodies are then traced once per input
 /// types, and its rules once per specialization, for as long as the function lives.
 pub struct DifferentiableDotProductAttention<C: Domain>
 where
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    /// Named attention definitions called by the rules of this function.
-    definitions: Arc<AttentionDefinitions<C::Constant, C::Operation>>,
+    /// Configuration of this function.
+    configuration: AttentionConfiguration,
 
-    /// Named composites that stage the calls of this function, by input structure.
-    functions: Mutex<HashMap<AttentionInputs<Placeholder>, Arc<DifferentiableFunction<C::Constant, C::Operation>>>>,
+    /// Named composite that stages the calls of this function, whatever their input structure. Its primal and its
+    /// rules own the named attention definitions that they call.
+    function: DifferentiableFunction<C::Constant, C::Operation>,
 }
 
 impl<C: Domain> DifferentiableDotProductAttention<C>
@@ -994,7 +994,7 @@ where
     /// Returns the configuration of this function.
     #[inline]
     pub fn configuration(&self) -> AttentionConfiguration {
-        self.definitions.configuration()
+        self.configuration
     }
 
     /// Aligns the manual variation of `inputs` and stages one differentiable attention call, returning the attended
@@ -1009,118 +1009,7 @@ where
         Caller: CompositeCallContext<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>,
         V: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
     {
-        /// Returns the structural zero cotangent of `value`.
-        fn zero_cotangent<V: Value<Type: DifferentiableType>>(value: &V) -> Result<MaybeZero<V>, ProgramError> {
-            Ok(MaybeZero::Zero(value.r#type().cotangent()?))
-        }
-
-        let input_structure = inputs.parameter_structure();
-        let inputs = inputs.align_manual_variation()?;
-        let function = self
-            .functions
-            .lock()
-            .expect("attention functions mutex is poisoned")
-            .entry(input_structure)
-            .or_insert_with(|| {
-                // The named composite of an input structure is created on its first call. Its primal and
-                // its rules call the definitions that this function owns.
-                let definitions = self.definitions.clone();
-                let configuration = definitions.configuration();
-                // The composite returns only the attended output, whose type the forward boundary determines.
-                let output_types = move |input_types: AttentionInputs<C::Type>| -> Result<C::Type, ProgramError> {
-                    let input_types = input_types
-                        .parameters()
-                        .map(|r#type| r#type.as_array_type().cloned())
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let mut output_types = attention_forward_output_types(
-                        DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-                        configuration,
-                        input_structure,
-                        false,
-                        input_types.as_slice(),
-                    )?;
-                    check_count!("output", output_types, 1, ProgramError);
-                    Ok(output_types.remove(0).into())
-                };
-                // The primal stages the forward definition without its residual.
-                let primal = {
-                    let definitions = definitions.clone();
-                    move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<DomainTracer<C>, ProgramError> {
-                        let mut outputs = definitions.forward(inputs, false)?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        Ok(outputs.remove(0))
-                    }
-                };
-                // The forward rule stages the forward definition with its residual, and it retains the inputs, the
-                // output, and the residual for the backward rule.
-                let forward = {
-                    let definitions = definitions.clone();
-                    move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<_, ProgramError> {
-                        let mut outputs = definitions.forward(inputs.clone(), true)?;
-                        check_count!("output", outputs, 2, ProgramError);
-                        let residual = outputs.remove(1);
-                        let output = outputs.remove(0);
-                        Ok((output.clone(), AttentionResiduals { inputs, output, residual }))
-                    }
-                };
-                let backward = move |residuals: AttentionResiduals<DomainTracer<C>>,
-                                     output_cotangent: MaybeZero<DomainTracer<C>>|
-                      -> Result<_, ProgramError> {
-                    // A structurally zero output cotangent (e.g., of an unused output) makes every input cotangent
-                    // a structural zero, without staging the backward definition.
-                    let MaybeZero::Value(output_cotangent) = output_cotangent else {
-                        return residuals.inputs.try_map_parameters(|input| zero_cotangent(&input));
-                    };
-
-                    // The backward definition returns the cotangents of the query, key, and value, and of a bias
-                    // whose cotangent space is not zero-dimensional, so the cotangents of the other inputs (i.e., of
-                    // the masks, sequence lengths, and dropout states, and of a bias with a zero-dimensional
-                    // cotangent space) are structural zeros, which contribute nothing to their inputs' cotangents.
-                    let inputs = &residuals.inputs;
-                    let zero = |input: &Option<DomainTracer<C>>| input.as_ref().map(zero_cotangent).transpose();
-                    let mask = zero(&inputs.mask)?;
-                    let query_sequence_lengths = zero(&inputs.query_sequence_lengths)?;
-                    let key_value_sequence_lengths = zero(&inputs.key_value_sequence_lengths)?;
-                    let dropout_state = zero(&inputs.dropout_state)?;
-                    let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
-                    let mut outputs = definitions.backward((residuals, output_cotangent))?;
-                    let bias = match bias_cotangent_type {
-                        Some(_) if outputs.len() == 4 => Some(MaybeZero::Value(outputs.remove(3))),
-                        Some(r#type) => Some(MaybeZero::Zero(r#type)),
-                        None => None,
-                    };
-                    check_count!("output", outputs, 3, ProgramError);
-                    let value = MaybeZero::Value(outputs.remove(2));
-                    let key = MaybeZero::Value(outputs.remove(1));
-                    let query = MaybeZero::Value(outputs.remove(0));
-                    Ok(AttentionInputs {
-                        query,
-                        key,
-                        value,
-                        bias,
-                        mask,
-                        query_sequence_lengths,
-                        key_value_sequence_lengths,
-                        dropout_state,
-                    })
-                };
-                Arc::new(
-                    composite(primal)
-                        .with_symbolic_zero_vjp(forward, backward)
-                        .with_name(DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME)
-                        .with_named_composite(
-                            attention_composite_key(
-                                DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME,
-                                configuration,
-                                input_structure,
-                                None,
-                            ),
-                            output_types,
-                        ),
-                )
-            })
-            .clone();
-        function.call(inputs)
+        self.function.call(inputs.align_manual_variation()?)
     }
 }
 
@@ -1175,14 +1064,111 @@ where
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
         + CompositeCallContext<Type = C::Type, Value = DomainTracer<C>, Constant = C::Constant, Operation = C::Operation>,
 {
+    /// Returns the structural zero cotangent of `value`.
+    fn zero_cotangent<V: Value<Type: DifferentiableType>>(value: &V) -> Result<MaybeZero<V>, ProgramError> {
+        Ok(MaybeZero::Zero(value.r#type().cotangent()?))
+    }
+
     let configuration = match configuration.implementation() {
         AttentionImplementation::Automatic => configuration.with_implementation(AttentionImplementation::Portable),
         AttentionImplementation::Portable | AttentionImplementation::Fused => configuration,
     };
-    DifferentiableDotProductAttention {
-        definitions: Arc::new(AttentionDefinitions::new(configuration)),
-        functions: Mutex::new(HashMap::new()),
-    }
+    // The primal and the rules of the named composite call these definitions, which they own.
+    let definitions = Arc::new(AttentionDefinitions::new(configuration));
+    // The composite returns only the attended output, whose type the forward boundary determines.
+    let output_types = move |input_types: AttentionInputs<C::Type>| -> Result<C::Type, ProgramError> {
+        let input_structure = input_types.parameter_structure();
+        let input_types = input_types
+            .parameters()
+            .map(|r#type| r#type.as_array_type().cloned())
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut output_types = attention_forward_output_types(
+            DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+            configuration,
+            input_structure,
+            false,
+            input_types.as_slice(),
+        )?;
+        check_count!("output", output_types, 1, ProgramError);
+        Ok(output_types.remove(0).into())
+    };
+    // The primal stages the forward definition without its residual.
+    let primal = {
+        let definitions = definitions.clone();
+        move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<DomainTracer<C>, ProgramError> {
+            let mut outputs = definitions.forward(inputs, false)?;
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(outputs.remove(0))
+        }
+    };
+    // The forward rule stages the forward definition with its residual, and it retains the inputs, the
+    // output, and the residual for the backward rule.
+    let forward = {
+        let definitions = definitions.clone();
+        move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<_, ProgramError> {
+            let mut outputs = definitions.forward(inputs.clone(), true)?;
+            check_count!("output", outputs, 2, ProgramError);
+            let residual = outputs.remove(1);
+            let output = outputs.remove(0);
+            Ok((output.clone(), AttentionResiduals { inputs, output, residual }))
+        }
+    };
+    let backward = move |residuals: AttentionResiduals<DomainTracer<C>>,
+                         output_cotangent: MaybeZero<DomainTracer<C>>|
+          -> Result<_, ProgramError> {
+        // A structurally zero output cotangent (e.g., of an unused output) makes every input cotangent
+        // a structural zero, without staging the backward definition.
+        let MaybeZero::Value(output_cotangent) = output_cotangent else {
+            return residuals.inputs.try_map_parameters(|input| zero_cotangent(&input));
+        };
+
+        // The backward definition returns the cotangents of the query, key, and value, and of a bias
+        // whose cotangent space is not zero-dimensional, so the cotangents of the other inputs (i.e., of
+        // the masks, sequence lengths, and dropout states, and of a bias with a zero-dimensional
+        // cotangent space) are structural zeros, which contribute nothing to their inputs' cotangents.
+        let inputs = &residuals.inputs;
+        let zero = |input: &Option<DomainTracer<C>>| input.as_ref().map(zero_cotangent).transpose();
+        let mask = zero(&inputs.mask)?;
+        let query_sequence_lengths = zero(&inputs.query_sequence_lengths)?;
+        let key_value_sequence_lengths = zero(&inputs.key_value_sequence_lengths)?;
+        let dropout_state = zero(&inputs.dropout_state)?;
+        let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
+        let mut outputs = definitions.backward((residuals, output_cotangent))?;
+        let bias = match bias_cotangent_type {
+            Some(_) if outputs.len() == 4 => Some(MaybeZero::Value(outputs.remove(3))),
+            Some(r#type) => Some(MaybeZero::Zero(r#type)),
+            None => None,
+        };
+        check_count!("output", outputs, 3, ProgramError);
+        let value = MaybeZero::Value(outputs.remove(2));
+        let key = MaybeZero::Value(outputs.remove(1));
+        let query = MaybeZero::Value(outputs.remove(0));
+        Ok(AttentionInputs {
+            query,
+            key,
+            value,
+            bias,
+            mask,
+            query_sequence_lengths,
+            key_value_sequence_lengths,
+            dropout_state,
+        })
+    };
+    let function = composite(primal)
+        .with_symbolic_zero_vjp(forward, backward)
+        .with_name(DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME)
+        .with_named_composite_per_structure(
+            move |input_structure: &AttentionInputs<Placeholder>| {
+                attention_composite_key(
+                    DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME,
+                    configuration,
+                    *input_structure,
+                    None,
+                )
+            },
+            output_types,
+        );
+    DifferentiableDotProductAttention { configuration, function }
 }
 
 /// [`CustomRuleTracer`] of the operation family `(V, O)`.
@@ -1302,22 +1288,26 @@ struct AttentionDimensions {
     data_type: DataType,
 }
 
-/// Named attention definitions of one operation family `(V, O)` and one [`AttentionConfiguration`], with one named
-/// composite per [`AttentionKey`] (i.e., per definition, residual request, and input structure), each
-/// created on first use. The functions that stage attention own this cache, so its definitions, their traced bodies,
-/// and their rule specializations live exactly as long as those functions.
+/// Named attention definitions of one operation family `(V, O)` and one [`AttentionConfiguration`] (i.e., the forward
+/// definition without and with its residual, and the backward definition). Each one is a named composite that serves
+/// every input structure, under the [`AttentionKey`] of that structure (refer to
+/// [`Composite::with_named_composite_per_structure`]). The functions that stage attention own these definitions, so
+/// their traced bodies and their rule specializations live exactly as long as those functions.
 struct AttentionDefinitions<V: Value, O: Operation<Type = V::Type>>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
-    /// Configuration of every definition in this cache.
+    /// Configuration of every definition.
     configuration: AttentionConfiguration,
 
-    /// Forward definitions by residual request and input structure.
-    forward: Mutex<HashMap<(bool, AttentionInputs<Placeholder>), ForwardFunction<V, O>>>,
+    /// Forward definition that returns only the attended output.
+    forward: ForwardFunction<V, O>,
 
-    /// Backward definitions by input structure.
-    backward: Mutex<HashMap<AttentionInputs<Placeholder>, BackwardFunction<V, O>>>,
+    /// Forward definition that also returns the log-sum-exp residual of its softmax.
+    forward_with_residual: ForwardFunction<V, O>,
+
+    /// Backward definition.
+    backward: BackwardFunction<V, O>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> AttentionDefinitions<V, O>
@@ -1330,12 +1320,17 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
 {
-    /// Creates an empty cache of the definitions with the provided configuration.
+    /// Creates the definitions with the provided configuration.
     fn new(configuration: AttentionConfiguration) -> Self {
-        Self { configuration, forward: Mutex::new(HashMap::new()), backward: Mutex::new(HashMap::new()) }
+        Self {
+            configuration,
+            forward: forward_definition(configuration, false),
+            forward_with_residual: forward_definition(configuration, true),
+            backward: backward_definition(configuration),
+        }
     }
 
-    /// Returns the configuration of the definitions in this cache.
+    /// Returns the configuration of the definitions.
     #[inline]
     fn configuration(&self) -> AttentionConfiguration {
         self.configuration
@@ -1352,15 +1347,7 @@ where
         C: CompositeCallContext<Type = V::Type, Value = InputValue, Constant = V, Operation = O>,
         InputValue: Value<Type = V::Type, Domain = C>,
     {
-        let input_structure = inputs.parameter_structure();
-        let function = self
-            .forward
-            .lock()
-            .expect("attention definitions mutex is poisoned")
-            .entry((return_residual, input_structure))
-            .or_insert_with(|| forward_definition(self.configuration, input_structure, return_residual))
-            .clone();
-        match function {
+        match if return_residual { &self.forward_with_residual } else { &self.forward } {
             AttentionFunction::Folding(function) => function.call(inputs),
             AttentionFunction::Structural(function) => function.call(inputs),
         }
@@ -1373,15 +1360,7 @@ where
         C: CompositeCallContext<Type = V::Type, Value = InputValue, Constant = V, Operation = O>,
         InputValue: Value<Type = V::Type, Domain = C>,
     {
-        let input_structure = inputs.0.inputs.parameter_structure();
-        let function = self
-            .backward
-            .lock()
-            .expect("attention definitions mutex is poisoned")
-            .entry(input_structure)
-            .or_insert_with(|| backward_definition(self.configuration, input_structure))
-            .clone();
-        match function {
+        match &self.backward {
             AttentionFunction::Folding(function) => function.call(inputs),
             AttentionFunction::Structural(function) => function.call(inputs),
         }
@@ -1400,16 +1379,6 @@ enum AttentionFunction<Folding, Structural> {
 
     /// Definition that is batched structurally.
     Structural(Arc<Structural>),
-}
-
-impl<Folding, Structural> Clone for AttentionFunction<Folding, Structural> {
-    #[inline]
-    fn clone(&self) -> Self {
-        match self {
-            Self::Folding(function) => Self::Folding(function.clone()),
-            Self::Structural(function) => Self::Structural(function.clone()),
-        }
-    }
 }
 
 /// Inputs of a backward definition, which pair the [`AttentionResiduals`] of a forward call with the incoming
@@ -1707,8 +1676,6 @@ fn validate_attention_boundary(
     Ok(dimensions)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Validates the input contract that the attention definitions share (i.e., the `TNH` or `BTNH` query, key, and value
 /// shapes and data types, the divisibility of the query heads by the key/value heads, and the optional broadcastable
 /// bias and mask) and returns the validated [`AttentionDimensions`]. Refer to [`DotProductAttention`] for the contract
@@ -1724,131 +1691,153 @@ fn validate_attention_inputs(
     let query = infer_attention_dimensions(operation_name, "query", query_type)?;
     let key = infer_attention_dimensions(operation_name, "key", key_type)?;
     let value = infer_attention_dimensions(operation_name, "value", value_type)?;
+
     let data_type = query_type.data_type();
     if !data_type.is_floating_point() {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` requires floating-point inputs but got data type `{data_type}`"
+            "`{operation_name}` requires floating-point inputs but got data type `{data_type}`",
         )));
     }
+
     for (descriptor, dimensions, input_type) in [("key", &key, key_type), ("value", &value, value_type)] {
         if input_type.data_type() != data_type {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} data type `{}` does not match the query data type `{data_type}`",
+                "`{}` {} data type `{}` does not match the query data type `{}`",
+                operation_name,
+                descriptor,
                 input_type.data_type(),
+                data_type,
             )));
         }
+
         if dimensions[0] != query[0] {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} batch dimension ({}) does not match the query batch dimension \
-                     ({})",
-                dimensions[0], query[0],
+                "`{}` {} batch dimension ({}) does not match the query batch dimension ({})",
+                operation_name, descriptor, dimensions[0], query[0],
             )));
         }
+
         if dimensions[3] != query[3] {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} head dimension ({}) does not match the query head dimension \
-                     ({})",
-                dimensions[3], query[3],
+                "`{}` {} head dimension ({}) does not match the query head dimension ({})",
+                operation_name, descriptor, dimensions[3], query[3],
             )));
         }
     }
+
     if value[1] != key[1] {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` value sequence dimension ({}) does not match the key sequence dimension ({})",
-            value[1], key[1],
+            "`{}` value sequence dimension ({}) does not match the key sequence dimension ({})",
+            operation_name, value[1], key[1],
         )));
     }
+
     if value[2] != key[2] {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` value heads dimension ({}) does not match the key heads dimension ({})",
-            value[2], key[2],
+            "`{}` value heads dimension ({}) does not match the key heads dimension ({})",
+            operation_name, value[2], key[2],
         )));
     }
+
     let Dimension::Static(query_heads) = &query[2] else {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` query heads dimension must be static but got {}",
-            query[2],
+            "`{}` query heads dimension must be static but got {}",
+            operation_name, query[2],
         )));
     };
+
     let Dimension::Static(key_value_heads) = &key[2] else {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` key/value heads dimension must be static but got {}",
-            key[2],
+            "`{}` key/value heads dimension must be static but got {}",
+            operation_name, key[2],
         )));
     };
+
     let Dimension::Static(head_dimension) = &query[3] else {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` head dimension must be static but got {}",
-            query[3],
+            "`{}` head dimension must be static but got {}",
+            operation_name, query[3],
         )));
     };
+
     if *key_value_heads == 0 || *query_heads % *key_value_heads != 0 {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` key/value heads dimension ({}) must divide the query heads dimension ({})",
-            key_value_heads, query_heads,
+            "`{}` key/value heads dimension ({}) must divide the query heads dimension ({})",
+            operation_name, key_value_heads, query_heads,
         )));
     }
+
     for (descriptor, score_type, expected_data_type) in
         [("bias", bias_type, None), ("mask", mask_type, Some(DataType::Boolean))]
     {
         let Some(score_type) = score_type else {
             continue;
         };
+
         let score_dimensions = score_type.shape().dimensions();
         if score_dimensions.len() > 4 {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} must have rank at most 4 but got rank {}",
+                "`{}` {} must have rank at most 4 but got rank {}",
+                operation_name,
+                descriptor,
                 score_dimensions.len(),
             )));
         }
+
         let dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - score_dimensions.len())
             .chain(score_dimensions.iter().cloned())
             .collect::<Vec<_>>();
         let [score_batch, score_heads, score_rows, score_columns] = dimensions.as_slice() else {
             unreachable!("attention bias and mask shapes are normalized to exactly four dimensions")
         };
+
         if let Some(expected_data_type) = expected_data_type {
             if score_type.data_type() != expected_data_type {
                 return Err(TypeError::invalid(format!(
-                    "`{operation_name}` {descriptor} must have data type `{expected_data_type}` but got `{}`",
+                    "`{}` {} must have data type `{}` but got `{}`",
+                    operation_name,
+                    descriptor,
+                    expected_data_type,
                     score_type.data_type(),
                 )));
             }
         } else if !score_type.data_type().is_numeric() && !score_type.data_type().is_boolean() {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` bias must have a numeric or Boolean data type but got `{}`",
+                "`{}` bias must have a numeric or Boolean data type but got `{}`",
+                operation_name,
                 score_type.data_type(),
             )));
         }
+
         if score_batch != &Dimension::Static(1) && score_batch != &query[0] {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} batch dimension ({score_batch}) must be 1 or match the query \
-                 batch dimension ({})",
-                query[0],
+                "`{}` {} batch dimension ({}) must be 1 or match the query batch dimension ({})",
+                operation_name, descriptor, score_batch, query[0],
             )));
         }
+
         if score_heads != &Dimension::Static(1) && score_heads != &query[2] {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} heads dimension ({score_heads}) must be 1 or match the query \
-                 heads dimension ({})",
-                query[2],
+                "`{}` {} heads dimension ({}) must be 1 or match the query heads dimension ({})",
+                operation_name, descriptor, score_heads, query[2],
             )));
         }
+
         if score_rows != &Dimension::Static(1) && score_rows != &query[1] {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} query-sequence dimension ({score_rows}) must be 1 or match the \
-                 query sequence dimension ({})",
-                query[1],
+                "`{}` {} query-sequence dimension ({}) must be 1 or match the query sequence dimension ({})",
+                operation_name, descriptor, score_rows, query[1],
             )));
         }
+
         if score_columns != &Dimension::Static(1) && score_columns != &key[1] {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} key/value-sequence dimension ({score_columns}) must be 1 or \
-                 match the key sequence dimension ({})",
-                key[1],
+                "`{}` {} key/value-sequence dimension ({}) must be 1 or match the key sequence dimension ({})",
+                operation_name, descriptor, score_columns, key[1],
             )));
         }
     }
+
     Ok(AttentionDimensions {
         batch: query[0].clone(),
         query_sequence: query[1].clone(),
@@ -1873,7 +1862,9 @@ fn infer_attention_dimensions(
             Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
         }
         dimensions => Err(TypeError::invalid(format!(
-            "`{operation_name}` {descriptor} must have rank 3 or 4 but got rank {}",
+            "`{}` {} must have rank 3 or 4 but got rank {}",
+            operation_name,
+            descriptor,
             dimensions.len(),
         ))),
     }
@@ -1887,15 +1878,19 @@ fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayT
     } else {
         vec![dimensions.batch.clone(), dimensions.query_sequence.clone(), Dimension::Static(dimensions.query_heads)]
     };
+
     let residual_type = ArrayType::new(query_type.data_type(), Shape::new(dimensions));
     let Some(query_sharding) = query_type.sharding() else {
         return Ok(residual_type);
     };
+
     query_sharding
         .with_dimensions(query_sharding.dimensions()[..query_type.rank() - 1].to_vec())
         .and_then(|sharding| residual_type.with_sharding(sharding))
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Normalizes attention inputs and constructs the masked score logits shared by the forward and backward bodies.
 fn prepare_attention<
@@ -2114,8 +2109,8 @@ fn apply_dropout<V: Value + Dropout>(
     Ok(probabilities.dropout(rate, inputs.dropout_state.as_ref())?.0)
 }
 
-/// Returns the named composite of the forward definition with the provided configuration, input structure,
-/// and residual request.
+/// Returns the named composite of the forward definition with the provided configuration and residual request, which
+/// serves every input structure under the [`AttentionKey`] of that structure.
 ///
 /// The body of the definition evaluates portable scaled dot-product attention with ordinary array operations and
 /// returns the attended output, followed by the log-sum-exp residual when `return_residual` is set. Its constants,
@@ -2124,7 +2119,6 @@ fn apply_dropout<V: Value + Dropout>(
 /// their own.
 fn forward_definition<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
-    input_structure: AttentionInputs<Placeholder>,
     return_residual: bool,
 ) -> ForwardFunction<V, O>
 where
@@ -2136,17 +2130,8 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = RuleTracer<V, O>, Constant = V, Operation = O>,
 {
-    let key = AttentionKey::Forward { configuration, input_structure, return_residual };
     let output_types = move |input_types: AttentionInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
-        // Every definition is specialized to the input structure that its key records.
-        if input_types.parameter_structure() != input_structure {
-            return Err(TypeError::invalid(format!(
-                "named composite `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` was defined for the input structure \
-                 {input_structure:?} but was called with {:?}",
-                input_types.parameter_structure(),
-            ))
-            .into());
-        }
+        let input_structure = input_types.parameter_structure();
         let input_types = input_types
             .parameters()
             .map(|r#type| r#type.as_array_type().cloned())
@@ -2224,9 +2209,13 @@ where
         };
         Ok(std::iter::once(output).chain(residual).collect())
     };
-    let function = composite(body)
-        .with_name(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME)
-        .with_named_composite(key.to_composite_key(), output_types);
+    let function = composite(body).with_name(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME).with_named_composite_per_structure(
+        move |input_structure: &AttentionInputs<Placeholder>| {
+            AttentionKey::Forward { configuration, input_structure: *input_structure, return_residual }
+                .to_composite_key()
+        },
+        output_types,
+    );
     if configuration.dropout().is_some() {
         return match configuration.implementation() {
             // A batched call loses the identity of its definition (i.e., it lowers its structurally batched body), so
@@ -2254,21 +2243,22 @@ where
     }
     AttentionFunction::Folding(Arc::new_cyclic(|weak: &Weak<ForwardFolding<V, O>>| {
         let weak = weak.clone();
-        let input_roles = key.batch_input_roles();
         function.with_batching(move |inputs, axes: AttentionInputs<BatchAxis>, _| {
             // A staged call outlives the function that staged it when its program is batched after the function is
             // dropped, in which case the folded call stages an equivalent definition.
             let function = match weak.upgrade() {
                 Some(function) => function,
-                None => match forward_definition::<V, O>(configuration, input_structure, return_residual) {
+                None => match forward_definition::<V, O>(configuration, return_residual) {
                     AttentionFunction::Folding(function) => function,
                     AttentionFunction::Structural(_) => unreachable!("definitions without dropout batch by folding"),
                 },
             };
+            let input_structure = axes.parameter_structure();
+            let key = AttentionKey::Forward { configuration, input_structure, return_residual };
             batch_attention(
                 inputs.into_parameters().collect(),
                 axes.into_parameters().collect(),
-                input_roles.as_slice(),
+                key.batch_input_roles().as_slice(),
                 |output_count| key.batch_output_roles(output_count),
                 |inputs| function.call(AttentionInputs::from_parameters(input_structure, inputs)?),
             )
@@ -2306,7 +2296,6 @@ where
 /// reproduce.
 fn backward_definition<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
-    input_structure: AttentionInputs<Placeholder>,
 ) -> BackwardFunction<V, O>
 where
     V: 'static,
@@ -2338,17 +2327,8 @@ where
         cotangent.reshape(Shape::new(grouped_dimensions))?.reduce(&[3], ReductionKind::Sum)
     }
 
-    let key = AttentionKey::Backward { configuration, input_structure };
     let output_types = move |input_types: BackwardInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
-        // Every definition is specialized to the input structure that its key records.
-        if input_types.0.inputs.parameter_structure() != input_structure {
-            return Err(TypeError::invalid(format!(
-                "named composite `{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` was defined for the input \
-                 structure {input_structure:?} but was called with {:?}",
-                input_types.0.inputs.parameter_structure(),
-            ))
-            .into());
-        }
+        let input_structure = input_types.0.inputs.parameter_structure();
         let input_types = input_types
             .parameters()
             .map(|r#type| r#type.as_array_type().cloned())
@@ -2526,7 +2506,12 @@ where
     };
     let function = composite(body)
         .with_name(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME)
-        .with_named_composite(key.to_composite_key(), output_types);
+        .with_named_composite_per_structure(
+            move |input_structure: &BackwardInputs<Placeholder>| {
+                AttentionKey::Backward { configuration, input_structure: input_structure.0.inputs }.to_composite_key()
+            },
+            output_types,
+        );
     if configuration.dropout().is_some() {
         return match configuration.implementation() {
             // Refer to the forward definition for why a batched fused call with dropout is rejected.
@@ -2551,20 +2536,21 @@ where
     }
     AttentionFunction::Folding(Arc::new_cyclic(|weak: &Weak<BackwardFolding<V, O>>| {
         let weak = weak.clone();
-        let input_roles = key.batch_input_roles();
         function.with_batching(move |inputs, axes: BackwardInputs<BatchAxis>, _| {
             // Refer to the forward definition for when the function may have been dropped.
             let function = match weak.upgrade() {
                 Some(function) => function,
-                None => match backward_definition::<V, O>(configuration, input_structure) {
+                None => match backward_definition::<V, O>(configuration) {
                     AttentionFunction::Folding(function) => function,
                     AttentionFunction::Structural(_) => unreachable!("definitions without dropout batch by folding"),
                 },
             };
+            let input_structure = axes.0.inputs.parameter_structure();
+            let key = AttentionKey::Backward { configuration, input_structure };
             batch_attention(
                 inputs.into_parameters().collect(),
                 axes.into_parameters().collect(),
-                input_roles.as_slice(),
+                key.batch_input_roles().as_slice(),
                 |output_count| key.batch_output_roles(output_count),
                 |inputs| {
                     let structure = (
@@ -2776,6 +2762,8 @@ fn batch_attention<
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use approx::assert_abs_diff_eq;
     use half::bf16;
     use indoc::{formatdoc, indoc};
@@ -3262,7 +3250,7 @@ mod tests {
             .trim_end(),
         );
 
-        // One function stages both forward definitions, which agree on the attended output and are cached separately.
+        // One function stages both forward definitions, which agree on the attended output.
         let ones = f32_array(&[1, 2, 1, 1], &[1.0, 1.0]);
         let inputs = AttentionInputs::new(ones.clone(), ones, f32_array(&[1, 2, 1, 1], &[3.0, 5.0]));
         let output = function.call(inputs.clone()).unwrap();
@@ -3271,11 +3259,6 @@ mod tests {
             function.call_with_residual(inputs),
             Ok((output, f32_array(&[1, 2, 1], &[1.0, 1.0 + std::f32::consts::LN_2]))),
         );
-        let input_structure = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
-        let definitions = function.definitions.forward.lock().unwrap();
-        assert_eq!(definitions.len(), 2);
-        assert!(definitions.contains_key(&(false, input_structure)));
-        assert!(definitions.contains_key(&(true, input_structure)));
     }
 
     #[test]
