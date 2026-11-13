@@ -38,9 +38,6 @@ use crate::programs::{
 };
 use crate::tracing::{TracingContext, TracingScope};
 
-#[cfg(doc)]
-use crate::operations::composites::operations::CompositeTransposeOperation;
-
 /// Next process-unique identity assigned to a [`CustomRuleDefinition`].
 static NEXT_CUSTOM_RULE_DEFINITION_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -626,11 +623,11 @@ where
 }
 
 /// Retained accumulating custom Vector-Jacobian Product (VJP) backward rule. It is invoked while transposing a
-/// [`CompositeTransposeOperation`] with the known leading inputs (i.e., `p` followed by the residuals `r`), the
-/// output cotangent seeds, and one [`CotangentAccumulator`] per carrier input, and it submits the contributions
-/// of the differentiated inputs to their accumulators. A single rule therefore serves returned, caller-buffer,
-/// and ignored destinations, and can, for example, update only the affected entries of a caller-provided buffer
-/// instead of returning a full-sized cotangent.
+/// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation) with the known leading inputs (i.e., `p`
+/// followed by the residuals `r`), the output cotangent seeds, and one [`CotangentAccumulator`] per carrier input,
+/// and it submits the contributions of the differentiated inputs to their accumulators. A single rule therefore serves
+/// returned, caller-buffer, and ignored destinations, and can, for example, update only the affected entries of a
+/// caller-provided buffer instead of returning a full-sized cotangent.
 pub trait CustomVjpAccumulatingBackwardRule<V, O>: Send + Sync {
     /// Applies this rule in the provided transposition context.
     fn apply(
@@ -1405,12 +1402,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Returns this [`CustomRuleDefinition`] with its reverse mode differentiation forward rule deferred to the
     /// backward pass (i.e., the analogue of JAX's `custom_vjp(..., optimize_remat=True)`). Reverse mode then computes
     /// the outputs of a call with its primal region, which is cheaper than the forward rule whenever the residuals cost
-    /// extra work, and stages a [`CompositeTransposeOperation`] carrier whose leading inputs are the call's own inputs
-    /// rather than the residuals. Transposing that carrier replays the forward rule on those inputs to recover the
-    /// residuals and then applies the backward rule. The call's inputs are therefore the only values that its
-    /// derivative keeps alive between the two passes, which residual policies (e.g., that of a
-    /// [`RematerializeOperation`](crate::RematerializeOperation)) save or recompute like any
-    /// other value, and the forward rule runs only once, in the backward pass.
+    /// extra work, and stages a [`CompositeTransposeOperation`](crate::CompositeTransposeOperation) carrier whose
+    /// leading inputs are the call's own inputs rather than the residuals. Transposing that carrier replays the
+    /// forward rule on those inputs to recover the residuals and then applies the backward rule. The call's inputs are
+    /// therefore the only values that its derivative keeps alive between the two passes, which residual policies (e.g.,
+    /// that of a [`RematerializeOperation`](crate::RematerializeOperation)) save or recompute like any other value, and
+    /// the forward rule runs only once, in the backward pass.
     ///
     /// The swap applies whenever reverse mode partitions a call, and it has no effect on a definition without reverse
     /// mode rules (refer to [`Self::with_vjp`]). A call whose unused outputs were pruned (refer to
