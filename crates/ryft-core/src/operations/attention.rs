@@ -2132,16 +2132,12 @@ fn apply_dropout<V: Value + Dropout>(
     Ok(probabilities.dropout(rate, inputs.dropout_state.as_ref())?.0)
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns the named composite of the forward definition with the provided configuration and residual request,
-/// which serves every input structure under the [`AttentionKey`] of that structure.
-///
-/// The body of the definition evaluates portable scaled dot-product attention with ordinary array operations and
-/// returns the attended output, followed by the log-sum-exp residual when `return_residual` is set. Its constants,
-/// coordinates, and broadcasts take their shapes from existing values, and its reshapes keep the batch and sequence
-/// dimensions, so the same body supports static and dynamic extents and backends need no attention mathematics of
-/// their own.
+/// which serves every input structure under the [`AttentionKey`] of that structure. The body of the definition
+/// evaluates portable scaled dot-product attention with ordinary array operations and returns the attended output,
+/// followed by the log-sum-exp residual when `return_residual` is set. Its constants, coordinates, and broadcasts
+/// take their shapes from existing values, and its reshapes keep the batch and sequence dimensions, so the same
+/// body supports static and dynamic extents and backends need no attention mathematics of their own.
 fn forward_definition<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
     return_residual: bool,
@@ -2176,8 +2172,8 @@ where
                 inputs.mask.as_ref().map(|_| &input_types[3 + usize::from(inputs.bias.is_some())]),
             )?;
 
-            // The softmax over the key/value axis subtracts the maximum of every row before exponentiating, so that the
-            // exponentials cannot overflow and the largest one is exactly one.
+            // The softmax over the key/value axis subtracts the maximum of every row before exponentiating,
+            // so that the exponentials cannot overflow and the largest one is exactly one.
             let prepared = prepare_attention(&inputs, configuration, &dimensions)?;
             let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
             let maxima_broadcast = maxima.broadcast_like(&prepared.logits, &[0, 1, 2])?;
@@ -2185,6 +2181,7 @@ where
             let exponentials = shifted.exp()?;
             let sums = exponentials.reduce(&[3], ReductionKind::Sum)?;
             let sums_broadcast = sums.broadcast_like(&exponentials, &[0, 1, 2])?;
+
             // Dropout applies to the normalized probabilities in the softmax data type, before they return to the data
             // type of the query.
             let weights = apply_dropout(exponentials.div(&sums_broadcast)?, &inputs, configuration)?;
@@ -2193,21 +2190,25 @@ where
             } else {
                 weights.convert_element_type(dimensions.data_type)?
             };
+
             // The weights have the `BNTS` score form, and the values have the `BSNH` form with their heads expanded to
             // the query heads. Contracting the key/value axis for every batch item and head gives `BNTH`, which is
             // transposed to the `BTNH` form of the query.
             let attended = weights
                 .dot(&prepared.expanded_value, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?;
             let mut output = attended.transpose([0, 2, 1, 3])?;
+
             // Query rows at or beyond the query length of their batch item are exact zeros.
             if let Some(query_lengths) = &inputs.query_sequence_lengths {
                 output = zero_query_rows(output, query_lengths, 1)?;
             }
+
             // Unbatched attention was evaluated with an implicit unit batch axis, which its outputs do not have.
             let output = if query_rank == 4 { output } else { output.squeeze(0)? };
+
             // The residual is the logarithm of the sum of the exponentiated logits of every row, which is the row
-            // maximum plus the logarithm of the sum of the shifted exponentials. It is a statistic of the forward pass
-            // rather than a differentiable output, so it stops gradients.
+            // maximum plus the logarithm of the sum of the shifted exponentials. It is a statistic of the forward
+            // pass rather than a differentiable output, so it stops gradients.
             let residual = if return_residual {
                 let residual = maxima.add(&sums.log()?)?;
                 let residual = if SOFTMAX_DATA_TYPE == dimensions.data_type {
@@ -2221,6 +2222,7 @@ where
             } else {
                 None
             };
+
             Ok(std::iter::once(output).chain(residual).collect())
         },
     )
@@ -2246,14 +2248,15 @@ where
             Ok(output_types.into_iter().map(Into::into).collect())
         },
     );
+
     if configuration.dropout().is_some() {
         return match configuration.implementation() {
-            // A batched call loses the identity of its definition (i.e., it lowers its structurally batched body), so
-            // batching a fused call with dropout would silently replace the fused kernels and their dropout mask
-            // with the portable body and its mask. That would both change the requested numerics and break the
-            // agreement between the dropout masks of the forward and backward definitions when only one of them is
-            // batched (e.g., when the pullback of an unbatched call is batched).
             AttentionImplementation::Fused => {
+                // A batched call loses the identity of its definition (i.e., it lowers its structurally batched body),
+                // so batching a fused call with dropout would silently replace the fused kernels and their dropout mask
+                // with the portable body and its mask. That would both change the requested numerics and break the
+                // agreement between the dropout masks of the forward and backward definitions when only one of them
+                // is batched (e.g., when the pullback of an unbatched call is batched).
                 AttentionFunction::Folding(Arc::new(function.with_batching(|_, _, _| {
                     Err(ProgramError::UnsupportedOperation {
                         message: format!(
@@ -2264,19 +2267,20 @@ where
                     })
                 })))
             }
-            // Folding would change the shape of the dropout mask and therefore the mask of every batch item, so
-            // these definitions keep the structural batching of their bodies.
             AttentionImplementation::Automatic | AttentionImplementation::Portable => {
+                // Folding would change the shape of the dropout mask and therefore the mask of every batch item,
+                // so these definitions keep the structural batching of their bodies.
                 AttentionFunction::Structural(Arc::new(function))
             }
         };
     }
+
     AttentionFunction::Folding(Arc::new_cyclic(
         |weak: &Weak<BatchedComposite<V, O, AttentionInputs<CustomRuleTracer<V, O>>, Vec<CustomRuleTracer<V, O>>>>| {
             let weak = weak.clone();
             function.with_batching(move |inputs, axes: AttentionInputs<BatchAxis>, _| {
-                // A staged call outlives the function that staged it when its program is batched after the function is
-                // dropped, in which case the folded call stages an equivalent definition.
+                // A staged call outlives the function that staged it when its program is batched after the function
+                // is dropped, in which case the folded call stages an equivalent definition.
                 let function = match weak.upgrade() {
                     Some(function) => function,
                     None => match forward_definition::<V, O>(configuration, return_residual) {
@@ -2299,6 +2303,8 @@ where
         },
     ))
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Returns the named composite of the backward definition with the provided configuration, which serves every input
 /// structure under the [`AttentionKey`] of that structure.
