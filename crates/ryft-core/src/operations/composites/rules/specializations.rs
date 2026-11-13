@@ -32,9 +32,6 @@ use crate::programs::{
 };
 use crate::tracing::TracingContext;
 
-#[cfg(doc)]
-use crate::batching::DiagonalBatchingPolicy;
-
 /// Derivation of a definition from a source definition, which is stored in the derived definition as its batching rule.
 pub(super) struct CustomRuleDerivation<V: Typed + Parameter, O> {
     /// Reference to the source [`CustomRuleDefinition`] whose batching rule is differentiated for this derivation.
@@ -282,7 +279,7 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
     ///     the tangents). When the source's rule depends on its input batch axes (refer to
     ///     [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]), the rule is instead applied once, at the
     ///     primal axes, and the tangents of such primals are recovered exactly from an outer product (refer to
-    ///     [`DiagonalBatchingPolicy`]).
+    ///     [`DiagonalBatchingPolicy`](crate::DiagonalBatchingPolicy)).
     ///
     /// Derived definitions are registered by the source's registration, which retains a bounded number of derived
     /// registrations like its specializations. Every request for the same key returns the same derived definition
@@ -429,6 +426,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     self.definition().scope().clone(),
                 )?;
 
+                self.definition().validate_rule_program("JVP", &program)?;
+
                 // A call that keeps only some of the rule's outputs receives only those outputs and their tangents,
                 // whose computation is all that remains of the program.
                 let program = match key.kept_outputs {
@@ -544,6 +543,8 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     key.input_types.clone(),
                     self.definition().scope().clone(),
                 )?;
+
+                self.definition().validate_rule_program("forward", &program)?;
 
                 let kept_output_indices = key.kept_output_indices(output_count);
                 let program = align_rule_output_type_identities(
@@ -682,6 +683,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 )?;
                 let linear_inputs = (leading_input_count..input_count).collect::<Vec<_>>();
                 let (program, cotangents) = transposer(&source, &linear_inputs, &key.destination_kinds)?;
+                self.definition().validate_rule_program("backward", &program)?;
                 let program = self.definition().discharge_if(key.discharged, program)?;
                 return Ok(Arc::new(CustomRuleSpecialization { program, output_axes: Vec::new(), cotangents }));
             };
@@ -754,6 +756,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             return self.specialization(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
                 let CustomRuleSpecialization { program, output_axes, .. } =
                     derivation.batching_rule_specialization(self.name(), &key)?;
+                self.definition().validate_rule_program("batching", &program)?;
                 let program = self.definition().discharge_if(key.discharged, program)?;
                 Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
             });
@@ -781,6 +784,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
                 self.definition().scope().clone(),
             )?;
+            self.definition().validate_rule_program("batching", &program)?;
             let program = self.definition().discharge_if(key.discharged, program)?;
             Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
         })
