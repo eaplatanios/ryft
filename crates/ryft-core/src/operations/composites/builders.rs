@@ -25,9 +25,6 @@ use crate::programs::{AttachedRegions, MaybeZero, Operation, Program, ProgramErr
 use crate::tracing::{DomainTracingContext, TracingContext, TracingScope};
 
 #[cfg(doc)]
-use crate::batching::{BatchingError, DiagonalBatchingPolicy};
-
-#[cfg(doc)]
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 
 #[cfg(doc)]
@@ -1206,9 +1203,10 @@ where
     ///
     /// `forward` runs in the backward pass, where its effects would execute out of order with the rest of the program,
     /// so reverse mode rejects a call whose `forward` has effects (e.g., a `print` or a reference update) with a
-    /// [`ProgramError::UnsupportedOperation`] that names this function. Batching a call before differentiating it is
-    /// supported, but batching a reverse mode derivative after it is taken and before it is transposed (e.g., batching
-    /// a linearization) is rejected with a [`BatchingError::UnsupportedOperation`] that names this function.
+    /// [`ProgramError::UnsupportedOperation`] that names this function. Batching a call before differentiating it
+    /// is supported, but batching a reverse mode derivative after it is taken and before it is transposed
+    /// (e.g., batching a linearization) is rejected with a
+    /// [`BatchingError::UnsupportedOperation`](crate::BatchingError::UnsupportedOperation) that names this function.
     ///
     /// # Examples
     ///
@@ -1410,7 +1408,7 @@ where
     /// The outer product costs one application of the rule's derivative with respect to those inputs per batch item,
     /// which is why a rule that only computes the batched primal (and therefore gives the same values when an input
     /// is broadcast) should use [`Self::with_batching`] instead. The family's batching policy must support taking
-    /// diagonals (refer to [`DiagonalBatchingPolicy`]).
+    /// diagonals (refer to [`DiagonalBatchingPolicy`](crate::DiagonalBatchingPolicy)).
     #[inline]
     pub fn with_broadcast_sensitive_batching<Rule>(
         self,
