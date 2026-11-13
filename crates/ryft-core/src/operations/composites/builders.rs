@@ -7,6 +7,7 @@ use crate::axes::{MeshContext, NamedAxes};
 use crate::batching::{BatchAxis, BatchableType, BatchingLevelExtent, RecursiveBatchingPolicy};
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{CotangentAccumulator, CotangentBatchingPolicy, DifferentiableType, TranspositionContext};
+use crate::operations::collectives::CollectiveOperation;
 use crate::operations::composites::configurations::{
     AccumulatingVjp, BroadcastInvariantBatching, BroadcastSensitiveBatching, CompositeBatching, CompositeJvp,
     CompositeVjp, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
@@ -14,12 +15,13 @@ use crate::operations::composites::configurations::{
 };
 use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::{COMPOSITE_OPERATION_NAME, CompositeOperation};
+use crate::operations::composites::rules::definitions::validate_rule_axes;
 use crate::operations::composites::rules::{
     CompositeKey, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer, NamedComposite,
 };
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily, Placeholder};
-use crate::programs::{AttachedRegions, MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
+use crate::programs::{AttachedRegions, MaybeZero, Operation, Program, ProgramError, Type, TypeError, Typed, Value};
 use crate::tracing::{DomainTracingContext, TracingContext, TracingScope};
 
 #[cfg(doc)]
@@ -32,7 +34,7 @@ use crate::batching::{BatchingError, DiagonalBatchingPolicy};
 use crate::operations::control_flow::scan::{ScanOperation, ScanType};
 
 #[cfg(doc)]
-use crate::programs::Program;
+use crate::programs::EffectClass;
 
 /// Collects the [`Context`] bounds required by [`Composite::call`], so that wrappers can reuse them. Implemented for
 /// every context that satisfies these bounds. The call's input, output, and rule configuration bounds remain separate.
@@ -329,6 +331,14 @@ pub struct Composite<
     /// declared. Refer to [`Composite::with_rule_axes`] for more information.
     rule_axes: Option<Vec<String>>,
 
+    /// Validator of the traced rule programs against [`Self::rule_axes`], which is set exactly when the rule axes
+    /// are declared. [`Composite::with_rule_axes`] captures it because it is the one function that can require the
+    /// [`CollectiveOperation`] implementation of the operation family, and every definition that a call registers
+    /// receives it together with the rule axes (refer to [`CustomRuleDefinition::with_rule_axes`]).
+    #[allow(clippy::type_complexity)]
+    rule_validator:
+        Option<fn(&CustomRuleDefinition<V, O>, &str, &Program<V, O, Vec<V>, Vec<V>>) -> Result<(), ProgramError>>,
+
     /// Number of leading flattened input leaves that parameterize the call without being differentiated.
     non_differentiated_count: usize,
 
@@ -422,8 +432,8 @@ where
     /// can therefore serve calls whose input structures change the computation (e.g., calls with and without an
     /// optional input) while every one of its definitions keeps a key that describes exactly what it computes.
     ///
-    /// The function registers one definition per input and output structure and [`TracingScope`], and it
-    /// evaluates `key` once for each of them, when the definition is registered. The key _obligation_ of
+    /// The returned function registers one definition per input and output structure and [`TracingScope`],
+    /// and it evaluates `key` once for each of them, when the definition is registered. The key _obligation_ of
     /// [`Self::with_named_composite`] applies to every key that `key` returns, so input structures whose computations
     /// or rules differ must map to different keys.
     ///
@@ -506,7 +516,18 @@ where
     /// ```
     #[inline]
     pub fn with_non_differentiated_count(self, non_differentiated_count: usize) -> Self {
-        let Self { named_configuration, primal, jvp, vjp, batching, batched_output_axes, rule_axes, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            rule_validator,
+            name,
+            ..
+        } = self;
         Composite {
             named_configuration,
             primal,
@@ -515,6 +536,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -533,6 +555,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             ..
         } = self;
@@ -544,6 +567,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name: name.into(),
             registrations: CompositeRegistrations::default(),
@@ -559,21 +583,36 @@ where
     /// along it, which multiplies the work of the body by the size of that axis). With a declaration, they assume that
     /// the rules communicate along the declared axes only, so batching can release the other axes, as it releases
     /// the axes of any body that does not use them. The primal is not covered by the declaration, because analyses
-    /// always inspect the instructions that it stages.
+    /// always inspect the instructions that it stages. Calls staged before this reconfiguration keep their original
+    /// declaration.
     ///
-    /// The declaration is a promise that analyses trust without checking it. A rule that communicates along an axis
-    /// that it does not declare can see that axis released by batching, in which case the later request that traces the
-    /// rule stages a collective over an axis that no enclosing manual region binds. Interpreting the resulting program
-    /// on the reference backend then fails with a [`ProgramError::UnsupportedOperation`] that reports the missing
-    /// active manual mesh axis, and lowering it for XLA fails with a [`ProgramError::UnsupportedOperation`] that
-    /// reports that the enclosing manual region does not bind the axis. Calls staged before this reconfiguration
-    /// keep their original declaration.
+    /// The declaration exists only to let batching release manual axes, so it promises everything that releasing
+    /// another manual axis requires of the rules. They communicate only along the declared mesh axes, and they have
+    /// no I/O effect (i.e., no [`EffectClass::OrderedIo`], [`EffectClass::DeviceOrderedIo`], or
+    /// [`EffectClass::UnorderedIo`] effect), because every device along a manual axis runs its own occurrence of such
+    /// an effect, which releasing the axis would eliminate. A body with per device I/O can never have an axis released,
+    /// so a function whose rules have I/O (e.g., a backward rule that prints) gains nothing from a declaration and must
+    /// leave its rule axes undeclared. Its axes then stay manual and its effects keep running once per device.
+    ///
+    /// # Errors
+    ///
+    /// The declaration is checked rather than trusted. Every rule is validated when it is traced, before its program
+    /// is cached or used, so the request that traces a rule (e.g., a derivative or batching request) fails with a
+    /// [`ProgramError::UnsupportedOperation`] when the rule has an I/O effect, communicates along a mesh axis of the
+    /// scope of its call (i.e., an axis that an enclosing manual region made manual, whereas the axis of an enclosing
+    /// batching level is not restricted) that is not declared, or calls an operation whose hidden axes are unknown or
+    /// include an axis that is not declared (e.g., another function whose rule axes are not declared). Refer to
+    /// [`CustomRuleDefinition::with_rule_axes`] for more information.
     ///
     /// # Parameters
     ///
     ///   - `axis_names`: Names of the mesh axes that the retained rules may communicate along.
     #[inline]
-    pub fn with_rule_axes<A: Into<String>, I: IntoIterator<Item = A>>(self, axis_names: I) -> Self {
+    pub fn with_rule_axes<A: Into<String>, I: IntoIterator<Item = A>>(self, axis_names: I) -> Self
+    where
+        V::Type: Eq + Hash,
+        O: CollectiveOperation,
+    {
         let Self {
             named_configuration,
             primal,
@@ -593,6 +632,7 @@ where
             batching,
             batched_output_axes,
             rule_axes: Some(axis_names.into_iter().map(Into::into).collect()),
+            rule_validator: Some(validate_rule_axes::<V, O>),
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -688,6 +728,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             ..
@@ -701,6 +742,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -723,6 +765,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             ..
@@ -735,6 +778,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -810,6 +854,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             ..
@@ -823,6 +868,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -947,6 +993,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             ..
@@ -960,6 +1007,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1035,6 +1083,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             ..
@@ -1048,6 +1097,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1102,6 +1152,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             ..
@@ -1115,6 +1166,7 @@ where
             batching,
             batched_output_axes,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1320,7 +1372,17 @@ where
             + Send
             + Sync,
     {
-        let Self { named_configuration, primal, jvp, vjp, rule_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let batching = BroadcastInvariantBatching { rule: Arc::new(rule) };
         Composite {
             named_configuration,
@@ -1330,6 +1392,7 @@ where
             batching,
             batched_output_axes: None,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1368,7 +1431,17 @@ where
             + Send
             + Sync,
     {
-        let Self { named_configuration, primal, jvp, vjp, rule_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let batching = BroadcastSensitiveBatching { rule: Arc::new(rule) };
         Composite {
             named_configuration,
@@ -1378,6 +1451,7 @@ where
             batching,
             batched_output_axes: None,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1428,7 +1502,17 @@ where
     /// ```
     #[inline]
     pub fn with_sequential_batching(self) -> Composite<V, O, Input, Output, Jvp, Vjp, SequentialBatching> {
-        let Self { named_configuration, primal, jvp, vjp, rule_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         Composite {
             named_configuration,
             primal,
@@ -1437,6 +1521,7 @@ where
             batching: SequentialBatching,
             batched_output_axes: None,
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1456,8 +1541,18 @@ where
     ///   - `output_axes`: Batch axis of each flattened output leaf, in leaf order.
     #[inline]
     pub fn with_batched_output_axes(self, output_axes: Vec<BatchAxis>) -> Self {
-        let Self { named_configuration, primal, jvp, vjp, batching, rule_axes, non_differentiated_count, name, .. } =
-            self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            batching,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         Composite {
             named_configuration,
             primal,
@@ -1466,6 +1561,7 @@ where
             batching,
             batched_output_axes: Some(output_axes),
             rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1632,9 +1728,11 @@ where
                                     Some(output_axes) => definition.with_batched_output_axes(output_axes.clone()),
                                     None => definition,
                                 };
-                                let definition = match &self.rule_axes {
-                                    Some(axis_names) => definition.with_rule_axes(axis_names.iter().cloned()),
-                                    None => definition,
+                                let definition = match (&self.rule_axes, self.rule_validator) {
+                                    (Some(axis_names), Some(validator)) => {
+                                        definition.with_validated_rule_axes(axis_names.clone(), validator)
+                                    }
+                                    _ => definition,
                                 };
                                 definition.configure_batching(&self.batching, &input_structure, &output_structure)
                             };
@@ -1689,9 +1787,11 @@ where
                 Some(output_axes) => definition.with_batched_output_axes(output_axes.clone()),
                 None => definition,
             };
-            let definition = match &self.rule_axes {
-                Some(axis_names) => definition.with_rule_axes(axis_names.iter().cloned()),
-                None => definition,
+            let definition = match (&self.rule_axes, self.rule_validator) {
+                (Some(axis_names), Some(validator)) => {
+                    definition.with_validated_rule_axes(axis_names.clone(), validator)
+                }
+                _ => definition,
             };
             definition.configure_batching(&self.batching, &input_structure, &output_structure)
         });
@@ -1946,6 +2046,7 @@ where
         batching: DefaultBatching,
         batched_output_axes: None,
         rule_axes: None,
+        rule_validator: None,
         non_differentiated_count: 0,
         name: Cow::Borrowed(COMPOSITE_OPERATION_NAME),
         registrations: CompositeRegistrations::default(),
@@ -1982,6 +2083,7 @@ mod tests {
     use crate::operations::composites::rules::specializations::CustomRuleSource;
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;
+    use crate::operations::debugging::Print;
     use crate::operations::differentiation::stop_gradient::StopGradient;
     use crate::operations::dimensions::dimension_size::DimensionSize;
     use crate::operations::dot::{Dot, DotDimensionNumbers};
@@ -1995,7 +2097,7 @@ mod tests {
     };
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::parameters::Placeholder;
-    use crate::programs::{FlatProgram, Instruction, MaybeZero, ReferenceType, ValueProjection};
+    use crate::programs::{EffectClass, FlatProgram, Instruction, MaybeZero, ReferenceType, ValueProjection};
     use crate::tracing::{DomainTracer, Trace};
 
     use super::*;
@@ -2591,6 +2693,188 @@ mod tests {
             .with_rule_axes(["x"]);
         let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type).unwrap();
         assert_eq!(hidden_axes(program.into_flat_program().jvp().unwrap().instructions()), vec![named]);
+    }
+
+    #[test]
+    fn test_composite_with_rule_axes_validates_jvp_rules() {
+        // The forward mode rule is validated against the declaration when a derivative traces it, in the scope of the
+        // call, which binds the manual mesh axes `x` and `y` and the batch axis `b`. A rule may communicate along the
+        // declared mesh axes and along batch axes, but not along another mesh axis, it must have no I/O effect, and it
+        // must not call a function whose rule axes are not declared.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let named_axes = vec![
+            ("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true }),
+            ("y".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: true }),
+            ("b".to_string(), NamedAxis::Batched { size: Some(2) }),
+        ];
+        let scalar_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let jvp = |function: &JvpComposite<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer>| {
+            let (_, program) = DomainTracingContext::<ArrayContext>::trace_with_named_axes(
+                |x| function.call(x),
+                scalar_type.clone(),
+                named_axes.clone(),
+            )
+            .unwrap();
+            program.into_flat_program().jvp().map(|_| ())
+        };
+        let reducing = |axis_name: &'static str| {
+            composite(|x: ArrayTracer| Ok(x)).with_jvp(move |x: ArrayTracer, tangent: ArrayTracer| {
+                Ok((x, tangent.parallel_reduce(ReductionKind::Sum, axis_name)?))
+            })
+        };
+        let rejected = |reason: &str| {
+            format!(
+                "`{COMPOSITE_OPERATION_NAME}` JVP rule {reason}, which the rule axes declared with `with_rule_axes` \
+                 do not allow",
+            )
+        };
+
+        // Collectives over declared mesh axes and over batch axes are accepted.
+        assert_eq!(jvp(&reducing("x").with_rule_axes(["x"])), Ok(()));
+        assert_eq!(jvp(&reducing("b").with_rule_axes(Vec::<String>::new())), Ok(()));
+
+        // A collective over a mesh axis that is not declared is rejected.
+        assert!(matches!(
+            jvp(&reducing("y").with_rule_axes(["x"])),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == rejected("communicates along mesh axis `y`"),
+        ));
+
+        // An I/O effect is rejected even when the rule communicates along no axis.
+        let printing = composite(|x: ArrayTracer| Ok(x))
+            .with_jvp(|x: ArrayTracer, tangent: ArrayTracer| {
+                Ok((x, tangent.print_with_effect_class("tangent", EffectClass::DeviceOrderedIo)?))
+            })
+            .with_rule_axes(Vec::<String>::new());
+        assert!(matches!(
+            jvp(&printing),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == rejected("has the `DeviceOrderedIo` effect"),
+        ));
+
+        // A call of a function whose rule axes are not declared may communicate along any axis, so it is rejected.
+        let inner = composite(|x: ArrayTracer| Ok(x)).with_jvp(|x: ArrayTracer, tangent: ArrayTracer| Ok((x, tangent)));
+        let nested = composite(|x: ArrayTracer| Ok(x))
+            .with_jvp(move |x: ArrayTracer, tangent: ArrayTracer| Ok((x, inner.call(tangent)?)))
+            .with_rule_axes(Vec::<String>::new());
+        assert!(matches!(
+            jvp(&nested),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == rejected(&format!(
+                    "calls `{COMPOSITE_OPERATION_NAME}`, whose rules may communicate along any axis",
+                )),
+        ));
+    }
+
+    #[test]
+    fn test_composite_with_rule_axes_validates_vjp_rules() {
+        // The reverse mode forward and backward rules are validated against the declaration when a pullback traces
+        // them, in the scope of the call, which binds the manual mesh axes `x` and `y`.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let named_axes = vec![
+            ("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true }),
+            ("y".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: true }),
+        ];
+        let scalar_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let pullback =
+            |function: &VjpComposite<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer, ArrayTracer>| {
+                DomainTracingContext::<ArrayContext>::trace_with_named_axes(
+                    |(x, seed): (ArrayTracer, ArrayTracer)| {
+                        let (y, pullback) = differentiate_at(x).vjp(|x| function.call(x))?;
+                        Ok((y, pullback.apply_materialized(seed)?))
+                    },
+                    (scalar_type.clone(), scalar_type.clone()),
+                    named_axes.clone(),
+                )
+                .map(|_| ())
+            };
+        let reducing_backward = |axis_name: &'static str| {
+            composite(|x: ArrayTracer| Ok(x)).with_vjp(
+                |x: ArrayTracer| Ok((x.clone(), x)),
+                move |_: ArrayTracer, cotangent: ArrayTracer| cotangent.parallel_reduce(ReductionKind::Sum, axis_name),
+            )
+        };
+        let rejected = |rule: &str, reason: &str| {
+            format!(
+                "`{COMPOSITE_OPERATION_NAME}` {rule} rule {reason}, which the rule axes declared with `with_rule_axes` \
+                 do not allow",
+            )
+        };
+        assert_eq!(pullback(&reducing_backward("x").with_rule_axes(["x"])), Ok(()));
+        assert!(matches!(
+            pullback(&reducing_backward("y").with_rule_axes(["x"])),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == rejected("backward", "communicates along mesh axis `y`"),
+        ));
+        let printing_forward = composite(|x: ArrayTracer| Ok(x))
+            .with_vjp(
+                |x: ArrayTracer| Ok((x.clone().print_with_effect_class("x", EffectClass::OrderedIo)?, x)),
+                |_: ArrayTracer, cotangent: ArrayTracer| Ok(cotangent),
+            )
+            .with_rule_axes(["x", "y"]);
+        assert!(matches!(
+            pullback(&printing_forward),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == rejected("forward", "has the `OrderedIo` effect"),
+        ));
+    }
+
+    #[test]
+    fn test_composite_with_rule_axes_validates_batching_rules() {
+        // The custom batching rule is validated against the declaration when batching traces it, in the scope of the
+        // call, which binds the manual mesh axes `x` and `y`.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let named_axes = vec![
+            ("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true }),
+            ("y".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: true }),
+        ];
+        let scalar_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let batched = |function: &BatchedComposite<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer>| {
+            let (_, program) = DomainTracingContext::<ArrayContext>::trace_with_named_axes(
+                |x| function.call(x),
+                scalar_type.clone(),
+                named_axes.clone(),
+            )
+            .unwrap();
+            program
+                .into_flat_program()
+                .batched(
+                    2,
+                    ShardingDimension::Replicated,
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .map(|_| ())
+        };
+        let reducing = |axis_name: &'static str| {
+            composite(|x: ArrayTracer| Ok(x)).with_batching(
+                move |x: ArrayTracer, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer>| {
+                    Ok((x.parallel_reduce(ReductionKind::Sum, axis_name)?, axis))
+                },
+            )
+        };
+        assert_eq!(batched(&reducing("x").with_rule_axes(["x"])), Ok(()));
+        assert!(matches!(
+            batched(&reducing("y").with_rule_axes(["x"])),
+            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
+                if message
+                    == format!(
+                        "`{COMPOSITE_OPERATION_NAME}` batching rule communicates along mesh axis `y`, which the rule \
+                         axes declared with `with_rule_axes` do not allow",
+                    ),
+        ));
     }
 
     #[test]
