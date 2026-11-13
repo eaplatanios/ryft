@@ -164,7 +164,7 @@ use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::random::{Dropout, RandomAlgorithm};
 use crate::operations::reductions::{Reduce, ReductionKind};
-use crate::parameters::{Parameter, Parameterized, Placeholder};
+use crate::parameters::{Parameter, ParameterError, Parameterized, Placeholder};
 use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 
@@ -1189,99 +1189,6 @@ where
     DifferentiableDotProductAttention { configuration, function }
 }
 
-/// Borrowed canonical view of attention input types.
-struct AttentionInputTypes<'o> {
-    /// Query type.
-    query: &'o ArrayType,
-
-    /// Key type.
-    key: &'o ArrayType,
-
-    /// Value type.
-    value: &'o ArrayType,
-
-    /// Optional bias type.
-    bias: Option<&'o ArrayType>,
-
-    /// Optional arbitrary Boolean mask type.
-    mask: Option<&'o ArrayType>,
-
-    /// Optional query sequence lengths type.
-    query_sequence_lengths: Option<&'o ArrayType>,
-
-    /// Optional key/value sequence lengths type.
-    key_value_sequence_lengths: Option<&'o ArrayType>,
-
-    /// Optional dropout random state type.
-    dropout_state: Option<&'o ArrayType>,
-
-    /// Forward output type in a backward boundary.
-    output: Option<&'o ArrayType>,
-
-    /// Forward residual type in a backward boundary.
-    residual: Option<&'o ArrayType>,
-
-    /// Incoming output cotangent type in a backward boundary.
-    output_cotangent: Option<&'o ArrayType>,
-}
-
-impl<'o> AttentionInputTypes<'o> {
-    /// Parses one attention forward operation boundary into an [`AttentionInputTypes`] instance.
-    fn forward(input_structure: AttentionInputs<Placeholder>, input_types: &'o [ArrayType]) -> Result<Self, TypeError> {
-        let [query, key, value, optional @ ..] = input_types else {
-            return Err(TypeError::invalid("attention requires query, key, and value inputs"));
-        };
-        let mut index = 0;
-        let bias = input_structure.bias.is_some().then(|| {
-            let value = &optional[index];
-            index += 1;
-            value
-        });
-        let mask = input_structure.mask.is_some().then(|| {
-            let value = &optional[index];
-            index += 1;
-            value
-        });
-        let query_sequence_lengths = input_structure.query_sequence_lengths.is_some().then(|| {
-            let value = &optional[index];
-            index += 1;
-            value
-        });
-        let key_value_sequence_lengths = input_structure.key_value_sequence_lengths.is_some().then(|| {
-            let value = &optional[index];
-            index += 1;
-            value
-        });
-        let dropout_state = input_structure.dropout_state.is_some().then(|| &optional[index]);
-        Ok(Self {
-            query,
-            key,
-            value,
-            bias,
-            mask,
-            query_sequence_lengths,
-            key_value_sequence_lengths,
-            dropout_state,
-            output: None,
-            residual: None,
-            output_cotangent: None,
-        })
-    }
-
-    /// Parses one attention backward operation boundary into an [`AttentionInputTypes`] instance.
-    fn backward(
-        input_structure: AttentionInputs<Placeholder>,
-        input_types: &'o [ArrayType],
-    ) -> Result<Self, TypeError> {
-        let input_count = input_structure.parameter_count();
-        let mut types = Self::forward(input_structure, &input_types[..input_count])?;
-        types.output = Some(&input_types[input_count]);
-        types.residual = Some(&input_types[input_count + 1]);
-        types.output_cotangent = Some(&input_types[input_count + 2]);
-        Ok(types)
-    }
-}
-
 /// Validated dimensions that the input contracts of the attention definitions share.
 struct AttentionDimensions {
     /// Shared batch dimension of the query, key, and value.
@@ -1316,6 +1223,7 @@ impl AttentionDimensions {
 /// definition without and with its residual, and the backward definition). Each one is a named composite that serves
 /// every input structure, under the [`AttentionKey`] of that structure. The functions that stage attention own these
 /// definitions, so their traced bodies and their rule specializations live exactly as long as those functions.
+#[allow(clippy::type_complexity)]
 struct AttentionDefinitions<V: Value, O: Operation<Type = V::Type>>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -1527,12 +1435,13 @@ fn attention_forward_output_types(
         )));
     }
 
-    let types = AttentionInputTypes::forward(input_structure, input_types)?;
+    let types = AttentionInputs::from_parameters(input_structure, input_types.iter().cloned())
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
     let dimensions = validate_attention_boundary(operation_name, configuration, &types, input_types)?;
     let mut output_types = vec![types.query.clone()];
 
     if return_residual {
-        output_types.push(attention_residual_type(&dimensions, types.query)?);
+        output_types.push(attention_residual_type(&dimensions, &types.query)?);
     }
 
     Ok(output_types)
@@ -1558,44 +1467,42 @@ fn attention_backward_output_types(
         )));
     }
 
-    let types = AttentionInputTypes::backward(input_structure, input_types)?;
+    let structure =
+        (AttentionResiduals { inputs: input_structure, output: Placeholder, residual: Placeholder }, Placeholder);
+    let (AttentionResiduals { inputs: types, output, residual }, output_cotangent) =
+        Parameterized::from_parameters(structure, input_types.iter().cloned())
+            .map_err(|error: ParameterError| TypeError::invalid(error.to_string()))?;
     let dimensions = validate_attention_boundary(operation_name, configuration, &types, input_types)?;
 
     let matches_expected = |actual: &ArrayType, expected: &ArrayType| -> bool {
         actual.data_type() == expected.data_type() && actual.shape() == expected.shape()
     };
 
-    if !matches_expected(types.output.unwrap(), types.query) {
+    if !matches_expected(&output, &types.query) {
         return Err(TypeError::invalid(format!(
             "`{}` output type {} does not match the expected forward output type {}",
-            operation_name,
-            types.output.unwrap(),
-            types.query,
+            operation_name, output, types.query,
         )));
     }
 
     let expected_output_cotangent_type = types.query.cotangent()?;
-    if !matches_expected(types.output_cotangent.unwrap(), &expected_output_cotangent_type) {
+    if !matches_expected(&output_cotangent, &expected_output_cotangent_type) {
         return Err(TypeError::invalid(format!(
             "`{}` output cotangent type {} does not match the expected cotangent type {}",
-            operation_name,
-            types.output_cotangent.unwrap(),
-            expected_output_cotangent_type,
+            operation_name, output_cotangent, expected_output_cotangent_type,
         )));
     }
 
-    let expected_residual_type = attention_residual_type(&dimensions, types.query)?;
-    if !matches_expected(types.residual.unwrap(), &expected_residual_type) {
+    let expected_residual_type = attention_residual_type(&dimensions, &types.query)?;
+    if !matches_expected(&residual, &expected_residual_type) {
         return Err(TypeError::invalid(format!(
             "`{}` residual type {} does not match the expected residual type {}",
-            operation_name,
-            types.residual.unwrap(),
-            expected_residual_type,
+            operation_name, residual, expected_residual_type,
         )));
     }
 
     let mut output_types = vec![types.query.cotangent()?, types.key.cotangent()?, types.value.cotangent()?];
-    if let Some(bias) = types.bias {
+    if let Some(bias) = &types.bias {
         let bias_cotangent = bias.cotangent()?;
         if !bias_cotangent.is_zero_space() {
             output_types.push(bias_cotangent);
@@ -1611,18 +1518,24 @@ fn attention_backward_output_types(
 fn validate_attention_boundary(
     operation_name: &str,
     configuration: AttentionConfiguration,
-    types: &AttentionInputTypes<'_>,
+    types: &AttentionInputs<ArrayType>,
     input_types: &[ArrayType],
 ) -> Result<AttentionDimensions, TypeError> {
     ArrayType::check_matching_manual_variation(operation_name, &input_types.iter().collect::<Vec<_>>())?;
-    let dimensions =
-        validate_attention_inputs(operation_name, types.query, types.key, types.value, types.bias, types.mask)?;
+    let dimensions = validate_attention_inputs(
+        operation_name,
+        &types.query,
+        &types.key,
+        &types.value,
+        types.bias.as_ref(),
+        types.mask.as_ref(),
+    )?;
 
     // Each sequence lengths input holds one `i32` length per batch item, so it is a rank-1 array whose extent matches
     // the batch dimension that the query, key, and value share.
     for (descriptor, lengths_type) in [
-        ("query sequence lengths", types.query_sequence_lengths),
-        ("key/value sequence lengths", types.key_value_sequence_lengths),
+        ("query sequence lengths", &types.query_sequence_lengths),
+        ("key/value sequence lengths", &types.key_value_sequence_lengths),
     ] {
         let Some(lengths_type) = lengths_type else {
             continue;
@@ -1666,7 +1579,7 @@ fn validate_attention_boundary(
             "`{operation_name}` dropout rate must lie in the open interval (0, 1) but got {rate}",
         )));
     }
-    if let Some(state_type) = types.dropout_state {
+    if let Some(state_type) = &types.dropout_state {
         if configuration.dropout().is_none() {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` received a dropout random state without a dropout rate",
@@ -2843,8 +2756,6 @@ fn batch_attention<
     Ok((outputs, output_axes))
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -2863,8 +2774,11 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationError, differentiate_at};
     use crate::macros::check_gradient;
+    use crate::operations::collectives::parallel_vary::PARALLEL_VARY_OPERATION_NAME;
+    use crate::operations::composites::operations::composite::COMPOSITE_OPERATION_NAME;
+    use crate::operations::dimensions::dimension_size::DIMENSION_SIZE_OPERATION_NAME;
     use crate::operations::manipulation::slicing::Slice;
-    use crate::parameters::{ParameterError, Placeholder};
+    use crate::operations::random::DROPOUT_OPERATION_NAME;
     use crate::tests::hash_of;
     use crate::tracing::Trace;
 
@@ -2903,26 +2817,12 @@ mod tests {
             .unwrap()
     }
 
-    #[test]
-    fn test_attention_key() {
-        let configuration = AttentionConfiguration::new().with_causal(true).with_dropout(0.25);
-        let input_structure = AttentionInputs {
-            bias: Some(Placeholder),
-            query_sequence_lengths: Some(Placeholder),
-            dropout_state: Some(Placeholder),
-            ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
-        };
-        let key = AttentionKey::Forward { configuration, input_structure, return_residual: true };
-        assert_eq!(key.configuration(), configuration);
-        assert_eq!(key.input_structure(), input_structure);
-
-        // Forward keys with different residual requests identify different definitions.
-        assert_ne!(key, AttentionKey::Forward { configuration, input_structure, return_residual: false });
-
-        // Backward definitions have no residual request.
-        let key = AttentionKey::Backward { configuration, input_structure };
-        assert_eq!(key.configuration(), configuration);
-        assert_eq!(key.input_structure(), input_structure);
+    /// Returns the value of a cotangent that is not a structural zero.
+    fn cotangent_value<V: Typed>(cotangent: MaybeZero<V>) -> V {
+        match cotangent {
+            MaybeZero::Value(cotangent) => cotangent,
+            MaybeZero::Zero(_) => panic!("expected a cotangent value but got a structural zero"),
+        }
     }
 
     #[test]
@@ -2985,6 +2885,7 @@ mod tests {
             AttentionKey::from_composite_key(&extended),
             Err(TypeError::invalid(format!("named composite `{extended}` is not a valid attention definition"))),
         );
+
         // An unknown implementation, a local window with a negative radius, and a local window that is not a pair of
         // radii are all malformed.
         for (malformed_name, malformed_value) in [
@@ -3035,6 +2936,33 @@ mod tests {
     }
 
     #[test]
+    fn test_attention_key_configuration() {
+        let configuration = AttentionConfiguration::new().with_causal(true).with_dropout(0.25);
+        let input_structure = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
+        assert_eq!(
+            AttentionKey::Forward { configuration, input_structure, return_residual: true }.configuration(),
+            configuration,
+        );
+        assert_eq!(AttentionKey::Backward { configuration, input_structure }.configuration(), configuration);
+    }
+
+    #[test]
+    fn test_attention_key_input_structure() {
+        let configuration = AttentionConfiguration::new();
+        let input_structure = AttentionInputs {
+            bias: Some(Placeholder),
+            query_sequence_lengths: Some(Placeholder),
+            dropout_state: Some(Placeholder),
+            ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+        };
+        assert_eq!(
+            AttentionKey::Forward { configuration, input_structure, return_residual: true }.input_structure(),
+            input_structure,
+        );
+        assert_eq!(AttentionKey::Backward { configuration, input_structure }.input_structure(), input_structure);
+    }
+
+    #[test]
     fn test_attention_key_to_composite_key() {
         let configuration = AttentionConfiguration::new()
             .with_scale(0.125)
@@ -3058,6 +2986,12 @@ mod tests {
             "ryft.dot_product_attention.v1 {scale = some(0.125), causal = true, local_window = some([2, 0]), \
              implementation = 2, dropout_rate = some(0.25), residual = true, bias = true, mask = false, \
              query_sequence_lengths = true, key_value_sequence_lengths = false, dropout_state = true}",
+        );
+
+        // Forward keys with different residual requests identify different definitions.
+        assert_ne!(
+            key,
+            AttentionKey::Forward { configuration, input_structure, return_residual: false }.to_composite_key(),
         );
 
         // Backward keys have no residual request, so they omit its attribute.
@@ -3114,14 +3048,21 @@ mod tests {
 
     #[test]
     fn test_attention_configuration_equality_and_hashing() {
-        // Equal configurations are equal and hash identically, so they work as map keys.
+        // Equal configurations are equal and hash identically, so they work as map keys, and configurations that
+        // differ in any field are distinct.
         let configuration = AttentionConfiguration::new().with_scale(0.25).with_causal(true).with_dropout(0.1);
         let same_configuration = AttentionConfiguration::new().with_scale(0.25).with_causal(true).with_dropout(0.1);
         assert_eq!(configuration, same_configuration);
         assert_eq!(hash_of(&configuration), hash_of(&same_configuration));
+        let configurations = HashMap::from([(configuration, "configuration")]);
+        assert_eq!(configurations.get(&same_configuration), Some(&"configuration"));
+        assert_eq!(configurations.get(&configuration.with_dropout(0.2)), None);
+        assert_ne!(configuration, configuration.with_causal(false));
+        assert_ne!(configuration, configuration.with_dropout(0.2));
+        assert_ne!(configuration, configuration.with_dropout(None));
 
-        // The right local-window radius has no effect with causal masking, so it does not distinguish configurations
-        // or their keys there, while it does without causal masking.
+        // The right radius of the local window has no effect with causal masking, so it does not distinguish
+        // configurations or their keys there, while it does without causal masking.
         let left = configuration.with_local_window((2, 0));
         let both = configuration.with_local_window((2, 3));
         assert_eq!(left, both);
@@ -3132,12 +3073,6 @@ mod tests {
             AttentionKey::Backward { configuration: both, input_structure }.to_composite_key(),
         );
         assert_ne!(left.with_causal(false), both.with_causal(false));
-        let configurations = HashMap::from([(configuration, "configuration")]);
-        assert_eq!(configurations.get(&same_configuration), Some(&"configuration"));
-        assert_eq!(configurations.get(&configuration.with_dropout(0.2)), None);
-        assert_ne!(configuration, configuration.with_causal(false));
-        assert_ne!(configuration, configuration.with_dropout(0.2));
-        assert_ne!(configuration, configuration.with_dropout(None));
 
         // The scale and the dropout rate compare bitwise, so signed zeros are distinct even though `-0.0 == 0.0`.
         assert_ne!(AttentionConfiguration::new().with_scale(-0.0), AttentionConfiguration::new().with_scale(0.0));
@@ -3146,7 +3081,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attention_inputs() {
+    fn test_attention_inputs_new() {
         let types = (0..3).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
         assert_eq!(
             AttentionInputs::new(types[0].clone(), types[1].clone(), types[2].clone()),
@@ -3165,24 +3100,24 @@ mod tests {
 
     #[test]
     fn test_attention_inputs_parameters() {
-        // The parameters of the inputs are their values in canonical order, in which the present optional inputs
+        // The parameters of the inputs are their types in canonical order, in which the present optional inputs
         // follow the query, key, and value, and their structure records which optional inputs are present.
-        let values = (0..8).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
-        let inputs = AttentionInputs::new(values[0].clone(), values[1].clone(), values[2].clone());
+        let types = (0..8).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
+        let inputs = AttentionInputs::new(types[0].clone(), types[1].clone(), types[2].clone());
         assert_eq!(inputs.parameter_structure(), AttentionInputs::new(Placeholder, Placeholder, Placeholder));
         assert_eq!(inputs.parameter_count(), 3);
-        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), values[..3].to_vec());
+        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), types[..3].to_vec());
         assert_eq!(
             AttentionInputs::from_parameters(
                 AttentionInputs::new(Placeholder, Placeholder, Placeholder),
-                values[..3].iter().cloned()
+                types[..3].iter().cloned(),
             ),
             Ok(inputs.clone()),
         );
 
         let inputs = AttentionInputs {
-            mask: Some(values[3].clone()),
-            key_value_sequence_lengths: Some(values[4].clone()),
+            mask: Some(types[3].clone()),
+            key_value_sequence_lengths: Some(types[4].clone()),
             ..inputs
         };
         let structure = AttentionInputs {
@@ -3192,18 +3127,18 @@ mod tests {
         };
         assert_eq!(inputs.parameter_structure(), structure);
         assert_eq!(inputs.parameter_count(), 5);
-        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), values[..5].to_vec());
-        assert_eq!(AttentionInputs::from_parameters(structure, values[..5].iter().cloned()), Ok(inputs));
+        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), types[..5].to_vec());
+        assert_eq!(AttentionInputs::from_parameters(structure, types[..5].iter().cloned()), Ok(inputs));
 
         let inputs = AttentionInputs {
-            query: values[0].clone(),
-            key: values[1].clone(),
-            value: values[2].clone(),
-            bias: Some(values[3].clone()),
-            mask: Some(values[4].clone()),
-            query_sequence_lengths: Some(values[5].clone()),
-            key_value_sequence_lengths: Some(values[6].clone()),
-            dropout_state: Some(values[7].clone()),
+            query: types[0].clone(),
+            key: types[1].clone(),
+            value: types[2].clone(),
+            bias: Some(types[3].clone()),
+            mask: Some(types[4].clone()),
+            query_sequence_lengths: Some(types[5].clone()),
+            key_value_sequence_lengths: Some(types[6].clone()),
+            dropout_state: Some(types[7].clone()),
         };
         let structure = AttentionInputs {
             query: Placeholder,
@@ -3217,38 +3152,25 @@ mod tests {
         };
         assert_eq!(inputs.parameter_structure(), structure);
         assert_eq!(inputs.parameter_count(), 8);
-        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), values);
-        assert_eq!(AttentionInputs::from_parameters(structure, values.iter().cloned()), Ok(inputs));
-
-        // A structure only accepts as many values as it has parameters.
-        assert_eq!(
-            AttentionInputs::from_parameters(structure, values[..7].iter().cloned()),
-            Err(ParameterError::MissingParameters { expected_count: 8, paths: None }),
-        );
-        assert_eq!(
-            AttentionInputs::from_parameters(
-                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
-                values[..4].iter().cloned()
-            ),
-            Err(ParameterError::UnusedParameters { paths: None }),
-        );
+        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), types);
+        assert_eq!(AttentionInputs::from_parameters(structure, types.iter().cloned()), Ok(inputs));
     }
 
     #[test]
     fn test_attention_residuals_parameters() {
         // The inputs of the backward definition pair the residuals with the output cotangent, which appends the
         // forward output, its residual, and the output cotangent to the forward inputs.
-        let values = (0..7).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
+        let types = (0..7).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
         let inputs = (
             AttentionResiduals {
                 inputs: AttentionInputs {
-                    mask: Some(values[3].clone()),
-                    ..AttentionInputs::new(values[0].clone(), values[1].clone(), values[2].clone())
+                    mask: Some(types[3].clone()),
+                    ..AttentionInputs::new(types[0].clone(), types[1].clone(), types[2].clone())
                 },
-                output: values[4].clone(),
-                residual: values[5].clone(),
+                output: types[4].clone(),
+                residual: types[5].clone(),
             },
-            values[6].clone(),
+            types[6].clone(),
         );
         let structure = (
             AttentionResiduals {
@@ -3263,8 +3185,8 @@ mod tests {
         );
         assert_eq!(inputs.parameter_structure(), structure);
         assert_eq!(inputs.parameter_count(), 7);
-        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), values);
-        assert_eq!(<(AttentionResiduals<_>, _)>::from_parameters(structure, values.iter().cloned()), Ok(inputs));
+        assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), types);
+        assert_eq!(<(AttentionResiduals<_>, _)>::from_parameters(structure, types.iter().cloned()), Ok(inputs));
     }
 
     #[test]
@@ -3347,11 +3269,10 @@ mod tests {
 
         // One function serves every input structure under the key of that structure, including structures whose
         // flattened input types are equal (i.e., the two kinds of sequence lengths).
-        let r#type = ArrayType::new_static(DataType::F32, [1, 2, 1, 1]);
+        let r#type = ArrayType::new_static(DataType::F32, [1, 1, 1, 1]);
         let (_, program) = ArrayContext::trace(
             |(inputs, lengths): (AttentionInputs<_>, _)| {
                 Ok((
-                    function.call(inputs.clone())?,
                     function
                         .call(AttentionInputs { query_sequence_lengths: Some(lengths.clone()), ..inputs.clone() })?,
                     function.call(AttentionInputs { key_value_sequence_lengths: Some(lengths), ..inputs })?,
@@ -3360,26 +3281,96 @@ mod tests {
             (AttentionInputs::new(r#type.clone(), r#type.clone(), r#type), ArrayType::new_static(DataType::I32, [1])),
         )
         .unwrap();
-        let keys = program
-            .entry_region_ref()
-            .instructions()
-            .iter()
-            .filter_map(|instruction| match instruction.operation() {
-                ArrayOperation::Composite(operation) => operation.key().cloned(),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let input_structure = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
         assert_eq!(
-            keys,
-            [
-                input_structure,
-                AttentionInputs { query_sequence_lengths: Some(Placeholder), ..input_structure },
-                AttentionInputs { key_value_sequence_lengths: Some(Placeholder), ..input_structure },
-            ]
-            .map(|input_structure| {
-                AttentionKey::Forward { configuration, input_structure, return_residual: false }.to_composite_key()
-            }),
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1], %3:i32[1] .
+                let %4:f32[1, 1, 1, 1] = composite [
+                    key=\"ryft.dot_product_attention.v1 {scale = none, causal = true, local_window = none, \
+                        implementation = 0, dropout_rate = none, residual = false, bias = false, mask = false, \
+                        query_sequence_lengths = true, key_value_sequence_lengths = false, dropout_state = false}\",
+                ] %0 %1 %2 %3 [
+                    primal={
+                        lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1], %3:i32[1] .
+                        let %4:f32[1, 1, 1, 1] = dot [
+                            dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
+                                rhs_batching=[0, 2]),
+                        ] %0 %1
+                            %5:f32[] = constant [value=1.0]
+                            %6:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %5
+                            %7:f32[1, 1, 1, 1] = mul %4 %6
+                            %8:i32[1, 1, 1, 1] = iota [type=i32[1, 1, 1, 1], dimension=3]
+                            %9:i32[1, 1, 1, 1] = iota [type=i32[1, 1, 1, 1], dimension=2]
+                            %10:bool[1, 1, 1, 1] = compare [direction=LessThanOrEqual] %8 %9
+                            %11:i32[1, 1, 1, 1] = iota [type=i32[1, 1, 1, 1], dimension=2]
+                            %12:i32[1, 1, 1, 1] = broadcast [output_type=i32[1, 1, 1, 1], output_axes=[0]] %3
+                            %13:bool[1, 1, 1, 1] = compare [direction=LessThan] %11 %12
+                            %14:bool[1, 1, 1, 1] = and %10 %13
+                            %15:f32[] = constant [value=-2.3819763e38]
+                            %16:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %15
+                            %17:f32[1, 1, 1, 1] = select %14 %7 %16
+                            %18:f32[1, 1, 1] = reduce [kind=max, axes=[3]] %17
+                            %19:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %18
+                            %20:f32[1, 1, 1, 1] = sub %17 %19
+                            %21:f32[1, 1, 1, 1] = exp %20
+                            %22:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %21
+                            %23:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %22
+                            %24:f32[1, 1, 1, 1] = div %21 %23
+                            %25:f32[1, 1, 1, 1] = dot [
+                                dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
+                                    rhs_batching=[0, 2]),
+                            ] %24 %2
+                            %26:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %25
+                            %27:i32[1, 1, 1, 1] = iota [type=i32[1, 1, 1, 1], dimension=1]
+                            %28:i32[1, 1, 1, 1] = broadcast [output_type=i32[1, 1, 1, 1], output_axes=[0]] %3
+                            %29:bool[1, 1, 1, 1] = compare [direction=LessThan] %27 %28
+                            %30:f32[] = constant [value=0.0]
+                            %31:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %30
+                            %32:f32[1, 1, 1, 1] = select %29 %26 %31
+                        in (%32)
+                    },
+                ]
+                    %5:f32[1, 1, 1, 1] = composite [
+                        key=\"ryft.dot_product_attention.v1 {scale = none, causal = true, local_window = none, \
+                            implementation = 0, dropout_rate = none, residual = false, bias = false, mask = false, \
+                            query_sequence_lengths = false, key_value_sequence_lengths = true, dropout_state = false}\",
+                    ] %0 %1 %2 %3 [
+                        primal={
+                            lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1], %3:i32[1] .
+                            let %4:f32[1, 1, 1, 1] = dot [
+                                dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
+                                    rhs_batching=[0, 2]),
+                            ] %0 %1
+                                %5:f32[] = constant [value=1.0]
+                                %6:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %5
+                                %7:f32[1, 1, 1, 1] = mul %4 %6
+                                %8:i32[1, 1, 1, 1] = iota [type=i32[1, 1, 1, 1], dimension=3]
+                                %9:i32[1, 1, 1, 1] = iota [type=i32[1, 1, 1, 1], dimension=2]
+                                %10:bool[1, 1, 1, 1] = compare [direction=LessThanOrEqual] %8 %9
+                                %11:i32[1, 1, 1, 1] = broadcast [output_type=i32[1, 1, 1, 1], output_axes=[0]] %3
+                                %12:bool[1, 1, 1, 1] = compare [direction=LessThan] %8 %11
+                                %13:bool[1, 1, 1, 1] = and %10 %12
+                                %14:f32[] = constant [value=-2.3819763e38]
+                                %15:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %14
+                                %16:f32[1, 1, 1, 1] = select %13 %7 %15
+                                %17:f32[1, 1, 1] = reduce [kind=max, axes=[3]] %16
+                                %18:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %17
+                                %19:f32[1, 1, 1, 1] = sub %16 %18
+                                %20:f32[1, 1, 1, 1] = exp %19
+                                %21:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %20
+                                %22:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %21
+                                %23:f32[1, 1, 1, 1] = div %20 %22
+                                %24:f32[1, 1, 1, 1] = dot [
+                                    dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
+                                        rhs_batching=[0, 2]),
+                                ] %23 %2
+                                %25:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %24
+                            in (%25)
+                        },
+                    ]
+                in (%4, %5)
+            "}
+            .trim_end(),
         );
     }
 
@@ -3602,6 +3593,227 @@ mod tests {
                 ),
         ));
 
+        // The query, key, and value must be rank-3 or rank-4 floating-point arrays that agree on their data type and
+        // on their batch, sequence, heads, and head dimensions, with static heads and head dimensions and key/value
+        // heads that divide the query heads. A bias and a mask must broadcast to the scores, the mask must be Boolean,
+        // and sequence lengths hold one `i32` length per batch item.
+        let extent = Dimension::Dynamic(DimensionVariable::new("extent", DimensionBounds::positive(Some(4)).unwrap()));
+        let plain = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
+        let scored = AttentionInputs { bias: Some(Placeholder), mask: Some(Placeholder), ..plain };
+        let padded = AttentionInputs {
+            query_sequence_lengths: Some(Placeholder),
+            key_value_sequence_lengths: Some(Placeholder),
+            ..plain
+        };
+        let bias = ArrayType::new_static(DataType::F64, [3]);
+        let mask = ArrayType::new_static(DataType::Boolean, [2, 3]);
+        let lengths = ArrayType::new_static(DataType::I32, [1]);
+        for (input_structure, input_types, message) in [
+            (
+                plain,
+                vec![ArrayType::new_static(DataType::F32, [2, 2]), key_value.clone(), key_value.clone()],
+                "query must have rank 3 or 4 but got rank 2",
+            ),
+            (
+                plain,
+                vec![ArrayType::new_static(DataType::I32, [2, 2, 2]), key_value.clone(), key_value.clone()],
+                "requires floating-point inputs but got data type `i32`",
+            ),
+            (
+                plain,
+                vec![query.clone(), ArrayType::new_static(DataType::F64, [3, 1, 2]), key_value.clone()],
+                "key data type `f64` does not match the query data type `f32`",
+            ),
+            (
+                plain,
+                vec![query.clone(), ArrayType::new_static(DataType::F32, [3, 3, 1, 2]), key_value.clone()],
+                "key batch dimension (3) does not match the query batch dimension (1)",
+            ),
+            (
+                plain,
+                vec![query.clone(), key_value.clone(), ArrayType::new_static(DataType::F32, [3, 1, 3])],
+                "value head dimension (3) does not match the query head dimension (2)",
+            ),
+            (
+                plain,
+                vec![query.clone(), key_value.clone(), ArrayType::new_static(DataType::F32, [4, 1, 2])],
+                "value sequence dimension (4) does not match the key sequence dimension (3)",
+            ),
+            (
+                plain,
+                vec![query.clone(), key_value.clone(), ArrayType::new_static(DataType::F32, [3, 2, 2])],
+                "value heads dimension (2) does not match the key heads dimension (1)",
+            ),
+            (
+                plain,
+                vec![
+                    ArrayType::new(DataType::F32, Shape::new(vec![2.into(), extent.clone(), 2.into()])),
+                    key_value.clone(),
+                    key_value.clone(),
+                ],
+                "query heads dimension must be static but got extent",
+            ),
+            (
+                plain,
+                vec![
+                    query.clone(),
+                    ArrayType::new(DataType::F32, Shape::new(vec![3.into(), extent.clone(), 2.into()])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![3.into(), extent.clone(), 2.into()])),
+                ],
+                "key/value heads dimension must be static but got extent",
+            ),
+            (
+                plain,
+                vec![
+                    ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 2.into(), extent.clone()])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![3.into(), 1.into(), extent.clone()])),
+                    ArrayType::new(DataType::F32, Shape::new(vec![3.into(), 1.into(), extent])),
+                ],
+                "head dimension must be static but got extent",
+            ),
+            (
+                plain,
+                vec![
+                    ArrayType::new_static(DataType::F32, [2, 3, 2]),
+                    ArrayType::new_static(DataType::F32, [3, 2, 2]),
+                    ArrayType::new_static(DataType::F32, [3, 2, 2]),
+                ],
+                "key/value heads dimension (2) must divide the query heads dimension (3)",
+            ),
+            (
+                scored,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    ArrayType::new_static(DataType::F64, [1, 1, 1, 1, 3]),
+                    mask.clone(),
+                ],
+                "bias must have rank at most 4 but got rank 5",
+            ),
+            (
+                scored,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    bias.clone(),
+                    ArrayType::new_static(DataType::F32, [2, 3]),
+                ],
+                "mask must have data type `bool` but got `f32`",
+            ),
+            (
+                scored,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    ArrayType::new_static(DataType::Zero, [3]),
+                    mask.clone(),
+                ],
+                "bias must have a numeric or Boolean data type but got `zero`",
+            ),
+            (
+                scored,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    ArrayType::new_static(DataType::F64, [3, 1, 1, 3]),
+                    mask.clone(),
+                ],
+                "bias batch dimension (3) must be 1 or match the query batch dimension (1)",
+            ),
+            (
+                scored,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    ArrayType::new_static(DataType::F64, [3, 1, 3]),
+                    mask.clone(),
+                ],
+                "bias heads dimension (3) must be 1 or match the query heads dimension (2)",
+            ),
+            (
+                scored,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    ArrayType::new_static(DataType::F64, [3, 3]),
+                    mask.clone(),
+                ],
+                "bias query-sequence dimension (3) must be 1 or match the query sequence dimension (2)",
+            ),
+            (
+                scored,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    ArrayType::new_static(DataType::F64, [2]),
+                    mask,
+                ],
+                "bias key/value-sequence dimension (2) must be 1 or match the key sequence dimension (3)",
+            ),
+            (
+                scored,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    bias,
+                    ArrayType::new_static(DataType::Boolean, [2, 2]),
+                ],
+                "mask key/value-sequence dimension (2) must be 1 or match the key sequence dimension (3)",
+            ),
+            (
+                padded,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    ArrayType::new_static(DataType::I64, [1]),
+                    lengths.clone(),
+                ],
+                "query sequence lengths must have data type `i32` but got `i64`",
+            ),
+            (
+                padded,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    lengths.clone(),
+                    ArrayType::new_static(DataType::I32, [2]),
+                ],
+                "key/value sequence lengths size (2) does not match the batch dimension (1)",
+            ),
+            (
+                padded,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    ArrayType::new_static(DataType::I32, [1, 1]),
+                    lengths,
+                ],
+                "query sequence lengths must have rank 1 but got rank 2",
+            ),
+        ] {
+            assert_eq!(
+                attention_forward_output_types(
+                    DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                    AttentionConfiguration::new(),
+                    input_structure,
+                    false,
+                    input_types.as_slice(),
+                ),
+                Err(TypeError::invalid(format!("`{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` {message}"))),
+            );
+        }
+
         // Dropout requires a rate in the open unit interval and a valid random state when a state is present.
         let plain_types = vec![query.clone(), key_value.clone(), key_value];
         let stateful = AttentionInputs {
@@ -3674,7 +3886,8 @@ mod tests {
                                (i.e., for `philox`) but got `f32[2]`",
         ));
 
-        // Inputs inside manual regions must have matching manual variation, and reduced inputs are rejected.
+        // Inputs inside manual regions must have matching manual variation, and reduced and unreduced inputs are
+        // rejected.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant = ArrayType::new_static(DataType::F32, [1, 1, 1, 1])
             .with_sharding(Sharding::replicated(mesh.clone(), 4))
@@ -3685,7 +3898,11 @@ mod tests {
             .unwrap();
         let reduced = invariant
             .clone()
-            .with_sharding(Sharding::replicated(mesh, 4).with_reduced_axes(["x"]).unwrap())
+            .with_sharding(Sharding::replicated(mesh.clone(), 4).with_reduced_axes(["x"]).unwrap())
+            .unwrap();
+        let unreduced = invariant
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 4).with_unreduced_axes(["x"]).unwrap())
             .unwrap();
         assert!(matches!(
             attention_forward_output_types(
@@ -3698,7 +3915,7 @@ mod tests {
             Err(TypeError::Invalid { message, .. })
                 if message == format!(
                     "`{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` inputs must have matching varying manual axes; insert \
-                     `parallel_vary` on the inputs that lack an axis, as `align_manual_variation` does",
+                     `{PARALLEL_VARY_OPERATION_NAME}` on the inputs that lack an axis, as `align_manual_variation` does",
                 ),
         ));
         assert!(matches!(
@@ -3707,10 +3924,21 @@ mod tests {
                 AttentionConfiguration::new(),
                 AttentionInputs::new(Placeholder, Placeholder, Placeholder),
                 false,
-                &[reduced, invariant.clone(), invariant],
+                &[reduced, invariant.clone(), invariant.clone()],
             ),
             Err(TypeError::Invalid { message, .. })
                 if message == format!("`{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` does not support reduced inputs"),
+        ));
+        assert!(matches!(
+            attention_forward_output_types(
+                DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                AttentionConfiguration::new(),
+                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                false,
+                &[unreduced, invariant.clone(), invariant],
+            ),
+            Err(TypeError::Invalid { message, .. })
+                if message == format!("`{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` does not support unreduced inputs"),
         ));
     }
 
@@ -3772,6 +4000,54 @@ mod tests {
                      got 9",
                 ),
         ));
+
+        // The forward output, its residual, and the output cotangent must have the types that the forward inputs
+        // determine.
+        for (input_types, message) in [
+            (
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    ArrayType::new_static(DataType::F32, [2, 2, 1]),
+                    residual.clone(),
+                    query.clone(),
+                ],
+                "output type f32[2, 2, 1] does not match the expected forward output type f32[2, 2, 2]",
+            ),
+            (
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    query.clone(),
+                    ArrayType::new_static(DataType::F32, [2]),
+                    query.clone(),
+                ],
+                "residual type f32[2] does not match the expected residual type f32[2, 2]",
+            ),
+            (
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    query.clone(),
+                    residual.clone(),
+                    ArrayType::new_static(DataType::F32, [2, 2, 1]),
+                ],
+                "output cotangent type f32[2, 2, 1] does not match the expected cotangent type f32[2, 2, 2]",
+            ),
+        ] {
+            assert_eq!(
+                attention_backward_output_types(
+                    DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+                    configuration,
+                    AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                    input_types.as_slice(),
+                ),
+                Err(TypeError::invalid(format!("`{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` {message}"))),
+            );
+        }
 
         // An integer bias remains a legal forward input, but its cotangent space is zero-dimensional and so it
         // contributes no backward output.
@@ -3934,7 +4210,7 @@ mod tests {
         let batch = DimensionVariable::new("batch", DimensionBounds::positive(Some(4)).unwrap());
         let query_length = DimensionVariable::new("query_length", DimensionBounds::positive(Some(4)).unwrap());
         let key_length = DimensionVariable::new("key_length", DimensionBounds::positive(Some(4)).unwrap());
-        let operand_type = |length: &DimensionVariable| {
+        let input_type = |length: &DimensionVariable| {
             let dimensions = vec![batch.clone().into(), length.clone().into(), 1.into(), 2.into()];
             ArrayType::new(DataType::F32, Shape::new(dimensions))
         };
@@ -3942,7 +4218,7 @@ mod tests {
         let elements = |count: usize, offset: f32| {
             (0..count).map(|index| ((index * 7 + 3) % 11) as f32 * 0.25 - offset).collect::<Vec<_>>()
         };
-        let operands = |batch: usize, query_length: usize, key_length: usize| {
+        let attention_inputs = |batch: usize, query_length: usize, key_length: usize| {
             AttentionInputs::new(
                 f32_array(&[batch, query_length, 1, 2], &elements(2 * batch * query_length, 1.0)),
                 f32_array(&[batch, key_length, 1, 2], &elements(2 * batch * key_length, 0.5)),
@@ -3960,11 +4236,7 @@ mod tests {
             AttentionInputs {
                 query_sequence_lengths: Some(lengths_type.clone()),
                 key_value_sequence_lengths: Some(lengths_type),
-                ..AttentionInputs::new(
-                    operand_type(&query_length),
-                    operand_type(&key_length),
-                    operand_type(&key_length),
-                )
+                ..AttentionInputs::new(input_type(&query_length), input_type(&key_length), input_type(&key_length))
             },
         )
         .unwrap();
@@ -3972,12 +4244,12 @@ mod tests {
             AttentionInputs {
                 query_sequence_lengths: Some(lengths(&[2, 1])),
                 key_value_sequence_lengths: Some(lengths(&[3, 2])),
-                ..operands(2, 2, 3)
+                ..attention_inputs(2, 2, 3)
             },
             AttentionInputs {
                 query_sequence_lengths: Some(lengths(&[2])),
                 key_value_sequence_lengths: Some(lengths(&[1])),
-                ..operands(1, 3, 2)
+                ..attention_inputs(1, 3, 2)
             },
         ] {
             assert_eq!(program.interpret(inputs.clone()), Ok(function.call_with_residual(inputs).unwrap()));
@@ -3987,10 +4259,52 @@ mod tests {
         let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
         let (_, program) = ArrayContext::trace(
             |inputs: AttentionInputs<_>| function.call(inputs),
-            AttentionInputs::new(operand_type(&query_length), operand_type(&key_length), operand_type(&key_length)),
+            AttentionInputs::new(input_type(&query_length), input_type(&key_length), input_type(&key_length)),
         )
         .unwrap();
-        for inputs in [operands(2, 2, 3), operands(1, 3, 2)] {
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda \
+                    %0:f32[batch, query_length, 1, 2], \
+                    %1:f32[batch, key_length, 1, 2], \
+                    %2:f32[batch, key_length, 1, 2] .
+                let %3:f32[batch, query_length, 1, 2] = composite [
+                    key=\"ryft.dot_product_attention.v1 {scale = none, causal = false, local_window = none, \
+                        implementation = 0, dropout_rate = none, residual = false, bias = false, mask = false, \
+                        query_sequence_lengths = false, key_value_sequence_lengths = false, dropout_state = false}\",
+                ] %0 %1 %2 [
+                    primal={
+                        lambda \
+                            %0:f32[batch, query_length, 1, 2], \
+                            %1:f32[batch, key_length, 1, 2], \
+                            %2:f32[batch, key_length, 1, 2] .
+                        let %3:f32[batch, 1, query_length, key_length] = dot [
+                            dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
+                                rhs_batching=[0, 2]),
+                        ] %0 %1
+                            %4:f32[batch, 1, query_length, key_length] = fill_like [value=0.70710677] %3
+                            %5:f32[batch, 1, query_length, key_length] = mul %3 %4
+                            %6:f32[batch, 1, query_length] = reduce [kind=max, axes=[3]] %5
+                            %7:f32[batch, 1, query_length, key_length] = broadcast_like [output_axes=[0, 1, 2]] %6 %5
+                            %8:f32[batch, 1, query_length, key_length] = sub %5 %7
+                            %9:f32[batch, 1, query_length, key_length] = exp %8
+                            %10:f32[batch, 1, query_length] = reduce [kind=sum, axes=[3]] %9
+                            %11:f32[batch, 1, query_length, key_length] = broadcast_like [output_axes=[0, 1, 2]] %10 %9
+                            %12:f32[batch, 1, query_length, key_length] = div %9 %11
+                            %13:f32[batch, 1, query_length, 2] = dot [
+                                dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
+                                    rhs_batching=[0, 2]),
+                            ] %12 %2
+                            %14:f32[batch, query_length, 1, 2] = transpose [permutation=[0, 2, 1, 3]] %13
+                        in (%14)
+                    },
+                ]
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        for inputs in [attention_inputs(2, 2, 3), attention_inputs(1, 3, 2)] {
             assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap()));
         }
 
@@ -4008,11 +4322,7 @@ mod tests {
             AttentionInputs {
                 bias: Some(bias_type),
                 mask: Some(mask_type),
-                ..AttentionInputs::new(
-                    operand_type(&query_length),
-                    operand_type(&key_length),
-                    operand_type(&key_length),
-                )
+                ..AttentionInputs::new(input_type(&query_length), input_type(&key_length), input_type(&key_length))
             },
         )
         .unwrap();
@@ -4022,7 +4332,7 @@ mod tests {
             let inputs = AttentionInputs {
                 bias: Some(f32_array(&[rows, columns], &elements(rows * columns, 0.75))),
                 mask: Some(Array::from_elements(mask_type, &visible).unwrap()),
-                ..operands(items, rows, columns)
+                ..attention_inputs(items, rows, columns)
             };
             assert_eq!(program.interpret(inputs.clone()), Ok(function.call(inputs).unwrap()));
         }
@@ -4032,18 +4342,20 @@ mod tests {
         let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_dropout(0.5));
         let result = ArrayContext::trace(
             |inputs: AttentionInputs<_>| function.call(inputs),
-            AttentionInputs::new(operand_type(&query_length), operand_type(&key_length), operand_type(&key_length)),
+            AttentionInputs::new(input_type(&query_length), input_type(&key_length), input_type(&key_length)),
         );
         assert!(matches!(
             result,
             Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`dropout` requires static extents along the axes that are not broadcast axes, but axis \
-                               0 of `f32[batch, 1, query_length, key_length]` has extent `batch`",
+                if message == format!(
+                    "`{DROPOUT_OPERATION_NAME}` requires static extents along the axes that are not broadcast axes, \
+                     but axis 0 of `f32[batch, 1, query_length, key_length]` has extent `batch`",
+                ),
         ));
-        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
 
         // Grouped key/value heads are replicated along a new group axis and merged into the query heads, which keeps
         // the dynamic batch and sequence dimensions.
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
         let grouped_type = |length: &DimensionVariable, heads: usize| {
             let dimensions = vec![batch.clone().into(), length.clone().into(), heads.into(), 2.into()];
             ArrayType::new(DataType::F32, Shape::new(dimensions))
@@ -4114,6 +4426,27 @@ mod tests {
         .unwrap();
         assert_eq!(output, f32_array(&[2, 1, 1, 1], &[3.0, 10.0]));
         assert_eq!(residual, f32_array(&[2, 1, 1], &[1.0, 2.0]));
+
+        // Mapped sequence lengths become the lengths of the folded batch, so every batch item keeps its own lengths.
+        // Here the second key is padding for the first batch item, and the second query is padding for the second one.
+        let zeros = f32_array(&[2, 1, 2, 1, 1], &[0.0; 4]);
+        let inputs = AttentionInputs {
+            query_sequence_lengths: Some(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[2i32, 1]).unwrap(),
+            ),
+            key_value_sequence_lengths: Some(
+                Array::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[1i32, 2]).unwrap(),
+            ),
+            ..AttentionInputs::new(zeros.clone(), zeros, f32_array(&[2, 1, 2, 1, 1], &[3.0, 5.0, 3.0, 5.0]))
+        };
+        let axes = AttentionInputs {
+            query_sequence_lengths: Some(BatchAxis::new(0)),
+            key_value_sequence_lengths: Some(BatchAxis::new(0)),
+            ..AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0))
+        };
+        let output =
+            batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes, BatchAxis::new(0), None).unwrap();
+        assert_eq!(output, f32_array(&[2, 1, 2, 1, 1], &[3.0, 3.0, 4.0, 0.0]));
 
         // Batching inside a trace stages the folded call of the same definition inside the rule program of the
         // batched call.
@@ -4197,57 +4530,6 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_dot_product_attention_batching_dynamic_shapes() {
-        // Homogeneous array families support dynamic sequence extents in batched calls whose mapped axis becomes the
-        // implicit batch axis of rank-3 attention, because their batching rule reads no dynamic extent.
-        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
-        let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(3)).unwrap());
-        let axes = AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0));
-        let r#type =
-            ArrayType::new(DataType::F32, Shape::new(vec![2.into(), length.clone().into(), 1.into(), 1.into()]));
-        let (_, program) = ArrayContext::trace(
-            |inputs: AttentionInputs<_>| {
-                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
-                    .map_err(ProgramError::from)
-            },
-            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
-        )
-        .unwrap();
-        let inputs = AttentionInputs::new(
-            f32_array(&[2, 2, 1, 1], &[1.0, 0.5, -1.0, 2.0]),
-            f32_array(&[2, 2, 1, 1], &[0.25, -0.5, 1.5, 1.0]),
-            f32_array(&[2, 2, 1, 1], &[3.0, 5.0, 7.0, 11.0]),
-        );
-        let expected = batch(
-            |inputs: AttentionInputs<_>| function.call(inputs),
-            inputs.clone(),
-            axes.clone(),
-            BatchAxis::new(0),
-            None,
-        )
-        .unwrap();
-        assert_eq!(program.interpret(inputs), Ok(expected));
-
-        // Rank-4 attention folds its mapped axis into its batch axis, whose extents and trailing extents must be
-        // static in homogeneous array families, so batching over a dynamic sequence extent fails.
-        let r#type =
-            ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 1.into(), length.into(), 1.into(), 1.into()]));
-        let result = ArrayContext::trace(
-            |inputs: AttentionInputs<_>| {
-                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
-                    .map_err(ProgramError::from)
-            },
-            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
-        );
-        assert!(matches!(
-            result,
-            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
-                if message == "`dimension_size` cannot return the dynamic extent `length` of axis 2 of \
-                               `f32[2, 1, length, 1, 1]` as a host extent; use array IR values for dynamic extents",
-        ));
     }
 
     #[test]
@@ -4363,11 +4645,64 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_product_attention_batching_dynamic_extent() {
+    fn test_dot_product_attention_batching_dynamic_shapes() {
+        // Homogeneous array families support dynamic sequence extents in batched calls whose mapped axis becomes the
+        // implicit batch axis of rank-3 attention, because their batching rule reads no dynamic extent.
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let length = DimensionVariable::new("length", DimensionBounds::new(1, Some(3)).unwrap());
+        let axes = AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0));
+        let r#type =
+            ArrayType::new(DataType::F32, Shape::new(vec![2.into(), length.clone().into(), 1.into(), 1.into()]));
+        let (_, program) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| {
+                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                    .map_err(ProgramError::from)
+            },
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
+        )
+        .unwrap();
+        let inputs = AttentionInputs::new(
+            f32_array(&[2, 2, 1, 1], &[1.0, 0.5, -1.0, 2.0]),
+            f32_array(&[2, 2, 1, 1], &[0.25, -0.5, 1.5, 1.0]),
+            f32_array(&[2, 2, 1, 1], &[3.0, 5.0, 7.0, 11.0]),
+        );
+        let expected = batch(
+            |inputs: AttentionInputs<_>| function.call(inputs),
+            inputs.clone(),
+            axes.clone(),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(program.interpret(inputs), Ok(expected));
+
+        // Rank-4 attention folds its mapped axis into its batch axis with a reshape, whose output extents must be
+        // static in homogeneous array families, so batching over a dynamic sequence extent fails.
+        let r#type =
+            ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 1.into(), length.into(), 1.into(), 1.into()]));
+        let result = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| {
+                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                    .map_err(ProgramError::from)
+            },
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
+        );
+        assert!(matches!(
+            result,
+            Err(ProgramError::Type(TypeError::Invalid { message, .. }))
+                if message == format!(
+                    "`{DIMENSION_SIZE_OPERATION_NAME}` cannot return the dynamic extent `length` of axis 2 of \
+                     `f32[2, 1, length, 1, 1]` as a host extent; use array IR values for dynamic extents",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_dot_product_attention_batching_dynamic_shapes_array_ir() {
         // Array IR families fold dynamic mapped extents with first-class dimension values, which the rule reads from
         // the mapped axis of a mapped input.
         let function = dot_product_attention::<ArrayIrContext>(AttentionConfiguration::new());
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let r#type = ArrayType::new(
             DataType::F32,
@@ -4379,9 +4714,9 @@ mod tests {
                 Dimension::Static(1),
             ]),
         );
-        let query = trace.input(r#type.clone().into());
-        let key = trace.input(r#type.clone().into());
-        let value = trace.input(r#type.clone().into());
+        let query = context.input(r#type.clone().into());
+        let key = context.input(r#type.clone().into());
+        let value = context.input(r#type.clone().into());
         let output = batch(
             |inputs: AttentionInputs<_>| function.call(inputs),
             AttentionInputs::new(query, key, value),
@@ -4390,7 +4725,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let program = trace
+        let program = context
             .builder()
             .borrow()
             .clone()
@@ -4607,8 +4942,8 @@ mod tests {
                 .gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum)),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == format!(
-                    "cannot differentiate a `composite` call of `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` that has no \
-                     derivative rule",
+                    "cannot differentiate a `{COMPOSITE_OPERATION_NAME}` call of \
+                     `{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` that has no derivative rule",
                 ),
         ));
     }
@@ -4659,6 +4994,155 @@ mod tests {
             .unwrap();
         assert_eq!(gradients.value.to_f64s(), vec![1.0]);
         assert_eq!(gradients.bias.unwrap().r#type().data_type(), DataType::Zero);
+
+        // Reverse mode stages the forward definition with its residual, followed by the backward definition.
+        let r#type = ArrayType::new_static(DataType::F32, [1, 1, 1, 1]);
+        let (_, program) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| {
+                differentiate_at(inputs)
+                    .gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum))
+                    .map_err(ProgramError::from)
+            },
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1] .
+                let %3:f32[1, 1, 1, 1], %4:f32[1, 1, 1] = composite [
+                    key=\"ryft.dot_product_attention.v1 {scale = some(0.5), causal = false, local_window = none, \
+                        implementation = 1, dropout_rate = none, residual = true, bias = false, mask = false, \
+                        query_sequence_lengths = false, key_value_sequence_lengths = false, dropout_state = false}\",
+                ] %0 %1 %2 [
+                    primal={
+                        lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1] .
+                        let %3:f32[1, 1, 1, 1] = dot [
+                            dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
+                                rhs_batching=[0, 2]),
+                        ] %0 %1
+                            %4:f32[] = constant [value=0.5]
+                            %5:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %4
+                            %6:f32[1, 1, 1, 1] = mul %3 %5
+                            %7:f32[1, 1, 1] = reduce [kind=max, axes=[3]] %6
+                            %8:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %7
+                            %9:f32[1, 1, 1, 1] = sub %6 %8
+                            %10:f32[1, 1, 1, 1] = exp %9
+                            %11:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %10
+                            %12:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %11
+                            %13:f32[1, 1, 1, 1] = div %10 %12
+                            %14:f32[1, 1, 1, 1] = dot [
+                                dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
+                                    rhs_batching=[0, 2]),
+                            ] %13 %2
+                            %15:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %14
+                            %16:f32[1, 1, 1] = log %11
+                            %17:f32[1, 1, 1] = add %7 %16
+                            %18:f32[1, 1, 1] = transpose [permutation=[0, 2, 1]] %17
+                            %19:f32[1, 1, 1] = stop_gradient %18
+                        in (%15, %19)
+                    },
+                ]
+                    %5:f32[] = reduce [kind=sum, axes=[0, 1, 2, 3]] %3
+                    %6:f32[] = one [type=f32[]]
+                    %7:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %6
+                    %8:f32[1, 1, 1, 1], %9:f32[1, 1, 1, 1], %10:f32[1, 1, 1, 1] = composite [
+                        key=\"ryft.dot_product_attention_backward.v1 {scale = some(0.5), causal = false, \
+                            local_window = none, implementation = 1, dropout_rate = none, bias = false, mask = false, \
+                            query_sequence_lengths = false, key_value_sequence_lengths = false, \
+                            dropout_state = false}\",
+                    ] %0 %1 %2 %3 %4 %7 [
+                        primal={
+                            lambda \
+                                %0:f32[1, 1, 1, 1], \
+                                %1:f32[1, 1, 1, 1], \
+                                %2:f32[1, 1, 1, 1], \
+                                %3:f32[1, 1, 1, 1], \
+                                %4:f32[1, 1, 1], \
+                                %5:f32[1, 1, 1, 1] .
+                            let %6:f32[1, 1, 1, 1] = dot [
+                                dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
+                                    rhs_batching=[0, 2]),
+                            ] %0 %1
+                                %7:f32[] = constant [value=0.5]
+                                %8:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %7
+                                %9:f32[1, 1, 1, 1] = mul %6 %8
+                                %10:f32[1, 1, 1] = reduce [kind=max, axes=[3]] %9
+                                %11:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %10
+                                %12:f32[1, 1, 1, 1] = sub %9 %11
+                                %13:f32[1, 1, 1, 1] = exp %12
+                                %14:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %13
+                                %15:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %14
+                                %16:f32[1, 1, 1, 1] = div %13 %15
+                                %17:i32[1, 1, 1, 1] = iota [type=i32[1, 1, 1, 1], dimension=3]
+                                %18:i32[] = constant [value=2147483647]
+                                %19:i32[1, 1, 1, 1] = broadcast [output_type=i32[1, 1, 1, 1], output_axes=[]] %18
+                                %20:bool[1, 1, 1, 1] = compare [direction=Equal] %9 %11
+                                %21:i32[1, 1, 1, 1] = select %20 %17 %19
+                                %22:i32[1, 1, 1] = reduce [kind=min, axes=[3]] %21
+                                %23:i32[1, 1, 1, 1] = broadcast [output_type=i32[1, 1, 1, 1], output_axes=[0, 1, 2]] %22
+                                %24:bool[1, 1, 1, 1] = compare [direction=Equal] %17 %23
+                                %25:f32[1, 1, 1, 1] = dot [
+                                    dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
+                                        rhs_batching=[0, 2]),
+                                ] %5 %2
+                                %26:f32[] = constant [value=0.0]
+                                %27:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %26
+                                %28:f32[1, 1, 1, 1] = select %24 %25 %27
+                                %29:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %28
+                                %30:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %29
+                                %31:f32[1, 1, 1, 1] = sub %25 %30
+                                %32:f32[1, 1, 1, 1] = mul %16 %31
+                                %33:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %32
+                                %34:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %33
+                                %35:f32[1, 1, 1, 1] = sub %31 %34
+                                %36:f32[1, 1, 1, 1] = mul %16 %35
+                                %37:f32[1, 1, 1, 1] = select %24 %27 %36
+                                %38:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %37
+                                %39:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %38
+                                %40:f32[1, 1, 1, 1] = sub %27 %39
+                                %41:f32[1, 1, 1, 1] = select %24 %40 %37
+                                %42:f32[] = constant [value=0.5]
+                                %43:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %42
+                                %44:f32[1, 1, 1, 1] = mul %41 %43
+                                %45:f32[1, 1, 1, 1] = dot [
+                                    dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
+                                        rhs_batching=[0, 2]),
+                                ] %44 %1
+                                %46:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %45
+                                %47:f32[1, 1, 1, 1] = dot [
+                                    dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0, 1], \
+                                        rhs_batching=[0, 2]),
+                                ] %44 %0
+                                %48:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %47
+                                %49:f32[1, 1, 1, 1] = dot [
+                                    dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0, 1], \
+                                        rhs_batching=[0, 2]),
+                                ] %16 %5
+                                %50:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %49
+                            in (%46, %48, %50)
+                        },
+                    ]
+                in (%8, %9, %10)
+            "}
+            .trim_end(),
+        );
+
+        // A structurally zero output cotangent (i.e., of an unused output) makes every input cotangent a structural
+        // zero without staging the backward definition.
+        let (_, program) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| {
+                differentiate_at(inputs)
+                    .gradient(|inputs| {
+                        function.call(inputs.clone())?;
+                        inputs.value.reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+                    })
+                    .map_err(ProgramError::from)
+            },
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
+        )
+        .unwrap();
+        assert_eq!(program.to_string(), "TODO-unused");
     }
 
     #[test]
@@ -5097,8 +5581,8 @@ mod tests {
         let configuration = AttentionConfiguration::new().with_causal(true);
         let function = differentiable_dot_product_attention::<ArrayIrContext>(configuration);
         let (_, program) = ArrayIrContext::trace(
-            |(operands, lengths): ((_, _, _), _)| {
-                differentiate_at(operands)
+            |(inputs, lengths): ((_, _, _), _)| {
+                differentiate_at(inputs)
                     .with_captures(lengths)
                     .gradient(|(query, key, value), lengths| {
                         function
@@ -5120,14 +5604,14 @@ mod tests {
         for (batch, length) in [(2, 3), (1, 2)] {
             let dimensions = [batch, length, 1, 2];
             let count = 2 * batch * length;
-            let operands = (
+            let inputs = (
                 f32_array(&dimensions, &elements(count, 0.5)),
                 f32_array(&dimensions, &elements(count, 1.0)),
                 f32_array(&dimensions, &elements(count, -1.0)),
             );
             let query_lengths = (0..batch).map(|item| (length - item) as i32).collect::<Vec<_>>();
             let lengths = Array::from_elements(ArrayType::new_static(DataType::I32, [batch]), &query_lengths).unwrap();
-            let (query, key, value) = differentiate_at(operands.clone())
+            let (query, key, value) = differentiate_at(inputs.clone())
                 .with_captures(lengths.clone())
                 .gradient(|(query, key, value), lengths| {
                     expected_function
@@ -5138,7 +5622,7 @@ mod tests {
                         .reduce(&[0, 1, 2, 3], ReductionKind::Sum)
                 })
                 .unwrap();
-            let (query_input, key_input, value_input) = operands;
+            let (query_input, key_input, value_input) = inputs;
             assert_eq!(
                 program.interpret((
                     (
@@ -5157,50 +5641,42 @@ mod tests {
         // the reduction of its cotangent over the axes along which it was broadcast.
         let batch = DimensionVariable::new("batch", DimensionBounds::positive(Some(4)).unwrap());
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(4)).unwrap());
-        let operand_type = ArrayType::new(
+        let input_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![batch.clone().into(), length.clone().into(), 1.into(), 2.into()]),
         );
         let bias_type = ArrayType::new(DataType::F32, Shape::new(vec![1.into(), length.clone().into()]));
         let function = differentiable_dot_product_attention::<ArrayContext>(configuration);
         let (_, program) = ArrayContext::trace(
-            |(operands, cotangent): ((_, _, _, _), _)| {
-                let (_, pullback) = differentiate_at(operands).vjp(|(query, key, value, bias)| {
+            |(inputs, cotangent): ((_, _, _, _), _)| {
+                let (_, pullback) = differentiate_at(inputs).vjp(|(query, key, value, bias)| {
                     function.call(AttentionInputs { bias: Some(bias), ..AttentionInputs::new(query, key, value) })
                 })?;
                 let (query, key, value, bias) = pullback.apply(cotangent)?;
-                let cotangents = [query, key, value, bias].map(|cotangent| match cotangent {
-                    MaybeZero::Value(cotangent) => cotangent,
-                    MaybeZero::Zero(_) => unreachable!("every floating-point input has a cotangent"),
-                });
-                let [query, key, value, bias] = cotangents;
-                Ok((query, key, value, bias))
+                Ok((cotangent_value(query), cotangent_value(key), cotangent_value(value), cotangent_value(bias)))
             },
-            ((operand_type.clone(), operand_type.clone(), operand_type.clone(), bias_type), operand_type.clone()),
+            ((input_type.clone(), input_type.clone(), input_type.clone(), bias_type), input_type.clone()),
         )
         .unwrap();
         for (batch, length) in [(2, 3), (1, 2)] {
             let dimensions = [batch, length, 1, 2];
             let count = 2 * batch * length;
-            let operands = (
+            let inputs = (
                 f32_array(&dimensions, &elements(count, 0.5)),
                 f32_array(&dimensions, &elements(count, 1.0)),
                 f32_array(&dimensions, &elements(count, -1.0)),
                 f32_array(&[1, length], &elements(length, 0.25)),
             );
             let cotangent = f32_array(&dimensions, &elements(count, 0.75));
-            let (_, pullback) = differentiate_at(operands.clone())
+            let (_, pullback) = differentiate_at(inputs.clone())
                 .vjp(|(query, key, value, bias)| {
                     function.call(AttentionInputs { bias: Some(bias), ..AttentionInputs::new(query, key, value) })
                 })
                 .unwrap();
             let (query, key, value, bias) = pullback.apply(cotangent.clone()).unwrap();
-            let expected = [query, key, value, bias].map(|cotangent| match cotangent {
-                MaybeZero::Value(cotangent) => cotangent,
-                MaybeZero::Zero(_) => unreachable!("every floating-point input has a cotangent"),
-            });
-            let [query, key, value, bias] = expected;
-            assert_eq!(program.interpret((operands, cotangent)), Ok((query, key, value, bias)));
+            let expected =
+                (cotangent_value(query), cotangent_value(key), cotangent_value(value), cotangent_value(bias));
+            assert_eq!(program.interpret((inputs, cotangent)), Ok(expected));
         }
 
         // Grouped key/value heads sum the cotangents of the query heads that share them, by splitting the query head
@@ -5212,46 +5688,37 @@ mod tests {
             )
         };
         let (_, program) = ArrayContext::trace(
-            |(operands, cotangent): ((_, _, _), _)| {
-                let (_, pullback) = differentiate_at(operands)
+            |(inputs, cotangent): ((_, _, _), _)| {
+                let (_, pullback) = differentiate_at(inputs)
                     .vjp(|(query, key, value)| function.call(AttentionInputs::new(query, key, value)))?;
                 let (query, key, value) = pullback.apply(cotangent)?;
-                let cotangents = [query, key, value].map(|cotangent| match cotangent {
-                    MaybeZero::Value(cotangent) => cotangent,
-                    MaybeZero::Zero(_) => unreachable!("every floating-point input has a cotangent"),
-                });
-                let [query, key, value] = cotangents;
-                Ok((query, key, value))
+                Ok((cotangent_value(query), cotangent_value(key), cotangent_value(value)))
             },
             ((grouped_type(4), grouped_type(2), grouped_type(2)), grouped_type(4)),
         )
         .unwrap();
         for (batch, length) in [(2, 3), (1, 1)] {
-            let operands = (
+            let inputs = (
                 f32_array(&[batch, length, 4, 2], &elements(8 * batch * length, 0.5)),
                 f32_array(&[batch, length, 2, 2], &elements(4 * batch * length, 1.0)),
                 f32_array(&[batch, length, 2, 2], &elements(4 * batch * length, -1.0)),
             );
             let cotangent = f32_array(&[batch, length, 4, 2], &elements(8 * batch * length, 0.75));
-            let (_, pullback) = differentiate_at(operands.clone())
+            let (_, pullback) = differentiate_at(inputs.clone())
                 .vjp(|(query, key, value)| function.call(AttentionInputs::new(query, key, value)))
                 .unwrap();
             let (query, key, value) = pullback.apply(cotangent.clone()).unwrap();
-            let expected = [query, key, value].map(|cotangent| match cotangent {
-                MaybeZero::Value(cotangent) => cotangent,
-                MaybeZero::Zero(_) => unreachable!("every floating-point input has a cotangent"),
-            });
-            let [query, key, value] = expected;
-            assert_eq!(program.interpret((operands, cotangent)), Ok((query, key, value)));
+            let expected = (cotangent_value(query), cotangent_value(key), cotangent_value(value));
+            assert_eq!(program.interpret((inputs, cotangent)), Ok(expected));
         }
 
         // Integer inputs (e.g., sequence lengths) have structurally zero tangents, which homogeneous array programs
         // cannot materialize for a dynamic shape, so reverse mode with such inputs needs an array IR family.
         let lengths_type = ArrayType::new(DataType::I32, Shape::new(vec![batch.into()]));
         let result = ArrayContext::trace(
-            |(operands, lengths): ((_, _, _), _)| {
+            |(inputs, lengths): ((_, _, _), _)| {
                 let (output, _) =
-                    differentiate_at(operands).with_captures(lengths).vjp(|(query, key, value), lengths| {
+                    differentiate_at(inputs).with_captures(lengths).vjp(|(query, key, value), lengths| {
                         function.call(AttentionInputs {
                             query_sequence_lengths: Some(lengths),
                             ..AttentionInputs::new(query, key, value)
@@ -5259,7 +5726,7 @@ mod tests {
                     })?;
                 Ok(output)
             },
-            ((operand_type.clone(), operand_type.clone(), operand_type), lengths_type),
+            ((input_type.clone(), input_type.clone(), input_type), lengths_type),
         );
         assert_eq!(
             result.map(|_| ()),
