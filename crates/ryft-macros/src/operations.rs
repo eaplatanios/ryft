@@ -1453,9 +1453,8 @@ impl OperationCodeGenerator {
                 .predicates
                 .push(syn::parse_quote_spanned!(variant.span => #payload_type: #ryft::CollectiveOperation));
             axes_arms.push(variant.arm(quote!(<#payload_type as #ryft::CollectiveOperation>::axes(#receiver))));
-            hidden_axes_arms.push(
-                variant.arm(quote!(<#payload_type as #ryft::CollectiveOperation>::may_use_hidden_axes(#receiver))),
-            );
+            hidden_axes_arms
+                .push(variant.arm(quote!(<#payload_type as #ryft::CollectiveOperation>::hidden_axes(#receiver))));
         }
 
         if axes_arms.is_empty() {
@@ -1479,10 +1478,10 @@ impl OperationCodeGenerator {
 
                 #[allow(unreachable_patterns)]
                 #[inline]
-                fn may_use_hidden_axes(&self) -> bool {
+                fn hidden_axes(&self) -> #ryft::HiddenAxes {
                     match self {
                         #(#hidden_axes_arms)*
-                        _ => false,
+                        _ => #ryft::HiddenAxes::None,
                     }
                 }
             }
@@ -4363,20 +4362,18 @@ mod tests {
 
                     #[allow(unreachable_patterns)]
                     #[inline]
-                    fn may_use_hidden_axes(&self) -> bool {
+                    fn hidden_axes(&self) -> ryft::HiddenAxes {
                         match self {
                             Self::Array(operation) => {
-                                <ArrayOperation<A> as ryft::CollectiveOperation>::may_use_hidden_axes(operation)
+                                <ArrayOperation<A> as ryft::CollectiveOperation>::hidden_axes(operation)
                             },
                             Self::Gather(operation) => {
-                                <ParallelAllGatherOperation as ryft::CollectiveOperation>::may_use_hidden_axes(
-                                    &**operation
-                                )
+                                <ParallelAllGatherOperation as ryft::CollectiveOperation>::hidden_axes(&**operation)
                             },
                             Self::Extension(operation) => {
-                                <Extension as ryft::CollectiveOperation>::may_use_hidden_axes(operation)
+                                <Extension as ryft::CollectiveOperation>::hidden_axes(operation)
                             },
-                            _ => false,
+                            _ => ryft::HiddenAxes::None,
                         }
                     }
                 }

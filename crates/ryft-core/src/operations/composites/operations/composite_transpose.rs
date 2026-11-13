@@ -17,7 +17,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation, HiddenAxes};
 use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::composite::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::operations::{CompositeConversion, transpose_carrier_batching};
@@ -670,9 +670,15 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Collec
     }
 
     #[inline]
-    fn may_use_hidden_axes(&self) -> bool {
-        // A retained backward rule is specialized only when transposition requests it, so its axes are hidden.
-        matches!(self.rules, CompositeTransposeRules::Retained { .. })
+    fn hidden_axes(&self) -> HiddenAxes {
+        // A retained backward rule is specialized only when transposition requests it, so its axes are hidden,
+        // and only the declaration of its definition names them.
+        match &self.rules {
+            CompositeTransposeRules::Attached => HiddenAxes::None,
+            CompositeTransposeRules::Retained { rules, .. } => {
+                rules.rule_axes().map_or(HiddenAxes::Unknown, |axis_names| HiddenAxes::Named(axis_names.to_vec()))
+            }
+        }
     }
 }
 

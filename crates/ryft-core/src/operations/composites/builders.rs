@@ -324,6 +324,10 @@ pub struct Composite<
     /// mapping every output leaf at axis `0`. Refer to [`Composite::with_batched_output_axes`] for more information.
     batched_output_axes: Option<Vec<BatchAxis>>,
 
+    /// Mesh axes that the retained rules of this function may communicate along, or [`None`] when they are not
+    /// declared. Refer to [`Composite::with_rule_axes`] for more information.
+    rule_axes: Option<Vec<String>>,
+
     /// Number of leading flattened input leaves that parameterize the call without being differentiated.
     non_differentiated_count: usize,
 
@@ -468,7 +472,7 @@ where
     /// ```
     #[inline]
     pub fn with_non_differentiated_count(self, non_differentiated_count: usize) -> Self {
-        let Self { named_configuration, primal, jvp, vjp, batching, batched_output_axes, name, .. } = self;
+        let Self { named_configuration, primal, jvp, vjp, batching, batched_output_axes, rule_axes, name, .. } = self;
         Composite {
             named_configuration,
             primal,
@@ -476,6 +480,7 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -487,7 +492,15 @@ where
     #[inline]
     pub fn with_name<N: Into<Cow<'static, str>>>(self, name: N) -> Self {
         let Self {
-            named_configuration, primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, ..
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            non_differentiated_count,
+            ..
         } = self;
         Composite {
             named_configuration,
@@ -496,10 +509,67 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name: name.into(),
             registrations: CompositeRegistrations::default(),
         }
+    }
+
+    /// Returns this function with a declaration of the mesh axes that its retained rules (i.e., its custom forward
+    /// mode, reverse mode, and batching rules) may communicate along, where an empty list declares that they
+    /// communicate along no mesh axis. The rules are traced only when a transform requests them, so analyses of a
+    /// program that calls this function cannot see the collectives that they stage. Without a declaration, those
+    /// analyses must assume that the rules communicate along every axis (e.g., batching a `shard_map` whose body calls
+    /// this function then keeps every active manual axis that the batch is placed on manual and gathers the batch
+    /// along it, which multiplies the work of the body by the size of that axis). With a declaration, they assume that
+    /// the rules communicate along the declared axes only, so batching can release the other axes, as it releases
+    /// the axes of any body that does not use them. The primal is not covered by the declaration, because analyses
+    /// always inspect the instructions that it stages.
+    ///
+    /// The declaration is a promise that analyses trust without checking it. A rule that communicates along an axis
+    /// that it does not declare can see that axis released by batching, in which case the later request that traces the
+    /// rule stages a collective over an axis that no enclosing manual region binds. Interpreting the resulting program
+    /// on the reference backend then fails with a [`ProgramError::UnsupportedOperation`] that reports the missing
+    /// active manual mesh axis, and lowering it for XLA fails with a [`ProgramError::UnsupportedOperation`] that
+    /// reports that the enclosing manual region does not bind the axis. Calls staged before this reconfiguration
+    /// keep their original declaration.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_names`: Names of the mesh axes that the retained rules may communicate along.
+    #[inline]
+    pub fn with_rule_axes<A: Into<String>, I: IntoIterator<Item = A>>(self, axis_names: I) -> Self {
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
+        Composite {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            rule_axes: Some(axis_names.into_iter().map(Into::into).collect()),
+            non_differentiated_count,
+            name,
+            registrations: CompositeRegistrations::default(),
+        }
+    }
+
+    /// Returns the mesh axes that the retained rules of this function may communicate along, or [`None`] when they
+    /// are not declared. Refer to [`Self::with_rule_axes`] for more information.
+    #[inline]
+    pub fn rule_axes(&self) -> Option<&[String]> {
+        self.rule_axes.as_deref()
     }
 }
 
@@ -583,6 +653,7 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             ..
@@ -595,6 +666,7 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -616,6 +688,7 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             ..
@@ -627,6 +700,7 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -701,6 +775,7 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             ..
@@ -713,6 +788,7 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -836,6 +912,7 @@ where
             jvp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             ..
@@ -848,6 +925,7 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -922,6 +1000,7 @@ where
             jvp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             ..
@@ -934,6 +1013,7 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -987,6 +1067,7 @@ where
             jvp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             ..
@@ -999,6 +1080,7 @@ where
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1204,7 +1286,7 @@ where
             + Send
             + Sync,
     {
-        let Self { named_configuration, primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        let Self { named_configuration, primal, jvp, vjp, rule_axes, non_differentiated_count, name, .. } = self;
         let batching = BroadcastInvariantBatching { rule: Arc::new(rule) };
         Composite {
             named_configuration,
@@ -1213,6 +1295,7 @@ where
             vjp,
             batching,
             batched_output_axes: None,
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1251,7 +1334,7 @@ where
             + Send
             + Sync,
     {
-        let Self { named_configuration, primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        let Self { named_configuration, primal, jvp, vjp, rule_axes, non_differentiated_count, name, .. } = self;
         let batching = BroadcastSensitiveBatching { rule: Arc::new(rule) };
         Composite {
             named_configuration,
@@ -1260,6 +1343,7 @@ where
             vjp,
             batching,
             batched_output_axes: None,
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1310,7 +1394,7 @@ where
     /// ```
     #[inline]
     pub fn with_sequential_batching(self) -> Composite<V, O, Input, Output, Jvp, Vjp, SequentialBatching> {
-        let Self { named_configuration, primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        let Self { named_configuration, primal, jvp, vjp, rule_axes, non_differentiated_count, name, .. } = self;
         Composite {
             named_configuration,
             primal,
@@ -1318,6 +1402,7 @@ where
             vjp,
             batching: SequentialBatching,
             batched_output_axes: None,
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1337,7 +1422,8 @@ where
     ///   - `output_axes`: Batch axis of each flattened output leaf, in leaf order.
     #[inline]
     pub fn with_batched_output_axes(self, output_axes: Vec<BatchAxis>) -> Self {
-        let Self { named_configuration, primal, jvp, vjp, batching, non_differentiated_count, name, .. } = self;
+        let Self { named_configuration, primal, jvp, vjp, batching, rule_axes, non_differentiated_count, name, .. } =
+            self;
         Composite {
             named_configuration,
             primal,
@@ -1345,6 +1431,7 @@ where
             vjp,
             batching,
             batched_output_axes: Some(output_axes),
+            rule_axes,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1510,6 +1597,10 @@ where
                                     Some(output_axes) => definition.with_batched_output_axes(output_axes.clone()),
                                     None => definition,
                                 };
+                                let definition = match &self.rule_axes {
+                                    Some(axis_names) => definition.with_rule_axes(axis_names.iter().cloned()),
+                                    None => definition,
+                                };
                                 definition.configure_batching(&self.batching, &input_structure, &output_structure)
                             };
                             Ok::<_, ProgramError>(CustomRuleRegistration::new(definition))
@@ -1561,6 +1652,10 @@ where
             };
             let definition = match &self.batched_output_axes {
                 Some(output_axes) => definition.with_batched_output_axes(output_axes.clone()),
+                None => definition,
+            };
+            let definition = match &self.rule_axes {
+                Some(axis_names) => definition.with_rule_axes(axis_names.iter().cloned()),
                 None => definition,
             };
             definition.configure_batching(&self.batching, &input_structure, &output_structure)
@@ -1815,6 +1910,7 @@ where
         vjp: DefaultVjp,
         batching: DefaultBatching,
         batched_output_axes: None,
+        rule_axes: None,
         non_differentiated_count: 0,
         name: Cow::Borrowed(COMPOSITE_OPERATION_NAME),
         registrations: CompositeRegistrations::default(),
@@ -1847,6 +1943,7 @@ mod tests {
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
+    use crate::operations::collectives::{CollectiveOperation, HiddenAxes};
     use crate::operations::composites::rules::specializations::CustomRuleSource;
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;
@@ -1863,7 +1960,7 @@ mod tests {
     };
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::parameters::Placeholder;
-    use crate::programs::{FlatProgram, MaybeZero, ReferenceType, ValueProjection};
+    use crate::programs::{FlatProgram, Instruction, MaybeZero, ReferenceType, ValueProjection};
     use crate::tracing::{DomainTracer, Trace};
 
     use super::*;
@@ -2333,6 +2430,75 @@ mod tests {
                                has only reverse mode rules; it supports only reverse mode differentiation (e.g., \
                                `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
         ));
+    }
+
+    #[test]
+    fn test_composite_with_rule_axes() {
+        // A function declares no rule axes until it is configured to, an empty declaration differs from no declaration,
+        // and the declaration survives later configurations, including the configuration of rules.
+        let function = composite(|x: ArrayTracer| Ok(x.sin()?));
+        assert_eq!(function.rule_axes(), None);
+        let function = function.with_rule_axes(Vec::<String>::new());
+        assert_eq!(function.rule_axes(), Some(&[] as &[String]));
+        let function = function
+            .with_rule_axes(["x", "y"])
+            .with_jvp(|x: ArrayTracer, tangent: ArrayTracer| Ok((x.sin()?, x.cos()? * tangent)))
+            .with_name("sine");
+        assert_eq!(function.rule_axes(), Some(["x".to_string(), "y".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn test_composite_with_rule_axes_hidden_axes() {
+        // The declaration reaches the staged call through its definition, and so do the calls and carriers that
+        // transforms derive from it (i.e., a batched call, a reverse mode carrier, and a derived forward mode call).
+        // A call without retained rules has no hidden axes, with or without a declaration, and a call with retained
+        // rules but without a declaration may use any axis.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let hidden_axes = |instructions: &[Instruction<ArrayOperation<Array>>]| {
+            instructions.iter().map(|instruction| instruction.operation().hidden_axes()).collect::<Vec<_>>()
+        };
+        let named = HiddenAxes::Named(vec!["x".to_string()]);
+
+        let function = composite(|x: ArrayTracer| Ok(x.sin()?));
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
+        assert_eq!(hidden_axes(program.instructions()), vec![HiddenAxes::None]);
+        let function = function.with_rule_axes(["x"]);
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
+        assert_eq!(hidden_axes(program.instructions()), vec![HiddenAxes::None]);
+
+        let jvp = |x: ArrayTracer, tangent: ArrayTracer| -> Result<(ArrayTracer, ArrayTracer), ProgramError> {
+            Ok((x.sin()?, x.cos()? * tangent))
+        };
+        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_jvp(jvp);
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
+        assert_eq!(hidden_axes(program.instructions()), vec![HiddenAxes::Unknown]);
+        let function = function.with_rule_axes(["x"]);
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
+        assert_eq!(hidden_axes(program.instructions()), vec![named.clone()]);
+        let batched = program
+            .into_flat_program()
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(hidden_axes(batched.instructions()), vec![named.clone()]);
+
+        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+            .with_vjp(|x| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
+            .with_rule_axes(["x"]);
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
+        let linearization = program
+            .into_flat_program()
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
+            .unwrap();
+        assert_eq!(hidden_axes(linearization.tangent().instructions()), vec![named.clone()]);
+
+        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+            .with_batching(|x: ArrayTracer, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer>| Ok((x.sin()?, axis)))
+            .with_rule_axes(["x"]);
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type).unwrap();
+        assert_eq!(hidden_axes(program.into_flat_program().jvp().unwrap().instructions()), vec![named]);
     }
 
     #[test]

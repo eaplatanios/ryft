@@ -14,7 +14,7 @@ use ryft_core::{
     Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReferenceTransform, ArrayType,
     CollectiveAxes, CollectiveOperation, ConditionOperation, ConstantOperation, Context, DimensionOperation,
     DimensionSizeOperation, DimensionType, DimensionValue, Domain, DynamicBroadcastOperation, Effects, ErasedOperation,
-    InputRegionProvenance, InterpretableOperation, InterpretationDriver, LockstepDomain, LockstepOperation,
+    HiddenAxes, InputRegionProvenance, InterpretableOperation, InterpretationDriver, LockstepDomain, LockstepOperation,
     LockstepValue, Operation, OperationBoundaryPruning, OperationPayloadProjection, OperationProjection,
     OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue,
     PartiallyEvaluatableOperation, ProgramError, ReferenceAccessDescriptor, ReferenceAccessMode,
@@ -831,11 +831,11 @@ impl<Extension: Operation<Type = ArrayIrType>> CollectiveOperation for KernelOpe
         }
     }
 
-    fn may_use_hidden_axes(&self) -> bool {
+    fn hidden_axes(&self) -> HiddenAxes {
         // Only the portable operations can have rules that are traced lazily (i.e., composite calls). The call's
         // attached region reveals its own axes, and the extension is not consulted, as for the collective axes.
         match self {
-            Self::Portable(operation) => operation.may_use_hidden_axes(),
+            Self::Portable(operation) => operation.hidden_axes(),
             Self::Call(_)
             | Self::Scratch(_)
             | Self::TileLoad(_)
@@ -844,7 +844,7 @@ impl<Extension: Operation<Type = ArrayIrType>> CollectiveOperation for KernelOpe
             | Self::MaskedLoad(_)
             | Self::MaskedStore(_)
             | Self::MaskedSwap(_)
-            | Self::Extension(_) => false,
+            | Self::Extension(_) => HiddenAxes::None,
         }
     }
 }

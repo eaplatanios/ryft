@@ -97,6 +97,10 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
     /// Returns the declared batch axes of the outputs of batched calls, or [`None`] when they are not declared.
     fn batched_output_axes(&self) -> Option<&[BatchAxis]>;
 
+    /// Returns the declared mesh axes that the retained rules may communicate along, or [`None`] when they are not
+    /// declared. Refer to [`CustomRuleDefinition::with_rule_axes`] for more information.
+    fn rule_axes(&self) -> Option<&[String]>;
+
     /// Returns whether the source has a custom batching rule, which takes precedence over structurally batching
     /// the primal region of its calls.
     fn has_batching_rule(&self) -> bool;
@@ -154,6 +158,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
     #[inline]
     fn batched_output_axes(&self) -> Option<&[BatchAxis]> {
         self.definition().batched_output_axes()
+    }
+
+    #[inline]
+    fn rule_axes(&self) -> Option<&[String]> {
+        self.definition().rule_axes()
     }
 
     #[inline]
@@ -869,6 +878,9 @@ pub struct UnavailableCustomRules {
     /// Declared batch axes of the outputs of batched calls of the original definition.
     batched_output_axes: Option<Vec<BatchAxis>>,
 
+    /// Declared mesh axes that the retained rules of the original definition may communicate along.
+    rule_axes: Option<Vec<String>>,
+
     /// Whether the original definition has a custom batching rule.
     has_batching_rule: bool,
 
@@ -889,6 +901,7 @@ impl UnavailableCustomRules {
             has_vjp: rules.has_vjp(),
             defers_forward: rules.defers_forward(),
             batched_output_axes: rules.batched_output_axes().map(<[BatchAxis]>::to_vec),
+            rule_axes: rules.rule_axes().map(<[String]>::to_vec),
             has_batching_rule: rules.has_batching_rule(),
             has_sequential_batching: rules.has_sequential_batching(),
         }
@@ -1121,6 +1134,14 @@ where
         match self {
             Self::Member(rules) => rules.batched_output_axes(),
             Self::Unavailable(rules) => rules.batched_output_axes.as_deref(),
+        }
+    }
+
+    #[inline]
+    fn rule_axes(&self) -> Option<&[String]> {
+        match self {
+            Self::Member(rules) => rules.rule_axes(),
+            Self::Unavailable(rules) => rules.rule_axes.as_deref(),
         }
     }
 
@@ -2396,6 +2417,22 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_rule_source_rule_axes() {
+        // Lifted rules report the declaration of their definition, even when they are unavailable.
+        let rule_axes = ["x".to_string()];
+        let declared = CustomRuleRegistration::new(MemberDefinition::new("pair").with_rule_axes(["x"]));
+        let default = CustomRuleRegistration::new(MemberDefinition::new("pair"));
+        assert_eq!(declared.reference().rule_axes(), Some(rule_axes.as_slice()));
+        assert_eq!(default.reference().rule_axes(), None);
+        for rules in lifted_forms(&declared.reference()) {
+            assert_eq!(in_array_ir(&rules).rule_axes(), Some(rule_axes.as_slice()));
+        }
+        for rules in lifted_forms(&default.reference()) {
+            assert_eq!(in_array_ir(&rules).rule_axes(), None);
+        }
+    }
+
+    #[test]
     fn test_custom_rule_source_has_batching_rule() {
         // A custom batching rule and the derivation of a derived definition are batching rules, while sequential
         // batching is not.
@@ -2807,7 +2844,7 @@ mod tests {
             format!(
                 "Unavailable(UnavailableCustomRules {{ id: {id}, key: None, name: \"cube\", has_jvp: false, \
                  derives_jvp_from_primal: false, has_vjp: false, defers_forward: false, batched_output_axes: None, \
-                 has_batching_rule: false, has_sequential_batching: false }})",
+                 rule_axes: None, has_batching_rule: false, has_sequential_batching: false }})",
             ),
         );
     }

@@ -3014,8 +3014,9 @@ mod tests {
             vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
         )
         .unwrap();
-        let stack_type =
-            ArrayType::new_static(DataType::F32, [4, 8]).with_sharding(Sharding::replicated(logical_mesh, 2)).unwrap();
+        let stack_type = ArrayType::new_static(DataType::F32, [4, 8])
+            .with_sharding(Sharding::replicated(logical_mesh, 2))
+            .unwrap();
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
             builder.add_input(ArrayType::scalar(DataType::I64).into());

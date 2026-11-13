@@ -142,7 +142,7 @@ pub use operations::{
     ErfOperation, Exp, ExpM1, ExpM1Operation, ExpOperation, ExplicitJvp, ExplicitVjp, ExponentialOperations,
     ExtremaOperations, FILL_LIKE_OPERATION_NAME, FLOOR_OPERATION_NAME, Fill, FillLike, FillLikeOperation, Floor,
     FloorOperation, GATHER_OPERATION_NAME, GUARD_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode,
-    GatherOperation, GatherOptions, GuardOperation, IMAGINARY_OPERATION_NAME, IOTA_LIKE_OPERATION_NAME,
+    GatherOperation, GatherOptions, GuardOperation, HiddenAxes, IMAGINARY_OPERATION_NAME, IOTA_LIKE_OPERATION_NAME,
     IOTA_OPERATION_NAME, Imaginary, ImaginaryOperation, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed,
     Indexing, Iota, IotaLike, IotaLikeOperation, IotaOperation, JvpComposite, JvpFromPrimal,
     LINEAR_CALL_OPERATION_NAME, LN_1P_OPERATION_NAME, LOG_ADD_EXP_OPERATION_NAME, LOG_OPERATION_NAME,

@@ -18,7 +18,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation, HiddenAxes};
 use crate::operations::composites::operations::composite_transpose::{
     CompositeTransposeOperation, CompositeTransposeRules,
 };
@@ -993,13 +993,18 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> Collec
     }
 
     #[inline]
-    fn may_use_hidden_axes(&self) -> bool {
+    fn hidden_axes(&self) -> HiddenAxes {
         // Retained custom differentiation and batching rules are traced only when a transform requests them, in the
-        // scope of that request, so their axes are hidden. A forward mode rule derived from the primal region and the
-        // sequential batching of calls without a custom batching rule use only the axes of the primal region.
+        // scope of that request, so their axes are hidden, and only the declaration of their definition names them.
+        // A forward mode rule derived from the primal region and the sequential batching of calls without a custom
+        // batching rule use only the axes of the primal region.
         match &self.rules {
-            CompositeRules::Attached { .. } => false,
-            CompositeRules::Retained { rules, .. } => rules.has_jvp() || rules.has_vjp() || rules.has_batching_rule(),
+            CompositeRules::Retained { rules, .. }
+                if rules.has_jvp() || rules.has_vjp() || rules.has_batching_rule() =>
+            {
+                rules.rule_axes().map_or(HiddenAxes::Unknown, |axis_names| HiddenAxes::Named(axis_names.to_vec()))
+            }
+            CompositeRules::Attached { .. } | CompositeRules::Retained { .. } => HiddenAxes::None,
         }
     }
 }

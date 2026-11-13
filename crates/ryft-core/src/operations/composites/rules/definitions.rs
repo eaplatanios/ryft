@@ -1084,6 +1084,10 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Optional batch axes of the outputs of batched calls, which default to mapping every output at axis 0.
     batched_output_axes: Option<Vec<BatchAxis>>,
 
+    /// Optional mesh axes that the retained rules may communicate along, which definitions derived from this
+    /// definition inherit. Refer to [`Self::with_rule_axes`] for more information.
+    rule_axes: Option<Vec<String>>,
+
     /// Optional custom batching rule, which is a derivation for the definitions derived from a definition that has one.
     batching_rule: Option<CustomRuleBatching<V, O>>,
 
@@ -1123,6 +1127,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             structural_batcher: None,
             sequential_batching_scan: None,
             batched_output_axes: None,
+            rule_axes: None,
             batching_rule: None,
             discharger: None,
             uncached_specializations: Mutex::new(HashSet::new()),
@@ -1139,6 +1144,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             jvp: Some(CustomRuleJvp::Derived),
             structural_batcher: self.structural_batcher.clone(),
             sequential_batching_scan: self.sequential_batching_scan.clone(),
+            rule_axes: self.rule_axes.clone(),
             batching_rule,
             discharger: self.discharger.clone(),
             ..Self::new(name)
@@ -1484,6 +1490,26 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self
     }
 
+    /// Returns this [`CustomRuleDefinition`] with a declaration of the mesh axes that its retained rules (i.e., its
+    /// forward mode, reverse mode, and batching rules) may communicate along, where an empty list declares that they
+    /// communicate along no mesh axis. The rules are traced only when a transform requests them, so analyses that must
+    /// prove that a call does not use an axis (refer to
+    /// [`CollectiveOperation::hidden_axes`](crate::CollectiveOperation::hidden_axes)) assume that an undeclared
+    /// definition's rules communicate along every axis, and that a declared definition's rules communicate along the
+    /// declared axes only. The declaration covers the rules only, because the primal region of every call is
+    /// inspected directly. The definitions derived from this definition (e.g., for the derived calls of its forward
+    /// mode derivatives) inherit it, because their rules are derived from these rules.
+    ///
+    /// The declaration is trusted without being checked, so a rule that communicates along an undeclared axis may find
+    /// that axis released (e.g., by the batching of an enclosing `shard_map`), and the request that traces the rule
+    /// then stages a collective over an axis that no enclosing manual region binds, which fails when the program is
+    /// interpreted or lowered.
+    #[inline]
+    pub fn with_rule_axes<A: Into<String>, I: IntoIterator<Item = A>>(mut self, axis_names: I) -> Self {
+        self.rule_axes = Some(axis_names.into_iter().map(Into::into).collect());
+        self
+    }
+
     /// Returns this [`CustomRuleDefinition`] with the provided custom batching rule, which batches its calls instead
     /// of structurally batching their primal regions (i.e., the analogue of JAX's `custom_vmap`). The rule receives the
     /// call's batched inputs, their batch axes, the batching level, and the level's boundary inputs (e.g., a first-class
@@ -1717,6 +1743,13 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     #[inline]
     pub fn batched_output_axes(&self) -> Option<&[BatchAxis]> {
         self.batched_output_axes.as_deref()
+    }
+
+    /// Returns the mesh axes that the retained rules may communicate along, or [`None`] when they are not declared.
+    /// Refer to [`Self::with_rule_axes`] for more information.
+    #[inline]
+    pub fn rule_axes(&self) -> Option<&[String]> {
+        self.rule_axes.as_deref()
     }
 
     /// Returns the configured custom batching rule and its support for derived definitions, or [`None`] when there
@@ -2621,6 +2654,18 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_rule_definition_with_rule_axes() {
+        // A later declaration replaces an earlier one, an empty declaration differs from no declaration, and the
+        // definitions derived from a definition inherit its declaration, because their rules derive from its rules.
+        let definition = TestDefinition::new("pair").with_rule_axes(["y"]).with_rule_axes(["x", "z"]);
+        assert_eq!(definition.rule_axes(), Some(["x".to_string(), "z".to_string()].as_slice()));
+        assert_eq!(TestDefinition::new("pair").with_rule_axes(Vec::<String>::new()).rule_axes(), Some([].as_slice()));
+        let derived = definition.new_derived("jvp(pair)".to_string(), None);
+        assert_eq!(derived.rule_axes(), Some(["x".to_string(), "z".to_string()].as_slice()));
+        assert_eq!(TestDefinition::new("pair").new_derived("jvp(pair)".to_string(), None).rule_axes(), None);
+    }
+
+    #[test]
     fn test_custom_rule_definition_with_batching_rule() {
         // The rule becomes the definition's own batching rule, which is not broadcast sensitive.
         let definition = MemberDefinition::new("square")
@@ -2813,6 +2858,12 @@ mod tests {
         assert_eq!(TestDefinition::new("pair").batched_output_axes(), None);
         let definition = TestDefinition::new("pair").with_batched_output_axes(output_axes.clone());
         assert_eq!(definition.batched_output_axes(), Some(output_axes.as_slice()));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_rule_axes() {
+        assert_eq!(TestDefinition::new("pair").rule_axes(), None);
+        assert_eq!(TestDefinition::new("pair").with_rule_axes(["x"]).rule_axes(), Some(["x".to_string()].as_slice()));
     }
 
     #[test]

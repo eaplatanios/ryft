@@ -567,6 +567,27 @@ impl<
 {
 }
 
+/// Axes that an operation may communicate along through transform rules that are traced only when a transform requests
+/// them, which neither its [`CollectiveOperation::axes`] nor its regions reveal. An analysis that must prove that an
+/// operation does not use an axis treats the axes that this describes as used. Refer to the documentation of
+/// [`CollectiveOperation::hidden_axes`] for more information.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum HiddenAxes {
+    /// The operation communicates along no axis that its [`CollectiveOperation::axes`] and regions do not reveal.
+    #[default]
+    None,
+
+    /// The operation may communicate along the named axes, and along no other axis that its
+    /// [`CollectiveOperation::axes`] and regions do not reveal (e.g., a composite call whose retained rules declare
+    /// these axes, refer to [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)). An empty list is
+    /// equivalent to [`HiddenAxes::None`].
+    Named(Vec<String>),
+
+    /// The operation may communicate along any axis (e.g., a composite call whose retained rules have no declaration
+    /// of their axes).
+    Unknown,
+}
+
 /// [`Operation`] that may communicate along named axes. A collective exchanges values over named axes or observes its
 /// position along one (i.e., an [`AxisIndexOperation`]), and this trait reports those axes. Code that inspects the
 /// operations of a program without knowing its operation family uses it to find the axes that an operation
@@ -576,12 +597,12 @@ impl<
 ///
 /// Every collective implements this trait, and so does every operation whose transform rules
 /// are not visible in its payload and regions (i.e., a [`CompositeOperation`](crate::CompositeOperation) or
-/// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation), whose retained rules are traced only when a
-/// transform requests them), which reports no axes but answers [`may_use_hidden_axes`](Self::may_use_hidden_axes).
-/// No other operation implements it. An operation family (e.g., [`ArrayOperation`](crate::ArrayOperation)) whose
-/// programs reach such code must also implement it, because that code only sees the family and cannot tell which
-/// member it holds. A family answers for whichever member it holds, and so it reports no axes when that member
-/// is not a collective (e.g., an addition or a composite call).
+/// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation), whose retained rules are traced only when
+/// a transform requests them), which reports no axes but reports its [`hidden_axes`](Self::hidden_axes). No other
+/// operation implements it. An operation family (e.g., [`ArrayOperation`](crate::ArrayOperation)) whose programs
+/// reach such code must also implement it, because that code only sees the family and cannot tell which member it
+/// holds. A family answers for whichever member it holds, and so it reports no axes when that member is not a
+/// collective (e.g., an addition or a composite call).
 ///
 /// `#[derive(Operation)]` implements this trait for a family in which at least one variant is marked with
 /// `#[ryft(collective)]`, by delegating to the payloads of the marked variants, while every other variant
@@ -597,17 +618,18 @@ pub trait CollectiveOperation {
     /// and it is owned for a collective that stores a single axis name instead.
     fn axes(&self) -> Cow<'_, CollectiveAxes>;
 
-    /// Returns `true` when this operation may communicate along axes that neither [`axes`](Self::axes) nor its regions
-    /// reveal, because some of its transform rules are traced only when a transform requests them, in the scope of
-    /// that request (e.g., the retained custom differentiation and batching rules of a composite call). Analyses that
-    /// must prove that an operation does not use an axis (e.g., the release of manual axes by the batching rule of
-    /// [`ShardMapOperation`](crate::ShardMapOperation)) must therefore treat such an operation as using every axis.
-    /// Operations whose transform rules are derived from their payload and regions, or are attached to them as regions,
-    /// use no hidden axes, which is what the default implementation reports. This function does not affect how an
-    /// operation executes or lowers, which depends on [`axes`](Self::axes) and on its regions only.
+    /// Returns the axes that this operation may communicate along without [`axes`](Self::axes) or its regions
+    /// revealing them, because some of its transform rules are traced only when a transform requests them, in the
+    /// scope of that request (e.g., the retained custom differentiation and batching rules of a composite call).
+    /// Analyses that must prove that an operation does not use an axis (e.g., the release of manual axes by the
+    /// batching rule of [`ShardMapOperation`](crate::ShardMapOperation)) must treat the named axes of
+    /// [`HiddenAxes::Named`] as used and every axis as used for [`HiddenAxes::Unknown`]. Operations whose transform
+    /// rules are derived from their payload and regions, or are attached to them as regions, have no hidden axes,
+    /// which is what the default implementation reports. This function does not affect how an operation executes or
+    /// lowers, which depends on [`axes`](Self::axes) and on its regions only.
     #[inline]
-    fn may_use_hidden_axes(&self) -> bool {
-        false
+    fn hidden_axes(&self) -> HiddenAxes {
+        HiddenAxes::None
     }
 }
 
@@ -3367,6 +3389,17 @@ mod tests {
                 .infer_output_types(&[two_axis_type(2, &[], &[])], &[]),
             Err(TypeError::invalid("`parallel_permute` axis names repeat `x`")),
         );
+    }
+
+    #[test]
+    fn test_hidden_axes() {
+        // The default describes an operation without lazily traced rules, which is also what every collective reports
+        // through the default implementation of `CollectiveOperation::hidden_axes`, because its axes are explicit.
+        assert_eq!(HiddenAxes::default(), HiddenAxes::None);
+        assert_eq!(ParallelPermuteOperation::new(["x", "y"], 4, Vec::new()).hidden_axes(), HiddenAxes::None);
+        assert_eq!(AxisIndexOperation::new("x".to_string()).hidden_axes(), HiddenAxes::None);
+        assert_ne!(HiddenAxes::Named(vec!["x".to_string()]), HiddenAxes::Named(vec!["y".to_string()]));
+        assert_ne!(HiddenAxes::Named(Vec::new()), HiddenAxes::Unknown);
     }
 
     #[test]

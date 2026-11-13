@@ -289,7 +289,7 @@ use crate::operations::collectives::parallel_all_gather::{
 use crate::operations::collectives::parallel_reduce::ParallelReduceOperation;
 use crate::operations::collectives::parallel_vary::{ParallelVary, ParallelVaryOperation};
 use crate::operations::collectives::{
-    CollectiveAxes, CollectiveOperation, reduce_participants, validate_participant_types,
+    CollectiveAxes, CollectiveOperation, HiddenAxes, reduce_participants, validate_participant_types,
 };
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
@@ -1459,10 +1459,12 @@ impl ShardMapBoundary {
     /// an `axis_index` names. An unchecked body carries no variation labels, so only its collectives and `axis_index`
     /// operations reveal its uses, which suffices, because no input or output sharding of a map whose batch axis is
     /// placed on an axis names that axis (every input is replicated along it), and so only those operations can make
-    /// the devices along it compute different values. A body that contains an operation whose transform rules are
-    /// traced only when a transform requests them, such as a composite call with retained custom differentiation or
-    /// batching rules, may use every candidate axis, because those rules are traced in the scope of the original call,
-    /// where the axes are still manual. Refer to [`CollectiveOperation::may_use_hidden_axes`] for more information.
+    /// the devices along it compute different values. An operation whose transform rules are traced only when a
+    /// transform requests them, such as a composite call with retained custom differentiation or batching rules,
+    /// uses the axes that those rules may communicate along, because they are traced in the scope of the original
+    /// call, where the axes are still manual. It therefore uses the axes that its rules declare, or every candidate
+    /// axis when they declare none (refer to [`CollectiveOperation::hidden_axes`] and to
+    /// [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)).
     fn used_manual_placement_axes<
         V: Value<Type = ArrayIrType>,
         O: Operation<Type = ArrayIrType> + CollectiveOperation,
@@ -1480,10 +1482,6 @@ impl ShardMapBoundary {
 
         if candidate_axes.is_empty() {
             return Vec::new();
-        }
-
-        if body.instructions_in_closure().any(|(_, instruction)| instruction.operation().may_use_hidden_axes()) {
-            return candidate_axes;
         }
 
         let mut used_axes = BTreeSet::new();
@@ -1510,10 +1508,18 @@ impl ShardMapBoundary {
 
         // A collective or an `axis_index` over an axis communicates along it even when no value varies along it (e.g.,
         // a permutation of invariant values in the meshless form, which types its output by its input), so the
-        // variation check above cannot detect it.
+        // variation check above cannot detect it. Neither can it detect the hidden axes of rules that are traced later.
         for (_, instruction) in body.instructions_in_closure() {
-            let axis_names = instruction.operation().axes();
+            let operation = instruction.operation();
+            let axis_names = operation.axes();
             used_axes.extend(candidate_axes.iter().filter(|axis_name| axis_names.contains(axis_name)).cloned());
+            match operation.hidden_axes() {
+                HiddenAxes::None => {}
+                HiddenAxes::Named(axis_names) => {
+                    used_axes.extend(candidate_axes.iter().filter(|axis_name| axis_names.contains(axis_name)).cloned());
+                }
+                HiddenAxes::Unknown => return candidate_axes,
+            }
         }
 
         candidate_axes.into_iter().filter(|axis_name| used_axes.contains(axis_name)).collect()
@@ -1524,13 +1530,14 @@ impl ShardMapBoundary {
     /// batching rule of [`ShardMapOperation`] for the rationale). Every placement axis must be an axis of the mesh.
     /// [`Auto`](MeshAxisType::Auto) axes are dropped, as the boundary drops them from every sharding, while free axes
     /// (i.e., axes that are not active manual axes) are kept. An active manual placement axis is released only when
-    /// `body` (the local body of this map) provably does not use it (refer to [`Self::used_manual_placement_axes`]),
-    /// so that it is a free axis of the batched map, which is correct because every device along it computes the same
-    /// values. Every other active manual placement axis stays manual, the batch is gathered along it on entry, and
-    /// every mapped output is tiled along it ahead of the free placement axes, because manual axes must precede free
-    /// axes within each dimension sharding. Such axes must therefore come first in `placement_axes`, so that outputs
-    /// keep the requested placement. Releasing an axis is rejected when `body` has an [`EffectClass::DeviceOrderedIo`]
-    /// or an [`EffectClass::UnorderedIo`] effect, because every device along an active manual axis executes its own
+    /// `body` (the local body of this map) provably does not use it (refer to [`Self::used_manual_placement_axes`],
+    /// which counts the axes that the lazily traced rules of its operations may use as used), so that it is a free axis
+    /// of the batched map, which is correct because every device along it computes the same values. Every other active
+    /// manual placement axis stays manual, the batch is gathered along it on entry, and every mapped output is tiled
+    /// along it ahead of the free placement axes, because manual axes must precede free axes within each dimension
+    /// sharding. Such axes must therefore come first in `placement_axes`, so that outputs keep the requested placement.
+    /// Releasing an axis is rejected when `body` has an [`EffectClass::DeviceOrderedIo`] or an
+    /// [`EffectClass::UnorderedIo`] effect, because every device along an active manual axis executes its own
     /// occurrence of such an effect, and releasing the axis would eliminate all but one of them. A placement that
     /// releases every active manual axis leaves the batched map without active manual axes, so its body runs once
     /// on the global values, which is what each device along the released axes computed already.
@@ -1654,29 +1661,30 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// batch axis and is otherwise placed on the mesh axes that the batching level places the batch axis on (the analogue
 /// of JAX's `spmd_axis_name`). Free placement axes stay free, so the batch dimension keeps its global extent inside the
 /// body, where the batched body places it on exactly those axes, so that its declared local types are the local types
-/// that the batched boundary derives. An active manual placement axis is released only when the body provably does
-/// not use it, which is when no body value varies along it, no collective or `axis_index` of the body names it, and
-/// the body contains no operation whose transform rules are traced only when a transform requests them, such as a
-/// composite call with retained custom differentiation or batching rules (refer to
-/// [`CollectiveOperation::may_use_hidden_axes`]). A released axis becomes a free placement axis, which leaves a map
-/// without active manual axes when the placement releases all of them. Every other active manual placement axis counts
-/// as used and stays manual, but it does not partition the batch dimension of mapped inputs, so the batch is gathered
-/// along it on entry and the body runs over every batch item on every device along it, which per-item semantics
-/// requires, because each batch item needs the body at every coordinate along that axis. Each mapped output is then
-/// sliced inside the body to the block of the batch that its device holds along the gathered axes, and its batch
-/// dimension is tiled along them, ahead of the free placement axes. JAX instead splits the batch along such an axis
-/// and runs each batch item at a single coordinate along it, so that its collectives over the axis combine different
-/// batch items. Batching a map with mapped inputs or outputs therefore rejects a placement axis that an input or output
-/// sharding names (with a [`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`]), a placement that releases an active
-/// manual axis of a body with the [`EffectClass::DeviceOrderedIo`] or the [`EffectClass::UnorderedIo`] effect (with a
-/// [`ShardMapError::BatchAxisPlacedOnManualAxisWithIo`], because the released axis would stop executing one occurrence
-/// of the effect per device along it), a gathered batch extent that the devices along the gathered axes do not divide
-/// (with a [`ShardMapError::BatchExtentNotDivisibleAlongUsedManualAxes`]), and a batched reference input of a map with
-/// gathered axes (with a [`ShardMapError::BatchedReferenceGatheredAlongUsedManualAxis`]). With manual-variation
-/// checking disabled, the body carries no variation labels, so it uses only the axes that its collectives and
-/// `axis_index` operations name (or every axis, when it contains an operation whose rules are traced lazily), which
-/// suffices because every input is replicated along the placement axes. It also rejects a dynamic batch extent
-/// whenever a boundary position is mapped or the body uses the extent (with a
+/// that the batched boundary derives. An active manual placement axis is released only when the body provably does not
+/// use it, which is when no body value varies along it, no collective or `axis_index` of the body names it, and no
+/// operation of the body has transform rules that are traced only when a transform requests them and may communicate
+/// along it. A composite call with retained custom differentiation or batching rules may communicate along the axes
+/// that it declares with [`Composite::with_rule_axes`](crate::Composite::with_rule_axes), and along every axis without
+/// a declaration (refer to [`CollectiveOperation::hidden_axes`]). A released axis becomes a free placement axis, which
+/// leaves a map without active manual axes when the placement releases all of them. Every other active manual placement
+/// axis counts as used and stays manual, but it does not partition the batch dimension of mapped inputs, so the batch
+/// is gathered along it on entry and the body runs over every batch item on every device along it, which per-item
+/// semantics requires, because each batch item needs the body at every coordinate along that axis. Each mapped output
+/// is then sliced inside the body to the block of the batch that its device holds along the gathered axes, and its
+/// batch dimension is tiled along them, ahead of the free placement axes. JAX instead splits the batch along such an
+/// axis and runs each batch item at a single coordinate along it, so that its collectives over the axis combine
+/// different batch items. Batching a map with mapped inputs or outputs therefore rejects a placement axis that an input
+/// or output sharding names (with a [`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`]), a placement that releases an
+/// active manual axis of a body with the [`EffectClass::DeviceOrderedIo`] or the [`EffectClass::UnorderedIo`] effect
+/// (with a [`ShardMapError::BatchAxisPlacedOnManualAxisWithIo`], because the released axis would stop executing one
+/// occurrence of the effect per device along it), a gathered batch extent that the devices along the gathered axes do
+/// not divide (with a [`ShardMapError::BatchExtentNotDivisibleAlongUsedManualAxes`]), and a batched reference input of
+/// a map with gathered axes (with a [`ShardMapError::BatchedReferenceGatheredAlongUsedManualAxis`]). With
+/// manual-variation checking disabled, the body carries no variation labels, so it uses only the axes that its
+/// collectives and `axis_index` operations name, together with the hidden axes of operations whose rules are traced
+/// lazily, which suffices because every input is replicated along the placement axes. It also rejects a dynamic batch
+/// extent whenever a boundary position is mapped or the body uses the extent (with a
 /// [`ShardMapError::DynamicBatchExtentNotSupported`]), because boundary types are static (refer to the `# Static
 /// Boundaries` section below). A forwarded reference output keeps the batch axis of the reference input that it
 /// forwards, and an unbatched reference input is shared by every batch item, so writing a batched value into it
@@ -3487,17 +3495,17 @@ where
         // `spmd_axis_name` in JAX's `_shard_map_batch`. Free placement axes stay free in the batched map, so that the
         // batch dimension keeps its global extent inside the body and collectives over the batch axis there still see
         // every batch item. An active manual placement axis is released from the active manual axes only when the body
-        // provably does not use it, which is sound because every device along it computes the same values. A body with
-        // an operation whose transform rules are traced lazily may use every axis (refer to
-        // `CollectiveOperation::may_use_hidden_axes`), because a later transform traces those rules in the scope of
-        // the original call, where the axis is still manual. Every active manual placement axis that is not released
-        // is gathered instead. It stays manual, but it does not partition the batch dimension of mapped inputs, so
-        // every device along it runs the body over every batch item, at its own coordinate along the axis, which is
-        // what each batch item needs. Mapped outputs are then sliced to the block of the batch that each device holds
-        // along the gathered axes, which their output shardings tile. JAX instead splits the batch along such an axis
-        // (i.e., its `spmd_axis_name`), which runs each batch item at one coordinate only and makes collectives over
-        // the axis combine different batch items. A placement adds no manual variation anywhere (refer to
-        // `Sharding::batched`), so callers may type their values over the mesh of the map itself.
+        // provably does not use it, which is sound because every device along it computes the same values. An operation
+        // whose transform rules are traced lazily may use the axes that those rules declare, or every axis without a
+        // declaration (refer to `CollectiveOperation::hidden_axes`), because a later transform traces those rules in
+        // the scope of the original call, where the axis is still manual. Every active manual placement axis that is
+        // not released is gathered instead. It stays manual, but it does not partition the batch dimension of mapped
+        // inputs, so every device along it runs the body over every batch item, at its own coordinate along the axis,
+        // which is what each batch item needs. Mapped outputs are then sliced to the block of the batch that each
+        // device holds along the gathered axes, which their output shardings tile. JAX instead splits the batch along
+        // such an axis (i.e., its `spmd_axis_name`), which runs each batch item at one coordinate only and makes
+        // collectives over the axis combine different batch items. A placement adds no manual variation anywhere
+        // (refer to `Sharding::batched`), so callers may type their values over the mesh of the map itself.
         //
         // A placement that releases every active manual axis leaves the batched map without active manual axes, which
         // the boundary requests explicitly with `ManualAxisSelection::Listed` (because an empty list of manual axes
@@ -19500,6 +19508,174 @@ mod tests {
             batched.interpret(vec![extent.clone(), f32_value(f32_type(&[2], None), &[3.0, 4.0])]),
             Ok(vec![extent, f32_value(output_type, &[3.0, 4.0])]),
         );
+    }
+
+    #[test]
+    fn test_shard_map_batching_releases_batch_axes_that_declared_rule_axes_exclude() {
+        // The custom forward mode rule of an identity composite computes the tangent as the mean of its replicated
+        // copies along `x`, and the composite declares that its rules communicate along `x` only. A batch placed on `y`
+        // therefore releases `y`, while `x`, which is not a placement axis, stays manual. Without the declaration, the
+        // rules may communicate along `y` as well, so `y` stays manual too and the batch is gathered along it.
+        let mesh = manual_mesh_2x2();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let batched = |declared: bool| {
+            let program = trace_test_program(
+                |inputs| {
+                    vec![
+                        shard_map(
+                            |x: TestTracer| {
+                                let function =
+                                    composite(|x: BodyTracer| Ok(x)).with_jvp(|x: BodyTracer, tangent: BodyTracer| {
+                                        let tangent = ValueProjection::<ArrayType>::into_projected(tangent)?;
+                                        let two = tangent.one_like()? + tangent.one_like()?;
+                                        let tangent = tangent.parallel_reduce(ReductionKind::Sum, "x")? / two;
+                                        Ok((x, tangent.into_value()))
+                                    });
+                                let function = if declared { function.with_rule_axes(["x"]) } else { function };
+                                Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                            },
+                            inputs[0].clone(),
+                            mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )
+                        .unwrap(),
+                    ]
+                },
+                vec![f32_type(&[], None)],
+                Vec::new(),
+            );
+            program
+                .batched_with_threaded_extent(
+                    DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                    ShardingDimension::sharded(["y"]),
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        let declared = batched(true);
+        assert_eq!(declared.to_string(), "");
+        assert_eq!(batched(false).to_string(), "");
+        let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
+        let output_type = boundary_array_type(&declared.output_types()[1]).unwrap().clone();
+        assert_eq!(
+            declared.jvp_with_respect_to(&[1]).unwrap().interpret(vec![
+                extent.clone(),
+                f32_value(f32_type(&[2], None), &[3.0, 4.0]),
+                f32_value(f32_type(&[2], None), &[1.0, 1.0]),
+            ]),
+            Ok(vec![extent, f32_value(output_type.clone(), &[3.0, 4.0]), f32_value(output_type, &[1.0, 1.0])]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_batching_releases_batch_axes_of_rules_that_declare_no_axes() {
+        // The custom forward mode rule of an identity composite communicates along no mesh axis, which the composite
+        // declares with an empty list, so a batch placed on `x` releases `x`, as for a composite without custom rules.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function = composite(|x: BodyTracer| Ok(x))
+                                .with_jvp(|x: BodyTracer, tangent: BodyTracer| Ok((x, tangent)))
+                                .with_rule_axes(Vec::<String>::new());
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[], None)],
+            Vec::new(),
+        );
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::sharded(["x"]),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(batched.to_string(), "");
+        let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
+        let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
+        assert_eq!(
+            batched.jvp_with_respect_to(&[1]).unwrap().interpret(vec![
+                extent.clone(),
+                f32_value(f32_type(&[2], None), &[3.0, 4.0]),
+                f32_value(f32_type(&[2], None), &[1.0, 1.0]),
+            ]),
+            Ok(vec![extent, f32_value(output_type.clone(), &[3.0, 4.0]), f32_value(output_type, &[1.0, 1.0])]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_batching_releases_batch_axes_that_rules_use_without_declaring_them() {
+        // A wrong declaration is not checked. The custom forward mode rule of an identity composite reduces over `x`,
+        // but the composite declares that its rules communicate along no axis, so a batch placed on `x` releases `x`.
+        // The later forward mode derivative traces the rule, which stages its reduction over `x` in a map that no
+        // longer makes `x` manual, so executing it fails.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function = composite(|x: BodyTracer| Ok(x))
+                                .with_jvp(|x: BodyTracer, tangent: BodyTracer| {
+                                    let tangent = ValueProjection::<ArrayType>::into_projected(tangent)?;
+                                    let two = tangent.one_like()? + tangent.one_like()?;
+                                    let tangent = tangent.parallel_reduce(ReductionKind::Sum, "x")? / two;
+                                    Ok((x, tangent.into_value()))
+                                })
+                                .with_rule_axes(Vec::<String>::new());
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[], None)],
+            Vec::new(),
+        );
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::sharded(["x"]),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let result = batched.jvp_with_respect_to(&[1]).map(|derivative| {
+            derivative.interpret(vec![
+                TestValue::Dimension(DimensionValue::constant(2).unwrap()),
+                f32_value(f32_type(&[2], None), &[3.0, 4.0]),
+                f32_value(f32_type(&[2], None), &[1.0, 1.0]),
+            ])
+        });
+        assert_eq!(format!("{result:?}"), "");
     }
 
     #[test]
