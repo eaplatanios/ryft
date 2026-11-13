@@ -578,9 +578,12 @@ pub enum HiddenAxes {
     None,
 
     /// The operation may communicate along the named axes, and along no other axis that its
-    /// [`CollectiveOperation::axes`] and regions do not reveal (e.g., a composite call whose retained rules declare
-    /// these axes, refer to [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)). An empty list is
-    /// equivalent to [`HiddenAxes::None`].
+    /// [`CollectiveOperation::axes`] and regions do not reveal (e.g., a composite call whose retained rules
+    /// declare these axes, refer to [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)). The rules
+    /// that it hides also have no I/O effect (i.e., no [`EffectClass::OrderedIo`](crate::EffectClass::OrderedIo),
+    /// [`EffectClass::DeviceOrderedIo`](crate::EffectClass::DeviceOrderedIo), or
+    /// [`EffectClass::UnorderedIo`](crate::EffectClass::UnorderedIo) effect), so an analysis may release every other
+    /// axis as it would for an operation without hidden axes. An empty list is equivalent to [`HiddenAxes::None`].
     Named(Vec<String>),
 
     /// The operation may communicate along any axis (e.g., a composite call whose retained rules have no declaration
@@ -623,10 +626,14 @@ pub trait CollectiveOperation {
     /// scope of that request (e.g., the retained custom differentiation and batching rules of a composite call).
     /// Analyses that must prove that an operation does not use an axis (e.g., the release of manual axes by the
     /// batching rule of [`ShardMapOperation`](crate::ShardMapOperation)) must treat the named axes of
-    /// [`HiddenAxes::Named`] as used and every axis as used for [`HiddenAxes::Unknown`]. Operations whose transform
-    /// rules are derived from their payload and regions, or are attached to them as regions, have no hidden axes,
-    /// which is what the default implementation reports. This function does not affect how an operation executes or
-    /// lowers, which depends on [`axes`](Self::axes) and on its regions only.
+    /// [`HiddenAxes::Named`] as used and every axis as used for [`HiddenAxes::Unknown`]. An operation that reports
+    /// [`HiddenAxes::Named`] also promises that the rules it hides have no I/O effect, because the effects of rules
+    /// that are traced later are not part of the operation's own effects and so no effect analysis can see them (e.g.,
+    /// a composite call checks this promise when it traces its rules, refer to
+    /// [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)). Operations whose transform rules are derived
+    /// from their payload and regions, or are attached to them as regions, have no hidden axes, which is what the
+    /// default implementation reports. This function does not affect how an operation executes or lowers, which
+    /// depends on [`axes`](Self::axes) and on its regions only.
     #[inline]
     fn hidden_axes(&self) -> HiddenAxes {
         HiddenAxes::None

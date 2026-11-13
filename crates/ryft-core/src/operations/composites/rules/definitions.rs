@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::ThreadId;
 
 use crate::arrays::{ArrayType, DataType, ShardingDimension};
+use crate::axes::NamedAxis;
 use crate::batching::{
     BatchAxis, BatchableType, BatchedProgram, BatchingError, BatchingLevel, BatchingPolicy, DiagonalBatchingPolicy,
     ProgramBatchingOutputAxesPolicy, RecursiveBatchingPolicy,
@@ -19,6 +20,7 @@ use crate::differentiation::{
     TranspositionContext,
 };
 use crate::operations::arithmetic::{Add, AddOperation};
+use crate::operations::collectives::{CollectiveOperation, HiddenAxes};
 use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::specializations::CustomRuleDerivation;
@@ -30,14 +32,14 @@ use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOpe
 use crate::parameters::Parameter;
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceAccessOperation, ReferenceDischargePolicy,
-    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType, ReferenceTransform,
-    ReferenceType, Type, Typed, Value,
+    EffectClass, MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceAccessOperation,
+    ReferenceDischargePolicy, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType,
+    ReferenceTransform, ReferenceType, Type, Typed, Value,
 };
 use crate::tracing::{TracingContext, TracingScope};
 
 #[cfg(doc)]
-use crate::operations::composites::rules::registrations::{CustomRuleReference, CustomRuleRegistration};
+use crate::operations::composites::rules::registrations::CustomRuleRegistration;
 
 #[cfg(doc)]
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
@@ -1017,10 +1019,10 @@ where
 /// The specialized programs are not stored in the definition, because a program that calls the definition (e.g., a
 /// rule that calls its own definition, directly or through other definitions) would then keep the definition alive
 /// forever. They are stored in caches owned by the [`CustomRuleRegistration`] handle, while calls and rules refer to
-/// the definition through a [`CustomRuleReference`], which holds the definition strongly and the caches only weakly.
-/// The strong references therefore always point from programs to definitions and from the handle to the caches, and
-/// never back from a definition to a program. Refer to [`CustomRuleRegistration`] for how rules must refer to
-/// definitions.
+/// the definition through a [`CustomRuleReference`](crate::CustomRuleReference), which holds the definition strongly
+/// and the caches only weakly. The strong references therefore always point from programs to definitions and from the
+/// handle to the caches, and never back from a definition to a program. Refer to [`CustomRuleRegistration`] for how
+/// rules must refer to definitions.
 pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Process-unique identity of this definition.
     id: u64,
@@ -1088,6 +1090,13 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// definition inherit. Refer to [`Self::with_rule_axes`] for more information.
     rule_axes: Option<Vec<String>>,
 
+    /// Validation of every traced rule program against [`Self::rule_axes`] (i.e., `validate_rule_axes` for the
+    /// operation family), which is set exactly when the rule axes are declared. It is captured where the family's
+    /// [`CollectiveOperation`] implementation is known, because requiring that implementation on the operations'
+    /// own rules would form a cycle with the payload bounds of the families that contain them.
+    #[allow(clippy::type_complexity)]
+    rule_validator: Option<fn(&Self, &str, &Program<V, O, Vec<V>, Vec<V>>) -> Result<(), ProgramError>>,
+
     /// Optional custom batching rule, which is a derivation for the definitions derived from a definition that has one.
     batching_rule: Option<CustomRuleBatching<V, O>>,
 
@@ -1128,6 +1137,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             sequential_batching_scan: None,
             batched_output_axes: None,
             rule_axes: None,
+            rule_validator: None,
             batching_rule: None,
             discharger: None,
             uncached_specializations: Mutex::new(HashSet::new()),
@@ -1145,6 +1155,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
             structural_batcher: self.structural_batcher.clone(),
             sequential_batching_scan: self.sequential_batching_scan.clone(),
             rule_axes: self.rule_axes.clone(),
+            rule_validator: self.rule_validator,
             batching_rule,
             discharger: self.discharger.clone(),
             ..Self::new(name)
@@ -1493,20 +1504,52 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Returns this [`CustomRuleDefinition`] with a declaration of the mesh axes that its retained rules (i.e., its
     /// forward mode, reverse mode, and batching rules) may communicate along, where an empty list declares that they
     /// communicate along no mesh axis. The rules are traced only when a transform requests them, so analyses that must
-    /// prove that a call does not use an axis (refer to
-    /// [`CollectiveOperation::hidden_axes`](crate::CollectiveOperation::hidden_axes)) assume that an undeclared
+    /// prove that a call does not use an axis (refer to [`CollectiveOperation::hidden_axes`]) assume that an undeclared
     /// definition's rules communicate along every axis, and that a declared definition's rules communicate along the
-    /// declared axes only. The declaration covers the rules only, because the primal region of every call is
-    /// inspected directly. The definitions derived from this definition (e.g., for the derived calls of its forward
-    /// mode derivatives) inherit it, because their rules are derived from these rules.
+    /// declared axes only. The declaration covers the rules only, because the primal region of every call is inspected
+    /// directly. The definitions derived from this definition (e.g., for the derived calls of its forward mode
+    /// derivatives) inherit it, because their rules are derived from these rules.
     ///
-    /// The declaration is trusted without being checked, so a rule that communicates along an undeclared axis may find
-    /// that axis released (e.g., by the batching of an enclosing `shard_map`), and the request that traces the rule
-    /// then stages a collective over an axis that no enclosing manual region binds, which fails when the program is
-    /// interpreted or lowered.
+    /// The declaration exists only to let batching release manual axes (e.g., the batching of an enclosing
+    /// `shard_map`), so it promises everything that releasing another manual axis requires of the rules.
+    /// They communicate only along the declared mesh axes, and they have no I/O effect (i.e., no
+    /// [`EffectClass::OrderedIo`], [`EffectClass::DeviceOrderedIo`], or [`EffectClass::UnorderedIo`] effect),
+    /// because every device along a manual axis runs its own occurrence of such an effect, which releasing the axis
+    /// would eliminate. A body with per device I/O can never have an axis released, so a definition whose rules have
+    /// I/O gains nothing from a declaration and must leave its rule axes undeclared. Its axes then stay manual and its
+    /// effects keep running once per device.
+    ///
+    /// # Errors
+    ///
+    /// The declaration is checked rather than trusted. Every rule program is validated when it is traced, before
+    /// it is cached or used, so the request that traces a rule (e.g., a derivative or batching request) fails with a
+    /// [`ProgramError::UnsupportedOperation`] when the rule has an I/O effect, communicates along a mesh axis of the
+    /// definition's scope (i.e., one of its manual axes or [`NamedAxis::Mesh`] bindings, whereas a batch axis is not
+    /// restricted) that is not declared, or calls an operation whose hidden axes are unknown or include an axis that
+    /// is not declared (e.g., another composite whose rule axes are not declared).
     #[inline]
-    pub fn with_rule_axes<A: Into<String>, I: IntoIterator<Item = A>>(mut self, axis_names: I) -> Self {
-        self.rule_axes = Some(axis_names.into_iter().map(Into::into).collect());
+    pub fn with_rule_axes<A: Into<String>, I: IntoIterator<Item = A>>(self, axis_names: I) -> Self
+    where
+        V: Value,
+        O: Operation<Type = V::Type> + CollectiveOperation,
+    {
+        self.with_validated_rule_axes(axis_names.into_iter().map(Into::into).collect(), validate_rule_axes::<V, O>)
+    }
+
+    /// Returns this [`CustomRuleDefinition`] with the provided rule axes and their validator, which must be
+    /// [`validate_rule_axes`] for the operation family. A [`Composite`](crate::Composite) captures that validator
+    /// where it declares its rule axes, because the registration of its definitions cannot require the family's
+    /// [`CollectiveOperation`] implementation without requiring it of every caller. Refer to [`Self::with_rule_axes`]
+    /// for more information.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    pub(crate) fn with_validated_rule_axes(
+        mut self,
+        axis_names: Vec<String>,
+        validator: fn(&Self, &str, &Program<V, O, Vec<V>, Vec<V>>) -> Result<(), ProgramError>,
+    ) -> Self {
+        self.rule_axes = Some(axis_names);
+        self.rule_validator = Some(validator);
         self
     }
 
@@ -1836,6 +1879,20 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         };
         Ok(discharger(program)?)
     }
+
+    /// Validates `program`, which was just traced from this definition's `rule` rule (e.g., `"JVP"` or `"backward"`,
+    /// which diagnostics name), against the declaration of its rule axes before the program is cached or used. A
+    /// definition without a declaration accepts every rule program. Refer to [`Self::with_rule_axes`] for the checks.
+    pub(crate) fn validate_rule_program(
+        &self,
+        rule: &str,
+        program: &Program<V, O, Vec<V>, Vec<V>>,
+    ) -> Result<(), ProgramError> {
+        match self.rule_validator {
+            Some(validator) => validator(self, rule, program),
+            None => Ok(()),
+        }
+    }
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V, O> {
@@ -1871,6 +1928,77 @@ where
     let transposed = program.entry_region_ref().transpose(input_indices, &[], destination_kinds)?;
     let cotangents = transposed.cotangents().to_vec();
     Ok((Arc::unwrap_or_clone(transposed.into_program()), cotangents))
+}
+
+/// Validates `program`, which was just traced from the `rule` rule of `definition`, against the rule axes that
+/// `definition` declares (refer to [`CustomRuleDefinition::with_rule_axes`]). The program must have no I/O effect,
+/// every mesh axis that one of its instructions communicates along must be declared, and every hidden axis of its
+/// instructions must be known and declared. Mesh axes are those of the definition's [`TracingScope`] (i.e., its manual
+/// axes and its [`NamedAxis::Mesh`] bindings), while an axis that the scope binds only to a batching level, or does not
+/// bind at all, cannot be released by batching a manual region and is therefore not restricted.
+pub(crate) fn validate_rule_axes<V, O>(
+    definition: &CustomRuleDefinition<V, O>,
+    rule: &str,
+    program: &Program<V, O, Vec<V>, Vec<V>>,
+) -> Result<(), ProgramError>
+where
+    V: Value<Type: Eq + Hash>,
+    O: Operation<Type = V::Type> + CollectiveOperation,
+{
+    let declared_axes = definition.rule_axes().unwrap_or_default();
+    let violation = |reason: String| ProgramError::UnsupportedOperation {
+        message: format!(
+            "{} {} rule {}, which the rule axes declared with `with_rule_axes` do not allow",
+            describe_composite(COMPOSITE_OPERATION_NAME, definition.name()),
+            rule,
+            reason,
+        ),
+    };
+
+    let effect_classes = program.effects().classes();
+    if let Some(effect_class) = [EffectClass::OrderedIo, EffectClass::DeviceOrderedIo, EffectClass::UnorderedIo]
+        .into_iter()
+        .find(|effect_class| effect_classes.contains(*effect_class))
+    {
+        return Err(violation(format!("has the `{effect_class:?}` effect")));
+    }
+
+    let scope = definition.scope();
+    let is_mesh_axis = |axis_name: &String| {
+        scope.manual_axes().iter().any(|(name, _)| name == axis_name)
+            || scope
+                .named_axes()
+                .iter()
+                .any(|(name, axis)| name == axis_name && matches!(axis, NamedAxis::Mesh { .. }))
+    };
+    for (_, instruction) in program.entry_region_ref().instructions_in_closure() {
+        let operation = instruction.operation();
+        let axes = operation.axes();
+        if let Some(axis_name) =
+            axes.names().iter().find(|axis_name| is_mesh_axis(axis_name) && !declared_axes.contains(axis_name))
+        {
+            return Err(violation(format!("communicates along mesh axis `{axis_name}`")));
+        }
+        match operation.hidden_axes() {
+            HiddenAxes::None => {}
+            HiddenAxes::Named(axis_names) => {
+                if let Some(axis_name) = axis_names.iter().find(|axis_name| !declared_axes.contains(axis_name)) {
+                    return Err(violation(format!(
+                        "calls `{}`, whose rules may communicate along axis `{}`",
+                        operation.name(),
+                        axis_name,
+                    )));
+                }
+            }
+            HiddenAxes::Unknown => {
+                return Err(violation(format!(
+                    "calls `{}`, whose rules may communicate along any axis",
+                    operation.name(),
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
