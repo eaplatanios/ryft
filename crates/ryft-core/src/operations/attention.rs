@@ -2304,21 +2304,17 @@ where
     ))
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Returns the named composite of the backward definition with the provided configuration, which serves every input
-/// structure under the [`AttentionKey`] of that structure.
-///
-/// The body of the definition evaluates the portable attention backward pass using the same extents and mask
-/// construction as the forward body (refer to [`forward_definition`]), and returns the cotangents of the query, key,
-/// and value, followed by that of a present bias whose cotangent space is not zero-dimensional. Its inputs are the
-/// forward inputs followed by the attended output, its `TN` or `BTN` log-sum-exp residual, and the output cotangent.
-/// Boolean masks, integer sequence lengths, dropout states, and a bias whose cotangent space is zero-dimensional have
-/// no cotangent outputs.
+/// structure under the [`AttentionKey`] of that structure. The body of the definition evaluates the portable attention
+/// backward pass using the same extents and mask construction as the forward body (refer to [`forward_definition`]),
+/// and returns the cotangents of the query, key, and value, followed by that of a present bias whose cotangent space
+/// is not zero-dimensional. Its inputs are the forward inputs followed by the attended output, its `TN` or `BTN`
+/// log-sum-exp residual, and the output cotangent. Boolean masks, integer sequence lengths, dropout states, and
+/// a bias whose cotangent space is zero-dimensional have no cotangent outputs.
 ///
 /// The body recomputes the normalized probabilities `P` from the masked logits in `f32`, which avoids the precision
 /// that rounding the output or the residual to a narrower query data type loses, and so the output and the residual
-/// are validated inputs for backend implementations whose numerical values this body does not use. It computes
+/// are validated inputs for backend implementations whose numerical values this body does not use. It computes:
 ///
 /// ```text
 /// dV = transpose(P) * dO
@@ -2348,8 +2344,8 @@ fn backward_definition<V: Value, O: Operation<Type = V::Type>>(
 >
 where
     V: 'static,
-    O: 'static,
     V::Type: ArrayMemberType + From<ArrayType> + BatchableType,
+    O: 'static,
     CustomRuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
@@ -2381,6 +2377,7 @@ where
         // The portable body recomputes the probabilities instead of using them, so it only needs the forward inputs
         // and the output cotangent.
         let (AttentionResiduals { inputs, .. }, output_cotangent) = &inputs;
+
         // The output type rule has already validated this boundary, so the types are only needed for the
         // validated dimensions and the ranks of the query, key, and value.
         let input_types = inputs
@@ -2398,6 +2395,7 @@ where
         )?;
         let prepared = prepare_attention(inputs, configuration, &dimensions)?;
         let output_cotangent = normalize_attention_input(output_cotangent.clone())?;
+
         // The public residual and output have the query data type, which can lose the normalization correction in
         // narrow formats. Recompute probabilities in the softmax type instead of recovering them from those values.
         let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
@@ -2413,6 +2411,7 @@ where
         let sentinel = columns.fill_like(i32::MAX)?;
         let is_maximum = prepared.logits.compare(&maxima, ComparisonDirection::Equal)?;
         let pivot = is_maximum.select(&columns, &sentinel)?.reduce(&[3], ReductionKind::Min)?;
+
         // The column coordinates share the shape and the data type of the pivot, so they are its exemplar.
         let pivot = pivot.broadcast_like(&columns, &[0, 1, 2])?;
         let is_pivot = columns.compare(&pivot, ComparisonDirection::Equal)?;
@@ -2423,6 +2422,7 @@ where
             None => output_cotangent,
             Some(query_lengths) => zero_query_rows(output_cotangent, query_lengths, 1)?,
         };
+
         // The backward mathematics runs in the softmax data type, like the recomputed probabilities.
         let convert = |array: CustomRuleTracer<V, O>| -> Result<CustomRuleTracer<V, O>, ProgramError> {
             if dimensions.data_type == SOFTMAX_DATA_TYPE {
@@ -2448,6 +2448,7 @@ where
         let zero = prepared.logits.fill_like(0.0)?;
         let pivot_cotangent = is_pivot.select(&weight_cotangents, &zero)?.reduce(&[3], ReductionKind::Sum)?;
         let pivot_cotangent = pivot_cotangent.broadcast_like(&prepared.logits, &[0, 1, 2])?;
+
         // Center the incoming weight cotangents before their weighted sum. This preserves a tiny dominant derivative
         // and gives exact zero when every weight cotangent is equal, even if the rounded probabilities do not sum to
         // one.
@@ -2455,12 +2456,14 @@ where
         let delta = weights.mul(&centered)?.reduce(&[3], ReductionKind::Sum)?;
         let delta = delta.broadcast_like(&prepared.logits, &[0, 1, 2])?;
         let logit_cotangents = weights.mul(&centered.sub(&delta)?)?;
+
         // The logit cotangents of every row sum to zero, so the pivot's entry is replaced by the negative sum of the
         // other entries. That keeps the dominant derivative when the probability of the pivot rounds to one.
         let other_cotangents = is_pivot.select(&zero, &logit_cotangents)?;
         let pivot_cotangent = other_cotangents.reduce(&[3], ReductionKind::Sum)?;
         let pivot_cotangent = pivot_cotangent.broadcast_like(&prepared.logits, &[0, 1, 2])?;
         let logit_cotangents = is_pivot.select(&zero.sub(&pivot_cotangent)?, &other_cotangents)?;
+
         // The scores are `scale * Q * transpose(K)`, so the query and key cotangents contract the scaled logit
         // cotangents with the keys and the queries, and the value cotangent contracts the dropped probabilities with
         // the output cotangent. Every result is transposed from `BNTH` or `BNSH` to the form of its input.
@@ -2489,6 +2492,7 @@ where
                 sum_key_value_head_groups(value_cotangent, &dimensions)?,
             )
         };
+
         // Every cotangent returns to the cotangent data type and to the rank of its input.
         let mut cotangents = [query_cotangent, key_cotangent, value_cotangent]
             .into_iter()
@@ -2503,13 +2507,16 @@ where
                 if rank == 4 { Ok(cotangent) } else { cotangent.squeeze(0) }
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
+
         if let Some(bias) = &inputs.bias {
             let bias_type = bias.r#type().as_array_type()?.clone();
             let bias_cotangent_type = bias_type.cotangent()?;
+
             // A bias whose cotangent space is zero-dimensional (e.g., an integer bias) has no cotangent output.
             if bias_cotangent_type.is_zero_space() {
                 return Ok(cotangents);
             }
+
             // The bias was right-aligned and broadcast to the `BNTS` score shape, so its cotangent sums the logit
             // cotangents over the axes along which it was broadcast and then returns to the shape of the bias.
             let bias_dimensions = std::iter::repeat_n(Dimension::Static(1), 4 - bias_type.rank())
@@ -2527,6 +2534,7 @@ where
             } else {
                 logit_cotangents.reduce(reduce_axes.as_slice(), ReductionKind::Sum)?
             };
+
             // The reduced cotangent keeps the axes along which the bias is not broadcast, which are the axes of the
             // bias other than its unit axes, so restoring the shape of the bias only inserts or removes unit axes.
             let bias_cotangent = bias_cotangent.reshape(bias_type.shape().clone())?;
@@ -2537,6 +2545,7 @@ where
             };
             cotangents.push(bias_cotangent);
         }
+
         Ok(cotangents)
     })
     .with_name(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME)
@@ -2561,8 +2570,8 @@ where
     );
     if configuration.dropout().is_some() {
         return match configuration.implementation() {
-            // Refer to the forward definition for why a batched fused call with dropout is rejected.
             AttentionImplementation::Fused => {
+                // Refer to the forward definition for why a batched fused call with dropout is rejected.
                 AttentionFunction::Folding(Arc::new(function.with_batching(|_, _, _| {
                     Err(ProgramError::UnsupportedOperation {
                         message: format!(
@@ -2574,13 +2583,14 @@ where
                     })
                 })))
             }
-            // Folding would change the shape of the dropout mask and therefore the mask of every batch item, so
-            // these definitions keep the structural batching of their bodies.
             AttentionImplementation::Automatic | AttentionImplementation::Portable => {
+                // Folding would change the shape of the dropout mask and therefore the mask of every batch item,
+                // so these definitions keep the structural batching of their bodies.
                 AttentionFunction::Structural(Arc::new(function))
             }
         };
     }
+
     AttentionFunction::Folding(Arc::new_cyclic(
         |weak: &Weak<
             BatchedComposite<
@@ -2623,6 +2633,8 @@ where
         },
     ))
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Batches one attention call by folding its mapped axis into attention's batch axis, staging the definition once at
 /// the folded boundary through `call`, and restoring the outputs, which are all mapped at axis `0`.
