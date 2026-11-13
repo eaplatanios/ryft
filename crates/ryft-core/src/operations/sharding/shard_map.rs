@@ -7436,6 +7436,7 @@ mod tests {
     };
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
     use crate::operations::collectives::parallel_sum_scatter::{ParallelSumScatter, ParallelSumScatterOperation};
+    use crate::operations::collectives::parallel_vary::PARALLEL_VARY_OPERATION_NAME;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::composites::{CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, composite};
     use crate::operations::constants::one_like::{OneLike, OneLikeOperation};
@@ -19558,8 +19559,90 @@ mod tests {
                 .0
         };
         let declared = batched(true);
-        assert_eq!(declared.to_string(), "");
-        assert_eq!(batched(false).to_string(), "");
+        let mesh = "['x'=2:manual, 'y'=2:manual]";
+        let sharding = format!("{{mesh<{mesh}>, [{{'y'}}]}}");
+        let global = format!("f32[2][sharding={sharding}]");
+        assert_eq!(
+            declared.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<2>, %1:f32[2] .
+                let %2:{global} = shard_map [
+                    mesh={mesh},
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}],
+                    manual_axes=['x'],
+                    global_input_types=[{global}],
+                    global_output_types=[{global}],
+                ] %1 [
+                    body={{
+                        lambda %0:{global} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{global} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<2>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{global} .
+                                    in (%1)
+                                }},
+                            ]
+                        in (%2)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
+
+        // Without the declaration, `y` stays manual and the batch is gathered along it.
+        let replicated = format!("{{mesh<{mesh}>, [{{}}]}}");
+        let local = format!("f32[2][sharding={replicated}]");
+        let varying = format!("{{mesh<{mesh}>, [{{}}], varying_manual={{'y'}}}}");
+        let matrix = format!("{{mesh<{mesh}>, [{{}}, {{}}], varying_manual={{'y'}}}}");
+        let scalar = format!("{{mesh<{mesh}>, [], varying_manual={{'y'}}}}");
+        assert_eq!(
+            batched(false).to_string(),
+            formatdoc! {"
+                lambda %0:dimension<2>, %1:f32[2] .
+                let %2:{global} = shard_map [
+                    mesh={mesh},
+                    input_shardings=[{replicated}],
+                    output_shardings=[{sharding}],
+                    manual_axes=['x', 'y'],
+                    global_input_types=[{local}],
+                    global_output_types=[{global}],
+                ] %1 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{local} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<2>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{local} .
+                                    in (%1)
+                                }},
+                            ]
+                            %3:f32[2][sharding={varying}] = parallel_vary [axis_name=\"y\"] %2
+                            %4:f32[2, 1][sharding={matrix}] = reshape [
+                                shape=[2, 1],
+                                output_sharding={matrix},
+                            ] %3
+                            %5:u64[][sharding={scalar}] = axis_index [axis_name=\"y\", mesh={mesh}]
+                            %6:u64[][sharding={scalar}] = zero [
+                                type=u64[][sharding={scalar}],
+                            ]
+                            %7:f32[1, 1][sharding={matrix}] = dynamic_slice [sizes=[1, 1]] %4 %5 %6
+                            %8:f32[1][sharding={varying}] = reshape [
+                                shape=[1],
+                                output_sharding={varying},
+                            ] %7
+                        in (%8)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
         let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
         let output_type = boundary_array_type(&declared.output_types()[1]).unwrap().clone();
         assert_eq!(
@@ -19610,7 +19693,38 @@ mod tests {
             .unwrap()
             .into_parts()
             .0;
-        assert_eq!(batched.to_string(), "");
+        let sharding = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let global = format!("f32[2][sharding={sharding}]");
+        assert_eq!(
+            batched.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<2>, %1:f32[2] .
+                let %2:{global} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}],
+                    manual_axes=[],
+                    global_input_types=[{global}],
+                    global_output_types=[{global}],
+                ] %1 [
+                    body={{
+                        lambda %0:{global} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{global} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<2>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{global} .
+                                    in (%1)
+                                }},
+                            ]
+                        in (%2)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
         let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
         let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
         assert_eq!(
@@ -19668,14 +19782,17 @@ mod tests {
             .unwrap()
             .into_parts()
             .0;
-        let result = batched.jvp_with_respect_to(&[1]).map(|derivative| {
+        let derivative = batched.jvp_with_respect_to(&[1]).unwrap();
+        assert!(matches!(
             derivative.interpret(vec![
                 TestValue::Dimension(DimensionValue::constant(2).unwrap()),
                 f32_value(f32_type(&[2], None), &[3.0, 4.0]),
                 f32_value(f32_type(&[2], None), &[1.0, 1.0]),
-            ])
-        });
-        assert_eq!(format!("{result:?}"), "");
+            ]),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message
+                    == format!("`{PARALLEL_VARY_OPERATION_NAME}` requires an active non-empty manual mesh axis `x`"),
+        ));
     }
 
     #[test]
