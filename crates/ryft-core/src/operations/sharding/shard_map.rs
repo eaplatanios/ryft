@@ -10068,7 +10068,9 @@ mod tests {
             ))
         };
 
-        // A checked map rejects it at construction and in every consumer of a program that reattaches its body.
+        // A checked map rejects it at construction and in every consumer of a program that reattaches its body. The
+        // emulator does not validate the body of a checked map without references, so the lockstep rule of the gather
+        // rejects it there.
         let mesh = manual_mesh();
         let sharded = sharded_along_x();
         let boundary = ShardMapBoundary::new(mesh.clone(), vec![sharded.clone()], vec![sharded.clone()], Vec::new());
@@ -10087,7 +10089,10 @@ mod tests {
         let program = shard_map_program(operation, body).unwrap();
         assert_eq!(
             program.interpret(vec![f32_value(global_type.clone(), &[1.0, 2.0, 3.0, 4.0])]).map(|_| ()),
-            Err(expected.clone()),
+            Err(ProgramError::MalformedProgram(format!(
+                "`{PARALLEL_ALL_GATHER_OPERATION_NAME}` without a mesh cannot have invariant output variance over \
+                 manual axis `x`, along which its result keeps the manual variation of its input",
+            ))),
         );
         assert_eq!(
             program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).map(|_| ()),
@@ -25252,13 +25257,13 @@ mod tests {
                         lambda %0:{local_type}, %1:ref<{local_type}> .
                         let %2:{local_type} = zero [type={local_type}]
                             %3:ref<{local_type}> = reference_new %2
+                            () = reference_add_update %3 %0
+                            () = reference_add_update %1 %0
                             %4:{local_type} = zero [type={local_type}]
                             %5:ref<{local_type}> = reference_new %4
-                            () = reference_add_update %1 %0
-                            () = reference_add_update %3 %0
                             () = reference_add_update %5 %0
-                            %6:{local_type} = reference_freeze %3
-                            %7:{local_type} = reference_freeze %5
+                            %6:{local_type} = reference_freeze %5
+                            %7:{local_type} = reference_freeze %3
                         in (%6, %7)
                     }},
                 ]
