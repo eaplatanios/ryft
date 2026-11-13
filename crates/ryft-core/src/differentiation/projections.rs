@@ -1259,8 +1259,6 @@ impl<Input, ContextState> ParentDifferentiationBuilder<Input, ContextState> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// [`Pushforward`] returned by [`ParentDifferentiationBuilder::linearize`], whose program and residuals live in the
 /// parent context `C` and whose applications take and return projected values with the structures `Input` and `Output`
 /// of the linearized function.
