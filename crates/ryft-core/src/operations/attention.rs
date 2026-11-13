@@ -285,25 +285,15 @@ pub const DOT_PRODUCT_ATTENTION_COMPOSITE_NAME: &str = "ryft.dot_product_attenti
 pub const DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME: &str = "ryft.dot_product_attention_backward";
 
 /// Name of the named composite that stages a differentiable attention operation. Its key has the attributes of the
-/// forward definition's key except for `residual`. Refer to the documentation of [`AttentionKey`] for more information.
+/// forward definition's key except for `residual`. Refer to the documentation of [`AttentionKey::to_composite_key`]
+/// for those attributes.
 pub const DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME: &str = "ryft.dot_product_attention_differentiable";
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Semantic identity of one named attention definition, which identifies the forward or the backward definition and
-/// records its value-independent configuration and the structure of its inputs. It converts losslessly to
-/// and from the [`CompositeKey`] of the definition's named composite, which is how backends recognize attention calls
-/// (e.g., to replace them with fused kernels). The key's attributes are, in order:
-///
-///   - `scale`: Optional explicit score scale.
-///   - `causal`: Whether causal masking is enabled.
-///   - `local_window`: Optional inclusive `[left, right]` local window radii.
-///   - `implementation`: Requested [`AttentionImplementation`], which is `0` for automatic, `1` for portable, and `2`
-///     for fused.
-///   - `dropout_rate`: Optional dropout rate.
-///   - `residual`: Whether the log-sum-exp residual is returned (forward definitions only).
-///   - `bias`, `mask`, `query_sequence_lengths`, `key_value_sequence_lengths`, and `dropout_state`: Whether the
-///     corresponding optional input is present.
+/// records its value-independent configuration and the structure of its inputs. It converts losslessly to and from
+/// the [`CompositeKey`] of the definition's named composite, through [`AttentionKey::to_composite_key`] and
+/// [`AttentionKey::from_composite_key`], which is how backends recognize attention calls (e.g., to
+/// replace them with fused kernels).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum AttentionKey {
     /// Forward attention, named [`DOT_PRODUCT_ATTENTION_COMPOSITE_NAME`], whose inputs are the [`AttentionInputs`] and
@@ -344,80 +334,96 @@ impl AttentionKey {
         if name != DOT_PRODUCT_ATTENTION_COMPOSITE_NAME && name != DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME {
             return Ok(None);
         }
+
         if key.version() != DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION {
             return Err(TypeError::invalid(format!(
-                "named composite `{key}` has attention definition version {}, but only version \
-                 {DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION} is supported",
+                "named composite `{}` has attention definition version {}, but only version {} is supported",
+                key,
                 key.version(),
+                DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION,
             )));
         }
-        let malformed = || TypeError::invalid(format!("named composite `{key}` is not a valid attention definition"));
-        let attribute = |name: &str| {
-            key.attributes()
-                .iter()
-                .find(|(attribute, _)| attribute == name)
-                .map(|(_, value)| value)
-                .ok_or_else(malformed)
-        };
+
+        let attribute =
+            |name: &str| {
+                key.attributes().iter().find(|(attribute, _)| attribute == name).map(|(_, value)| value).ok_or_else(
+                    || TypeError::invalid(format!("named composite `{key}` is not a valid attention definition")),
+                )
+            };
+
         let boolean = |name: &str| match attribute(name)? {
             CompositeAttribute::Boolean(value) => Ok(*value),
-            _ => Err(malformed()),
+            _ => Err(TypeError::invalid(format!("named composite `{key}` is not a valid attention definition"))),
         };
+
         let optional_float = |name: &str| match attribute(name)? {
             CompositeAttribute::Optional(None) => Ok(None),
             CompositeAttribute::Optional(Some(value)) => match value.as_ref() {
                 CompositeAttribute::Float(value) => Ok(Some(*value)),
-                _ => Err(malformed()),
+                _ => Err(TypeError::invalid(format!("named composite `{key}` is not a valid attention definition"))),
             },
-            _ => Err(malformed()),
+            _ => Err(TypeError::invalid(format!("named composite `{key}` is not a valid attention definition"))),
         };
-        let local_window = match attribute("local_window")? {
-            CompositeAttribute::Optional(None) => None,
-            CompositeAttribute::Optional(Some(value)) => match value.as_ref() {
-                CompositeAttribute::Sequence(values) => match values.as_slice() {
-                    [CompositeAttribute::Integer(left), CompositeAttribute::Integer(right)] => Some((
-                        usize::try_from(*left).map_err(|_| malformed())?,
-                        usize::try_from(*right).map_err(|_| malformed())?,
-                    )),
-                    _ => return Err(malformed()),
-                },
-                _ => return Err(malformed()),
-            },
-            _ => return Err(malformed()),
-        };
+
         let implementation = match attribute("implementation")? {
             CompositeAttribute::Integer(0) => AttentionImplementation::Automatic,
             CompositeAttribute::Integer(1) => AttentionImplementation::Portable,
             CompositeAttribute::Integer(2) => AttentionImplementation::Fused,
-            _ => return Err(malformed()),
+            _ => {
+                return Err(TypeError::invalid(format!("named composite `{key}` is not a valid attention definition")));
+            }
         };
+
         let configuration = AttentionConfiguration::new()
             .with_scale(optional_float("scale")?)
             .with_causal(boolean("causal")?)
-            .with_local_window(local_window)
+            .with_local_window(match attribute("local_window")? {
+                CompositeAttribute::Optional(None) => None,
+                CompositeAttribute::Optional(Some(value)) => {
+                    if let CompositeAttribute::Sequence(values) = value.as_ref()
+                        && let [CompositeAttribute::Integer(left), CompositeAttribute::Integer(right)] =
+                            values.as_slice()
+                        && let (Ok(left), Ok(right)) = (usize::try_from(*left), usize::try_from(*right))
+                    {
+                        Some((left, right))
+                    } else {
+                        return Err(TypeError::invalid(format!(
+                            "named composite `{key}` is not a valid attention definition"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(TypeError::invalid(format!(
+                        "named composite `{key}` is not a valid attention definition"
+                    )));
+                }
+            })
             .with_implementation(implementation)
             .with_dropout(optional_float("dropout_rate")?);
-        let present = |name: &str| boolean(name).map(|present| present.then_some(Placeholder));
+
         let input_structure = AttentionInputs {
-            bias: present("bias")?,
-            mask: present("mask")?,
-            query_sequence_lengths: present("query_sequence_lengths")?,
-            key_value_sequence_lengths: present("key_value_sequence_lengths")?,
-            dropout_state: present("dropout_state")?,
+            bias: boolean("bias")?.then_some(Placeholder),
+            mask: boolean("mask")?.then_some(Placeholder),
+            query_sequence_lengths: boolean("query_sequence_lengths")?.then_some(Placeholder),
+            key_value_sequence_lengths: boolean("key_value_sequence_lengths")?.then_some(Placeholder),
+            dropout_state: boolean("dropout_state")?.then_some(Placeholder),
             ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
         };
+
         let decoded = if name == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME {
             Self::Forward { configuration, input_structure, return_residual: boolean("residual")? }
         } else {
             Self::Backward { configuration, input_structure }
         };
+
         if &decoded.to_composite_key() != key {
-            return Err(malformed());
+            return Err(TypeError::invalid(format!("named composite `{key}` is not a valid attention definition")));
         }
+
         Ok(Some(decoded))
     }
 
-    /// Returns the value-independent configuration of the definition.
+    /// Returns the value-independent configuration of this [`AttentionKey`].
     #[inline]
     pub fn configuration(&self) -> AttentionConfiguration {
         match self {
@@ -425,7 +431,7 @@ impl AttentionKey {
         }
     }
 
-    /// Returns the structure of the [`AttentionInputs`] of the definition (i.e., which optional inputs are present).
+    /// Returns the structure of the [`AttentionInputs`] of this [`AttentionKey`].
     #[inline]
     pub fn input_structure(&self) -> AttentionInputs<Placeholder> {
         match self {
@@ -434,6 +440,22 @@ impl AttentionKey {
     }
 
     /// Returns the [`CompositeKey`] of the named composite of this definition.
+    /// Its name is [`DOT_PRODUCT_ATTENTION_COMPOSITE_NAME`] for a forward definition and
+    /// [`DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME`] for a backward definition, and its version is
+    /// [`DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION`]. Its attributes flatten the fields of this key, in
+    /// the order of the following list:
+    ///
+    ///   - `scale`: Explicit score scale of the configuration, if any.
+    ///   - `causal`: Whether the configuration enables causal masking.
+    ///   - `local_window`: Inclusive `[left, right]` local window radii of the configuration, if any.
+    ///   - `implementation`: [`AttentionImplementation`] that the configuration requests, which is `0` for automatic,
+    ///     `1` for portable, and `2` for fused.
+    ///   - `dropout_rate`: Dropout rate of the configuration, if any.
+    ///   - `residual`: Whether the definition also returns the log-sum-exp residual of its softmax. Only the keys of
+    ///     forward definitions have this attribute.
+    ///   - `bias`, `mask`, `query_sequence_lengths`, `key_value_sequence_lengths`, and `dropout_state`: Whether the
+    ///     input structure contains the corresponding optional input.
+    #[inline]
     pub fn to_composite_key(&self) -> CompositeKey {
         match *self {
             Self::Forward { configuration, input_structure, return_residual } => attention_composite_key(
@@ -451,7 +473,7 @@ impl AttentionKey {
         }
     }
 
-    /// Returns the batching roles of the canonical inputs of this definition. Dropout states never reach batching
+    /// Returns the batching roles of the canonical inputs of this [`AttentionKey`]. Dropout states never reach batching
     /// rules, because definitions with dropout are batched structurally.
     fn batch_input_roles(&self) -> Vec<AttentionBatchInput> {
         let input_structure = self.input_structure();
@@ -466,8 +488,8 @@ impl AttentionKey {
         roles
     }
 
-    /// Returns the batching roles of the `output_count` outputs of this definition. A backward definition returns a
-    /// bias cotangent, whose bias is always the fourth canonical input, only when the bias is present and its
+    /// Returns the batching roles of the `output_count` outputs of this definition. A backward definition returns
+    /// a bias cotangent, whose bias is always the fourth canonical input, only when the bias is present and its
     /// cotangent space is not zero-dimensional.
     fn batch_output_roles(&self, output_count: usize) -> Vec<AttentionBatchOutput> {
         match self {
@@ -490,7 +512,7 @@ impl AttentionKey {
     }
 }
 
-/// Backend implementation requested for attention.
+/// Backend implementation requested for an attention operation.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum AttentionImplementation {
     /// Uses a fused implementation when the active backend supports the complete configuration and otherwise uses
@@ -507,6 +529,7 @@ pub enum AttentionImplementation {
 }
 
 impl Display for AttentionImplementation {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Automatic => formatter.write_str("automatic"),
@@ -515,6 +538,8 @@ impl Display for AttentionImplementation {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Value-independent semantics of scaled dot-product attention.
 ///
@@ -1398,7 +1423,7 @@ enum AttentionBatchOutput {
 }
 
 /// Returns the [`CompositeKey`] named `name` with the attributes of `configuration` and `input_structure`, including
-/// the `residual` attribute when `residual` is present (refer to [`AttentionKey`] for the encoding).
+/// the `residual` attribute when `residual` is present (refer to [`AttentionKey::to_composite_key`] for the encoding).
 fn attention_composite_key(
     name: &'static str,
     configuration: AttentionConfiguration,
@@ -2821,17 +2846,25 @@ mod tests {
             AttentionKey::from_composite_key(&extended),
             Err(TypeError::invalid(format!("named composite `{extended}` is not a valid attention definition"))),
         );
-        let malformed = forward_key.attributes().iter().fold(
-            CompositeKey::new(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION),
-            |key, (name, value)| {
-                let value = if name == "implementation" { CompositeAttribute::Integer(3) } else { value.clone() };
-                key.with_attribute(name.clone(), value)
-            },
-        );
-        assert_eq!(
-            AttentionKey::from_composite_key(&malformed),
-            Err(TypeError::invalid(format!("named composite `{malformed}` is not a valid attention definition"))),
-        );
+        // An unknown implementation, a local window with a negative radius, and a local window that is not a pair of
+        // radii are all malformed.
+        for (malformed_name, malformed_value) in [
+            ("implementation", CompositeAttribute::Integer(3)),
+            ("local_window", CompositeAttribute::from(Some((-1i64, 0i64)))),
+            ("local_window", CompositeAttribute::from(Some(1i64))),
+        ] {
+            let malformed = forward_key.attributes().iter().fold(
+                CompositeKey::new(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION),
+                |key, (name, value)| {
+                    let value = if name == malformed_name { malformed_value.clone() } else { value.clone() };
+                    key.with_attribute(name.clone(), value)
+                },
+            );
+            assert_eq!(
+                AttentionKey::from_composite_key(&malformed),
+                Err(TypeError::invalid(format!("named composite `{malformed}` is not a valid attention definition"))),
+            );
+        }
         let missing =
             CompositeKey::new(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION)
                 .with_attribute("causal", false);
