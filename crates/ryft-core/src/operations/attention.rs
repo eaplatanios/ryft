@@ -687,40 +687,62 @@ impl Hash for AttentionConfiguration {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Query, key, value, and optional inputs supplied to scaled dot-product attention. Their canonical order is the order
-/// of the fields, which is the order of [`Parameterized::parameters`], and their structure (i.e.,
-/// [`Parameterized::parameter_structure`]) records which optional inputs are present.
+/// Query, key, value, and optional inputs supplied to a scaled dot-product attention operation. Their canonical order
+/// is the order of the fields of this struct, which is the order of [`Parameterized::parameters`], and their structure
+/// (i.e., [`Parameterized::parameter_structure`]) records which optional inputs are present.
+///
+/// # Shapes
+///
+/// The shapes of the inputs are written with one letter per axis, so that `BTNH` denotes a rank-4 array of shape
+/// `[B, T, N, H]`. The letters stand for the following extents.
+///
+///   | Letter | Extent                                                      |
+///   |--------|-------------------------------------------------------------|
+///   | `B`    | Number of batch items.                                      |
+///   | `T`    | Length of the query sequence (i.e., the target length).     |
+///   | `S`    | Length of the key/value sequence (i.e., the source length). |
+///   | `N`    | Number of query heads.                                      |
+///   | `K`    | Number of key/value heads, which must divide `N`.           |
+///   | `H`    | Size of each head (i.e., the head dimension).               |
+///
+/// The batch axis is optional. The query, key, and value have rank 3 for a single batch item and rank 4 for a batch.
+/// The attention scores, which the bias and the mask apply to, have one entry per batch item, query head, query
+/// position, and key/value position, so their shape is `[B, N, T, S]`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameterized)]
 pub struct AttentionInputs<P: Parameter> {
-    /// Query array in `TNH` or `BTNH` layout.
+    /// Query array of shape `[T, N, H]` or `[B, T, N, H]` (i.e., one vector of size `H` per query position and query
+    /// head).
     pub query: P,
 
-    /// Key array in `SKH` or `BSKH` layout.
+    /// Key array of shape `[S, K, H]` or `[B, S, K, H]` (i.e., one vector of size `H` per key/value position and
+    /// key/value head).
     pub key: P,
 
     /// Value array with the same logical shape as `key`.
     pub value: P,
 
-    /// Optional broadcastable additive bias.
+    /// Optional additive bias of the attention scores, of rank at most 4, which is broadcast to the score shape
+    /// `[B, N, T, S]` by aligning its axes with the trailing score axes.
     pub bias: Option<P>,
 
-    /// Optional broadcastable Boolean visibility mask.
+    /// Optional Boolean visibility mask of the attention scores, of rank at most 4, which is broadcast to the score
+    /// shape `[B, N, T, S]` like the bias. A key/value position is visible to a query position where it is `true`.
     pub mask: Option<P>,
 
-    /// Optional query sequence length of every batch item.
+    /// Optional rank-1 array with the query sequence length of every batch item (i.e., how many of the `T` query
+    /// positions of that item are valid).
     pub query_sequence_lengths: Option<P>,
 
-    /// Optional key/value sequence length of every batch item.
+    /// Optional rank-1 array with the key/value sequence length of every batch item (i.e., how many of the `S`
+    /// key/value positions of that item are valid).
     pub key_value_sequence_lengths: Option<P>,
 
     /// Optional random generator state of the dropout mask (refer to [`AttentionConfiguration::with_dropout`]), with
-    /// the [`RandomAlgorithm::state_type`](crate::RandomAlgorithm::state_type) of its algorithm. With a state, the
-    /// mask is a deterministic function of that state and backends never replace the dropout with a fused kernel that
-    /// draws its own mask. Without a state, backends may fuse the dropout (e.g., into the cuDNN attention kernel),
-    /// while Ryft's own implementations draw the mask from a fixed state (refer to
-    /// [`DropoutOperation`](crate::DropoutOperation)). It is only accepted together with a dropout rate.
+    /// the [`RandomAlgorithm::state_type`] of its algorithm. With a state, the mask is a deterministic function of
+    /// that state and backends never replace the dropout with a fused kernel that draws its own mask. Without a state,
+    /// backends may fuse the dropout (e.g., into the cuDNN attention kernel), while Ryft's own implementations draw
+    /// the mask from a fixed state (refer to [`DropoutOperation`](crate::DropoutOperation)). It is only accepted
+    /// together with a dropout rate.
     pub dropout_state: Option<P>,
 }
 
@@ -762,14 +784,14 @@ pub struct AttentionResiduals<P: Parameter> {
 }
 
 /// Scaled dot-product attention inference function, built by [`dot_product_attention`]. Each call stages one call of
-/// the named forward attention definition (refer to [`AttentionKey`]) for the structure of its inputs, which
-/// backends may replace with their own implementation of the definition (e.g., a fused kernel). The function
-/// owns its definitions, so it should be created once and called many times, which traces each definition's body once
+/// the named forward attention definition (refer to [`AttentionKey`]) for the structure of its inputs, which backends
+/// may replace with their own implementation of the definition (e.g., a fused kernel). The function owns its
+/// definitions, so it should be created once and called many times, which traces each definition's body once
 /// per input types and shares it, together with its lowering, across those calls.
 ///
 /// # Semantics
 ///
-/// For each batch item and query head, attention computes
+/// For each batch item and query head, attention computes:
 ///
 /// ```text
 /// softmax(scale * Q * transpose(K) + bias, visibility) * V.
@@ -788,11 +810,11 @@ pub struct AttentionResiduals<P: Parameter> {
 /// `f32`, and the masked logits are then converted to `f32` for the numerically stable softmax. Visibility is the
 /// conjunction of the explicit mask, causal ordering, the inclusive `(left, right)` local window, and both sequence
 /// length predicates. Invisible scores use a finite large negative value in the logits type, and query rows beyond
-/// their lengths are exact zeros. Without a configured scale, attention uses `1 / sqrt(H)`. Every batch item uses the
-/// same rectangular storage shape, and sequence lengths control visibility within that storage.
+/// their lengths are exact zeros. Without a configured scale, attention uses `1 / sqrt(H)`. Every batch item uses
+/// the same rectangular storage shape, and sequence lengths control visibility within that storage.
 ///
-/// [`DotProductAttention::call_with_residual`] also returns the log-sum-exp residual (i.e., the natural logarithm of
-/// the sum of the exponentiated logits), which has the `TN` or `BTN` form and the query data type. With
+/// [`DotProductAttention::call_with_residual`] also returns the log-sum-exp residual (i.e., the natural
+/// logarithm of the sum of the exponentiated logits), which has the `TN` or `BTN` form and the query data type. With
 /// [`AttentionConfiguration::with_dropout`], the attention weights are dropped and rescaled by [`Dropout`] with the
 /// dropout state of the inputs, which determines the mask (refer to [`AttentionInputs::dropout_state`]). Dropout
 /// supports sharding only along the broadcast axes of its input, so attention with dropout over sharded inputs runs
@@ -808,32 +830,35 @@ pub struct AttentionResiduals<P: Parameter> {
 /// Batching a call folds its mapped axis into the logical batch axis and calls the same definition at the folded
 /// boundary, which keeps backend implementations for batched calls, while calls with dropout are batched structurally
 /// and calls with dropout and the fused implementation cannot be batched. The named definitions have no derivative
-/// rules, so differentiating a call fails. Use [`differentiable_dot_product_attention`] for the training path.
+/// rules, so differentiating a call fails. Use [`differentiable_dot_product_attention`] for the differentiable path.
 pub struct DotProductAttention<C: Domain>
 where
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    /// Named attention definitions staged by this function.
+    /// [`AttentionDefinitions`] staged by this [`DotProductAttention`] operation.
     definitions: AttentionDefinitions<C::Constant, C::Operation>,
 }
 
 impl<C: Domain> DotProductAttention<C>
 where
+    C::Type: ArrayMemberType + From<ArrayType> + BatchableType,
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: ArrayMemberType + From<ArrayType> + BatchableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>,
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
         + CompositeCallContext<Type = C::Type, Value = DomainTracer<C>, Constant = C::Constant, Operation = C::Operation>,
 {
-    /// Returns the configuration of this function.
+    /// Returns the [`AttentionConfiguration`] of this [`DotProductAttention`].
     #[inline]
     pub fn configuration(&self) -> AttentionConfiguration {
         self.definitions.configuration()
     }
 
-    /// Aligns the manual variation of `inputs` and stages one attention call, returning the attended output.
+    // TODO(eaplatanios): Review from here onwards.
+
+    /// Aligns the manual variation of `inputs` and stages one [`DotProductAttention`] call, returning
+    /// the attended output.
     ///
     /// # Errors
     ///
