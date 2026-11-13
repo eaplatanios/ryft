@@ -2634,16 +2634,13 @@ where
     ))
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Batches one attention call by folding its mapped axis into attention's batch axis, staging the definition once at
-/// the folded boundary through `call`, and restoring the outputs, which are all mapped at axis `0`.
-///
-/// The [module documentation](self#batching) describes the steps and their shapes. Normalizing biases and masks to
-/// the score shape handles every broadcastable rank and preserves mapped bias and mask inputs, and a bias cotangent is
+/// Batches one attention call by folding its mapped axis into attention's batch axis, staging the definition
+/// once at the folded boundary through `call`, and restoring the outputs, which are all mapped at axis `0`. The
+/// [module documentation](self#batching) describes the steps and their shapes. Normalizing biases and masks to the
+/// score shape handles every broadcastable rank and preserves mapped bias and mask inputs, and a bias cotangent is
 /// reduced over precisely the axes that its logical bias input broadcasts. Every extent is read from an input with
-/// [`DimensionSize`], so a dynamic mapped extent, logical batch, or sequence length never becomes host metadata. Calls
-/// whose inputs are all replicated stage the unbatched definition.
+/// [`DimensionSize`], so a dynamic mapped extent, logical batch, or sequence length never becomes host metadata.
+/// Calls whose inputs are all replicated stage the unbatched definition.
 fn batch_attention<
     V: Value<Type: ArrayMemberType>
         + Reduce
@@ -2652,21 +2649,25 @@ fn batch_attention<
         + DimensionSize<Extent: Clone + Mul>
         + DynamicReshape<<V as DimensionSize>::Extent>
         + DynamicBroadcast<<V as DimensionSize>::Extent>,
+    OutputRolesFn: FnOnce(usize) -> Vec<AttentionBatchOutput>,
+    CallFn: FnOnce(Vec<V>) -> Result<Vec<V>, ProgramError>,
 >(
     inputs: Vec<V>,
     axes: Vec<BatchAxis>,
     input_roles: &[AttentionBatchInput],
-    output_roles: impl FnOnce(usize) -> Vec<AttentionBatchOutput>,
-    call: impl FnOnce(Vec<V>) -> Result<Vec<V>, ProgramError>,
+    output_roles_fn: OutputRolesFn,
+    call_fn: CallFn,
 ) -> Result<(Vec<V>, Vec<BatchAxis>), ProgramError> {
     check_count!("input", input_roles, inputs.len(), ProgramError);
     check_count!("input", axes, inputs.len(), ProgramError);
+
     let rank = |value: &V| -> Result<usize, ProgramError> { Ok(value.r#type().as_array_type()?.rank()) };
     let extents = |value: &V, start: usize| {
         (start..rank(value)?)
             .map(|axis| value.dimension_size(axis))
             .collect::<Result<Vec<_>, ProgramError>>()
     };
+
     let mapped_axes = inputs
         .iter()
         .zip(&axes)
@@ -2677,11 +2678,12 @@ fn batch_attention<
             None => Ok(None),
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
+
     // The mapped extent is the extent of every mapped input along its mapped axis.
     let Some((mapped_input, mapped_axis)) =
         inputs.iter().zip(&mapped_axes).find_map(|(input, axis)| axis.map(|axis| (input, axis)))
     else {
-        let outputs = call(inputs)?;
+        let outputs = call_fn(inputs)?;
         let output_axes = vec![BatchAxis::replicated(); outputs.len()];
         return Ok((outputs, output_axes));
     };
@@ -2708,8 +2710,10 @@ fn batch_attention<
             }
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
+
     let query_rank = rank(&aligned[0])? - 1;
     let key_rank = rank(&aligned[1])? - 1;
+
     // Rank-3 attention has no batch axis, so its mapped axis becomes the batch axis without a product.
     let batch_extent = if query_rank == 4 { Some(aligned[0].dimension_size(1)?) } else { None };
     let folded_batch_extent = match &batch_extent {
@@ -2736,11 +2740,6 @@ fn batch_attention<
     } else {
         None
     };
-    let score_extents = || {
-        score_extents.as_ref().ok_or_else(|| {
-            ProgramError::from(TypeError::invalid("attention batching produced a bias cotangent without a bias"))
-        })
-    };
 
     // Fold the mapped axis into attention's batch axis and stage the definition at the folded boundary.
     let folded = aligned
@@ -2756,7 +2755,12 @@ fn batch_attention<
                 }
                 AttentionBatchInput::Tensor => Ok(value.clone()),
                 AttentionBatchInput::Score => {
-                    let (normalized_extents, folded_extents) = score_extents()?;
+                    let (normalized_extents, folded_extents) = score_extents.as_ref().ok_or_else(|| {
+                        ProgramError::from(TypeError::invalid(
+                            "attention batching produced a bias cotangent without a bias",
+                        ))
+                    })?;
+
                     // A rank-4 bias or mask of rank-3 attention has a unit batch axis, which the normalized score
                     // shape of rank-3 attention does not have.
                     let value = if rank == normalized_extents.len() + 1 { value.squeeze(1)? } else { value.clone() };
@@ -2778,8 +2782,9 @@ fn batch_attention<
             }
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
-    let outputs = call(folded)?;
-    let output_roles = output_roles(outputs.len());
+
+    let outputs = call_fn(folded)?;
+    let output_roles = output_roles_fn(outputs.len());
     check_count!("output", output_roles, outputs.len(), ProgramError);
 
     // Restore the mapped axis of every output and reduce bias cotangents over the axes that their biases broadcast.
@@ -2806,11 +2811,17 @@ fn batch_attention<
                 None => Ok(output),
             },
             AttentionBatchOutput::Score(input_index) => {
-                let (normalized_extents, folded_extents) = score_extents()?;
+                let (normalized_extents, folded_extents) = score_extents.as_ref().ok_or_else(|| {
+                    ProgramError::from(TypeError::invalid(
+                        "attention batching produced a bias cotangent without a bias",
+                    ))
+                })?;
+
                 let normalized = match folded_extents {
                     Some(_) => output.dynamic_reshape(normalized_extents.as_slice())?,
                     None => output,
                 };
+
                 // The logical bias is right-aligned to the score axes that follow the mapped axis, without the unit
                 // batch axis that a rank-4 bias of rank-3 attention has.
                 let bias = &aligned[input_index];
@@ -2831,6 +2842,8 @@ fn batch_attention<
     let output_axes = vec![BatchAxis::from_position(0); outputs.len()];
     Ok((outputs, output_axes))
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 #[cfg(test)]
 mod tests {
