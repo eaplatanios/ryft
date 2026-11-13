@@ -796,8 +796,8 @@ impl<P: Parameter> AttentionInputs<P> {
 /// definition takes them paired with the incoming cotangent of the output (i.e., its inputs are
 /// `(AttentionResiduals<P>, P)`). The canonical order of those inputs is that of the forward inputs followed by the
 /// output, the residual, and the output cotangent, which is the order of [`Parameterized::parameters`]. The type is
-/// public because it appears in [`AttentionVjp`] and in the bounds of [`AttentionRules`], and its contents are private
-/// to the attention rules.
+/// public because it appears in the bounds of [`AttentionRules`] and of [`differentiable_dot_product_attention`], and
+/// its contents are private to the attention rules.
 #[derive(Clone, Debug, PartialEq, Parameterized)]
 pub struct AttentionResiduals<P: Parameter> {
     /// Forward inputs, including the present optional inputs.
@@ -948,11 +948,6 @@ where
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Reverse mode configuration of the named composites that stage differentiable attention. It is public because the
-/// bounds of [`differentiable_dot_product_attention`] name it.
-pub type AttentionVjp<V, O> =
-    SymbolicZeroVjp<V, O, AttentionInputs<RuleTracer<V, O>>, RuleTracer<V, O>, AttentionResiduals<RuleTracer<V, O>>>;
-
 /// Differentiable scaled dot-product attention function, built by [`differentiable_dot_product_attention`]. Each
 /// call stages one call of a named composite (refer to [`DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME`]) with
 /// reverse mode rules, whose primal calls the forward attention definition and whose rules call the forward
@@ -982,7 +977,13 @@ where
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>
         + CompositeVjp<
-            AttentionVjp<C::Constant, C::Operation>,
+            SymbolicZeroVjp<
+                C::Constant,
+                C::Operation,
+                AttentionInputs<DomainTracer<C>>,
+                DomainTracer<C>,
+                AttentionResiduals<DomainTracer<C>>,
+            >,
             DomainTracer<C>,
             AttentionInputs<DomainTracer<C>>,
             DomainTracer<C>,
@@ -1160,7 +1161,13 @@ where
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>
         + CompositeVjp<
-            AttentionVjp<C::Constant, C::Operation>,
+            SymbolicZeroVjp<
+                C::Constant,
+                C::Operation,
+                AttentionInputs<DomainTracer<C>>,
+                DomainTracer<C>,
+                AttentionResiduals<DomainTracer<C>>,
+            >,
             DomainTracer<C>,
             AttentionInputs<DomainTracer<C>>,
             DomainTracer<C>,
@@ -1424,8 +1431,14 @@ type BackwardFunction<V, O> =
     AttentionFunction<BackwardFolding<V, O>, Composite<V, O, BackwardInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>>;
 
 /// Named composite that stages differentiable attention for one input structure.
-type DifferentiableFunction<V, O> =
-    Composite<V, O, AttentionInputs<RuleTracer<V, O>>, RuleTracer<V, O>, DefaultJvp, AttentionVjp<V, O>>;
+type DifferentiableFunction<V, O> = Composite<
+    V,
+    O,
+    AttentionInputs<RuleTracer<V, O>>,
+    RuleTracer<V, O>,
+    DefaultJvp,
+    SymbolicZeroVjp<V, O, AttentionInputs<RuleTracer<V, O>>, RuleTracer<V, O>, AttentionResiduals<RuleTracer<V, O>>>,
+>;
 
 /// Shared normalized inputs and masked logits consumed by the forward and backward attention bodies.
 struct PreparedAttention<V> {
@@ -1510,9 +1523,9 @@ fn attention_composite_key(
         .with_attribute("dropout_state", input_structure.dropout_state.is_some())
 }
 
-/// Validates one forward attention boundary (i.e., the [`AttentionInputs`] of `input_structure` in canonical order) and
-/// returns the types of its outputs. The first output is the attended output, which has the query type and therefore
-/// propagates the query's metadata (e.g., its sharding), and it is followed by the log-sum-exp residual when
+/// Validates one forward attention boundary (i.e., the [`AttentionInputs`] of `input_structure` in canonical order)
+/// and returns the types of its outputs. The first output is the attended output, which has the query type and
+/// therefore propagates the query's metadata (e.g., its sharding), and it is followed by the log-sum-exp residual when
 /// `return_residual` is set. Every input must have matching manual variation, and reduced and unreduced inputs are
 /// rejected, because softmax and the log-sum-exp residual preserve neither partial sums nor replicas that are filled
 /// with zeros.
@@ -1525,17 +1538,21 @@ fn attention_forward_output_types(
 ) -> Result<Vec<ArrayType>, TypeError> {
     if input_types.len() != input_structure.parameter_count() {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` expects {} inputs for its input structure but got {}",
+            "`{}` expects {} inputs for its input structure but got {}",
+            operation_name,
             input_structure.parameter_count(),
             input_types.len(),
         )));
     }
+
     let types = AttentionInputTypes::forward(input_structure, input_types)?;
     let dimensions = validate_attention_boundary(operation_name, configuration, &types, input_types)?;
     let mut output_types = vec![types.query.clone()];
+
     if return_residual {
         output_types.push(attention_residual_type(&dimensions, types.query)?);
     }
+
     Ok(output_types)
 }
 
@@ -1552,39 +1569,49 @@ fn attention_backward_output_types(
 ) -> Result<Vec<ArrayType>, TypeError> {
     if input_types.len() != input_structure.parameter_count() + 3 {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` expects {} inputs for its input structure but got {}",
+            "`{}` expects {} inputs for its input structure but got {}",
+            operation_name,
             input_structure.parameter_count() + 3,
             input_types.len(),
         )));
     }
+
     let types = AttentionInputTypes::backward(input_structure, input_types)?;
     let dimensions = validate_attention_boundary(operation_name, configuration, &types, input_types)?;
+
     let matches_expected = |actual: &ArrayType, expected: &ArrayType| -> bool {
         actual.data_type() == expected.data_type() && actual.shape() == expected.shape()
     };
+
     if !matches_expected(types.output.unwrap(), types.query) {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` output type {} does not match the expected forward output type {}",
+            "`{}` output type {} does not match the expected forward output type {}",
+            operation_name,
             types.output.unwrap(),
             types.query,
         )));
     }
+
     let expected_output_cotangent_type = types.query.cotangent()?;
     if !matches_expected(types.output_cotangent.unwrap(), &expected_output_cotangent_type) {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` output cotangent type {} does not match the expected cotangent type \
-             {expected_output_cotangent_type}",
+            "`{}` output cotangent type {} does not match the expected cotangent type {}",
+            operation_name,
             types.output_cotangent.unwrap(),
+            expected_output_cotangent_type,
         )));
     }
+
     let expected_residual_type = attention_residual_type(&dimensions, types.query)?;
     if !matches_expected(types.residual.unwrap(), &expected_residual_type) {
         return Err(TypeError::invalid(format!(
-            "`{operation_name}` residual type {} does not match the expected residual type \
-             {expected_residual_type}",
+            "`{}` residual type {} does not match the expected residual type {}",
+            operation_name,
             types.residual.unwrap(),
+            expected_residual_type,
         )));
     }
+
     let mut output_types = vec![types.query.cotangent()?, types.key.cotangent()?, types.value.cotangent()?];
     if let Some(bias) = types.bias {
         let bias_cotangent = bias.cotangent()?;
@@ -1592,6 +1619,7 @@ fn attention_backward_output_types(
             output_types.push(bias_cotangent);
         }
     }
+
     Ok(output_types)
 }
 
@@ -1617,23 +1645,29 @@ fn validate_attention_boundary(
         let Some(lengths_type) = lengths_type else {
             continue;
         };
+
         if lengths_type.data_type() != DataType::I32 {
             return Err(TypeError::invalid(format!(
-                "`{operation_name}` {descriptor} must have data type `i32` but got `{}`",
+                "`{}` {} must have data type `i32` but got `{}`",
+                operation_name,
+                descriptor,
                 lengths_type.data_type(),
             )));
         }
+
         match lengths_type.shape().dimensions() {
             [size] if size == &dimensions.batch => {}
             [size] => {
                 return Err(TypeError::invalid(format!(
-                    "`{operation_name}` {descriptor} size ({size}) does not match the batch dimension ({})",
-                    dimensions.batch,
+                    "`{}` {} size ({}) does not match the batch dimension ({})",
+                    operation_name, descriptor, size, dimensions.batch,
                 )));
             }
-            ref lengths_dimensions => {
+            lengths_dimensions => {
                 return Err(TypeError::invalid(format!(
-                    "`{operation_name}` {descriptor} must have rank 1 but got rank {}",
+                    "`{}` {} must have rank 1 but got rank {}",
+                    operation_name,
+                    descriptor,
                     lengths_dimensions.len(),
                 )));
             }
@@ -1659,8 +1693,8 @@ fn validate_attention_boundary(
         RandomAlgorithm::from_state_type(state_type)?;
     }
 
-    // Softmax and the log-sum-exp residual preserve neither partial sums nor replicas that are filled with zeros, so
-    // reduced and unreduced inputs have no meaningful attention.
+    // Softmax and the log-sum-exp residual preserve neither partial sums nor replicas that are filled with zeros,
+    // so reduced and unreduced inputs have no meaningful attention.
     for input_type in input_types {
         if !input_type.reduced_axes().is_empty() {
             return Err(TypeError::invalid(format!("`{operation_name}` does not support reduced inputs")));
@@ -1669,8 +1703,11 @@ fn validate_attention_boundary(
             return Err(TypeError::invalid(format!("`{operation_name}` does not support unreduced inputs")));
         }
     }
+
     Ok(dimensions)
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Validates the input contract that the attention definitions share (i.e., the `TNH` or `BTNH` query, key, and value
 /// shapes and data types, the divisibility of the query heads by the key/value heads, and the optional broadcastable
