@@ -3049,7 +3049,7 @@ mod tests {
     #[test]
     fn test_attention_configuration_equality_and_hashing() {
         // Equal configurations are equal and hash identically, so they work as map keys, and configurations that
-        // differ in any field are distinct.
+        // differ in causal masking or in their dropout rate are distinct.
         let configuration = AttentionConfiguration::new().with_scale(0.25).with_causal(true).with_dropout(0.1);
         let same_configuration = AttentionConfiguration::new().with_scale(0.25).with_causal(true).with_dropout(0.1);
         assert_eq!(configuration, same_configuration);
@@ -3537,6 +3537,8 @@ mod tests {
     fn test_dot_product_attention_type_inference() {
         let query = ArrayType::new_static(DataType::F32, [2, 2, 2]);
         let key_value = ArrayType::new_static(DataType::F32, [3, 1, 2]);
+        let bias = ArrayType::new_static(DataType::F64, [3]);
+        let mask = ArrayType::new_static(DataType::Boolean, [2, 3]);
         let lengths = ArrayType::new_static(DataType::I32, [1]);
         let input_structure = AttentionInputs {
             bias: Some(Placeholder),
@@ -3550,10 +3552,10 @@ mod tests {
             query.clone(),
             key_value.clone(),
             key_value.clone(),
-            ArrayType::new_static(DataType::F64, [3]),
-            ArrayType::new_static(DataType::Boolean, [2, 3]),
+            bias.clone(),
+            mask.clone(),
             lengths.clone(),
-            lengths,
+            lengths.clone(),
         ];
 
         // The attended output has the query type, and the residual drops the head dimension of the query.
@@ -3593,10 +3595,11 @@ mod tests {
                 ),
         ));
 
-        // The query, key, and value must be rank-3 or rank-4 floating-point arrays that agree on their data type and
-        // on their batch, sequence, heads, and head dimensions, with static heads and head dimensions and key/value
-        // heads that divide the query heads. A bias and a mask must broadcast to the scores, the mask must be Boolean,
-        // and sequence lengths hold one `i32` length per batch item.
+        // The query, key, and value must be rank-3 or rank-4 floating-point arrays that agree on their data type,
+        // batch dimension, and head dimension, and the key and value must also agree on their sequence and heads
+        // dimensions. The heads and head dimensions must be static, and the key/value heads must divide the query
+        // heads. A bias and a mask must have rank at most 4 and broadcast to the scores, the bias must be numeric
+        // or Boolean, the mask must be Boolean, and sequence lengths hold one `i32` length per batch item.
         let extent = Dimension::Dynamic(DimensionVariable::new("extent", DimensionBounds::positive(Some(4)).unwrap()));
         let plain = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
         let scored = AttentionInputs { bias: Some(Placeholder), mask: Some(Placeholder), ..plain };
@@ -3605,9 +3608,6 @@ mod tests {
             key_value_sequence_lengths: Some(Placeholder),
             ..plain
         };
-        let bias = ArrayType::new_static(DataType::F64, [3]);
-        let mask = ArrayType::new_static(DataType::Boolean, [2, 3]);
-        let lengths = ArrayType::new_static(DataType::I32, [1]);
         for (input_structure, input_types, message) in [
             (
                 plain,
@@ -3915,7 +3915,8 @@ mod tests {
             Err(TypeError::Invalid { message, .. })
                 if message == format!(
                     "`{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` inputs must have matching varying manual axes; insert \
-                     `{PARALLEL_VARY_OPERATION_NAME}` on the inputs that lack an axis, as `align_manual_variation` does",
+                     `{PARALLEL_VARY_OPERATION_NAME}` on the inputs that lack an axis, as `align_manual_variation` \
+                     does",
                 ),
         ));
         assert!(matches!(
@@ -5128,8 +5129,8 @@ mod tests {
             .trim_end(),
         );
 
-        // A structurally zero output cotangent (i.e., of an unused output) makes every input cotangent a structural
-        // zero without staging the backward definition.
+        // An unused output has a structurally zero cotangent, so reverse mode stages no backward definition. The
+        // query and key cotangents are zeros, and the value cotangent comes only from the direct use of the value.
         let (_, program) = ArrayContext::trace(
             |inputs: AttentionInputs<_>| {
                 differentiate_at(inputs)
@@ -5570,7 +5571,7 @@ mod tests {
             AttentionConfiguration::new().with_dropout(0.5).with_implementation(AttentionImplementation::Fused);
         let AttentionFunction::Folding(backward) = backward_definition::<Array, ArrayOperation<Array>>(configuration)
         else {
-            panic!("backward definitions with dropout and the fused implementation reject batching in their rule");
+            panic!("expected a folding backward definition for dropout with the fused implementation");
         };
         let ones = f32_array(&[1, 1, 1, 1], &[1.0]);
         let residuals = AttentionResiduals {
