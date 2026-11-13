@@ -1091,103 +1091,98 @@ where
     // The primal and the rules of the named composite call these definitions, which they own.
     let definitions = Arc::new(AttentionDefinitions::new(configuration));
 
-    // The composite returns only the attended output, whose type the forward boundary determines.
-    let output_types = move |input_types: AttentionInputs<C::Type>| -> Result<C::Type, ProgramError> {
-        let input_structure = input_types.parameter_structure();
-        let input_types = input_types
-            .parameters()
-            .map(|r#type| r#type.as_array_type().cloned())
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut output_types = attention_forward_output_types(
-            DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-            configuration,
-            input_structure,
-            false,
-            input_types.as_slice(),
-        )?;
-        check_count!("output", output_types, 1, ProgramError);
-        Ok(output_types.remove(0).into())
-    };
-
-    // The primal stages the forward definition without its residual.
-    let primal = {
+    let function = composite({
+        // The primal stages the forward definition without its residual.
         let definitions = definitions.clone();
         move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<DomainTracer<C>, ProgramError> {
             let mut outputs = definitions.forward(inputs, false)?;
             check_count!("output", outputs, 1, ProgramError);
             Ok(outputs.remove(0))
         }
-    };
+    })
+    .with_symbolic_zero_vjp(
+        {
+            // The forward rule stages the forward definition with its residual, and it retains the inputs, the
+            // output, and the residual for the backward rule.
+            let definitions = definitions.clone();
+            move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<_, ProgramError> {
+                let mut outputs = definitions.forward(inputs.clone(), true)?;
+                check_count!("output", outputs, 2, ProgramError);
+                let residual = outputs.remove(1);
+                let output = outputs.remove(0);
+                Ok((output.clone(), AttentionResiduals { inputs, output, residual }))
+            }
+        },
+        move |residuals: AttentionResiduals<DomainTracer<C>>,
+              output_cotangent: MaybeZero<DomainTracer<C>>|
+              -> Result<_, ProgramError> {
+            // A structurally zero output cotangent (e.g., of an unused output) makes every input cotangent
+            // a structural zero, without staging the backward definition.
+            let MaybeZero::Value(output_cotangent) = output_cotangent else {
+                return residuals.inputs.try_map_parameters(|input| zero_cotangent(&input));
+            };
 
-    // The forward rule stages the forward definition with its residual, and it retains the inputs,
-    // the output, and the residual for the backward rule.
-    let forward = {
-        let definitions = definitions.clone();
-        move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<_, ProgramError> {
-            let mut outputs = definitions.forward(inputs.clone(), true)?;
-            check_count!("output", outputs, 2, ProgramError);
-            let residual = outputs.remove(1);
-            let output = outputs.remove(0);
-            Ok((output.clone(), AttentionResiduals { inputs, output, residual }))
-        }
-    };
-
-    let backward = move |residuals: AttentionResiduals<DomainTracer<C>>,
-                         output_cotangent: MaybeZero<DomainTracer<C>>|
-          -> Result<_, ProgramError> {
-        // A structurally zero output cotangent (e.g., of an unused output) makes every input cotangent
-        // a structural zero, without staging the backward definition.
-        let MaybeZero::Value(output_cotangent) = output_cotangent else {
-            return residuals.inputs.try_map_parameters(|input| zero_cotangent(&input));
-        };
-
-        // The backward definition returns the cotangents of the query, key, and value, and of a bias
-        // whose cotangent space is not zero-dimensional, so the cotangents of the other inputs (i.e., of
-        // the masks, sequence lengths, and dropout states, and of a bias with a zero-dimensional
-        // cotangent space) are structural zeros, which contribute nothing to their inputs' cotangents.
-        let inputs = &residuals.inputs;
-        let zero = |input: &Option<DomainTracer<C>>| input.as_ref().map(zero_cotangent).transpose();
-        let mask = zero(&inputs.mask)?;
-        let query_sequence_lengths = zero(&inputs.query_sequence_lengths)?;
-        let key_value_sequence_lengths = zero(&inputs.key_value_sequence_lengths)?;
-        let dropout_state = zero(&inputs.dropout_state)?;
-        let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
-        let mut outputs = definitions.backward((residuals, output_cotangent))?;
-        let bias = match bias_cotangent_type {
-            Some(_) if outputs.len() == 4 => Some(MaybeZero::Value(outputs.remove(3))),
-            Some(r#type) => Some(MaybeZero::Zero(r#type)),
-            None => None,
-        };
-        check_count!("output", outputs, 3, ProgramError);
-        let value = MaybeZero::Value(outputs.remove(2));
-        let key = MaybeZero::Value(outputs.remove(1));
-        let query = MaybeZero::Value(outputs.remove(0));
-        Ok(AttentionInputs {
-            query,
-            key,
-            value,
-            bias,
-            mask,
-            query_sequence_lengths,
-            key_value_sequence_lengths,
-            dropout_state,
-        })
-    };
-
-    let function = composite(primal)
-        .with_symbolic_zero_vjp(forward, backward)
-        .with_name(DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME)
-        .with_named_composite_per_structure(
-            move |input_structure: &AttentionInputs<Placeholder>| {
-                attention_composite_key(
-                    DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME,
-                    configuration,
-                    *input_structure,
-                    None,
-                )
-            },
-            output_types,
-        );
+            // The backward definition returns the cotangents of the query, key, and value, and of a bias
+            // whose cotangent space is not zero-dimensional, so the cotangents of the other inputs (i.e., of
+            // the masks, sequence lengths, and dropout states, and of a bias with a zero-dimensional
+            // cotangent space) are structural zeros, which contribute nothing to their inputs' cotangents.
+            let inputs = &residuals.inputs;
+            let mask = inputs.mask.as_ref().map(zero_cotangent).transpose()?;
+            let query_sequence_lengths = inputs.query_sequence_lengths.as_ref().map(zero_cotangent).transpose()?;
+            let key_value_sequence_lengths =
+                inputs.key_value_sequence_lengths.as_ref().map(zero_cotangent).transpose()?;
+            let dropout_state = inputs.dropout_state.as_ref().map(zero_cotangent).transpose()?;
+            let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
+            let mut outputs = definitions.backward((residuals, output_cotangent))?;
+            let bias = match bias_cotangent_type {
+                Some(_) if outputs.len() == 4 => Some(MaybeZero::Value(outputs.remove(3))),
+                Some(r#type) => Some(MaybeZero::Zero(r#type)),
+                None => None,
+            };
+            check_count!("output", outputs, 3, ProgramError);
+            let value = MaybeZero::Value(outputs.remove(2));
+            let key = MaybeZero::Value(outputs.remove(1));
+            let query = MaybeZero::Value(outputs.remove(0));
+            Ok(AttentionInputs {
+                query,
+                key,
+                value,
+                bias,
+                mask,
+                query_sequence_lengths,
+                key_value_sequence_lengths,
+                dropout_state,
+            })
+        },
+    )
+    .with_name(DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME)
+    .with_named_composite_per_structure(
+        move |input_structure: &AttentionInputs<Placeholder>| {
+            attention_composite_key(
+                DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME,
+                configuration,
+                *input_structure,
+                None,
+            )
+        },
+        // The composite returns only the attended output, whose type the forward boundary determines.
+        move |input_types: AttentionInputs<C::Type>| -> Result<C::Type, ProgramError> {
+            let input_structure = input_types.parameter_structure();
+            let input_types = input_types
+                .parameters()
+                .map(|r#type| r#type.as_array_type().cloned())
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut output_types = attention_forward_output_types(
+                DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                configuration,
+                input_structure,
+                false,
+                input_types.as_slice(),
+            )?;
+            check_count!("output", output_types, 1, ProgramError);
+            Ok(output_types.remove(0).into())
+        },
+    );
 
     DifferentiableDotProductAttention { configuration, function }
 }
