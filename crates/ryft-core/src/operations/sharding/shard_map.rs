@@ -1464,7 +1464,9 @@ impl ShardMapBoundary {
     /// uses the axes that those rules may communicate along, because they are traced in the scope of the original
     /// call, where the axes are still manual. It therefore uses the axes that its rules declare, or every candidate
     /// axis when they declare none (refer to [`CollectiveOperation::hidden_axes`] and to
-    /// [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)).
+    /// [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)). A declaration also promises that the rules
+    /// have no I/O effect, which the composite checks when it traces them, so releasing an axis that they do not use
+    /// never eliminates an occurrence of an effect that [`Self::batched_placement`] cannot see.
     fn used_manual_placement_axes<
         V: Value<Type = ArrayIrType>,
         O: Operation<Type = ArrayIrType> + CollectiveOperation,
@@ -1538,9 +1540,11 @@ impl ShardMapBoundary {
     /// sharding. Such axes must therefore come first in `placement_axes`, so that outputs keep the requested placement.
     /// Releasing an axis is rejected when `body` has an [`EffectClass::DeviceOrderedIo`] or an
     /// [`EffectClass::UnorderedIo`] effect, because every device along an active manual axis executes its own
-    /// occurrence of such an effect, and releasing the axis would eliminate all but one of them. A placement that
-    /// releases every active manual axis leaves the batched map without active manual axes, so its body runs once
-    /// on the global values, which is what each device along the released axes computed already.
+    /// occurrence of such an effect, and releasing the axis would eliminate all but one of them. The effects of `body`
+    /// exclude those of rules that are traced later, but an operation whose hidden axes are known promises that its
+    /// rules have no such effect (refer to [`HiddenAxes::Named`]), and every other one keeps the axes manual.
+    /// A placement that releases every active manual axis leaves the batched map without active manual axes,
+    /// so its body runs once on the global values, which is what each device along the released axes computed already.
     ///
     /// # Errors
     ///
@@ -1666,16 +1670,18 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// operation of the body has transform rules that are traced only when a transform requests them and may communicate
 /// along it. A composite call with retained custom differentiation or batching rules may communicate along the axes
 /// that it declares with [`Composite::with_rule_axes`](crate::Composite::with_rule_axes), and along every axis without
-/// a declaration (refer to [`CollectiveOperation::hidden_axes`]). A released axis becomes a free placement axis, which
-/// leaves a map without active manual axes when the placement releases all of them. Every other active manual placement
-/// axis counts as used and stays manual, but it does not partition the batch dimension of mapped inputs, so the batch
-/// is gathered along it on entry and the body runs over every batch item on every device along it, which per-item
-/// semantics requires, because each batch item needs the body at every coordinate along that axis. Each mapped output
-/// is then sliced inside the body to the block of the batch that its device holds along the gathered axes, and its
-/// batch dimension is tiled along them, ahead of the free placement axes. JAX instead splits the batch along such an
-/// axis and runs each batch item at a single coordinate along it, so that its collectives over the axis combine
-/// different batch items. Batching a map with mapped inputs or outputs therefore rejects a placement axis that an input
-/// or output sharding names (with a [`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`]), a placement that releases an
+/// a declaration (refer to [`CollectiveOperation::hidden_axes`]). A declaration also promises that those rules have no
+/// I/O effect, which the effects of the body cannot reveal, and the composite checks both promises when it traces its
+/// rules. A released axis becomes a free placement axis, which leaves a map without active manual axes when the
+/// placement releases all of them. Every other active manual placement axis counts as used and stays manual, but it
+/// does not partition the batch dimension of mapped inputs, so the batch is gathered along it on entry and the body
+/// runs over every batch item on every device along it, which per-item semantics requires, because each batch item
+/// needs the body at every coordinate along that axis. Each mapped output is then sliced inside the body to the block
+/// of the batch that its device holds along the gathered axes, and its batch dimension is tiled along them, ahead of
+/// the free placement axes. JAX instead splits the batch along such an axis and runs each batch item at a single
+/// coordinate along it, so that its collectives over the axis combine different batch items. Batching a map with
+/// mapped inputs or outputs therefore rejects a placement axis that an input or output sharding names (with a
+/// [`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`]), a placement that releases an
 /// active manual axis of a body with the [`EffectClass::DeviceOrderedIo`] or the [`EffectClass::UnorderedIo`] effect
 /// (with a [`ShardMapError::BatchAxisPlacedOnManualAxisWithIo`], because the released axis would stop executing one
 /// occurrence of the effect per device along it), a gathered batch extent that the devices along the gathered axes do
@@ -7499,9 +7505,10 @@ mod tests {
     };
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
     use crate::operations::collectives::parallel_sum_scatter::{ParallelSumScatter, ParallelSumScatterOperation};
-    use crate::operations::collectives::parallel_vary::PARALLEL_VARY_OPERATION_NAME;
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
-    use crate::operations::composites::{CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, composite};
+    use crate::operations::composites::{
+        COMPOSITE_OPERATION_NAME, CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, composite,
+    };
     use crate::operations::constants::one_like::{OneLike, OneLikeOperation};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
@@ -7654,6 +7661,89 @@ mod tests {
         ) -> Result<Vec<DifferentiationDual<Tracer<TestContext>>>, DifferentiationError> {
             Err(ProgramError::MalformedProgram("the test driver only linearizes".to_string()).into())
         }
+    }
+
+    /// Test-only interpretation driver that records every `print` that the regions it interprets bind, including the
+    /// prints of nested regions (e.g., the per device bindings of a `shard_map` body or the primal region of a
+    /// composite call), because standard error capture is not available here.
+    struct PrintRecordingDriver<'r, 'p> {
+        /// Regions attached to the interpreted operation.
+        regions: Vec<RegionRef<'r, TestValue, TestOperation>>,
+
+        /// Label and input of every bound `print`, in binding order, which the drivers of nested regions share.
+        prints: &'p RefCell<Vec<(String, TestValue)>>,
+    }
+
+    impl PrintRecordingDriver<'_, '_> {
+        /// Records `operation` if it is a `print` and binds it on `inputs`, interpreting its `regions` through a
+        /// driver that records the prints that they bind.
+        fn bind_recording(
+            &self,
+            context: &TestEagerContext,
+            operation: TestOperation,
+            regions: Vec<RegionRef<'_, TestValue, TestOperation>>,
+            inputs: &[TestValue],
+        ) -> Result<Vec<TestValue>, ProgramError> {
+            if let Some(print) = operation.projected_payload::<PrintOperation<ArrayType>>() {
+                self.prints.borrow_mut().push((print.label().to_string(), inputs[0].clone()));
+            }
+            if regions.is_empty() {
+                return context.bind(operation, AttachedRegions::Empty, inputs);
+            }
+            operation.interpret(context, &PrintRecordingDriver { regions, prints: self.prints }, inputs)
+        }
+    }
+
+    impl RegionDriver<TestValue, TestOperation> for PrintRecordingDriver<'_, '_> {
+        fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, TestValue, TestOperation>>
+        where
+            TestValue: 'r,
+            TestOperation: 'r,
+        {
+            self.regions.iter().copied()
+        }
+    }
+
+    impl InterpretationDriver<TestEagerContext> for PrintRecordingDriver<'_, '_> {
+        fn interpret_region(
+            &self,
+            context: &TestEagerContext,
+            index: usize,
+            inputs: Vec<TestValue>,
+        ) -> Result<Vec<TestValue>, ProgramError> {
+            let region = self.region(index)?;
+            region.interpret_with(
+                inputs,
+                |_, constant| Ok::<_, ProgramError>(constant.clone()),
+                |instruction, inputs| {
+                    let regions =
+                        instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
+                    self.bind_recording(context, instruction.operation().clone(), regions, inputs)
+                },
+            )
+        }
+
+        fn bind(
+            &self,
+            context: &TestEagerContext,
+            operation: TestOperation,
+            regions: AttachedRegions<'_, TestValue, TestOperation>,
+            inputs: &[TestValue],
+        ) -> Result<Vec<TestValue>, ProgramError> {
+            self.bind_recording(context, operation, regions.regions().collect(), inputs)
+        }
+    }
+
+    /// Interprets `program` on the reference backend and returns its outputs together with the label and input of
+    /// every `print` that it binds, in binding order, through a [`PrintRecordingDriver`].
+    fn interpret_recording_prints(
+        program: &TestProgram,
+        inputs: Vec<TestValue>,
+    ) -> Result<(Vec<TestValue>, Vec<(String, TestValue)>), ProgramError> {
+        let prints = RefCell::new(Vec::new());
+        let driver = PrintRecordingDriver { regions: vec![program.entry_region_ref()], prints: &prints };
+        let outputs = driver.interpret_region(&TestEagerContext::new(), 0, inputs)?;
+        Ok((outputs, prints.into_inner()))
     }
 
     /// Two-device manual mesh over `x`.
@@ -15397,48 +15487,6 @@ mod tests {
         // Standard error capture is not available here, so a driver that records every bound `print` observes the
         // effect order instead. Each `print` of the body runs once per device, in device order, on that device's local
         // value, and the prints of one device follow the program order of the body.
-        struct PrintRecordingDriver {
-            /// Body of the interpreted `shard_map`.
-            body: TestProgram,
-
-            /// Label and input of every bound `print`, in binding order.
-            prints: RefCell<Vec<(String, TestValue)>>,
-        }
-
-        impl RegionDriver<TestValue, TestOperation> for PrintRecordingDriver {
-            fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, TestValue, TestOperation>>
-            where
-                TestValue: 'r,
-                TestOperation: 'r,
-            {
-                std::iter::once(self.body.entry_region_ref())
-            }
-        }
-
-        impl InterpretationDriver<EagerContext<TestValue, TestOperation>> for PrintRecordingDriver {
-            fn interpret_region(
-                &self,
-                context: &EagerContext<TestValue, TestOperation>,
-                index: usize,
-                inputs: Vec<TestValue>,
-            ) -> Result<Vec<TestValue>, ProgramError> {
-                self.region(index)?.interpret_in_context(context, inputs)
-            }
-
-            fn bind(
-                &self,
-                context: &EagerContext<TestValue, TestOperation>,
-                operation: TestOperation,
-                regions: AttachedRegions<'_, TestValue, TestOperation>,
-                inputs: &[TestValue],
-            ) -> Result<Vec<TestValue>, ProgramError> {
-                if let Some(print) = operation.projected_payload::<PrintOperation<ArrayType>>() {
-                    self.prints.borrow_mut().push((print.label().to_string(), inputs[0].clone()));
-                }
-                context.bind(operation, regions, inputs)
-            }
-        }
-
         let mesh = manual_mesh();
         let sharded = sharded_along_x();
         let boundary = ShardMapBoundary::new(mesh, vec![sharded.clone()], vec![sharded.clone()], Vec::new()).unwrap();
@@ -15453,7 +15501,8 @@ mod tests {
         });
         let operation =
             ShardMapOperation::from_program(&body, vec![ArrayIrType::Array(f32_type(&[4], None))], boundary).unwrap();
-        let driver = PrintRecordingDriver { body, prints: RefCell::new(Vec::new()) };
+        let prints = RefCell::new(Vec::new());
+        let driver = PrintRecordingDriver { regions: vec![body.entry_region_ref()], prints: &prints };
         assert_eq!(
             operation.interpret(
                 &EagerContext::<TestValue, TestOperation>::new(),
@@ -15463,7 +15512,7 @@ mod tests {
             Ok(vec![f32_value(f32_type(&[4], Some(sharded)), &[2.0, 4.0, 6.0, 8.0])]),
         );
         assert_eq!(
-            driver.prints.into_inner(),
+            prints.into_inner(),
             vec![
                 ("a".to_string(), f32_value(local_type.clone(), &[1.0, 2.0])),
                 ("a".to_string(), f32_value(local_type.clone(), &[3.0, 4.0])),
@@ -19941,11 +19990,12 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_batching_releases_batch_axes_that_rules_use_without_declaring_them() {
-        // A wrong declaration is not checked. The custom forward mode rule of an identity composite reduces over `x`,
-        // but the composite declares that its rules communicate along no axis, so a batch placed on `x` releases `x`.
-        // The later forward mode derivative traces the rule, which stages its reduction over `x` in a map that no
-        // longer makes `x` manual, so executing it fails.
+    fn test_shard_map_batching_rejects_traced_rules_that_communicate_along_undeclared_axes() {
+        // A declaration is checked when a rule is traced. The custom forward mode rule of an identity composite reduces
+        // over `x`, but the composite declares that its rules communicate along no axis, so a batch placed on `x`
+        // releases `x`. The later forward mode derivative traces the rule in the scope of the original call, where `x`
+        // is a manual mesh axis, and rejects it, rather than staging its reduction over `x` in a map that no longer
+        // makes `x` manual.
         let mesh = manual_mesh();
         let replicated = Sharding::replicated(mesh.clone(), 0);
         let program = trace_test_program(
@@ -19985,17 +20035,275 @@ mod tests {
             .unwrap()
             .into_parts()
             .0;
-        let derivative = batched.jvp_with_respect_to(&[1]).unwrap();
         assert!(matches!(
-            derivative.interpret(vec![
+            batched.jvp_with_respect_to(&[1]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message
+                    == format!(
+                        "`{COMPOSITE_OPERATION_NAME}` JVP rule communicates along mesh axis `x`, which the rule axes \
+                         declared with `with_rule_axes` do not allow",
+                    ),
+        ));
+    }
+
+    #[test]
+    fn test_shard_map_batching_rejects_traced_backward_rules_with_io_under_declared_rule_axes() {
+        // The custom backward rule of an identity composite prints its cotangent with the `DeviceOrderedIo` effect,
+        // which every device along `x` runs once. A declaration promises that the rules have no I/O, so the composite
+        // that declares no rule axes lets batching release `x`, but the pullback that traces its backward rule then
+        // rejects it, because the released `x` would run the print once instead of once per device.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = |declared: bool| {
+            trace_test_program(
+                |inputs| {
+                    vec![
+                        shard_map(
+                            |x: TestTracer| {
+                                let function = composite(|x: BodyTracer| Ok(x)).with_vjp(
+                                    |x: BodyTracer| Ok((x.clone(), x)),
+                                    |_: BodyTracer, cotangent: BodyTracer| {
+                                        cotangent.print_with_effect_class("cotangent", EffectClass::DeviceOrderedIo)
+                                    },
+                                );
+                                let function =
+                                    if declared { function.with_rule_axes(Vec::<String>::new()) } else { function };
+                                Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                            },
+                            inputs[0].clone(),
+                            mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )
+                        .unwrap(),
+                    ]
+                },
+                vec![f32_type(&[], None)],
+                Vec::new(),
+            )
+        };
+        let batch = |program: TestProgram| {
+            program
+                .batched_with_threaded_extent(
+                    DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                    ShardingDimension::sharded(["x"]),
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        let linearization = batch(program(true))
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[1], DifferentiationRule::JvpForTranspose, None)
+            .unwrap();
+        assert!(matches!(
+            linearization.pullback(),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message
+                    == format!(
+                        "`{COMPOSITE_OPERATION_NAME}` backward rule has the `DeviceOrderedIo` effect, which the rule \
+                         axes declared with `with_rule_axes` do not allow",
+                    ),
+        ));
+    }
+
+    #[test]
+    fn test_shard_map_batching_keeps_axes_of_backward_rules_with_io_without_declared_rule_axes() {
+        // The backward rule of `test_shard_map_batching_rejects_traced_backward_rules_with_io_under_declared_rule_axes`
+        // without a declaration of its rule axes. The rule may then use any axis, so `x` stays manual, the batch is
+        // gathered along it, and the pullback of the batched map prints its cotangent once per device along `x`, as the
+        // pullback of the map before batching does.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function = composite(|x: BodyTracer| Ok(x)).with_vjp(
+                                |x: BodyTracer| Ok((x.clone(), x)),
+                                |_: BodyTracer, cotangent: BodyTracer| {
+                                    cotangent.print_with_effect_class("cotangent", EffectClass::DeviceOrderedIo)
+                                },
+                            );
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[], None)],
+            Vec::new(),
+        );
+        let pullback_prints = |program: &TestProgram, active_input: usize, inputs: Vec<TestValue>| {
+            let linearization = program
+                .entry_region_ref()
+                .linearize_shared_for_rule(&[active_input], DifferentiationRule::JvpForTranspose, None)
+                .unwrap();
+            let pullback = linearization.pullback().unwrap().into_program();
+            let mut outputs = linearization.primal().interpret(inputs).unwrap();
+            let residuals = outputs.split_off(outputs.len() - linearization.residual_count());
+            let mut pullback_inputs = vec![unit_seed(outputs.last().unwrap())];
+            pullback_inputs.extend(residuals);
+            let (cotangents, prints) = interpret_recording_prints(&pullback, pullback_inputs).unwrap();
+            (arrays_f64(cotangents), prints.into_iter().map(|(label, value)| (label, arrays_f64(vec![value]))))
+        };
+
+        // Before batching, each of the two devices along `x` prints its unit cotangent.
+        let (cotangents, prints) = pullback_prints(&program, 0, vec![f32_value(f32_type(&[], None), &[3.0])]);
+        assert_eq!(cotangents, vec![vec![1.0]]);
+        assert_eq!(
+            prints.collect::<Vec<_>>(),
+            vec![("cotangent".to_string(), vec![vec![1.0]]), ("cotangent".to_string(), vec![vec![1.0]])],
+        );
+
+        // After batching, `x` stays manual, so each device still prints, now its cotangent of every batch item.
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::sharded(["x"]),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let map = batched
+            .instructions()
+            .iter()
+            .find_map(|instruction| instruction.operation().projected_payload::<ShardMapOperation>())
+            .unwrap();
+        assert_eq!(map.boundary().manual_axes(), &["x".to_string()]);
+        let (cotangents, prints) = pullback_prints(
+            &batched,
+            1,
+            vec![
                 TestValue::Dimension(DimensionValue::constant(2).unwrap()),
                 f32_value(f32_type(&[2], None), &[3.0, 4.0]),
-                f32_value(f32_type(&[2], None), &[1.0, 1.0]),
-            ]),
-            Err(ProgramError::UnsupportedOperation { message })
+            ],
+        );
+        assert_eq!(cotangents, vec![vec![1.0, 1.0]]);
+        assert_eq!(
+            prints.collect::<Vec<_>>(),
+            vec![("cotangent".to_string(), vec![vec![1.0, 1.0]]), ("cotangent".to_string(), vec![vec![1.0, 1.0]])],
+        );
+    }
+
+    #[test]
+    fn test_shard_map_batching_rejects_traced_batching_rules_with_io_under_declared_rule_axes() {
+        // The custom batching rule of an identity composite prints its input with the `UnorderedIo` effect, which every
+        // device along `x` runs once. The composite that declares no rule axes lets batching release `x`, but batching
+        // its call then traces the rule and rejects it, because the released `x` would run the print only once.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function = composite(|x: BodyTracer| Ok(x))
+                                .with_batching(|x: BodyTracer, axis: BatchAxis, _: BatchingLevelExtent<BodyTracer>| {
+                                    Ok((x.print_with_effect_class("batch", EffectClass::UnorderedIo)?, axis))
+                                })
+                                .with_rule_axes(Vec::<String>::new());
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[], None)],
+            Vec::new(),
+        );
+        let result = program.batched_with_threaded_extent(
+            DimensionValue::constant(2).unwrap().r#type().into_owned(),
+            ShardingDimension::sharded(["x"]),
+            &[BatchAxis::new(0)],
+            ProgramBatchingOutputAxesPolicy::Natural,
+        );
+        assert!(matches!(
+            result,
+            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
                 if message
-                    == format!("`{PARALLEL_VARY_OPERATION_NAME}` requires an active non-empty manual mesh axis `x`"),
+                    == format!(
+                        "`{COMPOSITE_OPERATION_NAME}` batching rule has the `UnorderedIo` effect, which the rule axes \
+                         declared with `with_rule_axes` do not allow",
+                    ),
         ));
+    }
+
+    #[test]
+    fn test_shard_map_batching_keeps_axes_of_batching_rules_with_io_without_declared_rule_axes() {
+        // The batching rule of `test_shard_map_batching_rejects_traced_batching_rules_with_io_under_declared_rule_axes`
+        // without a declaration of its rule axes. The rule may then use any axis, so a batch placed on `x` keeps `x`
+        // manual and gathers the batch along it, and the batched map prints once per device along `x`, as the map
+        // batched with a replicated batch axis does.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function = composite(|x: BodyTracer| Ok(x)).with_batching(
+                                |x: BodyTracer, axis: BatchAxis, _: BatchingLevelExtent<BodyTracer>| {
+                                    Ok((x.print_with_effect_class("batch", EffectClass::UnorderedIo)?, axis))
+                                },
+                            );
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[], None)],
+            Vec::new(),
+        );
+        let batched_prints = |axis_sharding: ShardingDimension| {
+            let batched = program
+                .batched_with_threaded_extent(
+                    DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                    axis_sharding,
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0;
+            let map = batched
+                .instructions()
+                .iter()
+                .find_map(|instruction| instruction.operation().projected_payload::<ShardMapOperation>())
+                .unwrap();
+            assert_eq!(map.boundary().manual_axes(), &["x".to_string()]);
+            let inputs = vec![
+                TestValue::Dimension(DimensionValue::constant(2).unwrap()),
+                f32_value(f32_type(&[2], None), &[3.0, 4.0]),
+            ];
+            let (_, prints) = interpret_recording_prints(&batched, inputs).unwrap();
+            prints.into_iter().map(|(label, value)| (label, arrays_f64(vec![value]))).collect::<Vec<_>>()
+        };
+        let expected = vec![("batch".to_string(), vec![vec![3.0, 4.0]]), ("batch".to_string(), vec![vec![3.0, 4.0]])];
+        assert_eq!(batched_prints(ShardingDimension::Replicated), expected);
+        assert_eq!(batched_prints(ShardingDimension::sharded(["x"])), expected);
     }
 
     #[test]
