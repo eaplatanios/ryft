@@ -52,12 +52,11 @@ pub use assertions::{
     AssertionValue, GUARD_OPERATION_NAME, GuardOperation,
 };
 pub use attention::{
-    AttentionBackwardInputs, AttentionConfiguration, AttentionImplementation, AttentionInputs, AttentionKey,
-    AttentionOperations, AttentionResiduals, AttentionRules, AttentionVjp,
-    DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-    DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION, DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME,
-    DifferentiableDotProductAttention, DotProductAttention, differentiable_dot_product_attention,
-    dot_product_attention,
+    AttentionConfiguration, AttentionImplementation, AttentionInputs, AttentionKey, AttentionOperations,
+    AttentionResiduals, AttentionRules, AttentionVjp, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+    DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION,
+    DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, DifferentiableDotProductAttention, DotProductAttention,
+    differentiable_dot_product_attention, dot_product_attention,
 };
 pub use collectives::{
     AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveAxes, CollectiveMode, CollectiveOperation,

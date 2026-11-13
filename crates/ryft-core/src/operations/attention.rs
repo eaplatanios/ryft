@@ -12,9 +12,10 @@
 //!
 //!   - **Forward:** Named [`DOT_PRODUCT_ATTENTION_COMPOSITE_NAME`]. It maps the [`AttentionInputs`] to the attended
 //!     output, followed by the log-sum-exp residual of its softmax when its key requests it.
-//!   - **Backward:** Named [`DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME`]. It maps the [`AttentionBackwardInputs`]
-//!     (i.e., the forward inputs, the forward output, its residual, and the output cotangent) to the cotangents of the
-//!     query, key, and value, followed by that of a bias whose cotangent space is not zero-dimensional.
+//!   - **Backward:** Named [`DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME`]. It maps the [`AttentionResiduals`] of
+//!     a forward call and the cotangent of its output (i.e., the forward inputs, the forward output, its residual, and
+//!     the output cotangent, in that order) to the cotangents of the query, key, and value, followed by that of a bias
+//!     whose cotangent space is not zero-dimensional.
 //!
 //! The keys identify the computation for backends, kernel persistence, and shared lowering. A backend decodes them
 //! with [`AttentionKey::from_composite_key`] and then either lowers the portable body of the definition or replaces
@@ -246,9 +247,14 @@ pub trait AttentionRules<V: Value, O: Operation<Type = V::Type>>:
         AttentionInputs<RuleTracer<V, O>>,
         Vec<RuleTracer<V, O>>,
     > + CompositeBatching<
-        BroadcastInvariantBatching<V, O, AttentionBackwardInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>,
+        BroadcastInvariantBatching<
+            V,
+            O,
+            (AttentionResiduals<RuleTracer<V, O>>, RuleTracer<V, O>),
+            Vec<RuleTracer<V, O>>,
+        >,
         RuleTracer<V, O>,
-        AttentionBackwardInputs<RuleTracer<V, O>>,
+        (AttentionResiduals<RuleTracer<V, O>>, RuleTracer<V, O>),
         Vec<RuleTracer<V, O>>,
     >
 where
@@ -264,9 +270,14 @@ where
             AttentionInputs<RuleTracer<V, O>>,
             Vec<RuleTracer<V, O>>,
         > + CompositeBatching<
-            BroadcastInvariantBatching<V, O, AttentionBackwardInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>,
+            BroadcastInvariantBatching<
+                V,
+                O,
+                (AttentionResiduals<RuleTracer<V, O>>, RuleTracer<V, O>),
+                Vec<RuleTracer<V, O>>,
+            >,
             RuleTracer<V, O>,
-            AttentionBackwardInputs<RuleTracer<V, O>>,
+            (AttentionResiduals<RuleTracer<V, O>>, RuleTracer<V, O>),
             Vec<RuleTracer<V, O>>,
         >,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -310,8 +321,9 @@ pub enum AttentionKey {
     },
 
     /// Analytical backward attention, named [`DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME`], whose inputs are the
-    /// [`AttentionBackwardInputs`] and whose outputs are the cotangents of the query, key, and value, followed by that
-    /// of a present bias whose cotangent space is not zero-dimensional.
+    /// [`AttentionResiduals`] of a forward call followed by the cotangent of its output, and whose outputs are the
+    /// cotangents of the query, key, and value, followed by that of a present bias whose cotangent space is not
+    /// zero-dimensional.
     Backward {
         /// Value-independent configuration of the definition.
         configuration: AttentionConfiguration,
@@ -729,23 +741,24 @@ impl<P: Parameter> AttentionInputs<P> {
     }
 }
 
-/// Inputs of the backward attention definition, consisting of the forward [`AttentionInputs`], the attended forward
-/// output, its log-sum-exp residual, and the incoming cotangent of the output. Their canonical order is that of the
-/// forward inputs followed by the output, the residual, and the output cotangent, which is the order of
-/// [`Parameterized::parameters`].
+/// Residuals of one forward attention call that its backward pass consumes, consisting of the forward
+/// [`AttentionInputs`], the attended forward output, and its log-sum-exp residual. The reverse mode rules of
+/// differentiable attention retain them between the forward and the backward call, and the backward attention
+/// definition takes them paired with the incoming cotangent of the output (i.e., its inputs are
+/// `(AttentionResiduals<P>, P)`). The canonical order of those inputs is that of the forward inputs followed by the
+/// output, the residual, and the output cotangent, which is the order of [`Parameterized::parameters`]. The type is
+/// public because it appears in [`AttentionVjp`] and in the bounds of [`AttentionRules`], and its contents are private
+/// to the attention rules.
 #[derive(Clone, Debug, PartialEq, Parameterized)]
-pub struct AttentionBackwardInputs<P: Parameter> {
+pub struct AttentionResiduals<P: Parameter> {
     /// Forward inputs, including the present optional inputs.
-    pub inputs: AttentionInputs<P>,
+    inputs: AttentionInputs<P>,
 
     /// Attended forward output.
-    pub output: P,
+    output: P,
 
-    /// Log-sum-exp residual of the forward output.
-    pub residual: P,
-
-    /// Incoming cotangent of the forward output.
-    pub output_cotangent: P,
+    /// Log-sum-exp residual of the forward output, which the backward definition consumes.
+    residual: P,
 }
 
 /// Scaled dot-product attention inference function, built by [`dot_product_attention`]. Each call stages one call of
@@ -882,20 +895,6 @@ where
     DotProductAttention { definitions: AttentionDefinitions::new(configuration) }
 }
 
-/// Residuals retained by the reverse mode rules of differentiable attention. The type is public because it appears in
-/// [`AttentionVjp`], and its contents are private to those rules.
-#[derive(Clone, Debug, PartialEq, Parameterized)]
-pub struct AttentionResiduals<P: Parameter> {
-    /// Forward inputs, including the present optional inputs.
-    inputs: AttentionInputs<P>,
-
-    /// Attended forward output.
-    output: P,
-
-    /// Log-sum-exp residual of the forward output, which the backward definition consumes.
-    residual: P,
-}
-
 /// Reverse mode configuration of the named composites that stage differentiable attention. It is public because the
 /// bounds of [`differentiable_dot_product_attention`] name it.
 pub type AttentionVjp<V, O> =
@@ -1013,25 +1012,24 @@ where
                 let backward = move |residuals: AttentionResiduals<DomainTracer<C>>,
                                      output_cotangent: MaybeZero<DomainTracer<C>>|
                       -> Result<_, ProgramError> {
-                    let AttentionResiduals { inputs, output, residual } = residuals;
                     // A structurally zero output cotangent (e.g., of an unused output) makes every input cotangent
                     // a structural zero, without staging the backward definition.
                     let MaybeZero::Value(output_cotangent) = output_cotangent else {
-                        return inputs.try_map_parameters(|input| zero_cotangent(&input));
+                        return residuals.inputs.try_map_parameters(|input| zero_cotangent(&input));
                     };
 
                     // The backward definition returns the cotangents of the query, key, and value, and of a bias
                     // whose cotangent space is not zero-dimensional, so the cotangents of the other inputs (i.e., of
                     // the masks, sequence lengths, and dropout states, and of a bias with a zero-dimensional
                     // cotangent space) are structural zeros, which contribute nothing to their inputs' cotangents.
+                    let inputs = &residuals.inputs;
                     let zero = |input: &Option<DomainTracer<C>>| input.as_ref().map(zero_cotangent).transpose();
                     let mask = zero(&inputs.mask)?;
                     let query_sequence_lengths = zero(&inputs.query_sequence_lengths)?;
                     let key_value_sequence_lengths = zero(&inputs.key_value_sequence_lengths)?;
                     let dropout_state = zero(&inputs.dropout_state)?;
                     let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
-                    let mut outputs =
-                        definitions.backward(AttentionBackwardInputs { inputs, output, residual, output_cotangent })?;
+                    let mut outputs = definitions.backward((residuals, output_cotangent))?;
                     let bias = match bias_cotangent_type {
                         Some(_) if outputs.len() == 4 => Some(MaybeZero::Value(outputs.remove(3))),
                         Some(r#type) => Some(MaybeZero::Zero(r#type)),
@@ -1306,12 +1304,12 @@ where
 
     /// Stages one call of the backward definition at `inputs`, returning the cotangents of the query, key, and value,
     /// followed by that of a present bias whose cotangent space is not zero-dimensional.
-    fn backward<C, X>(&self, inputs: AttentionBackwardInputs<X>) -> Result<Vec<X>, ProgramError>
+    fn backward<C, X>(&self, inputs: BackwardInputs<X>) -> Result<Vec<X>, ProgramError>
     where
         C: CompositeCallContext<Type = V::Type, Value = X, Constant = V, Operation = O>,
         X: Value<Type = V::Type, Domain = C>,
     {
-        let input_structure = inputs.inputs.parameter_structure();
+        let input_structure = inputs.0.inputs.parameter_structure();
         let function = self
             .backward
             .lock()
@@ -1350,21 +1348,23 @@ impl<Folding, Structural> Clone for AttentionFunction<Folding, Structural> {
     }
 }
 
+/// Inputs of a backward definition, which pair the [`AttentionResiduals`] of a forward call with the incoming
+/// cotangent of its output.
+type BackwardInputs<P> = (AttentionResiduals<P>, P);
+
 /// Named composite of a forward definition that batches its calls by folding.
 type ForwardFolding<V, O> = BatchedComposite<V, O, AttentionInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>;
 
 /// Named composite of a backward definition that batches its calls by folding.
-type BackwardFolding<V, O> = BatchedComposite<V, O, AttentionBackwardInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>;
+type BackwardFolding<V, O> = BatchedComposite<V, O, BackwardInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>;
 
 /// Named composite of a forward definition.
 type ForwardFunction<V, O> =
     AttentionFunction<ForwardFolding<V, O>, Composite<V, O, AttentionInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>>;
 
 /// Named composite of a backward definition.
-type BackwardFunction<V, O> = AttentionFunction<
-    BackwardFolding<V, O>,
-    Composite<V, O, AttentionBackwardInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>,
->;
+type BackwardFunction<V, O> =
+    AttentionFunction<BackwardFolding<V, O>, Composite<V, O, BackwardInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>>;
 
 /// Named composite that stages differentiable attention for one input structure.
 type DifferentiableFunction<V, O> =
@@ -2272,13 +2272,13 @@ where
     }
 
     let key = AttentionKey::Backward { configuration, input_structure };
-    let output_types = move |input_types: AttentionBackwardInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
+    let output_types = move |input_types: BackwardInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
         // Every definition is specialized to the input structure that its key records.
-        if input_types.inputs.parameter_structure() != input_structure {
+        if input_types.0.inputs.parameter_structure() != input_structure {
             return Err(TypeError::invalid(format!(
                 "named composite `{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` was defined for the input \
                  structure {input_structure:?} but was called with {:?}",
-                input_types.inputs.parameter_structure(),
+                input_types.0.inputs.parameter_structure(),
             ))
             .into());
         }
@@ -2294,11 +2294,11 @@ where
         )?;
         Ok(output_types.into_iter().map(Into::into).collect())
     };
-    let body = move |inputs: AttentionBackwardInputs<RuleTracer<V, O>>| -> Result<Vec<RuleTracer<V, O>>, ProgramError> {
+    let body = move |inputs: BackwardInputs<RuleTracer<V, O>>| -> Result<Vec<RuleTracer<V, O>>, ProgramError> {
         // The forward output and its residual are validated inputs for backend implementations of this definition.
         // The portable body recomputes the probabilities instead of using them, so it only needs the forward inputs
         // and the output cotangent.
-        let AttentionBackwardInputs { inputs, output_cotangent, .. } = &inputs;
+        let (AttentionResiduals { inputs, .. }, output_cotangent) = &inputs;
         // The output type rule above has already validated this boundary, so the types are only needed for the
         // validated dimensions and the ranks of the query, key, and value.
         let input_types = inputs
@@ -2485,7 +2485,7 @@ where
     AttentionFunction::Folding(Arc::new_cyclic(|weak: &Weak<BackwardFolding<V, O>>| {
         let weak = weak.clone();
         let input_roles = key.batch_input_roles();
-        function.with_batching(move |inputs, axes: AttentionBackwardInputs<BatchAxis>, _| {
+        function.with_batching(move |inputs, axes: BackwardInputs<BatchAxis>, _| {
             // Refer to the forward definition for when the function may have been dropped.
             let function = match weak.upgrade() {
                 Some(function) => function,
@@ -2500,13 +2500,11 @@ where
                 input_roles.as_slice(),
                 |output_count| key.batch_output_roles(output_count),
                 |inputs| {
-                    let structure = AttentionBackwardInputs {
-                        inputs: input_structure,
-                        output: Placeholder,
-                        residual: Placeholder,
-                        output_cotangent: Placeholder,
-                    };
-                    function.call(AttentionBackwardInputs::from_parameters(structure, inputs)?)
+                    let structure = (
+                        AttentionResiduals { inputs: input_structure, output: Placeholder, residual: Placeholder },
+                        Placeholder,
+                    );
+                    function.call(<BackwardInputs<_>>::from_parameters(structure, inputs)?)
                 },
             )
         })
@@ -3097,31 +3095,36 @@ mod tests {
     }
 
     #[test]
-    fn test_attention_backward_inputs_parameters() {
-        // Backward inputs append the forward output, its residual, and the output cotangent to the forward inputs.
+    fn test_attention_residuals_parameters() {
+        // The inputs of the backward definition pair the residuals with the output cotangent, which appends the
+        // forward output, its residual, and the output cotangent to the forward inputs.
         let values = (0..7).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
-        let inputs = AttentionBackwardInputs {
-            inputs: AttentionInputs {
-                mask: Some(values[3].clone()),
-                ..AttentionInputs::new(values[0].clone(), values[1].clone(), values[2].clone())
+        let inputs = (
+            AttentionResiduals {
+                inputs: AttentionInputs {
+                    mask: Some(values[3].clone()),
+                    ..AttentionInputs::new(values[0].clone(), values[1].clone(), values[2].clone())
+                },
+                output: values[4].clone(),
+                residual: values[5].clone(),
             },
-            output: values[4].clone(),
-            residual: values[5].clone(),
-            output_cotangent: values[6].clone(),
-        };
-        let structure = AttentionBackwardInputs {
-            inputs: AttentionInputs {
-                mask: Some(Placeholder),
-                ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+            values[6].clone(),
+        );
+        let structure = (
+            AttentionResiduals {
+                inputs: AttentionInputs {
+                    mask: Some(Placeholder),
+                    ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+                },
+                output: Placeholder,
+                residual: Placeholder,
             },
-            output: Placeholder,
-            residual: Placeholder,
-            output_cotangent: Placeholder,
-        };
+            Placeholder,
+        );
         assert_eq!(inputs.parameter_structure(), structure);
         assert_eq!(inputs.parameter_count(), 7);
         assert_eq!(inputs.clone().into_parameters().collect::<Vec<_>>(), values);
-        assert_eq!(AttentionBackwardInputs::from_parameters(structure, values.iter().cloned()), Ok(inputs));
+        assert_eq!(<(AttentionResiduals<_>, _)>::from_parameters(structure, values.iter().cloned()), Ok(inputs));
     }
 
     #[test]
