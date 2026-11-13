@@ -539,12 +539,9 @@ impl Display for AttentionImplementation {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Value-independent semantics of scaled dot-product attention.
-///
-/// Equality and hashing compare the floating-point scale and dropout rate bitwise, so that configurations are faithful
-/// keys of the attributes that backends receive (e.g., `-0.0` and `+0.0` scales are distinct).
+/// Value-independent semantics of a scaled dot-product attention operation. Equality and hashing compare the
+/// floating-point scale and dropout rate bitwise, so that configurations are faithful keys of the attributes
+/// that backends receive (e.g., `-0.0` and `+0.0` scales are distinct).
 #[derive(Copy, Clone, Debug, Default)]
 pub struct AttentionConfiguration {
     /// Explicit score scale, or [`None`] to use `1 / sqrt(head_dimension)`.
@@ -586,8 +583,8 @@ impl AttentionConfiguration {
     }
 
     /// Sets the inclusive `(left, right)` local window radii, with which query position `i` may attend only to
-    /// key/value positions `j` with `i - left <= j <= i + right`. Causal masking already hides every position to the
-    /// right, so the right radius has no effect with it and [`Self::local_window`] reports it as zero.
+    /// key/value positions `j` with `i - left <= j <= i + right`. Causal masking already hides every position to
+    /// the right, so the right radius has no effect with it and [`Self::local_window`] reports it as zero.
     #[inline]
     pub fn with_local_window<W: Into<Option<(usize, usize)>>>(mut self, local_window: W) -> Self {
         self.local_window = local_window.into();
@@ -610,8 +607,8 @@ impl AttentionConfiguration {
 
     /// Sets the probability with which dropout drops each attention probability, which must lie in the open interval
     /// `(0, 1)`. Passing [`None`] disables dropout. Dropout applies a [`DropoutOperation`](crate::DropoutOperation) to
-    /// the normalized attention probabilities, whose random state is the optional
-    /// [`AttentionInputs::dropout_state`] input. Refer to that input for how the state selects the dropout mask.
+    /// the normalized attention probabilities, whose random state is the optional [`AttentionInputs::dropout_state`]
+    /// input. Refer to that input for how the state selects the dropout mask.
     #[inline]
     pub fn with_dropout<D: Into<Option<f64>>>(mut self, dropout: D) -> Self {
         self.dropout = dropout.into();
@@ -631,8 +628,8 @@ impl AttentionConfiguration {
     }
 
     /// Returns the optional inclusive `(left, right)` local window radii. The right radius is zero with causal
-    /// masking, which hides every position to the right, so that configurations with the same semantics are equal and
-    /// have the same keys.
+    /// masking, which hides every position to the right, so that configurations with the same semantics are equal
+    /// and have the same keys.
     #[inline]
     pub fn local_window(&self) -> Option<(usize, usize)> {
         match self.local_window {
@@ -655,6 +652,7 @@ impl AttentionConfiguration {
 }
 
 impl PartialEq for AttentionConfiguration {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.scale.map(f64::to_bits) == other.scale.map(f64::to_bits)
             && self.causal == other.causal
@@ -667,6 +665,7 @@ impl PartialEq for AttentionConfiguration {
 impl Eq for AttentionConfiguration {}
 
 impl Hash for AttentionConfiguration {
+    #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.scale.map(f64::to_bits).hash(state);
         self.causal.hash(state);
@@ -675,6 +674,8 @@ impl Hash for AttentionConfiguration {
         self.dropout.map(f64::to_bits).hash(state);
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Query, key, value, and optional inputs supplied to scaled dot-product attention. Their canonical order is the order
 /// of the fields, which is the order of [`Parameterized::parameters`], and their structure (i.e.,
