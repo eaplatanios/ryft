@@ -65,7 +65,10 @@ pub enum ParallelAllGatherOutputVariance {
     #[default]
     Varying,
 
-    /// The result is invariant across the gathered manual mesh axis.
+    /// The result is invariant across the gathered manual mesh axis. An all-gather without a mesh keeps the manual
+    /// variation of its input in its type, so it can use this option only over an axis that a `batch` level consumes,
+    /// and it is rejected over an active manual axis of a [`ShardMapOperation`](crate::ShardMapOperation) and by its
+    /// lockstep emulation.
     Invariant,
 
     /// The result records the gathered manual mesh axis as reduced.
@@ -102,7 +105,9 @@ pub const PARALLEL_ALL_GATHER_OPERATION_NAME: &str = "parallel_all_gather";
 /// ordinary all-gather carries no mesh and preserves the mesh state of its input, even when that input carries a manual
 /// mesh axis with the same name, because a `batch` level whose axis name shadows that mesh axis may bind it instead.
 /// Its output variance therefore selects only its transpose, and it rejects reduced output variance, which records
-/// state on a manual mesh axis. Outside any binder, the single participant of a degenerate ordinary all-gather keeps
+/// state on a manual mesh axis. Its invariant output variance holds only when a `batch` level consumes it, so a
+/// `shard_map` rejects it over an active manual axis, whose devices it would gather without making the result
+/// invariant. Outside any binder, the single participant of a degenerate ordinary all-gather keeps
 /// its value, with a size-one axis inserted in untiled mode, while a manual mesh all-gather always requires its binder,
 /// because a local reshape cannot perform its variance transition.
 ///
@@ -655,6 +660,16 @@ impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for ParallelAllGathe
         driver: &D,
         inputs: &[LockstepValue<O>],
     ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        // The emulator runs this rule only over emulated manual axes. An ordinary all-gather keeps the manual variation
+        // of its input in its type, so it cannot honor an invariant output variance over such an axis, whichever
+        // checking mode the map that made the axis manual uses (refer to `ShardMapOperation::validate_body`).
+        if self.mesh.is_none() && self.output_variance == ParallelAllGatherOutputVariance::Invariant {
+            return Some(Err(ProgramError::MalformedProgram(format!(
+                "`{}` without a mesh cannot have invariant output variance over manual axis `{}`, \
+                 along which its result keeps the manual variation of its input",
+                PARALLEL_ALL_GATHER_OPERATION_NAME, self.axes,
+            ))));
+        }
         Some(self.interpret_in_parent(context, driver, inputs))
     }
 }
@@ -2447,6 +2462,42 @@ mod tests {
                 ArrayIrValue::Array(Array::vector(vec![1.0f32, 3.0]).unwrap()),
                 ArrayIrValue::Array(Array::vector(vec![4.0f32, 2.0]).unwrap()),
             ]])),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_interpretation_in_lockstep_rejects_invariant_gathers_without_meshes() {
+        // A gather without a mesh keeps the manual variation of its input, so it cannot make its result invariant over
+        // an emulated manual axis, while the same gather with varying output variance runs.
+        let inputs = vec![vec![
+            ArrayIrValue::Array(Array::vector(vec![1.0f32]).unwrap()),
+            ArrayIrValue::Array(Array::vector(vec![2.0f32]).unwrap()),
+        ]];
+        let operation = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+            ParallelAllGatherOutputVariance::Invariant,
+        );
+        assert_eq!(
+            run_collective(2, operation, &inputs),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_all_gather` without a mesh cannot have invariant output variance over manual axis `x`, \
+                 along which its result keeps the manual variation of its input"
+                    .to_string(),
+            )),
+        );
+        let operation = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+            ParallelAllGatherOutputVariance::Varying,
+        );
+        assert_eq!(
+            run_collective(2, operation, &inputs),
+            Ok(Some(vec![vec![ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap()); 2]])),
         );
     }
 

@@ -248,8 +248,9 @@ struct NamedCompositeOutputCacheEntry<V: Typed + Parameter, O, InputStructure, O
 
 /// Named composite configuration of a [`Composite`]. Refer to [`Composite::with_named_composite`] for more information.
 struct NamedCompositeConfiguration<T, InputStructure, OutputStructure> {
-    /// Semantic identity of the function.
-    key: CompositeKey,
+    /// Semantic identity of the definition that the function registers for calls with the provided input parameter
+    /// structure.
+    key: Arc<dyn Fn(&InputStructure) -> CompositeKey + Send + Sync>,
 
     /// Output type rule over the parameter structure and flattened types of a call's inputs, returning the parameter
     /// structure and flattened types of its outputs.
@@ -399,8 +400,41 @@ where
     /// Unlike other functions, a named function without derivative rules does not derive its forward mode rule
     /// from its primal, so it rejects differentiation like an operation without derivative rules. Configure
     /// [`Self::with_jvp_from_primal`] to differentiate its body explicitly.
+    ///
+    /// Every call of the returned function has the same key, whatever the parameter structure of its inputs. Use
+    /// [`Self::with_named_composite_per_structure`] when that structure changes the computation (e.g., when optional
+    /// inputs may be absent).
+    #[inline]
     pub fn with_named_composite<R>(self, key: CompositeKey, output_types: R) -> Self
     where
+        R: 'static + Fn(Input::To<V::Type>) -> Result<Output::To<V::Type>, ProgramError> + Send + Sync,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::To<V::Type>: Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
+        Output::Family: ParameterizedFamily<V::Type>,
+        Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
+    {
+        self.with_named_composite_per_structure(move |_| key.clone(), output_types)
+    }
+
+    /// Returns this function configured as a [`NamedComposite`] whose semantic identity depends on the parameter
+    /// structure of the inputs of each call. It behaves like [`Self::with_named_composite`], except that `key` maps
+    /// the input parameter structure of a call to the [`CompositeKey`] of the definition that serves it. One function
+    /// can therefore serve calls whose input structures change the computation (e.g., calls with and without an
+    /// optional input) while every one of its definitions keeps a key that describes exactly what it computes.
+    ///
+    /// The function registers one definition per input and output structure and [`TracingScope`], and it
+    /// evaluates `key` once for each of them, when the definition is registered. The key _obligation_ of
+    /// [`Self::with_named_composite`] applies to every key that `key` returns, so input structures whose computations
+    /// or rules differ must map to different keys.
+    ///
+    /// # Parameters
+    ///
+    ///   - `key`: Function from the parameter structure of a call's inputs to the semantic identity of its definition.
+    ///   - `output_types`: Output type rule, which validates the types of a call's inputs and returns the types of
+    ///     its outputs. It must agree with the body for every input that it accepts.
+    pub fn with_named_composite_per_structure<K, R>(self, key: K, output_types: R) -> Self
+    where
+        K: 'static + Fn(&Input::ParameterStructure) -> CompositeKey + Send + Sync,
         R: 'static + Fn(Input::To<V::Type>) -> Result<Output::To<V::Type>, ProgramError> + Send + Sync,
         Input::Family: ParameterizedFamily<V::Type>,
         Input::To<V::Type>: Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -414,7 +448,7 @@ where
             Ok((output_types.parameter_structure(), output_types.into_parameters().collect()))
         });
         Self {
-            named_configuration: Some(NamedCompositeConfiguration { key, output_types }),
+            named_configuration: Some(NamedCompositeConfiguration { key: Arc::new(key), output_types }),
             registrations: CompositeRegistrations::default(),
             ..self
         }
@@ -1549,11 +1583,12 @@ where
                                         .map(|(_, output_types)| output_types)
                                 };
                                 let named_definition = {
-                                    let (primal, name) =
-                                        (self.primal.clone(), named_configuration.key.name().to_owned());
+                                    // The key of a definition is the key of its input structure.
+                                    let key = (named_configuration.key)(&input_structure);
+                                    let (primal, name) = (self.primal.clone(), key.name().to_owned());
                                     let body_input_structure = shared_input_structure;
                                     NamedComposite::new(
-                                        named_configuration.key.clone(),
+                                        key,
                                         output_types,
                                         move |inputs: &[CustomRuleTracer<V, O>]| {
                                             let input_structure = body_input_structure
@@ -2254,6 +2289,63 @@ mod tests {
         assert_eq!(
             ArrayContext::trace(|x| rejecting.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
             Err(ProgramError::from(TypeError::invalid("rejected"))),
+        );
+    }
+
+    #[test]
+    fn test_composite_with_named_composite_per_structure() {
+        // The key of every definition is derived from the input structure of its calls, so one function serves calls
+        // with different numbers of inputs under different keys, and calls with the same structure share a definition.
+        let function = composite(|inputs: Vec<ArrayTracer>| {
+            let mut inputs = inputs.into_iter();
+            let first = inputs.next().unwrap();
+            Ok(inputs.fold(first, |product, input| product * input))
+        })
+        .with_name("product")
+        .with_named_composite_per_structure(
+            |inputs| {
+                CompositeKey::new("ryft.tests.composite_named_per_structure", 1).with_attribute("count", inputs.len())
+            },
+            |inputs: Vec<ArrayType>| Ok(inputs[0].clone()),
+        );
+        let (_, program) = ArrayContext::trace(
+            |(x, y): (ArrayTracer, ArrayTracer)| {
+                Ok((
+                    function.call(vec![x.clone()])?,
+                    function.call(vec![x.clone(), y.clone()])?,
+                    function.call(vec![y, x])?,
+                ))
+            },
+            (ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = composite [key=\"ryft.tests.composite_named_per_structure.v1 {count = 1}\"] %0 [
+                    primal={
+                        lambda %0:f64[] .
+                        in (%0)
+                    },
+                ]
+                    %3:f64[] = composite [key=\"ryft.tests.composite_named_per_structure.v1 {count = 2}\"] %0 %1 [
+                        primal=^1={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = mul %0 %1
+                            in (%2)
+                        },
+                    ]
+                    %4:f64[] = composite [key=\"ryft.tests.composite_named_per_structure.v1 {count = 2}\"] %1 %0 [
+                        primal=^1,
+                    ]
+                in (%2, %3, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())),
+            Ok((Array::scalar(2.0).unwrap(), Array::scalar(6.0).unwrap(), Array::scalar(6.0).unwrap())),
         );
     }
 
