@@ -25,9 +25,6 @@ use crate::programs::{AttachedRegions, MaybeZero, Operation, Program, ProgramErr
 use crate::tracing::{DomainTracingContext, TracingContext, TracingScope};
 
 #[cfg(doc)]
-use crate::tracing::DomainTracer;
-
-#[cfg(doc)]
 use crate::batching::{BatchingError, DiagonalBatchingPolicy};
 
 #[cfg(doc)]
@@ -1852,10 +1849,10 @@ pub type VjpComposite<V, O, Input, Output, Residual> =
 pub type BatchedComposite<V, O, Input, Output> =
     Composite<V, O, Input, Output, DefaultJvp, DefaultVjp, BroadcastInvariantBatching<V, O, Input, Output>>;
 
-/// Creates a [`Composite`] from a primal closure `x ↦ y = f(x)` over values of [`DomainTracer`]s, without any custom
-/// rule. It is the one entry point for custom rules of every transform, and its configuration functions add them,
-/// where each configuration is the Ryft analogue of one JAX entry point: [`Composite::with_jvp`] of
-/// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html), [`Composite::with_vjp`]
+/// Creates a [`Composite`] from a primal closure `x ↦ y = f(x)` over values of [`DomainTracer`](crate::DomainTracer)s,
+/// without any custom rule. It is the one entry point for custom rules of every transform, and its configuration
+/// functions add them, where each configuration is the Ryft analogue of one JAX entry point: [`Composite::with_jvp`]
+/// of [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html), [`Composite::with_vjp`]
 /// of [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html),
 /// and [`Composite::with_batching`] of
 /// [`jax.custom_batching.custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html),
@@ -1931,12 +1928,12 @@ pub type BatchedComposite<V, O, Input, Output> =
 ///
 /// # Calling Convention
 ///
-/// All closures operate on [`Parameterized`] values of [`DomainTracer`]s (i.e., Ryft's analogue of JAX pytrees), so
-/// inputs, outputs, and residuals may each be a single tracer, a tuple, or any other parameterized structure. Tangents
-/// and cotangents have the parameter structures of their primal values. Because this function builds a reusable
-/// function before any input is known, the primal closure must annotate the tracer type of its input (e.g.,
-/// `|x: DomainTracer<C>| ...`), from which the composite's operation family `(V, O)` is inferred and which fixes the
-/// input types of the rule closures. Static configuration should be captured by the closures, while a dynamic value
+/// All closures operate on [`Parameterized`] values of [`DomainTracer`](crate::DomainTracer)s (i.e., Ryft's analogue
+/// of JAX pytrees), so inputs, outputs, and residuals may each be a single tracer, a tuple, or any other parameterized
+/// structure. Tangents and cotangents have the parameter structures of their primal values. Because this function
+/// builds a reusable function before any input is known, the primal closure must annotate the tracer type of its input
+/// (e.g., `|x: DomainTracer<C>| ...`), from which the composite's operation family `(V, O)` is inferred and which fixes
+/// the input types of the rule closures. Static configuration should be captured by the closures, while a dynamic value
 /// should remain an explicit input, either as a non-differentiated input (see below) or as an ordinary input whose
 /// derivative the rules treat as zero.
 ///
