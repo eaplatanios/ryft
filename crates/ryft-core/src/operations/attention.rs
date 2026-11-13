@@ -5142,7 +5142,52 @@ mod tests {
             AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
         )
         .unwrap();
-        assert_eq!(program.to_string(), "TODO-unused");
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1] .
+                let %3:f32[1, 1, 1, 1], %4:f32[1, 1, 1] = composite [
+                    key=\"ryft.dot_product_attention.v1 {scale = some(0.5), causal = false, local_window = none, \
+                        implementation = 1, dropout_rate = none, residual = true, bias = false, mask = false, \
+                        query_sequence_lengths = false, key_value_sequence_lengths = false, dropout_state = false}\",
+                ] %0 %1 %2 [
+                    primal={
+                        lambda %0:f32[1, 1, 1, 1], %1:f32[1, 1, 1, 1], %2:f32[1, 1, 1, 1] .
+                        let %3:f32[1, 1, 1, 1] = dot [
+                            dimensions=(lhs_contracting=[3], rhs_contracting=[3], lhs_batching=[0, 2], \
+                                rhs_batching=[0, 2]),
+                        ] %0 %1
+                            %4:f32[] = constant [value=0.5]
+                            %5:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %4
+                            %6:f32[1, 1, 1, 1] = mul %3 %5
+                            %7:f32[1, 1, 1] = reduce [kind=max, axes=[3]] %6
+                            %8:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %7
+                            %9:f32[1, 1, 1, 1] = sub %6 %8
+                            %10:f32[1, 1, 1, 1] = exp %9
+                            %11:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %10
+                            %12:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %11
+                            %13:f32[1, 1, 1, 1] = div %10 %12
+                            %14:f32[1, 1, 1, 1] = dot [
+                                dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
+                                    rhs_batching=[0, 2]),
+                            ] %13 %2
+                            %15:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %14
+                            %16:f32[1, 1, 1] = log %11
+                            %17:f32[1, 1, 1] = add %7 %16
+                            %18:f32[1, 1, 1] = transpose [permutation=[0, 2, 1]] %17
+                            %19:f32[1, 1, 1] = stop_gradient %18
+                        in (%15, %19)
+                    },
+                ]
+                    %5:f32[] = reduce [kind=sum, axes=[0, 1, 2, 3]] %2
+                    %6:f32[] = one [type=f32[]]
+                    %7:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %6
+                    %8:f32[1, 1, 1, 1] = zero [type=f32[1, 1, 1, 1]]
+                    %9:f32[1, 1, 1, 1] = zero [type=f32[1, 1, 1, 1]]
+                in (%8, %9, %7)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -5471,6 +5516,89 @@ mod tests {
             .iter()
             .zip(expected_bias)
             .for_each(|(actual, expected)| assert_abs_diff_eq!(*actual, expected, epsilon = 1e-6));
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_batching_dropout() {
+        // Definitions with dropout batch structurally, so every batch item applies the mask of its unbatched call in
+        // the forward and in the backward definition, and the batched gradients equal the gradients of every item.
+        let function =
+            differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_dropout(0.5));
+        let state = Array::from_elements(ArrayType::new_static(DataType::U64, [2]), &[0u64, 3]).unwrap();
+        let query = [0.5, -1.0, 0.25, 2.0];
+        let key = [1.0, -0.5, 0.75, 0.25, -1.5, 0.5, 1.25, -0.25];
+        let value = [1.0, 2.0, 3.0, 4.0, -1.0, 0.5, 2.5, -3.0];
+        let inputs = AttentionInputs {
+            dropout_state: Some(state.clone()),
+            ..AttentionInputs::new(
+                f32_array(&[2, 1, 2, 1, 1], &query),
+                f32_array(&[2, 1, 4, 1, 1], &key),
+                f32_array(&[2, 1, 4, 1, 1], &value),
+            )
+        };
+        let axes = AttentionInputs {
+            dropout_state: Some(BatchAxis::replicated()),
+            ..AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0))
+        };
+        let batched = differentiate_at(inputs)
+            .gradient(|inputs| {
+                let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                    .map_err(ProgramError::from)?;
+                outputs.reduce(&[0, 1, 2, 3, 4], ReductionKind::Sum)
+            })
+            .unwrap();
+        for item in 0..2 {
+            let inputs = AttentionInputs {
+                dropout_state: Some(state.clone()),
+                ..AttentionInputs::new(
+                    f32_array(&[1, 2, 1, 1], &query[2 * item..2 * item + 2]),
+                    f32_array(&[1, 4, 1, 1], &key[4 * item..4 * item + 4]),
+                    f32_array(&[1, 4, 1, 1], &value[4 * item..4 * item + 4]),
+                )
+            };
+            let expected = differentiate_at(inputs)
+                .gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum))
+                .unwrap();
+            assert_eq!(batched.query.to_f64s()[2 * item..2 * item + 2], expected.query.to_f64s());
+            assert_eq!(batched.key.to_f64s()[4 * item..4 * item + 4], expected.key.to_f64s());
+            assert_eq!(batched.value.to_f64s()[4 * item..4 * item + 4], expected.value.to_f64s());
+        }
+
+        // Batching the pullback of an unbatched call batches only its backward definition, which the fused
+        // implementation rejects for the same reason as a batched forward definition.
+        let configuration =
+            AttentionConfiguration::new().with_dropout(0.5).with_implementation(AttentionImplementation::Fused);
+        let function = differentiable_dot_product_attention::<ArrayContext>(configuration);
+        let r#type = ArrayType::new_static(DataType::F32, [1, 1, 1, 1]);
+        let (_, program) = ArrayContext::trace(
+            |(inputs, cotangent): (AttentionInputs<_>, _)| {
+                let (_, pullback) = differentiate_at(inputs).vjp(|inputs| function.call(inputs))?;
+                Ok(cotangent_value(pullback.apply(cotangent)?.value))
+            },
+            (AttentionInputs::new(r#type.clone(), r#type.clone(), r#type.clone()), r#type),
+        )
+        .unwrap();
+        let program = program.into_flat_program();
+        let ones = f32_array(&[1, 1, 1, 1], &[1.0]);
+        let result = batch(
+            |inputs: Vec<_>| {
+                let context = inputs[0].domain();
+                Ok(program.entry_region_ref().interpret_in_context(&context, inputs)?.remove(0))
+            },
+            vec![ones.clone(), ones.clone(), ones, f32_array(&[2, 1, 1, 1, 1], &[1.0, 1.0])],
+            vec![BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::new(0)],
+            BatchAxis::new(0),
+            None,
+        );
+        assert!(matches!(
+            result,
+            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == format!(
+                    "named composite `{DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME}` with dropout cannot be batched \
+                     with the fused implementation, because a batched call cannot use the fused kernels or reproduce \
+                     their dropout mask; use the portable implementation or a dropout state",
+                ),
+        ));
     }
 
     #[test]
