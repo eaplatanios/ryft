@@ -5564,30 +5564,30 @@ mod tests {
             assert_eq!(batched.value.to_f64s()[4 * item..4 * item + 4], expected.value.to_f64s());
         }
 
-        // Batching the pullback of an unbatched call batches only its backward definition, which the fused
-        // implementation rejects for the same reason as a batched forward definition.
+        // A batched call of the backward definition with dropout and the fused implementation is rejected, for the
+        // same reason as a batched call of the forward definition.
         let configuration =
             AttentionConfiguration::new().with_dropout(0.5).with_implementation(AttentionImplementation::Fused);
-        let function = differentiable_dot_product_attention::<ArrayContext>(configuration);
-        let r#type = ArrayType::new_static(DataType::F32, [1, 1, 1, 1]);
-        let (_, program) = ArrayContext::trace(
-            |(inputs, cotangent): (AttentionInputs<_>, _)| {
-                let (_, pullback) = differentiate_at(inputs).vjp(|inputs| function.call(inputs))?;
-                Ok(cotangent_value(pullback.apply(cotangent)?.value))
-            },
-            (AttentionInputs::new(r#type.clone(), r#type.clone(), r#type.clone()), r#type),
-        )
-        .unwrap();
-        let program = program.into_flat_program();
+        let AttentionFunction::Folding(backward) = backward_definition::<Array, ArrayOperation<Array>>(configuration)
+        else {
+            panic!("backward definitions with dropout and the fused implementation reject batching in their rule");
+        };
         let ones = f32_array(&[1, 1, 1, 1], &[1.0]);
+        let residuals = AttentionResiduals {
+            inputs: AttentionInputs::new(ones.clone(), ones.clone(), ones.clone()),
+            output: ones,
+            residual: f32_array(&[1, 1, 1], &[1.0]),
+        };
+        let axes = AttentionResiduals {
+            inputs: AttentionInputs::new(BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::replicated()),
+            output: BatchAxis::replicated(),
+            residual: BatchAxis::replicated(),
+        };
         let result = batch(
-            |inputs: Vec<_>| {
-                let context = inputs[0].domain();
-                Ok(program.entry_region_ref().interpret_in_context(&context, inputs)?.remove(0))
-            },
-            vec![ones.clone(), ones.clone(), ones, f32_array(&[2, 1, 1, 1, 1], &[1.0, 1.0])],
-            vec![BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::replicated(), BatchAxis::new(0)],
-            BatchAxis::new(0),
+            |inputs: (AttentionResiduals<_>, _)| backward.call(inputs),
+            (residuals, f32_array(&[2, 1, 1, 1, 1], &[1.0, 1.0])),
+            (axes, BatchAxis::new(0)),
+            vec![BatchAxis::new(0); 3],
             None,
         );
         assert!(matches!(
