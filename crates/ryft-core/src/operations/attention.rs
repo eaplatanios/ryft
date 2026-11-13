@@ -761,6 +761,33 @@ impl<P: Parameter> AttentionInputs<P> {
             dropout_state: None,
         }
     }
+
+    /// Returns these inputs with their manual variation aligned through
+    /// [`ManualVariationAlignment::align_manual_variation`], which precedes every call of the functions that stage
+    /// attention. Alignment is the identity when every input already varies over the same manual axes (e.g., outside
+    /// manual regions), and so those inputs are returned unchanged without staging the alignment.
+    fn align_manual_variation(self) -> Result<Self, ProgramError>
+    where
+        P: Value<Type: ArrayMemberType> + ManualVariationAlignment<P::Type>,
+    {
+        let mut varying_manual_axes = None;
+        let mut aligned = true;
+        for input in self.parameters() {
+            let r#type = input.r#type();
+            let array_type = r#type.as_array_type()?;
+            let axes = array_type.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
+            match &varying_manual_axes {
+                None => varying_manual_axes = Some(axes),
+                Some(expected) => aligned &= *expected == axes,
+            }
+        }
+        if aligned {
+            return Ok(self);
+        }
+        let input_structure = self.parameter_structure();
+        let inputs = ManualVariationAlignment::align_manual_variation(&self.into_parameters().collect::<Vec<_>>())?;
+        Ok(Self::from_parameters(input_structure, inputs)?)
+    }
 }
 
 /// Residuals of one forward attention call that its backward pass consumes, consisting of the forward
@@ -855,8 +882,6 @@ where
         self.definitions.configuration()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Aligns the manual variation of `inputs` and stages one [`DotProductAttention`] call, returning
     /// the attended output.
     ///
@@ -864,12 +889,12 @@ where
     ///
     /// Returns a [`ProgramError`] when `inputs` are invalid for the configuration (e.g., because their shapes are
     /// incompatible) or when staging the call fails.
-    pub fn call<Caller, X>(&self, inputs: AttentionInputs<X>) -> Result<X, ProgramError>
+    pub fn call<Caller, V>(&self, inputs: AttentionInputs<V>) -> Result<V, ProgramError>
     where
-        Caller: CompositeCallContext<Type = C::Type, Value = X, Constant = C::Constant, Operation = C::Operation>,
-        X: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
+        Caller: CompositeCallContext<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>,
+        V: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
     {
-        let inputs = align_attention_inputs(inputs)?;
+        let inputs = inputs.align_manual_variation()?;
         let mut outputs = self.definitions.forward(inputs, false)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -882,12 +907,12 @@ where
     ///
     /// Returns a [`ProgramError`] when `inputs` are invalid for the configuration (e.g., because their shapes are
     /// incompatible) or when staging the call fails.
-    pub fn call_with_residual<Caller, X>(&self, inputs: AttentionInputs<X>) -> Result<(X, X), ProgramError>
+    pub fn call_with_residual<Caller, V>(&self, inputs: AttentionInputs<V>) -> Result<(V, V), ProgramError>
     where
-        Caller: CompositeCallContext<Type = C::Type, Value = X, Constant = C::Constant, Operation = C::Operation>,
-        X: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
+        Caller: CompositeCallContext<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>,
+        V: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
     {
-        let inputs = align_attention_inputs(inputs)?;
+        let inputs = inputs.align_manual_variation()?;
         let mut outputs = self.definitions.forward(inputs, true)?;
         check_count!("output", outputs, 2, ProgramError);
         let residual = outputs.remove(1);
@@ -896,22 +921,23 @@ where
 }
 
 /// Creates the scaled dot-product attention inference function with the provided configuration for the values of the
-/// domain `C`, whose calls stage the named forward attention definition (refer to [`DotProductAttention`]).
+/// domain `C`, whose calls stage the named forward attention definition. Refer to [`DotProductAttention`] for more
+/// information.
 ///
 /// The definition's portable body computes attention with ordinary array operations, while backends may replace it
 /// (e.g., the XLA backend replaces it with cuDNN's fused attention kernels when the configuration and the input types
 /// are eligible). Array IR domains support dynamic batch and sequence extents (e.g., in bounded dynamic programs).
-/// Homogeneous array domains support them as well, except in batching rules that need a dynamic extent (refer to
-/// [`AttentionOperations`]).
+/// Homogeneous array domains support them as well, except in batching rules that need a dynamic extent.
 ///
 /// # Parameters
 ///
 ///   - `configuration`: Value-independent attention semantics and implementation selection.
+#[inline]
 pub fn dot_product_attention<C: Domain>(configuration: AttentionConfiguration) -> DotProductAttention<C>
 where
+    C::Type: ArrayMemberType + From<ArrayType> + BatchableType,
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: ArrayMemberType + From<ArrayType> + BatchableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>,
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
@@ -919,6 +945,8 @@ where
 {
     DotProductAttention { definitions: AttentionDefinitions::new(configuration) }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Reverse mode configuration of the named composites that stage differentiable attention. It is public because the
 /// bounds of [`differentiable_dot_product_attention`] name it.
@@ -975,10 +1003,10 @@ where
     ///
     /// Returns a [`ProgramError`] when `inputs` are invalid for the configuration (e.g., because their shapes are
     /// incompatible) or when staging the call fails.
-    pub fn call<Caller, X>(&self, inputs: AttentionInputs<X>) -> Result<X, ProgramError>
+    pub fn call<Caller, V>(&self, inputs: AttentionInputs<V>) -> Result<V, ProgramError>
     where
-        Caller: CompositeCallContext<Type = C::Type, Value = X, Constant = C::Constant, Operation = C::Operation>,
-        X: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
+        Caller: CompositeCallContext<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>,
+        V: Value<Type = C::Type, Domain = Caller> + ManualVariationAlignment<C::Type>,
     {
         /// Returns the structural zero cotangent of `value`.
         fn zero_cotangent<V: Value<Type: DifferentiableType>>(value: &V) -> Result<MaybeZero<V>, ProgramError> {
@@ -986,7 +1014,7 @@ where
         }
 
         let input_structure = inputs.parameter_structure();
-        let inputs = align_attention_inputs(inputs)?;
+        let inputs = inputs.align_manual_variation()?;
         let function = self
             .functions
             .lock()
@@ -1308,10 +1336,14 @@ where
 
     /// Stages one call of the forward definition with the provided residual request at `inputs`, returning the
     /// attended output followed by its log-sum-exp residual when `return_residual` is set.
-    fn forward<C, X>(&self, inputs: AttentionInputs<X>, return_residual: bool) -> Result<Vec<X>, ProgramError>
+    fn forward<C, InputValue>(
+        &self,
+        inputs: AttentionInputs<InputValue>,
+        return_residual: bool,
+    ) -> Result<Vec<InputValue>, ProgramError>
     where
-        C: CompositeCallContext<Type = V::Type, Value = X, Constant = V, Operation = O>,
-        X: Value<Type = V::Type, Domain = C>,
+        C: CompositeCallContext<Type = V::Type, Value = InputValue, Constant = V, Operation = O>,
+        InputValue: Value<Type = V::Type, Domain = C>,
     {
         let input_structure = inputs.parameter_structure();
         let function = self
@@ -1329,10 +1361,10 @@ where
 
     /// Stages one call of the backward definition at `inputs`, returning the cotangents of the query, key, and value,
     /// followed by that of a present bias whose cotangent space is not zero-dimensional.
-    fn backward<C, X>(&self, inputs: BackwardInputs<X>) -> Result<Vec<X>, ProgramError>
+    fn backward<C, InputValue>(&self, inputs: BackwardInputs<InputValue>) -> Result<Vec<InputValue>, ProgramError>
     where
-        C: CompositeCallContext<Type = V::Type, Value = X, Constant = V, Operation = O>,
-        X: Value<Type = V::Type, Domain = C>,
+        C: CompositeCallContext<Type = V::Type, Value = InputValue, Constant = V, Operation = O>,
+        InputValue: Value<Type = V::Type, Domain = C>,
     {
         let input_structure = inputs.0.inputs.parameter_structure();
         let function = self
@@ -1476,33 +1508,6 @@ fn attention_composite_key(
         .with_attribute("query_sequence_lengths", input_structure.query_sequence_lengths.is_some())
         .with_attribute("key_value_sequence_lengths", input_structure.key_value_sequence_lengths.is_some())
         .with_attribute("dropout_state", input_structure.dropout_state.is_some())
-}
-
-/// Returns `inputs` with their manual variation aligned through [`ManualVariationAlignment::align_manual_variation`],
-/// which precedes every call of the functions that stage attention. Alignment is the identity when every input already
-/// varies over the same manual axes (e.g., outside manual regions), and so those inputs are returned unchanged without
-/// staging the alignment.
-fn align_attention_inputs<X>(inputs: AttentionInputs<X>) -> Result<AttentionInputs<X>, ProgramError>
-where
-    X: Value<Type: ArrayMemberType> + ManualVariationAlignment<X::Type>,
-{
-    let mut varying_manual_axes = None;
-    let mut aligned = true;
-    for input in inputs.parameters() {
-        let r#type = input.r#type();
-        let array_type = r#type.as_array_type()?;
-        let axes = array_type.sharding().map(|sharding| sharding.varying_manual_axes().clone()).unwrap_or_default();
-        match &varying_manual_axes {
-            None => varying_manual_axes = Some(axes),
-            Some(expected) => aligned &= *expected == axes,
-        }
-    }
-    if aligned {
-        return Ok(inputs);
-    }
-    let input_structure = inputs.parameter_structure();
-    let inputs = ManualVariationAlignment::align_manual_variation(&inputs.into_parameters().collect::<Vec<_>>())?;
-    Ok(AttentionInputs::from_parameters(input_structure, inputs)?)
 }
 
 /// Validates one forward attention boundary (i.e., the [`AttentionInputs`] of `input_structure` in canonical order) and
