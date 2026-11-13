@@ -830,6 +830,23 @@ impl<Extension: Operation<Type = ArrayIrType>> CollectiveOperation for KernelOpe
             | Self::Extension(_) => Cow::Owned(CollectiveAxes::default()),
         }
     }
+
+    fn may_use_hidden_axes(&self) -> bool {
+        // Only the portable operations can have rules that are traced lazily (i.e., composite calls). The call's
+        // attached region reveals its own axes, and the extension is not consulted, as for the collective axes.
+        match self {
+            Self::Portable(operation) => operation.may_use_hidden_axes(),
+            Self::Call(_)
+            | Self::Scratch(_)
+            | Self::TileLoad(_)
+            | Self::AsyncCopy(_)
+            | Self::Wait(_)
+            | Self::MaskedLoad(_)
+            | Self::MaskedStore(_)
+            | Self::MaskedSwap(_)
+            | Self::Extension(_) => false,
+        }
+    }
 }
 
 impl<Extension: Operation<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> LockstepOperation<O>

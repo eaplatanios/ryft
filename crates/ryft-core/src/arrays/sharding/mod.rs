@@ -46,6 +46,9 @@ pub enum ShardingError {
     )]
     UndefinedUnreducedCotangent { kind: UnreducedKind },
 
+    #[error("mesh with axis sizes {sizes:?} has a device count that does not fit `usize`")]
+    MeshDeviceCountOverflow { sizes: Vec<usize> },
+
     #[error("device ID `{id}` appears more than once")]
     DuplicateDeviceId { id: DeviceId },
 

@@ -1433,16 +1433,18 @@ impl OperationCodeGenerator {
         }
     }
 
-    /// Generates the `CollectiveOperation` implementation, which delegates to the payloads of the variants that declare
-    /// `#[ryft(collective)]` and reports no axes for every other variant, or returns [`None`] when no variant declares
-    /// it. The payload of a marked variant is either a collective or a family that implements `CollectiveOperation`
-    /// itself (e.g., a projected member family or a generic extension), and it is bounded accordingly, so that a family
-    /// with a marked generic payload implements the trait only when that payload does.
+    /// Generates the `CollectiveOperation` implementation, which delegates both of its functions to the payloads
+    /// of the variants that declare `#[ryft(collective)]` and reports no axes and no hidden axes for every other
+    /// variant, or returns [`None`] when no variant declares it. The payload of a marked variant either implements
+    /// `CollectiveOperation` itself (e.g., a collective or a composite call) or is a family that does (e.g., a
+    /// projected member family or a generic extension), and it is bounded accordingly, so that a family with a
+    /// marked generic payload implements the trait only when that payload does.
     fn generate_collective_impl(&self) -> Option<TokenStream> {
         let ryft = &self.ryft_crate;
         let self_type = &self.self_type;
         let mut generics = self.generics.clone();
-        let mut arms = Vec::new();
+        let mut axes_arms = Vec::new();
+        let mut hidden_axes_arms = Vec::new();
         for variant in self.variants.iter().filter(|variant| variant.is_collective) {
             let payload_type = &variant.payload_type;
             let receiver = variant.receiver();
@@ -1450,11 +1452,16 @@ impl OperationCodeGenerator {
                 .make_where_clause()
                 .predicates
                 .push(syn::parse_quote_spanned!(variant.span => #payload_type: #ryft::CollectiveOperation));
-            arms.push(variant.arm(quote!(<#payload_type as #ryft::CollectiveOperation>::axes(#receiver))));
+            axes_arms.push(variant.arm(quote!(<#payload_type as #ryft::CollectiveOperation>::axes(#receiver))));
+            hidden_axes_arms.push(
+                variant.arm(quote!(<#payload_type as #ryft::CollectiveOperation>::may_use_hidden_axes(#receiver))),
+            );
         }
-        if arms.is_empty() {
+
+        if axes_arms.is_empty() {
             return None;
         }
+
         let (impl_generics, _, where_clause) = generics.split_for_impl();
         Some(quote! {
             #[automatically_derived]
@@ -1463,10 +1470,19 @@ impl OperationCodeGenerator {
                 #[inline]
                 fn axes(&self) -> ::std::borrow::Cow<'_, #ryft::CollectiveAxes> {
                     match self {
-                        #(#arms)*
+                        #(#axes_arms)*
                         _ => ::std::borrow::Cow::Owned(
                             <#ryft::CollectiveAxes as ::std::default::Default>::default(),
                         ),
+                    }
+                }
+
+                #[allow(unreachable_patterns)]
+                #[inline]
+                fn may_use_hidden_axes(&self) -> bool {
+                    match self {
+                        #(#hidden_axes_arms)*
+                        _ => false,
                     }
                 }
             }
@@ -4342,6 +4358,25 @@ mod tests {
                             _ => ::std::borrow::Cow::Owned(
                                 <ryft::CollectiveAxes as ::std::default::Default>::default()
                             ),
+                        }
+                    }
+
+                    #[allow(unreachable_patterns)]
+                    #[inline]
+                    fn may_use_hidden_axes(&self) -> bool {
+                        match self {
+                            Self::Array(operation) => {
+                                <ArrayOperation<A> as ryft::CollectiveOperation>::may_use_hidden_axes(operation)
+                            },
+                            Self::Gather(operation) => {
+                                <ParallelAllGatherOperation as ryft::CollectiveOperation>::may_use_hidden_axes(
+                                    &**operation
+                                )
+                            },
+                            Self::Extension(operation) => {
+                                <Extension as ryft::CollectiveOperation>::may_use_hidden_axes(operation)
+                            },
+                            _ => false,
                         }
                     }
                 }

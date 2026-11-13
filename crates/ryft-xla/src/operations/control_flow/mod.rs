@@ -119,8 +119,9 @@ where
                 // Both loop regions share the state types, so the condition's input types are the entry types.
                 Some((WHILE_OPERATION_NAME, first_region_input_types()?, input_types.as_slice()))
             } else if let Some(scan) = operation.projected_payload::<ScanOperation<ArrayIrType>>() {
-                let entry_types =
-                    scan.declared_input_types(&first_region_input_types()?).map_err(ProgramError::from)?;
+                let entry_types = scan
+                    .entry_input_types(&first_region_input_types()?, input_types.as_slice())
+                    .map_err(ProgramError::from)?;
                 Some((SCAN_OPERATION_NAME, entry_types, input_types.as_slice()))
             } else {
                 None

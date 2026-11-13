@@ -4087,19 +4087,14 @@ mod tests {
 
     #[test]
     fn test_condition_type_inference_rejects_outputs_invariant_under_varying_predicates() {
-        // An identity branch declares an invariant `f64[]` input and output. A varying input refines the branch input,
-        // but the output keeps the declared invariant type, so under a predicate that varies over `devices` tracing
-        // rejects the condition before staging it, because devices may take different branches.
+        // An identity branch declares an invariant `f64[]` input and output, and receives an invariant input. Its
+        // output keeps the invariant type, so under a predicate that varies over `devices` tracing rejects the
+        // condition before staging it, because devices may take different branches.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let predicate_type = ArrayType::scalar(DataType::Boolean)
-            .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["devices"]).unwrap())
-            .unwrap();
-        let declared_type = ArrayType::scalar(DataType::F64);
-        let varying_type = declared_type
-            .clone()
             .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap())
             .unwrap();
-        assert!(declared_type.is_refined_by(&varying_type));
+        let declared_type = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(declared_type.clone());
         let branch =
@@ -4117,7 +4112,7 @@ mod tests {
         );
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let predicate = context.input(predicate_type);
-        let input = context.input(varying_type);
+        let input = context.input(declared_type);
         assert_eq!(
             context
                 .bind(ConditionOperation::new(), vec![branch.clone(), branch], &[predicate, input])
@@ -4128,11 +4123,35 @@ mod tests {
     }
 
     #[test]
+    fn test_condition_type_inference_rejects_varying_inputs_of_branch_inputs_declared_without_sharding() {
+        // A branch input declared without a sharding is invariant, so a branch could not report the variation of an
+        // input that varies over `devices` on its outputs, and the condition rejects that input.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let declared_type = ArrayType::scalar(DataType::F64);
+        let varying_type = declared_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["devices"]).unwrap())
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(declared_type);
+        let branch =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let interfaces = [branch.interface().clone(), branch.interface().clone()];
+        assert_eq!(
+            ConditionOperation::new()
+                .infer_output_types(&[ArrayType::scalar(DataType::Boolean), varying_type], &interfaces),
+            Err(TypeError::invalid(
+                "`condition` input 1 has type `f64[][sharding={mesh<['devices'=2:manual]>, [], \
+                 varying_manual={'devices'}}]`, which does not refine its branch input type `f64[]`",
+            )),
+        );
+    }
+
+    #[test]
     fn test_condition_type_inference_rejects_branch_outputs_that_differ_in_metadata() {
         // The `true` branch returns a constant that varies over `devices`, while the `false` branch returns its
-        // invariant `f64[]` input. Refining the branches by a varying input does not carry its sharding metadata into
-        // the `false` branch output, so the outputs differ in that metadata alone. Inference, tracing, and eager
-        // binding all reject the branches, and region input inference declines to specialize them.
+        // invariant `f64[]` input, so the outputs differ in their sharding metadata alone. Inference, tracing, and
+        // eager binding all reject the branches, and region input inference declines to specialize them.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let declared_type = ArrayType::scalar(DataType::F64);
         let varying_type = declared_type
@@ -4145,13 +4164,13 @@ mod tests {
         let true_branch =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(declared_type);
+        let input = builder.add_input(declared_type.clone());
         let false_branch =
             builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
         let branches = [true_branch, false_branch];
         let interfaces = branches.each_ref().map(|program| program.interface().clone());
         let predicate_type = ArrayType::scalar(DataType::Boolean);
-        let input_types = [predicate_type.clone(), varying_type.clone()];
+        let input_types = [predicate_type.clone(), declared_type.clone()];
         let operation = ConditionOperation::new();
         let expected = TypeError::invalid(format!(
             "`condition` branch output type signature mismatch: expected [{varying_type}] but got [f64[]]",
@@ -4160,7 +4179,7 @@ mod tests {
         assert_eq!(operation.infer_region_input_types(&input_types, &interfaces), Ok(vec![None, None]));
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let predicate = context.input(predicate_type);
-        let input = context.input(varying_type.clone());
+        let input = context.input(declared_type.clone());
         assert_eq!(
             context.bind(operation, branches.clone(), &[predicate, input]).map(|_| ()),
             Err(ProgramError::Type(expected.clone())),
@@ -4168,7 +4187,7 @@ mod tests {
         assert!(context.builder().borrow().instructions().is_empty());
         for predicate in [false, true] {
             let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-            let input = Array::from_elements::<f64>(varying_type.clone(), &[1.0]).unwrap();
+            let input = Array::from_elements::<f64>(declared_type.clone(), &[1.0]).unwrap();
             assert_eq!(
                 context.bind(operation, branches.clone(), &[Array::scalar(predicate).unwrap(), input]),
                 Err(ProgramError::Type(expected.clone())),
@@ -6890,7 +6909,7 @@ mod tests {
                 .unwrap()
         };
         let driver = BranchDriver([branch(true), branch(false)]);
-        let grid = LockstepDeviceGrid::new(vec![("x".to_string(), 2)]);
+        let grid = LockstepDeviceGrid::new(vec![("x".to_string(), 2)]).unwrap();
         let domain = LockstepDomain::<TestIrOperation>::new(grid, Vec::new());
         let predicate = |value: bool| array(Array::from_elements(predicate_type.clone(), &[value]).unwrap());
         let reference = || {

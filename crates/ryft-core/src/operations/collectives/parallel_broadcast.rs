@@ -877,6 +877,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
                     .push(ValueProjection::<ArrayType>::projected(&inputs[1].values()[device])?.r#type().into_owned());
             }
             let output_type = self.infer_output_types(&input_types, &[])?.remove(0);
+            context.validate_collective(self, self.mesh(), std::slice::from_ref(&output_type))?;
             let source = match self.source() {
                 ParallelBroadcastSource::Static(source) => source,
                 ParallelBroadcastSource::Dynamic(()) => {

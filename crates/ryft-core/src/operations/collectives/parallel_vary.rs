@@ -211,8 +211,15 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
 
         // Varying an invariant value along an axis changes only its type, because every device already holds it.
         let outputs = context.grid().map_devices(|device| {
+            // The inference of the output type has already validated that the input carries a sharding, whose mesh
+            // is the tracking metadata of this collective.
             let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
-            context.validate_tracked_collective(self, self.axis_name(), &arrays[device].r#type())?;
+            let input_type = arrays[device].r#type();
+            context.validate_collective(
+                self,
+                input_type.sharding().map(Sharding::mesh),
+                std::slice::from_ref(&output_type),
+            )?;
             with_placement_of(arrays[device], &output_type)
         })?;
 

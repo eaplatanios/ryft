@@ -382,7 +382,7 @@ pub trait ScanType:
         Self::validate_scan_body_type_signature(body_input_types, body_output_types, carry_count, iteration_count)?;
         Self::validate_scan_input_type_signature(body_input_types, carry_count, iteration_count, input_types)?;
         let scan = ScanOperation::<Self>::new(carry_count, iteration_count.clone());
-        let expected_input_types = scan.declared_input_types(body_input_types)?;
+        let expected_input_types = scan.entry_input_types(body_input_types, input_types)?;
 
         // An iteration count input that only refines the declared bounds fixes the iteration count to one exact extent,
         // so the stacked boundary axes are inferred at that extent instead of at the still-symbolic declared iteration
@@ -1090,17 +1090,20 @@ impl<T: Type> ScanOperation<T> {
 }
 
 impl<T: ScanType> ScanOperation<T> {
-    /// Returns the declared input types of this [`ScanOperation`] when its body declares `body_input_types` (i.e., the
-    /// intrinsic iteration index followed by the carries and the slices or reference stacks of the stacked inputs),
+    /// Returns the declared input types of this [`ScanOperation`] when its body declares `body_input_types` (i.e.,
+    /// the intrinsic iteration index followed by the carries and the slices or reference stacks of the stacked inputs),
     /// followed by the `dimension<iteration_count>` type of the trailing iteration count input when the iteration count
     /// is dynamic. Carries keep their types, a reference stack keeps its type, and a stacked array gains the leading
-    /// scan axis while keeping only the memory placement of its slice: scan input validation compares the slices of the
-    /// actual stacks with the body input types, so a stack may carry any sharding whose slice the body admits (e.g.,
-    /// one whose scan axis is sharded over a `Manual` mesh axis). The iteration count shares its identity with every
-    /// carry or stack that the body declares with the iteration count's identity, so these types relate the iteration
-    /// count to those inputs. Backends that check the entry of a scan whose body they inline (e.g., with a
-    /// [`GuardOperation`]) and transform rules that remove or split the scan boundary relate the actual
-    /// inputs to these types.
+    /// scan axis while keeping only the memory placement of its slice. This is the one declaration of a scan that is
+    /// deliberately open. It constrains only the data type, shape, and memory of a stack and declares no sharding,
+    /// because the sharding of a stack (i.e., the placement of its scan axis, its manual variation, and its reduction
+    /// state) is validated through its slice against the slice type that the body declares (refer to
+    /// [`ScanType::validate_scan_input_type_signature`]), so a stack may carry any sharding whose slice the body admits
+    /// (e.g., one whose scan axis is sharded over a `Manual` mesh axis). A declaration without a sharding does not
+    /// admit manual variation or reduction state (refer to [`Type::is_refined_by`]), so relating actual inputs to these
+    /// types goes through [`Self::entry_input_types`], which adopts the sharding of every actual stack. The iteration
+    /// count shares its identity with every carry or stack that the body declares with the iteration count's identity,
+    /// so these types relate the iteration count to those inputs.
     ///
     /// # Errors
     ///
@@ -1174,6 +1177,43 @@ impl<T: ScanType> ScanOperation<T> {
         }
 
         Ok(input_types)
+    }
+
+    /// Returns the [declared input types](Self::declared_input_types) of this [`ScanOperation`] for a body that
+    /// declares `body_input_types` as its entry relates them to actual inputs of the `input_types`. Every rule that
+    /// relates actual inputs to the declared ones (e.g., output inference, entry guards of transform rules that remove
+    /// or split the scan boundary, and backends that check the entry of a scan whose body they inline with a
+    /// [`GuardOperation`]) uses these types. They are the declared types, except that each declared array stack whose
+    /// actual input is an array of the same rank adopts the sharding of that input. The declaration of a stack
+    /// constrains only its data type, shape, and memory, and its sharding is validated through its slice against the
+    /// body (refer to [`ScanType::validate_scan_input_type_signature`]), which callers must validate first. Adopting
+    /// the sharding therefore makes the relationship between a declared and an actual stack a comparison of their
+    /// data types, shapes, and memory, while every other input keeps the strict refinement of its declaration. The
+    /// actual sharding is adopted rather than removed from the actual type, because entry guards check values, whose
+    /// types keep their shardings.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::declared_input_types`].
+    pub fn entry_input_types(&self, body_input_types: &[T], input_types: &[T]) -> Result<Vec<T>, TypeError> {
+        let mut declared_input_types = self.declared_input_types(body_input_types)?;
+        let stack_end = body_input_types.len().saturating_sub(1);
+        for (index, declared) in declared_input_types.iter_mut().enumerate().take(stack_end).skip(self.carry_count) {
+            if declared.referent().is_some() {
+                continue;
+            }
+            let actual = input_types.get(index).map(|actual| actual.as_array_type());
+            let adopted = match (declared.as_array_type(), actual) {
+                (Ok(declared_stack), Some(Ok(actual_stack))) if actual_stack.rank() == declared_stack.rank() => {
+                    Some(declared_stack.clone().with_sharding_unchecked(actual_stack.sharding().cloned()))
+                }
+                _ => None,
+            };
+            if let Some(adopted) = adopted {
+                *declared = T::from(adopted);
+            }
+        }
+        Ok(declared_input_types)
     }
 
     /// Returns the declared output types of this [`ScanOperation`] when its body declares `body_output_types` (i.e.,
@@ -1363,7 +1403,7 @@ impl<T: ScanType> Operation for ScanOperation<T> {
         // identities (e.g., a body declared over `f32[extent]` slices supplied with `f32[other]` slices) is still
         // requested.
         if let Some(iteration_count) = self.iteration_count.variable() {
-            let declared_input_types = self.declared_input_types(region_interfaces[0].input_types())?;
+            let declared_input_types = self.entry_input_types(region_interfaces[0].input_types(), input_types)?;
             let refinements = T::Refinements::from_local_declarations(&declared_input_types, input_types)?;
             if refinements.identities_needing_runtime_checks().contains(iteration_count) {
                 return Ok(vec![None]);
@@ -1759,7 +1799,7 @@ impl<
                 let mut outputs = carry_inputs.to_vec();
                 let actual_types = boundary_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
                 let declared_types = self
-                    .declared_input_types(&source_input_types)?
+                    .entry_input_types(&source_input_types, &actual_types)?
                     .into_iter()
                     .zip(&actual_types)
                     .map(|(declared_type, actual_type)| match declared_type {
@@ -2034,7 +2074,8 @@ impl<
         // Splitting the scan replaces its boundary with the boundaries of the rebuilt scans, and forwarding a carry can
         // leave a residual scan dead, so the relationships that the input types leave unproven are checked by an entry
         // guard first. The rebuilt scans and the forwarded carries use the guarded inputs, whose types prove them.
-        let inputs = context.guard_inputs(&self.declared_input_types(&body_input_types)?, inputs.to_vec(), false)?;
+        let inputs =
+            context.guard_inputs(&self.entry_input_types(&body_input_types, &input_types)?, inputs.to_vec(), false)?;
 
         // The trailing iteration count input of a scan with a dynamic iteration count is neither a carry nor a stacked
         // input, so it does not make any per-iteration work known. A split forwards the carries that the body passes
@@ -2242,7 +2283,7 @@ where
         // a carry can leave a staged scan dead, so the relationships that the primal input types leave unproven are
         // first checked by an entry guard, through the guard's own rule (which casts each tangent to the checked
         // representation of its primal). The rebuilt scans then receive inputs whose types prove every relationship.
-        let declared_input_types = self.declared_input_types(&body.input_types())?;
+        let declared_input_types = self.entry_input_types(&body.input_types(), &input_types)?;
         let mut inputs = inputs.to_vec();
         if let Some((guard, members)) = scan_entry_guard(&declared_input_types, &input_types)? {
             let guarded = members.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
@@ -3348,7 +3389,7 @@ impl<C: Context<Type: ScanType, Operation: From<ScanOperation<C::Type>>>, P: Bat
 
         // The bound scan checks its complete boundary. Forwarding a carry would detach its value from that check,
         // so forward only when the input types already prove every relationship and no entry guard is needed.
-        if scan_entry_guard(&operation.declared_input_types(&body_input_types)?, &input_types)?.is_none() {
+        if scan_entry_guard(&operation.entry_input_types(&body_input_types, &input_types)?, &input_types)?.is_none() {
             operation.forward_carries(body, inputs, &mut outputs);
         }
 
@@ -3776,8 +3817,8 @@ fn scan_stack_type(
 }
 
 /// Returns the entry guard that checks a scan application whose inputs have the `actual` types against the `declared`
-/// input types of the scan (refer to [`ScanOperation::declared_input_types`]), together with the positions of its
-/// members among those inputs (refer to [`GuardOperation::for_entry`]), or [`None`] when the actual types prove every
+/// input types of the scan (refer to [`ScanOperation::entry_input_types`]), together with the positions of its members
+/// among those inputs (refer to [`GuardOperation::for_entry`]), or [`None`] when the actual types prove every
 /// relationship of the boundary. A rule that removes or splits the boundary of a scan stages such a guard first, so
 /// that the relationships which only that boundary checks at runtime (e.g., between an `f32[3]` stack and an iteration
 /// count of type `dimension<iteration_count>`) are still checked. The guard pins no identity, so that its outputs carry
@@ -3884,7 +3925,7 @@ fn write_scan_iteration<V: Value<Type = ArrayType> + UpdateSlice + Reshape>(
 ///     embed it instead of threading the value through the residual scan.
 ///   - `bind_known_fn`: Binds the known scan and any hoisted invariant work.
 ///   - `bind_residual_fn`: Binds the residual scan, preserving deferred work and effects.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 #[inline]
 fn reconstruct_partitioned_scan<
     V: Value<Type: ScanType>,
@@ -6697,6 +6738,56 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(&[sharded_stack_type.into()], std::slice::from_ref(&interface)),
             Ok(vec![slice_type.with_inserted_dimension(0, 3.into()).unwrap().into()]),
+        );
+    }
+
+    #[test]
+    fn test_scan_type_inference_rejects_varying_inputs_of_body_inputs_declared_without_sharding() {
+        // A carry or slice declared without a sharding is invariant, so the body could not report the variation of an
+        // input that varies over `x` on its outputs, and the scan rejects that input. A stack whose slice the body
+        // declares with that variation is accepted, because the declaration of a stack leaves its sharding to the
+        // slice.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let declared_type = ArrayType::scalar(DataType::F64);
+        let varying_type = declared_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let varying_stack_type = varying_type.with_inserted_dimension(0, 3.into()).unwrap();
+        let interface = |carry_type: &ArrayType, slice_type: &ArrayType| {
+            RegionInterface::new(
+                vec![ArrayType::scalar(DataType::I64), carry_type.clone(), slice_type.clone()],
+                vec![carry_type.clone()],
+                EffectClasses::NONE,
+            )
+        };
+        let operation = TestScanOperation::new(1, 3);
+        assert_eq!(
+            operation.infer_output_types(
+                &[varying_type.clone(), varying_stack_type.clone()],
+                &[interface(&declared_type, &varying_type)],
+            ),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` input 0 has type `{varying_type}`, which does not refine its expected type \
+                 `{declared_type}`",
+            ))),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                &[varying_type.clone(), varying_stack_type.clone()],
+                &[interface(&varying_type, &declared_type)],
+            ),
+            Err(TypeError::invalid(format!(
+                "`{SCAN_OPERATION_NAME}` stacked input 1 has type `{varying_stack_type}`, whose slice type \
+                 `{varying_type}` does not refine its body input type `{declared_type}`",
+            ))),
+        );
+        assert_eq!(
+            operation.infer_output_types(
+                &[varying_type.clone(), varying_stack_type],
+                &[interface(&varying_type, &varying_type)],
+            ),
+            Ok(vec![varying_type]),
         );
     }
 
@@ -11061,18 +11152,20 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_interpretation_widens_stacks_whose_manual_variation_changes_across_iterations() {
-        // The body declares its carry and slice without manual variation, returns the slice as the next carry, and
-        // stacks the carry that it receives. An invariant initial carry makes the first stacked slice invariant and the
-        // second one varying, so an array IR scan widens the stack to the join of their variation, as `parallel_vary`
-        // would, and returns the same values and types as when the carry enters varying. A carry that enters varying
-        // keeps its variation, and its slices stack as usual.
+    fn test_scan_interpretation_rejects_varying_stacks_of_slices_declared_without_sharding() {
+        // The body declares its carry and slice without manual variation, so its slice could not report that the
+        // stack varies over `devices`. Eager binding of an array IR scan and of a homogeneous scan therefore rejects
+        // the stack before any iteration, instead of stacking slices whose variation the body does not declare.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("devices", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let varying = |rank| Sharding::replicated(mesh.clone(), rank).with_varying_manual_axes(["devices"]).unwrap();
-        let stacked_type = ArrayType::new_static(DataType::F64, [2]).with_sharding(varying(1)).unwrap();
-        let varying_scalar_type = ArrayType::scalar(DataType::F64).with_sharding(varying(0)).unwrap();
+        let stacked_type = ArrayType::new_static(DataType::F64, [2])
+            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["devices"]).unwrap())
+            .unwrap();
         let values = Array::from_elements::<f64>(stacked_type.clone(), &[2.0, 3.0]).unwrap();
-        let initial = Array::from_elements::<f64>(varying_scalar_type.clone(), &[1.0]).unwrap();
+        let expected = ProgramError::Type(TypeError::invalid(format!(
+            "`{SCAN_OPERATION_NAME}` stacked input 1 has type `{stacked_type}`, whose slice type \
+             `f64[][sharding={{mesh<['devices'=2:manual]>, [], varying_manual={{'devices'}}}}]` does not refine its \
+             body input type `f64[]`",
+        )));
         let mut body = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         body.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body.add_input(ArrayType::scalar(DataType::F64).into());
@@ -11080,45 +11173,22 @@ mod tests {
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![slice, carry], vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
-        let context = TestIrEagerContext::new();
-        let operation = ScanOperation::<ArrayIrType>::new(1, 2);
-        let expected = Ok(vec![
-            array(Array::from_elements::<f64>(varying_scalar_type, &[3.0]).unwrap()),
-            array(Array::from_elements::<f64>(stacked_type.clone(), &[1.0, 2.0]).unwrap()),
-        ]);
         assert_eq!(
-            context.bind(
-                operation.clone(),
-                vec![body.clone()],
+            TestIrEagerContext::new().bind(
+                ScanOperation::<ArrayIrType>::new(1, 2),
+                vec![body],
                 &[array(Array::scalar(1.0).unwrap()), array(values.clone())],
             ),
-            expected,
+            Err(expected.clone()),
         );
-        assert_eq!(context.bind(operation, vec![body], &[array(initial.clone()), array(values.clone())]), expected);
-
-        // The values of a homogeneous scan are generic and cannot relabel their manual variation, so it rejects the
-        // second slice with its own error instead.
         let body = scalar_body(2, |_, inputs| vec![inputs[2], inputs[1]]);
-        let context = TestEagerContext::new();
-        let operation = TestOperation::Scan(TestScanOperation::new(1, 2));
         assert_eq!(
-            context.bind(operation.clone(), vec![body.clone()], &[Array::scalar(1.0).unwrap(), values.clone()]),
-            Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{SCAN_OPERATION_NAME}` body returns a slice of output 1 that varies over `devices` after earlier \
-                 slices that vary over no manual axes; every slice of a stacked output must have the same manual \
-                 variation",
-            ),))),
-        );
-        assert_eq!(
-            context.bind(operation, vec![body], &[initial, values]),
-            Ok(vec![
-                Array::from_elements::<f64>(
-                    ArrayType::scalar(DataType::F64).with_sharding(varying(0)).unwrap(),
-                    &[3.0],
-                )
-                .unwrap(),
-                Array::from_elements::<f64>(stacked_type, &[1.0, 2.0]).unwrap(),
-            ]),
+            TestEagerContext::new().bind(
+                TestOperation::Scan(TestScanOperation::new(1, 2)),
+                vec![body],
+                &[Array::scalar(1.0).unwrap(), values],
+            ),
+            Err(expected),
         );
     }
 
@@ -16012,11 +16082,21 @@ mod tests {
 
     #[test]
     fn test_scan_batching_preserves_stacked_input_placement_through_metadata_free_bodies() {
-        // Actual inputs may refine a metadata-free body declaration. Their element sharding and manual variation must
-        // reach the output allocation even when the mapped axis itself is replicated, for explicit and manual mesh axes
-        // alike.
+        // The element sharding and manual variation of the actual inputs must reach the output allocation even when
+        // the mapped axis itself is replicated, for explicit and manual mesh axes alike. A body declaration without a
+        // sharding admits the explicit placement of an actual input, while the varying slices of the manual case must
+        // be declared with their variation (and therefore with their placement).
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let item_type = if axis_type == MeshAxisType::Manual {
+                let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap();
+                ArrayType::new_static(DataType::F64, [2]).with_sharding(sharding).unwrap()
+            } else {
+                ArrayType::new_static(DataType::F64, [2])
+            };
             let sharding = Sharding::new(
                 mesh,
                 vec![
@@ -16036,7 +16116,7 @@ mod tests {
             .unwrap();
             let mut builder = ProgramBuilder::<Array, TestOperation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64));
-            let item = builder.add_input(ArrayType::new_static(DataType::F64, [2]));
+            let item = builder.add_input(item_type);
             let body = builder.build(vec![item], vec![Placeholder; 2], vec![Placeholder]).unwrap();
             let outputs = bind_batched_scan(
                 &BatchingContext::new(TestEagerContext::new(), 2),
@@ -16050,11 +16130,21 @@ mod tests {
 
     #[test]
     fn test_scan_batching_preserves_stacked_output_placement_of_reset_carries() {
-        // Resetting a carry may drop its optional placement while stacking its original, sharded value. The reset carry
-        // is instantiated at the mapped carry axis, and the stacked output keeps the sharding of its slices, for
-        // explicit and manual mesh axes alike.
+        // Resetting a carry may drop its optional placement while stacking its original, sharded value. The reset
+        // carry is instantiated at the mapped carry axis, and the stacked output keeps the sharding of its slices, for
+        // explicit and manual mesh axes alike. A carry declared without a sharding admits the explicit placement, while
+        // the varying carry of the manual case must be declared with its variation, which its reset keeps.
         for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let item_type = if axis_type == MeshAxisType::Manual {
+                let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+                    .unwrap()
+                    .with_varying_manual_axes(["x"])
+                    .unwrap();
+                ArrayType::new_static(DataType::F64, [2]).with_sharding(sharding).unwrap()
+            } else {
+                ArrayType::new_static(DataType::F64, [2])
+            };
             let sharding =
                 Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
                     .unwrap()
@@ -16062,20 +16152,18 @@ mod tests {
                     .unwrap();
             let carry_type = ArrayType::new_static(DataType::F64, [2, 2]).with_sharding(sharding).unwrap();
             let stacked_type = carry_type.with_inserted_dimension(0, Dimension::Static(1)).unwrap();
+            let reset_type = if axis_type == MeshAxisType::Manual {
+                carry_type.clone()
+            } else {
+                ArrayType::new_static(DataType::F64, [2, 2])
+            };
             let carry =
                 ArrayBatch::new(Array::from_elements::<f64>(carry_type, &[1., 2., 3., 4.]).unwrap(), BatchAxis::new(0))
                     .unwrap();
             let mut builder = ProgramBuilder::<Array, TestOperation>::new();
             builder.add_input(ArrayType::scalar(DataType::I64));
-            let carry_atom = builder.add_input(ArrayType::new_static(DataType::F64, [2]));
-            let zero = builder
-                .add_instruction(
-                    ZeroOperation::new(ArrayType::new_static(DataType::F64, [2])),
-                    Vec::new(),
-                    vec![],
-                    None,
-                )
-                .unwrap()[0];
+            let carry_atom = builder.add_input(item_type.clone());
+            let zero = builder.add_instruction(ZeroOperation::new(item_type), Vec::new(), vec![], None).unwrap()[0];
             let body = builder.build(vec![zero, carry_atom], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
             assert_eq!(
                 bind_batched_scan(
@@ -16085,8 +16173,11 @@ mod tests {
                     vec![carry],
                 ),
                 vec![
-                    ArrayBatch::new(Array::matrix(2, 2, vec![0.0f64, 0.0, 0.0, 0.0]).unwrap(), BatchAxis::new(0))
-                        .unwrap(),
+                    ArrayBatch::new(
+                        Array::from_elements::<f64>(reset_type, &[0.0, 0.0, 0.0, 0.0]).unwrap(),
+                        BatchAxis::new(0),
+                    )
+                    .unwrap(),
                     ArrayBatch::new(
                         Array::from_elements::<f64>(stacked_type, &[1., 2., 3., 4.]).unwrap(),
                         BatchAxis::new(1),

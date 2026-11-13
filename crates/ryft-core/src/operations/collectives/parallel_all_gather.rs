@@ -913,6 +913,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
         context.validate_collective_axis_size(self, &axes, self.axis_size())?;
         let outputs = context.grid().map_devices(|device| {
             let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
+            context.validate_collective(self, self.mesh(), std::slice::from_ref(&output_type))?;
             let (participants, _) = context.grid().participants(device, &axes, self.options().axis_index_groups())?;
             let participant_arrays = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
             validate_participant_types(name, &participant_arrays)?;

@@ -542,13 +542,14 @@ impl ArrayType {
                 continue;
             }
 
-            // Dimensions sharded only over manual or automatic axes have an explicit mesh-axis product of one.
+            // Dimensions sharded only over manual or automatic axes have an explicit mesh-axis product of one. The
+            // product is over distinct axes of one mesh, so it never exceeds the device count of that mesh, which fits
+            // `usize`.
             let explicit_axis_product: usize = axis_names
                 .iter()
                 .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
                 .filter_map(|name| sharding.mesh().axis_size(name))
-                .try_fold(1usize, |product, size| product.checked_mul(size))
-                .ok_or_else(|| TypeError::invalid(format!("`{operation_name}` mesh-axis product overflows `usize`")))?;
+                .product();
             if explicit_axis_product > 1 && output_size % explicit_axis_product != 0 {
                 return Err(TypeError::invalid(format!(
                     "`{operation_name}` on a dimension sharded over explicit mesh axes requires the output size \
@@ -563,6 +564,14 @@ impl ArrayType {
     /// refines this type's optional [`Layout`] and [`Sharding`] constraints. [`Shape`] refinement is deliberately
     /// excluded because ordinary type refinement, identity-renaming derivation, and cross-signature refinement
     /// validation have different requirements.
+    ///
+    /// A declared [`Sharding`] requires the exact same actual sharding. A declared type without a sharding admits an
+    /// actual type without one, or one whose sharding only places the value (i.e., its dimension shardings and mesh)
+    /// and has no [`Sharding::varying_manual_axes`], [`Sharding::unreduced_axes`], or [`Sharding::reduced_axes`].
+    /// Manual variation and reduction state change the meaning of a value (i.e., it holds per device values or still
+    /// needs a cross-device reduction), and consumers of declared types read a missing sharding as invariant and fully
+    /// reduced. A region that accepted such a value through a declaration without a sharding could therefore not
+    /// report that state on its outputs, and the state would be lost.
     fn non_shape_components_are_refined_by(&self, other: &Self) -> bool {
         let layout_is_refined = match (&self.payload.layout, &other.payload.layout) {
             (None, _) => true,
@@ -570,7 +579,12 @@ impl ArrayType {
             (Some(declared), Some(actual)) => declared == actual,
         };
         let sharding_is_refined = match (&self.payload.sharding, &other.payload.sharding) {
-            (None, _) => true,
+            (None, None) => true,
+            (None, Some(actual)) => {
+                actual.varying_manual_axes().is_empty()
+                    && actual.unreduced_axes().is_empty()
+                    && actual.reduced_axes().is_empty()
+            }
             (Some(_), None) => false,
             (Some(declared), Some(actual)) => declared == actual,
         };
@@ -674,11 +688,13 @@ impl Type for ArrayType {
     #[inline]
     fn is_refined_by(&self, other: &Self) -> bool {
         // `DataType`s and `Memory` placements must match exactly and shapes follow `Shape::is_refined_by`. The optional
-        // `Layout` and `Sharding` metadata components follow the same directional declared-vs-actual reading as dynamic
-        // dimensions where a declared `None` leaves the component unspecified and admits every actual value (including
-        // one that carries the component), while a declared `Some` requires the actual type to carry the exact same
-        // component. This is what lets declared types staged without placement information (e.g., program input types
-        // traced from metadata-free exemplars) accept concrete runtime values whose types carry normalized shardings.
+        // `Layout` and `Sharding` metadata components follow the same directional declared versus actual reading as
+        // dynamic dimensions, where a declared `Some` requires the actual type to carry the exact same component. A
+        // declared `None` layout admits every actual layout. A declared `None` sharding admits every actual placement
+        // but no manual variation and no unreduced or reduced axes, because consumers of the declared type read a
+        // missing sharding as invariant and fully reduced (refer to `non_shape_components_are_refined_by`). This lets
+        // declared types staged without placement information (e.g., program input types traced from exemplars without
+        // metadata) accept concrete runtime values whose types carry normalized placements.
         self.non_shape_components_are_refined_by(other) && self.payload.shape.is_refined_by(&other.payload.shape)
     }
 
@@ -1555,6 +1571,34 @@ mod tests {
     }
 
     #[test]
+    fn test_array_type_is_refined_by_manual_variation_and_reduction_state() {
+        // An unsharded declared type admits every placement over a manual axis, but no manual variation and no
+        // unreduced or reduced axes, because its consumers read it as invariant and fully reduced. A declared sharding
+        // still requires the exact same actual sharding, including its variation and reduction state.
+        let declared = ArrayType::new_static(F32, [4, 2]);
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 2);
+        let with = |sharding: Sharding| declared.clone().with_sharding(sharding).unwrap();
+        let placed = with(
+            Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
+        );
+        let varying = with(replicated.clone().with_varying_manual_axes(["x"]).unwrap());
+        let unreduced = with(replicated.clone().with_unreduced_axes(["x"]).unwrap());
+        let reduced = with(replicated.clone().with_reduced_axes(["x"]).unwrap());
+        assert!(declared.is_refined_by(&with(replicated)));
+        assert!(declared.is_refined_by(&placed));
+        assert!(!declared.is_refined_by(&varying));
+        assert!(!declared.is_refined_by(&unreduced));
+        assert!(!declared.is_refined_by(&reduced));
+        for sharded in [&placed, &varying, &unreduced, &reduced] {
+            assert!(sharded.is_refined_by(sharded));
+            assert!(!sharded.is_refined_by(&declared));
+        }
+        assert!(!varying.is_refined_by(&placed));
+        assert!(!unreduced.is_refined_by(&reduced));
+    }
+
+    #[test]
     fn test_array_type_with_mismatched_sharding_rank() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
@@ -1866,22 +1910,6 @@ mod tests {
         assert_eq!(
             explicit_input.resized_sharding(&[Dimension::Dynamic(extent), Dimension::Static(4)], "slice"),
             Ok(Some(explicit)),
-        );
-    }
-
-    #[test]
-    fn test_array_type_resized_sharding_overflow() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", usize::MAX, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-        let input = ArrayType::new_static(DataType::I32, [1])
-            .with_sharding(Sharding::new(mesh, vec![ShardingDimension::sharded(["x", "y"])]).unwrap())
-            .unwrap();
-        assert_eq!(
-            input.resized_sharding(&[Dimension::Static(0)], "slice"),
-            Err(TypeError::invalid("`slice` mesh-axis product overflows `usize`")),
         );
     }
 

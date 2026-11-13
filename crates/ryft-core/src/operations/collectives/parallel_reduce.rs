@@ -521,20 +521,14 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
         }
 
         // A mesh reduction records the mesh that it was staged over, whose participants must be the devices of the
-        // manual region that actually binds each reduced axis.
-        if let Some(mesh) = self.mesh() {
-            for axis_name in self.axes().names() {
-                context.validate_collective_mesh(self, axis_name, Some(mesh))?;
-            }
-        }
-
+        // manual regions that own the reduced axes, and a meshless one must keep its outputs varying along those axes
+        // inside a checked region (e.g., a grouped reduction of a varying input).
         let outputs = context.grid().map_devices(|device| {
+            let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
+            context.validate_collective(self, self.mesh(), std::slice::from_ref(&output_type))?;
             let (participants, _) = context.grid().participants(device, &axes, self.axis_index_groups())?;
             let participants = participants.iter().map(|participant| arrays[*participant]).collect::<Vec<_>>();
-            with_placement_of(
-                &reduce_participants(name, &participants, self.kind())?,
-                &context.collective_output_type(self, arrays[device], extents, device)?,
-            )
+            with_placement_of(&reduce_participants(name, &participants, self.kind())?, &output_type)
         })?;
 
         Ok(vec![LockstepValue::new(outputs, context)?])

@@ -5201,6 +5201,34 @@ mod tests {
     }
 
     #[test]
+    fn test_while_type_inference_rejects_varying_inputs_of_state_declared_without_sharding() {
+        // A state element declared without a sharding is invariant, so the loop could not report the variation
+        // of an initial state that varies over `m` on its outputs, and it rejects that initial state.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let state_type = ArrayType::scalar(DataType::F32);
+        let varying_type = state_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let state_types = vec![ArrayIrType::Array(state_type)];
+        let interfaces = [
+            RegionInterface::new(
+                state_types.clone(),
+                vec![ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))],
+                EffectClasses::NONE,
+            ),
+            RegionInterface::new(state_types.clone(), state_types, EffectClasses::NONE),
+        ];
+        assert_eq!(
+            WhileOperation::new().infer_output_types(&[ArrayIrType::Array(varying_type)], &interfaces),
+            Err(TypeError::invalid(format!(
+                "`{WHILE_OPERATION_NAME}` input 0 has type `f32[][sharding={{mesh<['m'=2:manual]>, [], \
+                 varying_manual={{'m'}}}}]`, which does not refine its state type `f32[]`",
+            ))),
+        );
+    }
+
+    #[test]
     fn test_while_type_inference_refines_input_types() {
         // Inputs only need to refine the state types, so actual types that carry metadata the state types leave
         // unspecified (e.g., the normalized shardings of concrete backend array types) are accepted, and the outputs

@@ -121,11 +121,21 @@ fn interned_logical_meshes() -> &'static Mutex<HashMap<LogicalMeshKey, Weak<Logi
 /// of a mesh: it provides enough information to validate partition specifications and generate sharding-related code
 /// (e.g., [Shardy](https://openxla.org/shardy) MLIR attributes), but it does not carry any device-specific information.
 /// Note that equivalent meshes are interned within the process and so repeated constructions share immutable storage.
+///
+/// Every [`LogicalMesh`] has a device count (i.e., the product of its axis sizes) that fits `usize`, because
+/// [`Self::new`] is the only way to construct one, and it rejects other meshes. The product of the sizes of any subset
+/// of the axes of one mesh therefore also fits `usize`, so code that multiplies the sizes of axes of one mesh needs
+/// no overflow checks.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LogicalMesh(Arc<LogicalMeshPayload>);
 
 impl LogicalMesh {
     /// Creates a new [`LogicalMesh`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardingError::DuplicateMeshAxisName`] when two axes share a name, and
+    /// [`ShardingError::MeshDeviceCountOverflow`] when the product of the axis sizes does not fit `usize`.
     #[inline]
     pub fn new(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
         let mut axis_indices = HashMap::with_capacity(axes.len());
@@ -134,6 +144,11 @@ impl LogicalMesh {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis.name.clone() });
             }
         }
+
+        if axes.iter().try_fold(1usize, |count, axis| count.checked_mul(axis.size)).is_none() {
+            return Err(ShardingError::MeshDeviceCountOverflow { sizes: axes.iter().map(|axis| axis.size).collect() });
+        }
+
         let mut interner = interned_logical_meshes().lock().expect("poisoned logical mesh interner mutex");
         match interner.entry(LogicalMeshKey { axes }) {
             Entry::Occupied(mut occupied) => {
@@ -207,10 +222,12 @@ impl LogicalMesh {
         self.0.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.0.axes[*axis_index].r#type)
     }
 
-    /// Returns the total number of devices that the topology defined by this [`LogicalMesh`] contains.
+    /// Returns the total number of devices that the topology defined by this [`LogicalMesh`] contains (i.e., the
+    /// product of its axis sizes). This product never overflows, because [`Self::new`] rejects meshes whose device
+    /// count does not fit `usize`.
     #[inline]
     pub fn device_count(&self) -> usize {
-        self.0.axes.iter().fold(1usize, |count, axis| count * axis.size)
+        self.0.axes.iter().map(|axis| axis.size).product()
     }
 
     /// Returns `true` when this [`LogicalMesh`] and `other` define the same topology (i.e., the same axes, with the
@@ -507,6 +524,26 @@ mod tests {
             ]),
             Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
         ));
+
+        // Axis sizes that each fit `usize` are rejected when their product (i.e., the device count) does not.
+        let largest_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", usize::MAX / 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(largest_mesh.device_count(), usize::MAX - 1);
+        let overflowing_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", usize::MAX / 2 + 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ]);
+        assert_eq!(
+            overflowing_mesh,
+            Err(ShardingError::MeshDeviceCountOverflow { sizes: vec![usize::MAX / 2 + 1, 2] }),
+        );
+        assert_eq!(
+            overflowing_mesh.unwrap_err().to_string(),
+            format!("mesh with axis sizes [{}, 2] has a device count that does not fit `usize`", usize::MAX / 2 + 1),
+        );
 
         let mesh_0 = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),

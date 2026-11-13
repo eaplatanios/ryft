@@ -197,8 +197,8 @@ mod tests {
         Add, Array as CoreArray, ArrayOperation, AxisIndex, ConvertElementType, DataType, DimensionBounds,
         DimensionType, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, ParallelAllGather,
         ParallelAllToAllOperation, ParallelCastOperation, ParallelCastTarget, ParallelPermuteOperation, ParallelReduce,
-        ParallelVaryOperation, ReductionKind, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension,
-        Value as CoreValue, auto_axes,
+        ParallelReduceOperation, ParallelVaryOperation, ReductionKind, Shape, ShardMapBoundary, ShardMapOptions,
+        Sharding, ShardingDimension, Value as CoreValue, auto_axes,
     };
     use ryft_mlir::{Block, Location, Value as MlirValue};
 
@@ -462,6 +462,66 @@ mod tests {
                 state.channel_ids.set(1);
             }
         }
+    }
+
+    #[test]
+    fn test_parallel_reduce_lowering_revalidates_meshless_bindings() {
+        // A meshless (e.g., grouped) reduction inside a checked binding must record outputs that vary along its axis,
+        // because an output typed as invariant would be accepted as replicated although the devices can hold
+        // different values. A mesh reduction tracks manual variation, so its binding must check it.
+        let mesh = test_manual_mesh("x", 2);
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
+        let checked = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let unchecked = checked.clone().with_check_manual_variation(false);
+        let lower = |operation: &ParallelReduceOperation, boundary: &ShardMapBoundary, sharding: &Sharding| {
+            let input_type = test_vector_type(2).with_sharding(sharding.clone()).unwrap();
+            let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
+            let state = CollectiveLoweringState::new().enter_manual_region(boundary.clone());
+            let context = MlirContext::new();
+            let location = context.unknown_location();
+            let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+            let block = context.block(&[(tensor_type, location)]);
+            let input = block.argument(0).unwrap().as_ref();
+            let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+                Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state);
+            operation.lower(&mut lowerer, &[input], &[input_type], &output_types).map(|_| ())
+        };
+        let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string());
+        let grouped =
+            ParallelReduceOperation::grouped(ReductionKind::Sum, "x".to_string(), 2, vec![vec![0], vec![1]]).unwrap();
+        let tracked = sum.clone().with_mesh(mesh);
+
+        // Meshless reductions whose recorded outputs vary along the axis and every reduction of an unchecked binding
+        // that records no mesh lower.
+        assert!(lower(&grouped, &checked, &varying).is_ok());
+        assert!(lower(&sum, &checked, &varying).is_ok());
+        assert!(lower(&tracked, &checked, &varying).is_ok());
+        assert!(lower(&sum, &unchecked, &replicated).is_ok());
+        assert!(lower(&grouped, &unchecked, &replicated).is_ok());
+
+        // Meshless reductions whose recorded outputs are invariant along the axis are rejected in a checked binding.
+        for operation in [&sum, &grouped] {
+            assert!(matches!(
+                lower(operation, &checked, &replicated),
+                Err(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                        if *message == "`parallel_reduce` without tracked mesh metadata types its outputs as invariant \
+                                        along manual axis `x` inside a checked manual region",
+                ),
+            ));
+        }
+
+        // Mesh reductions are rejected in an unchecked binding.
+        assert!(matches!(
+            lower(&tracked, &unchecked, &varying),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message == "`parallel_reduce` cannot use tracked mesh metadata inside an unchecked manual binding",
+            ),
+        ));
     }
 
     #[test]

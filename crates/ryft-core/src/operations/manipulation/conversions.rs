@@ -1876,20 +1876,11 @@ impl CastType for ArrayIrType {
         let preserved = operation.validate_declaration(input_types)?;
         match (&input_types[0], &operation.output_type) {
             (Self::Array(input), Self::Array(output)) => {
-                // The validation above guarantees that the declared first input has the supplied input's member kind.
-                let Self::Array(declared) = &operation.input_types[0] else { unreachable!() };
-
                 // Arrays preserve the input value properties and static extents. Layout and explicit placement may
-                // change, while manual placement, manual variation, and reduction state remain constrained.
-                if declared.unreduced_axes() != input.unreduced_axes()
-                    || declared.unreduced_kind() != input.unreduced_kind()
-                    || declared.reduced_axes() != input.reduced_axes()
-                {
-                    return Err(TypeError::invalid(format!(
-                        "`{CAST_OPERATION_NAME}` supplied input changes the declared reduction state",
-                    )));
-                }
-
+                // change, while manual placement, manual variation, and reduction state remain constrained. The
+                // validation above already requires the supplied input to refine the declared first input, which
+                // admits no manual variation or reduction state that the declaration lacks, so the supplied input
+                // has the declared variation and reduction state.
                 if input.data_type() != output.data_type()
                     || input.rank() != output.rank()
                     || input.memory() != output.memory()
@@ -1911,12 +1902,6 @@ impl CastType for ArrayIrType {
                 // These are semantic dependencies, not optional placement constraints. An absent sharding is invariant,
                 // and changing variation requires the corresponding operation (whose transpose performs the required
                 // reduction).
-                if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[declared, input]).is_err() {
-                    return Err(TypeError::invalid(format!(
-                        "`{CAST_OPERATION_NAME}` supplied input changes the declared manual variation",
-                    )));
-                }
-
                 if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[input, output]).is_err() {
                     return Err(TypeError::invalid(format!(
                         "`{CAST_OPERATION_NAME}` cannot change varying manual axes; use `parallel_vary` to add \
@@ -4656,16 +4641,17 @@ mod tests {
     #[test]
     fn test_cast_type_inference_distributed_semantics() {
         // Manual variation and reduction state are semantic rather than optional placement: a supplied input may not
-        // carry variation or reduction state that the declared source lacks, and the output may not add or drop them,
-        // even when the supplied input matches the requested output exactly.
+        // carry variation or reduction state that the declared source lacks (which the refinement of the declaration
+        // rejects), and the output may not add or drop them, even when the supplied input matches the requested output
+        // exactly.
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh, 1);
         let varying = plain.clone().with_sharding(replicated.clone().with_varying_manual_axes(["x"]).unwrap()).unwrap();
         let unreduced = plain.clone().with_sharding(replicated.clone().with_unreduced_axes(["x"]).unwrap()).unwrap();
         let reduced = plain.clone().with_sharding(replicated.with_reduced_axes(["x"]).unwrap()).unwrap();
-        let variation = TypeError::invalid("`cast` supplied input changes the declared manual variation");
-        let reduction = TypeError::invalid("`cast` supplied input changes the declared reduction state");
+        let refinement =
+            |actual: &ArrayType| TypeError::invalid(format!("type {actual} does not refine declared type {plain}"));
         let variation_change = TypeError::invalid(
             "`cast` cannot change varying manual axes; use `parallel_vary` to add variation or a reduction to \
              remove it",
@@ -4676,9 +4662,9 @@ mod tests {
                     .unwrap()
                     .infer_output_types(&[actual.clone()], &[])
             };
-            assert_eq!(infer(&varying, &plain, &varying), Err(variation.clone()));
-            assert_eq!(infer(&unreduced, &plain, &unreduced), Err(reduction.clone()));
-            assert_eq!(infer(&reduced, &plain, &reduced), Err(reduction.clone()));
+            assert_eq!(infer(&varying, &plain, &varying), Err(refinement(&varying)));
+            assert_eq!(infer(&unreduced, &plain, &unreduced), Err(refinement(&unreduced)));
+            assert_eq!(infer(&reduced, &plain, &reduced), Err(refinement(&reduced)));
             assert_eq!(infer(&varying, &plain, &plain), Err(variation_change.clone()));
             assert_eq!(infer(&plain, &varying, &varying), Err(variation_change.clone()));
             assert_eq!(
@@ -4715,8 +4701,8 @@ mod tests {
         assert_eq!(
             CastOperation::<ArrayIrType>::checked(varying.clone().into(), vec![plain.clone().into()])
                 .unwrap()
-                .infer_output_types(&[varying.into()], &[]),
-            Err(variation),
+                .infer_output_types(&[varying.clone().into()], &[]),
+            Err(refinement(&varying)),
         );
         assert_eq!(
             CastOperation::<ArrayIrType>::unchecked(plain.clone().into(), vec![reduced.clone().into()])
@@ -6611,8 +6597,7 @@ mod tests {
         }
 
         // Variation that the declaration does not have, on `x` or `y`, remains an input-contract error, which the
-        // parent's validation of the lifted declaration reports for a sharded declaration and the cast itself reports
-        // for an unannotated one.
+        // validation of the lifted declaration reports for sharded and unannotated declarations alike.
         let packed = plain.batched(0, Dimension::Static(4), ShardingDimension::sharded(["x"])).unwrap();
         let wrong_type = packed
             .clone()
@@ -6624,7 +6609,7 @@ mod tests {
             ArrayBatch::new(Array::from_elements(wrong_type.clone(), &[1f32; 8]).unwrap(), BatchAxis::new(0)).unwrap();
         for (declared, message) in [
             (plain, format!("type {wrong_type} does not refine declared type {packed}")),
-            (unannotated, "`cast` supplied input changes the declared manual variation".to_string()),
+            (unannotated, format!("type {wrong_type} does not refine declared type f32[4, 2]")),
         ] {
             assert_eq!(
                 CastOperation::checked(declared.clone(), vec![declared])

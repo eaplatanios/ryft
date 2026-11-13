@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -17,6 +18,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
 use crate::operations::composites::operations::composite_transpose::{
     CompositeTransposeOperation, CompositeTransposeRules,
 };
@@ -977,6 +979,27 @@ where
                 };
                 context.discharge_local_reference_operation(&discharged, driver, inputs)
             }
+        }
+    }
+}
+
+impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> CollectiveOperation
+    for CompositeOperation<V, O, S>
+{
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        // A composite call is not a collective, and its primal and attached rule regions reveal their own axes.
+        Cow::Owned(CollectiveAxes::default())
+    }
+
+    #[inline]
+    fn may_use_hidden_axes(&self) -> bool {
+        // Retained custom differentiation and batching rules are traced only when a transform requests them, in the
+        // scope of that request, so their axes are hidden. A forward mode rule derived from the primal region and the
+        // sequential batching of calls without a custom batching rule use only the axes of the primal region.
+        match &self.rules {
+            CompositeRules::Attached { .. } => false,
+            CompositeRules::Retained { rules, .. } => rules.has_jvp() || rules.has_vjp() || rules.has_batching_rule(),
         }
     }
 }

@@ -17,6 +17,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation};
 use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::composite::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::operations::{CompositeConversion, transpose_carrier_batching};
@@ -511,6 +512,13 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 
     #[inline]
+    fn defers_reference_discharge(&self) -> bool {
+        // A retained backward rule (and a deferred forward rule) is traced on demand, so only discharging the carrier
+        // can record that the programs traced for it later must be discharged as well.
+        matches!(self.rules, CompositeTransposeRules::Retained { discharged: false, .. })
+    }
+
+    #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
         // A retained backward rule is an unresolved obligation of the carrier itself. An attached backward region is a
         // deferred rule region instead (refer to `region_slots`), which makes the carrier carry deferred work exactly
@@ -520,13 +528,6 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             CompositeTransposeRules::Attached => Cow::Borrowed(Effects::empty()),
             CompositeTransposeRules::Retained { .. } => Cow::Borrowed(&EFFECTS),
         }
-    }
-
-    #[inline]
-    fn defers_reference_discharge(&self) -> bool {
-        // A retained backward rule (and a deferred forward rule) is traced on demand, so only discharging the carrier
-        // can record that the programs traced for it later must be discharged as well.
-        matches!(self.rules, CompositeTransposeRules::Retained { discharged: false, .. })
     }
 
     fn rename_type_identities(
@@ -656,6 +657,22 @@ where
                 context.discharge_reference_free_operation(&discharged, driver, inputs)
             }
         }
+    }
+}
+
+impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> CollectiveOperation
+    for CompositeTransposeOperation<V, O, S>
+{
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        // A carrier is not a collective, and an attached backward region reveals its own axes.
+        Cow::Owned(CollectiveAxes::default())
+    }
+
+    #[inline]
+    fn may_use_hidden_axes(&self) -> bool {
+        // A retained backward rule is specialized only when transposition requests it, so its axes are hidden.
+        matches!(self.rules, CompositeTransposeRules::Retained { .. })
     }
 }
 

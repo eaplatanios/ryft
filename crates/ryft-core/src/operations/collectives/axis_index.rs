@@ -241,16 +241,16 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
         let axes = context.collective_axes(self)?;
         check_count!("input", inputs, 0, ProgramError);
 
-        // The coordinates differ across the devices, so the manual region that owns the axis must agree with this
-        // operation on whether that variation is tracked. Otherwise, a checked region would accept the output of the
-        // meshless form as replicated.
-        context.validate_collective_mesh(self, &self.axis_name, self.mesh.as_ref())?;
-
+        // The coordinates differ across the devices, so a checked owner of the axis needs the tracked form,
+        // whose output varies along it. Otherwise, it would accept the output of the meshless form as replicated.
         let output_type = self.infer_output_types(&[], &[])?.remove(0);
+        context.validate_collective(self, self.mesh.as_ref(), std::slice::from_ref(&output_type))?;
+
         let outputs = context.grid().map_devices(|device| {
             let position = Array::scalar(context.grid().position(device, &axes) as u64)?;
             with_placement_of(&position.converted_to(output_type.data_type())?, &output_type)
         })?;
+
         Ok(vec![LockstepValue::new(outputs, context)?])
     }
 }

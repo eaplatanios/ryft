@@ -446,7 +446,7 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
         let (carry_count, length) = (self.carry_count(), self.iteration_count());
         let body_input_types = body.input_types();
         let body_output_types = body.output_types();
-        let entry_types = self.declared_input_types(&body_input_types).map_err(ProgramError::from)?;
+        let entry_types = self.entry_input_types(&body_input_types, input_types).map_err(ProgramError::from)?;
         let expected = entry_types.len();
         for actual in [input_values.len(), input_types.len()] {
             if actual != expected {

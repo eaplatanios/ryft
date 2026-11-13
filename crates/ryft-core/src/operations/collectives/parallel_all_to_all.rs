@@ -830,6 +830,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
         context.validate_collective_axis_size(self, &axes, self.axis_size())?;
         let outputs = context.grid().map_devices(|device| {
             let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
+            context.validate_collective(self, self.mesh(), std::slice::from_ref(&output_type))?;
             let groups = self.options().axis_index_groups();
             let (participants, position) = context.grid().participants(device, &axes, groups)?;
             let (split_axis, concatenation_axis) = (self.split_axis(), self.concatenation_axis());

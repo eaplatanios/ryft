@@ -221,11 +221,11 @@ pub use parallel_vary::{ManualVariationAlignment, PARALLEL_VARY_OPERATION_NAME, 
 /// Several names must be distinct manual mesh axes of one mesh. A `batch` level that binds any of them rejects the
 /// collective, because a batch level binds a single axis.
 ///
-/// Note that no collective accepts the empty [`CollectiveAxes`], which is the [`Default`] and selects
-/// no axis. It only appears as the result of [`CollectiveOperation::axes`] for an operation family (e.g.,
-/// [`ArrayOperation`](crate::ArrayOperation)), which implements that trait on behalf of all of its members, when the
-/// member that it holds is not a collective (e.g., an addition operation). Operations that are not collectives do not
-/// implement that trait themselves.
+/// Note that no collective accepts the empty [`CollectiveAxes`], which is the [`Default`] and selects no axis. It only
+/// appears as the result of [`CollectiveOperation::axes`] for an operation that is not a collective, which is either a
+/// composite call (or its transpose carrier) or an operation family (e.g., [`ArrayOperation`](crate::ArrayOperation))
+/// that implements that trait on behalf of all of its members and holds a member that is not a collective (e.g., an
+/// addition operation).
 ///
 /// The [`Display`] form names the axes for diagnostics (e.g., `x` or `(x, y)`), and the [`Debug`] form renders them
 /// as they appear in programs (e.g., `"x"` or `("x", "y")`).
@@ -574,24 +574,41 @@ impl<
 /// find the manual axes that a body uses, and the reference backend emulation of that operation uses it to find the
 /// operations that communicate across the emulated devices.
 ///
-/// Every collective implements this trait, and no other operation does. An operation family (e.g.,
-/// [`ArrayOperation`](crate::ArrayOperation)) whose programs reach such code must also implement it, because that code
-/// only sees the family and cannot tell which member it holds. A family answers for whichever member it holds, and so
-/// it reports no axes when that member is not a collective (e.g., an addition), which is the only case in which
-/// [`axes`](Self::axes) is empty.
+/// Every collective implements this trait, and so does every operation whose transform rules
+/// are not visible in its payload and regions (i.e., a [`CompositeOperation`](crate::CompositeOperation) or
+/// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation), whose retained rules are traced only when a
+/// transform requests them), which reports no axes but answers [`may_use_hidden_axes`](Self::may_use_hidden_axes).
+/// No other operation implements it. An operation family (e.g., [`ArrayOperation`](crate::ArrayOperation)) whose
+/// programs reach such code must also implement it, because that code only sees the family and cannot tell which
+/// member it holds. A family answers for whichever member it holds, and so it reports no axes when that member
+/// is not a collective (e.g., an addition or a composite call).
 ///
 /// `#[derive(Operation)]` implements this trait for a family in which at least one variant is marked with
 /// `#[ryft(collective)]`, by delegating to the payloads of the marked variants, while every other variant
-/// communicates along no axis. A family must therefore mark every variant whose payload is a collective and every
-/// variant whose payload is itself a family that holds collectives (e.g., the
-/// [`Array`](crate::ArrayIrOperation::Array) variant of [`ArrayIrOperation`](crate::ArrayIrOperation)),
-/// because an unmarked collective is treated as an operation that communicates along no axis.
+/// communicates along no axis and uses no hidden axes. A family must therefore mark every variant whose payload
+/// implements this trait (i.e., every collective, composite call, and composite transpose carrier) and every variant
+/// whose payload is itself a family that holds such operations (e.g., the [`Array`](crate::ArrayIrOperation::Array)
+/// variant of [`ArrayIrOperation`](crate::ArrayIrOperation)), because an unmarked variant is treated as an operation
+/// that communicates along no axis.
 pub trait CollectiveOperation {
     /// Returns the names of the axes that this operation communicates along. A collective names at least one axis, and
-    /// so the result is empty only for a member of an operation family that is not a collective. The result borrows
-    /// the [`CollectiveAxes`] that a collective stores, and it is owned for a collective that stores a single axis
-    /// name instead.
+    /// so the result is empty only for an operation that is not a collective (e.g., a composite call or a member of an
+    /// operation family that is not a collective). The result borrows the [`CollectiveAxes`] that a collective stores,
+    /// and it is owned for a collective that stores a single axis name instead.
     fn axes(&self) -> Cow<'_, CollectiveAxes>;
+
+    /// Returns `true` when this operation may communicate along axes that neither [`axes`](Self::axes) nor its regions
+    /// reveal, because some of its transform rules are traced only when a transform requests them, in the scope of
+    /// that request (e.g., the retained custom differentiation and batching rules of a composite call). Analyses that
+    /// must prove that an operation does not use an axis (e.g., the release of manual axes by the batching rule of
+    /// [`ShardMapOperation`](crate::ShardMapOperation)) must therefore treat such an operation as using every axis.
+    /// Operations whose transform rules are derived from their payload and regions, or are attached to them as regions,
+    /// use no hidden axes, which is what the default implementation reports. This function does not affect how an
+    /// operation executes or lowers, which depends on [`axes`](Self::axes) and on its regions only.
+    #[inline]
+    fn may_use_hidden_axes(&self) -> bool {
+        false
+    }
 }
 
 /// Single-input linear collective operation over a named axis (i.e., [`ParallelPermuteOperation`],
@@ -1569,13 +1586,13 @@ fn validate_manual_mesh_axes_input(
     if let Some(axis_name) = axes.single() {
         return validate_manual_mesh_input(operation_name, axis_name, Some(axis_size), mesh, input_type);
     }
-    let mut mesh_axis_size = 1usize;
     for axis_name in axes.names() {
         validate_manual_mesh_axis(operation_name, axis_name, None, mesh)?;
-        mesh_axis_size = mesh_axis_size.checked_mul(mesh.axis_size(axis_name).unwrap()).ok_or_else(|| {
-            TypeError::invalid(format!("`{operation_name}` combined size of manual mesh axes {axes} overflows `usize`"))
-        })?;
     }
+
+    // The axes are distinct axes of one mesh, so their combined size never exceeds the device count of that mesh,
+    // which fits `usize`.
+    let mesh_axis_size = axes.names().iter().map(|axis_name| mesh.axis_size(axis_name).unwrap()).product::<usize>();
     if mesh_axis_size != axis_size {
         return Err(TypeError::invalid(format!(
             "`{operation_name}` axis size {axis_size} does not match the size {mesh_axis_size} \
@@ -1999,17 +2016,21 @@ mod tests {
     }
 
     /// Runs the lockstep rule of the collective `operation` (refer to [`LockstepOperation`]) over the devices of one
-    /// emulated manual axis `x` with `axis_size` devices. Every input holds one value per device, and the result holds
-    /// the outputs of every device, or [`None`] when the operation has no rule over all devices.
+    /// emulated manual axis `x` with `axis_size` devices, which a region that does not check manual variation binds,
+    /// so that the meshless forms may exchange device values whose types carry no manual variation. Every input holds
+    /// one value per device, and the result holds the outputs of every device, or [`None`] when the operation has no
+    /// rule over all devices.
     pub(super) fn run_collective(
         axis_size: usize,
         operation: impl Into<ArrayIrOperation<Array>>,
         inputs: &[Vec<ArrayIrValue<Array>>],
     ) -> Result<Option<Vec<Vec<ArrayIrValue<Array>>>>, ProgramError> {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", axis_size, MeshAxisType::Manual).unwrap()]).unwrap();
+        let boundary =
+            ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new())?.with_check_manual_variation(false);
         let domain = LockstepDomain::<ArrayIrOperation<Array>>::new(
-            LockstepDeviceGrid::new(vec![("x".to_string(), axis_size)]),
-            vec![ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap()],
+            LockstepDeviceGrid::new(vec![("x".to_string(), axis_size)])?,
+            vec![boundary],
         );
         let inputs = inputs
             .iter()

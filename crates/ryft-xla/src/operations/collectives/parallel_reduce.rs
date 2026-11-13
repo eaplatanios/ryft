@@ -163,6 +163,33 @@ impl LowerableOperation for ParallelReduceOperation {
         check_count!("input", input_values, 1, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let collective_state = lowerer.collective_state.clone();
+
+        // A mesh reduction tracks manual variation, so its binding must check it. Inside a checked binding, a meshless
+        // (e.g., grouped) reduction must keep its recorded output varying along the axis, because otherwise that
+        // binding would accept an output that is typed as invariant although the devices can hold different values.
+        if let Some(boundary) = collective_state.manual_axis_region(self.axis_name()) {
+            let axis_name = self.axis_name();
+            let operation_name = self.name();
+            if !boundary.checks_manual_variation() && self.mesh().is_some() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "`{operation_name}` cannot use tracked mesh metadata inside an unchecked manual binding",
+                ))
+                .into());
+            }
+            if boundary.checks_manual_variation()
+                && self.mesh().is_none()
+                && output_types[0]
+                    .sharding()
+                    .is_none_or(|sharding| !sharding.varying_manual_axes().contains(axis_name))
+            {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "`{operation_name}` without tracked mesh metadata types its outputs as invariant along manual axis \
+                     `{axis_name}` inside a checked manual region",
+                ))
+                .into());
+            }
+        }
+
         let result = lower_collective_to_all_reduce(
             self,
             &collective_state,

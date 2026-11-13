@@ -1489,6 +1489,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
                     Ok(self.infer_output_types(&input_types, &[])?.remove(0))
                 })
                 .collect::<Result<Vec<_>, ProgramError>>()?;
+            context.validate_collective(self, self.mesh(), &output_types)?;
 
             // Each of the six physical inputs has one leading row per participant, in axis index order.
             // Corresponding inputs must have one static shape and data type to share that representation.

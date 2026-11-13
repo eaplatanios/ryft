@@ -35,9 +35,9 @@ pub fn derive_parameterized(input: TokenStream) -> TokenStream {
 /// `TryFrom<&Enum>` payload conversions. Unless a variant stores a native `GuardOperation`, it also generates an
 /// `OperationProvider` implementation that rejects guard requests, and when a variant declares `#[ryft(collective)]`,
 /// it generates a `CollectiveOperation` implementation that delegates to the payloads of the variants that declare it
-/// and reports no axes for every other variant. The payload-delegating `PartialEq`, `Eq`, and `Hash` implementations,
-/// as well as the reference discharge, batching, differentiation, and transposition dispatchers, are generated only
-/// when they are selected through `#[ryft(dispatch(...))]`.
+/// and reports no axes and no hidden axes for every other variant. The payload-delegating `PartialEq`, `Eq`, and
+/// `Hash` implementations, as well as the reference discharge, batching, differentiation, and transposition
+/// dispatchers, are generated only when they are selected through `#[ryft(dispatch(...))]`.
 ///
 /// The macro supports the following optional `#[ryft(...)]` attributes:
 ///

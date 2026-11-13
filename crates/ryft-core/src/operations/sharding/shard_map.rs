@@ -26,10 +26,10 @@
 //! invariant along the active manual axes that its output sharding does not tile. Set
 //! [`ShardMapOptions::with_check_output_replication(false)`](ShardMapOptions::with_check_output_replication) to trust
 //! that replication promise when the body's types cannot prove it. Reference execution verifies that the replicated
-//! copies have identical logical bytes, while compiled execution trusts the caller. The promise must hold throughout
-//! the differentiated computation, including its tangents, when applying automatic differentiation. This option is
-//! limited to the output boundary. Transposition restores the output variation that the boundary forgets and normalizes
-//! its cotangent seeds, while the body's variation adjoints continue to aggregate input cotangents.
+//! copies of every map have identical logical bytes, while compiled execution trusts the caller. The promise must hold
+//! throughout the differentiated computation, including its tangents, when applying automatic differentiation. This
+//! option is limited to the output boundary. Transposition restores the output variation that the boundary forgets
+//! and normalizes its cotangent seeds, while the body's variation adjoints continue to aggregate input cotangents.
 //! [`ShardMapOptions::with_check_manual_variation(false)`](ShardMapOptions::with_check_manual_variation) also disables
 //! variation tracking for the active manual axes inside the body, like JAX's `check_vma=False`. Local inputs and
 //! collectives then use ordinary types, permitting operations without variation rules and reference updates whose
@@ -201,7 +201,10 @@
 //!     on the device at coordinate zero along those axes and zeros elsewhere. Every global output is assembled at its
 //!     declared global type from the body outputs. Tiles along the active manual axes that its output sharding names
 //!     are placed in mesh order, untiled invariant axes (including reduced ones) take the value of coordinate zero,
-//!     and unreduced axes are summed.
+//!     and unreduced axes are summed. Before that, the emulator compares the copies along every untiled invariant axis
+//!     by their logical bytes and rejects a map whose copies differ with [`ProgramError::MalformedProgram`], whether
+//!     its boundary trusts output replication or proves it from the types of its body. The reference backend is an
+//!     oracle, so a type that fails to report manual variation becomes an error instead of the copy of coordinate zero.
 //!   - **References are copied in and written back.** The current referent of a reference input is split like an
 //!     array input, and each device receives its shard as a fresh local [`ArrayReference`] root that it owns. After
 //!     the body, the final local shards are assembled like an output at the input sharding and written back into the
@@ -219,7 +222,8 @@
 //!   - **Collectives communicate across device groups.** A collective over an emulated axis (i.e., `axis_index`,
 //!     `parallel_reduce`, `parallel_vary`, `parallel_cast`, `parallel_all_gather`, `parallel_sum_scatter`,
 //!     `parallel_all_to_all`, `parallel_ragged_all_to_all`, `parallel_permute`, and `parallel_broadcast`) is computed
-//!     across the participants of each device group directly. Any other operation that its family declares
+//!     across the participants of each device group directly, after [`LockstepDomain::validate_collective`] checks it
+//!     against the manual regions that own its axes. Any other operation that its family declares
 //!     as a collective over an emulated axis through [`CollectiveOperation`] is rejected with
 //!     [`ProgramError::UnsupportedOperation`], because the emulator cannot compute it.
 //!     A collective over other axes binds per device like an ordinary operation.
@@ -295,7 +299,7 @@ use crate::operations::control_flow::r#while::{WHILE_OPERATION_NAME, WhilePredic
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
 use crate::operations::manipulation::broadcasting::BroadcastOperation;
-use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
+use crate::operations::manipulation::conversions::{CastOperation, ConvertElementTypeOperation};
 use crate::operations::manipulation::memory::TransferToMemoryOperation;
 use crate::operations::manipulation::reshaping::ReshapeOperation;
 use crate::operations::manipulation::slicing::DynamicSliceOperation;
@@ -1382,7 +1386,9 @@ impl ShardMapBoundary {
 
     /// Returns the manual partition count of every dimension of a value of rank `rank` that `sharding` places, which is
     /// the product of the sizes of the active manual axes that shard that dimension, after validating that `sharding`
-    /// has rank `rank`. The value has index `value_index` among the values of kind `value_kind`.
+    /// has rank `rank`. The value has index `value_index` among the values of kind `value_kind`. A sharding names each
+    /// axis of the mesh of this boundary at most once, so these products never exceed its device count, which fits
+    /// `usize`.
     fn manual_partition_counts(
         &self,
         sharding: &Sharding,
@@ -1399,27 +1405,18 @@ impl ShardMapBoundary {
             });
         }
         let manual_axis_names = self.manual_axes.iter().map(String::as_str).collect::<HashSet<_>>();
-        sharding
+        Ok(sharding
             .dimensions()
             .iter()
-            .enumerate()
-            .map(|(dimension, sharding_dimension)| match sharding_dimension {
+            .map(|sharding_dimension| match sharding_dimension {
                 ShardingDimension::Sharded(axis_names) => axis_names
                     .iter()
                     .filter(|axis_name| manual_axis_names.contains(axis_name.as_str()))
-                    .try_fold(1usize, |partition_count, axis_name| {
-                        partition_count.checked_mul(self.mesh.axis_size(axis_name).unwrap()).ok_or_else(|| {
-                            ShardMapError::ArithmeticOverflow {
-                                context: format!(
-                                    "computing the manual partition count of {value_kind} #{value_index} \
-                                     dimension #{dimension}",
-                                ),
-                            }
-                        })
-                    }),
-                ShardingDimension::Replicated | ShardingDimension::Unconstrained => Ok(1),
+                    .map(|axis_name| self.mesh.axis_size(axis_name).unwrap())
+                    .product(),
+                ShardingDimension::Replicated | ShardingDimension::Unconstrained => 1,
             })
-            .collect()
+            .collect())
     }
 
     /// Returns this boundary's active manual axes along which `sharding` tiles a dimension, so that the local value
@@ -1457,11 +1454,15 @@ impl ShardMapBoundary {
     }
 
     /// Returns the active manual axes of this map among `placement_axes` that `body` (the local body of this map,
-    /// including its nested regions) uses, in placement order. A checked body uses an axis that some of its values vary
-    /// along, and every body uses an axis that a collective or an `axis_index` names. An unchecked body carries no
-    /// variation labels, so only its collectives and `axis_index` operations reveal its uses, which suffices, because
-    /// no input or output sharding of a map whose batch axis is placed on an axis names that axis (every input is
-    /// replicated along it), and so only those operations can make the devices along it compute different values.
+    /// including its nested regions) may use, in placement order, so that every other one is provably unused. A
+    /// checked body uses an axis that some of its values vary along, and every body uses an axis that a collective or
+    /// an `axis_index` names. An unchecked body carries no variation labels, so only its collectives and `axis_index`
+    /// operations reveal its uses, which suffices, because no input or output sharding of a map whose batch axis is
+    /// placed on an axis names that axis (every input is replicated along it), and so only those operations can make
+    /// the devices along it compute different values. A body that contains an operation whose transform rules are
+    /// traced only when a transform requests them, such as a composite call with retained custom differentiation or
+    /// batching rules, may use every candidate axis, because those rules are traced in the scope of the original call,
+    /// where the axes are still manual. Refer to [`CollectiveOperation::may_use_hidden_axes`] for more information.
     fn used_manual_placement_axes<
         V: Value<Type = ArrayIrType>,
         O: Operation<Type = ArrayIrType> + CollectiveOperation,
@@ -1476,9 +1477,15 @@ impl ShardMapBoundary {
                 candidate_axes.push(axis_name.clone());
             }
         }
+
         if candidate_axes.is_empty() {
             return Vec::new();
         }
+
+        if body.instructions_in_closure().any(|(_, instruction)| instruction.operation().may_use_hidden_axes()) {
+            return candidate_axes;
+        }
+
         let mut used_axes = BTreeSet::new();
         if self.checks_manual_variation() {
             for region_id in body.region_ids_in_closure() {
@@ -1508,6 +1515,7 @@ impl ShardMapBoundary {
             let axis_names = instruction.operation().axes();
             used_axes.extend(candidate_axes.iter().filter(|axis_name| axis_names.contains(axis_name)).cloned());
         }
+
         candidate_axes.into_iter().filter(|axis_name| used_axes.contains(axis_name)).collect()
     }
 
@@ -1515,17 +1523,17 @@ impl ShardMapBoundary {
     /// map, for a batch axis placed on the mesh axes `placement_axes` (refer to [`ShardMapBatchPlacement`] and to the
     /// batching rule of [`ShardMapOperation`] for the rationale). Every placement axis must be an axis of the mesh.
     /// [`Auto`](MeshAxisType::Auto) axes are dropped, as the boundary drops them from every sharding, while free axes
-    /// (i.e., axes that are not active manual axes) are kept. An active manual placement axis that `body` (the local
-    /// body of this map) uses (refer to [`Self::used_manual_placement_axes`]) stays manual, the batch is gathered along
-    /// it on entry, and every mapped output is tiled along it ahead of the free placement axes, because manual axes
-    /// must precede free axes within each dimension sharding. Such axes must therefore come first in `placement_axes`,
-    /// so that outputs keep the requested placement. Every other active manual placement axis is released, so that it
-    /// is no longer active in the batched map, which is correct because every device along it computes the same values,
-    /// but only when `body` has no [`EffectClass::DeviceOrderedIo`] or [`EffectClass::UnorderedIo`] effect, because
-    /// every device along an active manual axis executes its own occurrence of such an effect, and releasing the axis
-    /// would eliminate all but one of them. A placement that releases every active manual axis leaves the batched map
-    /// without active manual axes, so its body runs once on the global values, which is what each device along the
-    /// released axes computed already.
+    /// (i.e., axes that are not active manual axes) are kept. An active manual placement axis is released only when
+    /// `body` (the local body of this map) provably does not use it (refer to [`Self::used_manual_placement_axes`]),
+    /// so that it is a free axis of the batched map, which is correct because every device along it computes the same
+    /// values. Every other active manual placement axis stays manual, the batch is gathered along it on entry, and
+    /// every mapped output is tiled along it ahead of the free placement axes, because manual axes must precede free
+    /// axes within each dimension sharding. Such axes must therefore come first in `placement_axes`, so that outputs
+    /// keep the requested placement. Releasing an axis is rejected when `body` has an [`EffectClass::DeviceOrderedIo`]
+    /// or an [`EffectClass::UnorderedIo`] effect, because every device along an active manual axis executes its own
+    /// occurrence of such an effect, and releasing the axis would eliminate all but one of them. A placement that
+    /// releases every active manual axis leaves the batched map without active manual axes, so its body runs once
+    /// on the global values, which is what each device along the released axes computed already.
     ///
     /// # Errors
     ///
@@ -1645,25 +1653,30 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// level preserves the boundary when all inputs are unbatched. The batch dimension is unpartitioned for a replicated
 /// batch axis and is otherwise placed on the mesh axes that the batching level places the batch axis on (the analogue
 /// of JAX's `spmd_axis_name`). Free placement axes stay free, so the batch dimension keeps its global extent inside the
-/// body. An active manual placement axis that the body does not use (i.e., no body value varies along it and no
-/// collective or `axis_index` of the body names it) stops being manual, which leaves a map without active manual axes
-/// when the placement releases all of them. An active manual placement axis that the body uses stays manual, but it
-/// does not partition the batch dimension of mapped inputs, so the batch is gathered along it on entry and the body
-/// runs over every batch item on every device along it, which per-item semantics requires, because each batch item
-/// needs the body at every coordinate along that axis. Each mapped output is then sliced inside the body to the block
-/// of the batch that its device holds along the gathered axes, and its batch dimension is tiled along them, ahead of
-/// the free placement axes. JAX instead splits the batch along such an axis and runs each batch item at a single
-/// coordinate along it, so that its collectives over the axis combine different batch items. Batching a map with
-/// mapped inputs or outputs therefore rejects a placement axis that an input or output sharding names (with a
-/// [`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`]), a placement that releases an active manual axis of a body with
-/// the [`EffectClass::DeviceOrderedIo`] or the [`EffectClass::UnorderedIo`] effect (with a
+/// body, where the batched body places it on exactly those axes, so that its declared local types are the local types
+/// that the batched boundary derives. An active manual placement axis is released only when the body provably does
+/// not use it, which is when no body value varies along it, no collective or `axis_index` of the body names it, and
+/// the body contains no operation whose transform rules are traced only when a transform requests them, such as a
+/// composite call with retained custom differentiation or batching rules (refer to
+/// [`CollectiveOperation::may_use_hidden_axes`]). A released axis becomes a free placement axis, which leaves a map
+/// without active manual axes when the placement releases all of them. Every other active manual placement axis counts
+/// as used and stays manual, but it does not partition the batch dimension of mapped inputs, so the batch is gathered
+/// along it on entry and the body runs over every batch item on every device along it, which per-item semantics
+/// requires, because each batch item needs the body at every coordinate along that axis. Each mapped output is then
+/// sliced inside the body to the block of the batch that its device holds along the gathered axes, and its batch
+/// dimension is tiled along them, ahead of the free placement axes. JAX instead splits the batch along such an axis
+/// and runs each batch item at a single coordinate along it, so that its collectives over the axis combine different
+/// batch items. Batching a map with mapped inputs or outputs therefore rejects a placement axis that an input or output
+/// sharding names (with a [`ShardMapError::BatchAxisPlacedOnSpecifiedAxis`]), a placement that releases an active
+/// manual axis of a body with the [`EffectClass::DeviceOrderedIo`] or the [`EffectClass::UnorderedIo`] effect (with a
 /// [`ShardMapError::BatchAxisPlacedOnManualAxisWithIo`], because the released axis would stop executing one occurrence
 /// of the effect per device along it), a gathered batch extent that the devices along the gathered axes do not divide
 /// (with a [`ShardMapError::BatchExtentNotDivisibleAlongUsedManualAxes`]), and a batched reference input of a map with
 /// gathered axes (with a [`ShardMapError::BatchedReferenceGatheredAlongUsedManualAxis`]). With manual-variation
-/// checking disabled, the body carries no variation labels, so it uses exactly the axes that its collectives and
-/// `axis_index` operations name, which suffices because every input is replicated along the placement axes. It also
-/// rejects a dynamic batch extent whenever a boundary position is mapped or the body uses the extent (with a
+/// checking disabled, the body carries no variation labels, so it uses only the axes that its collectives and
+/// `axis_index` operations name (or every axis, when it contains an operation whose rules are traced lazily), which
+/// suffices because every input is replicated along the placement axes. It also rejects a dynamic batch extent
+/// whenever a boundary position is mapped or the body uses the extent (with a
 /// [`ShardMapError::DynamicBatchExtentNotSupported`]), because boundary types are static (refer to the `# Static
 /// Boundaries` section below). A forwarded reference output keeps the batch axis of the reference input that it
 /// forwards, and an unbatched reference input is shared by every batch item, so writing a batched value into it
@@ -3473,16 +3486,18 @@ where
         // batch axis imposes no placement, so its dimension is unpartitioned at the boundary, as without
         // `spmd_axis_name` in JAX's `_shard_map_batch`. Free placement axes stay free in the batched map, so that the
         // batch dimension keeps its global extent inside the body and collectives over the batch axis there still see
-        // every batch item. An active manual placement axis that the body does not use is released from the active
-        // manual axes, which is sound because every device along it computes the same values. An active manual
-        // placement axis that the body uses is gathered instead. It stays manual, but it does not partition the batch
-        // dimension of mapped inputs, so every device along it runs the body over every batch item, at its own
-        // coordinate along the axis, which is what each batch item needs. Mapped outputs are then sliced to the block
-        // of the batch that each device holds along the gathered axes, which their output shardings tile. JAX instead
-        // splits the batch along such an axis (i.e., its `spmd_axis_name`), which runs each batch item at one
-        // coordinate only and makes collectives over the axis combine different batch items. A placement adds no manual
-        // variation anywhere (refer to `Sharding::batched`), so callers may type their values over the mesh of the map
-        // itself.
+        // every batch item. An active manual placement axis is released from the active manual axes only when the body
+        // provably does not use it, which is sound because every device along it computes the same values. A body with
+        // an operation whose transform rules are traced lazily may use every axis (refer to
+        // `CollectiveOperation::may_use_hidden_axes`), because a later transform traces those rules in the scope of
+        // the original call, where the axis is still manual. Every active manual placement axis that is not released
+        // is gathered instead. It stays manual, but it does not partition the batch dimension of mapped inputs, so
+        // every device along it runs the body over every batch item, at its own coordinate along the axis, which is
+        // what each batch item needs. Mapped outputs are then sliced to the block of the batch that each device holds
+        // along the gathered axes, which their output shardings tile. JAX instead splits the batch along such an axis
+        // (i.e., its `spmd_axis_name`), which runs each batch item at one coordinate only and makes collectives over
+        // the axis combine different batch items. A placement adds no manual variation anywhere (refer to
+        // `Sharding::batched`), so callers may type their values over the mesh of the map itself.
         //
         // A placement that releases every active manual axis leaves the batched map without active manual axes, which
         // the boundary requests explicitly with `ManualAxisSelection::Listed` (because an empty list of manual axes
@@ -3490,20 +3505,20 @@ where
         // this design unchanged, whereas binding the batched body inline would need its caller's values to carry
         // exactly the declared shardings of the body.
         //
-        // When some input is mapped, the placement is validated before the body is batched, because the body context
-        // keeps its explicit axes, so a placement that the boundary rejects would otherwise fail inside the batched
-        // body with a less precise error. A batched reference input cannot be gathered, because a reference crosses
-        // the boundary by identity.
+        // The placement is derived before the body is batched, because the batched body places its batch dimension
+        // on the free placement axes of the batched map. When some input is mapped, the placement must be valid, and
+        // it is validated here, so that a placement that the boundary rejects does not fail inside the batched body
+        // with a less precise error. Otherwise, an invalid placement is reported only if some output turns out to be
+        // mapped. A batched reference input cannot be gathered, because a reference crosses the boundary by identity.
         let placement_axes: &[String] = match context.axis_sharding() {
             ShardingDimension::Sharded(axis_names) => axis_names,
             ShardingDimension::Replicated | ShardingDimension::Unconstrained => &[],
         };
         let to_batching_error = |error: ShardMapError| BatchingError::from(ProgramError::from(error));
-        let mut boundary_placement = None;
+        let placement = self.boundary.batched_placement(placement_axes, driver.region(0)?);
         if input_positions.iter().any(Option::is_some) {
             static_extent()?;
-            let placement =
-                self.boundary.batched_placement(placement_axes, driver.region(0)?).map_err(to_batching_error)?;
+            let placement = placement.as_ref().map_err(|error| to_batching_error(error.clone()))?;
             if let Some(axis_name) = placement.gathered_axes.first()
                 && let Some(input_index) = inputs
                     .iter()
@@ -3514,43 +3529,31 @@ where
                     input_index,
                 }));
             }
-            boundary_placement = Some(placement);
         }
 
         // Batch the local body at the mapped input axes, and replace its leading extent input and output by a constant
         // of the extent's own static type, so that the batched body keeps the boundary of the source body. A body that
         // does not use the extent (e.g., one whose values are all unbatched) drops it instead, so that it needs no
         // static extent. Unbatched inputs enter the batched body unbatched, where its structural batching aligns them
-        // with the mapped values that they meet. Inside the body, the batch dimension keeps only the `Explicit` axes of
-        // its placement, because no released placement axis is manual there and the boundary already partitions the
-        // batch dimension along the released manual axes. A body with gathered axes keeps its batch dimension
-        // unpartitioned instead, because the gathered axes are manual inside it, and its outputs are sliced along them
-        // below. Boundary validation compares local types up to their placement, so the local types still match.
+        // with the mapped values that they meet. Inside the body, the batch dimension is placed on exactly the free
+        // placement axes of the batched map (i.e., the placement of the batch dimension of mapped inputs, which
+        // includes the released axes and excludes the gathered ones), so that the declared input types of the batched
+        // body are the local shards that the batched boundary derives, including their placement. A placement adds no
+        // manual variation (refer to `Sharding::batched`), so a free axis of mesh type `Manual` places the batch
+        // dimension like any other free axis. Outputs carry the same placement, which the output shardings extend
+        // with the gathered axes ahead of the free ones, along which the batched body slices its outputs below. An
+        // invalid placement leaves the batch dimension unpartitioned, which only matters when every boundary position
+        // is unbatched, because the placement error is reported otherwise.
         let body = driver.region(0)?;
-        let gathered_axes = match &boundary_placement {
-            Some(placement) => placement.gathered_axes.clone(),
-            None => self.boundary.used_manual_placement_axes(placement_axes, body),
-        };
         let input_axes = inputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
-        let body_context = match context.axis_sharding() {
-            ShardingDimension::Sharded(_) if !gathered_axes.is_empty() => {
+        let body_context = match (context.axis_sharding(), &placement) {
+            (ShardingDimension::Sharded(_), Ok(placement)) => {
+                context.clone().with_axis_sharding(placement.input_placement.clone())
+            }
+            (ShardingDimension::Sharded(_), Err(_)) => {
                 context.clone().with_axis_sharding(ShardingDimension::Replicated)
             }
-            ShardingDimension::Sharded(axis_names) => {
-                let mesh = self.boundary.mesh();
-                let explicit_axes = axis_names
-                    .iter()
-                    .filter(|axis_name| mesh.axis_type(axis_name) == Some(MeshAxisType::Explicit))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let body_placement = if explicit_axes.is_empty() {
-                    ShardingDimension::Replicated
-                } else {
-                    ShardingDimension::Sharded(explicit_axes)
-                };
-                context.clone().with_axis_sharding(body_placement)
-            }
-            ShardingDimension::Replicated | ShardingDimension::Unconstrained => context.clone(),
+            (ShardingDimension::Replicated | ShardingDimension::Unconstrained, _) => context.clone(),
         }
         .with_axis_name(axis_name.map(str::to_string));
         let (batched_body, output_axes) = driver
@@ -3618,12 +3621,7 @@ where
         let mut batched_body = batched_body;
         if input_positions.iter().chain(&output_positions).any(Option::is_some) {
             let ShardMapBatchPlacement { input_placement, output_placement, manual_axes, gathered_axes } =
-                match boundary_placement {
-                    Some(boundary_placement) => boundary_placement,
-                    None => {
-                        self.boundary.batched_placement(placement_axes, driver.region(0)?).map_err(to_batching_error)?
-                    }
-                };
+                placement.map_err(to_batching_error)?;
             let extent = static_extent()?;
 
             // Mapped outputs are sliced along the gathered axes, which requires the devices along them to divide the
@@ -3639,15 +3637,9 @@ where
                 let gathered_axes =
                     gathered_axes.iter().map(|axis_name| (axis_name.clone(), mesh.axis_size(axis_name).unwrap()));
                 let gathered_axes = gathered_axes.collect::<Vec<_>>();
-                let device_count = gathered_axes
-                    .iter()
-                    .try_fold(1usize, |device_count, (_, size)| device_count.checked_mul(*size))
-                    .ok_or_else(|| {
-                        to_batching_error(ShardMapError::ArithmeticOverflow {
-                            context: "counting the devices along the gathered manual axes of a batched body"
-                                .to_string(),
-                        })
-                    })?;
+
+                // The gathered axes are distinct axes of one mesh, whose device count fits `usize`.
+                let device_count = gathered_axes.iter().map(|(_, size)| size).product::<usize>();
                 if extent % device_count != 0 {
                     return Err(to_batching_error(ShardMapError::BatchExtentNotDivisibleAlongUsedManualAxes {
                         extent,
@@ -4069,6 +4061,7 @@ where
                            + From<ConstantOperation<Array>>
                            + From<DivOperation<ArrayType>>
                            + From<ConvertElementTypeOperation<ArrayType>>
+                           + From<CastOperation<ArrayType>>
                            + From<ParallelReduceOperation>,
         > + From<ReferenceNewOperation<ArrayType, ArrayIrType>>
         + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>
@@ -4451,6 +4444,7 @@ where
                 })
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
+
         if !self.boundary.checks_manual_variation() || seed_axes.iter().any(|axes| !axes.is_empty()) {
             let mut builder = ProgramBuilder::<V, O>::new();
             let mut inputs = Vec::with_capacity(transposed_body.input_count());
@@ -4459,6 +4453,7 @@ where
                     inputs.push(builder.add_input(source.clone()));
                     continue;
                 };
+
                 let target = boundary_array_type(source)?;
                 let local_type = if self.boundary.checks_manual_variation() {
                     let sharding = target.sharding().unwrap();
@@ -4479,10 +4474,13 @@ where
                         ParallelVaryOperation::new(axis.clone()).into();
                     seed = builder.add_instruction(O::from(vary), Vec::new(), vec![seed], None)?[0];
                 }
+
                 let divisor = axes.iter().map(|axis| boundary.mesh().axis_size(axis).unwrap() as f64).product::<f64>();
+
                 // Normalize low-precision cotangents in `f32`, so a device count outside their finite range does not
                 // turn the divisor into infinity, and a small reciprocal does not underflow before multiplying a large
-                // seed.
+                // seed. The widened seed drops a byte stride layout of the target, which addresses only the narrower
+                // elements, so every widened temporary takes its type from the widened seed rather than the target.
                 let normalization_data_type =
                     if target.data_type().is_floating_point() && target.data_type().bit_width() < 32 {
                         DataType::F32
@@ -4494,6 +4492,8 @@ where
                         ConvertElementTypeOperation::<ArrayType>::new(normalization_data_type, false).into();
                     seed = builder.add_instruction(O::from(convert), Vec::new(), vec![seed], None)?[0];
                 }
+
+                let normalization_type = boundary_array_type(&builder.atoms()[seed.index()].r#type())?.clone();
                 let coefficient_sharding = target
                     .sharding()
                     .map(|sharding| {
@@ -4513,15 +4513,12 @@ where
                     .with_memory(target.memory())
                     .with_sharding(divisor_sharding)
                     .map_err(TypeError::from)?;
+
                 // The divisor is a nondifferentiable literal, so its variation is created directly without an adjoint.
                 let divisor = EagerContext::<Array, ArrayOperation<Array>>::new().fill(&scalar_type, divisor)?;
                 let constant: <O as OperationProjection<ArrayType>>::Projected = ConstantOperation::new(divisor).into();
                 let divisor = builder.add_instruction(O::from(constant), Vec::new(), Vec::new(), None)?[0];
-                let divisor_type = target
-                    .clone()
-                    .with_data_type(normalization_data_type)
-                    .with_sharding(coefficient_sharding)
-                    .map_err(TypeError::from)?;
+                let divisor_type = normalization_type.with_sharding(coefficient_sharding).map_err(TypeError::from)?;
                 let broadcast: <O as OperationProjection<ArrayType>>::Projected =
                     BroadcastOperation::new(divisor_type, Vec::new()).into();
                 let divisor = builder.add_instruction(O::from(broadcast), Vec::new(), vec![divisor], None)?[0];
@@ -4531,9 +4528,22 @@ where
                     let convert: <O as OperationProjection<ArrayType>>::Projected =
                         ConvertElementTypeOperation::<ArrayType>::new(target.data_type(), false).into();
                     seed = builder.add_instruction(O::from(convert), Vec::new(), vec![seed], None)?[0];
+
+                    // Narrowing cannot restore the byte stride layout that widening dropped, so an unchecked cast,
+                    // whose relationship holds because only the layout differs, requests the exact target type that
+                    // the transposed body declares.
+                    let narrowed_type = boundary_array_type(&builder.atoms()[seed.index()].r#type())?.clone();
+                    if narrowed_type != *target {
+                        let cast = CastOperation::unchecked(target.clone(), vec![narrowed_type]);
+                        let cast: <O as OperationProjection<ArrayType>>::Projected =
+                            cast.map_err(ProgramError::from)?.into();
+                        seed = builder.add_instruction(O::from(cast), Vec::new(), vec![seed], None)?[0];
+                    }
                 }
+
                 inputs.push(seed);
             }
+
             let mut outputs = builder.splice_program(&transposed_body, &inputs)?;
             if !self.boundary.checks_manual_variation() {
                 for (position, output) in outputs.iter_mut().enumerate() {
@@ -4544,11 +4554,12 @@ where
                     {
                         return Err(ProgramError::UnsupportedOperation {
                             message: format!(
-                                "`{SHARD_MAP_OPERATION_NAME}` cannot aggregate a replicated gradient reference"
+                                "`{SHARD_MAP_OPERATION_NAME}` cannot aggregate a replicated gradient reference",
                             ),
                         }
                         .into());
                     }
+
                     for axis in axes {
                         let reduce: <O as OperationProjection<ArrayType>>::Projected =
                             ParallelReduceOperation::new(ReductionKind::Sum, axis).into();
@@ -4556,6 +4567,7 @@ where
                     }
                 }
             }
+
             let output_count = outputs.len();
             transposed_body = Arc::new(
                 builder
@@ -4563,6 +4575,7 @@ where
                     .into_simplified()?,
             );
         }
+
         let transposed_operation = ShardMapOperation::from_boundary(boundary, global_input_types, global_output_types)
             .with_output_forwarding(output_forwarding)
             .map_err(ProgramError::from)?;
@@ -5238,6 +5251,12 @@ where
 /// keeps every device of the outer grid as one contiguous block of inner devices. The rule of a collective reaches the
 /// grid through [`LockstepDomain::grid`] and addresses its axes by the positions that
 /// [`LockstepDomain::collective_axes`] returns.
+///
+/// The device count of every grid (i.e., the product of its axis sizes) fits `usize`, so the device indices,
+/// positions, and sizes that its functions compute never overflow. [`Self::new`] and [`Self::with_axes`] validate
+/// this, because nested manual regions can be over different meshes, so the product of the sizes of their axes is not
+/// bounded by the device count of one [`LogicalMesh`]. The emulator otherwise builds a grid directly only from the
+/// distinct manual axes of one mesh, whose device count fits `usize` by construction.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LockstepDeviceGrid {
     /// Names and sizes of the emulated manual axes, outermost first.
@@ -5247,18 +5266,32 @@ pub struct LockstepDeviceGrid {
 impl LockstepDeviceGrid {
     /// Creates a [`LockstepDeviceGrid`] over the emulated manual `axes`, given as their names and sizes, outermost
     /// first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardMapError::ArithmeticOverflow`] when the device count of the grid does not fit `usize`.
     #[inline]
-    pub fn new(axes: Vec<(String, usize)>) -> Self {
-        Self { axes }
+    pub fn new(axes: Vec<(String, usize)>) -> Result<Self, ShardMapError> {
+        if axes.iter().try_fold(1usize, |count, (_, size)| count.checked_mul(*size)).is_none() {
+            let axis_names = axes.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>();
+            return Err(ShardMapError::ArithmeticOverflow {
+                context: format!("counting the emulated devices along manual axes `{}`", axis_names.join("`, `")),
+            });
+        }
+        Ok(Self { axes })
     }
 
     /// Returns this grid extended by the provided innermost `axes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardMapError::ArithmeticOverflow`] when the device count of the extended grid does not fit `usize`.
     #[inline]
-    pub fn with_axes(&self, axes: &[(String, usize)]) -> Self {
-        Self { axes: self.axes.iter().chain(axes).cloned().collect() }
+    pub fn with_axes(&self, axes: &[(String, usize)]) -> Result<Self, ShardMapError> {
+        Self::new(self.axes.iter().chain(axes).cloned().collect())
     }
 
-    /// Returns the number of devices along the combined axis of the grid axes `axes`.
+    /// Returns the number of devices along the combined axis of the distinct grid axes `axes`.
     pub fn axis_size(&self, axes: &[usize]) -> usize {
         axes.iter().map(|axis| self.axes[*axis].1).product()
     }
@@ -5626,62 +5659,114 @@ impl<O: Operation<Type = ArrayIrType>> LockstepDomain<O> {
         }
     }
 
-    /// Checks that the variation or reduction state cast `payload` belongs to the actual checked manual binding of its
-    /// axis, which is the check of [`Self::validate_collective_mesh`] for the mesh of `input_type`. The operation's
-    /// inference has already validated the input's mesh and source state.
-    pub fn validate_tracked_collective<P: Operation>(
-        &self,
-        payload: &P,
-        axis_name: &str,
-        input_type: &ArrayType,
-    ) -> Result<(), ProgramError> {
-        self.validate_collective_mesh(payload, axis_name, Some(input_type.sharding().unwrap().mesh()))
-    }
-
-    /// Checks the mesh that the collective `payload` over the manual axis `axis_name` was staged with against the
-    /// manual region that actually binds that axis. That region owns the physical mesh and the checking policy of
-    /// the axis, and a nested region that binds other axes does not replace it, so ownership is resolved by axis,
-    /// from the inside out. A collective staged with a `mesh` tracks manual variation, so that mesh must type the same
-    /// axes as manual over the same topology as the mesh of the owning region (its free axes may be retyped, e.g., by
-    /// [`auto_axes`](crate::auto_axes)), and the owning region must check manual variation. A collective staged
-    /// without a mesh tracks no variation, so its owning region must not check manual variation, because a checked
-    /// region would otherwise accept results that the collective types as invariant although they differ across
-    /// devices (e.g., the coordinates of an `axis_index`).
+    /// Validates the collective `payload` against the manual regions that own the axes that it communicates along.
+    /// Every rule of a collective in this domain calls this function before it computes any output. The region that
+    /// made an axis manual owns the physical mesh and the checking policy of that axis, and a nested region that binds
+    /// other axes does not replace it, so the owner of each axis that `payload` names is the innermost region in
+    /// [`Self::manual_regions`] that makes that axis manual. The owners of all of those axes must agree on whether
+    /// they check manual variation. The collective is then valid when one of the following holds.
+    ///
+    ///   - It was staged with tracking metadata (i.e., `mesh` is present), its owners check manual variation, and that
+    ///     mesh types the same axes as manual over the same topology as the mesh of every owner. Its free axes may be
+    ///     retyped (e.g., by [`auto_axes`](crate::auto_axes)).
+    ///   - It was staged without tracking metadata and its owners do not check manual variation, which then trust the
+    ///     program instead of its types.
+    ///   - It was staged without tracking metadata, its owners check manual variation, and every one of its
+    ///     `output_types` varies along every axis that it names (e.g., a grouped [`ParallelReduceOperation`] whose
+    ///     input already varies along its axis). Only such output types admit that the devices along those axes may
+    ///     hold different values. Otherwise, a checked region would accept outputs that are typed as invariant
+    ///     although they can differ across devices (e.g., the coordinates of a meshless [`AxisIndexOperation`]).
+    ///
+    /// This criterion depends only on types, so it applies uniformly to every collective, whether or not its result
+    /// is the same on every participant.
+    ///
+    /// # Parameters
+    ///
+    ///   - `payload`: Collective to validate.
+    ///   - `mesh`: Tracking metadata of the collective, which is the mesh recorded on its payload or, for the
+    ///     collectives that only change the state that types record (e.g., [`ParallelVaryOperation`]), the mesh of
+    ///     the sharding of its input. `None` when the collective tracks no manual variation.
+    ///   - `output_types`: Output types of the collective as inferred from its actual input types (refer to
+    ///     [`Self::collective_output_type`]), which are only inspected when `mesh` is `None` and the owners check
+    ///     manual variation.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when no enclosing manual region binds `axis_name`, when `mesh`
-    /// disagrees with the mesh of the owning region, or when the collective and the owning region disagree on whether
-    /// manual variation is tracked.
-    pub fn validate_collective_mesh<P: Operation>(
+    /// Returns [`ProgramError::MalformedProgram`] when no enclosing manual region makes one of the axes of `payload`
+    /// manual, when the owners of its axes disagree on whether they check manual variation, when `mesh` is present
+    /// but disagrees with the mesh of an owner or the owners do not check manual variation, or when `mesh` is absent,
+    /// the owners check manual variation, and an output type is invariant along one of the axes of `payload`.
+    pub fn validate_collective<P: Operation + CollectiveOperation>(
         &self,
         payload: &P,
-        axis_name: &str,
         mesh: Option<&LogicalMesh>,
+        output_types: &[ArrayType],
     ) -> Result<(), ProgramError> {
         let operation_name = payload.name();
-        let boundary = self
-            .manual_regions()
+        let axes = payload.axes();
+        let owners = axes
+            .names()
             .iter()
-            .rev()
-            .find(|boundary| boundary.manual_axes().iter().any(|axis| axis == axis_name))
-            .ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "`{operation_name}` manual axis `{axis_name}` has no enclosing manual binding",
-                ))
-            })?;
-        match mesh {
-            Some(mesh) if !mesh.has_same_manual_axes(boundary.mesh()) => Err(ProgramError::MalformedProgram(format!(
-                "`{operation_name}` operation mesh does not match the enclosing manual axis `{axis_name}` mesh",
-            ))),
-            Some(_) if !boundary.checks_manual_variation() => Err(ProgramError::MalformedProgram(format!(
-                "`{operation_name}` cannot use tracked mesh metadata inside an unchecked manual binding",
-            ))),
-            None if boundary.checks_manual_variation() => Err(ProgramError::MalformedProgram(format!(
-                "`{operation_name}` requires tracked mesh metadata inside a checked manual binding",
-            ))),
-            _ => Ok(()),
+            .map(|axis_name| {
+                let owner = self
+                    .manual_regions()
+                    .iter()
+                    .rev()
+                    .find(|boundary| boundary.manual_axes().iter().any(|axis| axis == axis_name))
+                    .ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "`{operation_name}` manual axis `{axis_name}` has no enclosing manual binding",
+                        ))
+                    })?;
+                Ok((axis_name.as_str(), owner))
+            })
+            .collect::<Result<Vec<_>, ProgramError>>()?;
+
+        let Some(&(_, first_owner)) = owners.first() else {
+            return Ok(());
+        };
+
+        let checked = first_owner.checks_manual_variation();
+        if owners.iter().any(|(_, owner)| owner.checks_manual_variation() != checked) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` communicates along manual axes `{axes}` whose regions disagree on whether they \
+                 check manual variation",
+            )));
         }
+
+        match mesh {
+            Some(mesh) => {
+                if let Some((axis_name, _)) = owners.iter().find(|(_, owner)| !mesh.has_same_manual_axes(owner.mesh()))
+                {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "`{operation_name}` operation mesh does not match the enclosing manual axis `{axis_name}` mesh",
+                    )));
+                }
+                if !checked {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "`{operation_name}` cannot use tracked mesh metadata inside an unchecked manual binding",
+                    )));
+                }
+            }
+            None if checked => {
+                for (axis_name, _) in &owners {
+                    let invariant = output_types.iter().any(|output_type| {
+                        output_type
+                            .sharding()
+                            .is_none_or(|sharding| !sharding.varying_manual_axes().contains(*axis_name))
+                    });
+                    if invariant {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "`{operation_name}` without tracked mesh metadata types its outputs as invariant along \
+                             manual axis `{axis_name}` inside a checked manual region",
+                        )));
+                    }
+                }
+            }
+            None => {}
+        }
+
+        Ok(())
     }
 }
 
@@ -6010,8 +6095,12 @@ where
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
+
+        // The active manual axes are distinct axes of one mesh, so the local grid needs no validation. The enclosing
+        // regions can be over another mesh, so the grid of the body validates its device count.
         let local_grid = LockstepDeviceGrid { axes: manual_axes.clone() };
         let local_device_count = local_grid.device_count();
+        let body_grid = self.domain.grid().with_axes(&manual_axes)?;
         check_count!("input", inputs, operation.global_input_types().len(), ProgramError);
 
         // Every reference input is copied into fresh local roots and written back independently below, so two inputs
@@ -6042,6 +6131,8 @@ where
         // Split every global input of every enclosing device, or the current referent of every reference input, into
         // the shards of its local devices. Each local device owns a fresh local root that holds its shard of a
         // reference input, which is recorded together with the caller's reference for the write-back below.
+        let body_input_types = body.input_types();
+        check_count!("input", body_input_types, inputs.len(), ProgramError);
         let mut body_inputs = Vec::with_capacity(inputs.len());
         let mut reference_inputs = Vec::new();
         for (index, values) in inputs.iter().enumerate() {
@@ -6071,8 +6162,14 @@ where
                 .into());
             }
 
+            // The body is authoritative for the local types, so every shard has the input type that the body declares
+            // (the referent of its declared reference type, for a reference input). Type inference validated that type
+            // against the local type that the boundary derives from the global type, with which it agrees on the data
+            // type, shape, layout, manual variation, and reduction state, so the derived shape locates the shards.
             let global_type = boundary_array_type(&operation.global_input_types()[index])?;
-            let local_type = boundary.local_input_type(index, global_type)?;
+            let local_type = boundary_array_type(&body_input_types[index])?;
+            let derived_local_type = boundary.local_input_type(index, global_type)?;
+            let local_shape = ShardMapBoundary::static_extents(&derived_local_type, ShardMapValueKind::Input, index)?;
             let mut local_values = Vec::with_capacity(values.len() * local_device_count);
             for value in values {
                 let referent;
@@ -6111,18 +6208,8 @@ where
                                 .iter()
                                 .any(|axis_name| local_grid.axis(axis_name).is_some_and(|axis| coordinates[axis] != 0))
                         {
-                            return EagerContext::<Array, ArrayOperation<Array>>::new().zero(&local_type);
+                            return EagerContext::<Array, ArrayOperation<Array>>::new().zero(local_type);
                         }
-
-                        let local_shape = local_type
-                            .static_shape()
-                            .map(|shape| shape.dimensions().to_vec())
-                            .ok_or_else(|| ProgramError::InvalidArgument {
-                                message: format!(
-                                    "`{SHARD_MAP_OPERATION_NAME}` interpretation requires static types \
-                                     but got `{local_type}`"
-                                ),
-                            })?;
 
                         let offsets = local_grid.block_offsets(sharding, &coordinates, &local_shape);
                         let block =
@@ -6149,27 +6236,36 @@ where
         let emulator = ShardMapEmulator {
             context: self.context,
             driver: self.driver,
-            domain: LockstepDomain::new(self.domain.grid().with_axes(&manual_axes), manual_regions),
+            domain: LockstepDomain::new(body_grid, manual_regions),
         };
         let body_outputs = emulator.run_region(body, body_inputs)?;
         check_count!("output", body_outputs, operation.global_output_types().len(), ProgramError);
 
-        // The unchecked boundary trusts output replication statically, but the emulator can inspect every device.
-        // Validate each enclosing device's local group before committing reference state to the caller.
-        if !boundary.checks_output_replication() {
-            for (index, values) in body_outputs.iter().enumerate() {
-                if operation.output_forwarding()[index].is_some() {
+        // The emulator is the oracle of the reference backend, so it compares the copies of every replicated output
+        // across the devices of each enclosing device's local group before committing reference state to the caller.
+        // A boundary that does not check output replication trusts the program, and differing copies break its promise.
+        // A boundary that checks it relies on the types of the body, and differing copies reveal types that fail to
+        // report manual variation, which would otherwise silently yield the copy of the first device.
+        for (index, values) in body_outputs.iter().enumerate() {
+            if operation.output_forwarding()[index].is_some() {
+                continue;
+            }
+            let sharding = &boundary.output_shardings()[index];
+            for values in values.chunks(local_device_count) {
+                let Some(axis_name) = local_grid.replicated_copy_mismatch(sharding, values)? else {
                     continue;
-                }
-                let sharding = &boundary.output_shardings()[index];
-                for values in values.chunks(local_device_count) {
-                    if let Some(axis_name) = local_grid.replicated_copy_mismatch(sharding, values)? {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "`{SHARD_MAP_OPERATION_NAME}` output #{index} promises replication along manual axis \
-                             `{axis_name}`, but its devices along that axis produced different values",
-                        )));
-                    }
-                }
+                };
+                return Err(ProgramError::MalformedProgram(if boundary.checks_output_replication() {
+                    format!(
+                        "`{SHARD_MAP_OPERATION_NAME}` output #{index} is typed as replicated along manual axis \
+                         `{axis_name}`, but its copies differ across devices",
+                    )
+                } else {
+                    format!(
+                        "`{SHARD_MAP_OPERATION_NAME}` output #{index} promises replication along manual axis \
+                         `{axis_name}`, but its devices along that axis produced different values",
+                    )
+                }));
             }
         }
 
@@ -7322,17 +7418,19 @@ mod tests {
     use crate::operations::collectives::CollectiveOptions;
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_all_gather::ParallelAllGather;
-    use crate::operations::collectives::parallel_all_to_all::ParallelAllToAll;
+    use crate::operations::collectives::parallel_all_to_all::{ParallelAllToAll, ParallelAllToAllOperation};
     use crate::operations::collectives::parallel_arg_extrema::ParallelArgExtrema;
     use crate::operations::collectives::parallel_broadcast::{PARALLEL_BROADCAST_OPERATION_NAME, ParallelBroadcast};
     use crate::operations::collectives::parallel_cast::{ParallelCast, ParallelCastOperation, ParallelCastTarget};
     use crate::operations::collectives::parallel_permute::{ParallelPermute, ParallelPermuteOperation};
-    use crate::operations::collectives::parallel_ragged_all_to_all::ParallelRaggedAllToAll;
+    use crate::operations::collectives::parallel_ragged_all_to_all::{
+        ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation,
+    };
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
     use crate::operations::collectives::parallel_sum_scatter::{ParallelSumScatter, ParallelSumScatterOperation};
     use crate::operations::comparisons::{CompareOperation, ComparisonDirection};
     use crate::operations::composites::{CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, composite};
-    use crate::operations::constants::one_like::OneLikeOperation;
+    use crate::operations::constants::one_like::{OneLike, OneLikeOperation};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
@@ -8834,28 +8932,6 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_boundary_local_input_type_rejects_overflowing_manual_partition_counts() {
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 1 << 33, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 1 << 33, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
-        let boundary = ShardMapBoundary::new(mesh, vec![sharding.clone()], vec![sharding], Vec::new()).unwrap();
-        let result = boundary.local_input_type(0, &f32_type(&[8], None));
-        assert_eq!(
-            result,
-            Err(ShardMapError::ArithmeticOverflow {
-                context: "computing the manual partition count of input #0 dimension #0".to_string(),
-            }),
-        );
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "integer overflow in `shard_map` while computing the manual partition count of input #0 dimension #0",
-        );
-    }
-
-    #[test]
     fn test_shard_map_boundary_local_input_type_rejects_rank_mismatch() {
         let mesh = manual_mesh_2x2();
         let boundary = ShardMapBoundary::new(
@@ -9375,31 +9451,8 @@ mod tests {
 
     #[test]
     fn test_shard_map_boundary_global_output_type_rejects_overflow() {
-        // The manual partition count of a dimension that the output sharding tiles along two huge manual axes
-        // overflows.
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 1 << 33, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 1 << 33, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
-        let boundary = ShardMapBoundary::new(mesh.clone(), Vec::new(), vec![sharding], Vec::new()).unwrap();
-        let local_output_type = f32_type(&[8], None)
-            .with_sharding(Sharding::replicated(mesh, 1).with_varying_manual_axes(["x", "y"]).unwrap())
-            .unwrap();
-        let result = boundary.global_output_type(0, &local_output_type);
-        assert_eq!(
-            result,
-            Err(ShardMapError::ArithmeticOverflow {
-                context: "computing the manual partition count of output #0 dimension #0".to_string(),
-            }),
-        );
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "integer overflow in `shard_map` while computing the manual partition count of output #0 dimension #0",
-        );
-
-        // Scaling a huge local extent by its manual partition count overflows as well.
+        // The manual partition count of a dimension never exceeds the device count of the mesh, which fits `usize`,
+        // but scaling a huge local extent by it can overflow.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let boundary = ShardMapBoundary::new(mesh.clone(), Vec::new(), vec![sharding], Vec::new()).unwrap();
@@ -12602,6 +12655,34 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_interpretation_rejects_nested_maps_whose_device_counts_overflow() {
+        // The device count of each mesh fits `usize`, but a nested map over another mesh whose body reads its
+        // coordinate along the enclosing axis `x` runs in lockstep on the devices of both meshes, whose count does not.
+        let outer_mesh = manual_mesh();
+        let inner_mesh =
+            LogicalMesh::new(vec![MeshAxis::new("y", 1 << (usize::BITS - 1), MeshAxisType::Manual).unwrap()]).unwrap();
+        let inner_body = build_program(Vec::new(), |builder, _| {
+            let index = ArrayOperation::AxisIndex(AxisIndexOperation::new("x".to_string()));
+            builder.add_instruction(index, Vec::new(), Vec::new(), None).unwrap();
+            Vec::new()
+        });
+        let inner_boundary = ShardMapBoundary::new(inner_mesh, Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let inner_operation = ShardMapOperation::from_program(&inner_body, Vec::new(), inner_boundary).unwrap();
+        let outer_body = build_program(Vec::new(), |builder, _| {
+            let inner_body = builder.import_program(inner_body);
+            builder.add_instruction(inner_operation, vec![inner_body], Vec::new(), None).unwrap().to_vec()
+        });
+        let outer_boundary = ShardMapBoundary::new(outer_mesh, Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let program = caller_typed_shard_map_program(outer_body, Vec::new(), outer_boundary);
+        assert_eq!(
+            program.interpret(Vec::new()),
+            Err(ProgramError::from(ShardMapError::ArithmeticOverflow {
+                context: "counting the emulated devices along manual axes `x`, `y`".to_string(),
+            })),
+        );
+    }
+
+    #[test]
     fn test_shard_map_interpretation_while() {
         // A loop whose body reduces over the manual axis runs its iterations in lockstep on both devices, here for its
         // bound of two iterations, each of which replaces the value of every device by the sum over both devices.
@@ -12988,44 +13069,123 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_interpretation_scan_widening_does_not_depend_on_collectives() {
-        // The scan body declares its carry and slice without manual variation, returns the slice as the next carry, and
-        // stacks the carry that it receives, so with the invariant initial carry `10` the first stacked slice is
-        // invariant and the second one varies along `x`. A scan whose body does not use collectives binds per device
-        // through the eager rule, while the same body with an additional (unused) reduction over `x` runs in lockstep.
-        // Both widen the stack to the join of the variation of its slices and give the same outputs. The map returns
-        // the declared (invariant) outputs of the scan replicated, i.e., the values of the device at coordinate zero.
+    fn test_shard_map_body_rejects_control_flow_regions_that_erase_manual_variation() {
+        // Regions that declare their inputs without a sharding are invariant, so a checked map whose body passes them
+        // values that vary along `x` cannot be built. Otherwise, a `condition`, a `while` that runs no iteration, and a
+        // `scan` would type their outputs as invariant, and the map would accept as replicated outputs the values `1`
+        // and `3` of the two devices (or their final carries `2` and `4`) and return those of the first device.
+        let mesh = manual_mesh();
+        let boundary = ShardMapBoundary::new(
+            mesh.clone(),
+            vec![
+                sharded_along_x(),
+                Sharding::replicated(mesh.clone(), 1),
+                sharding(&mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let varying_type = boundary.local_input_type(0, &f32_type(&[2], None)).unwrap();
+        let initial_type = boundary.local_input_type(1, &f32_type(&[1], None)).unwrap();
+        let slices_type = boundary.local_input_type(2, &f32_type(&[2, 2], None)).unwrap();
+        let declared_type = ArrayIrType::Array(f32_type(&[1], None));
+        let identity = || build_program(vec![declared_type.clone()], |_, inputs| inputs.to_vec());
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let varying = builder.add_input(varying_type.clone().into());
+        let initial = builder.add_input(initial_type.into());
+        let slices = builder.add_input(slices_type.clone().into());
+
+        let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
+        let (first, second) = (builder.import_program(identity()), builder.import_program(identity()));
+        assert_eq!(
+            builder
+                .add_instruction(
+                    ConditionOperation::<ArrayIrType>::new(),
+                    vec![first, second],
+                    vec![predicate, varying],
+                    None,
+                )
+                .map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`condition` input 1 has type `{varying_type}`, which does not refine its branch input type `f32[1]`",
+            )))),
+        );
+
+        let condition = build_program(vec![declared_type.clone()], |builder, _| {
+            vec![builder.add_constant(ArrayIrValue::Array(Array::scalar(false).unwrap()))]
+        });
+        let (condition, body) = (builder.import_program(condition), builder.import_program(identity()));
+        assert_eq!(
+            builder
+                .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], vec![varying], None)
+                .map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`while` input 0 has type `{varying_type}`, which does not refine its state type `f32[1]`",
+            )))),
+        );
+
+        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
+        let scan_body = build_program(vec![index_type, declared_type.clone(), declared_type], |_, inputs| {
+            vec![inputs[2], inputs[1]]
+        });
+        let scan_body = builder.import_program(scan_body);
+        assert_eq!(
+            builder
+                .add_instruction(
+                    ScanOperation::<ArrayIrType>::new(1, 2usize),
+                    vec![scan_body],
+                    vec![initial, slices],
+                    None,
+                )
+                .map(|_| ()),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`scan` stacked input 1 has type `{slices_type}`, whose slice type \
+                 `f32[1][sharding={{mesh<['x'=2:manual]>, [{{}}], varying_manual={{'x'}}}}]` does not refine its body \
+                 input type `f32[1]`",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_scan_does_not_depend_on_collectives() {
+        // The scan body declares its carry and slice with the variation along `x` that its inputs carry, returns the
+        // slice as the next carry, and stacks the carry that it receives. The map varies the replicated initial carry
+        // `10` along `x` before the scan. A scan whose body does not use collectives binds per device through the eager
+        // rule, while the same body with an additional (unused) `axis_index` along `x` runs in lockstep. Both compute
+        // the same values, which the map tiles along `x`, so the final carries `2` and `4` and the stacks of both
+        // devices are visible.
         let mesh = manual_mesh();
         let replicated = |rank| Sharding::replicated(mesh.clone(), rank);
         let stacked = sharding(&mesh, vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])]);
         let boundary = ShardMapBoundary::new(
             mesh.clone(),
             vec![replicated(1), stacked.clone()],
-            vec![replicated(1), replicated(2)],
+            vec![sharded_along_x(), stacked.clone()],
             Vec::new(),
         )
         .unwrap();
         let initial_type = boundary.local_input_type(0, &f32_type(&[1], Some(replicated(1)))).unwrap();
-        let slices_type = boundary.local_input_type(1, &f32_type(&[2, 2], Some(stacked))).unwrap();
+        let slices_type = boundary.local_input_type(1, &f32_type(&[2, 2], Some(stacked.clone()))).unwrap();
         let program = |collective: bool| {
-            let slice_type = ArrayIrType::Array(f32_type(&[1], None));
+            let slice_type =
+                ArrayIrType::Array(f32_type(&[1], Some(replicated(1).with_varying_manual_axes(["x"]).unwrap())));
             let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64));
             let scan_body = build_program(vec![index_type, slice_type.clone(), slice_type], |builder, inputs| {
                 if collective {
-                    let sum = ArrayOperation::ParallelReduce(ParallelReduceOperation::new(
-                        ReductionKind::Sum,
-                        "x".to_string(),
-                    ));
-                    builder.add_instruction(sum, Vec::new(), vec![inputs[2]], None).unwrap();
+                    let index = AxisIndexOperation::new("x".to_string()).with_mesh(mesh.clone());
+                    builder.add_instruction(ArrayOperation::AxisIndex(index), Vec::new(), Vec::new(), None).unwrap();
                 }
                 vec![inputs[2], inputs[1]]
             });
             let body = build_program(
                 vec![ArrayIrType::Array(initial_type.clone()), ArrayIrType::Array(slices_type.clone())],
                 |builder, inputs| {
+                    let vary = ArrayOperation::ParallelVary(ParallelVaryOperation::new("x".to_string()));
+                    let initial = builder.add_instruction(vary, Vec::new(), vec![inputs[0]], None).unwrap()[0];
                     let scan_body = builder.import_program(scan_body);
                     let scan = ScanOperation::<ArrayIrType>::new(1, 2usize);
-                    builder.add_instruction(scan, vec![scan_body], inputs.to_vec(), None).unwrap().to_vec()
+                    builder.add_instruction(scan, vec![scan_body], vec![initial, inputs[1]], None).unwrap().to_vec()
                 },
             );
             let input_types =
@@ -13035,8 +13195,8 @@ mod tests {
         let inputs =
             vec![f32_value(f32_type(&[1], None), &[10.0]), f32_value(f32_type(&[2, 2], None), &[1.0, 3.0, 2.0, 4.0])];
         let expected = Ok(vec![
-            f32_value(f32_type(&[1], Some(replicated(1))), &[2.0]),
-            f32_value(f32_type(&[2, 1], Some(replicated(2))), &[10.0, 1.0]),
+            f32_value(f32_type(&[2], Some(sharded_along_x())), &[2.0, 4.0]),
+            f32_value(f32_type(&[2, 2], Some(stacked)), &[10.0, 10.0, 1.0, 3.0]),
         ]);
         assert_eq!(program(false).interpret(inputs.clone()), expected);
         assert_eq!(program(true).interpret(inputs), expected);
@@ -13241,8 +13401,96 @@ mod tests {
         assert_eq!(
             shard_map_program(operation, body).unwrap().interpret(Vec::new()),
             Err(ProgramError::MalformedProgram(
-                "`axis_index` requires tracked mesh metadata inside a checked manual binding".to_string(),
+                "`axis_index` without tracked mesh metadata types its outputs as invariant along manual axis `x` \
+                 inside a checked manual region"
+                    .to_string(),
             )),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_rejects_meshless_collectives_with_invariant_outputs_in_checked_maps() {
+        // The meshless forms of these collectives keep the invariant types of their replicated inputs, although the
+        // devices along `x` compute different values (i.e., `[2]` and `[4]` for the sum scatter, `[1, 1]` and `[2, 2]`
+        // for the exchange, `0` and `7` for the partial permutation, and different received segments for the ragged
+        // exchange). A checked map would accept those values as replicated outputs and assemble the copy of the first
+        // device, so the emulator rejects the collectives against the policy of the region that owns `x` instead.
+        let mesh = manual_mesh();
+        let interpret = |operation: ArrayOperation<Array>, inputs: Vec<TestValue>, output_rank: usize| {
+            let input_types = inputs
+                .iter()
+                .map(|input| ValueProjection::<ArrayType>::projected(input).unwrap().r#type().into_owned())
+                .collect::<Vec<_>>();
+            let input_shardings = input_types
+                .iter()
+                .map(|r#type| Sharding::replicated(mesh.clone(), r#type.rank()))
+                .collect::<Vec<_>>();
+            let output_sharding = Sharding::replicated(mesh.clone(), output_rank);
+            let boundary =
+                ShardMapBoundary::new(mesh.clone(), input_shardings, vec![output_sharding], Vec::new()).unwrap();
+            let local_input_types = input_types
+                .iter()
+                .enumerate()
+                .map(|(index, r#type)| ArrayIrType::Array(boundary.local_input_type(index, r#type).unwrap()))
+                .collect::<Vec<_>>();
+            let body = build_program(local_input_types, |builder, inputs| {
+                builder.add_instruction(operation, Vec::new(), inputs.to_vec(), None).unwrap().to_vec()
+            });
+            let input_types = input_types.into_iter().map(ArrayIrType::Array).collect();
+            caller_typed_shard_map_program(body, input_types, boundary).interpret(inputs)
+        };
+        let message = |operation_name: &str| {
+            Err(ProgramError::MalformedProgram(format!(
+                "`{operation_name}` without tracked mesh metadata types its outputs as invariant along manual axis `x` \
+                 inside a checked manual region",
+            )))
+        };
+
+        let sum_scatter = ParallelSumScatterOperation::new("x", 2, 0, CollectiveOptions::tiled());
+        assert_eq!(
+            interpret(
+                ArrayOperation::ParallelSumScatter(sum_scatter),
+                vec![f32_value(f32_type(&[2], None), &[1.0, 2.0])],
+                1,
+            ),
+            message("parallel_sum_scatter"),
+        );
+
+        let all_to_all = ParallelAllToAllOperation::new("x", 2, 0, 0, CollectiveOptions::tiled());
+        assert_eq!(
+            interpret(
+                ArrayOperation::ParallelAllToAll(all_to_all),
+                vec![f32_value(f32_type(&[2], None), &[1.0, 2.0])],
+                1,
+            ),
+            message("parallel_all_to_all"),
+        );
+
+        let permute = ParallelPermuteOperation::new("x", 2, vec![(0, 1)]);
+        assert_eq!(
+            interpret(ArrayOperation::ParallelPermute(permute), vec![f32_value(f32_type(&[], None), &[7.0])], 0),
+            message("parallel_permute"),
+        );
+
+        // Every device sends its first input element to itself and its second one to the other device.
+        let metadata = |elements: &[i32]| {
+            ArrayIrValue::Array(Array::from_elements(ArrayType::new_static(DataType::I32, [2]), elements).unwrap())
+        };
+        let ragged_all_to_all = ParallelRaggedAllToAllOperation::new("x".to_string(), 2);
+        assert_eq!(
+            interpret(
+                ArrayOperation::ParallelRaggedAllToAll(ragged_all_to_all),
+                vec![
+                    f32_value(f32_type(&[2], None), &[1.0, 2.0]),
+                    f32_value(f32_type(&[2], None), &[-1.0, -1.0]),
+                    metadata(&[0, 1]),
+                    metadata(&[1, 1]),
+                    metadata(&[0, 1]),
+                    metadata(&[1, 1]),
+                ],
+                1,
+            ),
+            message("parallel_ragged_all_to_all"),
         );
     }
 
@@ -17762,11 +18010,11 @@ mod tests {
                 in (%0, %2)"},
         );
 
-        // A manual axis `y` that the map does not make manual places only the boundary values, because the batched
-        // body keeps only the `Explicit` placement axes.
+        // A manual axis `y` that the map does not make manual is a free axis too, so it places the batch dimension of
+        // the local body values in the same way, which adds no manual variation along it.
         let sharding = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}";
         let global = format!("f32[3, 4][sharding={sharding}]");
-        let local = "f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}], varying_manual={'x'}}]";
+        let local = "f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {}], varying_manual={'x'}}]";
         assert_eq!(
             batched(manual_mesh_2x2(), vec!["x".to_string()]),
             formatdoc! {"
@@ -17790,11 +18038,108 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_batching_places_batch_axes_of_composites_on_inactive_manual_mesh_axes() {
+        // A batch axis placed on the manual mesh axis `y`, which the map does not make manual, places the batch
+        // dimension of the local body values along `y` as well. A composite call, which requires inputs of exactly
+        // the types that its primal region declares, therefore executes in the batched body, with or without a retained
+        // custom batching rule (whose hidden axes do not matter, because `y` is not an active manual axis).
+        let mesh = manual_mesh_2x2();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let batched = |custom_batching: bool| {
+            let program = trace_test_program(
+                |inputs| {
+                    vec![
+                        shard_map(
+                            |x: TestTracer| {
+                                let function = composite(|x: BodyTracer| Ok(x));
+                                let output = if custom_batching {
+                                    function
+                                        .with_batching(
+                                            |x: BodyTracer, axis: BatchAxis, _: BatchingLevelExtent<BodyTracer>| {
+                                                Ok((x, axis))
+                                            },
+                                        )
+                                        .call(x.into_value())?
+                                } else {
+                                    function.call(x.into_value())?
+                                };
+                                Ok(ValueProjection::<ArrayType>::into_projected(output)?)
+                            },
+                            inputs[0].clone(),
+                            mesh.clone(),
+                            sharded.clone(),
+                            sharded.clone(),
+                            ShardMapOptions::new().with_manual_axes(vec!["x".to_string()]),
+                        )
+                        .unwrap(),
+                    ]
+                },
+                vec![f32_type(&[4], None)],
+                Vec::new(),
+            );
+            program
+                .batched_with_threaded_extent(
+                    DimensionValue::constant(3).unwrap().r#type().into_owned(),
+                    ShardingDimension::sharded(["y"]),
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        let plain = batched(false);
+        let sharding = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}";
+        let global = format!("f32[3, 4][sharding={sharding}]");
+        let local = "f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {}], varying_manual={'x'}}]";
+        assert_eq!(
+            plain.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<3>, %1:f32[3, 4] .
+                let %2:{global} = shard_map [
+                    mesh=['x'=2:manual, 'y'=2:manual],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}],
+                    manual_axes=['x'],
+                    global_input_types=[{global}],
+                    global_output_types=[{global}],
+                ] %1 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:dimension<3> = constant [value=3]
+                            %2:{local} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<3>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<3>, %1:{local} .
+                                    in (%1)
+                                }},
+                            ]
+                        in (%2)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
+        let extent = TestValue::Dimension(DimensionValue::constant(3).unwrap());
+        let elements = (0..12).map(|element| element as f32).collect::<Vec<_>>();
+        for batched in [plain, batched(true)] {
+            let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
+            assert_eq!(
+                batched.interpret(vec![extent.clone(), f32_value(f32_type(&[3, 4], None), &elements)]),
+                Ok(vec![extent.clone(), f32_value(output_type, &elements)]),
+            );
+        }
+    }
+
+    #[test]
     fn test_shard_map_batching_places_batch_axes_on_unused_manual_axes() {
         // A batch axis placed on an active manual axis `y` that no sharding names and that the body does not use (the
         // analogue of JAX's `spmd_axis_name`) makes `y` free in the batched map. Every device along `y` runs the same
         // body on the same inputs, so the batched map, which partitions the batch dimension along `y` at its boundary,
-        // computes the same values.
+        // computes the same values. The body places its batch dimension along the released axis `y` as well, so its
+        // declared input type is the local shard that the batched boundary derives.
         let mesh = manual_mesh_2x2();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let program = trace_test_program(
@@ -17824,7 +18169,7 @@ mod tests {
             .unwrap();
         let boundary_sharding = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}";
         let global = format!("f32[3, 4][sharding={boundary_sharding}]");
-        let local = "f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}], varying_manual={'x'}}]";
+        let local = "f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {}], varying_manual={'x'}}]";
         assert_eq!(
             batched.into_parts().0.to_string(),
             formatdoc! {"
@@ -17895,8 +18240,8 @@ mod tests {
                     global_output_types=[f32[3, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {'x'}]}]],
                 ] %1 [
                     body={
-                        lambda %0:f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}] .
-                        let %1:f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}] = add %0 %0
+                        lambda %0:f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {}]}] .
+                        let %1:f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {}]}] = add %0 %0
                         in (%1)
                     },
                 ]
@@ -17913,6 +18258,103 @@ mod tests {
             batched.interpret(vec![extent.clone(), f32_value(ArrayType::new_static(DataType::F32, [3, 4]), &elements)]),
             Ok(vec![extent, f32_value(output_type, &doubled)]),
         );
+    }
+
+    #[test]
+    fn test_shard_map_batching_places_batch_axes_of_composites_on_released_manual_axes() {
+        // A composite call requires inputs of exactly the types that its primal region declares, so it executes in a
+        // batched body only if the declared input types of that body are the local shards of the batched boundary,
+        // including the placement of the batch dimension along the released axis `x`. A call without custom rules uses
+        // no hidden axes, so `x` is released. A call with a retained custom batching rule may use every axis, so `x`
+        // stays manual and the batch is gathered along it instead (as rendered in
+        // `test_shard_map_batching_gathers_batch_axes_placed_on_axes_that_retained_custom_batching_rules_use`), and
+        // both compute the identity.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let batched = |custom_batching: bool| {
+            let program = trace_test_program(
+                |inputs| {
+                    vec![
+                        shard_map(
+                            |x: TestTracer| {
+                                let function = composite(|x: BodyTracer| Ok(x));
+                                let output = if custom_batching {
+                                    function
+                                        .with_batching(
+                                            |x: BodyTracer, axis: BatchAxis, _: BatchingLevelExtent<BodyTracer>| {
+                                                Ok((x, axis))
+                                            },
+                                        )
+                                        .call(x.into_value())?
+                                } else {
+                                    function.call(x.into_value())?
+                                };
+                                Ok(ValueProjection::<ArrayType>::into_projected(output)?)
+                            },
+                            inputs[0].clone(),
+                            mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )
+                        .unwrap(),
+                    ]
+                },
+                vec![f32_type(&[], None)],
+                Vec::new(),
+            );
+            program
+                .batched_with_threaded_extent(
+                    DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                    ShardingDimension::sharded(["x"]),
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        let sharding = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let global = format!("f32[2][sharding={sharding}]");
+        let plain = batched(false);
+        assert_eq!(
+            plain.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<2>, %1:f32[2] .
+                let %2:{global} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}],
+                    manual_axes=[],
+                    global_input_types=[{global}],
+                    global_output_types=[{global}],
+                ] %1 [
+                    body={{
+                        lambda %0:{global} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{global} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<2>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{global} .
+                                    in (%1)
+                                }},
+                            ]
+                        in (%2)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
+        let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
+        for batched in [plain, batched(true)] {
+            let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
+            assert_eq!(
+                batched.interpret(vec![extent.clone(), f32_value(f32_type(&[2], None), &[3.0, 4.0])]),
+                Ok(vec![extent.clone(), f32_value(output_type, &[3.0, 4.0])]),
+            );
+        }
     }
 
     #[test]
@@ -17953,7 +18395,7 @@ mod tests {
             .0;
         let input_sharding = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {}], reduced={'x'}}";
         let output_sharding = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {}], unreduced={'x'}}";
-        let local = "f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}]";
+        let local = "f32[3, 2][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'y'}, {}]}]";
         assert_eq!(
             batched.to_string(),
             formatdoc! {"
@@ -18359,9 +18801,11 @@ mod tests {
         ));
         let input_sharding = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}, {}]}";
         let output_sharding = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'y', 'x'}, {}]}";
-        let local = "f32[4, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}]}]";
-        let y_varying = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}], varying_manual={'y'}}";
-        let y_cube = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {}, {}], varying_manual={'y'}}";
+        // The batch dimension of the body values is placed on the free axis `x`, as at the boundary, and the gathered
+        // axis `y` tiles the batch dimension of the output only.
+        let local = "f32[4, 4][sharding={mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}, {}]}]";
+        let y_varying = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{'x'}, {}], varying_manual={'y'}}";
+        let y_cube = "{mesh<['x'=2:manual, 'y'=2:manual]>, [{}, {'x'}, {}], varying_manual={'y'}}";
         let y_scalar = "{mesh<['x'=2:manual, 'y'=2:manual]>, [], varying_manual={'y'}}";
         assert_eq!(
             batch(ShardingDimension::sharded(["y", "x"])).unwrap().into_parts().0.to_string(),
@@ -18449,71 +18893,27 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_batching_rejects_overflowing_gathered_device_counts() {
-        // Each axis size fits `usize`, but the number of devices along both gathered axes does not. Staging the scalar
-        // program allocates no devices or large arrays, so the overflow must be reported instead of panicking.
-        let axis_size = 1usize << (usize::BITS / 2);
-        let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", axis_size, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", axis_size, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let replicated = Sharding::replicated(mesh.clone(), 0);
-        let program = trace_test_program(
-            |inputs| {
-                vec![
-                    shard_map(
-                        |x: TestTracer| {
-                            Ok(x.parallel_reduce(ReductionKind::Sum, "x")?.parallel_reduce(ReductionKind::Sum, "y")?)
-                        },
-                        inputs[0].clone(),
-                        mesh.clone(),
-                        replicated.clone(),
-                        replicated.clone(),
-                        ShardMapOptions::new(),
-                    )
-                    .unwrap(),
-                ]
-            },
-            vec![f32_type(&[], None)],
-            Vec::new(),
-        );
-        let result = program.batched_with_threaded_extent(
-            DimensionValue::constant(1).unwrap().r#type().into_owned(),
-            ShardingDimension::sharded(["x", "y"]),
-            &[BatchAxis::new(0)],
-            ProgramBatchingOutputAxesPolicy::Natural,
-        );
-        let expected = ShardMapError::ArithmeticOverflow {
-            context: "counting the devices along the gathered manual axes of a batched body".to_string(),
-        };
-        assert!(matches!(
-            &result,
-            Err(BatchingError::Program(error)) if error.downcast_custom::<ShardMapError>() == Some(&expected),
-        ));
-        assert_eq!(
-            expected.to_string(),
-            "integer overflow in `shard_map` while counting the devices along the gathered manual axes of a batched \
-             body",
-        );
-    }
-
-    #[test]
     fn test_shard_map_batching_gathers_batch_axes_placed_on_axes_that_the_body_communicates_along() {
-        // A batch axis placed on an active manual axis `y` over which the body communicates is gathered even when no
-        // body value varies along `y`. Here, the body permutes its local values along `y` through the meshless form of
-        // `parallel_permute`, whose output type is that of its input, which does not vary along `y`, although the
-        // devices along `y` exchange their values. Every device along `y` holds the same batch items, so the exchange
-        // leaves every item unchanged, as it does without batching.
+        // A batch axis placed on an active manual axis `y` over which the body communicates is gathered. Here, the body
+        // varies its local values along `y`, exchanges them along `y` through the tracked form of `parallel_permute`,
+        // and sums them along `y`. Every device along `y` holds the same batch items, so the exchange leaves every item
+        // unchanged and the sum doubles it, as it does without batching.
         let mesh = manual_mesh_2x2();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let boundary = ShardMapBoundary::new(mesh, vec![sharded.clone()], vec![sharded], Vec::new()).unwrap();
+        let boundary = ShardMapBoundary::new(mesh.clone(), vec![sharded.clone()], vec![sharded], Vec::new()).unwrap();
         let local_type = boundary.local_input_type(0, &f32_type(&[4], None)).unwrap();
         let body = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let input = builder.add_input(local_type.into());
-            let permute = ParallelPermuteOperation::new("y".to_string(), 2, vec![(0, 1), (1, 0)]);
-            let output = builder.add_instruction(permute, Vec::new(), vec![input], None).unwrap()[0];
+            let vary = ParallelVaryOperation::new("y".to_string());
+            let varying = builder.add_instruction(vary, Vec::new(), vec![input], None).unwrap()[0];
+            let permute =
+                ParallelPermuteOperation::new("y".to_string(), 2, vec![(0, 1), (1, 0)]).with_mesh(mesh.clone());
+            let permuted = builder.add_instruction(permute, Vec::new(), vec![varying], None).unwrap()[0];
+            let sum = ParallelReduceOperation::new(ReductionKind::Sum, "y".to_string()).with_mesh(mesh);
+            let output = builder
+                .add_instruction(ArrayOperation::ParallelReduce(sum), Vec::new(), vec![permuted], None)
+                .unwrap()[0];
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -18551,33 +18951,44 @@ mod tests {
                 ] %1 [
                     body={{
                         lambda %0:f32[2, 2][sharding={x_varying}] .
-                        let %1:f32[2, 2][sharding={x_varying}] = \
-                            parallel_permute [axes=\"y\", axis_size=2, source_target_pairs=[(0, 1), (1, 0)]] %0
-                            %2:f32[2, 2][sharding={xy_varying}] = parallel_vary [axis_name=\"y\"] %1
-                            %3:f32[2, 1, 2][sharding={xy_cube}] = reshape [
+                        let %1:f32[2, 2][sharding={xy_varying}] = parallel_vary [axis_name=\"y\"] %0
+                            %2:f32[2, 2][sharding={xy_varying}] = parallel_permute [
+                                axes=\"y\",
+                                axis_size=2,
+                                source_target_pairs=[(0, 1), (1, 0)],
+                                mesh=['x'=2:manual, 'y'=2:manual],
+                            ] %1
+                            %3:f32[2, 2][sharding={x_varying}] = \
+                                parallel_reduce [kind=sum, axis_name=\"y\", mesh=['x'=2:manual, 'y'=2:manual]] %2
+                            %4:f32[2, 2][sharding={xy_varying}] = parallel_vary [axis_name=\"y\"] %3
+                            %5:f32[2, 1, 2][sharding={xy_cube}] = reshape [
                                 shape=[2, 1, 2],
                                 output_sharding={xy_cube},
-                            ] %2
-                            %4:u64[][sharding={y_scalar}] = \
+                            ] %4
+                            %6:u64[][sharding={y_scalar}] = \
                                 axis_index [axis_name=\"y\", mesh=['x'=2:manual, 'y'=2:manual]]
-                            %5:u64[][sharding={xy_scalar}] = parallel_vary [axis_name=\"x\"] %4
-                            %6:u64[][sharding={xy_scalar}] = zero [
+                            %7:u64[][sharding={xy_scalar}] = parallel_vary [axis_name=\"x\"] %6
+                            %8:u64[][sharding={xy_scalar}] = zero [
                                 type=u64[][sharding={xy_scalar}],
                             ]
-                            %7:f32[1, 1, 2][sharding={xy_cube}] = dynamic_slice [sizes=[1, 1, 2]] %3 %5 %6 %6
-                            %8:f32[1, 2][sharding={xy_varying}] = reshape [
+                            %9:f32[1, 1, 2][sharding={xy_cube}] = dynamic_slice [sizes=[1, 1, 2]] %5 %7 %8 %8
+                            %10:f32[1, 2][sharding={xy_varying}] = reshape [
                                 shape=[1, 2],
                                 output_sharding={xy_varying},
-                            ] %7
-                        in (%8)
+                            ] %9
+                        in (%10)
                     }},
                 ]
                 in (%0, %2)"},
         );
         let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
         let elements = (0..8).map(|element| element as f32).collect::<Vec<_>>();
-        let input = f32_value(boundary_array_type(&batched.input_types()[1]).unwrap().clone(), &elements);
-        assert_eq!(batched.interpret(vec![extent.clone(), input.clone()]), Ok(vec![extent, input]));
+        let doubled = elements.iter().map(|element| 2.0 * element).collect::<Vec<_>>();
+        let global_type = boundary_array_type(&batched.input_types()[1]).unwrap().clone();
+        assert_eq!(
+            batched.interpret(vec![extent.clone(), f32_value(global_type.clone(), &elements)]),
+            Ok(vec![extent, f32_value(global_type, &doubled)]),
+        );
     }
 
     #[test]
@@ -18655,6 +19066,439 @@ mod tests {
         assert_eq!(
             batched.interpret(vec![extent.clone(), f32_value(ArrayType::new_static(DataType::F32, [2, 4]), &elements)]),
             Ok(vec![extent, f32_value(output_type, &doubled)]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_batching_places_batch_axes_of_composites_on_gathered_and_explicit_axes() {
+        // The body reduces over `x`, so a batch placed on `[x, y]` gathers it along the manual axis `x` and partitions
+        // it along the explicit axis `y`. The batch dimension of the local body values is placed on `y`, as the batched
+        // boundary places that of the local inputs, so a composite call, which requires inputs of exactly the types
+        // that its primal region declares, executes in the batched body, with or without a retained custom batching
+        // rule. Every batch item `a` maps to `2 * a`, as the unbatched map computes it.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let batched = |custom_batching: bool| {
+            let program = trace_test_program(
+                |inputs| {
+                    vec![
+                        shard_map(
+                            |x: TestTracer| {
+                                let function = composite(|x: BodyTracer| Ok(x));
+                                let output = if custom_batching {
+                                    function
+                                        .with_batching(
+                                            |x: BodyTracer, axis: BatchAxis, _: BatchingLevelExtent<BodyTracer>| {
+                                                Ok((x, axis))
+                                            },
+                                        )
+                                        .call(x.into_value())?
+                                } else {
+                                    function.call(x.into_value())?
+                                };
+                                Ok(ValueProjection::<ArrayType>::into_projected(output)?
+                                    .parallel_reduce(ReductionKind::Sum, "x")?)
+                            },
+                            inputs[0].clone(),
+                            mesh.clone(),
+                            replicated.clone(),
+                            replicated.clone(),
+                            ShardMapOptions::new(),
+                        )
+                        .unwrap(),
+                    ]
+                },
+                vec![f32_type(&[], None)],
+                Vec::new(),
+            );
+            program
+                .batched_with_threaded_extent(
+                    DimensionValue::constant(4).unwrap().r#type().into_owned(),
+                    ShardingDimension::sharded(["x", "y"]),
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .unwrap()
+                .into_parts()
+                .0
+        };
+        let plain = batched(false);
+        let mesh = "['x'=2:manual, 'y'=2:explicit]";
+        let input_sharding = format!("{{mesh<{mesh}>, [{{'y'}}]}}");
+        let output_sharding = format!("{{mesh<{mesh}>, [{{'x', 'y'}}]}}");
+        let local = format!("f32[4][sharding={input_sharding}]");
+        let x_varying = format!("{{mesh<{mesh}>, [{{'y'}}], varying_manual={{'x'}}}}");
+        let x_matrix = format!("{{mesh<{mesh}>, [{{}}, {{'y'}}], varying_manual={{'x'}}}}");
+        let x_scalar = format!("{{mesh<{mesh}>, [], varying_manual={{'x'}}}}");
+        assert_eq!(
+            plain.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<4>, %1:f32[4] .
+                let %2:f32[4][sharding={output_sharding}] = shard_map [
+                    mesh={mesh},
+                    input_shardings=[{input_sharding}],
+                    output_shardings=[{output_sharding}],
+                    manual_axes=['x'],
+                    global_input_types=[{local}],
+                    global_output_types=[f32[4][sharding={output_sharding}]],
+                ] %1 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:dimension<4> = constant [value=4]
+                            %2:{local} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<4>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<4>, %1:{local} .
+                                    in (%1)
+                                }},
+                            ]
+                            %3:f32[4][sharding={x_varying}] = parallel_vary [axis_name=\"x\"] %2
+                            %4:{local} = parallel_reduce [kind=sum, axis_name=\"x\", mesh={mesh}] %3
+                            %5:f32[4][sharding={x_varying}] = parallel_vary [axis_name=\"x\"] %4
+                            %6:f32[2, 2][sharding={x_matrix}] = reshape [
+                                shape=[2, 2],
+                                output_sharding={x_matrix},
+                            ] %5
+                            %7:u64[][sharding={x_scalar}] = axis_index [axis_name=\"x\", mesh={mesh}]
+                            %8:u64[][sharding={x_scalar}] = zero [
+                                type=u64[][sharding={x_scalar}],
+                            ]
+                            %9:f32[1, 2][sharding={x_matrix}] = dynamic_slice [sizes=[1, 2]] %6 %7 %8
+                            %10:f32[2][sharding={x_varying}] = reshape [
+                                shape=[2],
+                                output_sharding={x_varying},
+                            ] %9
+                        in (%10)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
+        let extent = TestValue::Dimension(DimensionValue::constant(4).unwrap());
+        for batched in [plain, batched(true)] {
+            let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
+            assert_eq!(
+                batched.interpret(vec![extent.clone(), f32_value(f32_type(&[4], None), &[1.0, 2.0, 3.0, 4.0])]),
+                Ok(vec![extent.clone(), f32_value(output_type, &[2.0, 4.0, 6.0, 8.0])]),
+            );
+        }
+    }
+
+    #[test]
+    fn test_shard_map_batching_gathers_batch_axes_placed_on_axes_that_retained_custom_jvp_rules_use() {
+        // The custom forward mode rule of an identity composite computes the tangent as the mean of its replicated
+        // copies along `x`, which communicates along `x`. That rule is traced only when a later `jvp` requests it, in
+        // the scope of the original call, where `x` is manual, so `x` cannot be proven unused and stays manual, and the
+        // batch is gathered along it. Releasing `x` instead would make that `jvp` stage collectives over an axis that
+        // the batched map no longer makes manual.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function =
+                                composite(|x: BodyTracer| Ok(x)).with_jvp(|x: BodyTracer, tangent: BodyTracer| {
+                                    let tangent = ValueProjection::<ArrayType>::into_projected(tangent)?;
+                                    let two = tangent.one_like()? + tangent.one_like()?;
+                                    let tangent = tangent.parallel_reduce(ReductionKind::Sum, "x")? / two;
+                                    Ok((x, tangent.into_value()))
+                                });
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[], None)],
+            Vec::new(),
+        );
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::sharded(["x"]),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let replicated = "{mesh<['x'=2:manual]>, [{}]}";
+        let tiled = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let local = format!("f32[2][sharding={replicated}]");
+        let varying = "{mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}";
+        let matrix = "{mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}";
+        let scalar = "{mesh<['x'=2:manual]>, [], varying_manual={'x'}}";
+        assert_eq!(
+            batched.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<2>, %1:f32[2] .
+                let %2:f32[2][sharding={tiled}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{tiled}],
+                    manual_axes=['x'],
+                    global_input_types=[{local}],
+                    global_output_types=[f32[2][sharding={tiled}]],
+                ] %1 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{local} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<2>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{local} .
+                                    in (%1)
+                                }},
+                            ]
+                            %3:f32[2][sharding={varying}] = parallel_vary [axis_name=\"x\"] %2
+                            %4:f32[2, 1][sharding={matrix}] = reshape [
+                                shape=[2, 1],
+                                output_sharding={matrix},
+                            ] %3
+                            %5:u64[][sharding={scalar}] = axis_index [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %6:u64[][sharding={scalar}] = zero [type=u64[][sharding={scalar}]]
+                            %7:f32[1, 1][sharding={matrix}] = dynamic_slice [sizes=[1, 1]] %4 %5 %6
+                            %8:f32[1][sharding={varying}] = reshape [shape=[1], output_sharding={varying}] %7
+                        in (%8)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
+        let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
+        let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
+        assert_eq!(
+            batched.jvp_with_respect_to(&[1]).unwrap().interpret(vec![
+                extent.clone(),
+                f32_value(f32_type(&[2], None), &[3.0, 4.0]),
+                f32_value(f32_type(&[2], None), &[1.0, 1.0]),
+            ]),
+            Ok(vec![extent, f32_value(output_type.clone(), &[3.0, 4.0]), f32_value(output_type, &[1.0, 1.0])]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_batching_gathers_batch_axes_placed_on_axes_that_retained_custom_vjp_rules_use() {
+        // The custom backward rule of an identity composite computes the cotangent as the mean of its replicated
+        // copies along `x`. That rule is traced only when transposition requests it, in the scope of the original
+        // call, where `x` is manual, so `x` stays manual, the batch is gathered along it, and the gradient of the
+        // batched map is the identity.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function = composite(|x: BodyTracer| Ok(x)).with_vjp(
+                                |x: BodyTracer| Ok((x.clone(), x)),
+                                |_: BodyTracer, cotangent: BodyTracer| {
+                                    let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
+                                    let two = cotangent.one_like()? + cotangent.one_like()?;
+                                    Ok((cotangent.parallel_reduce(ReductionKind::Sum, "x")? / two).into_value())
+                                },
+                            );
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[], None)],
+            Vec::new(),
+        );
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::sharded(["x"]),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let replicated = "{mesh<['x'=2:manual]>, [{}]}";
+        let tiled = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let local = format!("f32[2][sharding={replicated}]");
+        let varying = "{mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}";
+        let matrix = "{mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}";
+        let scalar = "{mesh<['x'=2:manual]>, [], varying_manual={'x'}}";
+        assert_eq!(
+            batched.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<2>, %1:f32[2] .
+                let %2:f32[2][sharding={tiled}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{tiled}],
+                    manual_axes=['x'],
+                    global_input_types=[{local}],
+                    global_output_types=[f32[2][sharding={tiled}]],
+                ] %1 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{local} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<2>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{local} .
+                                    in (%1)
+                                }},
+                            ]
+                            %3:f32[2][sharding={varying}] = parallel_vary [axis_name=\"x\"] %2
+                            %4:f32[2, 1][sharding={matrix}] = reshape [
+                                shape=[2, 1],
+                                output_sharding={matrix},
+                            ] %3
+                            %5:u64[][sharding={scalar}] = axis_index [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %6:u64[][sharding={scalar}] = zero [type=u64[][sharding={scalar}]]
+                            %7:f32[1, 1][sharding={matrix}] = dynamic_slice [sizes=[1, 1]] %4 %5 %6
+                            %8:f32[1][sharding={varying}] = reshape [shape=[1], output_sharding={varying}] %7
+                        in (%8)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
+        let linearization = batched
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[1], DifferentiationRule::JvpForTranspose, None)
+            .unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
+        let mut outputs = linearization
+            .primal()
+            .interpret(vec![extent.clone(), f32_value(f32_type(&[2], None), &[3.0, 4.0])])
+            .unwrap();
+        let residuals = outputs.split_off(outputs.len() - linearization.residual_count());
+        let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
+        assert_eq!(outputs, vec![extent, f32_value(output_type, &[3.0, 4.0])]);
+        let mut pullback_inputs = vec![unit_seed(&outputs[1])];
+        pullback_inputs.extend(residuals);
+        assert_eq!(arrays_f64(pullback.interpret(pullback_inputs).unwrap()), vec![vec![1.0, 1.0]]);
+    }
+
+    #[test]
+    fn test_shard_map_batching_gathers_batch_axes_placed_on_axes_that_retained_custom_batching_rules_use() {
+        // The custom batching rule of an identity composite computes the mean of the replicated copies of its input
+        // along `x`. That rule is traced only when the body is batched, after the placement is chosen, so `x` stays
+        // manual and the batch is gathered along it, which keeps the collectives of the rule over a manual axis.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function = composite(|x: BodyTracer| Ok(x)).with_batching(
+                                |x: BodyTracer, axis: BatchAxis, _: BatchingLevelExtent<BodyTracer>| {
+                                    let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                                    let two = x.one_like()? + x.one_like()?;
+                                    Ok(((x.parallel_reduce(ReductionKind::Sum, "x")? / two).into_value(), axis))
+                                },
+                            );
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[], None)],
+            Vec::new(),
+        );
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::sharded(["x"]),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let replicated = "{mesh<['x'=2:manual]>, [{}]}";
+        let tiled = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let local = format!("f32[2][sharding={replicated}]");
+        let varying = "{mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}";
+        let matrix = "{mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}";
+        let scalar = "{mesh<['x'=2:manual]>, [], varying_manual={'x'}}";
+        assert_eq!(
+            batched.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<2>, %1:f32[2] .
+                let %2:f32[2][sharding={tiled}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{tiled}],
+                    manual_axes=['x'],
+                    global_input_types=[{local}],
+                    global_output_types=[f32[2][sharding={tiled}]],
+                ] %1 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{local} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<2>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{local} .
+                                    let %2:f32[2][sharding={varying}] = parallel_vary [axis_name=\"x\"] %1
+                                        %3:{local} = parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %2
+                                        %4:{local} = one_like %1
+                                        %5:{local} = one_like %1
+                                        %6:{local} = add %4 %5
+                                        %7:{local} = div %3 %6
+                                    in (%7)
+                                }},
+                            ]
+                            %3:f32[2][sharding={varying}] = parallel_vary [axis_name=\"x\"] %2
+                            %4:f32[2, 1][sharding={matrix}] = reshape [
+                                shape=[2, 1],
+                                output_sharding={matrix},
+                            ] %3
+                            %5:u64[][sharding={scalar}] = axis_index [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %6:u64[][sharding={scalar}] = zero [type=u64[][sharding={scalar}]]
+                            %7:f32[1, 1][sharding={matrix}] = dynamic_slice [sizes=[1, 1]] %4 %5 %6
+                            %8:f32[1][sharding={varying}] = reshape [shape=[1], output_sharding={varying}] %7
+                        in (%8)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
+        let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
+        let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
+        assert_eq!(
+            batched.interpret(vec![extent.clone(), f32_value(f32_type(&[2], None), &[3.0, 4.0])]),
+            Ok(vec![extent, f32_value(output_type, &[3.0, 4.0])]),
         );
     }
 
@@ -18884,15 +19728,22 @@ mod tests {
         // batched reference input cannot be, because it crosses the boundary by identity.
         let mesh = manual_mesh_2x2();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let boundary = ShardMapBoundary::new(mesh, vec![sharded.clone()], vec![sharded], Vec::new()).unwrap();
+        let boundary = ShardMapBoundary::new(mesh.clone(), vec![sharded.clone()], vec![sharded], Vec::new()).unwrap();
         let local_type = boundary.local_input_type(0, &f32_type(&[4], None)).unwrap();
         let body = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let reference = builder.add_input(ReferenceType::new(local_type).into());
             let state =
                 builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-            let permute = ParallelPermuteOperation::new("y".to_string(), 2, vec![(0, 1), (1, 0)]);
-            let output = builder.add_instruction(permute, Vec::new(), vec![state], None).unwrap()[0];
+            let vary = ParallelVaryOperation::new("y".to_string());
+            let varying = builder.add_instruction(vary, Vec::new(), vec![state], None).unwrap()[0];
+            let permute =
+                ParallelPermuteOperation::new("y".to_string(), 2, vec![(0, 1), (1, 0)]).with_mesh(mesh.clone());
+            let permuted = builder.add_instruction(permute, Vec::new(), vec![varying], None).unwrap()[0];
+            let sum = ParallelReduceOperation::new(ReductionKind::Sum, "y".to_string()).with_mesh(mesh);
+            let output = builder
+                .add_instruction(ArrayOperation::ParallelReduce(sum), Vec::new(), vec![permuted], None)
+                .unwrap()[0];
             builder
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -18958,7 +19809,7 @@ mod tests {
                 .0;
             let sharding = "{mesh<['x'=2:manual]>, [{'x'}, {}]}";
             let global = format!("f32[2, 4][sharding={sharding}]");
-            let local = "f32[2, 4][sharding={mesh<['x'=2:manual]>, [{}, {}]}]";
+            let local = format!("f32[2, 4][sharding={sharding}]");
             let check = if check_manual_variation { "" } else { "\n    check_manual_variation=false," };
             assert_eq!(
                 batched.to_string(),
@@ -24008,6 +24859,133 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_transposition_normalizes_strided_low_precision_unchecked_body_seeds() {
+        // The byte strides of an `f16` seed do not address its `f32` temporaries, which therefore take the default
+        // layout, and the normalized seed regains the strides that the transposed body declares through a cast. The
+        // unchecked body divides the replicated seed over both devices and sums their contributions afterwards.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let global_type =
+            ArrayType::new_static(DataType::F16, [4]).with_layout(Layout::Strided(StridedLayout::new(vec![2])));
+        let boundary = ShardMapBoundary::new(mesh, vec![replicated.clone()], vec![replicated], Vec::new())
+            .unwrap()
+            .with_check_manual_variation(false);
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
+        let body = identity_body(local_type);
+        let program = caller_typed_shard_map_program(body, vec![ArrayIrType::Array(global_type.clone())], boundary);
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        let sharding = "{mesh<['x'=2:manual]>, [{}]}";
+        let strided = format!("f16[4][layout=strided{{2}}][sharding={sharding}]");
+        let widened = format!("f32[4][sharding={sharding}]");
+        let narrowed = format!("f16[4][sharding={sharding}]");
+        let scalar = "f32[][sharding={mesh<['x'=2:manual]>, []}]";
+        let caller = "f16[4][layout=strided{2}]";
+        assert_eq!(
+            pullback.to_string(),
+            formatdoc! {"
+                lambda %0:{strided} .
+                let %1:{strided} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{sharding}],
+                    output_shardings=[{sharding}],
+                    manual_axes=['x'],
+                    check_manual_variation=false,
+                    global_input_types=[{strided}],
+                    global_output_types=[{strided}],
+                ] %0 [
+                    body={{
+                        lambda %0:{strided} .
+                        let %1:{widened} = convert_element_type [data_type=f32] %0
+                            %2:{scalar} = constant [value=2.0]
+                            %3:{widened} = broadcast [output_type={widened}, output_axes=[]] %2
+                            %4:{widened} = div %1 %3
+                            %5:{narrowed} = convert_element_type [data_type=f16] %4
+                            %6:{strided} = cast [
+                                type={strided},
+                                inputs=[{narrowed}],
+                            ] %5
+                            %7:{strided} = parallel_reduce [kind=sum, axis_name=\"x\"] %6
+                        in (%7)
+                    }},
+                ]
+                    %2:{caller} = broadcast [output_type={caller}, output_axes=[0]] %1
+                in (%2)"},
+        );
+        let values = Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap().converted_to(DataType::F16).unwrap();
+        let seed_type = <&ArrayType>::try_from(&pullback.input_types()[0]).unwrap().clone();
+        let seed = Array::from_logical_bytes(seed_type, &values.logical_bytes()).unwrap();
+        let cotangent = Array::from_logical_bytes(global_type, &values.logical_bytes()).unwrap();
+        assert_eq!(pullback.interpret(vec![TestValue::Array(seed)]), Ok(vec![TestValue::Array(cotangent)]));
+    }
+
+    #[test]
+    fn test_shard_map_transposition_normalizes_strided_low_precision_trusted_output_seeds() {
+        // A checked body with a trusted replicated output divides its `f16` seed over the axis whose variation the
+        // boundary forgot, with the same layouts as an unchecked body.
+        let mesh = manual_mesh();
+        let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let global_type =
+            ArrayType::new_static(DataType::F16, [4]).with_layout(Layout::Strided(StridedLayout::new(vec![2])));
+        let boundary = ShardMapBoundary::new(mesh, vec![sharded], vec![replicated], Vec::new())
+            .unwrap()
+            .with_check_output_replication(false);
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
+        let body = identity_body(local_type);
+        let program = caller_typed_shard_map_program(body, vec![ArrayIrType::Array(global_type.clone())], boundary);
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        let replicated = "{mesh<['x'=2:manual]>, [{}]}";
+        let tiled = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let varying = "{mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}";
+        let seed = format!("f16[2][layout=strided{{2}}][sharding={replicated}]");
+        let varying_seed = format!("f16[2][layout=strided{{2}}][sharding={varying}]");
+        let widened = format!("f32[2][sharding={varying}]");
+        let narrowed = format!("f16[2][sharding={varying}]");
+        let scalar = "f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]";
+        let cotangent = format!("f16[4][layout=strided{{2}}][sharding={tiled}]");
+        let caller = "f16[4][layout=strided{2}]";
+        assert_eq!(
+            pullback.to_string(),
+            formatdoc! {"
+                lambda %0:{seed} .
+                let %1:{cotangent} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{tiled}],
+                    manual_axes=['x'],
+                    global_input_types=[{seed}],
+                    global_output_types=[{cotangent}],
+                ] %0 [
+                    body={{
+                        lambda %0:{seed} .
+                        let %1:{varying_seed} = parallel_vary [axis_name=\"x\"] %0
+                            %2:{widened} = convert_element_type [data_type=f32] %1
+                            %3:{scalar} = constant [value=2.0]
+                            %4:{widened} = broadcast [
+                                output_type={widened},
+                                output_axes=[],
+                            ] %3
+                            %5:{widened} = div %2 %4
+                            %6:{narrowed} = convert_element_type [data_type=f16] %5
+                            %7:{varying_seed} = cast [
+                                type={varying_seed},
+                                inputs=[{narrowed}],
+                            ] %6
+                        in (%7)
+                    }},
+                ]
+                    %2:{caller} = broadcast [output_type={caller}, output_axes=[0]] %1
+                in (%2)"},
+        );
+        let seed_type = <&ArrayType>::try_from(&pullback.input_types()[0]).unwrap().clone();
+        let seed = Array::vector(vec![1f32, 2.0]).unwrap().converted_to(DataType::F16).unwrap();
+        let seed = Array::from_logical_bytes(seed_type, &seed.logical_bytes()).unwrap();
+        let cotangent = Array::vector(vec![0.5f32, 1.0, 0.5, 1.0]).unwrap().converted_to(DataType::F16).unwrap();
+        let cotangent = Array::from_logical_bytes(global_type, &cotangent.logical_bytes()).unwrap();
+        assert_eq!(pullback.interpret(vec![TestValue::Array(seed)]), Ok(vec![TestValue::Array(cotangent)]));
+    }
+
+    #[test]
     fn test_shard_map_transposition_preserves_zero_space_seed_positions() {
         // Transposing a map whose outputs are a zero-space integer, a value, and a forwarded reference keeps every
         // output cotangent seed at its program position, although only the value cotangent crosses the transposed
@@ -26932,9 +27910,23 @@ mod tests {
 
     #[test]
     fn test_lockstep_device_grid_new() {
-        let grid = LockstepDeviceGrid::new(vec![("x".to_string(), 2), ("y".to_string(), 3)]);
+        let grid = LockstepDeviceGrid::new(vec![("x".to_string(), 2), ("y".to_string(), 3)]).unwrap();
         assert_eq!(grid, LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] });
         assert_eq!(grid.device_count(), 6);
+
+        // Axis sizes that each fit `usize` are rejected when their product (i.e., the device count) does not.
+        let axis_size = 1usize << (usize::BITS / 2);
+        let result = LockstepDeviceGrid::new(vec![("x".to_string(), axis_size), ("y".to_string(), axis_size)]);
+        assert_eq!(
+            result,
+            Err(ShardMapError::ArithmeticOverflow {
+                context: "counting the emulated devices along manual axes `x`, `y`".to_string(),
+            }),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "integer overflow in `shard_map` while counting the emulated devices along manual axes `x`, `y`",
+        );
     }
 
     #[test]
@@ -26942,9 +27934,19 @@ mod tests {
         let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2)] };
         assert_eq!(
             grid.with_axes(&[("y".to_string(), 3)]),
-            LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] },
+            Ok(LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 3)] }),
         );
-        assert_eq!(grid.with_axes(&[]), grid);
+        assert_eq!(grid.with_axes(&[]), Ok(grid));
+
+        // The axes of nested manual regions over different meshes can overflow together.
+        let axis_size = 1usize << (usize::BITS / 2);
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), axis_size)] };
+        assert_eq!(
+            grid.with_axes(&[("y".to_string(), axis_size)]),
+            Err(ShardMapError::ArithmeticOverflow {
+                context: "counting the emulated devices along manual axes `x`, `y`".to_string(),
+            }),
+        );
     }
 
     #[test]
@@ -27209,114 +28211,134 @@ mod tests {
     }
 
     #[test]
-    fn test_lockstep_domain_validate_tracked_collective() {
-        // A tracked collective uses the policy of the region that binds its axis, even through an inner region over
-        // another axis. Here the outer region binds `x` with manual variation checking and the inner one binds `y`
-        // without it.
-        let mesh = manual_mesh_2x2();
-        let boundary = |axis: &str, checked| {
-            ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec![axis.to_string()])
-                .unwrap()
-                .with_check_manual_variation(checked)
-        };
-        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 2)] };
-        let domain = LockstepDomain::<TestOperation>::new(grid, vec![boundary("x", true), boundary("y", false)]);
-        let input_type = f32_type(&[], None).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
-        let vary = |axis: &str| ParallelVaryOperation::new(axis.to_string());
-        assert_eq!(domain.validate_tracked_collective(&vary("x"), "x", &input_type), Ok(()));
-        assert_eq!(
-            domain.validate_tracked_collective(&vary("y"), "y", &input_type),
-            Err(ProgramError::MalformedProgram(
-                "`parallel_vary` cannot use tracked mesh metadata inside an unchecked manual binding".to_string(),
-            )),
-        );
-
-        // The mesh of the input must agree with the mesh of the owning region, rather than merely contain an axis
-        // with the same name.
-        let foreign_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let foreign_type = f32_type(&[], None).with_sharding(Sharding::replicated(foreign_mesh, 0)).unwrap();
-        assert_eq!(
-            domain.validate_tracked_collective(&vary("x"), "x", &foreign_type),
-            Err(ProgramError::MalformedProgram(
-                "`parallel_vary` operation mesh does not match the enclosing manual axis `x` mesh".to_string(),
-            )),
-        );
-
-        // An axis that no enclosing region binds has no owner.
-        assert_eq!(
-            domain.validate_tracked_collective(&vary("z"), "z", &input_type),
-            Err(ProgramError::MalformedProgram(
-                "`parallel_vary` manual axis `z` has no enclosing manual binding".to_string(),
-            )),
-        );
-    }
-
-    #[test]
-    fn test_lockstep_domain_validate_collective_mesh() {
-        // The region that binds an axis owns its mesh and its checking policy. Here the outer region binds `x` with
-        // manual variation checking and the inner one binds `y` without it, over a mesh with a free axis `f`.
+    fn test_lockstep_domain_validate_collective() {
+        // The region that binds an axis owns its mesh and its checking policy, even through an inner region over
+        // another axis. Here the outer regions bind `x` and `w` with manual variation checking and the inner one binds
+        // `y` without it, over a mesh with a free axis `f`.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("w", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("f", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let boundary = |axis: &str, checked| {
-            ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), vec![axis.to_string()])
-                .unwrap()
-                .with_check_manual_variation(checked)
+        let boundary = |axes: &[&str], checked| {
+            ShardMapBoundary::new(
+                mesh.clone(),
+                Vec::new(),
+                Vec::new(),
+                axes.iter().map(|axis| axis.to_string()).collect(),
+            )
+            .unwrap()
+            .with_check_manual_variation(checked)
         };
-        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("y".to_string(), 2)] };
-        let domain = LockstepDomain::<TestOperation>::new(grid, vec![boundary("x", true), boundary("y", false)]);
-        let index = |axis: &str| AxisIndexOperation::new(axis.to_string());
-
-        // A collective staged with a mesh tracks manual variation, which only a checked owner does, and one staged
-        // without a mesh tracks none, which a checked owner would mistake for invariance.
-        assert_eq!(domain.validate_collective_mesh(&index("x"), "x", Some(&mesh)), Ok(()));
-        assert_eq!(domain.validate_collective_mesh(&index("y"), "y", None), Ok(()));
-        assert_eq!(
-            domain.validate_collective_mesh(&index("x"), "x", None),
-            Err(ProgramError::MalformedProgram(
-                "`axis_index` requires tracked mesh metadata inside a checked manual binding".to_string(),
-            )),
+        let grid = LockstepDeviceGrid { axes: vec![("x".to_string(), 2), ("w".to_string(), 2), ("y".to_string(), 2)] };
+        let domain = LockstepDomain::<TestOperation>::new(
+            grid,
+            vec![boundary(&["x"], true), boundary(&["w"], true), boundary(&["y"], false)],
         );
+        let index = |axis: &str| AxisIndexOperation::new(axis.to_string());
+        let vary = |axis: &str| ParallelVaryOperation::new(axis.to_string());
+        let gather = |axes: [&str; 2]| {
+            ParallelAllGatherOperation::new(
+                axes,
+                4,
+                0,
+                CollectiveOptions::default(),
+                ParallelAllGatherOutputVariance::Varying,
+            )
+        };
+        let varying_along = |axes: &[&str]| {
+            f32_type(&[], None)
+                .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(axes.to_vec()).unwrap())
+                .unwrap()
+        };
+        let invariant = f32_type(&[], None);
+
+        // A collective staged with tracking metadata (i.e., a payload mesh, or the input mesh of `parallel_vary` and
+        // `parallel_cast`) needs checked owners, whatever its output types are.
+        assert_eq!(domain.validate_collective(&index("x"), Some(&mesh), &[varying_along(&["x"])]), Ok(()));
+        assert_eq!(domain.validate_collective(&vary("x"), Some(&mesh), &[varying_along(&["x"])]), Ok(()));
         assert_eq!(
-            domain.validate_collective_mesh(&index("y"), "y", Some(&mesh)),
+            domain.validate_collective(&index("y"), Some(&mesh), &[varying_along(&["y"])]),
             Err(ProgramError::MalformedProgram(
                 "`axis_index` cannot use tracked mesh metadata inside an unchecked manual binding".to_string(),
             )),
         );
 
-        // Retyping a free axis keeps the manual region, while another topology or other manual axes do not.
+        // Retyping a free axis (e.g., by `auto_axes`) keeps the manual region, while another topology or other manual
+        // axes do not.
         let retyped_mesh = mesh.with_axis_types(["f"], MeshAxisType::Auto).unwrap();
-        assert_eq!(domain.validate_collective_mesh(&index("x"), "x", Some(&retyped_mesh)), Ok(()));
+        assert_eq!(domain.validate_collective(&index("x"), Some(&retyped_mesh), &[varying_along(&["x"])]), Ok(()));
         let foreign_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 3, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("w", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("f", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
         assert_eq!(
-            domain.validate_collective_mesh(&index("x"), "x", Some(&foreign_mesh)),
+            domain.validate_collective(&vary("x"), Some(&foreign_mesh), &[invariant.clone()]),
             Err(ProgramError::MalformedProgram(
-                "`axis_index` operation mesh does not match the enclosing manual axis `x` mesh".to_string(),
+                "`parallel_vary` operation mesh does not match the enclosing manual axis `x` mesh".to_string(),
             )),
         );
         let explicit_mesh = mesh.with_axis_types(["y"], MeshAxisType::Explicit).unwrap();
         assert_eq!(
-            domain.validate_collective_mesh(&index("x"), "x", Some(&explicit_mesh)),
+            domain.validate_collective(&index("x"), Some(&explicit_mesh), &[varying_along(&["x"])]),
             Err(ProgramError::MalformedProgram(
                 "`axis_index` operation mesh does not match the enclosing manual axis `x` mesh".to_string(),
             )),
         );
 
+        // A collective staged without tracking metadata trusts the program under unchecked owners. Under checked
+        // owners, its outputs must vary along every axis that it names (e.g., a grouped reduction of a varying input),
+        // because outputs typed as invariant could hold different values on different devices.
+        assert_eq!(domain.validate_collective(&index("y"), None, &[invariant.clone()]), Ok(()));
+        let grouped =
+            ParallelReduceOperation::grouped(ReductionKind::Sum, "x".to_string(), 2, vec![vec![0], vec![1]]).unwrap();
+        assert_eq!(domain.validate_collective(&grouped, None, &[varying_along(&["x"])]), Ok(()));
+        assert_eq!(
+            domain.validate_collective(&index("x"), None, &[invariant.clone()]),
+            Err(ProgramError::MalformedProgram(
+                "`axis_index` without tracked mesh metadata types its outputs as invariant along manual axis `x` \
+                 inside a checked manual region"
+                    .to_string(),
+            )),
+        );
+        assert_eq!(
+            domain.validate_collective(&grouped, None, &[varying_along(&["x"]), varying_along(&["w"])]),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_reduce` without tracked mesh metadata types its outputs as invariant along manual axis `x` \
+                 inside a checked manual region"
+                    .to_string(),
+            )),
+        );
+
+        // A multi-axis collective resolves the owner of each axis, and those owners must agree on their policy. Under
+        // checked owners, its outputs must vary along all of its axes.
+        assert_eq!(domain.validate_collective(&gather(["x", "w"]), Some(&mesh), &[invariant.clone()]), Ok(()));
+        assert_eq!(domain.validate_collective(&gather(["x", "w"]), None, &[varying_along(&["w", "x"])]), Ok(()));
+        assert_eq!(
+            domain.validate_collective(&gather(["x", "w"]), None, &[varying_along(&["x"])]),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_all_gather` without tracked mesh metadata types its outputs as invariant along manual axis \
+                 `w` inside a checked manual region"
+                    .to_string(),
+            )),
+        );
+        assert_eq!(
+            domain.validate_collective(&gather(["x", "y"]), None, &[varying_along(&["x", "y"])]),
+            Err(ProgramError::MalformedProgram(
+                "`parallel_all_gather` communicates along manual axes `(x, y)` whose regions disagree on whether they \
+                 check manual variation"
+                    .to_string(),
+            )),
+        );
+
         // An axis that no enclosing region binds has no owner.
         assert_eq!(
-            domain.validate_collective_mesh(&index("z"), "z", Some(&mesh)),
+            domain.validate_collective(&index("z"), Some(&mesh), &[invariant]),
             Err(ProgramError::MalformedProgram(
                 "`axis_index` manual axis `z` has no enclosing manual binding".to_string(),
             )),

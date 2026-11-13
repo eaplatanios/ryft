@@ -422,6 +422,7 @@ impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDoma
         let outputs = context.grid().map_devices(|device| {
             // A device that no pair targets receives zeros.
             let output_type = context.collective_output_type(self, arrays[device], extents, device)?;
+            context.validate_collective(self, self.mesh(), std::slice::from_ref(&output_type))?;
             let position = context.grid().position(device, &axes);
             match self.source_target_pairs().iter().find(|(_, target)| *target == position) {
                 Some((source, _)) => {
