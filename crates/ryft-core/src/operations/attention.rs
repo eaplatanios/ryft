@@ -956,6 +956,7 @@ where
 /// The function owns its named composite together with the definitions that its primal and its rules call, so it should
 /// be created once and called many times. Its primal and its definitions' bodies are then traced once per input types,
 /// and its rules once per specialization, for as long as the function lives.
+#[allow(clippy::type_complexity)]
 pub struct DifferentiableDotProductAttention<C: Domain>
 where
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
@@ -1307,6 +1308,15 @@ struct AttentionDimensions {
     data_type: DataType,
 }
 
+impl AttentionDimensions {
+    /// Returns the score scale of `configuration` for these dimensions, which is its explicit scale or, without one,
+    /// `1 / sqrt(head_dimension)`.
+    #[inline]
+    fn scale(&self, configuration: AttentionConfiguration) -> f64 {
+        configuration.scale().unwrap_or(1.0 / (self.head_dimension as f64).sqrt())
+    }
+}
+
 /// Named attention definitions of one operation family `(V, O)` and one [`AttentionConfiguration`] (i.e., the forward
 /// definition without and with its residual, and the backward definition). Each one is a named composite that serves
 /// every input structure, under the [`AttentionKey`] of that structure (refer to
@@ -1418,6 +1428,9 @@ type ForwardFunction<V, O> =
 type BackwardFunction<V, O> =
     AttentionFunction<BackwardFolding<V, O>, Composite<V, O, BackwardInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>>;
 
+/// Data type in which the attention bodies evaluate softmax and its log-sum-exp residual.
+const SOFTMAX_DATA_TYPE: DataType = DataType::F32;
+
 /// Shared normalized inputs and masked logits consumed by the forward and backward attention bodies.
 struct PreparedAttention<V> {
     /// Normalized query.
@@ -1429,17 +1442,8 @@ struct PreparedAttention<V> {
     /// Normalized value expanded from key/value heads to query heads.
     expanded_value: V,
 
-    /// Masked logits converted to the data type used by softmax.
+    /// Masked logits converted to [`SOFTMAX_DATA_TYPE`].
     logits: V,
-
-    /// Shared query/key/value data type.
-    data_type: DataType,
-
-    /// Data type used by softmax and its log-sum-exp residual.
-    softmax_type: DataType,
-
-    /// Explicit or default score scale.
-    scale: f64,
 }
 
 /// Semantic role of one attention batching input.
@@ -1899,8 +1903,6 @@ fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayT
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Normalizes attention inputs and constructs the masked score logits shared by the forward and backward bodies.
 fn prepare_attention<
     V: Value<Type: ArrayMemberType>
@@ -1941,19 +1943,20 @@ fn prepare_attention<
     let expanded_key = expand_key_value_heads(key, dimensions)?;
     let expanded_value = expand_key_value_heads(value_input, dimensions)?;
     let data_type = dimensions.data_type;
+
     // Dot products, scaling, bias, and masking promote low precision inputs to `f32`, while `f64` remains `f64`.
     // The stable softmax itself always runs in `f32`, matching the public attention contract.
     let logits_type = if data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
-    let softmax_type = DataType::F32;
+
     // The scores contract the head dimension of the query and of the expanded key for every batch item and head,
     // which gives the `BNTS` score form.
     let scores = query.dot(&expanded_key, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?;
     let scores = if data_type == logits_type { scores } else { scores.convert_element_type(logits_type)? };
-    let scale = configuration.scale().unwrap_or(1.0 / (dimensions.head_dimension as f64).sqrt());
-    let scale_value = scores.fill_like(scale)?;
+    let scale_value = scores.fill_like(dimensions.scale(configuration))?;
     let mut scores = scores.mul(&scale_value)?;
-    // A bias is right-aligned to `BNTS`, converted to the data type of the scores, and broadcast to their shape. Every
-    // axis of the normalized bias either has the extent of the corresponding score axis or is a unit axis.
+
+    // A bias is right-aligned to `BNTS`, converted to the data type of the scores, and broadcast to their shape.
+    // Every axis of the normalized bias either has the extent of the corresponding score axis or is a unit axis.
     if let Some(bias) = &inputs.bias {
         let bias = normalize_attention_score_input(bias.clone())?;
         let bias = if bias.r#type().as_array_type()?.data_type() == logits_type {
@@ -1985,6 +1988,7 @@ fn prepare_attention<
                 Some(mask.broadcast_like(&scores, &[0, 1, 2, 3])?)
             }
         };
+
         // Causal masking lets query position `i` attend only to key/value positions `j <= i`.
         if configuration.causal() {
             let rows = scores.iota_like(2, DataType::I32)?;
@@ -1994,6 +1998,7 @@ fn prepare_attention<
                 Some(visible) => visible.and(&causal)?,
             });
         }
+
         // The local window keeps the key/value positions `j` with `i - left <= j <= i + right`.
         if let Some((left, right)) = configuration.local_window() {
             let rows = scores.iota_like(2, DataType::I32)?;
@@ -2009,6 +2014,7 @@ fn prepare_attention<
                 Some(visible) => visible.and(&in_window)?,
             });
         }
+
         // Query rows at or beyond the query length of their batch item see no key/value position at all.
         if let Some(lengths) = &inputs.query_sequence_lengths {
             let rows = scores.iota_like(2, DataType::I32)?;
@@ -2019,6 +2025,7 @@ fn prepare_attention<
                 Some(visible) => visible.and(&in_range)?,
             });
         }
+
         // Key/value columns at or beyond the key/value length of their batch item are invisible to every row.
         if let Some(lengths) = &inputs.key_value_sequence_lengths {
             let bounds = lengths.broadcast_like(&columns, &[0])?;
@@ -2028,6 +2035,7 @@ fn prepare_attention<
                 Some(visible) => visible.and(&in_range)?,
             });
         }
+
         // Invisible scores use a finite large negative value rather than negative infinity, so that a row without
         // any visible position still has a finite maximum and a finite log-sum-exp residual. At least one of the
         // masks above is present on this path, so the visibility is known.
@@ -2036,11 +2044,15 @@ fn prepare_attention<
         } else {
             -0.7 * f32::MAX as f64
         };
+
         let masked = scores.fill_like(large_negative)?;
         visible.unwrap().select(&scores, &masked)?
     };
-    let logits = if logits_type == softmax_type { logits } else { logits.convert_element_type(softmax_type)? };
-    Ok(PreparedAttention { query, expanded_key, expanded_value, logits, data_type, softmax_type, scale })
+
+    let logits =
+        if logits_type == SOFTMAX_DATA_TYPE { logits } else { logits.convert_element_type(SOFTMAX_DATA_TYPE)? };
+
+    Ok(PreparedAttention { query, expanded_key, expanded_value, logits })
 }
 
 /// Adds the implicit batch axis used to evaluate one unbatched `TNH` attention input (i.e., a query, key, value,
@@ -2062,6 +2074,7 @@ fn expand_key_value_heads<V: Value<Type: ArrayMemberType> + Reshape + Broadcast>
     if dimensions.key_value_heads == dimensions.query_heads {
         return Ok(key_or_value);
     }
+
     let group = dimensions.query_heads / dimensions.key_value_heads;
     let r#type = key_or_value.r#type();
     let r#type = r#type.as_array_type()?;
@@ -2072,6 +2085,7 @@ fn expand_key_value_heads<V: Value<Type: ArrayMemberType> + Reshape + Broadcast>
         ))
         .into());
     };
+
     // The output keeps the memory space and the placement of the input along the mapped axes, and its group axis is
     // replicated, because a broadcast cannot change manual variation.
     let axes = [0, 1, 2, 4];
@@ -2105,8 +2119,8 @@ fn zero_query_rows<V: Value + FillLike + IotaLike + Compare + Select + Broadcast
 }
 
 /// Applies the configured dropout to `probabilities`, whose shape is the normalized `BNTS` score shape, using the
-/// dropout random state of `inputs` (refer to [`AttentionInputs::dropout_state`]). The forward and backward bodies call
-/// this with arrays of the same shape and the same state, so they apply the same mask.
+/// dropout random state of `inputs` (refer to [`AttentionInputs::dropout_state`]). The forward and backward bodies
+/// call this with arrays of the same shape and the same state, so they apply the same mask.
 fn apply_dropout<V: Value + Dropout>(
     probabilities: V,
     inputs: &AttentionInputs<V>,
@@ -2118,8 +2132,10 @@ fn apply_dropout<V: Value + Dropout>(
     Ok(probabilities.dropout(rate, inputs.dropout_state.as_ref())?.0)
 }
 
-/// Returns the named composite of the forward definition with the provided configuration and residual request, which
-/// serves every input structure under the [`AttentionKey`] of that structure.
+// TODO(eaplatanios): Review from here onwards.
+
+/// Returns the named composite of the forward definition with the provided configuration and residual request,
+/// which serves every input structure under the [`AttentionKey`] of that structure.
 ///
 /// The body of the definition evaluates portable scaled dot-product attention with ordinary array operations and
 /// returns the attended output, followed by the log-sum-exp residual when `return_residual` is set. Its constants,
@@ -2132,8 +2148,8 @@ fn forward_definition<V: Value, O: Operation<Type = V::Type>>(
 ) -> ForwardFunction<V, O>
 where
     V: 'static,
-    O: 'static,
     V::Type: ArrayMemberType + From<ArrayType> + BatchableType,
+    O: 'static,
     RuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
@@ -2183,10 +2199,10 @@ where
         // Dropout applies to the normalized probabilities in the softmax data type, before they return to the data
         // type of the query.
         let weights = apply_dropout(exponentials.div(&sums_broadcast)?, &inputs, configuration)?;
-        let weights = if prepared.data_type == prepared.softmax_type {
+        let weights = if dimensions.data_type == SOFTMAX_DATA_TYPE {
             weights
         } else {
-            weights.convert_element_type(prepared.data_type)?
+            weights.convert_element_type(dimensions.data_type)?
         };
         // The weights have the `BNTS` score form, and the values have the `BSNH` form with their heads expanded to the
         // query heads. Contracting the key/value axis for every batch item and head gives `BNTH`, which is transposed
@@ -2205,10 +2221,10 @@ where
         // than a differentiable output, so it stops gradients.
         let residual = if return_residual {
             let residual = maxima.add(&sums.log()?)?;
-            let residual = if prepared.softmax_type == prepared.data_type {
+            let residual = if SOFTMAX_DATA_TYPE == dimensions.data_type {
                 residual
             } else {
-                residual.convert_element_type(prepared.data_type)?
+                residual.convert_element_type(dimensions.data_type)?
             };
             let residual = residual.transpose([0, 2, 1])?;
             let residual = if query_rank == 4 { residual } else { residual.squeeze(0)? };
@@ -2400,10 +2416,10 @@ where
         };
         // The backward mathematics runs in the softmax data type, like the recomputed probabilities.
         let convert = |array: RuleTracer<V, O>| -> Result<RuleTracer<V, O>, ProgramError> {
-            if prepared.data_type == prepared.softmax_type {
+            if dimensions.data_type == SOFTMAX_DATA_TYPE {
                 Ok(array)
             } else {
-                Ok(array.convert_element_type(prepared.softmax_type)?)
+                Ok(array.convert_element_type(SOFTMAX_DATA_TYPE)?)
             }
         };
         let softmax_query = convert(prepared.query)?;
@@ -2439,7 +2455,7 @@ where
         // The scores are `scale * Q * transpose(K)`, so the query and key cotangents contract the scaled logit
         // cotangents with the keys and the queries, and the value cotangent contracts the dropped probabilities with
         // the output cotangent. Every result is transposed from `BNTH` or `BNSH` to the form of its input.
-        let scale_value = logit_cotangents.fill_like(prepared.scale)?;
+        let scale_value = logit_cotangents.fill_like(dimensions.scale(configuration))?;
         let scaled_logit_cotangents = logit_cotangents.mul(&scale_value)?;
         let mut query_cotangent = scaled_logit_cotangents
             .dot(&softmax_key, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?
@@ -2505,7 +2521,7 @@ where
             // The reduced cotangent keeps the axes along which the bias is not broadcast, which are the axes of the
             // bias other than its unit axes, so restoring the shape of the bias only inserts or removes unit axes.
             let bias_cotangent = bias_cotangent.reshape(bias_type.shape().clone())?;
-            let bias_cotangent = if bias_cotangent_type.data_type() == prepared.softmax_type {
+            let bias_cotangent = if bias_cotangent_type.data_type() == SOFTMAX_DATA_TYPE {
                 bias_cotangent
             } else {
                 bias_cotangent.convert_element_type(bias_cotangent_type.data_type())?
