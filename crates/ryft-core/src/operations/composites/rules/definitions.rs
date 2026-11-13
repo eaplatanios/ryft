@@ -39,9 +39,6 @@ use crate::programs::{
 use crate::tracing::{TracingContext, TracingScope};
 
 #[cfg(doc)]
-use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
-
-#[cfg(doc)]
 use crate::operations::composites::operations::CompositeTransposeOperation;
 
 /// Next process-unique identity assigned to a [`CustomRuleDefinition`].
@@ -1111,9 +1108,9 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// static keys only, so they never retain a program.
     uncached_specializations: Mutex<HashSet<(ThreadId, CustomRuleSpecializationRequest<V::Type>)>>,
 
-    /// Definitions derived from this definition (refer to [`CustomRuleSpecializer::derived`]), held weakly so that a
-    /// derived definition that some call still holds keeps its identity whether or not its registration is alive,
-    /// while a derived definition, which holds this definition strongly, never forms a cycle with it.
+    /// Definitions derived from this definition, held weakly so that a derived definition that some call still holds
+    /// keeps its identity whether or not its registration is alive, while a derived definition, which holds this
+    /// definition strongly, never forms a cycle with it.
     derived_definitions: Mutex<HashMap<CustomRuleDerivedDefinitionKey, Weak<CustomRuleDefinition<V, O>>>>,
 }
 
