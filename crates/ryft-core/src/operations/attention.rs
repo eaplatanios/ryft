@@ -1189,8 +1189,6 @@ where
     DifferentiableDotProductAttention { configuration, function }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Borrowed canonical view of attention input types.
 struct AttentionInputTypes<'o> {
     /// Query type.
@@ -1228,7 +1226,7 @@ struct AttentionInputTypes<'o> {
 }
 
 impl<'o> AttentionInputTypes<'o> {
-    /// Parses one forward operation boundary.
+    /// Parses one attention forward operation boundary into an [`AttentionInputTypes`] instance.
     fn forward(input_structure: AttentionInputs<Placeholder>, input_types: &'o [ArrayType]) -> Result<Self, TypeError> {
         let [query, key, value, optional @ ..] = input_types else {
             return Err(TypeError::invalid("attention requires query, key, and value inputs"));
@@ -1270,7 +1268,7 @@ impl<'o> AttentionInputTypes<'o> {
         })
     }
 
-    /// Parses one backward operation boundary.
+    /// Parses one attention backward operation boundary into an [`AttentionInputTypes`] instance.
     fn backward(
         input_structure: AttentionInputs<Placeholder>,
         input_types: &'o [ArrayType],
@@ -1316,9 +1314,8 @@ impl AttentionDimensions {
 
 /// Named attention definitions of one operation family `(V, O)` and one [`AttentionConfiguration`] (i.e., the forward
 /// definition without and with its residual, and the backward definition). Each one is a named composite that serves
-/// every input structure, under the [`AttentionKey`] of that structure (refer to
-/// [`Composite::with_named_composite_per_structure`]). The functions that stage attention own these definitions, so
-/// their traced bodies and their rule specializations live exactly as long as those functions.
+/// every input structure, under the [`AttentionKey`] of that structure. The functions that stage attention own these
+/// definitions, so their traced bodies and their rule specializations live exactly as long as those functions.
 struct AttentionDefinitions<V: Value, O: Operation<Type = V::Type>>
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -1358,14 +1355,15 @@ where
 impl<V: Value, O: Operation<Type = V::Type>> AttentionDefinitions<V, O>
 where
     V: 'static,
-    O: 'static,
     V::Type: ArrayMemberType + From<ArrayType> + BatchableType,
+    O: 'static,
     CustomRuleTracer<V, O>: AttentionOperations,
     CustomRuleDefinition<V, O>: AttentionRules<V, O>,
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = CustomRuleTracer<V, O>, Constant = V, Operation = O>,
 {
-    /// Creates the definitions with the provided configuration.
+    /// Creates an [`AttentionDefinitions`] instance based on the provided [`AttentionConfiguration`].
+    #[inline]
     fn new(configuration: AttentionConfiguration) -> Self {
         Self {
             configuration,
@@ -1383,6 +1381,7 @@ where
 
     /// Stages one call of the forward definition with the provided residual request at `inputs`, returning the
     /// attended output followed by its log-sum-exp residual when `return_residual` is set.
+    #[inline]
     fn forward<C, InputValue>(
         &self,
         inputs: AttentionInputs<InputValue>,
@@ -1400,6 +1399,7 @@ where
 
     /// Stages one call of the backward definition at `inputs`, returning the cotangents of the query, key, and value,
     /// followed by that of a present bias whose cotangent space is not zero-dimensional.
+    #[inline]
     fn backward<C, InputValue>(
         &self,
         inputs: (AttentionResiduals<InputValue>, InputValue),
@@ -1419,17 +1419,16 @@ where
 /// into attention's batch axis and calling the same definition at the folded boundary, which keeps the definition (and
 /// therefore any backend implementation of it) for batched calls. Definitions with dropout are batched structurally
 /// instead, because folding would change the shape of the dropout mask and therefore the mask of every batch item,
-/// except that definitions with dropout and the fused implementation reject batching (refer to
-/// [`forward_definition`]).
+/// except that definitions with dropout and the fused implementation reject batching.
 enum AttentionFunction<Folding, Structural> {
-    /// Definition that folds mapped axes into attention's batch axis.
+    /// Definition that folds mapped axes into the attention's batch axis.
     Folding(Arc<Folding>),
 
     /// Definition that is batched structurally.
     Structural(Arc<Structural>),
 }
 
-/// Data type in which the attention bodies evaluate softmax and its log-sum-exp residual.
+/// Data type in which the attention bodies evaluate the softmax operation and its log-sum-exp residual.
 const SOFTMAX_DATA_TYPE: DataType = DataType::F32;
 
 /// Shared normalized inputs and masked logits consumed by the forward and backward attention bodies.
@@ -2159,24 +2158,9 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>
         + CompositeCallContext<Type = V::Type, Value = CustomRuleTracer<V, O>, Constant = V, Operation = O>,
 {
-    let output_types = move |input_types: AttentionInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
-        let input_structure = input_types.parameter_structure();
-        let input_types = input_types
-            .parameters()
-            .map(|r#type| r#type.as_array_type().cloned())
-            .collect::<Result<Vec<_>, _>>()?;
-        let output_types = attention_forward_output_types(
-            DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-            configuration,
-            input_structure,
-            return_residual,
-            input_types.as_slice(),
-        )?;
-        Ok(output_types.into_iter().map(Into::into).collect())
-    };
-    let body =
+    let function = composite(
         move |inputs: AttentionInputs<CustomRuleTracer<V, O>>| -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError> {
-            // The output type rule above has already validated this boundary, so the types are only needed for the
+            // The output type rule has already validated this boundary, so the types are only needed for the
             // validated dimensions and the rank of the query.
             let input_types = inputs
                 .parameters()
@@ -2209,9 +2193,9 @@ where
             } else {
                 weights.convert_element_type(dimensions.data_type)?
             };
-            // The weights have the `BNTS` score form, and the values have the `BSNH` form with their heads expanded to the
-            // query heads. Contracting the key/value axis for every batch item and head gives `BNTH`, which is transposed
-            // to the `BTNH` form of the query.
+            // The weights have the `BNTS` score form, and the values have the `BSNH` form with their heads expanded to
+            // the query heads. Contracting the key/value axis for every batch item and head gives `BNTH`, which is
+            // transposed to the `BTNH` form of the query.
             let attended = weights
                 .dot(&prepared.expanded_value, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?;
             let mut output = attended.transpose([0, 2, 1, 3])?;
@@ -2221,9 +2205,9 @@ where
             }
             // Unbatched attention was evaluated with an implicit unit batch axis, which its outputs do not have.
             let output = if query_rank == 4 { output } else { output.squeeze(0)? };
-            // The residual is the logarithm of the sum of the exponentiated logits of every row, which is the row maximum
-            // plus the logarithm of the sum of the shifted exponentials. It is a statistic of the forward pass rather
-            // than a differentiable output, so it stops gradients.
+            // The residual is the logarithm of the sum of the exponentiated logits of every row, which is the row
+            // maximum plus the logarithm of the sum of the shifted exponentials. It is a statistic of the forward pass
+            // rather than a differentiable output, so it stops gradients.
             let residual = if return_residual {
                 let residual = maxima.add(&sums.log()?)?;
                 let residual = if SOFTMAX_DATA_TYPE == dimensions.data_type {
@@ -2238,13 +2222,29 @@ where
                 None
             };
             Ok(std::iter::once(output).chain(residual).collect())
-        };
-    let function = composite(body).with_name(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME).with_named_composite_per_structure(
+        },
+    )
+    .with_name(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME)
+    .with_named_composite_per_structure(
         move |input_structure: &AttentionInputs<Placeholder>| {
             AttentionKey::Forward { configuration, input_structure: *input_structure, return_residual }
                 .to_composite_key()
         },
-        output_types,
+        move |input_types: AttentionInputs<V::Type>| -> Result<Vec<V::Type>, ProgramError> {
+            let input_structure = input_types.parameter_structure();
+            let input_types = input_types
+                .parameters()
+                .map(|r#type| r#type.as_array_type().cloned())
+                .collect::<Result<Vec<_>, _>>()?;
+            let output_types = attention_forward_output_types(
+                DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                configuration,
+                input_structure,
+                return_residual,
+                input_types.as_slice(),
+            )?;
+            Ok(output_types.into_iter().map(Into::into).collect())
+        },
     );
     if configuration.dropout().is_some() {
         return match configuration.implementation() {
@@ -2370,27 +2370,12 @@ where
         cotangent.reshape(Shape::new(grouped_dimensions))?.reduce(&[3], ReductionKind::Sum)
     }
 
-    let output_types =
-        move |input_types: (AttentionResiduals<V::Type>, V::Type)| -> Result<Vec<V::Type>, ProgramError> {
-            let input_structure = input_types.0.inputs.parameter_structure();
-            let input_types = input_types
-                .parameters()
-                .map(|r#type| r#type.as_array_type().cloned())
-                .collect::<Result<Vec<_>, _>>()?;
-            let output_types = attention_backward_output_types(
-                DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
-                configuration,
-                input_structure,
-                input_types.as_slice(),
-            )?;
-            Ok(output_types.into_iter().map(Into::into).collect())
-        };
-    let body = move |inputs: (AttentionResiduals<CustomRuleTracer<V, O>>, CustomRuleTracer<V, O>)| -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError> {
+    let function = composite(move |inputs: (AttentionResiduals<CustomRuleTracer<V, O>>, CustomRuleTracer<V, O>)| {
         // The forward output and its residual are validated inputs for backend implementations of this definition.
         // The portable body recomputes the probabilities instead of using them, so it only needs the forward inputs
         // and the output cotangent.
         let (AttentionResiduals { inputs, .. }, output_cotangent) = &inputs;
-        // The output type rule above has already validated this boundary, so the types are only needed for the
+        // The output type rule has already validated this boundary, so the types are only needed for the
         // validated dimensions and the ranks of the query, key, and value.
         let input_types = inputs
             .parameters()
@@ -2547,15 +2532,27 @@ where
             cotangents.push(bias_cotangent);
         }
         Ok(cotangents)
-    };
-    let function = composite(body)
-        .with_name(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME)
-        .with_named_composite_per_structure(
-            move |input_structure: &(AttentionResiduals<Placeholder>, Placeholder)| {
-                AttentionKey::Backward { configuration, input_structure: input_structure.0.inputs }.to_composite_key()
-            },
-            output_types,
-        );
+    })
+    .with_name(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME)
+    .with_named_composite_per_structure(
+        move |input_structure: &(AttentionResiduals<Placeholder>, Placeholder)| {
+            AttentionKey::Backward { configuration, input_structure: input_structure.0.inputs }.to_composite_key()
+        },
+        move |input_types: (AttentionResiduals<V::Type>, V::Type)| -> Result<Vec<V::Type>, ProgramError> {
+            let input_structure = input_types.0.inputs.parameter_structure();
+            let input_types = input_types
+                .parameters()
+                .map(|r#type| r#type.as_array_type().cloned())
+                .collect::<Result<Vec<_>, _>>()?;
+            let output_types = attention_backward_output_types(
+                DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+                configuration,
+                input_structure,
+                input_types.as_slice(),
+            )?;
+            Ok(output_types.into_iter().map(Into::into).collect())
+        },
+    );
     if configuration.dropout().is_some() {
         return match configuration.implementation() {
             // Refer to the forward definition for why a batched fused call with dropout is rejected.
@@ -2611,7 +2608,9 @@ where
                             AttentionResiduals { inputs: input_structure, output: Placeholder, residual: Placeholder },
                             Placeholder,
                         );
-                        function.call(<(AttentionResiduals<_>, _)>::from_parameters(structure, inputs)?)
+                        function.call(<(AttentionResiduals<_>, CustomRuleTracer<V, O>)>::from_parameters(
+                            structure, inputs,
+                        )?)
                     },
                 )
             })
