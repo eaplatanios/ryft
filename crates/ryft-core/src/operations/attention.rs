@@ -35,10 +35,11 @@
 //! Named composites are owned by their callers, so attention is staged through functions that are created once and
 //! called many times, which are the [`DotProductAttention`] that [`dot_product_attention`] creates for inference and
 //! the [`DifferentiableDotProductAttention`] that [`differentiable_dot_product_attention`] creates for training. Each
-//! function owns one cache of definitions with one named composite per definition, residual request, and input
-//! structure, each created on first use. Its calls therefore share the traced bodies, their lowering, and their rule
-//! specializations for as long as the function lives. Programs that contain staged calls remain valid after their
-//! function is dropped, and batching such a program stages an equivalent definition.
+//! function owns one named composite per definition and residual request, which serves every input structure under
+//! the key of that structure (refer to [`Composite::with_named_composite_per_structure`]). Its calls therefore share
+//! the traced bodies, their lowering, and their rule specializations for as long as the function lives. Programs that
+//! contain staged calls remain valid after their function is dropped, and batching such a program stages an
+//! equivalent definition.
 //!
 //! # Transforms
 //!
@@ -945,35 +946,45 @@ where
     DotProductAttention { definitions: AttentionDefinitions::new(configuration) }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Differentiable scaled dot-product attention function, built by [`differentiable_dot_product_attention`]. Each
-/// call stages one call of a named composite (refer to [`DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME`]) with
-/// reverse mode rules, whose primal calls the forward attention definition and whose rules call the forward
-/// definition with its residual and the backward definition (refer to [`AttentionKey`]). The manual variation
+/// Differentiable scaled dot-product attention function, built by [`differentiable_dot_product_attention`]. Each call
+/// stages one call of a named composite with reverse mode rules, whose primal calls the forward attention definition
+/// and whose rules call the forward definition with its residual and the backward definition. The manual variation
 /// transitions of the inputs precede the composite boundary, which lets their transposes accumulate the cotangent
 /// contributions of invariant inputs exactly once.
 ///
-/// The function owns its named composite together with the definitions that its primal and its rules call, so it
-/// should be created once and called many times. Its primal and its definitions' bodies are then traced once per input
-/// types, and its rules once per specialization, for as long as the function lives.
+/// The function owns its named composite together with the definitions that its primal and its rules call, so it should
+/// be created once and called many times. Its primal and its definitions' bodies are then traced once per input types,
+/// and its rules once per specialization, for as long as the function lives.
 pub struct DifferentiableDotProductAttention<C: Domain>
 where
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    /// Configuration of this function.
+    /// [`AttentionDefinitions`] staged by this [`DifferentiableDotProductAttention`] operation.
     configuration: AttentionConfiguration,
 
     /// Named composite that stages the calls of this function, whatever their input structure. Its primal and its
     /// rules own the named attention definitions that they call.
-    function: DifferentiableFunction<C::Constant, C::Operation>,
+    function: Composite<
+        C::Constant,
+        C::Operation,
+        AttentionInputs<DomainTracer<C>>,
+        DomainTracer<C>,
+        DefaultJvp,
+        SymbolicZeroVjp<
+            C::Constant,
+            C::Operation,
+            AttentionInputs<DomainTracer<C>>,
+            DomainTracer<C>,
+            AttentionResiduals<DomainTracer<C>>,
+        >,
+    >,
 }
 
 impl<C: Domain> DifferentiableDotProductAttention<C>
 where
+    C::Type: ArrayMemberType + From<ArrayType> + BatchableType + DifferentiableType,
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: ArrayMemberType + From<ArrayType> + BatchableType + DifferentiableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>
         + CompositeVjp<
@@ -991,19 +1002,20 @@ where
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
         + CompositeCallContext<Type = C::Type, Value = DomainTracer<C>, Constant = C::Constant, Operation = C::Operation>,
 {
-    /// Returns the configuration of this function.
+    /// Returns the configuration of this [`DifferentiableDotProductAttention`].
     #[inline]
     pub fn configuration(&self) -> AttentionConfiguration {
         self.configuration
     }
 
-    /// Aligns the manual variation of `inputs` and stages one differentiable attention call, returning the attended
-    /// output.
+    /// Aligns the manual variation of `inputs` and stages one [`DifferentiableDotProductAttention`] call,
+    /// returning the attended output.
     ///
     /// # Errors
     ///
     /// Returns a [`ProgramError`] when `inputs` are invalid for the configuration (e.g., because their shapes are
     /// incompatible) or when staging the call fails.
+    #[inline]
     pub fn call<Caller, V>(&self, inputs: AttentionInputs<V>) -> Result<V, ProgramError>
     where
         Caller: CompositeCallContext<Type = C::Type, Value = V, Constant = C::Constant, Operation = C::Operation>,
@@ -1013,11 +1025,13 @@ where
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Creates the differentiable scaled dot-product attention function with the provided configuration for the values
-/// of the domain `C`, for one canonical [`AttentionInputs`] tree.
+/// of the domain `C`, whose calls accept every structure of [`AttentionInputs`].
 ///
-/// The primal path returns only the attended output. Reverse mode differentiation runs the forward definition with its
-/// log-sum-exp residual and then applies the backward definition, whose portable body recomputes the normalization
+/// The primal path returns only the attended output. Reverse mode differentiation runs the forward definition with
+/// its log-sum-exp residual and then applies the backward definition, whose portable body recomputes the normalization
 /// with a stabilized composition. [`AttentionImplementation::Automatic`] selects [`AttentionImplementation::Portable`]
 /// for this training entry point, which preserves the small gradients of dominant logits. Explicitly requesting
 /// [`AttentionImplementation::Fused`] opts into the backend's native forward and backward kernels where the backend
@@ -1032,10 +1046,10 @@ where
 /// bias receives the cotangent returned by the backward definition. A structurally zero output cotangent (e.g., when
 /// the output is unused) skips the backward definition altogether.
 ///
-/// The returned function owns its named composites and their rules (refer to [`DifferentiableDotProductAttention`]),
+/// The returned function owns its named composite and its rules (refer to [`DifferentiableDotProductAttention`]),
 /// so it should be created once and called many times. To embed the resulting programs in a heterogeneous value
-/// universe, use [`Program::into_unprojected`](crate::programs::Program::into_unprojected), which converts the staged
-/// calls together with their rules.
+/// universe, use [`Program::into_unprojected`](crate::programs::Program::into_unprojected), which converts the
+/// staged calls together with their rules.
 ///
 /// # Parameters
 ///
@@ -1044,9 +1058,9 @@ pub fn differentiable_dot_product_attention<C: Domain>(
     configuration: AttentionConfiguration,
 ) -> DifferentiableDotProductAttention<C>
 where
+    C::Type: ArrayMemberType + From<ArrayType> + BatchableType + DifferentiableType,
     C::Constant: 'static,
     C::Operation: 'static,
-    C::Type: ArrayMemberType + From<ArrayType> + BatchableType + DifferentiableType,
     DomainTracer<C>: AttentionOperations,
     CustomRuleDefinition<C::Constant, C::Operation>: AttentionRules<C::Constant, C::Operation>
         + CompositeVjp<
@@ -1073,8 +1087,10 @@ where
         AttentionImplementation::Automatic => configuration.with_implementation(AttentionImplementation::Portable),
         AttentionImplementation::Portable | AttentionImplementation::Fused => configuration,
     };
+
     // The primal and the rules of the named composite call these definitions, which they own.
     let definitions = Arc::new(AttentionDefinitions::new(configuration));
+
     // The composite returns only the attended output, whose type the forward boundary determines.
     let output_types = move |input_types: AttentionInputs<C::Type>| -> Result<C::Type, ProgramError> {
         let input_structure = input_types.parameter_structure();
@@ -1092,6 +1108,7 @@ where
         check_count!("output", output_types, 1, ProgramError);
         Ok(output_types.remove(0).into())
     };
+
     // The primal stages the forward definition without its residual.
     let primal = {
         let definitions = definitions.clone();
@@ -1101,8 +1118,9 @@ where
             Ok(outputs.remove(0))
         }
     };
-    // The forward rule stages the forward definition with its residual, and it retains the inputs, the
-    // output, and the residual for the backward rule.
+
+    // The forward rule stages the forward definition with its residual, and it retains the inputs,
+    // the output, and the residual for the backward rule.
     let forward = {
         let definitions = definitions.clone();
         move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<_, ProgramError> {
@@ -1113,6 +1131,7 @@ where
             Ok((output.clone(), AttentionResiduals { inputs, output, residual }))
         }
     };
+
     let backward = move |residuals: AttentionResiduals<DomainTracer<C>>,
                          output_cotangent: MaybeZero<DomainTracer<C>>|
           -> Result<_, ProgramError> {
@@ -1154,6 +1173,7 @@ where
             dropout_state,
         })
     };
+
     let function = composite(primal)
         .with_symbolic_zero_vjp(forward, backward)
         .with_name(DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME)
@@ -1168,6 +1188,7 @@ where
             },
             output_types,
         );
+
     DifferentiableDotProductAttention { configuration, function }
 }
 
@@ -1398,16 +1419,6 @@ type ForwardFunction<V, O> =
 /// Named composite of a backward definition.
 type BackwardFunction<V, O> =
     AttentionFunction<BackwardFolding<V, O>, Composite<V, O, BackwardInputs<RuleTracer<V, O>>, Vec<RuleTracer<V, O>>>>;
-
-/// Named composite that stages differentiable attention for one input structure.
-type DifferentiableFunction<V, O> = Composite<
-    V,
-    O,
-    AttentionInputs<RuleTracer<V, O>>,
-    RuleTracer<V, O>,
-    DefaultJvp,
-    SymbolicZeroVjp<V, O, AttentionInputs<RuleTracer<V, O>>, RuleTracer<V, O>, AttentionResiduals<RuleTracer<V, O>>>,
->;
 
 /// Shared normalized inputs and masked logits consumed by the forward and backward attention bodies.
 struct PreparedAttention<V> {
