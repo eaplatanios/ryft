@@ -35,11 +35,12 @@
 //! Named composites are owned by their callers, so attention is staged through functions that are created once and
 //! called many times, which are the [`DotProductAttention`] that [`dot_product_attention`] creates for inference and
 //! the [`DifferentiableDotProductAttention`] that [`differentiable_dot_product_attention`] creates for training. Each
-//! function owns one named composite per definition and residual request, which serves every input structure under
-//! the key of that structure (refer to [`Composite::with_named_composite_per_structure`]). Its calls therefore share
-//! the traced bodies, their lowering, and their rule specializations for as long as the function lives. Programs that
-//! contain staged calls remain valid after their function is dropped, and batching such a program stages an
-//! equivalent definition.
+//! function owns one named composite per definition and residual request, and the training function also owns the
+//! named composite that carries its reverse mode rules. Each of them serves every input structure under the key of
+//! that structure (refer to [`Composite::with_named_composite_per_structure`]). The calls of a function therefore
+//! share the traced bodies, their lowering, and their rule specializations for as long as the function lives.
+//! Programs that contain staged calls remain valid after their function is dropped, and batching such a program
+//! stages an equivalent definition.
 //!
 //! # Transforms
 //!
@@ -959,7 +960,7 @@ pub struct DifferentiableDotProductAttention<C: Domain>
 where
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
 {
-    /// [`AttentionDefinitions`] staged by this [`DifferentiableDotProductAttention`] operation.
+    /// [`AttentionConfiguration`] of this [`DifferentiableDotProductAttention`].
     configuration: AttentionConfiguration,
 
     /// Named composite that stages the calls of this function, whatever their input structure. Its primal and its
@@ -1025,8 +1026,6 @@ where
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Creates the differentiable scaled dot-product attention function with the provided configuration for the values
 /// of the domain `C`, whose calls accept every structure of [`AttentionInputs`].
 ///
@@ -1078,19 +1077,11 @@ where
     DomainTracingContext<C>: StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>
         + CompositeCallContext<Type = C::Type, Value = DomainTracer<C>, Constant = C::Constant, Operation = C::Operation>,
 {
-    /// Returns the structural zero cotangent of `value`.
-    fn zero_cotangent<V: Value<Type: DifferentiableType>>(value: &V) -> Result<MaybeZero<V>, ProgramError> {
-        Ok(MaybeZero::Zero(value.r#type().cotangent()?))
-    }
-
     let configuration = match configuration.implementation() {
         AttentionImplementation::Automatic => configuration.with_implementation(AttentionImplementation::Portable),
         AttentionImplementation::Portable | AttentionImplementation::Fused => configuration,
     };
-
-    // The primal and the rules of the named composite call these definitions, which they own.
     let definitions = Arc::new(AttentionDefinitions::new(configuration));
-
     let function = composite({
         // The primal stages the forward definition without its residual.
         let definitions = definitions.clone();
@@ -1102,8 +1093,8 @@ where
     })
     .with_symbolic_zero_vjp(
         {
-            // The forward rule stages the forward definition with its residual, and it retains the inputs, the
-            // output, and the residual for the backward rule.
+            // The forward rule stages the forward definition with its residual, and it retains the inputs,
+            // the output, and the residual for the backward rule.
             let definitions = definitions.clone();
             move |inputs: AttentionInputs<DomainTracer<C>>| -> Result<_, ProgramError> {
                 let mut outputs = definitions.forward(inputs.clone(), true)?;
@@ -1119,19 +1110,30 @@ where
             // A structurally zero output cotangent (e.g., of an unused output) makes every input cotangent
             // a structural zero, without staging the backward definition.
             let MaybeZero::Value(output_cotangent) = output_cotangent else {
-                return residuals.inputs.try_map_parameters(|input| zero_cotangent(&input));
+                return residuals.inputs.try_map_parameters(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)));
             };
 
             // The backward definition returns the cotangents of the query, key, and value, and of a bias
-            // whose cotangent space is not zero-dimensional, so the cotangents of the other inputs (i.e., of
-            // the masks, sequence lengths, and dropout states, and of a bias with a zero-dimensional
+            // whose cotangent space is not zero-dimensional, so the cotangents of the other inputs (i.e.,
+            // of the masks, sequence lengths, and dropout states, and of a bias with a zero-dimensional
             // cotangent space) are structural zeros, which contribute nothing to their inputs' cotangents.
             let inputs = &residuals.inputs;
-            let mask = inputs.mask.as_ref().map(zero_cotangent).transpose()?;
-            let query_sequence_lengths = inputs.query_sequence_lengths.as_ref().map(zero_cotangent).transpose()?;
-            let key_value_sequence_lengths =
-                inputs.key_value_sequence_lengths.as_ref().map(zero_cotangent).transpose()?;
-            let dropout_state = inputs.dropout_state.as_ref().map(zero_cotangent).transpose()?;
+            let mask = inputs.mask.as_ref().map(|input| input.r#type().cotangent().map(MaybeZero::Zero)).transpose()?;
+            let query_sequence_lengths = inputs
+                .query_sequence_lengths
+                .as_ref()
+                .map(|input| input.r#type().cotangent().map(MaybeZero::Zero))
+                .transpose()?;
+            let key_value_sequence_lengths = inputs
+                .key_value_sequence_lengths
+                .as_ref()
+                .map(|input| input.r#type().cotangent().map(MaybeZero::Zero))
+                .transpose()?;
+            let dropout_state = inputs
+                .dropout_state
+                .as_ref()
+                .map(|input| input.r#type().cotangent().map(MaybeZero::Zero))
+                .transpose()?;
             let bias_cotangent_type = inputs.bias.as_ref().map(|bias| bias.r#type().cotangent()).transpose()?;
             let mut outputs = definitions.backward((residuals, output_cotangent))?;
             let bias = match bias_cotangent_type {
@@ -1165,8 +1167,8 @@ where
                 None,
             )
         },
-        // The composite returns only the attended output, whose type the forward boundary determines.
         move |input_types: AttentionInputs<C::Type>| -> Result<C::Type, ProgramError> {
+            // The composite returns only the attended output, whose type the forward boundary determines.
             let input_structure = input_types.parameter_structure();
             let input_types = input_types
                 .parameters()
@@ -1183,9 +1185,10 @@ where
             Ok(output_types.remove(0).into())
         },
     );
-
     DifferentiableDotProductAttention { configuration, function }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// [`CustomRuleTracer`] of the operation family `(V, O)`.
 type RuleTracer<V, O> = CustomRuleTracer<V, O>;
@@ -2272,7 +2275,8 @@ where
     }))
 }
 
-/// Returns the named composite of the backward definition with the provided configuration and input structure.
+/// Returns the named composite of the backward definition with the provided configuration, which serves every input
+/// structure under the [`AttentionKey`] of that structure.
 ///
 /// The body of the definition evaluates the portable attention backward pass using the same extents and mask
 /// construction as the forward body (refer to [`forward_definition`]), and returns the cotangents of the query, key,
@@ -3264,6 +3268,43 @@ mod tests {
         assert_eq!(
             function.call_with_residual(inputs),
             Ok((output, f32_array(&[1, 2, 1], &[1.0, 1.0 + std::f32::consts::LN_2]))),
+        );
+
+        // One function serves every input structure under the key of that structure, including structures whose
+        // flattened input types are equal (i.e., the two kinds of sequence lengths).
+        let r#type = ArrayType::new_static(DataType::F32, [1, 2, 1, 1]);
+        let (_, program) = ArrayContext::trace(
+            |(inputs, lengths): (AttentionInputs<_>, _)| {
+                Ok((
+                    function.call(inputs.clone())?,
+                    function
+                        .call(AttentionInputs { query_sequence_lengths: Some(lengths.clone()), ..inputs.clone() })?,
+                    function.call(AttentionInputs { key_value_sequence_lengths: Some(lengths), ..inputs })?,
+                ))
+            },
+            (AttentionInputs::new(r#type.clone(), r#type.clone(), r#type), ArrayType::new_static(DataType::I32, [1])),
+        )
+        .unwrap();
+        let keys = program
+            .entry_region_ref()
+            .instructions()
+            .iter()
+            .filter_map(|instruction| match instruction.operation() {
+                ArrayOperation::Composite(operation) => operation.key().cloned(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let input_structure = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
+        assert_eq!(
+            keys,
+            [
+                input_structure,
+                AttentionInputs { query_sequence_lengths: Some(Placeholder), ..input_structure },
+                AttentionInputs { key_value_sequence_lengths: Some(Placeholder), ..input_structure },
+            ]
+            .map(|input_structure| {
+                AttentionKey::Forward { configuration, input_structure, return_residual: false }.to_composite_key()
+            }),
         );
     }
 
