@@ -39,9 +39,6 @@ use crate::programs::{
 use crate::tracing::{TracingContext, TracingScope};
 
 #[cfg(doc)]
-use crate::operations::composites::rules::registrations::CustomRuleRegistration;
-
-#[cfg(doc)]
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 
 #[cfg(doc)]
@@ -364,9 +361,9 @@ where
 /// that the key cannot verify. Backends rely on it to replace calls by key and to index the functions that they emit
 /// for calls by key (e.g., the XLA backend), so a computation whose body or rules change requires a new key (e.g., a
 /// new version). A display label never establishes this identity, and neither does a matching body. Equal keys do not
-/// share definitions, though. Whoever constructs a definition registers it (refer to [`CustomRuleRegistration`] for
-/// more information) and owns its body and specialization caches, so calls share them by reusing that registration
-/// (e.g., by holding one [`Composite`](crate::Composite) value across calls).
+/// share definitions, though. Whoever constructs a definition registers it and owns its body and specialization caches,
+/// so calls share them by reusing that registration (e.g., by holding one [`Composite`](crate::Composite) value across
+/// calls).
 ///
 /// Any backend may replace the calls of a named computation with its own implementation of that contract (e.g., a
 /// fused kernel), and calls that no backend replaces run or lower their body. A computation that should only ever run
@@ -1001,13 +998,12 @@ where
 {
 }
 
-/// Shared definition of a custom rule set whose derivative rules are retained callbacks that are traced lazily, on the
-/// first request of each specialization, and which optionally specifies a named computation that its calls compute
-/// (i.e., a [`NamedComposite`]). A definition is registered once (refer to [`CustomRuleRegistration`]) and shared by
-/// every call that uses it, and two definitions are the same rule set exactly when they are the same definition (i.e.,
-/// identity is a process-unique identifier assigned at construction rather than structural), including definitions of
-/// named computations with equal keys. [`Self::name`] is a display label for rendering and diagnostics only, and
-/// distinct definitions may share it.
+/// Shared definition of a custom rule set whose derivative rules are retained callbacks that are traced lazily, on
+/// the first request of each specialization, and which optionally specifies a named computation that its calls compute
+/// (i.e., a [`NamedComposite`]). A definition is registered once and shared by every call that uses it, and two
+/// definitions are the same rule set exactly when they are the same definition (i.e., identity is a process-unique
+/// identifier assigned at construction rather than structural), including definitions of named computations with equal
+/// keys. [`Self::name`] is a display label for rendering and diagnostics only, and distinct definitions may share it.
 ///
 /// Specialization is deterministic and repeatable but not exactly-once: eviction, retries after a failed
 /// specialization, concurrent cold requests, and requests made after the registration handle was dropped may invoke
@@ -1018,11 +1014,11 @@ where
 ///
 /// The specialized programs are not stored in the definition, because a program that calls the definition (e.g., a
 /// rule that calls its own definition, directly or through other definitions) would then keep the definition alive
-/// forever. They are stored in caches owned by the [`CustomRuleRegistration`] handle, while calls and rules refer to
-/// the definition through a [`CustomRuleReference`](crate::CustomRuleReference), which holds the definition strongly
-/// and the caches only weakly. The strong references therefore always point from programs to definitions and from the
-/// handle to the caches, and never back from a definition to a program. Refer to [`CustomRuleRegistration`] for how
-/// rules must refer to definitions.
+/// forever. They are stored in caches owned by the [`CustomRuleRegistration`](crate::CustomRuleRegistration) handle,
+/// while calls and rules refer to the definition through a [`CustomRuleReference`](crate::CustomRuleReference), which
+/// holds the definition strongly and the caches only weakly. The strong references therefore always point from programs
+/// to definitions and from the handle to the caches, and never back from a definition to a program. Refer to
+/// [`CustomRuleRegistration`](crate::CustomRuleRegistration) for how rules must refer to definitions.
 pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Process-unique identity of this definition.
     id: u64,
