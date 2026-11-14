@@ -1959,7 +1959,8 @@ pub(crate) fn validate_common_mapped_dimension<V: Value<Type = ArrayType>>(
 /// The output [`Sharding`] follows the `dot_general` sharding rule of JAX (i.e., `_dot_general_sharding_rule`
 /// in the [JAX implementation](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/lax.py)). The StableHLO
 /// [`dot_general`](https://openxla.org/stablehlo/spec#dot_general) specification describes the underlying
-/// contraction semantics. Placement is inferred as follows:
+/// contraction semantics. The inputs must reside in the same memory space, which the output keeps, because
+/// a contraction never moves values between memory spaces. Placement is inferred as follows:
 ///
 ///   - When `output_sharding` is provided, it is validated and returned directly, bypassing the ordinary input
 ///     consistency checks. Validation checks its rank and mesh, rejects auto axes, and accepts unreduced axes only
@@ -1990,6 +1991,16 @@ pub(crate) fn infer_dot_output_type(
     }
 
     validate_dot_data_type(operation_name, lhs.data_type())?;
+
+    // A contraction never moves values between memory spaces, so its inputs must share one, which its output keeps.
+    if lhs.memory() != rhs.memory() {
+        return Err(TypeError::invalid(format!(
+            "`{}` inputs must reside in the same memory space but got `{}` and `{}`",
+            operation_name,
+            lhs.memory(),
+            rhs.memory(),
+        )));
+    }
 
     if let Some(accumulation_type) = accumulation_type {
         // An identical type is valid. Floating-point inputs may accumulate at `f32` or `f64`, and integer inputs may
@@ -2257,6 +2268,7 @@ pub(crate) fn infer_dot_output_type(
     };
 
     ArrayType::new(accumulation_type.unwrap_or(lhs.data_type()), Shape::new(output_dimensions))
+        .with_memory(lhs.memory())
         .with_sharding(sharding)
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
@@ -2360,8 +2372,8 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StridedLayout, f8e4m3fn, f8e8m0fnu,
-        i4,
+        Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StridedLayout, f8e4m3fn,
+        f8e8m0fnu, i4,
     };
     use crate::batching::{
         BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingTracer,
@@ -2656,6 +2668,24 @@ mod tests {
                     error = format!(
                         "`{DOT_OPERATION_NAME}` inputs must have matching varying manual axes; insert \
                          `parallel_vary` on the inputs that lack an axis, as `align_manual_variation` does",
+                    ),
+                },
+                // The inputs reside in one memory space, which the output keeps.
+                {
+                    input_types = [
+                        plain_array(&[2, 3]).with_memory(Memory::Host { pinned: true }),
+                        plain_array(&[3, 4]).with_memory(Memory::Host { pinned: true }),
+                    ],
+                    output_types = [plain_array(&[2, 4]).with_memory(Memory::Host { pinned: true })],
+                },
+                {
+                    input_types = [
+                        plain_array(&[2, 3]).with_memory(Memory::Host { pinned: true }),
+                        plain_array(&[3, 4]),
+                    ],
+                    error = format!(
+                        "`{DOT_OPERATION_NAME}` inputs must reside in the same memory space but got `Host[Pinned]` \
+                         and `Device`",
                     ),
                 },
             ],

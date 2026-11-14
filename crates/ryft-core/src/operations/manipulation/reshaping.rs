@@ -1440,7 +1440,7 @@ fn reshape_dimension_groups(shape: &Shape) -> Option<(Vec<&Dimension>, Vec<usize
 /// returned with the resolved sharding so that its layout survives. Any other reshape clears the layout, because the
 /// logical shape change does not determine a unique storage layout. Both homogeneous validation and mixed inference
 /// resolve their outputs here so that the two paths cannot drift.
-fn infer_reshape_output_type(
+pub(crate) fn infer_reshape_output_type(
     input: &ArrayType,
     output_shape: Shape,
     requested_sharding: Option<&Sharding>,
