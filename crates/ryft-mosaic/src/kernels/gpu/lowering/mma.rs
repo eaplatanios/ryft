@@ -30,6 +30,7 @@ pub(super) fn requirements(
     let unsupported = |reason: &str| Error::Unsupported { operation: "dot", reason: reason.to_owned() };
     if inputs.len() != 2
         || operation.dimensions() != DotOperation::matmul().dimensions()
+        || !operation.precision().is_default()
         || operation.accumulation_type() != Some(DataType::F32)
         || !matches!(inputs[0].data_type(), DataType::F16 | DataType::BF16)
         || inputs[0].data_type() != inputs[1].data_type()

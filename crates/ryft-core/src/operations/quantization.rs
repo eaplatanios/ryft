@@ -1260,6 +1260,15 @@ impl Operation for ScaledDotOperation {
             }
         }
 
+        // The scaled matrix units accumulate their `bf16` dequantized inputs at `bf16`, `f32`, or `f64` only,
+        // which is narrower than what an ordinary dot accepts, so the accumulation type is validated here.
+        if !matches!(self.accumulation_type, DataType::BF16 | DataType::F32 | DataType::F64) {
+            return Err(TypeError::invalid(format!(
+                "`{}` input data type `bf16` cannot accumulate at data type `{}`",
+                SCALED_DOT_OPERATION_NAME, self.accumulation_type,
+            )));
+        }
+
         // The contraction is a dot of the `bf16` dequantized element arrays, so the dot type inference rule validates
         // the dimension numbers and placements and determines the output type.
         let output_type = infer_dot_output_type(
@@ -1392,7 +1401,12 @@ where
             .iter()
             .map(|input| P::match_axis(context, input, Axis::from(0)))
             .collect::<Result<Vec<_>, _>>()?;
-        let (dimensions, output_axis) = self.dimensions.batched(Some(0), Some(0)).unwrap();
+        let (dimensions, output_axis) = self.dimensions.batched(
+            inputs[0].unbatched_type().rank(),
+            inputs[1].unbatched_type().rank(),
+            Some(0),
+            Some(0),
+        );
         let lifted_operation = Self::new(dimensions, self.accumulation_type, self.has_lhs_scale, self.has_rhs_scale);
         lifted_operation.interpret_with_batch_axes(
             context,
@@ -5997,6 +6011,15 @@ mod tests {
             cases = [{
                 input_types = [lhs.clone(), rhs.clone()],
                 output_types = [ArrayType::new_static(DataType::F64, [2, 3, 5])],
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ScaledDotOperation::new(dimensions.clone(), DataType::F16, false, false),
+            cases = [{
+                input_types = [lhs.clone(), rhs.clone()],
+                error = format!(
+                    "`{SCALED_DOT_OPERATION_NAME}` input data type `bf16` cannot accumulate at data type `f16`",
+                ),
             }],
         );
         check_operation_type_inference!(

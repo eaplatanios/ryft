@@ -271,12 +271,12 @@ mod tests {
     use ryft_core::Complex as ComplexNumber;
     use ryft_core::{
         Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType, BatchAxis,
-        BatchableOperation, BatchingContext, DataType, Dimension as CoreDimension, DimensionBounds, DimensionSize,
-        DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Gather, GatherDimensionNumbers,
-        GatherMode, GatherOperation, GatherOptions, LogicalMesh, MeshAxis, MeshAxisType, Placeholder,
-        ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, ReductionKind, ScatterDimensionNumbers,
-        ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Typed, TypedProgram,
-        ValueProjection, differentiate_at, i1,
+        BatchableOperation, BatchingContext, DataType, Diagonal, Dimension as CoreDimension, DimensionBounds,
+        DimensionSize, DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Gather,
+        GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, LogicalMesh, MeshAxis, MeshAxisType,
+        Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, ReductionKind,
+        ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Typed,
+        TypedProgram, ValueProjection, differentiate_at, i1,
     };
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
@@ -631,6 +631,37 @@ mod tests {
 
         assert!(stablehlo.contains("stablehlo.gather"), "{stablehlo}");
         assert!(stablehlo.contains("-> tensor<2x2xf32>"), "{stablehlo}");
+    }
+
+    #[test]
+    fn test_lower_gather_to_mlir_diagonal() {
+        // A diagonal is a slice of its two axes followed by one gather over iota indices, which lowers and executes
+        // like the reference backend, including for offsets, axes with different extents, and empty diagonals.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let values = (0..18).map(|value| value as f32).collect::<Vec<_>>();
+        let reference =
+            CoreArray::from_elements(ArrayType::new_static(DataType::F32, [3, 2, 3]), values.as_slice()).unwrap();
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[3, 2, 3], &values_to_bytes(&values));
+        for (offset, axis1, axis2) in [(0, 0, 2), (0, 2, 0), (1, 0, 2), (-1, 0, 2), (1, 1, 2), (-2, 2, 1), (3, 0, 2)] {
+            let diagonal = input.diagonal(offset, axis1, axis2).unwrap();
+            let reference_diagonal = reference.diagonal(offset, axis1, axis2).unwrap();
+            assert_eq!(
+                diagonal.r#type().shape(),
+                reference_diagonal.r#type().shape(),
+                "diagonal({offset}, {axis1}, {axis2})",
+            );
+            assert_eq!(
+                diagonal.copy_to_host().unwrap(),
+                reference_diagonal.logical_bytes(),
+                "diagonal({offset}, {axis1}, {axis2})",
+            );
+        }
+        assert_eq!(
+            values_from_bytes::<f32>(&input.diagonal(1, 0, 2).unwrap().copy_to_host().unwrap()),
+            vec![1.0, 4.0, 8.0, 11.0],
+        );
     }
 
     #[test]

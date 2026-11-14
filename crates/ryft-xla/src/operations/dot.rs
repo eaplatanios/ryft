@@ -1,18 +1,19 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayType, ComparisonDirection, DataType, DotDimensionNumbers, DotOperation, ProgramError,
-    RAGGED_DOT_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, Shape,
+    ArrayType, ComparisonDirection, DOT_OPERATION_NAME, DataType, DotAlgorithmPreset, DotDimensionNumbers,
+    DotInputPrecision, DotOperation, DotPrecision, ProgramError, RAGGED_DOT_OPERATION_NAME, RaggedDotMode,
+    RaggedDotOperation, Shape,
 };
-use ryft_mlir::dialects::stable_hlo::Precision;
+use ryft_mlir::dialects::stable_hlo::{DotAlgorithmAttributeRef, Precision};
 use ryft_mlir::dialects::{chlo, stable_hlo};
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Value as MlirValue,
-    ValueRef,
+    Block, BlockRef, Context as MlirContext, Float8TypeRef, FloatTypeRef, LocationRef, Operation as MlirOperation,
+    Region, Type as MlirType, Value as MlirValue, ValueRef,
 };
 
 use crate::experimental::lowering::types::{
-    lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_tensor_type, lower_u64_scalar_constant,
-    lower_unplaced_constant_output, physical_bound_type,
+    lower_element_type, lower_physical_bound_value, lower_restore_dynamic_dimensions, lower_tensor_type,
+    lower_u64_scalar_constant, lower_unplaced_constant_output, physical_bound_type,
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
@@ -31,14 +32,65 @@ pub enum RaggedDotLoweringStrategy {
 }
 
 impl LowerableOperation for DotOperation {
+    // Lower a dot to one `stablehlo.dot_general` that carries its per-input precisions and its algorithm. An algorithm
+    // may compute with other element types than the inputs and the output have, in which case the inputs are converted
+    // before the contraction and its result is converted after it, exactly like JAX's `_dot_general_lower`.
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
+        input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let output_tensor_type = lowerer.lower_tensor_type(&output_types[0])?;
+        check_count!("input", input_values, 2, ProgramError);
+        check_count!("input", input_types, 2, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let precision = self.precision();
+
+        // XLA's CPU compiler silently ignores the algorithm of a dot, so a CPU target accepts only the presets whose
+        // results it reproduces and rejects every other algorithm instead of computing something else. This is the
+        // allowlist of JAX's `_handle_dot_precision`, without its `DEFAULT` preset, which is the default precision.
+        let targets_cpu = lowerer
+            .collective_state
+            .target_platform()
+            .is_some_and(|platform| platform.eq_ignore_ascii_case("cpu"));
+        let supported_on_cpu = matches!(
+            precision,
+            DotPrecision::Inputs { .. }
+                | DotPrecision::Preset(
+                    DotAlgorithmPreset::F16_F16_F16
+                        | DotAlgorithmPreset::F32_F32_F32
+                        | DotAlgorithmPreset::F64_F64_F64
+                        | DotAlgorithmPreset::BF16_BF16_F32
+                        | DotAlgorithmPreset::BF16_BF16_F32_X3
+                        | DotAlgorithmPreset::BF16_BF16_F32_X6,
+                ),
+        );
+        if targets_cpu && !supported_on_cpu {
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DOT_OPERATION_NAME.to_string(),
+                reason: format!("the algorithm `{precision}` is not supported on CPU"),
+            }));
+        }
+
+        // The precision selects the element types that the contraction computes with. Per-input precisions keep the
+        // types of the operation, so they emit no conversions.
+        let output_type = &output_types[0];
+        let (lhs_type, rhs_type, result_type) = precision.computation_types(
+            input_types[0].data_type(),
+            input_types[1].data_type(),
+            output_type.data_type(),
+        );
+        let mut inputs = [input_values[0], input_values[1]];
+        for ((input, input_type), computation_type) in inputs.iter_mut().zip(input_types).zip([lhs_type, rhs_type]) {
+            if input_type.data_type() != computation_type {
+                let converted_type = lowerer.lower_tensor_type(&input_type.clone().with_data_type(computation_type))?;
+                let converted =
+                    lowerer.block.append_operation(stable_hlo::convert(*input, converted_type, lowerer.location)?)?;
+                *input = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
+            }
+        }
+
         let dimension_numbers = self.dimensions();
         let dimensions = lowerer.context.stable_hlo_dot_dimensions(
             dimension_numbers.lhs_batching_dimensions(),
@@ -46,17 +98,114 @@ impl LowerableOperation for DotOperation {
             dimension_numbers.lhs_contracting_dimensions(),
             dimension_numbers.rhs_contracting_dimensions(),
         )?;
+        let lower_input_precision = |precision: DotInputPrecision| match precision {
+            DotInputPrecision::Default => Precision::Default,
+            DotInputPrecision::High => Precision::High,
+            DotInputPrecision::Highest => Precision::Highest,
+        };
+        let (lhs_precision, rhs_precision) = precision.input_precisions();
+        let algorithm = lower_dot_algorithm(precision, lhs_type, rhs_type, lowerer.context)?;
+        let result_tensor_type = lowerer.lower_tensor_type(&output_type.clone().with_data_type(result_type))?;
         let result = lowerer.block.append_operation(stable_hlo::dot_general(
-            input_values[0],
-            input_values[1],
+            inputs[0],
+            inputs[1],
             dimensions,
-            Some((Precision::Default, Precision::Default)),
-            None,
-            output_tensor_type,
+            Some((lower_input_precision(lhs_precision), lower_input_precision(rhs_precision))),
+            algorithm,
+            result_tensor_type,
             lowerer.location,
         )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.dot_general should return one result").as_ref()])
+        let result = result.result(0).expect("stablehlo.dot_general should return one result").as_ref();
+        if result_type == output_type.data_type() {
+            return Ok(vec![result]);
+        }
+        let output_tensor_type = lowerer.lower_tensor_type(output_type)?;
+        let converted =
+            lowerer.block.append_operation(stable_hlo::convert(result, output_tensor_type, lowerer.location)?)?;
+        Ok(vec![converted.result(0).expect("stablehlo.convert should return one result").as_ref()])
     }
+}
+
+/// Lowers the algorithm that `precision` requests to a StableHLO `algorithm` attribute for a `dot_general` whose
+/// inputs have the computation element types `lhs_type` and `rhs_type` (refer to
+/// [`DotPrecision::computation_types`]). Per-input precisions request no algorithm.
+fn lower_dot_algorithm<'c, 't>(
+    precision: DotPrecision,
+    lhs_type: DataType,
+    rhs_type: DataType,
+    context: &'c MlirContext<'t>,
+) -> Result<Option<DotAlgorithmAttributeRef<'c, 't>>, Error> {
+    let float_type = |data_type: DataType| {
+        lower_element_type(data_type, context)?.cast::<FloatTypeRef>().ok_or_else(|| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DOT_OPERATION_NAME.to_string(),
+                reason: format!("the algorithm type `{data_type}` is not a floating-point type"),
+            })
+        })
+    };
+    let float8_type = |data_type: DataType| {
+        lower_element_type(data_type, context)?.cast::<Float8TypeRef>().ok_or_else(|| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DOT_OPERATION_NAME.to_string(),
+                reason: format!("the algorithm input type `{data_type}` is not an 8-bit floating-point type"),
+            })
+        })
+    };
+    let preset = match precision {
+        DotPrecision::Inputs { .. } => return Ok(None),
+        DotPrecision::Algorithm(algorithm) => {
+            return Ok(Some(context.stable_hlo_dot_algorithm(
+                float_type(algorithm.lhs_precision_type())?,
+                float_type(algorithm.rhs_precision_type())?,
+                float_type(algorithm.accumulation_type())?,
+                algorithm.lhs_component_count(),
+                algorithm.rhs_component_count(),
+                algorithm.primitive_operation_count(),
+                algorithm.allow_imprecise_accumulation(),
+            )?));
+        }
+        DotPrecision::Preset(preset) => preset,
+    };
+
+    // The `Any_F8` presets name the 8-bit input types of the operation and always declare `f32` accumulation, which
+    // is what JAX emits for all four of them. The fast variants allow imprecise accumulation. JAX sets that flag only
+    // for the `F32` fast variant, which makes its `ANY` fast variant identical to the precise one.
+    let preset = match preset {
+        DotAlgorithmPreset::Any_F8_Any_F8_F32 => stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_F32 {
+            lhs_precision_type: float8_type(lhs_type)?,
+            rhs_precision_type: float8_type(rhs_type)?,
+        },
+        DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation => {
+            stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation {
+                lhs_precision_type: float8_type(lhs_type)?,
+                rhs_precision_type: float8_type(rhs_type)?,
+            }
+        }
+        DotAlgorithmPreset::Any_F8_Any_F8_Any => stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_Any {
+            lhs_precision_type: float8_type(lhs_type)?,
+            rhs_precision_type: float8_type(rhs_type)?,
+            accumulation_type: float_type(DataType::F32)?,
+        },
+        DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation => {
+            stable_hlo::DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation {
+                lhs_precision_type: float8_type(lhs_type)?,
+                rhs_precision_type: float8_type(rhs_type)?,
+                accumulation_type: float_type(DataType::F32)?,
+            }
+        }
+        DotAlgorithmPreset::F16_F16_F16 => stable_hlo::DotAlgorithmPreset::F16_F16_F16,
+        DotAlgorithmPreset::F16_F16_F32 => stable_hlo::DotAlgorithmPreset::F16_F16_F32,
+        DotAlgorithmPreset::BF16_BF16_BF16 => stable_hlo::DotAlgorithmPreset::BF16_BF16_BF16,
+        DotAlgorithmPreset::BF16_BF16_F32 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32,
+        DotAlgorithmPreset::BF16_BF16_F32_X3 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32_X3,
+        DotAlgorithmPreset::BF16_BF16_F32_X6 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32_X6,
+        DotAlgorithmPreset::BF16_BF16_F32_X9 => stable_hlo::DotAlgorithmPreset::BF16_BF16_F32_X9,
+        DotAlgorithmPreset::TF32_TF32_F32 => stable_hlo::DotAlgorithmPreset::TF32_TF32_F32,
+        DotAlgorithmPreset::TF32_TF32_F32_X3 => stable_hlo::DotAlgorithmPreset::TF32_TF32_F32_X3,
+        DotAlgorithmPreset::F32_F32_F32 => stable_hlo::DotAlgorithmPreset::F32_F32_F32,
+        DotAlgorithmPreset::F64_F64_F64 => stable_hlo::DotAlgorithmPreset::F64_F64_F64,
+    };
+    Ok(context.stable_hlo_dot_algorithm_from_preset(preset)?)
 }
 
 /// Builds capped cumulative group starts and ends in `u64`. Signed inputs are clamped to zero before widening, bounded
@@ -457,15 +606,17 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayOperation, Dimension as CoreDimension, Dot, Placeholder, RaggedDot, Sharding, Typed,
-        f8e4m3fn,
+        Array as CoreArray, ArrayOperation, Dimension as CoreDimension, Dot, DotAlgorithm, Operation as CoreOperation,
+        Placeholder, RaggedDot, Sharding, Typed, bf16, f8e4m3fn, f8e5m2, f16,
     };
 
     use crate::domains::tests::domain_mesh;
     use crate::experimental::lowering::tests::{
         ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, unproject_plain_program,
     };
-    use crate::experimental::lowering::to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy;
+    use crate::experimental::lowering::{
+        lower_mlir_module_for_program, to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy,
+    };
     use crate::experimental::ops::ArrayConstant;
     use crate::tests::{execution_client, replicated_array, values_to_bytes};
     use crate::{Session, ToPjrt, to_mlir_module_for_program};
@@ -474,6 +625,27 @@ mod tests {
 
     #[cfg(test)]
     use ryft_core::RaggedDotDimensionNumbers;
+
+    // Lowers one dense dot of inputs with the provided types for the PJRT platform named `target_platform`.
+    fn lowered_dot_module(
+        operation: DotOperation,
+        lhs_type: ArrayType,
+        rhs_type: ArrayType,
+        target_platform: Option<&str>,
+    ) -> Result<String, Error> {
+        let output_types = operation.infer_output_types(&[lhs_type.clone(), rhs_type.clone()], &[]).unwrap();
+        let mut builder = ProgramBuilder::new();
+        let lhs = builder.add_input(lhs_type.clone());
+        let rhs = builder.add_input(rhs_type.clone());
+        let output = builder.add_instruction(operation, Vec::new(), vec![lhs, rhs], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        let input_types = vec![lhs_type, rhs_type];
+        lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, target_platform)
+            .map(|module| module.stable_hlo)
+    }
 
     // Lowers one grouped-dot signature using `strategy`.
     fn lowered_ragged_dot_module_for(
@@ -1352,6 +1524,286 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_dot_operation_lower_with_precision() {
+        // Per-input precisions lower to the `precision_config` of the contraction without any conversions.
+        let f32_type = ArrayType::new_static(DataType::F32, [2, 2]);
+        assert_eq!(
+            lowered_dot_module(
+                DotOperation::matmul().with_precision((DotInputPrecision::High, DotInputPrecision::Highest)),
+                f32_type.clone(),
+                f32_type.clone(),
+                None,
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>) -> tensor<2x2xf32> {
+                    %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], \
+                    precision = [HIGH, HIGHEST] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+                    return %0 : tensor<2x2xf32>
+                  }
+                }
+            "},
+        );
+
+        // A preset converts the inputs that it does not compute with, accumulates at its accumulation type, and
+        // converts the result to the output type.
+        let f64_type = ArrayType::new_static(DataType::F64, [2, 2]);
+        assert_eq!(
+            lowered_dot_module(
+                DotOperation::matmul().with_precision(DotAlgorithmPreset::BF16_BF16_F32),
+                f64_type.clone(),
+                f64_type,
+                None,
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x2xf64>, %arg1: tensor<2x2xf64>) -> tensor<2x2xf64> {
+                    %0 = stablehlo.convert %arg0 : (tensor<2x2xf64>) -> tensor<2x2xbf16>
+                    %1 = stablehlo.convert %arg1 : (tensor<2x2xf64>) -> tensor<2x2xbf16>
+                    %2 = stablehlo.dot_general %0, %1, contracting_dims = [1] x [0], \
+                    precision = [DEFAULT, DEFAULT], algorithm = <lhs_precision_type = bf16, \
+                    rhs_precision_type = bf16, accumulation_type = f32, lhs_component_count = 1, \
+                    rhs_component_count = 1, num_primitive_operations = 1, \
+                    allow_imprecise_accumulation = false> : (tensor<2x2xbf16>, tensor<2x2xbf16>) -> tensor<2x2xf32>
+                    %3 = stablehlo.convert %2 : (tensor<2x2xf32>) -> tensor<2x2xf64>
+                    return %3 : tensor<2x2xf64>
+                  }
+                }
+            "},
+        );
+
+        // The `Any_F8` presets name the two 8-bit input types, declare `f32` accumulation, and produce a listed
+        // output type directly.
+        assert_eq!(
+            lowered_dot_module(
+                DotOperation::matmul()
+                    .with_precision(DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation)
+                    .with_accumulation_type(DataType::BF16),
+                ArrayType::new_static(DataType::F8E4M3FN, [2, 2]),
+                ArrayType::new_static(DataType::F8E5M2, [2, 2]),
+                None,
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x2xf8E4M3FN>, %arg1: tensor<2x2xf8E5M2>) -> tensor<2x2xbf16> {
+                    %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], \
+                    precision = [DEFAULT, DEFAULT], algorithm = <lhs_precision_type = f8E4M3FN, \
+                    rhs_precision_type = f8E5M2, accumulation_type = f32, lhs_component_count = 1, \
+                    rhs_component_count = 1, num_primitive_operations = 1, \
+                    allow_imprecise_accumulation = true> : (tensor<2x2xf8E4M3FN>, tensor<2x2xf8E5M2>) -> \
+                    tensor<2x2xbf16>
+                    return %0 : tensor<2x2xbf16>
+                  }
+                }
+            "},
+        );
+
+        // An explicit algorithm converts the inputs to its precision types and lowers all of its fields.
+        assert_eq!(
+            lowered_dot_module(
+                DotOperation::matmul().with_precision(
+                    DotAlgorithm::new(DataType::BF16, DataType::BF16, DataType::F32).with_primitive_operation_count(3),
+                ),
+                f32_type.clone(),
+                f32_type.clone(),
+                None,
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>) -> tensor<2x2xf32> {
+                    %0 = stablehlo.convert %arg0 : (tensor<2x2xf32>) -> tensor<2x2xbf16>
+                    %1 = stablehlo.convert %arg1 : (tensor<2x2xf32>) -> tensor<2x2xbf16>
+                    %2 = stablehlo.dot_general %0, %1, contracting_dims = [1] x [0], \
+                    precision = [DEFAULT, DEFAULT], algorithm = <lhs_precision_type = bf16, \
+                    rhs_precision_type = bf16, accumulation_type = f32, lhs_component_count = 1, \
+                    rhs_component_count = 1, num_primitive_operations = 3, \
+                    allow_imprecise_accumulation = false> : (tensor<2x2xbf16>, tensor<2x2xbf16>) -> tensor<2x2xf32>
+                    return %2 : tensor<2x2xf32>
+                  }
+                }
+            "},
+        );
+
+        // The TensorFloat-32 presets lower to the `tf32` precision type, which no array element type represents.
+        assert_eq!(
+            lowered_dot_module(
+                DotOperation::matmul().with_precision(DotAlgorithmPreset::TF32_TF32_F32_X3),
+                f32_type.clone(),
+                f32_type.clone(),
+                Some("cuda"),
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>) -> tensor<2x2xf32> {
+                    %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], \
+                    precision = [DEFAULT, DEFAULT], algorithm = <lhs_precision_type = tf32, \
+                    rhs_precision_type = tf32, accumulation_type = f32, lhs_component_count = 1, \
+                    rhs_component_count = 1, num_primitive_operations = 3, \
+                    allow_imprecise_accumulation = false> : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+                    return %0 : tensor<2x2xf32>
+                  }
+                }
+            "},
+        );
+
+        // StableHLO verifies that an algorithm is known to be supported on some hardware, so an explicit algorithm
+        // outside that set fails the verification of the lowered module.
+        assert!(matches!(
+            lowered_dot_module(
+                DotOperation::matmul().with_precision(
+                    DotAlgorithm::new(DataType::F16, DataType::BF16, DataType::F32).with_component_counts(2, 3),
+                ),
+                f32_type.clone(),
+                f32_type,
+                None,
+            ),
+            Err(Error::Lowering(LoweringError::VerificationFailure)),
+        ));
+    }
+
+    #[test]
+    fn test_dot_operation_lower_rejects_unsupported_algorithms_on_cpu() {
+        let f32_type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let f8_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+
+        // The CPU compiler ignores algorithms, so a CPU target accepts only the presets whose results it reproduces.
+        for preset in [
+            DotAlgorithmPreset::F16_F16_F16,
+            DotAlgorithmPreset::F32_F32_F32,
+            DotAlgorithmPreset::F64_F64_F64,
+            DotAlgorithmPreset::BF16_BF16_F32,
+            DotAlgorithmPreset::BF16_BF16_F32_X3,
+            DotAlgorithmPreset::BF16_BF16_F32_X6,
+        ] {
+            let operation = DotOperation::matmul().with_precision(preset);
+            assert!(lowered_dot_module(operation, f32_type.clone(), f32_type.clone(), Some("cpu")).is_ok());
+        }
+        for preset in [
+            DotAlgorithmPreset::F16_F16_F32,
+            DotAlgorithmPreset::BF16_BF16_BF16,
+            DotAlgorithmPreset::BF16_BF16_F32_X9,
+            DotAlgorithmPreset::TF32_TF32_F32,
+            DotAlgorithmPreset::TF32_TF32_F32_X3,
+        ] {
+            let operation = DotOperation::matmul().with_precision(preset);
+            assert!(matches!(
+                lowered_dot_module(operation, f32_type.clone(), f32_type.clone(), Some("cpu")),
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                    if operation == DOT_OPERATION_NAME
+                        && reason == format!("the algorithm `{preset}` is not supported on CPU"),
+            ));
+        }
+        for preset in [
+            DotAlgorithmPreset::Any_F8_Any_F8_F32,
+            DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation,
+            DotAlgorithmPreset::Any_F8_Any_F8_Any,
+            DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation,
+        ] {
+            let operation = DotOperation::matmul().with_precision(preset).with_accumulation_type(DataType::F32);
+            assert!(matches!(
+                lowered_dot_module(operation, f8_type.clone(), f8_type.clone(), Some("cpu")),
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                    if operation == DOT_OPERATION_NAME
+                        && reason == format!("the algorithm `{preset}` is not supported on CPU"),
+            ));
+        }
+
+        // Explicit algorithms are rejected on CPU as well, while per-input precisions are always accepted.
+        let algorithm = DotAlgorithm::new(DataType::F32, DataType::F32, DataType::F32);
+        assert!(matches!(
+            lowered_dot_module(
+                DotOperation::matmul().with_precision(algorithm),
+                f32_type.clone(),
+                f32_type.clone(),
+                Some("cpu"),
+            ),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == DOT_OPERATION_NAME
+                    && reason == format!("the algorithm `{algorithm}` is not supported on CPU"),
+        ));
+        let operation = DotOperation::matmul().with_precision(DotInputPrecision::Highest);
+        assert!(lowered_dot_module(operation, f32_type.clone(), f32_type, Some("cpu")).is_ok());
+    }
+
+    #[test]
+    fn test_dot_operation_lower_with_precision_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // The `bf16` preset rounds its `f64` inputs to `bf16`, where `1 + 2⁻¹⁰` becomes `1`, accumulates at `f32`,
+        // and converts the result to the `f64` output type. Every remaining value is exact, so both backends are.
+        let reference_lhs = CoreArray::vector(vec![1.0009765625f64, 2.0]).unwrap();
+        let reference_rhs = CoreArray::vector(vec![1.0f64, 1.0]).unwrap();
+        let lhs = replicated_array(&domain, &mesh, DataType::F64, &[2], &reference_lhs.logical_bytes());
+        let rhs = replicated_array(&domain, &mesh, DataType::F64, &[2], &reference_rhs.logical_bytes());
+        let dimensions = DotDimensionNumbers::inner_product();
+        let product = lhs.dot_with_precision(&rhs, &dimensions, DotAlgorithmPreset::BF16_BF16_F32.into()).unwrap();
+        let reference_product = reference_lhs
+            .dot_with_precision(&reference_rhs, &dimensions, DotAlgorithmPreset::BF16_BF16_F32.into())
+            .unwrap();
+        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[3.0f64]));
+        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
+
+        // Per-input precisions are hints that the CPU backend ignores.
+        let product = lhs.dot_with_precision(&rhs, &dimensions, DotInputPrecision::Highest.into()).unwrap();
+        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[3.0009765625f64]));
+    }
+
+    #[test]
+    fn test_dot_operation_lower_with_narrower_accumulation_type_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // The three terms `2⁻¹²` sum to three quarters of the distance from `1` to the next `f16` value, so a sum
+        // that accumulates at `f32` and rounds once is `1 + 2⁻¹⁰`.
+        let reference_lhs = CoreArray::vector(vec![1.0f32, 0.000244140625, 0.000244140625, 0.000244140625]).unwrap();
+        let reference_rhs = CoreArray::vector(vec![1.0f32; 4]).unwrap();
+        let lhs = replicated_array(&domain, &mesh, DataType::F32, &[4], &reference_lhs.logical_bytes());
+        let rhs = replicated_array(&domain, &mesh, DataType::F32, &[4], &reference_rhs.logical_bytes());
+        let dimensions = DotDimensionNumbers::inner_product();
+        let product = lhs.dot_with_accumulation_type(&rhs, &dimensions, DataType::F16).unwrap();
+        let reference_product =
+            reference_lhs.dot_with_accumulation_type(&reference_rhs, &dimensions, DataType::F16).unwrap();
+        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[f16::from_f32(1.0009765625)]));
+        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
+    }
+
+    #[test]
+    fn test_dot_operation_lower_with_distinct_f8_inputs_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Two distinct 8-bit input types stay as they are on device and the contraction accumulates at the requested
+        // type. Every value is exactly representable, so `[0.5, 1.0] · [2.0, 4.0] = 5` on both backends.
+        let reference_lhs = CoreArray::from_elements(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[0.5f64, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let reference_rhs = CoreArray::from_elements(
+            ArrayType::new_static(DataType::F8E5M2, [2]),
+            &[2.0f64, 4.0].map(|value| f8e5m2::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let lhs = replicated_array(&domain, &mesh, DataType::F8E4M3FN, &[2], &reference_lhs.logical_bytes());
+        let rhs = replicated_array(&domain, &mesh, DataType::F8E5M2, &[2], &reference_rhs.logical_bytes());
+        let dimensions = DotDimensionNumbers::inner_product();
+        let product = lhs.dot_with_accumulation_type(&rhs, &dimensions, DataType::BF16).unwrap();
+        let reference_product =
+            reference_lhs.dot_with_accumulation_type(&reference_rhs, &dimensions, DataType::BF16).unwrap();
+        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[bf16::from_f32(5.0)]));
+        assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
     }
 
     #[test]

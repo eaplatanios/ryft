@@ -843,6 +843,11 @@ impl Encoder {
                         if operation.output_sharding().is_some() {
                             return Err(unsupported("dot output sharding"));
                         }
+                        // The wire records encode only the default precision, so other precisions are rejected
+                        // rather than silently dropped.
+                        if !operation.precision().is_default() {
+                            return Err(unsupported("dot precision"));
+                        }
                         let dimensions = operation.dimensions();
                         WireOperation::Dot {
                             dimensions: [
@@ -1517,7 +1522,8 @@ fn bounded_dot_dimensions<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Context, ProgramBuilder, SinOperation, TanOperation, TanhOperation, TypeIdentityRenaming, TypedProgram,
+        Context, DotInputPrecision, ProgramBuilder, SinOperation, TanOperation, TanhOperation, TypeIdentityRenaming,
+        TypedProgram,
     };
 
     use crate::authoring::whole_array_parameter;
@@ -1875,6 +1881,15 @@ mod tests {
         assert_eq!(
             Encoder::default().operation(&operation).err().unwrap().to_string(),
             "kernel source serialization does not support `tanh with a non-default accuracy`",
+        );
+
+        // The wire records encode only the default dot precision as well.
+        let operation = KernelOperation::Portable(ArrayIrOperation::Array(ArrayOperation::Dot(
+            DotOperation::matmul().with_precision(DotInputPrecision::Highest),
+        )));
+        assert_eq!(
+            Encoder::default().operation(&operation).err().unwrap().to_string(),
+            "kernel source serialization does not support `dot precision`",
         );
     }
 

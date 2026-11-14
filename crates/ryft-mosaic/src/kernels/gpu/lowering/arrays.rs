@@ -143,7 +143,8 @@ pub(super) fn validate(
             &format!("kind `{}` or the reduction's metadata has no baseline scalar implementation", reduction.kind()),
         )),
         ArrayOperation::Dot(dot)
-            if dot.accumulation_type().is_none()
+            if dot.precision().is_default()
+                && dot.accumulation_type().is_none()
                 && dot.output_sharding().is_none()
                 && output.data_type() != DataType::Boolean =>
         {

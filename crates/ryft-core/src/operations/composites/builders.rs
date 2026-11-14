@@ -6375,11 +6375,11 @@ mod tests {
 
     #[test]
     fn test_composite_with_broadcast_sensitive_batching_manual_variation() {
-        // Inside a manual region, the batching rule derived for the JVP of `(x, y) ↦ x + y` stages every value that it
-        // creates with the manual variation of the values that it combines. With `x` mapped and varying over the
+        // Inside a manual region, the batching rule derived for the JVP of `(x, y) ↦ x + y` stages every value that
+        // it creates with the manual variation of the values that it combines. With `x` mapped and varying over the
         // manual axis `m`, and `y` replicated and invariant with a mapped tangent `ẏ`, the derivative of the rule
-        // carries the transition of `y` into `ẏ` and the diagonal makes its indices vary before gathering, so the
-        // contribution of `ẋ` and the contribution of `ẏ` that the rule adds have the same variation.
+        // carries the transition of `y` into `ẏ` and the diagonal creates its integer indices with that variation,
+        // so the contribution of `ẋ` and the contribution of `ẏ` that the rule adds have the same variation.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let placed = |data_type: DataType, dimensions: &[usize], varying: bool| {
             let sharding = Sharding::replicated(mesh.clone(), dimensions.len());
@@ -6391,7 +6391,6 @@ mod tests {
         let varying_vector = placed(DataType::F64, &[3], true);
         let invariant_vector = placed(DataType::F64, &[3], false);
         let varying_matrix = placed(DataType::F64, &[3, 3], true);
-        let invariant_indices = placed(DataType::I64, &[3, 1], false);
         let varying_indices = placed(DataType::I64, &[3, 1], true);
         let varying_matrix_sharding = varying_matrix.sharding().unwrap();
         let named_axes =
@@ -6443,18 +6442,16 @@ mod tests {
                                 output_axes=[0],
                             ] %6
                             %8:{varying_matrix} = reshard [sharding={varying_matrix_sharding}] %7
-                            %9:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
-                            %10:{invariant_indices} = broadcast [
-                                output_type={invariant_indices},
-                                output_axes=[0, 1],
-                            ] %9
-                            %11:{varying_indices} = parallel_vary [axis_name=\"m\"] %10
-                            %12:{varying_vector} = gather [
+                            %9:{varying_indices} = iota [
+                                type={varying_indices},
+                                dimension=0,
+                            ]
+                            %10:{varying_vector} = gather [
                                 dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
                                 slice_sizes=[1, 1],
-                            ] %8 %11
-                            %13:{varying_vector} = add %2 %12
-                        in (%5, %13)
+                            ] %8 %9
+                            %11:{varying_vector} = add %2 %10
+                        in (%5, %11)
                     }},
                 ]
                 in (%4, %5)

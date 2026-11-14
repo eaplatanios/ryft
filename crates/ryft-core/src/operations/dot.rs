@@ -777,7 +777,12 @@ impl DotPrecision {
                         | DotAlgorithmPreset::Any_F8_Any_F8_Any
                         | DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation,
                 );
-                if requires_f8_inputs && !(is_f8_data_type(lhs) && is_f8_data_type(rhs)) {
+                if requires_f8_inputs
+                    && !(lhs.is_floating_point()
+                        && lhs.bit_width() == 8
+                        && rhs.is_floating_point()
+                        && rhs.bit_width() == 8)
+                {
                     return Err(TypeError::invalid(format!(
                         "`{operation_name}` algorithm preset `{preset}` requires 8-bit floating-point inputs \
                          but got `{lhs}` and `{rhs}`",
@@ -2682,9 +2687,9 @@ pub(crate) fn infer_dot_output_type(
     // Backends contract two distinct 8-bit floating-point types natively, except for `f8e4m3b11fnuz`, which JAX also
     // converts first. Such a pair has no common input type to default the output to, so it needs an accumulation type.
     // Every other pair of distinct types must be converted explicitly by the caller.
-    let is_native_f8_pair = [lhs.data_type(), rhs.data_type()]
-        .into_iter()
-        .all(|data_type| is_f8_data_type(data_type) && data_type != DataType::F8E4M3B11FNUZ);
+    let is_native_f8_pair = [lhs.data_type(), rhs.data_type()].into_iter().all(|data_type| {
+        data_type.is_floating_point() && data_type.bit_width() == 8 && data_type != DataType::F8E4M3B11FNUZ
+    });
     if lhs.data_type() != rhs.data_type() && !(accumulation_type.is_some() && is_native_f8_pair) {
         return Err(TypeError::invalid(format!("`{operation_name}` input element types are incompatible")));
     }
@@ -3005,13 +3010,6 @@ fn validate_dot_data_type(operation_name: &str, data_type: DataType) -> Result<(
     } else {
         Err(TypeError::invalid(format!("`{operation_name}` does not support input data type `{data_type}`")))
     }
-}
-
-// TODO(eaplatanios): Inline this function.
-/// Returns `true` if `data_type` is an 8-bit floating-point type (e.g., [`DataType::F8E4M3FN`]). These are the types
-/// that the `Any_F8` [`DotAlgorithmPreset`]s require.
-fn is_f8_data_type(data_type: DataType) -> bool {
-    data_type.is_floating_point() && data_type.bit_width() == 8
 }
 
 /// Applies the product rule `ẏ = f(ȧ, b) + f(a, ḃ)` of a bilinear dot operation `y = f(a, b)`, where `apply` evaluates
