@@ -685,12 +685,15 @@ where
     Scan(ScanOperation<ArrayIrType>),
 
     /// Backend-owned composite call whose primal region can contain XLA operations, with either attached rule regions
-    /// that can contain XLA operations or retained rules registered in this family, which are traced lazily.
-    #[ryft(lockstep)]
+    /// that can contain XLA operations or retained rules registered in this family, which are traced lazily. Its
+    /// retained rules can communicate along mesh axes that no instruction of the call names, which the call reports
+    /// as hidden axes, so this variant delegates the collective metadata of the family to it.
+    #[ryft(collective, lockstep)]
     Composite(CompositeOperation<Payload, Operation<Payload>>),
 
     /// Reverse-mode carrier of a [`Composite`](Self::Composite) call, which transposition replaces with the call's
     /// backward rule.
+    #[ryft(collective)]
     CompositeTranspose(CompositeTransposeOperation<Payload, Operation<Payload>>),
 
     /// Differentiation-owned call to an explicitly transposable linear map with ordinary trailing residual operands,
@@ -706,6 +709,7 @@ where
     /// member payload. Its derivative rules are specialized by the member definition and converted into this family
     /// (refer to [`LiftedCustomRules`]). Conversions never produce such a call with attached rules, which follow their
     /// call into the [`Composite`](Self::Composite) variant instead.
+    #[ryft(collective, lockstep)]
     LiftedComposite(
         CompositeOperation<
             Payload,
@@ -719,6 +723,7 @@ where
 
     /// Reverse-mode carrier of a [`LiftedComposite`](Self::LiftedComposite) call, whose backward rule is specialized by
     /// the member definition and converted into this family.
+    #[ryft(collective)]
     LiftedCompositeTranspose(
         CompositeTransposeOperation<
             Payload,
