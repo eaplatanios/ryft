@@ -2963,7 +2963,7 @@ impl Operation for ShardMapOperation {
             match declared {
                 ArrayIrType::Reference(declared) => {
                     let actual = <&ReferenceType<ArrayType>>::try_from(actual)?;
-                    if !boundary_types_match(actual.referent(), declared.referent()) {
+                    if !boundary_input_type_matches(actual.referent(), declared.referent()) {
                         return Err(TypeError::invalid(format!(
                             "`{name}` input #{index} has type `{actual}` but its declared global input type \
                              is `{declared}`",
@@ -2987,17 +2987,7 @@ impl Operation for ShardMapOperation {
                 declared => {
                     let actual = <&ArrayType>::try_from(actual)?;
                     let declared = <&ArrayType>::try_from(declared)?;
-
-                    // A declaration without a layout admits an array with any layout, as type refinement does, so
-                    // that an input whose layout is only known when the map runs (e.g., one that a `condition` branch
-                    // with a declared output type without a layout forwards) remains valid. The shards of the input
-                    // are copied into the local type, which the declaration determines.
-                    let matches = if declared.layout().is_none() && actual.layout().is_some() {
-                        boundary_types_match(&actual.clone().with_layout(None), declared)
-                    } else {
-                        boundary_types_match(actual, declared)
-                    };
-                    if !matches {
+                    if !boundary_input_type_matches(actual, declared) {
                         return Err(TypeError::invalid(format!(
                             "`{name}` input #{index} has type `{actual}` but its declared global input type \
                              is `{declared}`",
@@ -6624,17 +6614,21 @@ where
             };
         }
 
-        // An instruction communicates across the emulated devices when the closure of its regions contains a
-        // collective over an emulated axis. Any other instruction runs on every device independently, so its operation
-        // is bound once per device, in device order, with the inputs of that device and the regions of the instruction.
-        // No `shard_map` makes an emulated axis manual again, because the body validation of every enclosing map
-        // rejects that nesting.
+        // An instruction communicates across the emulated devices when its computation regions, or their computation
+        // descendants, contain a collective over an emulated axis. Dormant rule regions (e.g., the custom forward mode
+        // rule of a composite) are not considered, because interpretation never executes them, so a collective that
+        // only such a rule uses requires no lockstep. Any other instruction runs on every device independently, so its
+        // operation is bound once per device, in device order, with the inputs of that device and the regions of the
+        // instruction. No `shard_map` makes an emulated axis manual again, because the body validation of every
+        // enclosing map rejects that nesting.
         let regions = instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
-        let uses_emulated_axes = regions.iter().any(|region| {
-            region.instructions_in_closure().any(|(_, nested)| {
-                nested.operation().axes().names().iter().any(|name| self.domain.grid().axis(name).is_some())
-            })
-        });
+        let uses_emulated_axes = regions
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| operation.region_role(*index) == Some(RegionRole::Computation))
+            .flat_map(|(_, region)| region.computation_regions())
+            .flat_map(|region| region.instructions())
+            .any(|nested| nested.operation().axes().names().iter().any(|name| self.domain.grid().axis(name).is_some()));
         if !uses_emulated_axes {
             let device_count = self.domain.grid().device_count();
             let mut outputs = vec![Vec::with_capacity(device_count); instruction.outputs().len()];
@@ -7120,6 +7114,22 @@ fn boundary_types_match(actual: &ArrayType, expected: &ArrayType) -> bool {
         && actual.unreduced_kind() == expected.unreduced_kind()
         && actual.sharding().map_or(&no_axes, Sharding::reduced_axes)
             == expected.sharding().map_or(&no_axes, Sharding::reduced_axes)
+}
+
+/// Returns `true` when the array type `actual` of a `shard_map` input (i.e., the type of an array input or the referent
+/// type of a reference input) matches its declared global type `declared` as [`boundary_types_match`] defines, except
+/// that a declaration without a layout admits an input with any layout, as type refinement does. An input whose layout
+/// is only known when the map is applied therefore remains valid (e.g., one that a `condition` branch whose declared
+/// output type has no layout forwards, or a reference that batching maps, whose declared referent loses its layout when
+/// the batch dimension is inserted). The local shards of the input are copied into the local type, which the
+/// declaration determines, and the final state of a reference input is assembled at the referent type of the
+/// caller's reference, so how that reference is stored does not change.
+fn boundary_input_type_matches(actual: &ArrayType, declared: &ArrayType) -> bool {
+    if declared.layout().is_none() && actual.layout().is_some() {
+        boundary_types_match(&actual.clone().with_layout(None), declared)
+    } else {
+        boundary_types_match(actual, declared)
+    }
 }
 
 /// Returns the global boundary type that a `shard_map` input or output carries as an array, which is the type itself
@@ -13634,6 +13644,100 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_interpretation_accepts_references_whose_layouts_refine_their_declared_types() {
+        // Both branches of a `condition` declare a reference type whose referent has no layout and forward their
+        // input, whose referent has an explicit layout, so the reference that the map receives when it runs refines
+        // the type that it was staged with. A declared referent without a layout admits it, as a plain read of that
+        // reference does, and the map leaves the state of the reference as it is stored.
+        let sharded = sharded_along_x();
+        let boundary =
+            ShardMapBoundary::new(manual_mesh(), vec![sharded.clone()], vec![sharded.clone()], Vec::new()).unwrap();
+        let declared_type = f32_type(&[4], None);
+        let strided_type = declared_type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let declared_reference_type = ArrayIrType::Reference(ReferenceType::new(declared_type.clone()));
+        let local_type = boundary.local_input_type(0, &declared_type).unwrap();
+        let body = build_program(vec![ArrayIrType::Reference(ReferenceType::new(local_type))], |builder, inputs| {
+            builder
+                .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![inputs[0]], None)
+                .unwrap()
+                .to_vec()
+        });
+        let operation =
+            ShardMapOperation::from_program(&body, vec![declared_reference_type.clone()], boundary).unwrap();
+        let forward = || build_program(vec![declared_reference_type.clone()], |_, inputs| inputs.to_vec());
+        let strided_reference_type = ArrayIrType::Reference(ReferenceType::new(strided_type.clone()));
+        let program = build_program(vec![strided_reference_type], |builder, inputs| {
+            let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
+            let regions = vec![builder.import_program(forward()), builder.import_program(forward())];
+            let condition = ConditionOperation::<ArrayIrType>::new();
+            let refined = builder.add_instruction(condition, regions, vec![predicate, inputs[0]], None).unwrap()[0];
+            let body = builder.import_program(body);
+            builder.add_instruction(operation, vec![body], vec![refined], None).unwrap().to_vec()
+        });
+        let state = Array::from_elements(strided_type, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let reference = ArrayReference::new(state.clone());
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Reference(reference.clone())]),
+            Ok(vec![f32_value(f32_type(&[4], Some(sharded)), &[1.0, 2.0, 3.0, 4.0])]),
+        );
+        assert_eq!(reference.read(), Ok(state));
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_runs_condition_branches_per_device_despite_collectives_of_dormant_rules() {
+        // The devices select different branches of a `condition`, which is valid because neither branch communicates.
+        // One branch calls a composite whose explicit forward mode rule reads the coordinate along `x`, but
+        // interpretation runs only the primal of the composite, so the rule does not make the `condition` a lockstep
+        // operation, whose devices would have to agree on the predicate.
+        let mesh = manual_mesh();
+        let sharded = sharded_along_x();
+        let boundary =
+            ShardMapBoundary::new(mesh.clone(), vec![sharded.clone(); 2], vec![sharded.clone()], Vec::new()).unwrap();
+        let predicate_type = ArrayType::new_static(DataType::Boolean, [2]);
+        let value_type = f32_type(&[2], None);
+        let local_predicate_type = boundary.local_input_type(0, &predicate_type).unwrap();
+        let local_value_type = boundary.local_input_type(1, &value_type).unwrap();
+        let local_type = ArrayIrType::Array(local_value_type.clone());
+        let primal = build_program(vec![local_type.clone()], |_, inputs| inputs.to_vec());
+        let jvp = build_program(vec![local_type.clone(); 2], |builder, inputs| {
+            let coordinate = ArrayOperation::AxisIndex(AxisIndexOperation::new("x".into()).with_mesh(mesh.clone()));
+            let coordinate = builder.add_instruction(coordinate, Vec::new(), Vec::new(), None).unwrap()[0];
+            let convert = ArrayOperation::ConvertElementType(ConvertElementTypeOperation::new(DataType::F32, false));
+            let coordinate = builder.add_instruction(convert, Vec::new(), vec![coordinate], None).unwrap()[0];
+            let broadcast = ArrayOperation::Broadcast(BroadcastOperation::new(local_value_type.clone(), Vec::new()));
+            let coordinate = builder.add_instruction(broadcast, Vec::new(), vec![coordinate], None).unwrap()[0];
+            let scale = ArrayOperation::Mul(MulOperation::new());
+            vec![inputs[0], builder.add_instruction(scale, Vec::new(), vec![inputs[1], coordinate], None).unwrap()[0]]
+        });
+        let on_true = build_program(vec![local_type.clone()], |builder, inputs| {
+            let regions = vec![builder.import_program(primal), builder.import_program(jvp)];
+            let call =
+                CompositeOperation::<TestValue, TestOperation>::from_rule_regions(CompositeJvpRule::Explicit, false);
+            builder.add_instruction(call, regions, inputs.to_vec(), None).unwrap().to_vec()
+        });
+        let on_false = build_program(vec![local_type.clone()], |_, inputs| inputs.to_vec());
+        let body = build_program(vec![ArrayIrType::Array(local_predicate_type), local_type], |builder, inputs| {
+            let reshape = ArrayOperation::Reshape(ReshapeOperation::new(
+                Shape::new(vec![Dimension::Static(1)]),
+                Shape::new(Vec::new()),
+            ));
+            let predicate = builder.add_instruction(reshape, Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let regions = vec![builder.import_program(on_true), builder.import_program(on_false)];
+            let condition = ConditionOperation::<ArrayIrType>::new();
+            builder.add_instruction(condition, regions, vec![predicate, inputs[1]], None).unwrap().to_vec()
+        });
+        let input_types = vec![ArrayIrType::Array(predicate_type.clone()), ArrayIrType::Array(value_type.clone())];
+        let program = caller_typed_shard_map_program(body, input_types, boundary);
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::from_elements(predicate_type, &[true, false]).unwrap()),
+                f32_value(value_type, &[3.0, 4.0]),
+            ]),
+            Ok(vec![f32_value(f32_type(&[2], Some(sharded)), &[3.0, 4.0])]),
+        );
+    }
+
+    #[test]
     fn test_shard_map_interpretation_writes_back_only_mutated_references() {
         // A map whose body only forwards or only reads its reference input leaves the caller's reference untouched, so
         // the generation of its state does not advance and earlier observations of it stay valid. A body that writes
@@ -14139,10 +14243,10 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_interpretation_rejects_other_region_operations() {
-        // A region operation whose regions reduce over the manual axis needs lockstep execution, which the emulator
-        // provides only for the region operations whose region sequencing it knows. Here, the backward rule region of a
-        // `composite_transpose` carrier reduces over the manual axis.
+    fn test_shard_map_interpretation_binds_operations_with_dormant_rule_regions_per_device() {
+        // The backward rule region of a `composite_transpose` carrier reduces over the manual axis, but interpretation
+        // never executes a rule region, so the carrier needs no lockstep execution. It is bound once per device like
+        // an ordinary operation, and it reports its own error, because it has no forward program.
         let mesh = manual_mesh();
         let sharded = sharded_along_x();
         let boundary = ShardMapBoundary::new(mesh.clone(), vec![sharded.clone()], vec![sharded], Vec::new()).unwrap();
@@ -14162,9 +14266,8 @@ mod tests {
         assert_eq!(
             program.interpret(vec![f32_value(f32_type(&[2], None), &[1.0, 2.0])]),
             Err(ProgramError::UnsupportedOperation {
-                message: "`shard_map` interpretation cannot run `composite_transpose` in lockstep across \
-                          devices, which its attached regions require because they use collectives over the manual \
-                          axes"
+                message: "`composite_transpose` has no forward program to execute; it supports only reverse mode \
+                          differentiation (e.g., `vjp`, `value_and_gradient`, or `jacobian_reverse`)"
                     .to_string(),
             }),
         );
@@ -18761,6 +18864,41 @@ mod tests {
                 in (%0, %3)"
             },
         );
+    }
+
+    #[test]
+    fn test_shard_map_batching_of_mapped_reference_inputs_with_explicit_layouts() {
+        // Inserting the batch dimension into the declared referent of a mapped reference input clears its layout, while
+        // the reference that the batched map receives keeps the layout that it is stored with. The declaration without
+        // a layout admits it, the body adds the update of every batch item into it, and its final state is written back
+        // at the type of the caller's reference, so how the reference is stored does not change.
+        let (operation, body) = reference_shard_map(f32_type(&[4], None), sharded_along_x(), true);
+        let batched = shard_map_program(operation, body)
+            .unwrap()
+            .batched_with_threaded_extent(
+                DimensionValue::constant(3).unwrap().r#type().into_owned(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(1), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let strided_type = f32_type(&[4, 3], None).with_layout(Layout::Strided(StridedLayout::new(vec![12, 4])));
+        let reference = ArrayReference::new(Array::from_elements(strided_type.clone(), &[0.0f32; 12]).unwrap());
+        let extent = TestValue::Dimension(DimensionValue::constant(3).unwrap());
+        let update = (0..12).map(|element| element as f32).collect::<Vec<_>>();
+        let sum = [0.0f32, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0];
+        let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
+        assert_eq!(
+            batched.interpret(vec![
+                extent.clone(),
+                ArrayIrValue::Reference(reference.clone()),
+                f32_value(f32_type(&[3, 4], None), &update),
+            ]),
+            Ok(vec![extent, f32_value(output_type, &sum)]),
+        );
+        assert_eq!(reference.read(), Ok(Array::from_elements(strided_type, &sum).unwrap()));
     }
 
     #[test]
