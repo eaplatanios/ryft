@@ -2727,6 +2727,36 @@ where
         let dropped_weights = apply_dropout(weights.clone(), inputs, configuration)?;
         let value_weights = convert(convert(dropped_weights, dimensions.data_type)?, score_data_type)?;
         let weights = convert(weights, score_data_type)?;
+
+        // TODO(eaplatanios): Stabilize the weight cotangents before this contraction, if cotangents and values whose
+        //  products leave the range of the score data type ever need to be supported. The issue is that the weight
+        //  cotangents `dW = dO * transpose(V)` are contracted before any stabilization. A product of an output
+        //  cotangent with a value that is beyond the range of the score data type makes them infinite, and the
+        //  centering below then computes `inf - inf`, so the query, key, and bias cotangents of that row are NaN even
+        //  when the exact ones are finite. For example, with `f32` inputs, a scale of one, the query `[0]`, the keys
+        //  `[0, 0]`, the values `[1e20, 1e20]`, and the output cotangent `[1e20]`, the output does not depend on the
+        //  query or on the keys, so their cotangents are exactly zero, but `dW` is `[inf, inf]` and they come out as
+        //  NaN. The value cotangent does not use `dW` and is correct (i.e., `[5e19, 5e19]`). The halving below cannot
+        //  help, because it only runs after the overflow. JAX's `dot_product_attention` has no range handling here
+        //  either and returns the same NaNs for this example (checked with JAX 0.12). The change would rescale both
+        //  inputs of the contraction and undo that after the centering, which is linear in `dW`. That is, it would
+        //  divide every row of the output cotangent (i.e., along the head dimension, for each batch item, query
+        //  position, and head) by its largest magnitude `a`, divide every row of the values (for each batch item,
+        //  key/value position, and head) by its largest magnitude `b`, contract the two rescaled arrays, and multiply
+        //  the logit cotangents by `a` and by `b`, each broadcast to the `BNTS` score shape, once they are centered.
+        //  A row of zeros would divide by one, and a row with a non-finite magnitude would stay non-finite. To keep
+        //  ordinary gradients bit-for-bit as they are, `a` and `b` would be replaced by one unless they exceed a
+        //  threshold below which no product can overflow (which depends on the score data type and on the head
+        //  dimension), because dividing and multiplying by one are exact. The trade-offs are the following. Every
+        //  backward pass would stage two more reductions (the magnitudes of the output cotangent and of the values,
+        //  which need a maximum and a minimum or an absolute value each) and two more multiplications of the size of
+        //  the scores, together with the comparisons and selections of the threshold, whether or not anything is out
+        //  of range. Without the threshold, every logit cotangent would be rounded two more times (by the division and
+        //  by the multiplication), which gives up the single rounding that the halving below is arranged to keep. With
+        //  the threshold, gradients near it would change in their last bits depending on whether a row is rescaled.
+        //  The fused backward kernels do none of this, so the portable and the fused implementations would then differ
+        //  in this range, and the staged backward program (and its snapshots and lowering) would change for every
+        //  caller.
         let score_sharding = prepared.logits.r#type().as_array_type()?.sharding().cloned();
         let weight_cotangents = apply_dropout(
             contract_cotangent(
@@ -2747,11 +2777,8 @@ where
         // probabilities that multiply those differences. Doubling a probability is exact and cannot overflow, so
         // each product is rounded once to the logit cotangent itself. Returning the factor only afterwards would let
         // the product of a tiny probability with a halved difference underflow first, and folding it into the score
-        // scale would let a large scale overflow. The weight cotangents themselves have to be representable, though.
-        // A product of an output cotangent with a value that is beyond the range of the score data type overflows in
-        // the contraction above, before any of this, and the query, key, and bias cotangents of its row are then NaN.
-        // Avoiding that would mean rescaling every row of the output cotangent, which costs every other gradient an
-        // additional rounding.
+        // scale would let a large scale overflow. The weight cotangents themselves have to be representable, though
+        // (refer to the note above their contraction).
         let zero = weights.fill_like(0.0)?;
         let halved_weight_cotangents = weight_cotangents.mul(&weights.fill_like(0.5)?)?;
         let pivot_cotangent = is_pivot.select(&halved_weight_cotangents, &zero)?.reduce(&[3], ReductionKind::Sum)?;
