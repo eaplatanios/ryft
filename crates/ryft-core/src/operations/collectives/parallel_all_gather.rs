@@ -1609,7 +1609,7 @@ fn unchecked_output_variance<C: NamedAxes>(
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -3816,7 +3816,49 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(linearization.pullback().unwrap().program().to_string(), "");
+
+        // Reverse mode swaps the two regions. The cotangent that the selection returns for the input has the static
+        // type `f32[2]`, which the cotangent accumulator accepts for the input cotangent type `f32[n]`, because the
+        // two types are interchangeable.
+        let invariant = "{mesh<['x'=2:manual]>, [{}]}";
+        let varying = "{mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}";
+        let placed = "{mesh<['x'=2:manual]>, []}";
+        let scalar = "{mesh<['x'=2:manual]>, [], varying_manual={'x'}}";
+        assert_eq!(
+            linearization.pullback().unwrap().program().to_string(),
+            formatdoc! {"
+                lambda %0:f32[4][sharding={invariant}], %1:dimension<4>, %2:dimension<2> .
+                let %3:f32[2][sharding={varying}] = linear_call [residual_count=2] %1 %2 %0 [
+                    forward={{
+                        lambda %0:dimension<4>, %1:dimension<2>, %2:f32[4][sharding={invariant}] .
+                        let %3:f32[4][sharding={varying}] = parallel_vary [axis_name=\"x\"] %2
+                            %4:u64[][sharding={scalar}] = axis_index [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %5:i64[][sharding={scalar}] = convert_element_type [data_type=i64] %4
+                            %6:i64[] = dimension_to_scalar %1
+                            %7:i64[][sharding={placed}] = \
+                                broadcast [output_type=i64[][sharding={placed}], output_axes=[]] %6
+                            %8:i64[][sharding={scalar}] = parallel_vary [axis_name=\"x\"] %7
+                            %9:i64[][sharding={scalar}] = mul %5 %8
+                            %10:f32[2][sharding={varying}] = \
+                                dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %9 %1
+                            %11:f32[2][sharding={varying}] = reshape [output_sharding={varying}] %10 %1
+                        in (%11)
+                    }},
+                    transpose={{
+                        lambda %0:dimension<4>, %1:dimension<2>, %2:f32[2][sharding={varying}] .
+                        let %3:f32[4][sharding={invariant}] = parallel_all_gather [
+                            axes=\"x\",
+                            axis_size=2,
+                            concatenation_axis=0,
+                            options=Tiled,
+                            output_variance=Invariant,
+                            mesh=['x'=2:manual],
+                        ] %2 %0
+                        in (%3)
+                    }},
+                ]
+                in (%3)"},
+        );
     }
 
     #[test]

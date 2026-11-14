@@ -234,10 +234,11 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
 
     /// Returns whether values of `other` can stand in for values of this type without converting their elements (i.e.,
     /// whether the two types describe the same values and differ at most in metadata about how one value is stored,
-    /// such as the explicit layout of an array). Consumers that combine values which were computed independently of
-    /// how the value that they stand in for is stored use this instead of type equality (e.g., the contributions that
-    /// reverse mode differentiation accumulates into the cotangent of an input). The default is type equality, which
-    /// is exact for every type family without such metadata.
+    /// such as the explicit layout of an array, or in how they name them, such as a nominal extent that admits a single
+    /// extent and that static extent). Consumers that combine values which were computed independently of how the value
+    /// that they stand in for is stored use this instead of type equality (e.g., the contributions that reverse mode
+    /// differentiation accumulates into the cotangent of an input). The default is type equality, which is exact for
+    /// every type family without such metadata.
     #[inline]
     fn is_interchangeable_with(&self, other: &Self) -> bool {
         self == other
