@@ -13662,7 +13662,8 @@ mod tests {
                 .unwrap();
             vec![value]
         });
-        let generation = |reference: &ArrayReference| reference.lock_storage().unwrap().observe().unwrap().generation();
+        let generation =
+            |reference: &ArrayReference<Array>| reference.lock_storage().unwrap().observe().unwrap().generation();
         let run = |body: TestProgram, output_shardings: Vec<Sharding>| {
             let program =
                 caller_typed_shard_map_program(body, vec![global_reference_type.clone()], boundary(output_shardings));
@@ -20506,7 +20507,43 @@ mod tests {
             .unwrap()
             .into_parts()
             .0;
-        assert_eq!(batched.to_string(), "");
+        let replicated = "{mesh<['x'=2:manual]>, [{}]}";
+        let local = format!("f32[2][sharding={replicated}]");
+        let strided = format!("f32[2][layout=strided{{4}}][sharding={replicated}]");
+        assert_eq!(
+            batched.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<2>, %1:f32[2] .
+                let %2:{strided} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{replicated}],
+                    manual_axes=['x'],
+                    global_input_types=[{local}],
+                    global_output_types=[{strided}],
+                ] %1 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{strided} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<2>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{local} .
+                                    let %2:{strided} = cast [
+                                        type={strided},
+                                        inputs=[{local}],
+                                    ] %1
+                                    in (%2)
+                                }},
+                            ]
+                        in (%2)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
         let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
         let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
         assert_eq!(
@@ -23633,7 +23670,8 @@ mod tests {
         // The body computes `parallel_reduce(sin(parallel_vary(x)))` over a replicated scalar with an explicit strided
         // layout, so the residual `cos(parallel_vary(x))` is a varying scalar with that layout. It crosses as a single
         // element vector, which a reshape cannot give a layout, so the tangent body converts it back to its exact type
-        // with an unchecked cast after the reshape.
+        // with an unchecked cast after the reshape. The tangents have no explicit layout, because a tangent need not be
+        // stored like its primal.
         let strided_type = f32_type(&[], None).with_layout(Layout::Strided(StridedLayout::new(Vec::new())));
         let replicated = Sharding::replicated(manual_mesh(), 0);
         let program = trace_test_program(
@@ -23659,6 +23697,8 @@ mod tests {
         let varying_sharding = "{mesh<['x'=2:manual]>, [], varying_manual={'x'}}";
         let varying = format!("f32[][layout=strided{{}}][sharding={varying_sharding}]");
         let unpacked = format!("f32[][sharding={varying_sharding}]");
+        let tangent = format!("f32[][sharding={replicated}]");
+        let varying_tangent = format!("f32[][sharding={varying_sharding}]");
         let promoted_sharding = "{mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}";
         let promoted = format!("f32[1][sharding={promoted_sharding}]");
         let edge_sharding = "{mesh<['x'=2:manual]>, [{'x'}]}";
@@ -23690,25 +23730,25 @@ mod tests {
         assert_eq!(
             linearization.tangent().to_string(),
             formatdoc! {"
-                lambda %0:f32[][layout=strided{{}}], %1:{edge} .
-                let %2:{scalar} = shard_map [
+                lambda %0:f32[], %1:{edge} .
+                let %2:{tangent} = shard_map [
                     mesh=['x'=2:manual],
                     input_shardings=[{replicated}, {edge_sharding}],
                     output_shardings=[{replicated}],
                     manual_axes=['x'],
-                    global_input_types=[{scalar}, {edge}],
-                    global_output_types=[{scalar}],
+                    global_input_types=[{tangent}, {edge}],
+                    global_output_types=[{tangent}],
                 ] %0 %1 [
                     body={{
-                        lambda %0:{scalar}, %1:{promoted} .
+                        lambda %0:{tangent}, %1:{promoted} .
                         let %2:{unpacked} = reshape [shape=[], output_sharding={varying_sharding}] %1
                             %3:{varying} = cast [
                                 type={varying},
                                 inputs=[{unpacked}],
                             ] %2
-                            %4:{varying} = parallel_vary [axis_name=\"x\"] %0
-                            %5:{varying} = mul %3 %4
-                            %6:{scalar} = parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %5
+                            %4:{varying_tangent} = parallel_vary [axis_name=\"x\"] %0
+                            %5:{varying_tangent} = mul %3 %4
+                            %6:{tangent} = parallel_reduce [kind=sum, axis_name=\"x\", mesh=['x'=2:manual]] %5
                         in (%6)
                     }},
                 ]

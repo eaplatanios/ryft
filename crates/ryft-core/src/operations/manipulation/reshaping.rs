@@ -1037,9 +1037,9 @@ impl_differentiable_operation! {
                                 check_count!("output", outputs, 1, ProgramError);
                                 let cotangent = outputs.remove(0);
 
-                                // The inverse shape is exact, but reshape clears layouts and may need replicated
-                                // bridge sharding. Restore the original cotangent's complete storage metadata after
-                                // reconstructing the shape, just as the homogeneous rule's unalignment does.
+                                // The inverse shape is exact, but the reshape may need replicated bridge sharding.
+                                // Restore the placement of the original cotangent after reconstructing the shape,
+                                // just as the homogeneous rule's unalignment does.
                                 let cotangent =
                                     if <&ArrayType>::try_from(cotangent.r#type().as_ref())? != &transpose_target_type {
                                         transpose_context.bind_array(

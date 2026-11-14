@@ -1397,8 +1397,8 @@ impl_differentiable_operation! {
 
                             // The adjoint exchange has the type of its `output` input, which is a zero of the
                             // exact cotangent type of `operand`, so the operand cotangent needs no conversion. The
-                            // mask restores the shape of the output cotangent but not its layout, so that one is
-                            // returned at the exact cotangent type of `output`.
+                            // mask restores the shape of the output cotangent, and that one is returned at the
+                            // cotangent type of `output`.
                             let output_cotangent = match output_cotangent {
                                 MaybeZero::Value(value) => {
                                     let target = output.r#type().cotangent()?;

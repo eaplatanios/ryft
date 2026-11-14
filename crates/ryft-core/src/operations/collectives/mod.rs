@@ -181,8 +181,8 @@ use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::sharding::reshard::Reshard;
 use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, Operation, OperationProjection, ProgramError, RegionInterface, TypeError, TypeRefinements, Typed, Value,
-    ValueProjection,
+    MaybeZero, Operation, OperationProjection, ProgramError, RegionInterface, Type, TypeError, TypeRefinements, Typed,
+    Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -794,10 +794,9 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> + CollectiveOperati
     }
 
     /// Implements [`TransposableOperation::transpose`](crate::TransposableOperation::transpose) for this collective
-    /// by staging its [`adjoint`](Self::adjoint) on the output cotangent and returning the result at the exact input
-    /// cotangent type, including its layout. A known input or a structural zero output cotangent contributes nothing,
-    /// which leaves the input cotangent a structural zero. An ignored input cotangent also needs no adjoint
-    /// instructions.
+    /// by staging its [`adjoint`](Self::adjoint) on the output cotangent and returning the result at the input
+    /// cotangent type. A known input or a structural zero output cotangent contributes nothing, which leaves
+    /// the input cotangent a structural zero. An ignored input cotangent also needs no adjoint instructions.
     fn linear_collective_transpose<
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType>
@@ -934,7 +933,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
     /// Implements [`jvp_in_parent`](crate::MemberDifferentiableOperation::jvp_in_parent) for this collective. The
     /// explicit output extents and the exact input shape become ordinary residuals of one linear call, whose transpose
     /// applies the [`adjoint`](LinearCollectiveOperation::adjoint) of the primal array input to the output cotangent
-    /// and returns the result at the exact input cotangent type, including its layout.
+    /// and returns the result at the input cotangent type.
     fn shape_changing_collective_jvp_in_parent<
         C: Context<
                 Type = ArrayIrType,
@@ -1788,11 +1787,12 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
     if axis == 0 { Ok(routed) } else { Ok(routed.move_axis(0, axis)?) }
 }
 
-/// Returns the input cotangent `cotangent` of a collective's transposition at exactly the type `target`, which the
-/// cotangent accumulator of transposition requires. The adjoint collectives and reshapes that produce the cotangent
-/// restore its shape, placement, and memory kind but not its layout (e.g., resizing an axis clears it), so when only
-/// the layout differs, an unchecked cast, whose relationship holds for that reason, requests the target type.
-/// A cotangent that already has the target type is returned unchanged, so nothing is staged for it.
+/// Returns the input cotangent `cotangent` of a collective's transposition at a type that the cotangent accumulator
+/// of transposition accepts for the type `target`. The adjoint collectives and reshapes that produce the cotangent
+/// restore its shape, placement, and memory kind, so a cotangent whose type is interchangeable with the target
+/// (i.e., one that is at most stored differently, refer to [`Type::is_interchangeable_with`]) is returned unchanged
+/// and nothing is staged for it. Any other cotangent holds the same elements, and an unchecked cast, whose
+/// relationship holds for that reason, requests the target type.
 fn with_cotangent_type<C: Context<Type: CastType>>(
     context: &C,
     cotangent: C::Value,
@@ -1802,7 +1802,7 @@ where
     C::Operation: From<CastOperation<C::Type>>,
 {
     let cotangent_type = cotangent.r#type().into_owned();
-    if cotangent_type == target {
+    if target.is_interchangeable_with(&cotangent_type) {
         return Ok(cotangent);
     }
     let cast = CastOperation::unchecked(target, vec![cotangent_type])?;
@@ -1815,7 +1815,7 @@ where
 /// at a type that the linear call accepts for the input cotangent type `target`. The linear call accepts any type that
 /// refines `target` in both directions (e.g., the static extent of a nominal dimension whose bounds admit only that
 /// extent, for which no value of the region carries the nominal identity), so such an output is returned unchanged,
-/// and any other output is converted by [`with_cotangent_type`] (e.g., one whose layout differs).
+/// and any other output is converted by [`with_cotangent_type`].
 fn adapt_linear_call_cotangent<C: Context<Type = ArrayIrType>>(
     context: &C,
     output: C::Value,

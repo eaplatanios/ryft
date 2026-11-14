@@ -1831,6 +1831,16 @@ fn validate_attention_inputs(
         )));
     }
 
+    // The attention weights and the attended output are converted to the query data type, and `f8e8m0fnu` represents
+    // neither zero nor negative values, so it can hold neither the zero weight of a hidden position nor the weighted
+    // sums of the output.
+    if data_type == DataType::F8E8M0FNU {
+        return Err(TypeError::invalid(format!(
+            "`{operation_name}` does not support `{data_type}` inputs, because that data type represents neither \
+             zero nor negative values",
+        )));
+    }
+
     for (descriptor, dimensions, input_type) in [("key", &key, key_type), ("value", &value, value_type)] {
         if input_type.data_type() != data_type {
             return Err(TypeError::invalid(format!(
@@ -2737,7 +2747,11 @@ where
         // probabilities that multiply those differences. Doubling a probability is exact and cannot overflow, so
         // each product is rounded once to the logit cotangent itself. Returning the factor only afterwards would let
         // the product of a tiny probability with a halved difference underflow first, and folding it into the score
-        // scale would let a large scale overflow.
+        // scale would let a large scale overflow. The weight cotangents themselves have to be representable, though.
+        // A product of an output cotangent with a value that is beyond the range of the score data type overflows in
+        // the contraction above, before any of this, and the query, key, and bias cotangents of its row are then NaN.
+        // Avoiding that would mean rescaling every row of the output cotangent, which costs every other gradient an
+        // additional rounding.
         let zero = weights.fill_like(0.0)?;
         let halved_weight_cotangents = weight_cotangents.mul(&weights.fill_like(0.5)?)?;
         let pivot_cotangent = is_pivot.select(&halved_weight_cotangents, &zero)?.reduce(&[3], ReductionKind::Sum)?;
@@ -3113,6 +3127,41 @@ fn batch_attention<
         }
     };
 
+    // A fold merges the mapped axis and the logical batch axis that follows it, and an unfold splits them again. Both
+    // state the placement of their outputs, which is that of their inputs along the dimensions that they keep, because
+    // a reshape that changes a dynamic extent cannot infer where those dimensions go. The folded batch axis takes the
+    // placement of the mapped axis, since the logical batch axis is replicated first.
+    let fold = |value: V, extents: &[<V as DimensionSize>::Extent]| -> Result<V, ProgramError> {
+        let value = replicate_dimensions(value, &[1])?;
+        let sharding = value
+            .r#type()
+            .as_array_type()?
+            .sharding()
+            .map(|sharding| {
+                let mut dimensions = sharding.dimensions().to_vec();
+                dimensions.remove(1);
+                sharding.with_dimensions(dimensions)
+            })
+            .transpose()
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        value.dynamic_reshape_with_output_sharding(extents, sharding)
+    };
+
+    let unfold = |value: V, extents: &[<V as DimensionSize>::Extent]| -> Result<V, ProgramError> {
+        let sharding = value
+            .r#type()
+            .as_array_type()?
+            .sharding()
+            .map(|sharding| {
+                let mut dimensions = sharding.dimensions().to_vec();
+                dimensions.insert(1, ShardingDimension::Replicated);
+                sharding.with_dimensions(dimensions)
+            })
+            .transpose()
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        value.dynamic_reshape_with_output_sharding(extents, sharding)
+    };
+
     // Fold the mapped axis into attention's batch axis and stage the definition at the folded boundary.
     let folded = aligned
         .iter()
@@ -3125,7 +3174,7 @@ fn batch_attention<
                     // is another dimension to the validation of the folded call, even when it has the same value.
                     let folded_extents =
                         std::iter::once(folded_batch_extent.clone()).chain(extents(value, 2)?).collect::<Vec<_>>();
-                    replicate_dimensions(value.clone(), &[1])?.dynamic_reshape(folded_extents.as_slice())
+                    fold(value.clone(), folded_extents.as_slice())
                 }
                 AttentionBatchInput::Tensor => Ok(value.clone()),
                 AttentionBatchInput::Score => {
@@ -3142,19 +3191,18 @@ fn batch_attention<
                     let output_axes = std::iter::once(0).chain(offset..normalized_extents.len()).collect::<Vec<_>>();
                     let normalized = value.dynamic_broadcast(normalized_extents.as_slice(), output_axes.as_slice())?;
                     match folded_extents {
-                        Some(folded_extents) => {
-                            replicate_dimensions(normalized, &[1])?.dynamic_reshape(folded_extents.as_slice())
-                        }
+                        Some(folded_extents) => fold(normalized, folded_extents.as_slice()),
                         None => Ok(normalized),
                     }
                 }
-                AttentionBatchInput::Length if rank == 2 => replicate_dimensions(value.clone(), &[1])?
-                    .dynamic_reshape(std::slice::from_ref(&folded_batch_extent)),
+                AttentionBatchInput::Length if rank == 2 => {
+                    fold(value.clone(), std::slice::from_ref(&folded_batch_extent))
+                }
                 AttentionBatchInput::Length => value.dynamic_reshape(std::slice::from_ref(&folded_batch_extent)),
                 AttentionBatchInput::Residual if rank == 4 => {
                     let folded_extents =
                         std::iter::once(folded_batch_extent.clone()).chain(extents(value, 2)?).collect::<Vec<_>>();
-                    replicate_dimensions(value.clone(), &[1])?.dynamic_reshape(folded_extents.as_slice())
+                    fold(value.clone(), folded_extents.as_slice())
                 }
                 AttentionBatchInput::Residual => Ok(value.clone()),
             }
@@ -3179,7 +3227,7 @@ fn batch_attention<
                         .into_iter()
                         .chain(extents(&output, 1)?)
                         .collect::<Vec<_>>();
-                    output.dynamic_reshape(unfolded_extents.as_slice())?
+                    unfold(output, unfolded_extents.as_slice())?
                 } else {
                     output
                 };
@@ -3198,7 +3246,7 @@ fn batch_attention<
                         .into_iter()
                         .chain(extents(&output, 1)?)
                         .collect::<Vec<_>>();
-                    place_batch_axis(output.dynamic_reshape(unfolded_extents.as_slice())?)
+                    place_batch_axis(unfold(output, unfolded_extents.as_slice())?)
                 }
                 None => Ok(output),
             },
@@ -3210,7 +3258,7 @@ fn batch_attention<
                 })?;
 
                 let normalized = match folded_extents {
-                    Some(_) => output.dynamic_reshape(normalized_extents.as_slice())?,
+                    Some(_) => unfold(output, normalized_extents.as_slice())?,
                     None => output,
                 };
 
@@ -4172,6 +4220,12 @@ mod tests {
                 plain,
                 vec![ArrayType::new_static(DataType::I32, [2, 2, 2]), key_value.clone(), key_value.clone()],
                 "requires floating-point inputs but got data type `i32`",
+            ),
+            (
+                plain,
+                vec![ArrayType::new_static(DataType::F8E8M0FNU, [2, 2, 2]); 3],
+                "does not support `f8e8m0fnu` inputs, because that data type represents neither zero nor negative \
+                 values",
             ),
             (
                 plain,
@@ -5861,6 +5915,48 @@ mod tests {
             )),
             Ok(ArrayIrValue::Array(f32_array(&[3, 2, 1, 1, 1], expected.as_slice()))),
         );
+    }
+
+    #[test]
+    fn test_dot_product_attention_batching_dynamic_shapes_sharding() {
+        // A reshape that changes a dynamic extent cannot infer where the dimensions that it keeps are placed, so the
+        // folds and unfolds of the batching rule state the placement of their outputs. Here the logical batch extent
+        // is dynamic and a mesh axis shards the heads, which neither the fold nor the unfold changes.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4)).unwrap());
+        let placed = |dimensions: Vec<Dimension>, head_axis: usize| {
+            let mut placements = vec![ShardingDimension::Replicated; dimensions.len()];
+            placements[head_axis] = ShardingDimension::sharded(["x"]);
+            ArrayType::new(DataType::F32, Shape::new(dimensions))
+                .with_sharding(Sharding::new(mesh.clone(), placements).unwrap())
+                .unwrap()
+        };
+        let batch_dimension = Dimension::Dynamic(batch_variable);
+        let packed_type = placed(
+            vec![
+                Dimension::Static(2),
+                batch_dimension.clone(),
+                Dimension::Static(1),
+                Dimension::Static(2),
+                Dimension::Static(1),
+            ],
+            3,
+        );
+        let residual_type =
+            placed(vec![Dimension::Static(2), batch_dimension, Dimension::Static(1), Dimension::Static(2)], 3);
+        let function = dot_product_attention::<ArrayIrContext>(AttentionConfiguration::new());
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = context.input(packed_type.clone().into());
+        let (output, residual) = batch(
+            |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
+            AttentionInputs::new(input.clone(), input.clone(), input),
+            AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0)),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(packed_type));
+        assert_eq!(residual.r#type().as_ref(), &ArrayIrType::Array(residual_type));
     }
 
     #[test]

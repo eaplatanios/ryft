@@ -5269,7 +5269,8 @@ mod tests {
             ArrayIrValue::Array(Array::from_elements(concrete_type.with_layout(None), &[6f32, 15.]).unwrap(),)
         );
 
-        // An identity broadcast can add layout metadata that must be removed from its input cotangent.
+        // An identity broadcast can add layout metadata to its output. Cotangent types have no explicit layout, so
+        // neither the seed nor the input cotangent has that metadata.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.clone().into()]));
         let layout = Layout::Strided(StridedLayout::new(vec![4]));
@@ -5309,7 +5310,8 @@ mod tests {
             ArrayIrValue::Array(Array::from_elements(output_type.clone(), &[1f32, 2.]).unwrap(),)
         );
         let residuals = primal_outputs.split_off(primal_outputs.len() - linearization.residual_count());
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::from_elements(output_type, &[3f32, 4.]).unwrap())];
+        let seed_type = output_type.with_layout(None);
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::from_elements(seed_type, &[3f32, 4.]).unwrap())];
         pullback_inputs.extend(residuals);
         assert_eq!(
             pullback.interpret(pullback_inputs).unwrap()[0],

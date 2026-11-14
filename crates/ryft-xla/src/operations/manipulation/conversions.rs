@@ -2220,20 +2220,18 @@ mod tests {
             .to_string();
         assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
 
-        // Differentiation retains the checked primal relation even when the tangent already has the output type. Both
+        // Differentiation retains the checked primal relation even when the tangent already has the type of the output
+        // tangent, which has no explicit layout because a tangent does not have to be stored like its primal. Both
         // sides of the tangent cast carry `a` and `b`, so it needs no identity witness, but it depends on the guarded
         // primal output so that it stays behind the check.
         let differentiated = program.jvp().unwrap();
         assert_eq!(
             differentiated.to_string(),
             indoc! {"
-                lambda %0:f64[a, b][layout=tiled{1,0}], %1:f64[a, b][layout=tiled{1,0}] .
+                lambda %0:f64[a, b][layout=tiled{1,0}], %1:f64[a, b] .
                 let %2:f64[a, b][layout=tiled{1,0}] = guard [boundary=\"square\", declared_types=[f64[p, p]], \
                     retained_identities=[a, b]] %0
-                    %3:f64[a, b][layout=tiled{1,0}] = cast [
-                        type=f64[a, b][layout=tiled{1,0}],
-                        inputs=[f64[a, b][layout=tiled{1,0}], f64[a, b][layout=tiled{1,0}]],
-                    ] %1 %2
+                    %3:f64[a, b] = cast [type=f64[a, b], inputs=[f64[a, b], f64[a, b][layout=tiled{1,0}]]] %1 %2
                 in (%2, %3)"},
         );
         let inputs = [input.clone(), input];

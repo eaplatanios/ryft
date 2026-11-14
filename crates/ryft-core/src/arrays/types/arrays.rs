@@ -12,8 +12,8 @@ use crate::arrays::sharding::shardings::{Sharding, ShardingDimension, UnreducedK
 use crate::arrays::sharding::{ShardableType, ShardingError};
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{
-    Dimension, DimensionComparison, DimensionRefinementFact, DimensionRefinements, DimensionVariable, Shape,
-    StaticShape,
+    Dimension, DimensionComparison, DimensionRefinementFact, DimensionRefinements, DimensionType, DimensionVariable,
+    Shape, StaticShape,
 };
 use crate::arrays::types::layouts::Layout;
 use crate::arrays::types::memories::Memory;
@@ -700,8 +700,26 @@ impl Type for ArrayType {
 
     #[inline]
     fn is_interchangeable_with(&self, other: &Self) -> bool {
-        // An explicit layout describes how one array is stored, not which array it is.
-        self == other || self.clone().with_layout(None) == other.clone().with_layout(None)
+        // An explicit layout describes how one array is stored, not which array it is, so it is not compared. Neither
+        // is the identity of a nominal extent whose bounds admit a single extent, because such a type describes
+        // exactly the arrays that the type with that static extent describes, so extents are compared after
+        // simplification (refer to `DimensionType::simplified_dimension`).
+        if self == other {
+            return true;
+        }
+        let extents = |r#type: &Self| {
+            r#type
+                .payload
+                .shape
+                .dimensions()
+                .iter()
+                .map(|dimension| DimensionType::from(dimension.clone()).simplified_dimension())
+                .collect::<Vec<_>>()
+        };
+        self.payload.data_type == other.payload.data_type
+            && self.payload.sharding == other.payload.sharding
+            && self.payload.memory == other.payload.memory
+            && extents(self) == extents(other)
     }
 
     #[inline]
@@ -1177,6 +1195,17 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let replicated = strided.clone().with_sharding(Sharding::replicated(mesh, 2)).unwrap();
         assert!(!strided.is_interchangeable_with(&replicated));
+
+        // A nominal extent whose bounds admit a single extent describes the same arrays as that static extent,
+        // while one whose bounds admit other extents as well does not.
+        let nominal = |name: &str, upper| {
+            let variable = DimensionVariable::new(name, DimensionBounds::new(2, Some(upper)).unwrap());
+            ArrayType::new(F32, Shape::new(vec![Dimension::Dynamic(variable), Dimension::Static(3)]))
+        };
+        assert!(plain.is_interchangeable_with(&nominal("n", 3)));
+        assert!(nominal("n", 3).is_interchangeable_with(&strided));
+        assert!(!plain.is_interchangeable_with(&nominal("m", 4)));
+        assert!(!nominal("m", 4).is_interchangeable_with(&plain));
     }
 
     #[test]

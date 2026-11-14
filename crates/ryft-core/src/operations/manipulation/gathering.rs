@@ -4407,10 +4407,8 @@ mod tests {
                             lambda %0:i32[2, 1]@Host[Pinned], %1:dimension<4>, \
                                 %2:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
                             let %3:f64[extent][sharding={mesh<['x'=2:explicit]>, \
-                                [{'x'}]}]@Host[Pinned] = zero [
-                                type=f64[extent][sharding={mesh<['x'=2:explicit]>, \
-                                    [{'x'}]}]@Host[Pinned],
-                            ] %1
+                                [{'x'}]}]@Host[Pinned] = zero \
+                                [type=f64[extent][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned]] %1
                                 %4:f64[extent][sharding={mesh<['x'=2:explicit]>, \
                                     [{'x'}]}]@Host[Pinned] = scatter [
                                     kind=add,

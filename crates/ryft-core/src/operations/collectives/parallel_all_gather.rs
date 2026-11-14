@@ -1075,9 +1075,8 @@ where
                 let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
                 let input_shape = residuals.retain_shape(context, array.primal())?;
 
-                // Each region closure owns its copy of the operation and of the residual slots that it reads. The
-                // input cotangent type supplies the sharding and layout that the transpose region restores on its
-                // result.
+                // Each region closure owns its copy of the operation and of the residual slots that it reads.
+                // The input cotangent type supplies the sharding that the transpose region restores on its result.
                 let forward_operation = self.clone();
                 let forward_output_extents = output_extents.clone();
                 let transpose_operation = self.clone();
@@ -1254,7 +1253,7 @@ where
 
                         // Reshaping to the exact input dimensions removes the size-one participant axis of an untiled
                         // chunk and leaves a tiled chunk's shape unchanged, while assigning the input cotangent's
-                        // sharding to the result in both modes. The input cotangent's layout is restored last.
+                        // sharding to the result in both modes.
                         let mut reshape_inputs = Vec::with_capacity(1 + input_dimensions.len());
                         reshape_inputs.push(selected);
                         reshape_inputs.extend(input_dimensions);
@@ -3817,6 +3816,7 @@ mod tests {
             "}
             .trim_end(),
         );
+        assert_eq!(linearization.pullback().unwrap().program().to_string(), "");
     }
 
     #[test]
