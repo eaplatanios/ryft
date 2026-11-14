@@ -257,13 +257,21 @@ fn fmha_portable_head_dimension_limit(training: bool) -> usize {
 
 /// Returns the sliding window length of the cuDNN fMHA configuration, which is the left radius of the local window
 /// and the position itself, and zero without a window. A window whose length the 32-bit configuration cannot
-/// represent admits every position of every sequence, so it is no window either.
+/// represent admits every earlier position of every sequence, so it records no window and is causal masking instead
+/// (refer to [`fmha_is_causal`]).
 fn fmha_sliding_window_length(configuration: AttentionConfiguration) -> usize {
     configuration
         .local_window()
         .and_then(|(left, _)| left.checked_add(1))
         .filter(|length| *length <= i32::MAX as usize)
         .unwrap_or(0)
+}
+
+/// Returns whether the cuDNN fMHA configuration masks causally, which it does for causal attention and for a local
+/// window that [`fmha_sliding_window_length`] cannot record. Such a window still hides every later position, because
+/// the fused kernels only take windows whose right radius is zero, and that is exactly causal masking.
+fn fmha_is_causal(configuration: AttentionConfiguration) -> bool {
+    configuration.causal() || (configuration.local_window().is_some() && fmha_sliding_window_length(configuration) == 0)
 }
 
 /// Result of checking one attention boundary against the complete cuDNN fMHA contract.
@@ -602,7 +610,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
             element_type,
             [physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
             configuration.scale_for(head_dimension),
-            fmha_mask_type(configuration.causal(), sequence_lengths.is_some()),
+            fmha_mask_type(fmha_is_causal(configuration), sequence_lengths.is_some()),
             FMHA_FORWARD_DOT_DIMENSION_NUMBERS,
             configuration.dropout(),
             fmha_sliding_window_length(configuration),
@@ -814,7 +822,7 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
             element_type,
             [physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
             configuration.scale_for(head_dimension),
-            fmha_mask_type(configuration.causal(), sequence_lengths.is_some()),
+            fmha_mask_type(fmha_is_causal(configuration), sequence_lengths.is_some()),
             FMHA_BACKWARD_DOT_DIMENSION_NUMBERS,
             configuration.dropout(),
             fmha_sliding_window_length(configuration),
@@ -1351,7 +1359,15 @@ mod tests {
         assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmaxDropout("));
         assert!(module.contains("\\22dropout_rate\\22:0.5,\\22seed\\22:42,\\22sliding_window_length\\22:2"));
 
-        // A left radius whose window length is not representable admits every position, so it records no window.
+        // A left radius whose window length is not representable admits every earlier position, so it records no
+        // window. Its zero right radius still hides every later position, which is causal masking, including for a
+        // configuration that does not request it.
+        let (input_structure, input_types) = extended_input_types(DataType::BF16, 2, 2, false, false);
+        let unbounded = AttentionConfiguration::new().with_scale(0.125).with_local_window((usize::MAX, 0));
+        let module = lower(&forward_program(unbounded, input_structure, false, input_types, 1), Some("cuda")).unwrap();
+        assert!(module.contains("\\22sliding_window_length\\22:0"));
+        assert!(module.contains("CAUSAL"));
+        assert!(!module.contains("NO_MASK"));
         let (input_structure, input_types) = extended_input_types(DataType::BF16, 2, 2, false, false);
         let unbounded = configuration.with_local_window((usize::MAX, 0));
         let module = lower(&forward_program(unbounded, input_structure, false, input_types.clone(), 1), Some("cuda"));

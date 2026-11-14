@@ -405,8 +405,8 @@ mod tests {
         LogicalMesh, MeshAxis, MeshAxisType, PARALLEL_BROADCAST_OPERATION_NAME, ParallelAllGather, ParallelAllToAll,
         ParallelArgExtrema, ParallelBroadcast, ParallelCast, ParallelCastTarget, ParallelPermute, ParallelReduce,
         ParallelSumScatter, Placeholder, ProjectedValue, ReductionKind, ReshapeOperation, Shape, ShardMapOptions,
-        Typed, UnreducedKind, Value as CoreValue, ValueProjection, batch, differentiate_at, shard_map, shard_map_along,
-        shard_map_with_inferred_input_shardings,
+        Typed, UnreducedKind, Value as CoreValue, ValueProjection, batch, differentiate_at, explicit_axes, shard_map,
+        shard_map_along, shard_map_with_inferred_input_shardings,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -801,10 +801,10 @@ mod tests {
 
     #[test]
     fn test_to_mlir_module_for_program_lowers_collectives_over_nested_meshes_that_retype_free_axes() {
-        // An outer map over `x` contains an inner map over `y` whose mesh types the free axis `z` as explicit instead of
-        // auto, as `explicit_axes` does for the maps inside it. A collective over both manual axes communicates across
-        // both regions. Their meshes share their topology, which is all that its replica groups depend on, so the
-        // groups are those of either mesh.
+        // An outer map over `x` contains an inner map over `y` inside `explicit_axes`, which types the free axis `z` as
+        // explicit instead of auto, so the meshes of the two maps differ in the type of `z`. A collective over both
+        // manual axes communicates across both regions. Their meshes share their topology, which is all that its
+        // replica groups depend on, so the groups are those of either mesh.
         let mesh = |free_axis_type| {
             LogicalMesh::new(vec![
                 MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
@@ -817,19 +817,27 @@ mod tests {
         let inner_mesh = mesh(MeshAxisType::Explicit);
         let module = shard_map_module::<_, ArrayType, ArrayType>(
             {
+                let outer_mesh = outer_mesh.clone();
                 let inner_mesh = inner_mesh.clone();
                 move |_, x: ArrayTracer| {
-                    let nested: ArrayTracer = shard_map(
-                        |y: ArrayTracer| {
-                            Ok(y.parallel_all_gather(["x", "y"], 0)?
-                                .parallel_reduce(ReductionKind::Sum, "x")?
-                                .parallel_reduce(ReductionKind::Sum, "y")?)
+                    let nested: ArrayTracer = explicit_axes(
+                        |x: ArrayTracer| {
+                            Ok(shard_map(
+                                |y: ArrayTracer| {
+                                    Ok(y.parallel_all_gather(["x", "y"], 0)?
+                                        .parallel_reduce(ReductionKind::Sum, "x")?
+                                        .parallel_reduce(ReductionKind::Sum, "y")?)
+                                },
+                                x,
+                                inner_mesh.clone(),
+                                Sharding::replicated(inner_mesh.clone(), 0),
+                                Sharding::replicated(inner_mesh.clone(), 1),
+                                ShardMapOptions::new().with_manual_axes(["y"]),
+                            )?)
                         },
                         x,
-                        inner_mesh.clone(),
-                        Sharding::replicated(inner_mesh.clone(), 0),
-                        Sharding::replicated(inner_mesh.clone(), 1),
-                        ShardMapOptions::new().with_manual_axes(["y"]),
+                        Some(&["z"]),
+                        Sharding::replicated(outer_mesh.clone(), 0),
                     )?;
                     Ok(nested)
                 }
@@ -841,7 +849,37 @@ mod tests {
             ShardMapOptions::new().with_manual_axes(["x"]),
         )
         .unwrap();
-        assert_eq!(module, "");
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2, "y"=2, "z"=1]>
+                  func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={"x", "y"}>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={"x", "y"}>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [], replicated={"x", "y"}>] out_shardings=[<@mesh, [{?}], replicated={"x", "y"}>] manual_axes={"x"} (%arg1: tensor<f32>) {
+                      %1 = sdy.sharding_constraint %arg1 <@mesh, [], replicated={"y", "z"}> : tensor<f32>
+                      %2 = sdy.manual_computation(%1) in_shardings=[<@mesh, [], replicated={"y", "z"}>] out_shardings=[<@mesh, [{?}], replicated={"y", "z"}>] manual_axes={"y"} (%arg2: tensor<f32>) {
+                        %4 = stablehlo.broadcast_in_dim %arg2, dims = [] : (tensor<f32>) -> tensor<1xf32>
+                        %5 = "stablehlo.all_gather"(%4) <{all_gather_dim = 0 : i64, channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>, use_global_device_ids}> : (tensor<1xf32>) -> tensor<4xf32>
+                        %6 = "stablehlo.all_reduce"(%5) <{channel_handle = #stablehlo.channel_handle<handle = 2, type = 1>, replica_groups = dense<[[0, 2], [1, 3]]> : tensor<2x2xi64>, use_global_device_ids}> ({
+                        ^bb0(%arg3: tensor<f32>, %arg4: tensor<f32>):
+                          %8 = stablehlo.add %arg3, %arg4 : tensor<f32>
+                          stablehlo.return %8 : tensor<f32>
+                        }) : (tensor<4xf32>) -> tensor<4xf32>
+                        %7 = "stablehlo.all_reduce"(%6) <{channel_handle = #stablehlo.channel_handle<handle = 3, type = 1>, replica_groups = dense<[[0, 1], [2, 3]]> : tensor<2x2xi64>, use_global_device_ids}> ({
+                        ^bb0(%arg3: tensor<f32>, %arg4: tensor<f32>):
+                          %8 = stablehlo.add %arg3, %arg4 : tensor<f32>
+                          stablehlo.return %8 : tensor<f32>
+                        }) : (tensor<4xf32>) -> tensor<4xf32>
+                        sdy.return %7 : tensor<4xf32>
+                      } : (tensor<f32>) -> tensor<4xf32>
+                      %3 = sdy.sharding_constraint %2 <@mesh, [{?}], replicated={"y"}> : tensor<4xf32>
+                      sdy.return %3 : tensor<4xf32>
+                    } : (tensor<f32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]

@@ -2041,6 +2041,7 @@ fn prepare_attention<
         + Broadcast
         + BroadcastLike
         + ConvertElementType
+        + Reduce
         + Reshard,
 >(
     operation_name: &str,
@@ -2192,9 +2193,14 @@ fn prepare_attention<
         // any visible position still has a finite maximum and a finite log-sum-exp residual. The value is finite
         // in the softmax data type for every data type of the scores, because a value that is only finite in `f64`
         // would become negative infinity when the logits are converted for the softmax. At least one of the masks
-        // above is present on this path, so the visibility is known.
-        let masked = scores.fill_like(-0.7 * f32::MAX as f64)?;
+        // above is present on this path, so the visibility is known. That value only stands in for the scores of rows
+        // without any visible position, which attend uniformly. In every other row the invisible scores are negative
+        // infinity, so that they have exactly zero probability however small the visible scores of the row are (e.g.,
+        // with a bias below the finite value).
         let mask = mask.unwrap();
+        let has_visible = mask.reduce(&[3], ReductionKind::Any)?.broadcast_like(&mask, &[0, 1, 2])?;
+        let masked =
+            has_visible.select(&scores.fill_like(f64::NEG_INFINITY)?, &scores.fill_like(-0.7 * f32::MAX as f64)?)?;
         (mask.select(&scores, &masked)?, Some(mask))
     };
 
@@ -3071,17 +3077,24 @@ fn batch_attention<
     // A mesh axis that shards the logical batch axis cannot shard the folded batch axis, whose shards would interleave
     // the batch items of the mapped axis, so the inputs are replicated along the logical batch axis before they are
     // folded. The outputs return to that placement below. The logical batch axis follows the mapped axis in every
-    // aligned input that has one, and the placements of those inputs along it agree wherever they are not replicated,
-    // as they do for every batch item of the call.
+    // aligned input that has one (i.e., in a rank-4 query, key, value, or bias or mask, in a residual of rank-4
+    // attention, and in sequence lengths), and the placements of those inputs along it agree wherever they are not
+    // replicated, as they do for every batch item of the call. An aligned input of lower rank has another axis there
+    // (e.g., the sequence axis of a rank-3 key).
     let batch_placement = aligned
         .iter()
         .zip(input_roles)
-        .filter(|(_, role)| !matches!(role, AttentionBatchInput::Score))
-        .map(|(value, _)| -> Result<Option<ShardingDimension>, ProgramError> {
+        .map(|(value, role)| -> Result<Option<ShardingDimension>, ProgramError> {
             let r#type = value.r#type().as_array_type()?.clone();
+            let has_batch_axis = batch_extent.is_some()
+                && match role {
+                    AttentionBatchInput::Tensor | AttentionBatchInput::Score => r#type.rank() == 5,
+                    AttentionBatchInput::Residual => r#type.rank() == 4,
+                    AttentionBatchInput::Length => r#type.rank() == 2,
+                };
             Ok(r#type
                 .sharding()
-                .filter(|_| batch_extent.is_some() && r#type.rank() > 1)
+                .filter(|_| has_batch_axis)
                 .map(|sharding| (&sharding.dimensions()[1], sharding.mesh()))
                 .filter(|(dimension, mesh)| dimension.has_explicit_axis(mesh))
                 .map(|(dimension, _)| dimension.clone()))
@@ -3728,22 +3741,27 @@ mod tests {
                             %7:i32[1, 1, 2, 2] = iota [type=i32[1, 1, 2, 2], dimension=3]
                             %8:i32[1, 1, 2, 2] = iota [type=i32[1, 1, 2, 2], dimension=2]
                             %9:bool[1, 1, 2, 2] = compare [direction=LessThanOrEqual] %7 %8
-                            %10:f32[] = constant [value=-2.3819763e38]
-                            %11:f32[1, 1, 2, 2] = broadcast [output_type=f32[1, 1, 2, 2], output_axes=[]] %10
-                            %12:f32[1, 1, 2, 2] = select %9 %6 %11
-                            %13:f32[1, 1, 2] = reduce [kind=max, axes=[3]] %12
-                            %14:f32[1, 1, 2, 2] = broadcast [output_type=f32[1, 1, 2, 2], output_axes=[0, 1, 2]] %13
-                            %15:f32[1, 1, 2, 2] = sub %12 %14
-                            %16:f32[1, 1, 2, 2] = exp %15
-                            %17:f32[1, 1, 2] = reduce [kind=sum, axes=[3]] %16
-                            %18:f32[1, 1, 2, 2] = broadcast [output_type=f32[1, 1, 2, 2], output_axes=[0, 1, 2]] %17
-                            %19:f32[1, 1, 2, 2] = div %16 %18
-                            %20:f32[1, 1, 2, 1] = dot [
+                            %10:bool[1, 1, 2] = reduce [kind=any, axes=[3]] %9
+                            %11:bool[1, 1, 2, 2] = broadcast [output_type=bool[1, 1, 2, 2], output_axes=[0, 1, 2]] %10
+                            %12:f32[] = constant [value=-inf]
+                            %13:f32[1, 1, 2, 2] = broadcast [output_type=f32[1, 1, 2, 2], output_axes=[]] %12
+                            %14:f32[] = constant [value=-2.3819763e38]
+                            %15:f32[1, 1, 2, 2] = broadcast [output_type=f32[1, 1, 2, 2], output_axes=[]] %14
+                            %16:f32[1, 1, 2, 2] = select %11 %13 %15
+                            %17:f32[1, 1, 2, 2] = select %9 %6 %16
+                            %18:f32[1, 1, 2] = reduce [kind=max, axes=[3]] %17
+                            %19:f32[1, 1, 2, 2] = broadcast [output_type=f32[1, 1, 2, 2], output_axes=[0, 1, 2]] %18
+                            %20:f32[1, 1, 2, 2] = sub %17 %19
+                            %21:f32[1, 1, 2, 2] = exp %20
+                            %22:f32[1, 1, 2] = reduce [kind=sum, axes=[3]] %21
+                            %23:f32[1, 1, 2, 2] = broadcast [output_type=f32[1, 1, 2, 2], output_axes=[0, 1, 2]] %22
+                            %24:f32[1, 1, 2, 2] = div %21 %23
+                            %25:f32[1, 1, 2, 1] = dot [
                                 dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
                                     rhs_batching=[0, 2]),
-                            ] %19 %2
-                            %21:f32[1, 2, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %20
-                        in (%21)
+                            ] %24 %2
+                            %26:f32[1, 2, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %25
+                        in (%26)
                     },
                 ]
                     %4:f32[1, 2, 1, 1] = composite [
@@ -3808,28 +3826,33 @@ mod tests {
                             %12:i32[1, 1, 1, 1] = broadcast [output_type=i32[1, 1, 1, 1], output_axes=[0]] %3
                             %13:bool[1, 1, 1, 1] = compare [direction=LessThan] %11 %12
                             %14:bool[1, 1, 1, 1] = and %10 %13
-                            %15:f32[] = constant [value=-2.3819763e38]
-                            %16:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %15
-                            %17:f32[1, 1, 1, 1] = select %14 %7 %16
-                            %18:f32[1, 1, 1] = reduce [kind=max, axes=[3]] %17
-                            %19:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %18
-                            %20:f32[1, 1, 1, 1] = sub %17 %19
-                            %21:f32[1, 1, 1, 1] = exp %20
-                            %22:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %21
-                            %23:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %22
-                            %24:f32[1, 1, 1, 1] = div %21 %23
-                            %25:f32[1, 1, 1, 1] = dot [
+                            %15:bool[1, 1, 1] = reduce [kind=any, axes=[3]] %14
+                            %16:bool[1, 1, 1, 1] = broadcast [output_type=bool[1, 1, 1, 1], output_axes=[0, 1, 2]] %15
+                            %17:f32[] = constant [value=-inf]
+                            %18:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %17
+                            %19:f32[] = constant [value=-2.3819763e38]
+                            %20:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %19
+                            %21:f32[1, 1, 1, 1] = select %16 %18 %20
+                            %22:f32[1, 1, 1, 1] = select %14 %7 %21
+                            %23:f32[1, 1, 1] = reduce [kind=max, axes=[3]] %22
+                            %24:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %23
+                            %25:f32[1, 1, 1, 1] = sub %22 %24
+                            %26:f32[1, 1, 1, 1] = exp %25
+                            %27:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %26
+                            %28:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %27
+                            %29:f32[1, 1, 1, 1] = div %26 %28
+                            %30:f32[1, 1, 1, 1] = dot [
                                 dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
                                     rhs_batching=[0, 2]),
-                            ] %24 %2
-                            %26:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %25
-                            %27:i32[1, 1, 1, 1] = iota [type=i32[1, 1, 1, 1], dimension=1]
-                            %28:i32[1, 1, 1, 1] = broadcast [output_type=i32[1, 1, 1, 1], output_axes=[0]] %3
-                            %29:bool[1, 1, 1, 1] = compare [direction=LessThan] %27 %28
-                            %30:f32[] = constant [value=0.0]
-                            %31:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %30
-                            %32:f32[1, 1, 1, 1] = select %29 %26 %31
-                        in (%32)
+                            ] %29 %2
+                            %31:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %30
+                            %32:i32[1, 1, 1, 1] = iota [type=i32[1, 1, 1, 1], dimension=1]
+                            %33:i32[1, 1, 1, 1] = broadcast [output_type=i32[1, 1, 1, 1], output_axes=[0]] %3
+                            %34:bool[1, 1, 1, 1] = compare [direction=LessThan] %32 %33
+                            %35:f32[] = constant [value=0.0]
+                            %36:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %35
+                            %37:f32[1, 1, 1, 1] = select %34 %31 %36
+                        in (%37)
                     },
                 ]
                     %5:f32[1, 1, 1, 1] = composite [
@@ -3852,22 +3875,30 @@ mod tests {
                                 %11:i32[1, 1, 1, 1] = broadcast [output_type=i32[1, 1, 1, 1], output_axes=[0]] %3
                                 %12:bool[1, 1, 1, 1] = compare [direction=LessThan] %8 %11
                                 %13:bool[1, 1, 1, 1] = and %10 %12
-                                %14:f32[] = constant [value=-2.3819763e38]
-                                %15:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %14
-                                %16:f32[1, 1, 1, 1] = select %13 %7 %15
-                                %17:f32[1, 1, 1] = reduce [kind=max, axes=[3]] %16
-                                %18:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %17
-                                %19:f32[1, 1, 1, 1] = sub %16 %18
-                                %20:f32[1, 1, 1, 1] = exp %19
-                                %21:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %20
-                                %22:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %21
-                                %23:f32[1, 1, 1, 1] = div %20 %22
-                                %24:f32[1, 1, 1, 1] = dot [
+                                %14:bool[1, 1, 1] = reduce [kind=any, axes=[3]] %13
+                                %15:bool[1, 1, 1, 1] = broadcast [
+                                    output_type=bool[1, 1, 1, 1],
+                                    output_axes=[0, 1, 2],
+                                ] %14
+                                %16:f32[] = constant [value=-inf]
+                                %17:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %16
+                                %18:f32[] = constant [value=-2.3819763e38]
+                                %19:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %18
+                                %20:f32[1, 1, 1, 1] = select %15 %17 %19
+                                %21:f32[1, 1, 1, 1] = select %13 %7 %20
+                                %22:f32[1, 1, 1] = reduce [kind=max, axes=[3]] %21
+                                %23:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %22
+                                %24:f32[1, 1, 1, 1] = sub %21 %23
+                                %25:f32[1, 1, 1, 1] = exp %24
+                                %26:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %25
+                                %27:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %26
+                                %28:f32[1, 1, 1, 1] = div %25 %27
+                                %29:f32[1, 1, 1, 1] = dot [
                                     dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
                                         rhs_batching=[0, 2]),
-                                ] %23 %2
-                                %25:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %24
-                            in (%25)
+                                ] %28 %2
+                                %30:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %29
+                            in (%30)
                         },
                     ]
                 in (%4, %5)
@@ -3983,50 +4014,61 @@ mod tests {
                                 ] %6
                                 %18:bool[1, 1, 1, 1]{varying_rank_4} = compare [direction=LessThan] %12 %17
                                 %19:bool[1, 1, 1, 1]{varying_rank_4} = and %16 %18
-                                %20:f32[]{varying_rank_0} = constant [value=-2.3819763e38]
-                                %21:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                %20:bool[1, 1, 1]{varying_rank_3} = reduce [kind=any, axes=[3]] %19
+                                %21:bool[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                    output_type=bool[1, 1, 1, 1]{varying_rank_4},
+                                    output_axes=[0, 1, 2],
+                                ] %20
+                                %22:f32[]{varying_rank_0} = constant [value=-inf]
+                                %23:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                     output_type=f32[1, 1, 1, 1]{varying_rank_4},
                                     output_axes=[],
-                                ] %20
-                                %22:f32[1, 1, 1, 1]{varying_rank_4} = select %19 %11 %21
-                                %23:f32[1, 1, 1]{varying_rank_3} = reduce [kind=max, axes=[3]] %22
-                                %24:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                ] %22
+                                %24:f32[]{varying_rank_0} = constant [value=-2.3819763e38]
+                                %25:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                    output_type=f32[1, 1, 1, 1]{varying_rank_4},
+                                    output_axes=[],
+                                ] %24
+                                %26:f32[1, 1, 1, 1]{varying_rank_4} = select %21 %23 %25
+                                %27:f32[1, 1, 1, 1]{varying_rank_4} = select %19 %11 %26
+                                %28:f32[1, 1, 1]{varying_rank_3} = reduce [kind=max, axes=[3]] %27
+                                %29:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                     output_type=f32[1, 1, 1, 1]{varying_rank_4},
                                     output_axes=[0, 1, 2],
-                                ] %23
-                                %25:f32[1, 1, 1, 1]{varying_rank_4} = sub %22 %24
-                                %26:f32[1, 1, 1, 1]{varying_rank_4} = exp %25
-                                %27:f32[1, 1, 1]{varying_rank_3} = reduce [kind=sum, axes=[3]] %26
-                                %28:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                ] %28
+                                %30:f32[1, 1, 1, 1]{varying_rank_4} = sub %27 %29
+                                %31:f32[1, 1, 1, 1]{varying_rank_4} = exp %30
+                                %32:f32[1, 1, 1]{varying_rank_3} = reduce [kind=sum, axes=[3]] %31
+                                %33:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                     output_type=f32[1, 1, 1, 1]{varying_rank_4},
                                     output_axes=[0, 1, 2],
-                                ] %27
-                                %29:f32[1, 1, 1, 1]{varying_rank_4} = div %26 %28
-                                %30:f32[1, 1, 1, 1]{varying_rank_4} = dot [
+                                ] %32
+                                %34:f32[1, 1, 1, 1]{varying_rank_4} = div %31 %33
+                                %35:f32[1, 1, 1, 1]{varying_rank_4} = dot [
                                     dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
                                         rhs_batching=[0, 2]),
-                                ] %29 %2
-                                %31:f32[1, 1, 1, 1]{varying_rank_4} = transpose [permutation=[0, 2, 1, 3]] %30
-                                %32:i32[1, 1, 1, 1]{varying_rank_4} = iota [
+                                ] %34 %2
+                                %36:f32[1, 1, 1, 1]{varying_rank_4} = transpose [permutation=[0, 2, 1, 3]] %35
+                                %37:i32[1, 1, 1, 1]{varying_rank_4} = iota [
                                     type=i32[1, 1, 1, 1]{varying_rank_4},
                                     dimension=1,
                                 ]
-                                %33:i32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                %38:i32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                     output_type=i32[1, 1, 1, 1]{varying_rank_4},
                                     output_axes=[0],
                                 ] %5
-                                %34:bool[1, 1, 1, 1]{varying_rank_4} = compare [direction=LessThan] %32 %33
-                                %35:f32[]{varying_rank_0} = constant [value=0.0]
-                                %36:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
+                                %39:bool[1, 1, 1, 1]{varying_rank_4} = compare [direction=LessThan] %37 %38
+                                %40:f32[]{varying_rank_0} = constant [value=0.0]
+                                %41:f32[1, 1, 1, 1]{varying_rank_4} = broadcast [
                                     output_type=f32[1, 1, 1, 1]{varying_rank_4},
                                     output_axes=[],
-                                ] %35
-                                %37:f32[1, 1, 1, 1]{varying_rank_4} = select %34 %31 %36
-                                %38:f32[1, 1, 1]{varying_rank_3} = log %27
-                                %39:f32[1, 1, 1]{varying_rank_3} = add %23 %38
-                                %40:f32[1, 1, 1]{varying_rank_3} = transpose [permutation=[0, 2, 1]] %39
-                                %41:f32[1, 1, 1]{varying_rank_3} = stop_gradient %40
-                            in (%37, %41)
+                                ] %40
+                                %42:f32[1, 1, 1, 1]{varying_rank_4} = select %39 %36 %41
+                                %43:f32[1, 1, 1]{varying_rank_3} = log %32
+                                %44:f32[1, 1, 1]{varying_rank_3} = add %28 %43
+                                %45:f32[1, 1, 1]{varying_rank_3} = transpose [permutation=[0, 2, 1]] %44
+                                %46:f32[1, 1, 1]{varying_rank_3} = stop_gradient %45
+                            in (%42, %46)
                         }},
                     ]
                 in (%13, %14)
@@ -5058,6 +5100,26 @@ mod tests {
         );
         assert_eq!(output, f32_array(&[2, 1, 1], &[2.0, 4.0]));
         assert_eq!(residual, f32_array(&[2, 1], &[std::f32::consts::LN_2, invisible]));
+
+        // An invisible position has no probability next to a visible one, however small the visible score is. Here
+        // a bias gives the visible score the finite logit that stands in for the scores of rows without any visible
+        // position, and the row still attends only to its visible position.
+        let (output, residual) = attend(
+            AttentionInputs {
+                bias: Some(f32_array(&[1, 2], &[invisible, invisible])),
+                mask: Some(
+                    Array::from_elements(ArrayType::new_static(DataType::Boolean, [1, 2]), &[true, false]).unwrap(),
+                ),
+                ..AttentionInputs::new(
+                    f32_array(&[1, 1, 1], &[0.0]),
+                    f32_array(&[2, 1, 1], &[0.0, 0.0]),
+                    f32_array(&[2, 1, 1], &[0.0, 1.0]),
+                )
+            },
+            configuration,
+        );
+        assert_eq!(output, f32_array(&[1, 1, 1], &[0.0]));
+        assert_eq!(residual, f32_array(&[1, 1], &[invisible]));
 
         // The logits of `f64` inputs are converted to the `f32` softmax data type, in which the logit of the
         // invisible scores remains finite, so such rows behave in the same way.
@@ -6571,6 +6633,39 @@ mod tests {
         assert_eq!(output.elements::<f32>().unwrap(), plain_output.elements::<f32>().unwrap());
         assert_eq!(residual.r#type().sharding().unwrap().dimensions()[1], ShardingDimension::sharded(["x"]));
         assert_eq!(residual.elements::<f32>().unwrap(), plain_residual.elements::<f32>().unwrap());
+
+        // Only a rank-4 input has its logical batch axis after the mapped axis. A rank-3 key or value has its sequence
+        // axis there, whose placement is not that of the batch axis of the rank-4 query that it attends with.
+        let mixed = |sequence_sharded: bool| -> Array {
+            let mesh = placed_type.sharding().unwrap().mesh().clone();
+            let query_type = ArrayType::new_static(DataType::F32, [2, 1, 1, 1, 1]);
+            let key_value_type = ArrayType::new_static(DataType::F32, [2, 2, 1, 1]);
+            let mut value_placements = vec![ShardingDimension::Replicated; 4];
+            if sequence_sharded {
+                value_placements[1] = ShardingDimension::sharded(["x"]);
+            }
+            let replicated = |r#type: ArrayType| {
+                let rank = r#type.rank();
+                r#type.with_sharding(Sharding::replicated(mesh.clone(), rank)).unwrap()
+            };
+            let value_type = key_value_type
+                .clone()
+                .with_sharding(Sharding::new(mesh.clone(), value_placements).unwrap())
+                .unwrap();
+            batch(
+                |inputs: AttentionInputs<_>| function.call(inputs),
+                AttentionInputs::new(
+                    Array::from_elements(replicated(query_type), &[0.5f32, -1.0]).unwrap(),
+                    Array::from_elements(replicated(key_value_type), &[1.0f32, -1.0, 0.5, 2.0]).unwrap(),
+                    Array::from_elements(value_type, &[1.0f32, 3.0, 5.0, 9.0]).unwrap(),
+                ),
+                axes.clone(),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap()
+        };
+        assert_eq!(mixed(true).elements::<f32>().unwrap(), mixed(false).elements::<f32>().unwrap());
 
         let function = differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
         let gradients = |r#type: &ArrayType| -> AttentionInputs<Array> {
