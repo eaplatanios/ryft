@@ -1,16 +1,20 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension, LogicalMesh, Shape,
-    Sharding,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
+    LogicalMesh, Shape, Sharding,
 };
-use crate::axes::{AxisError, NamedAxes, NamedAxis};
+use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::interpretation::{InterpretableOperation, InterpretationDriver};
+use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::collectives::validate_manual_mesh_axis;
+use crate::operations::collectives::{
+    CollectiveAxes, CollectiveOperation, validate_manual_mesh_axis, with_placement_of,
+};
 use crate::operations::constants::iota::IotaOperation;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
@@ -19,8 +23,8 @@ use crate::programs::{Operation, OperationFormatter, ProgramError, RegionInterfa
 /// Canonical operation name for [`AxisIndexOperation`].
 pub const AXIS_INDEX_OPERATION_NAME: &str = "axis_index";
 
-/// Nullary primitive [`Operation`] that produces the current batch item's or device shard's index
-/// along a [`NamedAxis`] as a scalar [`DataType::U64`] value. This is the Ryft analogue of JAX's
+/// Nullary primitive [`Operation`] that produces the current batch item's or device shard's index along a
+/// [`NamedAxis`](crate::NamedAxis) as a scalar [`DataType::U64`] value. This is the Ryft analogue of JAX's
 /// [`jax.lax.axis_index`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.axis_index.html).
 /// [`AxisIndex::axis_index`] stages this operation uniformly for every axis kind and resolution depends on the
 /// enclosing binder. A _batched_ axis is consumed by this operation's staged batching rule at the `batch` level that
@@ -29,8 +33,10 @@ pub const AXIS_INDEX_OPERATION_NAME: &str = "axis_index";
 /// such trace-time binder. Its per-device coordinate is known only at execution time, and so the operation stays in the
 /// staged body and lowers, for example, inside a `shard_map` operation manual region to `partition_id`-based coordinate
 /// arithmetic. Only mesh uses therefore reach interpretation, which is why this operation is _not_ eagerly
-/// interpretable and, having no inputs, is [partially evaluated](PartiallyEvaluatableOperation) by residualizing
-/// rather than folding (that is because folding a nullary operation would result in trying to interpret it).
+/// interpretable. [Partial evaluation](PartiallyEvaluatableOperation) binds it into the known side, where an enclosing
+/// batching level resolves a batched axis, and keeps a mesh coordinate residual when an eager known side cannot produce
+/// it. A checked manual binding records its mesh on the operation and gives the result manual variation over the axis.
+/// An unchecked manual binding retains the physical coordinate reader with no recorded mesh or variation metadata.
 ///
 /// # Examples
 ///
@@ -133,6 +139,13 @@ impl Operation for AxisIndexOperation {
     }
 }
 
+impl CollectiveOperation for AxisIndexOperation {
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        Cow::Owned(CollectiveAxes::from(&self.axis_name))
+    }
+}
+
 impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for AxisIndexOperation {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -154,6 +167,18 @@ impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for AxisIndexOperati
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for AxisIndexOperation {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret_in_parent(context, driver, inputs))
+    }
+}
+
 impl<C: Context<Type = ArrayType, Operation: From<AxisIndexOperation>>> PartiallyEvaluatableOperation<C>
     for AxisIndexOperation
 {
@@ -164,9 +189,13 @@ impl<C: Context<Type = ArrayType, Operation: From<AxisIndexOperation>>> Partiall
         _driver: &D,
         inputs: &[PartialEvaluationValue<C::Value>],
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        // Partial evaluation always residualizes an `AxisIndexOperation`. Its value depends on the executing device,
-        // and so it is never a foldable constant even though it has no (known) inputs.
-        context.residualize(self.clone(), Vec::new(), inputs)
+        // The index of a batched axis is known to the batching level that binds it, which sits on the known side of
+        // this context (a batching level inside the partially evaluated function would have consumed the operation
+        // before it got here). Binding into the known side lets that level resolve it, which is what a linearized or
+        // differentiated function that reads an enclosing batch axis needs. A device mesh coordinate has no eager
+        // value, so an eager known side reports it as unsupported and the operation stays residual, while a staged
+        // known side (e.g., a `shard_map` body) stages it like any other known work.
+        context.fold_or_residualize(self.clone(), Vec::new(), inputs)
     }
 }
 
@@ -202,6 +231,30 @@ impl<
     }
 }
 
+impl<O: Operation<Type = ArrayIrType>> MemberInterpretableOperation<LockstepDomain<O>> for AxisIndexOperation {
+    fn interpret_in_parent<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        _driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Result<Vec<LockstepValue<O>>, ProgramError> {
+        let axes = context.collective_axes(self)?;
+        check_count!("input", inputs, 0, ProgramError);
+
+        // The coordinates differ across the devices, so a checked owner of the axis needs the tracked form,
+        // whose output varies along it. Otherwise, it would accept the output of the meshless form as replicated.
+        let output_type = self.infer_output_types(&[], &[])?.remove(0);
+        context.validate_collective(self, self.mesh.as_ref(), std::slice::from_ref(&output_type))?;
+
+        let outputs = context.grid().map_devices(|device| {
+            let position = Array::scalar(context.grid().position(device, &axes) as u64)?;
+            with_placement_of(&position.converted_to(output_type.data_type())?, &output_type)
+        })?;
+
+        Ok(vec![LockstepValue::new(outputs, context)?])
+    }
+}
+
 impl_non_differentiable_operation!(AxisIndexOperation);
 impl_nullary_transposable_operation!(AxisIndexOperation);
 
@@ -209,12 +262,12 @@ impl_nullary_transposable_operation!(AxisIndexOperation);
 /// [`NamedAxes`]. `NamedAxes` answers whether a name is in scope, while [`AxisIndex`] reads out the position along it.
 /// Resolution is validated against the active [`NamedAxes`] environment.
 pub trait AxisIndex: Context {
-    /// Returns a [`DataType::U64`] scalar giving the current element's position along `name`. What that position counts
-    /// follows the kind of binder that introduced the axis (refer to the documentation of [`NamedAxis`] for more
-    /// information): a batching axis of size `N` yields the current element's position in `0..N`, and a device mesh
-    /// axis yields the current shard's coordinate along that mesh axis. `U64` matches the `usize` axis sizes the
-    /// indices are drawn from and cannot be negative. A name that no enclosing binder binds will result in
-    /// [`AxisError::UnboundAxisName`].
+    /// Returns a [`DataType::U64`] scalar giving the current element's position along `name`. What that
+    /// position counts follows the kind of binder that introduced the axis (refer to the documentation of
+    /// [`NamedAxis`](crate::NamedAxis) for more information): a batching axis of size `N` yields the current element's
+    /// position in `0..N`, and a device mesh axis yields the current shard's coordinate along that mesh axis. `U64`
+    /// matches the `usize` axis sizes the indices are drawn from and cannot be negative. A name that no enclosing
+    /// binder binds will result in [`AxisError::UnboundAxisName`].
     fn axis_index(&self, name: &str) -> Result<Self::Value, ProgramError>;
 }
 
@@ -226,15 +279,18 @@ impl<C: Context<Operation: From<AxisIndexOperation>> + NamedAxes> AxisIndex for 
         // batching level that bound `name` consumes it (its batching rule materializes the per-element index), an inner
         // batching level re-binds it into its parent, and a mesh axis survives into the base program to lower during
         // sharded execution (refer to the documentation of `AxisIndexOperation`). Because resolution happens as the
-        // operation is consumed, a batched axis reached across a non-batching wrapper that *interprets* a nested
-        // program (e.g., an outer batch addressed from inside a `jvp` trace, whose primal program is spliced by
-        // interpretation) is not supported. The operation is interpreted before any batching rule can consume it
-        // and reports `ProgramError::UnsupportedOperation`. Mesh axes are unaffected, as they are meant to survive
-        // interpretation.
-        let operation = match self.named_axis(name) {
-            Some(NamedAxis::Mesh { mesh, .. }) => AxisIndexOperation::new(name.to_string()).with_mesh(mesh),
-            Some(NamedAxis::Batched { .. }) => AxisIndexOperation::new(name.to_string()),
-            None => return Err(AxisError::UnboundAxisName { name: name.to_string() }.into()),
+        // operation is consumed, every transform between the binding level and this context must forward it outward:
+        // differentiation treats it as non-differentiable primal work and partial evaluation binds it into its known
+        // side, so an outer batch axis can be read from inside `jvp`, `linearize`, `vjp`, and gradient traces,
+        // including inside rematerialized and composite bodies.
+        let named_axis = self.named_axis(name).ok_or_else(|| AxisError::UnboundAxisName { name: name.to_string() })?;
+        let operation = AxisIndexOperation::new(name.to_string());
+        let operation = if named_axis.checks_manual_variation()
+            && let Some(mesh) = named_axis.mesh()
+        {
+            operation.with_mesh(mesh.clone())
+        } else {
+            operation
         };
         let mut outputs = self.bind(operation, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
@@ -248,13 +304,16 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayOperation, MeshAxis, MeshAxisType};
+    use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, BatchAxisSpecification, batch};
     use crate::contexts::EagerContext;
+    use crate::differentiation::{Differentiate, rematerialize};
     use crate::macros::check_operation_type_inference;
+    use crate::operations::{Add, ConvertElementType};
     use crate::parameters::Placeholder;
     use crate::partial::PartialEvaluationOutput;
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed};
-    use crate::tracing::{DomainTracingContext, TracingContext};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, Typed, Value};
+    use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
     use super::*;
 
@@ -359,6 +418,33 @@ mod tests {
     }
 
     #[test]
+    fn test_axis_index_partial_evaluation_under_batching() {
+        // Linearizing or differentiating a function that reads an enclosing batch axis binds `axis_index` into the
+        // known side, where the batching level that binds the axis resolves it. This also holds inside rematerialized
+        // bodies, which are partially evaluated as nested programs. `x + i` has the gradient `1` for every item.
+        type Body = Tracer<TracingContext<Array, ArrayOperation<Array>>>;
+        let function = rematerialize(|x: Body| {
+            let index = x.domain().axis_index("i")?.convert_element_type(DataType::F64)?;
+            x.add(&index)
+        });
+        let (outputs, gradients): (Array, Array) = batch(
+            |x| {
+                let context = x.context().clone();
+                let (output, _) = context.differentiate_at(x.clone()).linearize(|x| function.call(x))?;
+                let gradient = context.differentiate_at(x).gradient(|x| function.call(x))?;
+                Ok((output, gradient))
+            },
+            Array::vector(vec![10.0, 20.0, 30.0]).unwrap(),
+            BatchAxis::new(0),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxisSpecification::named("i"),
+        )
+        .unwrap();
+        assert_eq!(outputs, Array::vector(vec![10.0, 21.0, 32.0]).unwrap());
+        assert_eq!(gradients, Array::vector(vec![1.0, 1.0, 1.0]).unwrap());
+    }
+
+    #[test]
     fn test_axis_index_batching() {
         // `axis_index("i")` gives each batch item its own position along the mapped axis `i` (size 3), so the
         // batched result is the `u64` index vector `[0, 1, 2]` regardless of the input values.
@@ -440,7 +526,10 @@ mod tests {
             DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
                 |input| input.context().axis_index("device"),
                 ArrayType::scalar(DataType::F64),
-                vec![("device".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 4 })],
+                vec![(
+                    "device".to_string(),
+                    NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 4, checks_manual_variation: true },
+                )],
             )
             .unwrap();
         assert_eq!(
@@ -478,6 +567,29 @@ mod tests {
     }
 
     #[test]
+    fn test_axis_index_axis_index_unchecked_mesh() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 4, MeshAxisType::Manual).unwrap()]).unwrap();
+        let (output_type, program) =
+            DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
+                |input| input.context().axis_index("device"),
+                ArrayType::scalar(DataType::F64),
+                vec![(
+                    "device".to_string(),
+                    NamedAxis::Mesh { mesh, axis: 0, size: 4, checks_manual_variation: false },
+                )],
+            )
+            .unwrap();
+        assert_eq!(output_type, ArrayType::scalar(DataType::U64));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:u64[] = axis_index [axis_name=\"device\"]
+                in (%1)"},
+        );
+    }
+
+    #[test]
     fn test_axis_index_axis_index_unbound_axis() {
         // A name that no enclosing binder binds fails fast at the reader, before any operation is staged, surfacing
         // `AxisError::UnboundAxisName` as a `ProgramError::Axis` error.
@@ -485,7 +597,7 @@ mod tests {
         let error = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
             |input| input.context().axis_index("missing"),
             ArrayType::scalar(DataType::F64),
-            vec![("device".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 4 })],
+            vec![("device".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 4, checks_manual_variation: true })],
         )
         .unwrap_err();
         assert_eq!(error, ProgramError::Axis(AxisError::UnboundAxisName { name: "missing".to_string() }));

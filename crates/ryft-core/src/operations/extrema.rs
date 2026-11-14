@@ -16,8 +16,11 @@
 //! floating-point values propagate NaNs and order negative zero below positive zero. Complex values compare their real
 //! parts first and their imaginary parts second, and select the right input on exact ties and whenever a NaN makes the
 //! deciding comparison unordered. Imaginary NaNs do not affect selection between unequal real components and may
-//! therefore remain in the selected input. Array inputs that carry partial sums over unreduced mesh axes are
-//! rejected, and the reduced-axis markers of the inputs must agree.
+//! therefore remain in the selected input. A minimum (respectively, maximum) accepts array inputs that are unreduced
+//! along the same mesh axes with kind [`UnreducedKind::Min`](crate::UnreducedKind::Min) (respectively,
+//! [`UnreducedKind::Max`](crate::UnreducedKind::Max)), because it commutes with the reduction that completes them, and
+//! returns a value unreduced along those axes with that kind, same as JAX does. Every other unreduced input is rejected
+//! (e.g., a partial sum, or any unreduced input of a clamp), and the reduced-axis markers of the inputs must agree.
 //!
 //! The tangent of an extremum weighs each input's tangent by `1` where that input is strictly selected, by `0.5` where
 //! the inputs tie, and by `0` where the other input is selected or the deciding comparison is unordered. Complex inputs
@@ -59,6 +62,8 @@ use crate::operations::complex::{Imaginary, Real};
 use crate::operations::constants::one_like::OneLike;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
+use crate::operations::dimensions::dimension_max::DimensionMax;
+use crate::operations::dimensions::dimension_min::DimensionMin;
 use crate::operations::logical::And;
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::{Capability, ElementwiseOperation};
@@ -77,8 +82,9 @@ define_elementwise_operation!(
     /// types and broadcasting their shapes. Boolean minima are conjunctions. Real floating-point inputs propagate NaNs
     /// and order negative zero below positive zero. Complex inputs compare real components first, then imaginary
     /// components when the real components are equal, and select one whole input, namely the right input on exact
-    /// ties and whenever a NaN makes the deciding comparison unordered. Array inputs that still carry partial sums
-    /// are rejected, and their reduced-axis markers must agree.
+    /// ties and whenever a NaN makes the deciding comparison unordered. Array inputs may be unreduced only along the
+    /// same mesh axes with kind [`UnreducedKind::Min`](crate::UnreducedKind::Min), which the output keeps, and their
+    /// reduced-axis markers must agree.
     ///
     /// The tangent weighs each input tangent by `1` where that input is strictly smaller, by `0.5` where the inputs
     /// tie, and by `0` where the other input is smaller or the deciding comparison is unordered. Complex inputs use
@@ -88,7 +94,7 @@ define_elementwise_operation!(
     Min,
     min,
     check_data_types = [@boolean_or_numeric],
-    check_array_types = [@no_unreduced, @same_reduced_axes],
+    check_array_types = [@same_unreduced_axes, @min_unreduced, @same_reduced_axes],
 );
 
 impl_differentiable_elementwise_operation! {
@@ -117,6 +123,7 @@ define_elementwise_capability!(
     /// error if the input types or metadata are unsupported.
     min(right),
     MinOperation,
+    dimension = DimensionMin::dimension_min,
 );
 
 impl_array_elementwise_operation!(
@@ -125,7 +132,7 @@ impl_array_elementwise_operation!(
     min,
     operation = "min",
     inputs = @boolean_or_numeric,
-    checks = [@no_unreduced, @same_reduced_axes],
+    checks = [@same_unreduced_axes, @min_unreduced, @same_reduced_axes],
     |left, right| Ok(ArrayElement::min(&left, &right)),
 );
 
@@ -196,8 +203,9 @@ define_elementwise_operation!(
     /// types and broadcasting their shapes. Boolean maxima are disjunctions. Real floating-point inputs propagate NaNs
     /// and order negative zero below positive zero. Complex inputs compare real components first, then imaginary
     /// components when the real components are equal, and select one whole input, namely the right input on exact
-    /// ties and whenever a NaN makes the deciding comparison unordered. Array inputs that still carry partial sums are
-    /// rejected, and their reduced-axis markers must agree.
+    /// ties and whenever a NaN makes the deciding comparison unordered. Array inputs may be unreduced only along the
+    /// same mesh axes with kind [`UnreducedKind::Max`](crate::UnreducedKind::Max), which the output keeps, and their
+    /// reduced-axis markers must agree.
     ///
     /// The tangent weighs each input tangent by `1` where that input is strictly larger, by `0.5` where the inputs
     /// tie, and by `0` where the other input is larger or the deciding comparison is unordered. Complex inputs use
@@ -207,7 +215,7 @@ define_elementwise_operation!(
     Max,
     max,
     check_data_types = [@boolean_or_numeric],
-    check_array_types = [@no_unreduced, @same_reduced_axes],
+    check_array_types = [@same_unreduced_axes, @max_unreduced, @same_reduced_axes],
 );
 
 impl_differentiable_elementwise_operation! {
@@ -236,6 +244,7 @@ define_elementwise_capability!(
     /// error if the input types or metadata are unsupported.
     max(right),
     MaxOperation,
+    dimension = DimensionMax::dimension_max,
 );
 
 impl_array_elementwise_operation!(
@@ -244,7 +253,7 @@ impl_array_elementwise_operation!(
     max,
     operation = "max",
     inputs = @boolean_or_numeric,
-    checks = [@no_unreduced, @same_reduced_axes],
+    checks = [@same_unreduced_axes, @max_unreduced, @same_reduced_axes],
     |left, right| Ok(ArrayElement::max(&left, &right)),
 );
 
@@ -694,7 +703,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding,
+        MeshAxis, MeshAxisType, Shape, Sharding, UnreducedKind,
     };
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiableOperation, DifferentiationContext, differentiate_at};
@@ -707,6 +716,65 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    /// Checks that the binary extremum `operation`, which commutes with pending reductions of `kind`, accepts inputs
+    /// that are unreduced along the same axes with `kind` and keeps that state, while it rejects inputs that are
+    /// unreduced with any other kind (e.g., `other` or a sum) or along different axes (as JAX's `max` and `min` do).
+    fn check_extremum_unreduced_inputs<O: Operation<Type = ArrayType>>(
+        operation: O,
+        kind: UnreducedKind,
+        other: UnreducedKind,
+    ) {
+        let name = operation.name();
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let unreduced = |axis: &str, kind: UnreducedKind| {
+            ArrayType::scalar(DataType::F64)
+                .with_sharding(
+                    Sharding::replicated(mesh.clone(), 0)
+                        .with_unreduced_axes([axis])
+                        .unwrap()
+                        .with_unreduced_kind(kind)
+                        .unwrap(),
+                )
+                .unwrap()
+        };
+        let plain = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [unreduced("x", kind), unreduced("x", kind)],
+                    output_types = [unreduced("x", kind)],
+                },
+                {
+                    input_types = [unreduced("x", UnreducedKind::Sum), unreduced("x", UnreducedKind::Sum)],
+                    error = format!("`{name}` supports only unreduced inputs of kind `{kind}` but got kind `sum`"),
+                },
+                {
+                    input_types = [unreduced("x", other), unreduced("x", other)],
+                    error = format!("`{name}` supports only unreduced inputs of kind `{kind}` but got kind `{other}`"),
+                },
+                {
+                    input_types = [unreduced("x", kind), unreduced("x", UnreducedKind::Sum)],
+                    error = format!(
+                        "`{name}` inputs must be unreduced with the same kind but got `{kind}` and `sum`",
+                    ),
+                },
+                {
+                    input_types = [unreduced("x", kind), unreduced("y", kind)],
+                    error = format!("`{name}` inputs must be unreduced over the same axes"),
+                },
+                {
+                    input_types = [unreduced("x", kind), plain.clone()],
+                    error = format!("`{name}` inputs must be unreduced over the same axes"),
+                },
+            ],
+        );
+    }
 
     #[test]
     fn test_min_type_inference() {
@@ -736,11 +804,7 @@ mod tests {
                 },
             ],
         );
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = MinOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-        );
+        check_extremum_unreduced_inputs(MinOperation::<ArrayType>::new(), UnreducedKind::Min, UnreducedKind::Max);
         check_operation_type_inference!(
             @reject @mismatched_reduced,
             operation = MinOperation::<ArrayType>::new(),
@@ -813,7 +877,7 @@ mod tests {
                             %7:f64[] = one_like %0
                             %8:f64[] = add %7 %7
                             %9:f64[] = div %7 %8
-                            %10:f64[] = zero_like %0
+                            %10:f64[] = zero [type=f64[]]
                             %11:f64[] = select %6 %9 %10
                             %12:f64[] = select %5 %7 %11
                             %13:f64[] = mul %12 %2
@@ -822,7 +886,7 @@ mod tests {
                             %16:f64[] = one_like %1
                             %17:f64[] = add %16 %16
                             %18:f64[] = div %16 %17
-                            %19:f64[] = zero_like %1
+                            %19:f64[] = zero [type=f64[]]
                             %20:f64[] = select %15 %18 %19
                             %21:f64[] = select %14 %16 %20
                             %22:f64[] = mul %21 %3
@@ -1108,11 +1172,7 @@ mod tests {
                 },
             ],
         );
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = MaxOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-        );
+        check_extremum_unreduced_inputs(MaxOperation::<ArrayType>::new(), UnreducedKind::Max, UnreducedKind::Min);
         check_operation_type_inference!(
             @reject @mismatched_reduced,
             operation = MaxOperation::<ArrayType>::new(),
@@ -1185,7 +1245,7 @@ mod tests {
                             %7:f64[] = one_like %0
                             %8:f64[] = add %7 %7
                             %9:f64[] = div %7 %8
-                            %10:f64[] = zero_like %0
+                            %10:f64[] = zero [type=f64[]]
                             %11:f64[] = select %6 %9 %10
                             %12:f64[] = select %5 %7 %11
                             %13:f64[] = mul %12 %2
@@ -1194,7 +1254,7 @@ mod tests {
                             %16:f64[] = one_like %1
                             %17:f64[] = add %16 %16
                             %18:f64[] = div %16 %17
-                            %19:f64[] = zero_like %1
+                            %19:f64[] = zero [type=f64[]]
                             %20:f64[] = select %15 %18 %19
                             %21:f64[] = select %14 %16 %20
                             %22:f64[] = mul %21 %3
@@ -1591,16 +1651,16 @@ mod tests {
                             %7:bool[] = compare [direction=GreaterThan] %0 %1
                             %8:bool[] = compare [direction=LessThan] %0 %2
                             %9:bool[] = and %7 %8
-                            %10:f64[] = zero_like %3
+                            %10:f64[] = zero [type=f64[]]
                             %11:f64[] = select %9 %3 %10
                             %12:bool[] = compare [direction=GreaterThan] %1 %0
                             %13:bool[] = compare [direction=LessThan] %1 %2
                             %14:bool[] = and %12 %13
-                            %15:f64[] = zero_like %4
+                            %15:f64[] = zero [type=f64[]]
                             %16:f64[] = select %14 %4 %15
                             %17:f64[] = add %11 %16
                             %18:bool[] = compare [direction=LessThan] %2 %1
-                            %19:f64[] = zero_like %5
+                            %19:f64[] = zero [type=f64[]]
                             %20:f64[] = select %18 %5 %19
                             %21:f64[] = add %17 %20
                         in (%6, %21)

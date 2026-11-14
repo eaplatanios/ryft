@@ -17,6 +17,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation, HiddenAxes};
 use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::composite::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::operations::{CompositeConversion, transpose_carrier_batching};
@@ -511,6 +512,13 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     }
 
     #[inline]
+    fn defers_reference_discharge(&self) -> bool {
+        // A retained backward rule (and a deferred forward rule) is traced on demand, so only discharging the carrier
+        // can record that the programs traced for it later must be discharged as well.
+        matches!(self.rules, CompositeTransposeRules::Retained { discharged: false, .. })
+    }
+
+    #[inline]
     fn effects(&self) -> Cow<'_, Effects> {
         // A retained backward rule is an unresolved obligation of the carrier itself. An attached backward region is a
         // deferred rule region instead (refer to `region_slots`), which makes the carrier carry deferred work exactly
@@ -520,13 +528,6 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             CompositeTransposeRules::Attached => Cow::Borrowed(Effects::empty()),
             CompositeTransposeRules::Retained { .. } => Cow::Borrowed(&EFFECTS),
         }
-    }
-
-    #[inline]
-    fn defers_reference_discharge(&self) -> bool {
-        // A retained backward rule (and a deferred forward rule) is traced on demand, so only discharging the carrier
-        // can record that the programs traced for it later must be discharged as well.
-        matches!(self.rules, CompositeTransposeRules::Retained { discharged: false, .. })
     }
 
     fn rename_type_identities(
@@ -654,6 +655,28 @@ where
                     ..self.clone()
                 };
                 context.discharge_reference_free_operation(&discharged, driver, inputs)
+            }
+        }
+    }
+}
+
+impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> CollectiveOperation
+    for CompositeTransposeOperation<V, O, S>
+{
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        // A carrier is not a collective, and an attached backward region reveals its own axes.
+        Cow::Owned(CollectiveAxes::default())
+    }
+
+    #[inline]
+    fn hidden_axes(&self) -> HiddenAxes {
+        // A retained backward rule is specialized only when transposition requests it, so its axes are hidden,
+        // and only the declaration of its definition names them.
+        match &self.rules {
+            CompositeTransposeRules::Attached => HiddenAxes::None,
+            CompositeTransposeRules::Retained { rules, .. } => {
+                rules.rule_axes().map_or(HiddenAxes::Unknown, |axis_names| HiddenAxes::Named(axis_names.to_vec()))
             }
         }
     }
@@ -1083,6 +1106,7 @@ where
                 let residual_indices = (rule_output_count..forward.program.output_ids().len()).collect::<Vec<_>>();
                 let residuals = forward
                     .program
+                    .clone()
                     .with_outputs(&residual_indices)?
                     .interpret_in_context(&**context, leading_values[..call_input_count].to_vec())?;
                 let seed_extents = leading_values.split_off(call_input_count);
@@ -2814,7 +2838,7 @@ mod tests {
             .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
         assert!(program.entry_region_ref().effects().has_deferred_work());
-        for program in [program.clone(), program.simplified().unwrap()] {
+        for program in [program.clone(), program.into_simplified().unwrap()] {
             let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
             assert_eq!(
                 transposed.to_string(),
@@ -3264,7 +3288,7 @@ mod tests {
 
         // Simplification retains the selected obligation even though the carrier's output is unused.
         assert_eq!(
-            program.simplified().unwrap().to_string(),
+            program.clone().into_simplified().unwrap().to_string(),
             indoc! {"
                 lambda %0:ref<f64[]>, %1:f64[] .
                 let %2:f64[] = composite_transpose [name=\"ignored_zero_effect\", leading_input_count=1] %0 %1
@@ -3435,7 +3459,7 @@ mod tests {
             Err(ProgramError::Concretization { message })
                 if message == "cannot extract a concrete `usize` from `i32[]`; value `-1` is out of range",
         ));
-        let simplified = program.simplified().unwrap();
+        let simplified = program.clone().into_simplified().unwrap();
         assert_eq!(simplified.to_string(), program.to_string());
         let repeated = simplified.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
         assert_eq!(repeated.to_string(), transposed.to_string());

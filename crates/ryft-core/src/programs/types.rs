@@ -210,7 +210,7 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// `f16` is compatible with (i.e., promotable to) `f32` but does not refine it, while a dynamically shaped `f32`
     /// array type of shape `[?, 3]` is refined by an `f32` array type of shape `[2, 3]` with no conversion involved
     /// at all.
-    fn is_compatible_with(&self, other: &Self) -> bool;
+    fn is_convertible_to(&self, other: &Self) -> bool;
 
     /// Returns `true` if every value described by `other` is also described by this [`Type`]. The receiver is the more
     /// general type (e.g., a declared or staged type) and the argument is the more precise one (e.g., the actual type
@@ -226,11 +226,23 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     ///
     /// Reading each [`Type`] as the set of values it describes, this relation is equivalent to set inclusion
     /// (i.e., argument ⊆ receiver) and forms a partial ordering (i.e., semantic subtyping where `other` is a subtype of
-    /// the receiver, with no conversion involved). This is what distinguishes it from [`Self::is_compatible_with`],
+    /// the receiver, with no conversion involved). This is what distinguishes it from [`Self::is_convertible_to`],
     /// whose promotion- and broadcasting-based notions describe *implicit convertibility* between values of different
     /// types rather than containment. This is also consistent with the notion of refinement in
     /// [StableHLO](https://openxla.org/stablehlo/dynamism) and MLIR.
     fn is_refined_by(&self, other: &Self) -> bool;
+
+    /// Returns whether values of `other` can stand in for values of this type without converting their elements (i.e.,
+    /// whether the two types describe the same values and differ at most in metadata about how one value is stored,
+    /// such as the explicit layout of an array, or in how they name them, such as a nominal extent that admits a single
+    /// extent and that static extent). Consumers that combine values which were computed independently of how the value
+    /// that they stand in for is stored use this instead of type equality (e.g., the contributions that reverse mode
+    /// differentiation accumulates into the cotangent of an input). The default is type equality, which is exact for
+    /// every type family without such metadata.
+    #[inline]
+    fn is_interchangeable_with(&self, other: &Self) -> bool {
+        self == other
+    }
 
     /// Returns `true` if this [`Type`] describes a single scalar (i.e., a rank-`0` array/tensor) value. This predicate
     /// exists to let reverse mode differentiation enforce scalar-output functions. Reverse mode differentiation seeds
@@ -1037,7 +1049,7 @@ mod tests {
         );
 
         // Implicit promotion does not make a differently typed value a valid input to an f32 program.
-        assert!(DataType::F16.is_compatible_with(&DataType::F32));
+        assert!(DataType::F16.is_convertible_to(&DataType::F32));
         assert_eq!(
             <() as TypeRefinements<DataType>>::new([DataType::F32], [DataType::F16]),
             Err(TypeError::invalid("type f16 does not refine declared type f32")),
@@ -1046,7 +1058,7 @@ mod tests {
         // Broadcasting is likewise a conversion, not ordinary entry admission.
         let declared = ArrayType::new_static(DataType::F32, [2, 3]);
         let actual = ArrayType::new_static(DataType::F32, [1, 3]);
-        assert!(actual.is_compatible_with(&declared));
+        assert!(actual.is_convertible_to(&declared));
         assert!(ArrayTypeRefinements::new([declared], [actual]).is_err());
     }
 

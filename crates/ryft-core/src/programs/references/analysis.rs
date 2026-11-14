@@ -1458,7 +1458,7 @@ impl<
 > Program<V, O, Input, Output>
 {
     /// Returns this [`Program`] without the unobserved lifecycles of the local references that its entry region
-    /// allocates at `allocations`, followed by dead code elimination (refer to [`Program::simplified`] for more
+    /// allocates at `allocations`, followed by dead code elimination (refer to [`Program::into_simplified`] for more
     /// information on that). The lifecycle of such a reference is its allocation together with every instruction that
     /// accesses it (refer to [`LocalReferenceLifecycles`] for more information on reference lifecycles). Its state is
     /// private to the program, so when no value that its instructions produce reaches a program output or an
@@ -2464,7 +2464,7 @@ mod tests {
         type Identity = NoIdentity;
         type Refinements = ();
 
-        fn is_compatible_with(&self, other: &Self) -> bool {
+        fn is_convertible_to(&self, other: &Self) -> bool {
             self == other
         }
 
@@ -5284,6 +5284,78 @@ mod tests {
         // Binding inputs and instructions outside the region have no path.
         assert_eq!(analysis.path(instruction, 1), None);
         assert_eq!(analysis.path(InstructionId::new(region.id(), 1), 0), None);
+    }
+
+    #[test]
+    fn test_reference_view_analysis_path_binds_attached_region_inputs() {
+        // Each branch reads `root[index]` through a different explicit branch input, so the bindings of accesses inside
+        // attached regions must name the branch-local index values rather than the operands that the entry supplies.
+        let transforms = vec![ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic }];
+        let make_branch = |index_input: usize| {
+            let mut branch = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+            let root = branch.add_input(array_reference_type(4));
+            let indices = [
+                branch.add_input(ArrayType::scalar(DataType::I32).into()),
+                branch.add_input(ArrayType::scalar(DataType::I32).into()),
+            ];
+            let output = branch
+                .add_instruction(
+                    ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new()
+                        .with_transforms(transforms.clone()),
+                    Vec::new(),
+                    vec![root, indices[index_input]],
+                    None,
+                )
+                .unwrap()[0];
+            let branch = branch
+                .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(
+                    vec![output],
+                    vec![Placeholder; 3],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            (branch, indices[index_input])
+        };
+        let (true_branch, true_index) = make_branch(0);
+        let (false_branch, false_index) = make_branch(1);
+        let mut builder = ProgramBuilder::<TestArrayValue, TestArrayIrOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let root = builder.add_input(array_reference_type(4));
+        let first_index = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let second_index = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let output = builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrType>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, root, first_index, second_index],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(vec![output], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+
+        let region = program.entry_region_ref();
+        let analysis = ReferenceViewAnalysis::new(region, 0).unwrap();
+        assert_eq!(
+            analysis.path(InstructionId::new(true_branch, 0), 0),
+            Some(
+                &ReferenceTransformPath::from_transforms(&transforms, &[ValueId::new(true_branch, true_index)])
+                    .unwrap()
+            ),
+        );
+        assert_eq!(
+            analysis.path(InstructionId::new(false_branch, 0), 0),
+            Some(
+                &ReferenceTransformPath::from_transforms(&transforms, &[ValueId::new(false_branch, false_index)])
+                    .unwrap()
+            ),
+        );
+
+        // The condition itself accesses no reference, so it has no path.
+        assert_eq!(analysis.path(InstructionId::new(region.id(), 0), 1), None);
     }
 
     #[test]

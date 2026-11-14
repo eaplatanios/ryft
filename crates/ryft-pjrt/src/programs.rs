@@ -826,7 +826,11 @@ impl<'c> LoadedExecutable<'c> {
     ///   - `launch_id`: Identifier for this execution/launch as part of a potentially multi-device launch. This can be
     ///     used to detect scheduling errors (e.g. if multi-host programs are launched in different orders on different
     ///     hosts, the launch IDs may be used by the runtime to detect the mismatch).
-    ///   - `context`: Optional execution context to pass through to the runtime.
+    ///   - `context`: Optional execution context to pass through to the runtime. PJRT only borrows the native context,
+    ///     so the returned [`ExecutionFence`] owns it, together with any send, receive, and HLO output callbacks, until
+    ///     every participating device completes. Ownership is released before the fence publishes readiness, so callers
+    ///     that own pointees of the context's user data must keep them alive until the fence is ready. Executing with
+    ///     such owners requires native `PJRT_Event_OnReady` or `PJRT_Event_Await` support.
     ///   - `call_location`: Optional string that can be used to pass down call site location information for
     ///     diagnostics (e.g., `"file.rs:42:71"` describing the location as column 71 in line 42 of the file `file.rs`).
     ///     This field stores the source location of the Rust code that triggered the execution of this
@@ -844,6 +848,9 @@ impl<'c> LoadedExecutable<'c> {
     ///     specified at compile time. Note that not all PJRT [`Plugin`]s or [`LoadedExecutable`]s support overriding
     ///     the execution device.
     ///   - `custom_options`: Per-execution runtime options. PJRT copies these values if it retains them after the call.
+    ///
+    /// If native submission succeeds but a later step of this function fails or unwinds, this function waits for every
+    /// participating device to complete before returning, so borrowed resources are never released early.
     pub fn execute<'l>(
         &self,
         inputs: Vec<ExecutionDeviceInputs<'c, 'l>>,
@@ -919,8 +926,7 @@ impl<'c> LoadedExecutable<'c> {
         // case when something goes wrong. For that reason, we take ownership of these pointers using `Box::from_raw`
         // in `owned_send_callbacks`. This will ensure that if anything goes wrong later on in this function, the
         // underlying memory will be freed. Furthermore, after the call to `PJRT_LoadedExecutable_Execute` and assuming
-        // that everything went well, we move ownership of the callbacks to the corresponding `Event::on_ready`
-        // callbacks so that the underlying memory will be freed once execution completes.
+        // that everything went well, the whole-execution fence retains them until every device completes.
 
         // Executions without send or receive callbacks (the common case) skip building these per-device containers.
         let mut send_callback_infos = if send_callback_count == 0 {
@@ -934,7 +940,7 @@ impl<'c> LoadedExecutable<'c> {
             }
         };
         let mut send_callback_ptrs = send_callback_infos.iter_mut().map(|c| c.as_mut_ptr()).collect::<Vec<_>>();
-        let mut send_callbacks = send_callback_infos
+        let send_callbacks = send_callback_infos
             .iter()
             .map(|c| c.iter().map(|c| unsafe { Box::from_raw(c.user_arg as *mut SendCallback) }).collect::<Vec<_>>())
             .collect::<Vec<_>>();
@@ -949,26 +955,21 @@ impl<'c> LoadedExecutable<'c> {
                 .collect::<Vec<_>>()
         };
         let mut receive_callback_ptrs = receive_callback_infos.iter_mut().map(|c| c.as_mut_ptr()).collect::<Vec<_>>();
-        let mut receive_callbacks = receive_callback_infos
+        let receive_callbacks = receive_callback_infos
             .iter()
             .map(|c| c.iter().map(|c| unsafe { Box::from_raw(c.user_arg as *mut ReceiveCallback) }).collect::<Vec<_>>())
             .collect::<Vec<_>>();
 
         // We handle HLO output callbacks in the same way as send and receive callbacks, except that they are flat
         // (i.e., not per-device) and so their owned state must be freed only after execution completes on _all_
-        // participating devices. We achieve that by moving the owned callbacks behind an `Arc` whose clones are
-        // dropped by the per-device completion events.
+        // participating devices. The whole-execution fence retains this shared state through that transition.
         let hlo_output_callback_count = hlo_output_callbacks.len();
         let mut hlo_output_callback_infos =
             hlo_output_callbacks.into_iter().map(|c| unsafe { c.to_c_api() }).collect::<Vec<_>>();
-        let hlo_output_callbacks = (hlo_output_callback_count > 0).then(|| {
-            Arc::new(Mutex::new(
-                hlo_output_callback_infos
-                    .iter()
-                    .map(|c| unsafe { Box::from_raw(c.user_arg as *mut HloOutputCallback) })
-                    .collect::<Vec<_>>(),
-            ))
-        });
+        let hlo_output_callbacks = hlo_output_callback_infos
+            .iter()
+            .map(|c| unsafe { Box::from_raw(c.user_arg as *mut HloOutputCallback) })
+            .collect::<Vec<_>>();
 
         let non_donatable_input_indices = first_device_inputs
             .iter()
@@ -1037,6 +1038,43 @@ impl<'c> LoadedExecutable<'c> {
             .collect::<Vec<_>>();
         let mut done_events: Vec<*mut crate::events::ffi::PJRT_Event> = vec![std::ptr::null_mut(); device_count];
 
+        // Own all native launch data before handoff. `Vec` moves preserve the callback/output allocations whose
+        // pointers are already present in the native argument structures.
+        let has_keepalive = context.is_some()
+            || !send_callbacks.is_empty()
+            || !receive_callbacks.is_empty()
+            || !hlo_output_callbacks.is_empty();
+        if has_keepalive {
+            let native_api = unsafe { self.api().to_c_api() };
+            let native_api_size = unsafe { (*native_api).struct_size };
+            let has_on_ready = native_api_size
+                >= std::mem::offset_of!(crate::ffi::PJRT_Api, PJRT_Event_OnReady)
+                    + size_of::<Option<crate::events::ffi::PJRT_Event_OnReady>>()
+                && unsafe { (*native_api).PJRT_Event_OnReady.is_some() };
+            let has_await = native_api_size
+                >= std::mem::offset_of!(crate::ffi::PJRT_Api, PJRT_Event_Await)
+                    + size_of::<Option<crate::events::ffi::PJRT_Event_Await>>()
+                && unsafe { (*native_api).PJRT_Event_Await.is_some() };
+            if !has_on_ready && !has_await {
+                return Err(Error::missing_function("PJRT_Event_Await", self.api().version()));
+            }
+        }
+        let mut submission = ExecutionSubmission {
+            api: self.api(),
+            client: self.client,
+            outputs: output_buffers,
+            fence: None,
+            submitted: false,
+            keepalive: has_keepalive.then(|| {
+                Box::new(ExecutionKeepalive {
+                    context: context.map(|context| FrozenExecutionContext { context }),
+                    send_callbacks,
+                    receive_callbacks,
+                    hlo_output_callbacks,
+                }) as Box<dyn Send>
+            }),
+        };
+
         invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_LoadedExecutable_Execute,
@@ -1052,37 +1090,37 @@ impl<'c> LoadedExecutable<'c> {
             },
         )?;
 
-        // Process the outputs and the completion events.
-        let mut execution_outputs = Vec::with_capacity(device_count);
-        let mut completion_events = Vec::with_capacity(device_count);
-        for device_index in 0..device_count {
-            let done_event = unsafe { Event::from_c_api(done_events[device_index], self.api(), ()) }?;
-            let send_callbacks = send_callbacks.get_mut(device_index).map(std::mem::take).unwrap_or_default();
-            let receive_callbacks = receive_callbacks.get_mut(device_index).map(std::mem::take).unwrap_or_default();
-            if !send_callbacks.is_empty() || !receive_callbacks.is_empty() || hlo_output_callbacks.is_some() {
-                // Move the owned callback allocations into the event completion handler so that they
-                // are released *only after* the runtime signals the device execution is done. HLO output
-                // callbacks are shared across all devices and so each device holds one clone of the `Arc`,
-                // releasing the callbacks only after the last device execution is done.
-                let hlo_output_callbacks = hlo_output_callbacks.clone();
-                done_event.on_ready(move |_| {
-                    drop(send_callbacks);
-                    drop(receive_callbacks);
-                    drop(hlo_output_callbacks);
-                })?
-            }
+        submission.submitted = true;
 
+        // Establish completion for every device before performing fallible output conversion.
+        let mut completion_events = Vec::with_capacity(device_count);
+        for handle in done_events {
+            // Native success must provide one event per participating device. If a plugin violates that contract,
+            // the submission guard cannot establish completion and deliberately retains the calling stack.
+            completion_events.push(unsafe { Event::from_c_api(handle, self.api(), ()) }?);
+        }
+        let fence = ExecutionFence::with_keepalive(completion_events, submission.keepalive.take());
+        submission.fence = Some(fence.clone());
+
+        let mut execution_outputs = Vec::with_capacity(device_count);
+        for device_index in 0..device_count {
             let mut outputs = Vec::with_capacity(output_count);
             for output_index in 0..output_count {
-                let output_handle = output_buffers[device_index * output_count + output_index];
-                outputs.push(unsafe { Buffer::from_c_api(output_handle, self.api(), self.client)? });
+                let slot = device_index * output_count + output_index;
+                let buffer = unsafe { Buffer::from_c_api(submission.outputs[slot], self.api(), self.client) }?;
+                submission.outputs[slot] = std::ptr::null_mut();
+                outputs.push(buffer);
             }
-
             execution_outputs.push(ExecutionDeviceOutputs { outputs });
-            completion_events.push(done_event);
         }
 
-        Ok(Execution::new(execution_outputs, ExecutionFence::new(completion_events)))
+        submission.fence = None;
+        submission.submitted = false;
+
+        // All output handles and launch owners have transferred to their asynchronous owners.
+        submission.outputs.clear();
+
+        Ok(Execution::new(execution_outputs, fence))
     }
 
     /// Returns `true` if and only if this [`LoadedExecutable`] has been deleted using [`LoadedExecutable::delete`].
@@ -1207,6 +1245,85 @@ pub struct ExecutionDeviceOutputs<'o> {
     pub outputs: Vec<Buffer<'o>>,
 }
 
+/// Native launch owners released before the joined completion result becomes observable. The fields are only retained
+/// for their destructors, which run in declaration order. Each callback is boxed because the native launch arguments
+/// hold its `user_arg` pointer into that box's allocation. Storing the callbacks inline in their vectors would move
+/// them and leave those pointers dangling.
+#[allow(dead_code)]
+struct ExecutionKeepalive {
+    /// Optional invocation context, whose userdata pointees are retained by the caller.
+    context: Option<FrozenExecutionContext>,
+
+    /// Send callbacks submitted across all participating devices.
+    #[allow(clippy::vec_box)]
+    send_callbacks: Vec<Vec<Box<SendCallback>>>,
+
+    /// Receive callbacks submitted across all participating devices.
+    #[allow(clippy::vec_box)]
+    receive_callbacks: Vec<Vec<Box<ReceiveCallback>>>,
+
+    /// HLO callbacks shared by all replicas and partitions.
+    #[allow(clippy::vec_box)]
+    hlo_output_callbacks: Vec<Box<HloOutputCallback>>,
+}
+
+/// Synchronous cleanup on a fallible path after native submission, before ownership reaches the public result.
+struct ExecutionSubmission {
+    /// API used to release output handles not yet converted into Rust owners.
+    api: Api,
+
+    /// Client owning the submitted output handles.
+    client: *mut crate::clients::ffi::PJRT_Client,
+
+    /// Unclaimed output handles, with null entries for handles already transferred to buffers.
+    outputs: Vec<*mut crate::buffers::ffi::PJRT_Buffer>,
+
+    /// Whole-launch completion, established before output conversion.
+    fence: Option<ExecutionFence>,
+
+    /// Whether native submission succeeded but asynchronous ownership has not been transferred completely.
+    submitted: bool,
+
+    /// Context and callback allocations owned before the native handoff.
+    keepalive: Option<Box<dyn Send>>,
+}
+
+impl Drop for ExecutionSubmission {
+    fn drop(&mut self) {
+        if self.submitted {
+            if let Some(fence) = &self.fence {
+                // Both success and asynchronous failure are terminal only after every device has completed.
+                match fence.block_until_ready() {
+                    Ok(()) | Err(_) => {}
+                }
+            } else {
+                // A successful native call without valid completion events violates the PJRT contract. Returning
+                // would release caller-owned userdata without knowing whether native work still borrows it.
+                loop {
+                    std::thread::park();
+                }
+            }
+        }
+        for handle in self.outputs.drain(..).filter(|handle| !handle.is_null()) {
+            // The launch has completed, and only non-null, unclaimed handles remain in this collection.
+            drop(unsafe { Buffer::from_c_api(handle, self.api, self.client) }.unwrap());
+        }
+    }
+}
+
+/// Frozen execute context moved into whole-launch ownership after all userdata mutation has finished.
+/// The PJRT execute contract permits runtime threads to read the supplied context; exclusive ownership moves its
+/// eventual destruction to the last-completing device thread. The mutable preparation wrapper remains non-[`Sync`].
+#[allow(dead_code)]
+struct FrozenExecutionContext {
+    /// Unique native context owner, retained without exposing mutable preparation access.
+    context: ExecutionContext,
+}
+
+// The native context is frozen before this wrapper is constructed and has exactly one Rust destruction owner.
+// PJRT APIs and execution callbacks are thread-safe, and plugin code remains loaded through the plugin manager.
+unsafe impl Send for FrozenExecutionContext {}
+
 /// Callback invoked once with an [`ExecutionFence`]'s terminal result.
 type ExecutionFenceCallback = Box<dyn FnOnce(Result<(), Error>) + Send + 'static>;
 
@@ -1227,6 +1344,9 @@ struct ExecutionFenceCompletion {
 
 /// Shared storage underlying an [`ExecutionFence`].
 struct ExecutionFenceState {
+    /// Native context and callback owners destroyed before terminal readiness is published.
+    keepalive: Mutex<Option<Box<dyn Send>>>,
+
     /// Events retained for the complete lifetime of their native callback registrations.
     events: Mutex<Vec<Event<()>>>,
 
@@ -1240,7 +1360,7 @@ struct ExecutionFenceState {
 impl ExecutionFenceState {
     /// Records one device event result and invokes terminal callbacks after releasing the state lock.
     fn record(&self, error: Option<Error>) {
-        let callbacks_and_result = {
+        let result = {
             let mut completion = self.completion.lock().expect("execution fence completion mutex poisoned");
             if completion.remaining == 0 {
                 return;
@@ -1249,27 +1369,31 @@ impl ExecutionFenceState {
                 completion.error = error;
             }
             completion.remaining -= 1;
-            (completion.remaining == 0).then(|| {
-                let result = completion.error.clone().map_or(Ok(()), Err);
-                completion.result = Some(result.clone());
-                (std::mem::take(&mut completion.callbacks), result)
-            })
+            (completion.remaining == 0).then(|| completion.error.clone().map_or(Ok(()), Err))
         };
-        if let Some((callbacks, result)) = callbacks_and_result {
+        if let Some(result) = result {
+            // Native context destruction can inspect userdata. It must finish while callers still see this fence
+            // as pending and therefore retain every borrowed userdata allocation.
+            let keepalive = self.keepalive.lock().expect("execution fence keepalive mutex poisoned").take();
+            drop(keepalive);
+
             // Native callbacks retain this state so registered completion consumers survive after every public fence
-            // handle is dropped. Releasing the retained events at the terminal transition breaks that temporary
-            // `state -> event -> native callback -> state` ownership cycle before user callbacks are delivered.
-            // A fence whose events never complete keeps that cycle alive by design, exactly like a bare
-            // never-completing `Event` (refer to the ownership cycle explanation on `EventState::waker`
-            // for more information).
+            // handle is dropped. Releasing the retained events breaks the temporary `state -> event -> callback ->
+            // state` cycle. A fence whose events never complete retains that cycle deliberately, like a bare pending
+            // event (refer to the ownership-cycle explanation on `EventState::waker`).
             //
-            // The terminal transition runs inside the native `PJRT_Event_OnReady` callback of the last completing
-            // event, so this drop destroys native events from within an event callback frame. That is the sanctioned
-            // PJRT usage pattern: the upstream C API client's own event-to-future bridge calls `PJRT_Event_Destroy`
-            // inside the `PJRT_Event_OnReady` callback as its final action (refer to `ConvertCEventToCppFuture` in
-            // [`pjrt_c_api_helpers.cc`](https://github.com/openxla/xla/blob/main/xla/pjrt/c/pjrt_c_api_helpers.cc) for
-            // more information), so implementations must tolerate destruction that overlaps callback-dispatch teardown.
-            drop(std::mem::take(&mut *self.events.lock().expect("execution fence events mutex poisoned")));
+            // This transition runs inside the final native `PJRT_Event_OnReady` callback. Native event destruction
+            // from that callback is sanctioned PJRT usage: the upstream `ConvertCEventToCppFuture` bridge likewise
+            // calls `PJRT_Event_Destroy` as its callback's final action (refer to `pjrt_c_api_helpers.cc`). Plugins
+            // must tolerate event destruction overlapping callback-dispatch teardown. Destruction runs outside locks.
+            let events = std::mem::take(&mut *self.events.lock().expect("execution fence events mutex poisoned"));
+            drop(events);
+
+            let callbacks = {
+                let mut completion = self.completion.lock().expect("execution fence completion mutex poisoned");
+                completion.result = Some(result.clone());
+                std::mem::take(&mut completion.callbacks)
+            };
             self.ready.notify_all();
             for callback in callbacks {
                 callback(result.clone());
@@ -1304,13 +1428,21 @@ impl ExecutionFence {
     /// Creates a new [`ExecutionFence`] from the provided per-device completion [`Event`]s. Callback registration
     /// failures wait for native completion before publishing an error. A plugin missing both native completion
     /// functions leaves the fence pending because device completion cannot be established safely.
+    #[inline]
     pub fn new(events: Vec<Event<()>>) -> Self {
+        Self::with_keepalive(events, None)
+    }
+
+    /// Joins native completion while retaining launch owners through the terminal transition.
+    fn with_keepalive(events: Vec<Event<()>>, keepalive: Option<Box<dyn Send>>) -> Self {
         if events.iter().all(|event| event.ready().unwrap_or(false) && event.ready_error().is_none()) {
+            drop(keepalive);
             return Self { state: None };
         }
 
         let event_count = events.len();
         let state = Arc::new(ExecutionFenceState {
+            keepalive: Mutex::new(keepalive),
             events: Mutex::new(Vec::new()),
             completion: Mutex::new(ExecutionFenceCompletion {
                 remaining: event_count,
@@ -1329,7 +1461,14 @@ impl ExecutionFence {
                 // Dropping its unit-payload event does not complete this fence. Execution owners still retain their
                 // resources while the fence is pending.
                 match event.r#await() {
-                    Err(Error::MissingFunction { function_name: "PJRT_Event_Await", .. }) => continue,
+                    Err(Error::MissingFunction { function_name: "PJRT_Event_Await", .. }) => {
+                        // No observer can establish completion. Pin owned launch data rather than freeing pointers
+                        // that a nonconforming plugin may still borrow after all public fence handles disappear.
+                        if state.keepalive.lock().expect("execution fence keepalive mutex poisoned").is_some() {
+                            std::mem::forget(Arc::clone(&state));
+                        }
+                        continue;
+                    }
                     Err(error) => state.record(Some(error)),
                     Ok(()) => state.record(Some(error)),
                 }
@@ -1345,8 +1484,9 @@ impl ExecutionFence {
         // installed. Releasing them here, on the constructing thread, keeps the ownership cycle bounded in that race
         // as well: a concurrent terminal `record` and this cleanup take from the same vector, so the events are dropped
         // exactly once.
-        if state.completion.lock().expect("execution fence completion mutex poisoned").result.is_some() {
-            drop(std::mem::take(&mut *state.events.lock().expect("execution fence events mutex poisoned")));
+        if state.completion.lock().expect("execution fence completion mutex poisoned").remaining == 0 {
+            let events = std::mem::take(&mut *state.events.lock().expect("execution fence events mutex poisoned"));
+            drop(events);
         }
 
         Self { state: Some(state) }
@@ -3007,6 +3147,7 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::mem::ManuallyDrop;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3041,6 +3182,107 @@ mod tests {
 
     /// Handler registrations outlive clients, so their state contains no client or buffer handles.
     static NATIVE_EFFECT_GATE: OnceLock<NativeEffectGate> = OnceLock::new();
+
+    thread_local! {
+        /// Completion handles transferred to the synchronous test launch on this thread.
+        static SUBMISSION_EVENTS: RefCell<Vec<*mut crate::events::ffi::PJRT_Event>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Transfers controlled real native events through a successful launch while leaving output handles null.
+    unsafe extern "C" fn submit_controlled_events(
+        args: *mut ffi::PJRT_LoadedExecutable_Execute_Args,
+    ) -> *mut crate::errors::ffi::PJRT_Error {
+        let args = unsafe { &mut *args };
+        SUBMISSION_EVENTS.with(|events| {
+            let events = std::mem::take(&mut *events.borrow_mut());
+            assert_eq!(events.len(), args.num_devices);
+            for (index, event) in events.into_iter().enumerate() {
+                unsafe { *args.device_complete_events.add(index) = event };
+            }
+        });
+        std::ptr::null_mut()
+    }
+
+    /// Drops a uniquely owned simulated context and records its native destruction.
+    unsafe extern "C" fn destroy_counted_context(
+        args: *mut ffi::PJRT_ExecuteContext_Destroy_Args,
+    ) -> *mut crate::errors::ffi::PJRT_Error {
+        let context = unsafe { Box::from_raw((*args).context as *mut Arc<AtomicUsize>) };
+        context.fetch_add(1, Ordering::SeqCst);
+        std::ptr::null_mut()
+    }
+
+    /// Creates an opaque context whose native destruction can be observed across completion threads.
+    fn counted_context(api: Api, drops: &Arc<AtomicUsize>) -> ExecutionContext {
+        let handle = Box::into_raw(Box::new(Arc::clone(drops))) as *mut ffi::PJRT_ExecuteContext;
+        unsafe { ExecutionContext::from_c_api(handle, api) }.unwrap()
+    }
+
+    /// Completes a controlled event whose unique native destruction owner is the submitted launch.
+    struct NativeCompletion {
+        /// Event pointer, accessed only once by this producer while the launch is pending.
+        handle: usize,
+        /// API owning the event and its setter.
+        api: Api,
+    }
+
+    /// Counts exact-once release of fence-owned launch state.
+    struct DropCounter(Arc<AtomicUsize>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl NativeCompletion {
+        fn set(self, error: Option<Error>) {
+            use crate::events::ffi::PJRT_Event_Set_Args;
+            let message = error.as_ref().map(|error| error.message());
+            invoke_pjrt_api_error_fn!(
+                self.api,
+                PJRT_Event_Set,
+                {
+                    event = self.handle as *mut crate::events::ffi::PJRT_Event,
+                    error_code = error.as_ref().map(|error| error.code()).unwrap_or(crate::errors::ffi::PJRT_Error_Code_OK),
+                    error_message = message.as_ref().map(|message| message.as_ptr()).unwrap_or(std::ptr::null()),
+                    error_message_size = message.as_ref().map(|message| message.count_bytes()).unwrap_or(0),
+                },
+            ).unwrap();
+        }
+    }
+
+    /// Creates events for the controlled launch without constructing a competing native destruction owner.
+    fn control_submission_events(api: Api, count: usize) -> Vec<NativeCompletion> {
+        use crate::events::ffi::PJRT_Event_Create_Args;
+        SUBMISSION_EVENTS.with(|handles| {
+            let mut handles = handles.borrow_mut();
+            assert!(handles.is_empty());
+            let mut completions = Vec::new();
+            for _ in 0..count {
+                let handle = invoke_pjrt_api_error_fn!(api, PJRT_Event_Create, {}, { event }).unwrap();
+                handles.push(handle);
+                completions.push(NativeCompletion { handle: handle as usize, api });
+            }
+            completions
+        })
+    }
+
+    /// Builds a launch-only fixture: the selected native submitter ignores the opaque executable handle.
+    fn controlled_executable<'c>(
+        client: &'c crate::Client<'_>,
+        api: Api,
+        devices: usize,
+        outputs: usize,
+    ) -> ManuallyDrop<LoadedExecutable<'c>> {
+        ManuallyDrop::new(LoadedExecutable {
+            handle: std::ptr::dangling_mut(),
+            api,
+            client: unsafe { client.to_c_api() },
+            execution_counts: OnceLock::from((devices, outputs)),
+            owner: PhantomData,
+        })
+    }
 
     /// Validates the native token ABI and holds the first effect until explicitly released.
     fn invoke_native_effect(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
@@ -3656,6 +3898,131 @@ mod tests {
     }
 
     #[test]
+    fn test_loaded_executable_execute_retains_context_until_completion() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_LoadedExecutable_Execute = Some(submit_controlled_events);
+        table.PJRT_ExecuteContext_Destroy = Some(destroy_counted_context);
+        let api = unsafe { Api::from_c_api(&*table) }.unwrap();
+        let executable = controlled_executable(&client, api, 1, 0);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut completions = control_submission_events(api, 1);
+        let execution = executable
+            .execute(
+                vec![ExecutionDeviceInputs::default()],
+                vec![],
+                0,
+                Some(counted_context(api, &drops)),
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap();
+        let fence = execution.fence().clone();
+        drop(execution);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert_eq!(fence.is_ready(), Ok(false));
+        completions.remove(0).set(None);
+        fence.block_until_ready().unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_loaded_executable_execute_waits_after_output_error() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_LoadedExecutable_Execute = Some(submit_controlled_events);
+        table.PJRT_ExecuteContext_Destroy = Some(destroy_counted_context);
+        let api = unsafe { Api::from_c_api(&*table) }.unwrap();
+        let executable = controlled_executable(&client, api, 2, 1);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut completions = control_submission_events(api, 2);
+        let second = completions.pop().unwrap();
+        let first = completions.pop().unwrap();
+        let (returned, returned_receiver) = mpsc::channel();
+        std::thread::scope(|threads| {
+            let worker_drops = Arc::clone(&drops);
+            threads.spawn(move || {
+                // The null output handles fail conversion only after submission, so `execute` must keep the context
+                // alive and stay blocked until both devices complete.
+                assert!(matches!(
+                    returned_receiver.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                first.set(Some(Error::aborted("first device failed")));
+                assert!(matches!(
+                    returned_receiver.recv_timeout(Duration::from_millis(100)),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ));
+                assert_eq!(worker_drops.load(Ordering::SeqCst), 0);
+                second.set(None);
+                returned_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert_eq!(worker_drops.load(Ordering::SeqCst), 1);
+            });
+            let result = executable.execute(
+                vec![ExecutionDeviceInputs::default(), ExecutionDeviceInputs::default()],
+                vec![],
+                0,
+                Some(counted_context(api, &drops)),
+                None,
+                None,
+                None,
+                &[],
+            );
+            assert!(
+                matches!(result, Err(Error::InvalidArgument { message, .. }) if message == "the provided PJRT buffer handle is a null pointer")
+            );
+            returned.send(()).unwrap();
+        });
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_loaded_executable_execute_rejects_unobservable_context() {
+        let client = test_cpu_client();
+        let mut table = Box::new(unsafe { std::ptr::read(client.api().to_c_api()) });
+        table.PJRT_LoadedExecutable_Execute = None;
+        table.PJRT_ExecuteContext_Destroy = Some(destroy_counted_context);
+        table.PJRT_Event_OnReady = None;
+        table.PJRT_Event_Await = None;
+        let api = unsafe { Api::from_c_api(&*table) }.unwrap();
+        let executable = controlled_executable(&client, api, 1, 0);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let result = executable.execute(
+            vec![ExecutionDeviceInputs::default()],
+            vec![],
+            0,
+            Some(counted_context(api, &drops)),
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert!(matches!(result, Err(Error::MissingFunction { function_name: "PJRT_Event_Await", .. })));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+        // Ordinary execution without native owners does not impose this additional completion capability admission.
+        let result = executable.execute(vec![ExecutionDeviceInputs::default()], vec![], 0, None, None, None, None, &[]);
+        assert!(matches!(result, Err(Error::MissingFunction { function_name: "PJRT_LoadedExecutable_Execute", .. })));
+
+        // A failure before native submission destroys the context before returning.
+        table.PJRT_Event_Await = unsafe { (*client.api().to_c_api()).PJRT_Event_Await };
+        let result = executable.execute(
+            vec![ExecutionDeviceInputs::default()],
+            vec![],
+            0,
+            Some(counted_context(api, &drops)),
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert!(matches!(result, Err(Error::MissingFunction { function_name: "PJRT_LoadedExecutable_Execute", .. })));
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
     fn test_loaded_executable_execute_with_native_token() {
         let client = test_cpu_client();
         let program = Program::Mlir {
@@ -3974,18 +4341,22 @@ mod tests {
         table.PJRT_Event_OnReady = None;
         let api = unsafe { crate::Api::from_c_api(&*table) }.unwrap();
         let (event, promise) = api.event(()).unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
         std::thread::scope(|threads| {
             let (started, waiting) = mpsc::channel();
             let (sender, completed) = mpsc::channel();
+            let owner = DropCounter(Arc::clone(&drops));
             threads.spawn(move || {
                 started.send(()).unwrap();
-                sender.send(ExecutionFence::new(vec![event])).unwrap();
+                sender.send(ExecutionFence::with_keepalive(vec![event], Some(Box::new(owner)))).unwrap();
             });
             waiting.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(matches!(completed.recv_timeout(Duration::from_millis(100)), Err(mpsc::RecvTimeoutError::Timeout)));
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
             promise.set(Some(Error::aborted("test terminal failure"))).unwrap();
             let fence = completed.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(matches!(fence.block_until_ready(), Err(Error::Aborted { .. })));
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
         });
         drop(table);
     }
@@ -3998,16 +4369,23 @@ mod tests {
         table.PJRT_Event_Await = None;
         let api = unsafe { crate::Api::from_c_api(&*table) }.unwrap();
         let (event, promise) = api.event(()).unwrap();
-        let fence = ExecutionFence::new(vec![event]);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let fence = ExecutionFence::with_keepalive(vec![event], Some(Box::new(DropCounter(Arc::clone(&drops)))));
         let completed = Arc::new(AtomicBool::new(false));
         let recorded = Arc::clone(&completed);
         fence.on_ready(move |_| recorded.store(true, Ordering::SeqCst));
         assert_eq!(fence.is_ready(), Ok(false));
         assert!(!completed.load(Ordering::SeqCst));
         promise.set(None).unwrap();
+
         // Without either observation mechanism, even later native completion cannot complete this fence.
         assert_eq!(fence.is_ready(), Ok(false));
         assert!(!completed.load(Ordering::SeqCst));
+
+        // A failed observation path cannot establish that a native owner is safe to release, even after every public
+        // fence disappears. This deliberately pins the tiny test owner, just as a real launch would pin its context.
+        drop(fence);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -4047,7 +4425,9 @@ mod tests {
         let client = test_cpu_client();
         let (event, promise) = client.event(()).unwrap();
         promise.set(None).unwrap();
-        let fence = ExecutionFence::new(vec![event]);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let fence = ExecutionFence::with_keepalive(vec![event], Some(Box::new(DropCounter(Arc::clone(&drops)))));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
         assert!(fence.state.is_none());
         assert_eq!(fence.is_ready(), Ok(true));
         assert_eq!(fence.clone().block_until_ready(), Ok(()));
@@ -4093,6 +4473,41 @@ mod tests {
         promise.set(None).unwrap();
         assert_eq!(waiter.join().unwrap(), Ok(()));
         assert_eq!(fence.is_ready(), Ok(true));
+    }
+
+    #[test]
+    fn test_execution_fence_releases_owners_before_publishing_readiness() {
+        struct BlockingCleanup {
+            started: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+        }
+
+        impl Drop for BlockingCleanup {
+            fn drop(&mut self) {
+                self.started.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+
+        let client = test_cpu_client();
+        let (event, promise) = client.event(()).unwrap();
+        let (started, started_receiver) = mpsc::channel();
+        let (release, release_receiver) = mpsc::channel();
+        let fence = ExecutionFence::with_keepalive(
+            vec![event],
+            Some(Box::new(BlockingCleanup { started, release: release_receiver })),
+        );
+        std::thread::scope(|threads| {
+            threads.spawn(move || promise.set(None).unwrap());
+            started_receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(fence.is_ready(), Ok(false));
+            let (callback, callback_receiver) = mpsc::channel();
+            fence.on_ready(move |result| callback.send(result).unwrap());
+            assert_eq!(callback_receiver.try_recv(), Err(mpsc::TryRecvError::Empty));
+            release.send(()).unwrap();
+            assert_eq!(fence.block_until_ready(), Ok(()));
+            assert_eq!(callback_receiver.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+        });
     }
 
     #[test]

@@ -43,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - **Partial Evaluation** in `ryft_core::partial` via `Program::partially_evaluate` and `Program::partition`,
     splitting known work from a residual program.
   - **Reference Discharge** via `Program::discharge_references`.
+  - **Parent Context Transforms** via `batch_in_parent` and `differentiate_in_parent_at`, which batch and differentiate
+    functions over projected values (e.g., the array views of array IR values) using the rules of the parent context.
 - Added backend-neutral Just-In-Time (JIT) compilation in `ryft_core::compilation`, which backends plug into by
   implementing `CompilationDomain`:
   - Staging via `stage` and `Compile::stage`, followed by lowering, compilation, and execution through the
@@ -57,15 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Execution with transactional external state for backends that implement `StatefulCompilationDomain`.
 - Added arrays and array programs in `ryft_core::arrays`. `ArrayType`s model data types, shapes with static or symbolic
   bounded `Dimension`s, layouts, memory spaces, and shardings over `LogicalMesh`es and `DeviceMesh`es, which are
-  defined in `ryft_core::arrays::sharding`. `Array` is an eager reference implementation, `ArrayReference` provides
-  mutable array references with indexed and sliced views, and `ArrayIrValue` unifies arrays, dimensions, and references
-  within one program.
+  defined in `ryft_core::arrays::sharding` and support unreduced axes (i.e., `UnreducedKind`). `Array` is an eager
+  reference implementation, `ArrayReference` provides mutable array references with indexed and sliced views, and
+  `ArrayIrValue` unifies arrays, dimensions, and references within one program.
 - Added operations along with value capability traits in `ryft_core::operations`, which can be applied uniformly to
   eager values and to traced values, and which provide rules for interpretation and all of the above transforms.
   Related capabilities are also bundled for generic code (e.g., `ArithmeticOperations`, `ManipulationOperations`,
   `CollectiveOperations`, and `ArrayOperations`). The supported operations are:
-  - **Constants:** `Constant`, `Zero`, `One`, `Fill`, `Iota`, `ZeroLike`, and `OneLike`, along with the dynamic-shape
-    `DynamicZero`, `DynamicOne`, `DynamicFill`, and `DynamicIota`.
+  - **Constants:** `Constant`, `Zero`, `One`, `Fill`, `Iota`, `ZeroLike`, `OneLike`, `FillLike`, and `IotaLike`, along
+    with the dynamic-shape `DynamicZero`, `DynamicOne`, `DynamicFill`, and `DynamicIota`.
   - **Arithmetic:** `Sign`, `Neg`, `Abs`, `Add`, `Sub`, `SaturatingSub`, `Mul`, `Div`, `Rem`, `Pow`, `Sqrt`, and
     `Rsqrt`.
   - **Exponential, Trigonometric, & Special Functions:** `Exp`, `ExpM1`, `Log`, `Ln1p`, `LogAddExp`, `Logistic`, `Sin`,
@@ -73,8 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - **Rounding & Extrema:** `Floor`, `Ceil`, `Round`, `Min`, `Max`, and `Clamp`.
   - **Comparisons & Logical:** `Compare`, `Not`, `And`, `Or`, and `Xor`.
   - **Complex Numbers:** `Complex`, `Real`, `Imaginary`, and `Conjugate`.
-  - **Manipulation:** `Transpose`, `Reverse`, `Reshape`, `Broadcast`, `Pad`, `Concatenate`, `Slice`, `UpdateSlice`,
-    `DynamicSlice`, `DynamicUpdateSlice`, `Gather`, `Scatter`, `Indexing`, `ConvertElementType`, `Cast`,
+  - **Manipulation:** `Transpose`, `Reverse`, `Reshape`, `Broadcast`, `BroadcastLike`, `Pad`, `Concatenate`, `Slice`,
+    `UpdateSlice`, `DynamicSlice`, `DynamicUpdateSlice`, `Gather`, `Scatter`, `Indexing`, `ConvertElementType`, `Cast`,
     `ReducePrecision`, and `TransferToMemory`, along with the dynamic-shape `DynamicReshape`, `DynamicBroadcast`,
     `DynamicPad`, `DynamicConcatenate`, `DynamicSliceWithDimensions`, `DynamicGather`, and `DynamicScatter`.
   - **Contractions, Reductions, & Sorting:** `Dot`, `RaggedDot`, `Reduce`, `ArgMax`, `ArgMin`, `Cumulative`,
@@ -82,18 +84,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - **Quantization:** `BlockQuantize`, `BlockDequantize`, and `ScaledDot` for block-scaled (i.e., microscaling) formats
     such as NVFP4 and MXFP8, along with `block_scaled_dot`, which creates a differentiable block-scaled dot product for
     training.
-  - **Random Number Generation:** `RngBitGenerator`, `DynamicRngBitGenerator`, and `Random`.
+  - **Attention:** Scaled dot-product attention via `dot_product_attention` and `differentiable_dot_product_attention`,
+    which is staged as calls of named composites that backends can replace with their own implementations.
+  - **Random Number Generation:** `RngBitGenerator`, `DynamicRngBitGenerator`, `Random`, and `Dropout`.
   - **Control Flow:** `Select`, `Condition`, `While`, and `Scan`.
   - **Dimensions:** `DimensionSize`, `DimensionFromScalar`, `DimensionToScalar`, `DimensionMin`, `DimensionMax`,
     `DimensionPow`, and `DimensionConstant`, with the remaining dimension arithmetic provided via the arithmetic
     capabilities.
   - **References:** `ReferenceNew`, `ReferenceRead`, `ReferenceWrite`, `ReferenceSwap`, `ReferenceAddUpdate`,
     `ReferenceAtomicAddUpdate`, and `ReferenceFreeze`.
-  - **Sharding & Collectives:** `Reshard`, `ConstrainSharding`, `AxisIndex`, `ParallelReduce`, `ParallelVary`,
-    `ParallelAllGather`, `ParallelSumScatter`, `ParallelPermute`, `ParallelAllToAll`, and `ParallelRaggedAllToAll`.
+  - **Sharding & Collectives:** `Reshard`, `ConstrainSharding`, `ShardMap`, `AxisIndex`, `ParallelReduce`,
+    `ParallelVary`, `ParallelCast`, `ParallelArgExtrema`, `ParallelAllGather`, `ParallelSumScatter`, `ParallelPermute`,
+    `ParallelBroadcast`, `ParallelAllToAll`, and `ParallelRaggedAllToAll`, along with `shard_map` for manual Single
+    Program Multiple Data (SPMD) computations and `auto_axes` and `explicit_axes` for switching the types of mesh
+    axes within a function.
   - **Differentiation:** `StopGradient`, along with operations that support rematerialization and linear calls.
   - **Extensibility & Debugging:** `CustomCall`, `Assert`, `Print`, and `Tag`, along with composite operations that
-    are created via `composite` and support custom JVP, VJP, and batching rules.
+    are created via `composite` and support custom JVP, VJP, and batching rules. Composites can also be named (i.e.,
+    `NamedComposite`s identified by `CompositeKey`s), so that backends can recognize and replace their calls.
 - Introduced more fine-grained error types like `ParameterError`, `DataTypeError`, `DimensionError`, `LayoutError`,
   `BroadcastingError`, `ShardingError`, `BatchingError`, and `DifferentiationError`.
 - Added support for the `DataType::F6E3M2FN` and `DataType::F6E2M3FN` 6-bit microscaling floating-point data types.

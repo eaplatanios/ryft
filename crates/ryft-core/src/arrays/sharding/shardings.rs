@@ -42,10 +42,7 @@ impl ShardingDimension {
         Self::Unconstrained
     }
 
-    /// Returns the [`MeshAxisType::Manual`] axes of `mesh` that this [`ShardingDimension`] partitions along. Inside a
-    /// manual region, a value whose dimension is partitioned along a manual axis holds a different slice on each device
-    /// along that axis, so introducing such a placement there makes the value vary along those axes (refer to the
-    /// documentation of [`Sharding::varying_manual_axes`]).
+    /// Returns the [`MeshAxisType::Manual`] axes of `mesh` that this [`ShardingDimension`] partitions along.
     pub fn manual_axes(&self, mesh: &LogicalMesh) -> Vec<String> {
         match self {
             Self::Sharded(axis_names) => axis_names
@@ -104,6 +101,7 @@ impl Display for ShardingDimension {
 ///         ShardingDimension::replicated(),
 ///     ],
 ///     unreduced_axes: std::collections::BTreeSet::from(["model".to_string()]),
+///     unreduced_kind: UnreducedKind::Sum,
 ///     reduced_axes: std::collections::BTreeSet::new(),
 ///     varying_manual_axes: std::collections::BTreeSet::new(),
 /// };
@@ -134,6 +132,10 @@ pub struct Sharding {
     /// Refer to the documentation of [`Self::unreduced_axes`] for information on this field.
     unreduced_axes: BTreeSet<String>,
 
+    /// Refer to the documentation of [`Self::unreduced_kind`] for information on this field. It is always
+    /// [`UnreducedKind::Sum`] when [`Self::unreduced_axes`] is empty, so that equal shardings compare equal.
+    unreduced_kind: UnreducedKind,
+
     /// Refer to the documentation of [`Self::reduced_axes`] for information on this field.
     reduced_axes: BTreeSet<String>,
 
@@ -150,6 +152,7 @@ impl Sharding {
             mesh,
             dimensions,
             unreduced_axes: BTreeSet::new(),
+            unreduced_kind: UnreducedKind::Sum,
             reduced_axes: BTreeSet::new(),
             varying_manual_axes: BTreeSet::new(),
         };
@@ -186,9 +189,32 @@ impl Sharding {
             mesh,
             dimensions: vec![ShardingDimension::Replicated; rank],
             unreduced_axes: BTreeSet::new(),
+            unreduced_kind: UnreducedKind::Sum,
             reduced_axes: BTreeSet::new(),
             varying_manual_axes: BTreeSet::new(),
         }
+    }
+
+    /// Creates a new [`Sharding`] for an array with rank `rank` whose dimension `dimension` is sharded along the mesh
+    /// axis named `axis_name` and whose other dimensions are all [`ShardingDimension::Replicated`]. When `dimension`
+    /// is [`None`], the result is the _fully-replicated_ sharding that [`Self::replicated`] creates.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardingError::DimensionOutOfBounds`] when `dimension` is not smaller than `rank`, and the errors
+    /// of [`Self::new`] otherwise (e.g., when `mesh` has no axis named `axis_name`).
+    pub fn along(
+        mesh: LogicalMesh,
+        axis_name: &str,
+        dimension: Option<usize>,
+        rank: usize,
+    ) -> Result<Self, ShardingError> {
+        let mut dimensions = vec![ShardingDimension::Replicated; rank];
+        if let Some(dimension) = dimension {
+            *dimensions.get_mut(dimension).ok_or(ShardingError::DimensionOutOfBounds { dimension, rank })? =
+                ShardingDimension::sharded([axis_name]);
+        }
+        Self::new(mesh, dimensions)
     }
 
     /// Returns the [`LogicalMesh`] that describes the device topology underlying this [`Sharding`] and gives meaning
@@ -226,6 +252,16 @@ impl Sharding {
     #[inline]
     pub fn unreduced_axes(&self) -> &BTreeSet<String> {
         &self.unreduced_axes
+    }
+
+    /// Returns the [`UnreducedKind`] that combines the per-device values along [`Self::unreduced_axes`] into the
+    /// logical value (e.g., [`UnreducedKind::Max`] for a value whose logical value is the maximum of the values that
+    /// the devices along those axes hold). One kind covers every unreduced axis, as in JAX's
+    /// [`PartitionSpec`](https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec), and it is
+    /// [`UnreducedKind::Sum`] for a sharding without unreduced axes.
+    #[inline]
+    pub fn unreduced_kind(&self) -> UnreducedKind {
+        self.unreduced_kind
     }
 
     /// Returns the mesh axes across which values are known to have already been reduced. This is the dual of
@@ -390,6 +426,22 @@ impl Sharding {
         self.with_dimensions(dimensions)?.with_varying_manual_axes(varying)
     }
 
+    /// Returns this [`Sharding`] re-expressed over `mesh`, which must have the same topology as [`Self::mesh`] (refer
+    /// to [`LogicalMesh::has_same_topology`]), with the same placement, reduction state, and manual variation, which
+    /// are then interpreted with the axis types of `mesh` and revalidated against them (e.g., manual variation is only
+    /// valid along axes that `mesh` types as [`Manual`](MeshAxisType::Manual)). Since the devices of a topology do not
+    /// depend on axis types, a value placed by this sharding is placed by the returned one too.
+    pub fn with_mesh(&self, mesh: LogicalMesh) -> Result<Self, ShardingError> {
+        if !self.mesh.has_same_topology(&mesh) {
+            return Err(ShardingError::MeshMismatch { expected: self.mesh.clone(), actual: mesh });
+        }
+        Self::new(mesh, self.dimensions.clone())?
+            .with_unreduced_axes(self.unreduced_axes.clone())?
+            .with_unreduced_kind(self.unreduced_kind)?
+            .with_reduced_axes(self.reduced_axes.clone())?
+            .with_varying_manual_axes(self.varying_manual_axes.clone())
+    }
+
     /// Returns this [`Sharding`] with its per-array dimension assignments replaced by `dimensions`, while preserving
     /// its mesh and auxiliary axis state. The resulting sharding is revalidated against all preserved axis sets.
     pub fn with_dimensions(&self, dimensions: Vec<ShardingDimension>) -> Result<Self, ShardingError> {
@@ -400,13 +452,16 @@ impl Sharding {
             }
         }
         sharding.unreduced_axes = self.unreduced_axes.clone();
+        sharding.unreduced_kind = self.unreduced_kind;
         sharding.reduced_axes = self.reduced_axes.clone();
         sharding.varying_manual_axes = self.varying_manual_axes.clone();
         Ok(sharding)
     }
 
     /// Returns this [`Sharding`] with its unreduced mesh axes replaced by `unreduced_axes`. Use this when the
-    /// sharding carries partial results along mesh axes that still need cross-device reduction.
+    /// sharding carries partial results along mesh axes that still need cross-device reduction. The
+    /// [`Self::unreduced_kind`] is kept, unless `unreduced_axes` is empty, in which case it becomes
+    /// [`UnreducedKind::Sum`].
     pub fn with_unreduced_axes<A: Into<String>, I: IntoIterator<Item = A>>(
         mut self,
         unreduced_axes: I,
@@ -423,7 +478,21 @@ impl Sharding {
                 return Err(ShardingError::ConflictingVaryingAndUnreducedMeshAxis { name: axis_name.clone() });
             }
         }
+        if unreduced_axes.is_empty() {
+            self.unreduced_kind = UnreducedKind::Sum;
+        }
         self.unreduced_axes = unreduced_axes;
+        Ok(self)
+    }
+
+    /// Returns this [`Sharding`] with its [`Self::unreduced_kind`] replaced by `unreduced_kind`. Set the unreduced
+    /// axes first (e.g., with [`Self::with_unreduced_axes`]), because a sharding without unreduced axes only admits
+    /// [`UnreducedKind::Sum`] and this function returns [`ShardingError::UnreducedKindWithoutUnreducedAxes`] otherwise.
+    pub fn with_unreduced_kind(mut self, unreduced_kind: UnreducedKind) -> Result<Self, ShardingError> {
+        if self.unreduced_axes.is_empty() && unreduced_kind != UnreducedKind::Sum {
+            return Err(ShardingError::UnreducedKindWithoutUnreducedAxes { kind: unreduced_kind });
+        }
+        self.unreduced_kind = unreduced_kind;
         Ok(self)
     }
 
@@ -498,10 +567,21 @@ impl Sharding {
     /// value that still carries per-device partial results along an axis is the same value on every device along that
     /// axis (i.e., marked reduced), while the cotangent of an already-reduced value carries per-device partial results
     /// that still need a reduction (i.e., marked unreduced). The swap is an **involution**, so that
-    /// `sharding.cotangent().cotangent()` recovers `sharding`.
+    /// `sharding.cotangent()?.cotangent()?` recovers `sharding`.
+    ///
+    /// Only sums have this duality, so the cotangent of a sharding whose [`Self::unreduced_kind`] is not
+    /// [`UnreducedKind::Sum`] is undefined and this function returns [`ShardingError::UndefinedUnreducedCotangent`]
+    /// for it, as JAX's `PartitionSpec.to_ct_spec` does. The unreduced axes of a cotangent are always sums.
     #[inline]
-    pub fn cotangent(&self) -> Self {
-        Self { unreduced_axes: self.reduced_axes.clone(), reduced_axes: self.unreduced_axes.clone(), ..self.clone() }
+    pub fn cotangent(&self) -> Result<Self, ShardingError> {
+        if self.unreduced_kind != UnreducedKind::Sum {
+            return Err(ShardingError::UndefinedUnreducedCotangent { kind: self.unreduced_kind });
+        }
+        Ok(Self {
+            unreduced_axes: self.reduced_axes.clone(),
+            reduced_axes: self.unreduced_axes.clone(),
+            ..self.clone()
+        })
     }
 
     /// Returns a [`Sharding`] with all of its [`MeshAxisType::Auto`] mesh axes removed.
@@ -540,7 +620,7 @@ impl Sharding {
             .filter(|name| matches!(self.mesh.axis_type(name), Some(MeshAxisType::Explicit | MeshAxisType::Manual)))
             .cloned()
             .collect();
-        Self { dimensions, unreduced_axes, reduced_axes, ..self.clone() }
+        Self { dimensions, unreduced_axes, reduced_axes, ..self.clone() }.with_canonical_unreduced_kind()
     }
 
     /// Returns a [`Sharding`] with every [`MeshAxisType::Manual`] mesh axis removed from its reduction state (i.e.,
@@ -554,16 +634,14 @@ impl Sharding {
         let is_not_manual = |name: &&String| self.mesh.axis_type(name) != Some(MeshAxisType::Manual);
         let unreduced_axes = self.unreduced_axes.iter().filter(is_not_manual).cloned().collect();
         let reduced_axes = self.reduced_axes.iter().filter(is_not_manual).cloned().collect();
-        Self { unreduced_axes, reduced_axes, ..self.clone() }
+        Self { unreduced_axes, reduced_axes, ..self.clone() }.with_canonical_unreduced_kind()
     }
 
     /// Returns a [`Sharding`] with the provided [`ShardingDimension`] inserted at dimension `index`, shifting all
     /// subsequent dimensions one position to the right. Batching rules use this to extend an explicit output sharding
     /// with an entry for a newly introduced batch dimension. The resulting sharding is revalidated, and so inserting
-    /// a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails.
-    ///
-    /// This is a placement-only insertion. A batch axis introduced inside a batched computation must be inserted with
-    /// [`Self::batched`] instead, which additionally records the variation the placement introduces along manual axes.
+    /// a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails. Batching rules
+    /// insert batch dimensions through [`Self::batched`], which reports [`BatchingError`](crate::BatchingError)s.
     pub fn with_inserted_dimension(&self, index: usize, dimension: ShardingDimension) -> Result<Self, ShardingError> {
         if index > self.dimensions.len() {
             return Err(ShardingError::DimensionOutOfBounds { dimension: index, rank: self.rank() });
@@ -572,6 +650,7 @@ impl Sharding {
         dimensions.insert(index, dimension);
         Self::new(self.mesh.clone(), dimensions)?
             .with_unreduced_axes(self.unreduced_axes.clone())?
+            .with_unreduced_kind(self.unreduced_kind)?
             .with_reduced_axes(self.reduced_axes.clone())?
             .with_varying_manual_axes(self.varying_manual_axes.clone())
     }
@@ -613,38 +692,38 @@ impl Sharding {
         }
         Self::new(self.mesh.clone(), dimensions)?
             .with_unreduced_axes(self.unreduced_axes.clone())?
+            .with_unreduced_kind(self.unreduced_kind)?
             .with_reduced_axes(self.reduced_axes.clone())?
             .with_varying_manual_axes(self.varying_manual_axes.clone())
     }
 
     /// Returns a [`Sharding`] with its `index`-th dimension removed, shifting subsequent dimensions one position to the
     /// left. This is the sharding analogue of [`ArrayType::without_dimension`](crate::ArrayType::without_dimension).
-    /// The reduction axis sets are unchanged, but the removed entry's placement is reconciled with the manual-axis
-    /// model. A dimension sharded over [`MeshAxisType::Manual`] axes moves those axes into the varying set (i.e., the
-    /// value now varies across them rather than being placed along a ranked dimension), while a dimension sharded over
-    /// a non-manual (e.g., a [`MeshAxisType::Explicit`]) axis cannot be dropped structurally (that would silently
-    /// discard an explicit placement that only a reduction or collective can remove), and yields a
-    /// [`ShardingError::NonManualShardedDimensionRemoval`]. [`ShardingDimension::Replicated`] and
-    /// [`ShardingDimension::Unconstrained`] entries are dropped without any further effect.
+    /// The reduction axis sets and the manual variation are unchanged. A dimension sharded over
+    /// [`MeshAxisType::Manual`] axes is dropped together with that placement, which adds no variation: a dimension can
+    /// only name a manual axis where no enclosing manual region binds it (a local dimension of such a region cannot
+    /// name it), and there the axis only describes how the value is distributed, as for a batch placement (refer to
+    /// [`Sharding::batched`]). A dimension sharded over a non-manual (e.g., a [`MeshAxisType::Explicit`]) axis cannot
+    /// be dropped structurally (that would silently discard an explicit placement that only a reduction or collective
+    /// can remove), and yields a [`ShardingError::NonManualShardedDimensionRemoval`]. [`ShardingDimension::Replicated`]
+    /// and [`ShardingDimension::Unconstrained`] entries are dropped without any further effect.
     pub fn without_dimension(&self, index: usize) -> Result<Self, ShardingError> {
         if index >= self.dimensions.len() {
             return Err(ShardingError::DimensionOutOfBounds { dimension: index, rank: self.rank() });
         }
         let mut dimensions = self.dimensions.clone();
-        let removed_dimension = dimensions.remove(index);
-        let mut varying_manual_axes = self.varying_manual_axes.clone();
-        if let ShardingDimension::Sharded(axis_names) = removed_dimension {
-            for axis_name in axis_names {
-                if self.mesh.axis_type(&axis_name) != Some(MeshAxisType::Manual) {
-                    return Err(ShardingError::NonManualShardedDimensionRemoval { dimension: index, name: axis_name });
-                }
-                varying_manual_axes.insert(axis_name);
-            }
+        if let ShardingDimension::Sharded(axis_names) = dimensions.remove(index)
+            && let Some(axis_name) = axis_names
+                .into_iter()
+                .find(|axis_name| self.mesh.axis_type(axis_name) != Some(MeshAxisType::Manual))
+        {
+            return Err(ShardingError::NonManualShardedDimensionRemoval { dimension: index, name: axis_name });
         }
         Self::new(self.mesh.clone(), dimensions)?
             .with_unreduced_axes(self.unreduced_axes.clone())?
+            .with_unreduced_kind(self.unreduced_kind)?
             .with_reduced_axes(self.reduced_axes.clone())?
-            .with_varying_manual_axes(varying_manual_axes)
+            .with_varying_manual_axes(self.varying_manual_axes.clone())
     }
 
     /// Returns `true` if this [`Sharding`] and `other`, which must share this sharding's mesh, disagree on any state
@@ -667,8 +746,20 @@ impl Sharding {
             left.symmetric_difference(right)
                 .any(|name| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit))
         };
+        let is_explicit = |name: &String| self.mesh.axis_type(name) == Some(MeshAxisType::Explicit);
         symmetric_difference_contains_explicit(&self.unreduced_axes, &other.unreduced_axes)
             || symmetric_difference_contains_explicit(&self.reduced_axes, &other.reduced_axes)
+            || (self.unreduced_kind != other.unreduced_kind
+                && self.unreduced_axes.iter().chain(&other.unreduced_axes).any(is_explicit))
+    }
+
+    /// Returns this [`Sharding`] with its [`Self::unreduced_kind`] reset to [`UnreducedKind::Sum`] when it has no
+    /// unreduced axes, which keeps the kind canonical after a projection removes unreduced axes.
+    fn with_canonical_unreduced_kind(mut self) -> Self {
+        if self.unreduced_axes.is_empty() {
+            self.unreduced_kind = UnreducedKind::Sum;
+        }
+        self
     }
 
     /// Returns `true` if any ranked dimension of this [`Sharding`] uses `axis_name` for sharding.
@@ -722,6 +813,9 @@ impl Display for Sharding {
         if !self.unreduced_axes.is_empty() {
             write!(formatter, ", unreduced=")?;
             write_names(formatter, self.unreduced_axes.iter())?;
+            if self.unreduced_kind != UnreducedKind::Sum {
+                write!(formatter, ", unreduced_kind={}", self.unreduced_kind)?;
+            }
         }
 
         if !self.reduced_axes.is_empty() {
@@ -735,6 +829,75 @@ impl Display for Sharding {
         }
 
         write!(formatter, "}}")
+    }
+}
+
+/// Kind of reduction state that a [`Sharding`] records along a mesh axis. Besides placing dimensions, a sharding
+/// records two sets of mesh axes along which the devices hold a value in a particular relation to its logical value:
+/// [`Sharding::unreduced_axes`] and [`Sharding::reduced_axes`]. Code that treats both sets alike uses this enum to say
+/// which one it refers to, and diagnostics display it as `unreduced` or `reduced` (e.g., a single
+/// [`ShardMapError::ReductionStateMismatch`](crate::ShardMapError::ReductionStateMismatch) variant
+/// reports a mismatch in either set).
+///
+/// For example, consider a scalar on a mesh with a single axis `x` of size `2`, inside a `shard_map` over `x`:
+///
+///   - If each device computes a partial sum over its own shard of some data, and those partial sums are `1` and `2`,
+///     the scalar is _unreduced_ along `x`. Its logical value is `3`, which no single device holds.
+///   - If the devices then add their partial sums together, both hold `3`, and the scalar is _reduced_ along `x`. Every
+///     device holds the logical value, but the sharding still records that it came from a reduction along `x`, because
+///     its cotangent is unreduced along `x` (i.e., [`Sharding::cotangent`] swaps the two sets).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReductionStateKind {
+    /// State along the [`Sharding::unreduced_axes`] of a sharding, along which the devices hold summands of the value.
+    Unreduced,
+
+    /// State along the [`Sharding::reduced_axes`] of a sharding, along which the value is replicated but its cotangent
+    /// is unreduced.
+    Reduced,
+}
+
+impl Display for ReductionStateKind {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreduced => write!(formatter, "unreduced"),
+            Self::Reduced => write!(formatter, "reduced"),
+        }
+    }
+}
+
+/// Reduction kind that combines the values that the devices hold along the [`Sharding::unreduced_axes`] of a sharding
+/// into its logical value, mirroring JAX's [`UnreducedKind`](
+/// https://docs.jax.dev/en/latest/jax.sharding.html#jax.sharding.PartitionSpec) and Shardy's reduction operation of
+/// unreduced axes. For example, a scalar on a mesh with one axis `x` of size `2` whose devices hold `1` and `5` has
+/// the logical value `6` when it is unreduced along `x` with kind [`Self::Sum`], and `5` with kind [`Self::Max`].
+///
+/// Only [`Self::Sum`] is linear, so operations follow JAX's rules for the other kinds: an operation that is linear in
+/// its unreduced inputs (e.g., an addition or a multiplication by a value reduced along the same axes) accepts only
+/// sums, an operation that commutes with the kind's reduction accepts that kind (e.g., a maximum of two values
+/// unreduced with kind [`Self::Max`]), and structural operations (e.g., reshaping or slicing) keep any kind.
+/// Reverse mode differentiation only supports sums. Refer to [`Sharding::cotangent`] for more information.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum UnreducedKind {
+    /// The logical value is the sum of the values along the unreduced axes. This is the default kind.
+    #[default]
+    Sum,
+
+    /// The logical value is the elementwise maximum of the values along the unreduced axes.
+    Max,
+
+    /// The logical value is the elementwise minimum of the values along the unreduced axes.
+    Min,
+}
+
+impl Display for UnreducedKind {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sum => write!(formatter, "sum"),
+            Self::Max => write!(formatter, "max"),
+            Self::Min => write!(formatter, "min"),
+        }
     }
 }
 
@@ -865,6 +1028,24 @@ mod tests {
             Sharding::new(mesh.clone(), vec![ShardingDimension::Sharded(Vec::new())]),
             Err(ShardingError::EmptySharding { dimension }) if dimension == 0,
         ));
+    }
+
+    #[test]
+    fn test_sharding_along() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("data", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        assert_eq!(
+            Sharding::along(mesh.clone(), "data", Some(1), 2),
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["data"])]),
+        );
+        assert_eq!(Sharding::along(mesh.clone(), "data", None, 2), Ok(Sharding::replicated(mesh.clone(), 2)));
+        assert_eq!(
+            Sharding::along(mesh.clone(), "data", Some(2), 2),
+            Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 }),
+        );
+        assert_eq!(
+            Sharding::along(mesh, "model", Some(0), 1),
+            Err(ShardingError::UnknownMeshAxisName { name: "model".to_string() }),
+        );
     }
 
     #[test]
@@ -1300,12 +1481,9 @@ mod tests {
             Err(ShardingError::DimensionOutOfBounds { dimension: 2, rank: 2 }),
         ));
 
-        // Dropping a dimension sharded over a manual axis moves that axis into the varying set.
+        // Dropping a dimension sharded over a manual axis drops that placement and keeps the variation unchanged.
         let manual = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["model"])]).unwrap();
-        assert_eq!(
-            manual.without_dimension(0),
-            Sharding::new(mesh.clone(), vec![]).unwrap().with_varying_manual_axes(["model"]),
-        );
+        assert_eq!(manual.without_dimension(0), Sharding::new(mesh.clone(), vec![]));
     }
 
     #[test]
@@ -1361,5 +1539,90 @@ mod tests {
 
         // A difference confined to the varying-manual-axis set is ignored entirely.
         assert!(!with_reduction_axes(vec![], vec![], vec!["manual"]).conflicts_on_explicit_axes_with(&replicated));
+
+        // A kind difference is a conflict only when either side is unreduced along an explicit axis.
+        let explicit_sum = with_reduction_axes(vec!["x"], vec![], vec![]);
+        let explicit_max = explicit_sum.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let manual_sum = with_reduction_axes(vec!["manual"], vec![], vec![]);
+        let manual_max = manual_sum.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        assert!(explicit_max.conflicts_on_explicit_axes_with(&explicit_sum));
+        assert!(!manual_max.conflicts_on_explicit_axes_with(&manual_sum));
+    }
+
+    #[test]
+    fn test_sharding_unreduced_kind() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 1);
+        let unreduced = replicated.clone().with_unreduced_axes(["y", "m"]).unwrap();
+
+        // Every sharding starts with kind `sum`, and a kind other than a sum requires unreduced axes.
+        assert_eq!(UnreducedKind::default(), UnreducedKind::Sum);
+        assert_eq!(replicated.unreduced_kind(), UnreducedKind::Sum);
+        assert_eq!(unreduced.unreduced_kind(), UnreducedKind::Sum);
+        assert_eq!(replicated.clone().with_unreduced_kind(UnreducedKind::Sum), Ok(replicated.clone()));
+        assert_eq!(
+            replicated.clone().with_unreduced_kind(UnreducedKind::Max),
+            Err(ShardingError::UnreducedKindWithoutUnreducedAxes { kind: UnreducedKind::Max }),
+        );
+
+        // The kind renders after the unreduced axes unless it is a sum, and it distinguishes otherwise equal shardings.
+        let maximum = unreduced.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let minimum = unreduced.clone().with_unreduced_kind(UnreducedKind::Min).unwrap();
+        assert_eq!(maximum.unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(
+            unreduced.to_string(),
+            "{mesh<['x'=2:explicit, 'y'=2:explicit, 'm'=2:manual]>, [{}], unreduced={'m', 'y'}}",
+        );
+        assert_eq!(
+            maximum.to_string(),
+            "{mesh<['x'=2:explicit, 'y'=2:explicit, 'm'=2:manual]>, [{}], unreduced={'m', 'y'}, unreduced_kind=max}",
+        );
+        assert_eq!(
+            minimum.to_string(),
+            "{mesh<['x'=2:explicit, 'y'=2:explicit, 'm'=2:manual]>, [{}], unreduced={'m', 'y'}, unreduced_kind=min}",
+        );
+        assert_ne!(maximum, unreduced);
+        assert_ne!(maximum, minimum);
+
+        // Structural derivations keep the kind, and replacing the unreduced axes keeps it unless none remain.
+        let dimensions = vec![ShardingDimension::sharded(["x"])];
+        assert_eq!(maximum.with_dimensions(dimensions.clone()).unwrap().unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(
+            maximum.with_inserted_dimension(0, ShardingDimension::sharded(["x"])).unwrap().unreduced_kind(),
+            UnreducedKind::Max,
+        );
+        assert_eq!(maximum.with_broadcasted_dimensions(2, &[1]).unwrap().unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(maximum.without_dimension(0).unwrap().unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(maximum.local_sharding(&["m".to_string()]).unwrap().unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(maximum.clone().with_unreduced_axes(["y"]).unwrap().unreduced_kind(), UnreducedKind::Max);
+        assert_eq!(maximum.clone().with_unreduced_axes(Vec::<String>::new()).unwrap(), replicated);
+
+        // Projections that remove every unreduced axis reset the kind to a sum, so the result equals the sharding
+        // that never had unreduced axes.
+        let manual_maximum = replicated
+            .clone()
+            .with_unreduced_axes(["m"])
+            .unwrap()
+            .with_unreduced_kind(UnreducedKind::Max)
+            .unwrap();
+        assert_eq!(manual_maximum.without_manual_reduction_axes(), replicated);
+        assert_eq!(maximum.without_manual_reduction_axes().unreduced_kind(), UnreducedKind::Max);
+
+        // Only sums have cotangents, whose unreduced axes are always sums.
+        assert_eq!(maximum.cotangent(), Err(ShardingError::UndefinedUnreducedCotangent { kind: UnreducedKind::Max }));
+        assert_eq!(minimum.cotangent(), Err(ShardingError::UndefinedUnreducedCotangent { kind: UnreducedKind::Min }));
+        assert_eq!(unreduced.cotangent().unwrap().unreduced_kind(), UnreducedKind::Sum);
+        assert_eq!(
+            ShardingError::UndefinedUnreducedCotangent { kind: UnreducedKind::Max }.to_string(),
+            "a value that is unreduced with kind `max` has no cotangent, because reverse mode supports only `sum` \
+             unreduced axes",
+        );
+        assert_eq!(UnreducedKind::Sum.to_string(), "sum");
+        assert_eq!(UnreducedKind::Min.to_string(), "min");
     }
 }

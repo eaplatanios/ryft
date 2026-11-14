@@ -24,7 +24,7 @@ trait UnsupportedFunctions<T = <Self as Capability>::Universe>: Capability + Siz
 
     fn infallible(&self) -> Self;
 
-    fn optional(&self) -> Result<Option<Self>, ProgramError>;
+    fn boxed(&self) -> Result<Box<Self>, ProgramError>;
 }
 
 /// Uses an invalid capability, which reports no additional errors because the capability is still emitted.

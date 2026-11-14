@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use ryft_macros::Parameter;
 
+use crate::captures::{ImportingContext, SameContext};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::forward::{
     DifferentiableOperation, ForwardModeDifferentiate, LinearizationTracer, Pushforward, linearize_for_rule,
@@ -26,10 +27,10 @@ use crate::programs::references::LocalReferenceLifecycles;
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::{
     Atom, AtomId, AttachedRegions, EffectClass, EmptyRegionDriver, Instruction, InstructionId, MaybeZero, Operation,
-    OperationProjection, OperationProvider, Program, ProgramBuilder, ProgramError, Provenance, ReferenceAccessMode,
+    OperationProvider, Program, ProgramBuilder, ProgramError, Provenance, ReferenceAccessMode,
     ReferenceAccessOperation, ReferenceAnalysis, ReferenceBoundary, ReferenceMemberType, ReferenceRoot,
     ReferenceTransform, ReferenceType, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type,
-    TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
+    TypeError, Typed, Value, ValueId, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -53,6 +54,19 @@ pub enum CotangentSeed<V> {
 
     /// No cotangent, for a reference-typed primal output leaf whose state cotangent is owned by an input destination.
     NoCotangent,
+}
+
+impl<V> CotangentSeed<V> {
+    /// Lifts a projected cotangent value into its parent value type through [`ValueProjection::from_projected`],
+    /// preserving [`Zero`](Self::Zero) and [`NoCotangent`](Self::NoCotangent) seeds.
+    #[inline]
+    pub fn lift<T: Type, ParentValue: ValueProjection<T, Projected = V>>(self) -> CotangentSeed<ParentValue> {
+        match self {
+            Self::Value(value) => CotangentSeed::Value(ParentValue::from_projected(value)),
+            Self::Zero => CotangentSeed::Zero,
+            Self::NoCotangent => CotangentSeed::NoCotangent,
+        }
+    }
 }
 
 /// Cotangent _destination_ for one flattened primal input leaf of a [`Pullback`] application, aligned leaf-for-leaf
@@ -91,6 +105,17 @@ impl<V> CotangentDestination<V> {
             Self::Return => CotangentDestinationKind::Return,
             Self::Reference(_) => CotangentDestinationKind::Reference,
             Self::Ignore => CotangentDestinationKind::Ignore,
+        }
+    }
+
+    /// Lifts a projected reference into its parent value type through [`ValueProjection::from_projected`],
+    /// preserving [`Return`](Self::Return) and [`Ignore`](Self::Ignore) destinations.
+    #[inline]
+    pub fn lift<T: Type, ParentValue: ValueProjection<T, Projected = V>>(self) -> CotangentDestination<ParentValue> {
+        match self {
+            Self::Return => CotangentDestination::Return,
+            Self::Reference(reference) => CotangentDestination::Reference(ParentValue::from_projected(reference)),
+            Self::Ignore => CotangentDestination::Ignore,
         }
     }
 }
@@ -439,9 +464,13 @@ impl CotangentAccumulator {
     /// Adds a contribution to this input's cotangent. Structural zeros emit no work, ignored contributions are
     /// discarded, and reference destinations are updated immediately. Value contributions are summed as they arrive
     /// and extracted by [`TranspositionContext::take_cotangents`]. Every contribution is validated before any storage
-    /// is changed, including contributions to ignored inputs. Live reference-state cotangents cannot use this additive
-    /// interface. The first value is reused directly; subsequent additions preserve submission order and combine the
-    /// provenance of their contributions.
+    /// is changed, including contributions to ignored inputs. A contribution must have a type that is interchangeable
+    /// with the cotangent type of the input (refer to [`Type::is_interchangeable_with`]), so it may be stored
+    /// differently (e.g., without the explicit layout of the input), because the operations that compute it do not
+    /// always know how the input is stored (e.g., the rules of a call that was batched after it was staged are traced
+    /// at the types of its batch items). Live reference-state cotangents cannot use this additive interface. The first
+    /// value is reused directly; subsequent additions preserve submission order and combine the provenance of their
+    /// contributions.
     pub fn accumulate<
         V: Value,
         O: Operation<Type = V::Type> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
@@ -456,7 +485,7 @@ impl CotangentAccumulator {
         // Validate the handle's context identity and the contribution's type before changing any storage,
         // even when this input does not need a cotangent.
         let storage = context.cotangent_storage(self)?;
-        if contribution.r#type() != storage.r#type() {
+        if !storage.r#type().is_interchangeable_with(&contribution.r#type()) {
             return Err(TypeError::invalid(format!(
                 "cotangent contribution has type {} but its accumulator expects {}",
                 contribution.r#type(),
@@ -1124,6 +1153,19 @@ where
         })
     }
 
+    /// Returns the running sum of the value contributions that `accumulator` has received, together with their combined
+    /// provenance, or [`None`] if it has received none or adds its contributions into a caller-supplied buffer. Returns
+    /// an error if `accumulator` belongs to another [`TranspositionContext`].
+    pub(super) fn accumulated_value(
+        &self,
+        accumulator: &CotangentAccumulator,
+    ) -> Result<Option<(&Tracer<TracingContext<V, O>>, &Provenance)>, DifferentiationError> {
+        Ok(match self.cotangent_storage(accumulator)? {
+            CotangentStorage::Value { value: Some((value, provenance)), .. } => Some((value, provenance)),
+            CotangentStorage::Value { value: None, .. } | CotangentStorage::Buffer { .. } => None,
+        })
+    }
+
     /// Returns the [`CotangentStorage`] for `accumulator` after checking its context identity. This storage receives
     /// additive contributions and is separate from reference state accumulators, whose transpose rules can also take or
     /// replace the state cotangent. Retained identity tokens prevent an old context's storage index from accidentally
@@ -1283,6 +1325,39 @@ impl<V: Value, O: Operation<Type = V::Type>> TransposedProgram<V, O> {
             })
             .collect())
     }
+}
+
+/// Operation family capability that [`Pullback`] application requires (i.e., transposing a linear program over types
+/// `T` with constants `V`, including the reference operations that accumulate cotangents into destinations). It only
+/// bundles those capabilities, and every operation family that has them implements it.
+pub trait PullbackOperation<T: ReferenceMemberType, V: Value<Type = T>>:
+    TransposableOperation<V, Self>
+    + ResidualZeroProvider<T, Operation = Self>
+    + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = T::Referent>>
+    + OperationProvider<T, ReferenceNewOperation<T::Referent, T>, Operation = Self>
+    + OperationProvider<
+        T,
+        ReferenceAddUpdateOperation<T::Referent, T, <Self as ReferenceAccessOperation>::Transform>,
+        Operation = Self,
+    > + OperationProvider<T, AddOperation<T>, Operation = Self>
+where
+    TracingContext<V, Self>: StagingContext<Type = T, Constant = V, Operation = Self>,
+{
+}
+
+impl<T: ReferenceMemberType, V: Value<Type = T>, O> PullbackOperation<T, V> for O
+where
+    O: TransposableOperation<V, O>
+        + ResidualZeroProvider<T, Operation = O>
+        + ReferenceAccessOperation<Transform: ReferenceTransform<Referent = T::Referent>>
+        + OperationProvider<T, ReferenceNewOperation<T::Referent, T>, Operation = O>
+        + OperationProvider<
+            T,
+            ReferenceAddUpdateOperation<T::Referent, T, <O as ReferenceAccessOperation>::Transform>,
+            Operation = O,
+        > + OperationProvider<T, AddOperation<T>, Operation = O>,
+    TracingContext<V, O>: StagingContext<Type = T, Constant = V, Operation = O>,
+{
 }
 
 /// Pullback of a function `f` at a linearization point `x` (i.e., the transposed linear map `ȳ ↦ x̄ = (∂f/∂x)(x)ᵀ · ȳ`),
@@ -1462,23 +1537,7 @@ impl<
         destination_kinds: &[CotangentDestinationKind],
     ) -> Result<TransposedProgram<C::Constant, C::Operation>, DifferentiationError>
     where
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1535,23 +1594,7 @@ impl<
         self,
     ) -> Result<(TransposedProgram<C::Constant, C::Operation>, Vec<C::Value>), DifferentiationError>
     where
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1565,11 +1608,13 @@ impl<
     /// alone when that suffices, and otherwise from the zero source that this pullback retained for the corresponding
     /// primal input leaf (refer to the [`Pullback`] documentation). Neither the linearization nor the caller needs to
     /// supply a value from which to materialize a disconnected input's zero.
+    /// This is [`Self::materialize_cotangents_in_context`] in that context.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::InvalidArgument`] for a leaf-count mismatch or a cotangent whose type differs from its
     /// primal input's cotangent type, and propagates zero-provider errors.
+    #[inline]
     pub fn materialize_cotangents(
         &self,
         cotangents: Input::To<MaybeZero<C::Value>>,
@@ -1578,6 +1623,33 @@ impl<
         C: Zero<C::Value>,
         C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
         Input::Family: ParameterizedFamily<MaybeZero<C::Value>>,
+    {
+        self.materialize_cotangents_in_context::<C, SameContext>(&self.context, cotangents)
+    }
+
+    /// Like [`Self::materialize_cotangents`], materializes the structural zeros of `cotangents` in `context`, which
+    /// may be a descendant of the context that this pullback was built in (e.g., a batching level over it) or, for a
+    /// pullback built eagerly, a trace that captures its retained values. Every value that this pullback retained from
+    /// its linearization (i.e., its residuals and its zero sources) enters `context` through [`ImportingContext`], and
+    /// the replay and validation are otherwise those of [`Self::materialize_cotangents`]. Refer to
+    /// [`Pushforward::apply_in_context`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::materialize_cotangents`], and errors from importing the retained values
+    /// into `context`.
+    pub fn materialize_cotangents_in_context<CallerContext, Path>(
+        &self,
+        context: &CallerContext,
+        cotangents: Input::To<MaybeZero<CallerContext::Value>>,
+    ) -> Result<Input::To<CallerContext::Value>, ProgramError>
+    where
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Input::Family: ParameterizedFamily<CallerContext::Value>,
+        CallerContext: Zero<CallerContext::Value>,
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
+        Input::Family: ParameterizedFamily<MaybeZero<CallerContext::Value>>,
     {
         let cotangents = cotangents.into_parameters().collect::<Vec<_>>();
         let expected = self.primal_input_types.len();
@@ -1601,7 +1673,9 @@ impl<
                         ),
                     });
                 }
-            } else if cotangent.r#type().as_ref() != &expected_type {
+            } else if !expected_type.is_interchangeable_with(cotangent.r#type().as_ref()) {
+                // A live cotangent may be stored differently than its type describes (e.g., with the explicit layout
+                // that a seed or a primal value contributed), because that type has no explicit layout.
                 return Err(ProgramError::InvalidArgument {
                     message: format!(
                         "pullback cotangent {} has type {} but its primal input requires cotangent type {}",
@@ -1616,14 +1690,16 @@ impl<
             .into_iter()
             .zip(&self.zero_sources)
             .map(|(cotangent, source)| {
-                C::Operation::materialize_zero_from_residual_sources(&self.context, cotangent, source.iter())
+                let source = source.clone().map(|source| context.import(source)).transpose()?;
+                C::Operation::materialize_zero_from_residual_sources(context, cotangent, source.iter())
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Input::To::<C::Value>::from_parameters(self.input_structure.clone(), values)?)
+        Ok(Input::To::<CallerContext::Value>::from_parameters(self.input_structure.clone(), values)?)
     }
 
     /// Applies this pullback and materializes its structural zeros from its retained zero sources. This combines
     /// [`Self::apply`] and [`Self::materialize_cotangents`] for consumers that require value cotangents.
+    /// This is [`Self::apply_materialized_in_context`] in that context.
     ///
     /// # Errors
     ///
@@ -1632,28 +1708,43 @@ impl<
     pub fn apply_materialized(&self, cotangents: Output::To<C::Value>) -> Result<Input::To<C::Value>, ProgramError>
     where
         C: Zero<C::Value>,
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         Input::Family: ParameterizedFamily<MaybeZero<C::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        self.materialize_cotangents(self.apply(cotangents)?)
+        self.apply_materialized_in_context::<C, SameContext>(&self.context, cotangents)
+    }
+
+    /// Like [`Self::apply_materialized`], applies this pullback and materializes its structural zeros in `context`,
+    /// which may be a descendant of the context that this pullback was built in (e.g., a batching level over it) or,
+    /// for a pullback built eagerly, a trace that captures its retained values. Every value that this pullback retained
+    /// from its linearization (i.e., its residuals and its zero sources) enters `context` through [`ImportingContext`],
+    /// and the replay and validation are otherwise those of [`Self::apply_materialized`]. Refer to
+    /// [`Pushforward::apply_in_context`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::apply_materialized`], and errors from importing the retained values
+    /// into `context`.
+    #[inline]
+    pub fn apply_materialized_in_context<CallerContext, Path>(
+        &self,
+        context: &CallerContext,
+        cotangents: Output::To<CallerContext::Value>,
+    ) -> Result<Input::To<CallerContext::Value>, ProgramError>
+    where
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Output::Family: ParameterizedFamily<CallerContext::Value>,
+        Input::Family: ParameterizedFamily<CallerContext::Value>,
+        CallerContext: Zero<CallerContext::Value>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
+        Input::Family: ParameterizedFamily<MaybeZero<CallerContext::Value>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        self.materialize_cotangents_in_context(context, self.apply_in_context(context, cotangents)?)
     }
 
     /// Pulls the provided structured output cotangents `cotangents` back to the closure's input cotangents.
@@ -1669,26 +1760,38 @@ impl<
     /// late-bound, the first application also reports transposition errors. Disconnected and zero-space input
     /// cotangents remain [`MaybeZero::Zero`]; no value or extent residual is produced merely to return them.
     /// Use [`Self::materialize_cotangents`] or [`Self::apply_materialized`] when value cotangents are required.
+    /// This is [`Self::apply_in_context`] in that context.
+    #[inline]
     pub fn apply(&self, cotangents: Output::To<C::Value>) -> Result<Input::To<MaybeZero<C::Value>>, ProgramError>
     where
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         Input::Family: ParameterizedFamily<MaybeZero<C::Value>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
+        self.apply_in_context::<C, SameContext>(&self.context, cotangents)
+    }
+
+    /// Like [`Self::apply`], applies this pullback to `cotangents` in `context`, which may be a descendant of the
+    /// context that this pullback was built in (e.g., a batching level over it) or, for a pullback built eagerly, a
+    /// trace that captures its retained values. Every value that this pullback retained from its linearization (i.e.,
+    /// its residuals and its zero sources) enters `context` through [`ImportingContext`], and the replay and validation
+    /// are otherwise those of [`Self::apply`]. Refer to [`Pushforward::apply_in_context`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::apply`], and errors from importing the retained values into `context`.
+    pub fn apply_in_context<CallerContext, Path>(
+        &self,
+        context: &CallerContext,
+        cotangents: Output::To<CallerContext::Value>,
+    ) -> Result<Input::To<MaybeZero<CallerContext::Value>>, ProgramError>
+    where
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Output::Family: ParameterizedFamily<CallerContext::Value>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
+        Input::Family: ParameterizedFamily<MaybeZero<CallerContext::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1696,7 +1799,7 @@ impl<
         let seeds = cotangents.into_parameters().map(CotangentSeed::Value).collect::<Vec<_>>();
         let destinations = (0..self.primal_input_types.len()).map(|_| CotangentDestination::Return).collect::<Vec<_>>();
         let cotangents = self
-            .apply_impl(seeds, &destinations)?
+            .apply_impl(context, seeds, &destinations)?
             .into_iter()
             .map(|cotangent| {
                 cotangent.ok_or_else(|| {
@@ -1706,13 +1809,14 @@ impl<
             .collect::<Result<Vec<_>, _>>()?;
 
         // Restore the closure's original structured input shape after rebuilding every flattened cotangent leaf.
-        Ok(Input::To::<MaybeZero<C::Value>>::from_parameters(self.input_structure.clone(), cotangents)?)
+        Ok(Input::To::<MaybeZero<CallerContext::Value>>::from_parameters(self.input_structure.clone(), cotangents)?)
     }
 
     /// Pulls the provided structured output cotangent `seeds` back to the closure's inputs under the provided
     /// structured cotangent `destinations`, returning [`Some`] exactly at the [`Return`](CotangentDestination::Return)
     /// positions, preserving structural zeros there. Seeds and destinations are aligned leaf for leaf with the
     /// closure's output and input structures and are validated against this matrix:
+    /// This is [`Self::apply_with_destinations_in_context`] in that context.
     ///
     /// | Primal Boundary Leaf | Legal Seed or Destination                                                    |
     /// |----------------------|------------------------------------------------------------------------------|
@@ -1755,39 +1859,58 @@ impl<
     /// Returns [`ProgramError::InvalidArgument`] for a seed or destination that violates the matrix above or a
     /// destination that aliases a primal reference or another destination, and propagates transposition and replay
     /// errors otherwise.
+    #[inline]
     pub fn apply_with_destinations(
         &self,
         seeds: Output::To<CotangentSeed<C::Value>>,
         destinations: Input::To<CotangentDestination<C::Value>>,
     ) -> Result<Input::To<Option<MaybeZero<C::Value>>>, ProgramError>
     where
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         Input::Family:
             ParameterizedFamily<CotangentDestination<C::Value>> + ParameterizedFamily<Option<MaybeZero<C::Value>>>,
         Output::Family: ParameterizedFamily<CotangentSeed<C::Value>>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
+        self.apply_with_destinations_in_context::<C, SameContext>(&self.context, seeds, destinations)
+    }
+
+    /// Like [`Self::apply_with_destinations`], applies this pullback with explicit seeds and destinations in `context`,
+    /// which may be a descendant of the context that this pullback was built in (e.g., a batching level over it) or,
+    /// for a pullback built eagerly, a trace that captures its retained values. Every value that this pullback retained
+    /// from its linearization (i.e., its residuals and its zero sources) enters `context` through [`ImportingContext`],
+    /// and the replay and validation are otherwise those of [`Self::apply_with_destinations`]. Refer to
+    /// [`Pushforward::apply_in_context`] for more information.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Self::apply_with_destinations`], and errors from importing the retained values into
+    /// `context`.
+    pub fn apply_with_destinations_in_context<CallerContext, Path>(
+        &self,
+        context: &CallerContext,
+        seeds: Output::To<CotangentSeed<CallerContext::Value>>,
+        destinations: Input::To<CotangentDestination<CallerContext::Value>>,
+    ) -> Result<Input::To<Option<MaybeZero<CallerContext::Value>>>, ProgramError>
+    where
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        Output::Family: ParameterizedFamily<CallerContext::Value>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
+        Input::Family: ParameterizedFamily<CotangentDestination<CallerContext::Value>>
+            + ParameterizedFamily<Option<MaybeZero<CallerContext::Value>>>,
+        Output::Family: ParameterizedFamily<CotangentSeed<CallerContext::Value>>,
+        TracingContext<C::Constant, C::Operation>:
+            StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
+    {
         let seeds = seeds.into_parameters().collect::<Vec<_>>();
         let destinations = destinations.into_parameters().collect::<Vec<_>>();
-        let cotangents = self.apply_impl(seeds, &destinations)?;
-        Ok(Input::To::<Option<MaybeZero<C::Value>>>::from_parameters(self.input_structure.clone(), cotangents)?)
+        let cotangents = self.apply_impl(context, seeds, &destinations)?;
+        Ok(Input::To::<Option<MaybeZero<CallerContext::Value>>>::from_parameters(
+            self.input_structure.clone(),
+            cotangents,
+        )?)
     }
 
     /// Replays a scalar gradient pullback and returns non-reference values at every input position. Reference
@@ -1806,27 +1929,11 @@ impl<
                 C::Type,
                 ReferenceFreezeOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
                 Operation = C::Operation,
-            > + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+            > + PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
-        let cotangents = self.apply_impl(seeds, &destinations)?;
+        let cotangents = self.apply_impl::<C, SameContext>(&self.context, seeds, &destinations)?;
         let gradients = destinations
             .into_iter()
             .zip(cotangents)
@@ -1866,31 +1973,19 @@ impl<
 
     /// Validates and replays the provided flattened seeds and [`CotangentDestination`].
     /// Only non-reference [`Return`](CotangentDestination::Return) inputs produce values here;
-    /// [`Reference`](CotangentDestination::Reference) destinations are updated during replay,
-    /// and [`Ignore`](CotangentDestination::Ignore) inputs expose no result.
-    fn apply_impl(
+    /// [`Reference`](CotangentDestination::Reference) destinations are updated during replay, and
+    /// [`Ignore`](CotangentDestination::Ignore) inputs expose no result. The transposed program is
+    /// replayed in `context`, into which the retained residuals are imported.
+    fn apply_impl<CallerContext, Path>(
         &self,
-        seeds: Vec<CotangentSeed<C::Value>>,
-        destinations: &[CotangentDestination<C::Value>],
-    ) -> Result<Vec<Option<MaybeZero<C::Value>>>, ProgramError>
+        context: &CallerContext,
+        seeds: Vec<CotangentSeed<CallerContext::Value>>,
+        destinations: &[CotangentDestination<CallerContext::Value>],
+    ) -> Result<Vec<Option<MaybeZero<CallerContext::Value>>>, ProgramError>
     where
-        C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type, Operation = C::Operation>
-            + ReferenceAccessOperation<
-                Transform: ReferenceTransform<Referent = <C::Type as ReferenceMemberType>::Referent>,
-            > + OperationProvider<
-                C::Type,
-                ReferenceNewOperation<<C::Type as ReferenceMemberType>::Referent, C::Type>,
-                Operation = C::Operation,
-            > + OperationProvider<
-                C::Type,
-                ReferenceAddUpdateOperation<
-                    <C::Type as ReferenceMemberType>::Referent,
-                    C::Type,
-                    <C::Operation as ReferenceAccessOperation>::Transform,
-                >,
-                Operation = C::Operation,
-            > + OperationProvider<C::Type, AddOperation<C::Type>, Operation = C::Operation>,
+        CallerContext:
+            Context<Type = C::Type, Constant = C::Constant, Operation = C::Operation> + ImportingContext<C, Path>,
+        C::Operation: PullbackOperation<C::Type, C::Constant>,
         TracingContext<C::Constant, C::Operation>:
             StagingContext<Type = C::Type, Constant = C::Constant, Operation = C::Operation>,
     {
@@ -1925,7 +2020,10 @@ impl<
                             ),
                         });
                     }
-                    if value.r#type().as_ref() != &cotangent_type {
+
+                    // A seed may be stored differently than the cotangent type describes (e.g., with the explicit
+                    // layout of the primal output), because that type has no explicit layout.
+                    if !cotangent_type.is_interchangeable_with(value.r#type().as_ref()) {
                         return Err(ProgramError::MalformedProgram(format!(
                             "pullback cotangent {} has type {} but its primal boundary requires cotangent type {}",
                             index,
@@ -1933,6 +2031,7 @@ impl<
                             cotangent_type,
                         )));
                     }
+
                     if has_slot {
                         program_inputs.push(value);
                     }
@@ -2023,7 +2122,7 @@ impl<
         // other destination. Identity, not generation, is compared: a primal reference that advanced generations after
         // the differentiated closure ran is still the same allocation and still rejected.
         self.primal_references.validate_differentiation_arguments(
-            &self.context,
+            context,
             destination_references
                 .iter()
                 .map(|&(index, reference)| (DifferentiationBoundaryPosition::Cotangent(index), reference)),
@@ -2050,12 +2149,14 @@ impl<
                 program_inputs.push(reference.clone());
             }
         }
-        program_inputs.extend(self.residuals.iter().cloned());
+        for residual in &self.residuals {
+            program_inputs.push(context.import(residual.clone())?);
+        }
         let cotangent_types =
             self.primal_input_types.iter().map(|r#type| r#type.cotangent()).collect::<Result<Vec<_>, _>>()?;
         let live_cotangent_types =
             cotangent_types.iter().filter(|r#type| !r#type.is_zero_space()).cloned().collect::<Vec<_>>();
-        let outputs = program.program().interpret_in_context(&self.context, program_inputs)?;
+        let outputs = program.program().interpret_in_context(context, program_inputs)?;
         let mut program_input_cotangents = program.assemble_cotangents(&live_cotangent_types, outputs)?.into_iter();
 
         // Restore type-omitted leaves without constructing values. Reference identity outputs are consumed by
@@ -2492,56 +2593,6 @@ where
     ///     Known, ignored, and reference-state inputs have unneeded handles. Contributions must have the input's
     ///     cotangent type and belong to this context's builder, including when the handle is unneeded.
     fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<V, O>,
-        driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError>;
-}
-
-/// Transpose rule for a member operation that runs in its enclosing operation family's [`TranspositionContext`].
-/// Unlike [`TransposableOperation`], this trait permits the operation's [`Type`] to differ from the context's type.
-/// For example, an array slice operates on arrays, but its parent context may also represent references. Its member
-/// rule can then add a cotangent into a reference slice without trying to project that reference into the array family.
-///
-/// This is the reverse mode counterpart of [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation).
-/// Generated operation family dispatchers call it for computational projected members. A member family delegates to
-/// its individual operations when they need parent family capabilities, and can use
-/// [`transpose_projected_operation`](TranspositionContext::transpose_projected_operation) for region-free rules that
-/// remain within the member family. Implementations specify the projection and operation capabilities they need; this
-/// trait does not require every enclosing family to support references.
-///
-/// Accumulators remain owned by the enclosing context. The contribution, ownership, and deterministic staging
-/// requirements of [`TransposableOperation::transpose`] apply unchanged, including when a rule delegates to projection.
-pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>:
-    Operation<Type: DifferentiableType>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
-    /// Applies this member's transpose rule using the enclosing family's values and cotangent accumulators.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active [`TranspositionContext`] for the enclosing operation family, which dereferences to the
-    ///     [`TracingContext`] in which rules stage additional linear operations. Reference-state rules access the
-    ///     instruction's reference inputs through this context; their state updates do not use the `accumulators`
-    ///     handles.
-    ///   - `driver`: Call-scoped nested-region [`TranspositionDriver`] for the current instruction, exposing attached
-    ///     regions in the enclosing operation family.
-    ///   - `inputs`: Per-input [`PartialValue`] knowledge, in operation input order, expressed using the enclosing
-    ///     family's types and tracers. As in [`TransposableOperation::transpose`], a [`PartialValue::Unknown`] entry
-    ///     marks a linear input that receives a cotangent contribution, while a [`Known`](PartialValue::Known) entry
-    ///     supplies a runtime value in the pullback and receives no contribution. Each input's [`Type`] is available
-    ///     either way through the [`Typed`] trait.
-    ///   - `outputs`: Symbolic cotangents for the instruction's outputs, in operation output order, expressed using
-    ///     the enclosing family's tracers. A reference-typed output never carries a live cotangent (its state cotangent
-    ///     lives in the accumulator of the root it forwards) and always arrives as a structural zero.
-    ///   - `accumulators`: [`CotangentAccumulator`]s, one per input in operation input order, owned by `context`.
-    ///     Known, ignored, and reference-state inputs have unneeded handles. Contributions must have the input's
-    ///     cotangent type and belong to this context's builder, including when the handle is unneeded.
-    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
         &self,
         context: &mut TranspositionContext<V, O>,
         driver: &D,
@@ -4204,239 +4255,6 @@ where
     Ok(((output, auxiliary), gradient))
 }
 
-// The following functions are the transposition rules that operation family dispatchers (e.g., the ones generated by
-// `#[derive(Operation)]`) apply to member operations whose rules run through a projected view.
-impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O>
-where
-    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
-{
-    /// Applies a member operation's transpose rule through a projected view of this heterogeneous
-    /// [`TranspositionContext`]. Use this function from a family-level operation dispatcher when the linear operation
-    /// is [`Region`]-free and every input and output belongs to the same projectable member type `T`. Because
-    /// [`TransposableOperation`] rules stage through a member-typed [`TracingContext`], this function records the rule
-    /// in a short-lived member program, converts that program to the heterogeneous type, and splices it into the active
-    /// trace. Known primal inputs and live output cotangents become splice inputs in encounter order; structural zeros
-    /// remain types and do not materialize values. The member rule receives the enclosing handles' cotangent mask but
-    /// accumulates values locally, because its type family may not represent reference buffers. Each resulting
-    /// contribution is lifted and submitted to the corresponding enclosing handle. Family-level rules that can update
-    /// reference views directly should bypass this dense fallback.
-    ///
-    /// Operations whose transpose crosses member types or whose rule needs attached regions require an explicit
-    /// family-level transpose rule instead. A member operation that declares [`RegionSlot`](crate::RegionSlot)s is
-    /// rejected with an exact diagnostic naming it, because projection reaches the member rule with no region access:
-    /// the attached regions are programs in the _heterogeneous_ universe, and no projected driver can present them in
-    /// the member universe.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Region-free linear operation expressed in the projected member operation family.
-    ///   - `inputs`: Per-input primal knowledge, preserving whether each primal is known or is a linear unknown.
-    ///   - `outputs`: Heterogeneous output cotangents, represented as live traced values or structural zeros.
-    ///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by this context.
-    pub fn transpose_projected_operation<T: DifferentiableType, P: Operation<Type = T>>(
-        &mut self,
-        operation: &P,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError>
-    where
-        V: ValueProjection<T, Projected: Value<Type = T>>,
-        V::Type: DifferentiableType + From<T>,
-        P: TransposableOperation<<V as ValueProjection<T>>::Projected, P>,
-        O: OperationProjection<T, Projected = P> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
-        for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
-        TracingContext<<V as ValueProjection<T>>::Projected, P>:
-            StagingContext<Type = T, Constant = <V as ValueProjection<T>>::Projected, Operation = P>,
-    {
-        if !operation.region_slots().is_empty() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "projected operation `{}` carries regions and cannot be transposed through its member family; \
-                     transpose it through a family-level carrier for that operation instead",
-                    operation.name(),
-                ),
-            }
-            .into());
-        }
-
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-        accumulators.iter().try_for_each(|accumulator| self.cotangent_storage(accumulator).map(|_| ()))?;
-
-        // Stage the native member rule in an isolated member-typed trace. The completed rule program is converted back
-        // to the heterogeneous type before it is attached to this context, so primitive transpose rules never need
-        // heterogeneous types. The trace is detached from any region, so the member rule cannot reach reference
-        // accumulators, which is what this helper's region-free, reference-free contract requires.
-        let mut rule_context =
-            TranspositionContext::<<V as ValueProjection<T>>::Projected, P>::new(TracingContext::new());
-
-        // Build the member rule's boundary and the matching source atoms together. Unknown primals contribute only
-        // their projected types. Known primals become leading member-program inputs and their heterogeneous atoms
-        // become the leading splice inputs, preserving the transposition rule's input order. Validate builder ownership
-        // before taking atom IDs: the same index in another trace names an unrelated value.
-        let mut splice_inputs = Vec::new();
-        let rule_inputs = inputs
-            .iter()
-            .map(|input| -> Result<_, DifferentiationError> {
-                match input {
-                    PartialValue::Unknown(r#type) => Ok(PartialValue::Unknown(<&T>::try_from(r#type)?.clone())),
-                    PartialValue::Known(value) => {
-                        check_builders!(self.builder(), value.builder())?;
-                        splice_inputs.push(value.atom_id()?);
-                        Ok(PartialValue::Known(rule_context.input(<&T>::try_from(value.r#type().as_ref())?.clone())))
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Live output cotangents follow known primals in both boundaries. Structural zeros remain type-only and
-        // therefore consume neither a member-program input nor a heterogeneous splice input.
-        let rule_outputs = outputs
-            .iter()
-            .map(|output| -> Result<_, DifferentiationError> {
-                match output {
-                    MaybeZero::Zero(r#type) => Ok(MaybeZero::Zero(<&T>::try_from(r#type)?.clone())),
-                    MaybeZero::Value(value) => {
-                        check_builders!(self.builder(), value.builder())?;
-                        splice_inputs.push(value.atom_id()?);
-                        Ok(MaybeZero::Value(rule_context.input(<&T>::try_from(value.r#type().as_ref())?.clone())))
-                    }
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Apply the native transpose rule to the member boundary. Any operations synthesized by the rule are recorded
-        // in `rule_context`. `EmptyRegionDriver` enforces this helper's region-free contract.
-        let cotangent_mask = accumulators.iter().map(CotangentAccumulator::is_needed).collect::<Vec<_>>();
-        let rule_accumulators = rule_context.cotangent_accumulators(&rule_inputs, &cotangent_mask)?;
-        (*rule_context).clone().invoke_with_provenance_origin(self.provenance(), || {
-            operation.transpose(&mut rule_context, &EmptyRegionDriver, &rule_inputs, &rule_outputs, &rule_accumulators)
-        })?;
-
-        // Export each accumulated member cotangent. Its additions are part of the member program, while reference
-        // updates remain the responsibility of the enclosing self.
-        let (contribution_inputs, output_ids): (Vec<_>, Vec<_>) = rule_accumulators
-            .iter()
-            .enumerate()
-            .filter_map(|(index, accumulator)| match &rule_context.cotangent_storage[accumulator.storage_index] {
-                CotangentStorage::Value { value: Some((value, provenance)), .. } => Some((index, value, provenance)),
-                _ => None,
-            })
-            .map(|(index, value, provenance)| Ok(((index, provenance.clone()), value.atom_id()?)))
-            .collect::<Result<_, DifferentiationError>>()?;
-
-        // Convert the complete member program into the heterogeneous universe, then splice it with the source atoms
-        // collected in precisely the same order as the temporary member-program inputs.
-        let rule_program = rule_context
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<<V as ValueProjection<T>>::Projected>, Vec<<V as ValueProjection<T>>::Projected>>(
-                output_ids,
-                vec![Placeholder; splice_inputs.len()],
-                vec![Placeholder; contribution_inputs.len()],
-            )?
-            .into_unprojected::<V, O>()?;
-        let splice_outputs = self.builder().borrow_mut().splice_program(&rule_program, splice_inputs.as_slice())?;
-        check_count!("output", splice_outputs, contribution_inputs.len(), ProgramError);
-        contribution_inputs.into_iter().zip(splice_outputs).try_for_each(|((input, provenance), output)| {
-            // Preserve scopes entered inside the member rule when outer storage later combines its contributions.
-            let contribution = MaybeZero::Value(self.tracer(output, None));
-            (**self)
-                .clone()
-                .invoke_with_provenance_origin(provenance, || accumulators[input].accumulate(self, contribution))
-        })
-    }
-
-    /// Applies a member operation's transpose rule to an instruction whose parent boundary is _mixed_, meaning that the
-    /// instruction consumes its `T`-typed member inputs together with inputs belonging to other members of the parent
-    /// type universe (e.g., the first-class dimensions that supply a dynamic result shape), in any arrangement. Use
-    /// this function from a family-level operation dispatcher for a [`Region`]-free payload that keeps its native
-    /// member operation type while its instruction crosses member kinds.
-    ///
-    /// Each instruction input is classified individually rather than by position. An input whose type projects into `T`
-    /// is a _data_ input and every other input is a parent-universe shape input. The data inputs, in input order, are
-    /// delegated to the payload's homogeneous [`TransposableOperation`] rule through
-    /// [`transpose_projected_operation`](Self::transpose_projected_operation), together with their corresponding
-    /// accumulator handles. Shape inputs only select the result shape and carry no differential contribution, so they
-    /// receive no contribution. This classification makes the helper independent of how the two input kinds are
-    /// arranged, so it handles interleaved signatures exactly like the "data-inputs-first" arrangement every current
-    /// payload uses. A payload with no data inputs at all (i.e., a dynamic constructor whose inputs are all extents) is
-    /// a constant linear map, so no member rule runs.
-    ///
-    /// Delegating reconstructs the member instruction from type metadata alone, so a mixed instruction whose inputs
-    /// carry runtime (i.e., [`Reference`](TypeIdentityPosition::Reference)-position) identities is rejected. Recovering
-    /// that runtime-dependent type metadata requires linearization, which retains the relevant primal information as
-    /// explicit residuals.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: Region-free linear member operation whose instruction has a mixed parent boundary. Its
-    ///     homogeneous rule sees exactly the data inputs, in the order they appear in the mixed instruction.
-    ///   - `inputs`: Per-input primal knowledge in the mixed instruction's input order.
-    ///   - `outputs`: Heterogeneous output cotangents, represented as live traced values or structural zeros.
-    ///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by this context.
-    pub fn transpose_mixed_operation<T: DifferentiableType, P: Operation<Type = T>>(
-        &mut self,
-        operation: &P,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        accumulators: &[CotangentAccumulator],
-    ) -> Result<(), DifferentiationError>
-    where
-        V: ValueProjection<T, Projected: Value<Type = T>>,
-        V::Type: DifferentiableType + From<T>,
-        O: OperationProjection<T> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
-        <O as OperationProjection<T>>::Projected: From<P>
-            + TransposableOperation<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>,
-        for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
-        TracingContext<<V as ValueProjection<T>>::Projected, <O as OperationProjection<T>>::Projected>: StagingContext<
-                Type = T,
-                Constant = <V as ValueProjection<T>>::Projected,
-                Operation = <O as OperationProjection<T>>::Projected,
-            >,
-    {
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-        accumulators.iter().try_for_each(|accumulator| self.cotangent_storage(accumulator).map(|_| ()))?;
-
-        // Classify each input by whether its type projects into the member universe. Data inputs keep their input order
-        // so the delegated member rule sees the same boundary it would see in a homogeneous instruction. Filter handles
-        // alongside inputs to preserve the association between each input and its enclosing storage.
-        let (data_inputs, data_accumulators): (Vec<_>, Vec<_>) = inputs
-            .iter()
-            .zip(accumulators)
-            .filter(|(input, _)| <&T>::try_from(input.r#type().as_ref()).is_ok())
-            .map(|(input, accumulator)| (input.clone(), accumulator.clone()))
-            .unzip();
-
-        // A mixed instruction with no member-typed inputs stages a value that does not depend on any of them, so every
-        // input receives a structural zero and the member rule is never consulted.
-        if data_inputs.is_empty() {
-            return Ok(());
-        }
-
-        // The delegated member rule sees only the member-typed inputs, so it must be able to derive every cotangent
-        // shape from those inputs alone. A runtime identity anywhere in the mixed signature means the runtime shape
-        // information lives in the parent-universe inputs instead, and only linearization can retain it.
-        if inputs
-            .iter()
-            .any(|input| input.r#type().identities().any(|(position, _)| position == TypeIdentityPosition::Reference))
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "direct `{}` transposition with runtime-dependent type metadata requires linearization so that the \
-                     relevant primal information can be retained as residuals",
-                    operation.name(),
-                ),
-            }
-            .into());
-        }
-
-        let member_operation: <O as OperationProjection<T>>::Projected = operation.clone().into();
-        self.transpose_projected_operation(&member_operation, &data_inputs, outputs, &data_accumulators)
-    }
-}
-
 /// [`Region`] [`Transform`] marker for retained transposed [`Program`]s.
 struct TranspositionTransform;
 
@@ -4634,35 +4452,40 @@ pub(crate) mod tests {
     use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
+    use ryft_macros::Operation;
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType,
-        DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, StridedLayout,
     };
     use crate::batching::{BatchAxis, batch};
-    use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::forward::LinearizationTracer;
+    use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
+    use crate::differentiation::forward::{
+        DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy, LinearizationTracer,
+    };
+    use crate::differentiation::projections::{MemberDifferentiableOperation, MemberTransposableOperation};
     use crate::differentiation::{Differentiate, differentiate_at};
     use crate::macros::{check_count, check_types, impl_guardless_operation};
     use crate::operations::{
-        AddOperation, CastOperation, ConditionOperation, Constant, MulOperation, PrintOperation, ReduceOperation,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap,
-        ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Sin, StopGradient, ZeroOperation,
+        AddOperation, BroadcastOperation, CastOperation, CompareOperation, ConcatenateOperation, ConditionOperation,
+        Constant, ConstantOperation, ConvertElementTypeOperation, DivOperation, ExpOperation, MulOperation,
+        NegOperation, OneLikeOperation, PadOperation, ParallelReduceOperation, ParallelVaryOperation, PrintOperation,
+        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ReshapeOperation,
+        ReshardOperation, SelectOperation, Sin, SliceOperation, StopGradient, SubOperation, TransposeOperation,
+        UpdateSliceOperation, ZeroLikeOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
         AtomId, Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, NoReferenceTransform, NoReferent,
         Operation, Program, ProgramBuilder, ProgramError, ProvenanceScope, ReferenceAccessDescriptor, ReferenceError,
-        ReferenceType, RegionInterface, RegionSlot, TypeError, Typed, TypedProgram, Value,
+        ReferenceType, RegionInterface, RegionSlot, TypeError, Typed, TypedProgram, Value, ValueProjection,
     };
     use crate::specialization::SpecializationCacheStatistics;
-    use crate::tests::{
-        ProjectedMemberOperation, ProjectedMemberType, ProjectedProgramOperation, ProjectedProgramType,
-        ProjectedProgramValue, TestArrayContext,
-    };
+    use crate::tests::TestArrayContext;
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
 
     use super::*;
@@ -5102,11 +4925,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_cotangent_seed_lift() {
+        let value = Array::scalar(2f32).unwrap();
+        assert_eq!(
+            CotangentSeed::Value(value.clone()).lift::<ArrayType, ReferenceTestValue>(),
+            CotangentSeed::Value(ArrayIrValue::Array(value)),
+        );
+        assert_eq!(CotangentSeed::<Array>::Zero.lift::<ArrayType, ReferenceTestValue>(), CotangentSeed::Zero);
+        assert_eq!(
+            CotangentSeed::<Array>::NoCotangent.lift::<ArrayType, ReferenceTestValue>(),
+            CotangentSeed::NoCotangent,
+        );
+    }
+
+    #[test]
     fn test_cotangent_destination_kind() {
         let reference = reference_test_scalar(1.0);
         assert_eq!(CotangentDestination::<ReferenceTestValue>::Return.kind(), CotangentDestinationKind::Return);
         assert_eq!(CotangentDestination::Reference(reference).kind(), CotangentDestinationKind::Reference);
         assert_eq!(CotangentDestination::<ReferenceTestValue>::Ignore.kind(), CotangentDestinationKind::Ignore);
+    }
+
+    #[test]
+    fn test_cotangent_destination_lift() {
+        let reference = ArrayReference::new(Array::scalar(2f32).unwrap());
+        assert_eq!(
+            CotangentDestination::Reference(reference.clone()).lift::<ReferenceType<ArrayType>, ReferenceTestValue>(),
+            CotangentDestination::Reference(ArrayIrValue::Reference(reference)),
+        );
+        assert_eq!(
+            CotangentDestination::<ArrayReference<Array>>::Return
+                .lift::<ReferenceType<ArrayType>, ReferenceTestValue>(),
+            CotangentDestination::Return,
+        );
+        assert_eq!(
+            CotangentDestination::<ArrayReference<Array>>::Ignore
+                .lift::<ReferenceType<ArrayType>, ReferenceTestValue>(),
+            CotangentDestination::Ignore,
+        );
     }
 
     #[test]
@@ -5367,6 +5223,37 @@ pub(crate) mod tests {
         assert_eq!(values[1].as_value().unwrap().atom_id().unwrap(), sum);
         assert_eq!(context.builder().borrow().instructions().len(), 2);
         assert!(context.take_cotangents(&[accumulator]).unwrap()[0].is_zero());
+    }
+
+    #[test]
+    fn test_cotangent_accumulator_accumulate_interchangeable_contributions() {
+        // The operations that compute a contribution do not always know how the input is stored, so a contribution
+        // may have another explicit layout than the cotangent type of the input, or none. Such contributions are
+        // summed like any others, while a contribution that describes other values is still rejected.
+        let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
+        let plain = ArrayType::new_static(DataType::F32, [2, 3]);
+        let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![16, 4])));
+        let accumulator = context.cotangent_accumulator(strided.clone(), true);
+        let first = context.input(plain.clone());
+        let second = context.input(strided.clone());
+        accumulator.accumulate(&mut context, MaybeZero::Value(first.clone())).unwrap();
+        accumulator.accumulate(&mut context, MaybeZero::Value(second.clone())).unwrap();
+        assert_eq!(
+            accumulator.accumulate(&mut context, MaybeZero::Zero(plain.clone().with_data_type(DataType::F64))),
+            Err(TypeError::invalid(format!(
+                "cotangent contribution has type {} but its accumulator expects {strided}",
+                plain.clone().with_data_type(DataType::F64),
+            ))
+            .into()),
+        );
+        let builder = context.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert_eq!(builder.instructions()[0].operation().name(), "add");
+        assert_eq!(builder.instructions()[0].inputs(), &[first.atom_id().unwrap(), second.atom_id().unwrap()]);
+        let sum = builder.instructions()[0].outputs()[0];
+        drop(builder);
+        let values = context.take_cotangents(&[accumulator]).unwrap();
+        assert_eq!(values[0].as_value().unwrap().atom_id().unwrap(), sum);
     }
 
     #[test]
@@ -5945,6 +5832,24 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_pullback_apply_interchangeable_cotangent_seeds() {
+        // The cotangent type of an output with an explicit layout has none, and a pullback accepts a seed that is
+        // stored like that output as well as one that is not. The gradient is an array of the cotangent type of the
+        // input, however the operations that computed it stored it.
+        let plain = ArrayType::new_static(DataType::F32, [2, 2]);
+        let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![16, 8])));
+        let primal = Array::from_elements(strided.clone(), &[1f32, 2.0, 3.0, 4.0]).unwrap();
+        let (output, pullback) = differentiate_at(primal).vjp(|input| Ok(input.clone() * input)).unwrap();
+        assert_eq!(output.r#type().as_ref(), &strided);
+        for seed_type in [&plain, &strided] {
+            let seed = Array::from_elements(seed_type.clone(), &[0.5f32, 1.5, 2.5, 3.5]).unwrap();
+            let gradient: Array = pullback.apply_materialized(seed).unwrap();
+            assert!(plain.is_interchangeable_with(gradient.r#type().as_ref()));
+            assert_eq!(gradient.elements::<f32>().unwrap(), vec![1.0, 6.0, 15.0, 28.0]);
+        }
+    }
+
+    #[test]
     fn test_pullback_transposed_program() {
         let (_, pullback) = differentiate_at(Array::scalar(2.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
         let transposed = pullback.transposed_program(&[]).unwrap().into_program();
@@ -6204,6 +6109,108 @@ pub(crate) mod tests {
         assert_eq!(
             pullback.apply(Array::scalar(4.0).unwrap()),
             Ok((MaybeZero::Value(Array::scalar(8.0).unwrap()), MaybeZero::Value(Array::scalar(12.0).unwrap()))),
+        );
+    }
+
+    #[test]
+    fn test_pullback_apply_in_context() {
+        // `f(left, right) = left * right` is differentiated once. Applied under a batching level, the pullback imports
+        // its residuals as replicated values and pulls a whole batch of cotangents back at once.
+        let function = |(left, right): (
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        )| Ok(left * right);
+        let (_, pullback) =
+            differentiate_at((Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap())).vjp(function).unwrap();
+        let batched = batch(
+            |cotangent| {
+                let context = cotangent.context().clone();
+                pullback.apply_materialized_in_context(&context, cotangent)
+            },
+            Array::vector(vec![1.0, 4.0]).unwrap(),
+            BatchAxis::new(0),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            None,
+        );
+        assert_eq!(batched, Ok((Array::vector(vec![2.0, 8.0]).unwrap(), Array::vector(vec![3.0, 12.0]).unwrap())));
+    }
+
+    #[test]
+    fn test_pullback_apply_in_context_repeated_in_different_caller_contexts() {
+        // `f(left, right) = left * right` is differentiated once at `(3, 2)`, so its pullback is `ȳ ↦ (2ȳ, 3ȳ)`. Each
+        // application imports the residuals anew into its own caller context, so applications that alternate between
+        // a batching level and forward mode differentiation do not affect each other.
+        let function = |(left, right): (
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        )| Ok(left * right);
+        let (_, pullback) =
+            differentiate_at((Array::scalar(3.0).unwrap(), Array::scalar(2.0).unwrap())).vjp(function).unwrap();
+        let apply_under_batch = || {
+            batch(
+                |cotangent| pullback.apply_materialized_in_context(&cotangent.domain(), cotangent),
+                Array::vector(vec![1.0, 4.0]).unwrap(),
+                BatchAxis::new(0),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                None,
+            )
+        };
+        let apply_under_jvp = || {
+            differentiate_at(Array::scalar(4.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |cotangent| {
+                pullback.apply_materialized_in_context(&cotangent.domain(), cotangent)
+            })
+        };
+        let batched = Ok((Array::vector(vec![2.0, 8.0]).unwrap(), Array::vector(vec![3.0, 12.0]).unwrap()));
+        let differentiated = Ok((
+            (Array::scalar(8.0).unwrap(), Array::scalar(12.0).unwrap()),
+            (Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap()),
+        ));
+        assert_eq!(apply_under_batch(), batched);
+        assert_eq!(apply_under_jvp(), differentiated);
+        assert_eq!(apply_under_batch(), batched);
+        assert_eq!(apply_under_jvp(), differentiated);
+    }
+
+    #[test]
+    fn test_pullback_apply_in_context_materializes_dynamic_zero_cotangents() {
+        // For `f(x, y) = y` with a dynamic `x`, the cotangent of `x` is a structural zero whose source is `x` itself.
+        // Applied under a batching level over the trace that differentiated it, the pullback imports that source as a
+        // replicated value and materializes the zero there, and the batching level then broadcasts it to the requested
+        // output batch axis.
+        let n = DimensionVariable::new("n", DimensionBounds::new(1, Some(5)).unwrap());
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]));
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>| {
+                let (_, pullback) = differentiate_at((inputs[0].clone(), inputs[1].clone())).vjp(|(_, y)| Ok(y))?;
+                let (x_cotangents, y_cotangents) = batch(
+                    |seed| {
+                        let context = seed.context().clone();
+                        pullback.apply_materialized_in_context(&context, seed)
+                    },
+                    inputs[2].clone(),
+                    BatchAxis::new(0),
+                    (BatchAxis::new(0), BatchAxis::new(0)),
+                    None,
+                )?;
+                Ok(vec![x_cotangents, y_cotangents])
+            },
+            vec![
+                ArrayIrType::from(vector_type),
+                ArrayIrType::from(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::from(ArrayType::new_static(DataType::F32, [3])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            program.into_flat_program().to_string(),
+            indoc! {"
+                lambda %0:f32[n], %1:f32[], %2:f32[3] .
+                let %3:dimension<3> = constant [value=3]
+                    %4:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %0
+                    %5:f32[n] = zero [type=f32[n]] %4
+                    %6:dimension<n ∈ [1, 5)> = dimension_size [axis=0] %5
+                    %7:f32[3, n] = broadcast [output_axes=[1]] %5 %3 %6
+                in (%7, %2)"},
         );
     }
 
@@ -10052,6 +10059,214 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_value_and_gradient_value_only_array_ir_family() {
+        // An operation family over the array IR type universe that supports no reference operation still computes
+        // ordinary gradients, because gradients of value-only inputs never allocate, accumulate into, or freeze
+        // cotangent references.
+
+        /// Ordinary array primitives needed by elementwise differentiation and its shape alignment rules.
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(type(ArrayType), constant(Array), dispatch(differentiation, transposition))]
+        enum ValueOnlyArrayOperation {
+            Constant(ConstantOperation<Array>),
+            Zero(ZeroOperation<ArrayType>),
+            One(OneOperation<ArrayType>),
+            ZeroLike(ZeroLikeOperation<ArrayType>),
+            OneLike(OneLikeOperation<ArrayType>),
+            Neg(NegOperation<ArrayType>),
+            Add(AddOperation<ArrayType>),
+            Sub(SubOperation<ArrayType>),
+            Exp(ExpOperation<ArrayType>),
+            Mul(MulOperation<ArrayType>),
+            ConvertElementType(ConvertElementTypeOperation<ArrayType>),
+            Broadcast(BroadcastOperation),
+            Transpose(TransposeOperation),
+            Reshape(ReshapeOperation),
+            Reduce(ReduceOperation),
+            Concatenate(ConcatenateOperation<ArrayType>),
+            Slice(SliceOperation),
+            UpdateSlice(UpdateSliceOperation),
+            Pad(PadOperation<ArrayType>),
+            Reshard(ReshardOperation),
+            Compare(CompareOperation<ArrayType>),
+            Div(DivOperation<ArrayType>),
+            Select(SelectOperation<ArrayType>),
+        }
+
+        impl OperationProvider<ArrayType, ParallelVaryOperation> for ValueOnlyArrayOperation {
+            type Operation = Self;
+
+            fn provide(_request: ParallelVaryOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "value-only test operation family cannot align manual variation".to_string(),
+                })
+            }
+        }
+
+        impl OperationProvider<ArrayType, ParallelReduceOperation> for ValueOnlyArrayOperation {
+            type Operation = Self;
+
+            fn provide(_request: ParallelReduceOperation, input_types: &[&ArrayType]) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "value-only test operation family cannot reduce over manual mesh axes".to_string(),
+                })
+            }
+        }
+
+        /// Array IR operation family containing only constants and ordinary array operations.
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(
+            type(ArrayIrType),
+            constant(ArrayIrValue<Array>),
+            members(ArrayType),
+            dispatch(differentiation, transposition),
+        )]
+        enum ValueOnlyOperation {
+            Constant(ConstantOperation<ArrayIrValue<Array>>),
+            Zero(ZeroOperation<ArrayIrType>),
+            One(OneOperation<ArrayIrType>),
+            #[ryft(projected(ArrayType))]
+            Array(ValueOnlyArrayOperation),
+        }
+
+        impl ReferenceAccessOperation for ValueOnlyOperation {
+            type Transform = NoReferenceTransform<ArrayType, ArrayIrType>;
+
+            fn base_input_count(&self) -> usize {
+                0
+            }
+
+            fn reference_access_descriptor(
+                &self,
+                _input_index: usize,
+            ) -> Option<ReferenceAccessDescriptor<'_, Self::Transform>> {
+                None
+            }
+
+            fn with_reference_access_transforms(
+                &self,
+                _input_index: usize,
+                _transforms: Vec<Self::Transform>,
+            ) -> Result<Self, ProgramError> {
+                Err(ProgramError::UnsupportedOperation {
+                    message: "value-only operations have no reference accesses".to_string(),
+                })
+            }
+        }
+
+        // The member rules stay entirely within ordinary arrays, so the standard projection adapters suffice.
+        impl<C> MemberDifferentiableOperation<C> for ValueOnlyArrayOperation
+        where
+            C: Context<
+                    Type = ArrayIrType,
+                    Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                    Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+                    Operation = ValueOnlyOperation,
+                >,
+            ProjectedContext<C, ArrayType>: Domain<
+                    Type = ArrayType,
+                    Value = <C::Value as ValueProjection<ArrayType>>::Projected,
+                    Constant = <C::Constant as ValueProjection<ArrayType>>::Projected,
+                    Operation = ValueOnlyArrayOperation,
+                >,
+            Self: DifferentiableOperation<ProjectedContext<C, ArrayType>>,
+        {
+            fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+                &self,
+                context: &DifferentiationContext<C, P>,
+                _driver: &D,
+                inputs: &[DifferentiationDual<C::Value>],
+            ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+                context.jvp_projected_operation(self, inputs)
+            }
+        }
+
+        impl MemberTransposableOperation<ArrayIrValue<Array>, ValueOnlyOperation> for ValueOnlyArrayOperation {
+            fn transpose_in_parent<D: TranspositionDriver<ArrayIrValue<Array>, ValueOnlyOperation>>(
+                &self,
+                context: &mut TranspositionContext<ArrayIrValue<Array>, ValueOnlyOperation>,
+                _driver: &D,
+                inputs: &[PartialValue<Tracer<TracingContext<ArrayIrValue<Array>, ValueOnlyOperation>>>],
+                outputs: &[MaybeZero<Tracer<TracingContext<ArrayIrValue<Array>, ValueOnlyOperation>>>],
+                accumulators: &[CotangentAccumulator],
+            ) -> Result<(), DifferentiationError> {
+                context.transpose_projected_operation(self, inputs, outputs, accumulators)
+            }
+        }
+
+        // This fixture uses static shapes, whose residual zeros need no runtime dimensions.
+        impl ResidualZeroProvider<ArrayIrType> for ValueOnlyOperation {}
+
+        impl From<AddOperation<ArrayIrType>> for ValueOnlyOperation {
+            fn from(_operation: AddOperation<ArrayIrType>) -> Self {
+                Self::Array(ValueOnlyArrayOperation::Add(AddOperation::new()))
+            }
+        }
+
+        // The family converts from no reference payload, so it explicitly reports every reference operation that
+        // reverse mode may request as unsupported.
+        impl OperationProvider<ArrayIrType, ReferenceNewOperation<ArrayType, ArrayIrType>> for ValueOnlyOperation {
+            type Operation = Self;
+
+            fn provide(
+                _request: ReferenceNewOperation<ArrayType, ArrayIrType>,
+                input_types: &[&ArrayIrType],
+            ) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "this operation family does not support reference allocation".to_string(),
+                })
+            }
+        }
+
+        impl OperationProvider<ArrayIrType, ReferenceAddUpdateOperation<ArrayType, ArrayIrType>> for ValueOnlyOperation {
+            type Operation = Self;
+
+            fn provide(
+                _request: ReferenceAddUpdateOperation<ArrayType, ArrayIrType>,
+                input_types: &[&ArrayIrType],
+            ) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 2, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "this operation family does not support reference accumulation".to_string(),
+                })
+            }
+        }
+
+        impl OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayType, ArrayIrType>> for ValueOnlyOperation {
+            type Operation = Self;
+
+            fn provide(
+                _request: ReferenceFreezeOperation<ArrayType, ArrayIrType>,
+                input_types: &[&ArrayIrType],
+            ) -> Result<Self, ProgramError> {
+                check_count!("input", input_types, 1, ProgramError);
+                Err(ProgramError::UnsupportedOperation {
+                    message: "this operation family does not support reference freezing".to_string(),
+                })
+            }
+        }
+
+        let context = EagerContext::<ArrayIrValue<Array>, ValueOnlyOperation>::new();
+        let result = differentiate_at(ArrayIrValue::Array(Array::scalar(3.0f32).unwrap()))
+            .in_context(&context)
+            .value_and_gradient(|value| {
+                let operation = ValueOnlyOperation::Array(ValueOnlyArrayOperation::Add(AddOperation::new()));
+                let mut outputs = value.context().bind(operation, Vec::new(), &[value.clone(), value.clone()])?;
+                Ok::<_, ProgramError>(outputs.remove(0))
+            });
+        assert_eq!(
+            result,
+            Ok((
+                ArrayIrValue::Array(Array::scalar(6.0f32).unwrap()),
+                ArrayIrValue::Array(Array::scalar(2.0f32).unwrap()),
+            )),
+        );
+    }
+
+    #[test]
     fn test_value_and_gradient_reference_inputs() {
         let reference = ArrayReference::new(Array::scalar(3.0_f32).unwrap());
         assert_eq!(
@@ -10594,238 +10809,5 @@ pub(crate) mod tests {
             2.0 * (2.0 * (x * x).cos() - 4.0 * x * x * (x * x).sin()),
             epsilon = 1e-9
         );
-    }
-
-    #[test]
-    fn test_transpose_projected_operation() {
-        // The third fixture member is intentionally unrelated to arrays. Its identity transpose proves that the
-        // adapter records the member rule, converts its program, and splices the live cotangent into the heterogeneous
-        // trace without changing its SSA identity or type.
-        let mut context =
-            TranspositionContext::new(TracingContext::<ProjectedProgramValue, ProjectedProgramOperation>::new());
-        let member_type = ProjectedProgramType::Third(ProjectedMemberType::<2>);
-        let output_cotangent = context.input(member_type.clone());
-        let inputs = &[PartialValue::Unknown(member_type.clone())];
-        let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
-        context
-            .transpose_projected_operation(
-                &ProjectedMemberOperation::<2>::Identity,
-                inputs,
-                &[MaybeZero::Value(output_cotangent.clone())],
-                &accumulators,
-            )
-            .unwrap();
-        let cotangents = context.take_cotangents(&accumulators).unwrap();
-        assert_eq!(cotangents.len(), 1);
-        let MaybeZero::Value(input_cotangent) = &cotangents[0] else {
-            panic!("identity transpose must preserve its live output cotangent");
-        };
-        assert_eq!(input_cotangent.atom_id(), output_cotangent.atom_id());
-        assert_eq!(input_cotangent.r#type(), output_cotangent.r#type());
-
-        // Known primal inputs are replay values rather than linear inputs, so the member rule returns a structural
-        // zero for them. Structural-zero output cotangents also cross the adapter without becoming replay values.
-        let known_input = context.input(member_type.clone());
-        let inputs = &[PartialValue::Known(known_input)];
-        let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
-        context
-            .transpose_projected_operation(
-                &ProjectedMemberOperation::<2>::Identity,
-                inputs,
-                &[MaybeZero::Value(output_cotangent)],
-                &accumulators,
-            )
-            .unwrap();
-        let cotangents = context.take_cotangents(&accumulators).unwrap();
-        assert!(matches!(
-            cotangents.as_slice(),
-            [MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>))],
-        ));
-        let inputs = &[PartialValue::Unknown(member_type.clone())];
-        let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
-        context
-            .transpose_projected_operation(
-                &ProjectedMemberOperation::<2>::Identity,
-                inputs,
-                &[MaybeZero::Zero(member_type)],
-                &accumulators,
-            )
-            .unwrap();
-        let cotangents = context.take_cotangents(&accumulators).unwrap();
-        assert!(matches!(
-            cotangents.as_slice(),
-            [MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>))],
-        ));
-    }
-
-    #[test]
-    fn test_transpose_projected_operation_preserves_contribution_provenance() {
-        // The member rule submits two identity contributions under different local scopes.
-        let mut context =
-            TranspositionContext::new(TracingContext::<ProjectedProgramValue, ProjectedProgramOperation>::new());
-        let r#type = ProjectedProgramType::Third(ProjectedMemberType::<2>);
-        let seed = context.input(r#type.clone());
-        let inputs = [PartialValue::Unknown(r#type)];
-        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
-        let origin = Provenance::scope(ProvenanceScope::new("source"), Provenance::unknown());
-        (*context)
-            .clone()
-            .invoke_with_provenance_origin(origin.clone(), || {
-                context.transpose_projected_operation(
-                    &ProjectedMemberOperation::<2>::Scoped,
-                    &inputs,
-                    &[MaybeZero::Value(seed.clone())],
-                    &accumulators,
-                )
-            })
-            .unwrap();
-
-        // The member rule adds its contributions before projection. Splicing preserves the fused member-local
-        // scopes and source origin, and extracting the accumulated value does not stage another addition.
-        assert_eq!(context.builder().borrow().instructions().len(), 1);
-        let cotangents = context.take_cotangents(&accumulators).unwrap();
-        let builder = context.builder().borrow();
-        assert_eq!(builder.instructions().len(), 1);
-        let addition = &builder.instructions()[0];
-        assert_eq!(addition.operation().name(), "add");
-        assert_eq!(addition.inputs(), &[seed.atom_id().unwrap(), seed.atom_id().unwrap()]);
-        assert_eq!(cotangents[0].as_value().unwrap().atom_id().unwrap(), addition.outputs()[0]);
-        assert_eq!(
-            addition.provenance(),
-            &Provenance::fused([
-                Provenance::scope(ProvenanceScope::new("first"), origin.clone()),
-                Provenance::scope(ProvenanceScope::new("second"), origin),
-            ]),
-        );
-    }
-
-    #[test]
-    fn test_transpose_projected_operation_rejects_foreign_builders() {
-        let mut context =
-            TranspositionContext::new(TracingContext::<ProjectedProgramValue, ProjectedProgramOperation>::new());
-        let foreign_context = TracingContext::<ProjectedProgramValue, ProjectedProgramOperation>::new();
-        let member_type = ProjectedProgramType::Third(ProjectedMemberType::<2>);
-        let local = context.input(member_type.clone());
-        let foreign = foreign_context.input(member_type.clone());
-
-        // Both traces assign their first input the same atom index. Checking only that index would silently replace
-        // the foreign value with the local input when the member program is spliced.
-        assert_eq!(local.atom_id(), foreign.atom_id());
-        let accumulators = context.cotangent_accumulators(&[PartialValue::Unknown(member_type.clone())], &[]).unwrap();
-        assert!(matches!(
-            context.transpose_projected_operation(
-                &ProjectedMemberOperation::<2>::Identity,
-                &[PartialValue::Known(foreign.clone())],
-                &[MaybeZero::Value(local)],
-                &accumulators,
-            ),
-            Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders)),
-        ));
-        assert!(matches!(
-            context.transpose_projected_operation(
-                &ProjectedMemberOperation::<2>::Identity,
-                &[PartialValue::Unknown(member_type)],
-                &[MaybeZero::Value(foreign)],
-                &accumulators,
-            ),
-            Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders)),
-        ));
-    }
-
-    #[test]
-    fn test_transpose_mixed_operation() {
-        // The member addition is linear in its two member-typed data inputs. No production mixed payload interleaves
-        // its data and shape inputs, so this test is what pins that mixed transposition classifies inputs one by one
-        // instead of splitting the input list at its first shape input.
-        type Context = TracingContext<ProjectedProgramValue, ProjectedProgramOperation>;
-
-        // Data inputs at positions 0 and 2 are delegated to the member rule in that order, and the shape inputs
-        // between and after them receive structural zeros in their own member universe.
-        let data_type = ProjectedProgramType::Third(ProjectedMemberType::<2>);
-        let shape_type = ProjectedProgramType::First(ProjectedMemberType::<0>);
-        let mut context = TranspositionContext::new(Context::new());
-        let output_cotangent = context.input(data_type.clone());
-        let inputs = &[
-            PartialValue::Unknown(data_type.clone()),
-            PartialValue::Unknown(shape_type.clone()),
-            PartialValue::Unknown(data_type.clone()),
-            PartialValue::Unknown(shape_type.clone()),
-        ];
-        let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
-        context
-            .transpose_mixed_operation(
-                &ProjectedMemberOperation::<2>::Add,
-                inputs,
-                &[MaybeZero::Value(output_cotangent.clone())],
-                &accumulators,
-            )
-            .unwrap();
-        let cotangents = context.take_cotangents(&accumulators).unwrap();
-        let [
-            MaybeZero::Value(first_cotangent),
-            MaybeZero::Zero(second_cotangent_type),
-            MaybeZero::Value(third_cotangent),
-            MaybeZero::Zero(fourth_cotangent_type),
-        ] = cotangents.as_slice()
-        else {
-            panic!("mixed transposition must classify each input individually: {cotangents:?}");
-        };
-        assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
-        assert_eq!(third_cotangent.atom_id(), output_cotangent.atom_id());
-        assert_eq!(second_cotangent_type, &shape_type);
-        assert_eq!(fourth_cotangent_type, &shape_type);
-
-        // Interleaved known data inputs stay known inputs of the member rule, so their structural zeros are the member
-        // rule's own and remain at their input positions.
-        let known_data = context.input(data_type.clone());
-        let inputs = &[
-            PartialValue::Known(known_data),
-            PartialValue::Unknown(shape_type.clone()),
-            PartialValue::Unknown(data_type.clone()),
-        ];
-        let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
-        context
-            .transpose_mixed_operation(
-                &ProjectedMemberOperation::<2>::Add,
-                inputs,
-                &[MaybeZero::Value(output_cotangent.clone())],
-                &accumulators,
-            )
-            .unwrap();
-        let cotangents = context.take_cotangents(&accumulators).unwrap();
-        assert!(matches!(
-            cotangents.as_slice(),
-            [
-                MaybeZero::Zero(ProjectedProgramType::Third(_)),
-                MaybeZero::Zero(ProjectedProgramType::First(_)),
-                MaybeZero::Value(_),
-            ],
-        ));
-
-        // The data-inputs-first arrangement every current payload uses degenerates to the same result, so the
-        // classification is a strict generalization of splitting the input list at its first shape input.
-        let inputs = &[
-            PartialValue::Unknown(data_type.clone()),
-            PartialValue::Unknown(data_type),
-            PartialValue::Unknown(shape_type.clone()),
-        ];
-        let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
-        context
-            .transpose_mixed_operation(
-                &ProjectedMemberOperation::<2>::Add,
-                inputs,
-                &[MaybeZero::Value(output_cotangent.clone())],
-                &accumulators,
-            )
-            .unwrap();
-        let cotangents = context.take_cotangents(&accumulators).unwrap();
-        let [MaybeZero::Value(first_cotangent), MaybeZero::Value(second_cotangent), MaybeZero::Zero(shape)] =
-            cotangents.as_slice()
-        else {
-            panic!("prefix-arranged mixed transposition must keep its previous result: {cotangents:?}");
-        };
-        assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
-        assert_eq!(second_cotangent.atom_id(), output_cotangent.atom_id());
-        assert_eq!(shape, &shape_type);
     }
 }

@@ -56,7 +56,11 @@ macro_rules! check_count {
 ///   - `@float`: Accepts floating-point and complex [`DataType`](crate::DataType)s.
 ///   - `@real`: Excludes complex [`DataType`](crate::DataType)s and is intended to refine `@numeric` or `@float`.
 ///   - `@no_unreduced`: Rejects [`ArrayType`](crate::ArrayType)s carrying any unreduced mesh axes.
-///   - `@same_unreduced_axes`: Requires exactly two [`ArrayType`](crate::ArrayType)s with matching unreduced-axis sets.
+///   - `@same_unreduced_axes`: Requires exactly two [`ArrayType`](crate::ArrayType)s with matching unreduced-axis sets
+///     and matching [`UnreducedKind`](crate::UnreducedKind)s.
+///   - `@sum_unreduced`, `@max_unreduced`, and `@min_unreduced`: Reject [`ArrayType`](crate::ArrayType)s carrying
+///     unreduced mesh axes of any [`UnreducedKind`](crate::UnreducedKind) other than the named one (e.g., the inputs
+///     of an operation that is linear only in sums, or that commutes only with maxima).
 ///   - `@same_reduced_axes`: Requires exactly two [`ArrayType`](crate::ArrayType)s with matching reduced-axis sets.
 ///
 /// # Examples
@@ -115,6 +119,46 @@ macro_rules! check_types {
         }
         if types[0].unreduced_axes() != types[1].unreduced_axes() {
             return Err($crate::TypeError::invalid(format!("`{descriptor}` inputs must be unreduced over the same axes"))
+            .into());
+        }
+        if types[0].unreduced_kind() != types[1].unreduced_kind() {
+            return Err($crate::TypeError::invalid(format!(
+                "`{}` inputs must be unreduced with the same kind but got `{}` and `{}`",
+                descriptor,
+                types[0].unreduced_kind(),
+                types[1].unreduced_kind(),
+            ))
+            .into());
+        }
+    }};
+
+    // The following branches reject array types whose unreduced mesh axes carry a kind other than the named one.
+    (@sum_unreduced, $descriptor:expr, $types:expr $(,)?) => {{
+        $crate::check_types!(@unreduced_kind Sum, $descriptor, $types);
+    }};
+
+    (@max_unreduced, $descriptor:expr, $types:expr $(,)?) => {{
+        $crate::check_types!(@unreduced_kind Max, $descriptor, $types);
+    }};
+
+    (@min_unreduced, $descriptor:expr, $types:expr $(,)?) => {{
+        $crate::check_types!(@unreduced_kind Min, $descriptor, $types);
+    }};
+
+    (@unreduced_kind $kind:ident, $descriptor:expr, $types:expr $(,)?) => {{
+        let descriptor = $descriptor;
+        let types = &$types[..];
+        let expected = $crate::UnreducedKind::$kind;
+        if let Some(r#type) = types
+            .iter()
+            .find(|r#type| !r#type.unreduced_axes().is_empty() && r#type.unreduced_kind() != expected)
+        {
+            return Err($crate::TypeError::invalid(format!(
+                "`{}` supports only unreduced inputs of kind `{}` but got kind `{}`",
+                descriptor,
+                expected,
+                r#type.unreduced_kind(),
+            ))
             .into());
         }
     }};
@@ -186,8 +230,9 @@ macro_rules! check_types {
     };
 }
 
-/// Checks that a concrete [`DeviceMesh`](crate::DeviceMesh) and a [`Sharding`](crate::Sharding) refer to the same
-/// [`LogicalMesh`](crate::LogicalMesh). If the logical meshes differ, the macro returns a
+/// Checks that a concrete [`DeviceMesh`](crate::DeviceMesh) and a [`Sharding`](crate::Sharding) refer to the same mesh
+/// topology (i.e., computed via [`LogicalMesh::has_same_topology`](crate::LogicalMesh::has_same_topology)), so axis
+/// types may differ. If the topologies differ, the macro returns a
 /// [`ShardingError::MeshMismatch`](crate::ShardingError::MeshMismatch) converted into the enclosing function's error
 /// type using [`Into::into`]. Use this macro in functions that return a [`Result`] whose error type can be constructed
 /// from [`ShardingError`](crate::ShardingError).
@@ -202,7 +247,7 @@ macro_rules! check_sharding {
     ($mesh:expr, $sharding:expr $(,)?) => {{
         let mesh = &$mesh;
         let sharding = &$sharding;
-        if mesh.logical_mesh() != sharding.mesh() {
+        if !mesh.logical_mesh().has_same_topology(sharding.mesh()) {
             return Err($crate::arrays::ShardingError::MeshMismatch {
                 expected: mesh.logical_mesh().clone(),
                 actual: sharding.mesh().clone(),
@@ -1185,8 +1230,9 @@ macro_rules! define_elementwise_operation {
 /// The generated trait is parameterized by its universe (i.e., `$capability<T = <Self as Capability>::Universe>`; refer
 /// to the documentation of [`Capability`](crate::Capability) for more information on that), its generic implementation
 /// covers every [`ValueDomainDispatch`](crate::ValueDomainDispatch) value whose domain can bind the operation for that
-/// value's own universe, and array IR values implement it through their array members (refer to the
-/// `#[capability]` attribute documented on [`Capability`](crate::Capability)). [`Parameterwise`](crate::Parameterwise)
+/// value's own universe, and array IR values implement it through their array members (refer to the `#[capability]`
+/// attribute documented on [`Capability`](crate::Capability)), or by member kind for binary capabilities that name a
+/// dimension capability function (refer to the `dimension` parameter below). [`Parameterwise`](crate::Parameterwise)
 /// structures implement it parameter-by-parameter (i.e., by zipping the parameters of both inputs for binary
 /// capabilities).
 ///
@@ -1240,6 +1286,14 @@ macro_rules! define_elementwise_operation {
 ///     configuration. Stateless operations provide themselves through the blanket implementation, while type families
 ///     whose operations carry type-derived metadata (e.g., checked dimension arithmetic) override the provider for the
 ///     marker.
+///   - `dimension = $dimension_capability::$dimension_method`: Optional dimension capability function
+///     of a `@binary` capability that also has a first-class dimension operation (e.g., `dimension = Mul::mul`
+///     or `dimension = DimensionMin::dimension_min`). Array IR values then implement the capability by member kind
+///     instead of through their array members alone. Two first-class dimensions use this function of their dimension
+///     members, and every other pair of inputs uses the capability of its array members. An array IR value therefore
+///     implements the capability only when it projects onto both [`ArrayType`](crate::ArrayType) and
+///     [`DimensionType`](crate::DimensionType) (refer to [`ValueProjection`](crate::ValueProjection)), its
+///     array member implements the capability, and its dimension member implements `$dimension_capability`.
 #[macro_export]
 macro_rules! define_elementwise_capability {
     // This branch defines a unary capability whose operation carries a result accuracy. The accuracy-free function
@@ -1380,7 +1434,7 @@ macro_rules! define_elementwise_capability {
     };
 
     // This branch defines a two-input capability whose binary operation is provided by the value type family,
-    // using the caller-provided name for the right input.
+    // using the caller-provided name for the right input. Array IR values implement it through their array members.
     (
         @binary
         $(#[$capability_documentation:meta])*
@@ -1403,6 +1457,84 @@ macro_rules! define_elementwise_capability {
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError>;
         }
 
+        $crate::define_elementwise_capability!(@binary_implementations $capability, $method($argument), $operation);
+    };
+
+    // This branch defines a two-input capability that array IR values implement by member kind. Two first-class
+    // dimensions use the provided dimension capability function of their dimension members, and every other pair
+    // of inputs uses this capability on their array members, which rejects inputs that are not arrays. The trait
+    // is declared here rather than in a shared branch, because the `#[capability]` attribute must be applied in
+    // the same macro expansion as the trait that it annotates.
+    (
+        @binary
+        $(#[$capability_documentation:meta])*
+        $capability:ident,
+        $(#[$method_documentation:meta])+
+        $method:ident($argument:ident),
+        $operation:ident,
+        dimension = $dimension_capability:ident :: $dimension_method:ident $(,)?
+    ) => {
+        $(#[$capability_documentation])*
+        #[doc = ""]
+        #[doc = "The universe parameter `T` defaults to the [`Capability`](crate::Capability) universe"]
+        #[doc = "of the implementor, so that homogeneous array values implement this capability for"]
+        #[doc = "[`ArrayType`](crate::ArrayType) and array IR values implement it for"]
+        #[doc = "[`ArrayIrType`](crate::ArrayIrType) by member kind. Two first-class dimensions use the"]
+        #[doc = "corresponding dimension capability of their dimension members, in the"]
+        #[doc = "[`DimensionType`](crate::DimensionType) universe, and every other pair of inputs uses"]
+        #[doc = "this capability of its array members."]
+        #[::ryft_macros::capability]
+        pub trait $capability<T = <Self as $crate::operations::Capability>::Universe>:
+            $crate::operations::Capability + Sized
+        {
+            $(#[$method_documentation])+
+            fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError>;
+        }
+
+        $crate::define_elementwise_capability!(@binary_implementations $capability, $method($argument), $operation);
+
+        impl<
+            __V: $crate::Value<Type = $crate::arrays::ArrayIrType>
+                + $crate::ValueProjection<$crate::arrays::ArrayType>
+                + $crate::ValueProjection<$crate::arrays::DimensionType>,
+        > $capability<$crate::arrays::ArrayIrType> for __V
+        where
+            <__V as $crate::ValueProjection<$crate::arrays::ArrayType>>::Projected:
+                $capability<$crate::arrays::ArrayType>,
+            <__V as $crate::ValueProjection<$crate::arrays::DimensionType>>::Projected:
+                $dimension_capability<$crate::arrays::DimensionType>,
+        {
+            fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError> {
+                // Only a pair of dimensions selects the dimension members. Every other pair is projected onto its
+                // array members, so that an input of another kind reports the error of that projection.
+                if let ($crate::arrays::ArrayIrType::Dimension(_), $crate::arrays::ArrayIrType::Dimension(_)) =
+                    ($crate::Typed::r#type(self).as_ref(), $crate::Typed::r#type($argument).as_ref())
+                {
+                    let left = <__V as $crate::ValueProjection<$crate::arrays::DimensionType>>::into_projected(
+                        ::core::clone::Clone::clone(self),
+                    )?;
+                    let right = <__V as $crate::ValueProjection<$crate::arrays::DimensionType>>::into_projected(
+                        ::core::clone::Clone::clone($argument),
+                    )?;
+                    return Ok(<__V as $crate::ValueProjection<$crate::arrays::DimensionType>>::from_projected(
+                        $dimension_capability::<$crate::arrays::DimensionType>::$dimension_method(&left, &right)?,
+                    ));
+                }
+                let left = <__V as $crate::ValueProjection<$crate::arrays::ArrayType>>::into_projected(
+                    ::core::clone::Clone::clone(self),
+                )?;
+                let right = <__V as $crate::ValueProjection<$crate::arrays::ArrayType>>::into_projected(
+                    ::core::clone::Clone::clone($argument),
+                )?;
+                Ok(<__V as $crate::ValueProjection<$crate::arrays::ArrayType>>::from_projected(
+                    $capability::<$crate::arrays::ArrayType>::$method(&left, &right)?,
+                ))
+            }
+        }
+    };
+
+    // This internal branch generates the implementations that both public binary forms share.
+    (@binary_implementations $capability:ident, $method:ident($argument:ident), $operation:ident $(,)?) => {
         impl<
             __T: $crate::Type,
             __V: $crate::Value<
@@ -6825,8 +6957,8 @@ mod tests {
     #[test]
     fn test_check_types_array_types() {
         let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
         let plain = ArrayType::scalar(DataType::F32);
@@ -6888,13 +7020,16 @@ mod tests {
         let expected_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let actual_mesh = LogicalMesh::new(vec![MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(expected_mesh.clone(), vec![Device::new(0, 0)]).unwrap();
+        let retyped_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let matching = Sharding::new(expected_mesh.clone(), vec![]).unwrap();
+        let retyped = Sharding::new(retyped_mesh, vec![]).unwrap();
         let mismatching = Sharding::new(actual_mesh.clone(), vec![]).unwrap();
         let check = |sharding: &Sharding| -> Result<(), ShardingError> {
             check_sharding!(&device_mesh, sharding);
             Ok(())
         };
         assert_eq!(check(&matching), Ok(()));
+        assert_eq!(check(&retyped), Ok(()));
         assert_eq!(
             check(&mismatching),
             Err(ShardingError::MeshMismatch { expected: expected_mesh, actual: actual_mesh }),
@@ -7050,7 +7185,7 @@ mod tests {
             Operation::infer_output_types(&array_operation, &[ArrayType::scalar(DataType::C64)], &[]),
             Err(TypeError::invalid("`test_unary` does not support input data type `c64`".to_string())),
         );
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let unreduced_type = ArrayType::scalar(DataType::F32)
             .with_sharding(Sharding::new(mesh, vec![]).unwrap().with_unreduced_axes(["x"]).unwrap())
             .unwrap();
@@ -7128,8 +7263,8 @@ mod tests {
             Err(TypeError::invalid("`test_binary` does not support input data type `c64`".to_string())),
         );
         let mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap(),
-            MeshAxis::new("y", 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 1, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
         let unreduced_x = ArrayType::scalar(DataType::F32)

@@ -21,7 +21,7 @@ use crate::differentiation::{
     ResidualZeroProvider, TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
+use crate::macros::{check_count, check_types, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::{Add, SaturatingSubOperation};
 use crate::operations::assertions::Assert;
@@ -571,7 +571,7 @@ where
 impl<C: ContextProjection<ArrayType, Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy>
     for PadOperation<ArrayIrType>
 where
-    C::Value: DimensionSize + ValueProjection<ArrayType>,
+    C::Value: DimensionSize<Extent = C::Value> + ValueProjection<ArrayType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Broadcast + Transpose + Value<Type = ArrayType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
@@ -1729,7 +1729,7 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
     ) -> Result<Self, ProgramError>
     where
         Self: Value<Type: ArrayMemberType + DimensionMemberType, Domain: DimensionConstant + DynamicIota<Self>>
-            + DimensionSize
+            + DimensionSize<Extent = Self>
             + Assert
             + DimensionToScalar
             + DynamicBroadcast
@@ -1833,7 +1833,7 @@ pub trait DynamicPad<T = <Self as Capability>::Universe>: Capability + Sized {
     }
 }
 
-impl<A: Value<Type = ArrayType> + Pad + DimensionSize<usize>> DynamicPad<ArrayIrType> for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + Pad + DimensionSize<Extent = usize>> DynamicPad<ArrayIrType> for ArrayIrValue<A> {
     fn dynamic_pad(
         &self,
         padding_value: &Self,
@@ -2090,6 +2090,9 @@ fn validate_padding_value_sharding(input: &ArrayType, padding_value: &ArrayType)
         ))
         .into());
     }
+
+    // Padding is jointly linear in the input and the padding value, so (as in JAX) it commutes only with pending sums.
+    check_types!(@sum_unreduced, PAD_OPERATION_NAME, [input, padding_value]);
 
     let input_varying_manual_axes = input.sharding().map(|sharding| sharding.varying_manual_axes());
     let padding_varying_manual_axes = padding_value.sharding().map(|sharding| sharding.varying_manual_axes());
@@ -3092,8 +3095,8 @@ mod tests {
             }],
         );
 
-        // The pullback restores the complete cotangent types of both inputs after slicing and reducing the output
-        // cotangent.
+        // After slicing and reducing the output cotangent, the input cotangents keep the memory placements of their
+        // inputs but not their explicit layouts.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
             .with_memory(Memory::Host { pinned: true });
@@ -3112,8 +3115,8 @@ mod tests {
                     &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
                 ).unwrap()],
                 input_cotangents = [
-                    Array::from_elements::<f64>(input_type, &[2.0, 4.0, 6.0]).unwrap(),
-                    Array::from_elements::<f64>(padding_type, &[24.0]).unwrap(),
+                    Array::from_elements::<f64>(input_type.with_layout(None), &[2.0, 4.0, 6.0]).unwrap(),
+                    Array::from_elements::<f64>(padding_type.with_layout(None), &[24.0]).unwrap(),
                 ],
             }],
         );
@@ -3413,7 +3416,10 @@ mod tests {
                 )
                 .unwrap()
         };
-        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let named_axes = vec![(
+            "m".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let invariant = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(input, padding_value): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
@@ -5062,7 +5068,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_pad_differentiation_restores_dynamic_layouts() {
+    fn test_array_ir_pad_differentiation_drops_dynamic_layouts() {
         let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
         let output_size = DimensionVariable::new("output_size", DimensionBounds::new(3, Some(7)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]))
@@ -5105,11 +5111,12 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::F32, [4]), &[1_f32, 2., 3., 4.]).unwrap(),
         )];
         pullback_inputs.extend(residuals);
+        // The input cotangents do not take the explicit layouts of their inputs.
         assert_eq!(
             linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![
-                ArrayIrValue::Array(Array::from_elements(concrete_input_type, &[2_f32, 3.]).unwrap()),
-                ArrayIrValue::Array(Array::from_elements(padding_type, &[5_f32]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements(concrete_input_type.with_layout(None), &[2_f32, 3.]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements(padding_type.with_layout(None), &[5_f32]).unwrap()),
             ])
         );
     }
@@ -5823,7 +5830,7 @@ mod tests {
                     ),
                     DimensionType::from(output_size.clone()).into(),
                 ],
-                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
             )
             .unwrap();
         assert_eq!(
@@ -6106,7 +6113,7 @@ mod tests {
                     DimensionType::from(low).into(),
                     DimensionType::from(extent.clone()).into(),
                 ],
-                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
             )
             .unwrap();
         assert_eq!(

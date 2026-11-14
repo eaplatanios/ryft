@@ -230,11 +230,11 @@ impl Type for ArrayIrType {
     }
 
     #[inline]
-    fn is_compatible_with(&self, other: &Self) -> bool {
+    fn is_convertible_to(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Array(left), Self::Array(right)) => left.is_compatible_with(right),
-            (Self::Dimension(left), Self::Dimension(right)) => left.is_compatible_with(right),
-            (Self::Reference(left), Self::Reference(right)) => left.is_compatible_with(right),
+            (Self::Array(left), Self::Array(right)) => left.is_convertible_to(right),
+            (Self::Dimension(left), Self::Dimension(right)) => left.is_convertible_to(right),
+            (Self::Reference(left), Self::Reference(right)) => left.is_convertible_to(right),
             _ => false,
         }
     }
@@ -246,6 +246,14 @@ impl Type for ArrayIrType {
             (Self::Dimension(left), Self::Dimension(right)) => left.is_refined_by(right),
             (Self::Reference(left), Self::Reference(right)) => left.is_refined_by(right),
             _ => false,
+        }
+    }
+
+    #[inline]
+    fn is_interchangeable_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Array(r#type), Self::Array(other)) => r#type.is_interchangeable_with(other),
+            _ => self == other,
         }
     }
 
@@ -399,13 +407,30 @@ impl TypeRefinements<ArrayIrType> for ArrayIrTypeRefinements {
     {
         // Member admission follows its existing array, dimension, or reference rules. Comparing the complete signature
         // then checks variables shared within and between all member kinds.
-        let declared = declared.into_iter().collect::<Vec<_>>();
-        let actual = actual.into_iter().collect::<Vec<_>>();
-        type_signature_pairs(declared.iter(), actual.iter())?.try_for_each(|(declared, actual)| {
-            Self::refinement_facts(declared.borrow(), actual.borrow(), DimensionComparison::Refinement)
-                .try_for_each(|refinement_fact| refinement_fact.map(|_| ()))
-        })?;
-        Self::from_local_declarations(declared, actual)
+        let mut declared_members = Vec::new();
+        let mut actual_members = Vec::new();
+        for (declared, actual) in type_signature_pairs(declared, actual)? {
+            let declared_type: &ArrayIrType = declared.borrow();
+            let actual_type: &ArrayIrType = actual.borrow();
+
+            // Equal identity-free members contribute neither refinement facts nor runtime relationships. Keep their
+            // admission check local and allocate buffers only for members whose facts can affect the signature.
+            if declared_type == actual_type && declared_type.identities().next().is_none() {
+                continue;
+            }
+
+            Self::refinement_facts(declared_type, actual_type, DimensionComparison::Refinement)
+                .try_for_each(|refinement_fact| refinement_fact.map(|_| ()))?;
+
+            declared_members.push(declared);
+            actual_members.push(actual);
+        }
+
+        if declared_members.is_empty() {
+            return Ok(Self::default());
+        }
+
+        Self::from_local_declarations(declared_members, actual_members)
     }
 
     fn from_local_declarations<D: IntoIterator, A: IntoIterator>(declared: D, actual: A) -> Result<Self, TypeError>
@@ -914,8 +939,8 @@ mod tests {
         assert!(!stored.is_complex());
         assert!(stored.is_reference());
         assert_eq!(stored.referent(), Some(&array));
-        assert!(!stored.is_compatible_with(&ArrayIrType::Array(array.clone())));
-        assert!(!ArrayIrType::Array(array.clone()).is_compatible_with(&stored));
+        assert!(!stored.is_convertible_to(&ArrayIrType::Array(array.clone())));
+        assert!(!ArrayIrType::Array(array.clone()).is_convertible_to(&stored));
         assert!(!stored.is_refined_by(&ArrayIrType::Array(array.clone())));
         assert!(!ArrayIrType::Array(array).is_refined_by(&stored));
         assert_eq!(
@@ -956,6 +981,64 @@ mod tests {
         assert_eq!(reference_member.as_referent(), None);
         assert_eq!(dimension_member.as_referent(), None);
         assert_eq!(array_member.as_referent(), <&ArrayType>::try_from(&array_member).ok());
+    }
+
+    #[test]
+    fn test_array_ir_type_refinements_new_omits_static_pairs() {
+        let array: ArrayIrType = ArrayType::new_static(F32, [2, 3]).into();
+        let dimension: ArrayIrType = DimensionType::from(Dimension::Static(3)).into();
+        let reference: ArrayIrType = ReferenceType::new(ArrayType::new_static(F32, [2, 3])).into();
+        let signature = [array.clone(), dimension, reference.clone()];
+        assert_eq!(ArrayIrTypeRefinements::new(&signature, &signature), Ok(ArrayIrTypeRefinements::default()));
+
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic: ArrayIrType = ArrayType::new(F32, Shape::new(vec![n.clone().into()])).into();
+        let nominal = ArrayIrTypeRefinements::new([&symbolic], [&symbolic]).unwrap();
+        assert_eq!(nominal.identity_classes().count(), 1);
+        assert_eq!(nominal.identity_classes().next().unwrap().declared(), &[n]);
+        assert_eq!(
+            ArrayIrTypeRefinements::new([&array, &symbolic, &reference], [&array, &symbolic, &reference]),
+            Ok(nominal),
+        );
+        let exact: ArrayIrType = ArrayType::new_static(F32, [3]).into();
+        let expected = ArrayIrTypeRefinements::new([&symbolic], [&exact]).unwrap();
+        assert_eq!(
+            ArrayIrTypeRefinements::new([&array, &symbolic, &reference], [&array, &exact, &reference]),
+            Ok(expected),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_type_refinements_new_preserves_error_precedence_with_static_pairs() {
+        let n = DimensionVariable::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let symbolic: ArrayIrType = ArrayType::new(F32, Shape::new(vec![n.into()])).into();
+        let prefix: ArrayIrType = DimensionType::from(Dimension::Static(3)).into();
+        let two: ArrayIrType = ArrayType::new_static(F32, [2]).into();
+        let three: ArrayIrType = ArrayType::new_static(F32, [3]).into();
+        let reference: ArrayIrType = ReferenceType::new(ArrayType::scalar(F32)).into();
+        let wrong_kind: ArrayIrType = ArrayType::scalar(F32).into();
+        assert_eq!(
+            ArrayIrTypeRefinements::new([&reference, &symbolic], [&wrong_kind]),
+            Err(TypeError::invalid("declared type count 2 does not match actual type count 1")),
+        );
+        assert_eq!(
+            ArrayIrTypeRefinements::new(
+                [&prefix, &symbolic, &symbolic, &reference],
+                [&prefix, &two, &three, &wrong_kind],
+            ),
+            Err(TypeError::invalid("expected reference type but got array type")),
+        );
+        assert_eq!(
+            ArrayIrTypeRefinements::new(
+                [&prefix, &symbolic, &symbolic, &reference],
+                [&prefix, &two, &three, &reference],
+            ),
+            Err(TypeError::from(DimensionError::InputDimensionMismatch {
+                dimension: "n".to_string(),
+                expected: 2,
+                actual: 3,
+            })),
+        );
     }
 
     #[test]

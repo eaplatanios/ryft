@@ -278,7 +278,10 @@ impl<
         // Validate inputs and regions before attempting to eliminate the comparison.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let regions = driver.region_programs();
-        self.infer_output_types(&input_types, &regions.iter().map(|region| region.interface()).collect::<Vec<_>>())?;
+        self.infer_output_types(
+            &input_types,
+            &regions.iter().map(|region| region.interface().clone()).collect::<Vec<_>>(),
+        )?;
         let left = <&DimensionType>::try_from(&input_types[0])?;
         let right = <&DimensionType>::try_from(&input_types[1])?;
         let mut exact = [None, None];
@@ -1615,7 +1618,7 @@ mod tests {
         let (_, program) = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
             |(invariant, varying): (_, _)| invariant.less_than(&varying),
             (ArrayType::scalar(DataType::F32), varying_type),
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(

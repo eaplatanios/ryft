@@ -7,7 +7,8 @@ use crate::contexts::Context;
 use crate::operations::Zero;
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
-use crate::programs::types::Typed;
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::ValueProjection;
 
 /// Represents either a [`Typed`] value or a _structural zero_ that carries only its [`Type`](crate::Type).
 /// [`MaybeZero`] is the symbolic zero representation shared by transforms like forward mode and reverse mode
@@ -59,6 +60,24 @@ impl<V: Typed> MaybeZero<V> {
         match self {
             Self::Zero(r#type) => MaybeZero::Zero(r#type),
             Self::Value(value) => MaybeZero::Value(function(value)),
+        }
+    }
+
+    /// Projects this value to its `T`-typed member through [`ValueProjection`], preserving structural zeros.
+    /// A structural zero projects only its carried type, without materializing a value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] when the value or structural zero type belongs to a different member kind.
+    #[inline]
+    pub fn project<T: Type>(self) -> Result<MaybeZero<V::Projected>, TypeError>
+    where
+        V: ValueProjection<T>,
+        for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
+    {
+        match self {
+            Self::Zero(r#type) => Ok(MaybeZero::Zero(<&T>::try_from(&r#type)?.clone())),
+            Self::Value(value) => Ok(MaybeZero::Value(value.into_projected()?)),
         }
     }
 
@@ -180,7 +199,7 @@ impl<V: Typed> Typed for Atom<V> {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayIrValue, ArrayType, DataType, DimensionValue};
 
     use super::*;
 
@@ -193,6 +212,31 @@ mod tests {
         assert_ne!(zero, MaybeZero::Zero(ArrayType::scalar(DataType::F64)));
         assert_ne!(value, MaybeZero::Value(Array::scalar(1f32).unwrap()));
         assert_ne!(zero, value);
+    }
+
+    #[test]
+    fn test_maybe_zero_project() {
+        let value = Array::scalar(2f32).unwrap();
+        let r#type = value.r#type().into_owned();
+        assert_eq!(
+            MaybeZero::Value(ArrayIrValue::Array(value.clone())).project::<ArrayType>(),
+            Ok(MaybeZero::Value(value)),
+        );
+        assert_eq!(
+            MaybeZero::<ArrayIrValue<Array>>::Zero(r#type.clone().into()).project::<ArrayType>(),
+            Ok(MaybeZero::<Array>::Zero(r#type)),
+        );
+
+        // Incompatible values and structural zero types use the same member-kind diagnostic.
+        let dimension = DimensionValue::constant(3).unwrap();
+        assert_eq!(
+            MaybeZero::Value(ArrayIrValue::<Array>::Dimension(dimension.clone())).project::<ArrayType>(),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
+        assert_eq!(
+            MaybeZero::<ArrayIrValue<Array>>::Zero(dimension.r#type().into_owned().into()).project::<ArrayType>(),
+            Err(TypeError::invalid("expected array type but got dimension type")),
+        );
     }
 
     #[test]

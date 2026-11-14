@@ -1806,7 +1806,8 @@ where
 
     #[inline]
     fn reshape(&self, input: &C::Value, shape: Shape) -> Result<C::Value, ProgramError> {
-        self.context.bind_array(ReshapeOperation::new(shape), &[input.clone()])
+        let input_shape = self.array_type(input)?.shape().clone();
+        self.context.bind_array(ReshapeOperation::new(input_shape, shape), &[input.clone()])
     }
 
     fn dynamic_index(&self, input: &C::Value, axis: usize, binding: &C::Value) -> Result<C::Value, ProgramError> {

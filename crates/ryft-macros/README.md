@@ -1,6 +1,10 @@
 # **Ryft Macros:** Procedural Macros for the Ryft Library
 
-This crate currently provides two derive macros that are aimed at improving ergonomics for the `ryft` library:
+This crate currently provides three derive macros that are aimed at improving ergonomics for the `ryft` library:
+
+- **`#[derive(Operation)]`:** Generates the base operation, interpretation, and partial-evaluation dispatchers
+  for an operation enum. Optional payload-delegating identity (`PartialEq`, `Eq`, and `Hash`), reference discharge,
+  batching, differentiation, and transposition dispatchers can be generated with `#[ryft(dispatch(...))]`.
 
 - **`#[derive(Parameter)]`:** Implements the marker trait `Parameter` for the annotated type. This is mainly
   a convenience macro for leaf parameter types. It can be applied to Rust containers supported by derive macros
@@ -25,11 +29,48 @@ This crate currently provides two derive macros that are aimed at improving ergo
   For tuple handling, mixed tuples (e.g., `(P, usize)`) are supported when nested inside a derived struct/enum field.
   However, standalone mixed tuples inside generic containers (e.g., `Vec<(P, usize)>`) are currently not supported.
 
-## Example
+## Examples
+
+### `Operation`
+
+`Operation` can be derived for an enum whose variants each wrap one concrete operation payload. The generated enum
+delegates the operation interface to the active payload and provides conversions from each payload type:
 
 ```rust
-use std::marker::PhantomData;
+use ryft::*;
 
+#[derive(Clone, Debug, Operation)]
+enum BackendOperation<V: Value<Type = DataType>> {
+    Zero(ZeroOperation<DataType>),
+    Constant(ConstantOperation<V>),
+}
+```
+
+Optional dispatchers can be generated with
+`#[ryft(dispatch(identity, discharge, batching, differentiation, transposition))]`, as described above. Heterogeneous
+operation families whose stored constants belong to a member universe declare their operation and constant types
+explicitly, together with their member universes:
+
+```rust,ignore
+#[derive(Clone, Debug, Operation)]
+#[ryft(
+    type(ArrayIrType),
+    constant(ArrayIrValue<A>),
+    members(ArrayType, structural(DimensionType)),
+    dispatch(identity, batching, differentiation, transposition),
+)]
+enum HeterogeneousOperation<A: Value<Type = ArrayType>> {
+    #[ryft(projected(ArrayType))]
+    Array(ArrayOperation<A>),
+
+    #[ryft(projected(DimensionType, structural))]
+    Dimension(DimensionOperation<DimensionValue>),
+}
+```
+
+### `Parameter` and `Parameterized`
+
+```rust
 use ryft::*;
 
 #[derive(Parameter, Clone, Copy)]

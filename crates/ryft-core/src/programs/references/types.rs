@@ -72,7 +72,7 @@ impl<T: Type> Type for ReferenceType<T> {
     }
 
     #[inline]
-    fn is_compatible_with(&self, other: &Self) -> bool {
+    fn is_convertible_to(&self, other: &Self) -> bool {
         self == other
     }
 
@@ -248,7 +248,7 @@ impl Type for NoReferent {
     // value lets Rust produce the required return types without fabricating semantics for a referent-free family.
 
     #[inline]
-    fn is_compatible_with(&self, other: &Self) -> bool {
+    fn is_convertible_to(&self, other: &Self) -> bool {
         let _ = other;
         match *self {}
     }
@@ -410,7 +410,7 @@ mod tests {
             })
         }
 
-        fn is_compatible_with(&self, other: &Self) -> bool {
+        fn is_convertible_to(&self, other: &Self) -> bool {
             self == other
         }
 
@@ -577,8 +577,8 @@ mod tests {
         let static_two = ReferenceType::new(TestType::Static(2));
         let static_three = ReferenceType::new(TestType::Static(3));
         assert!(declared_type.is_refined_by(&static_two));
-        assert!(!declared_type.is_compatible_with(&static_two));
-        assert!(!static_two.is_compatible_with(&static_three));
+        assert!(!declared_type.is_convertible_to(&static_two));
+        assert!(!static_two.is_convertible_to(&static_three));
         assert!(static_two.is_reference());
         assert!(!static_two.is_scalar());
         assert!(!static_two.is_complex());

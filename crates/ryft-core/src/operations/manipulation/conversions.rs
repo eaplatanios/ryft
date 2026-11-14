@@ -102,7 +102,6 @@ use crate::operations::Capability;
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::transposition::Transpose;
-use crate::operations::sharding::constrain_sharding::CONSTRAIN_SHARDING_OPERATION_NAME;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
@@ -442,6 +441,18 @@ impl ElementType for ArrayType {
             return Err(TypeError::invalid(format!(
                 "`{CONVERT_ELEMENT_TYPE_OPERATION_NAME}` in bitcast mode requires element types \
                  with a bit representation",
+            )));
+        }
+
+        // Reinterpreting bits commutes with no cross-device reduction (e.g., the summands, or the candidate maxima,
+        // of the bits of a value are not the bits of its summands or candidates), so a value whose reduction along some
+        // axes is still pending cannot be bitcast to another element type, as in JAX, whose `bitcast_convert_type` has
+        // no unreduced rule. A bitcast to the same element type is the identity on every summand or candidate and
+        // therefore preserves the pending reduction exactly.
+        if source != data_type && !self.unreduced_axes().is_empty() {
+            return Err(TypeError::invalid(format!(
+                "`{CONVERT_ELEMENT_TYPE_OPERATION_NAME}` in bitcast mode does not support unreduced inputs \
+                 unless the source and destination element types match",
             )));
         }
 
@@ -1006,17 +1017,18 @@ pub const CAST_OPERATION_NAME: &str = "cast";
 /// types, rank and memory space. Layout may change, as long as the requested layout addresses the output shape (refer
 /// to [`ArrayType::validate_layout`]), and so may placement over [`MeshAxisType::Explicit`] mesh axes under the rules
 /// of [`ReshardOperation`](crate::ReshardOperation): the output requests their new representation. Placement over
-/// [`MeshAxisType::Auto`] and [`MeshAxisType::Manual`] axes is preserved, since the former belongs to backend compilers
-/// (refer to [`ConstrainShardingOperation`](crate::ConstrainShardingOperation)) and the latter only changes through
-/// manual collectives, and so are manual variation and reduction state. The axes that shard a dimension are ordered
-/// from major to minor, so the axes up to and including an auto or manual axis determine which block of the dimension
-/// each of its shards holds. Each dimension therefore keeps its axes up to and including its last auto or manual axis,
-/// and only explicit axes minor to all of them may be added, removed, or reordered (e.g., `[m, x]` may become `[m]` or
-/// `[m, y]` but not `[x, m]`). Since axis sizes fix those blocks, every mesh axis in such a preserved prefix keeps its
-/// definition (i.e., its size and type) in the output mesh, explicit axes included (e.g., an explicit `x` in `[x, a]`
-/// over an auto `a` cannot change its size), and so does every mesh axis that carries manual variation or reduction
-/// state. Explicit axes may therefore be redefined or dropped only when they are minor to every auto and manual axis in
-/// each dimension and carry no such state. Further inputs act as _witnesses_, meaning values whose types make output
+/// [`MeshAxisType::Manual`] axes is preserved, since it only changes through manual collectives, and so are manual
+/// variation and reduction state. Array types never record placement over [`MeshAxisType::Auto`] axes (refer to
+/// [`ArrayType::with_sharding`]), which belongs to backend compilers and is constrained through
+/// [`ConstrainShardingOperation`](crate::ConstrainShardingOperation) instead. The axes that shard a dimension are
+/// ordered from major to minor, so the axes up to and including a manual axis determine which block of the dimension
+/// each of its shards holds. Each dimension therefore keeps its axes up to and including its last manual axis, and only
+/// explicit axes minor to all of them may be added, removed, or reordered (e.g., `[m, x]` may become `[m]` or `[m, y]`
+/// but not `[x, m]`). Since axis sizes fix those blocks, every mesh axis in such a preserved prefix keeps its
+/// definition (i.e., its size and type) in the output mesh, explicit axes included (e.g., an explicit `x` in `[x, m]`
+/// over a manual `m` cannot change its size), and so does every mesh axis that carries manual variation or reduction
+/// state. Explicit axes may therefore be redefined or dropped only when they are minor to every manual axis in each
+/// dimension and carry no such state. Further inputs act as _witnesses_, meaning values whose types make output
 /// identities available to the instruction (e.g., a value of type `f32[n]` lets `f32[2]` widen to `f32[n]`). Witnesses
 /// carry no derivatives. Every output identity must occur in an input declaration, and the output type may not define
 /// an identity. First-class dimension types define their names, so casts of dimension values can only target static
@@ -1558,9 +1570,9 @@ impl<C: Context<Type: CastType, Operation: From<CastOperation<C::Type>>>, P: Bat
         inputs: &[P::Batch],
     ) -> Result<Vec<P::Batch>, BatchingError> {
         // Validate the original declaration before lifting can erase its layout constraints. Reconstructed per-item
-        // types have already lost layout and may carry manual variation introduced by the batch axis, so they are not
-        // the original invocation's representations. The parent validates the supplied values against the lifted
-        // declaration, preserving source/witness shapes, layout and sharding unrelated to the mapped axes.
+        // types have already lost layout, so they are not the original invocation's representations. The parent
+        // validates the supplied values against the lifted declaration, preserving source/witness shapes, layout
+        // and sharding unrelated to the mapped axes.
         check_count!("input", inputs, self.input_types.len(), ProgramError);
         self.infer_output_types(&self.input_types, &driver.region_interfaces())?;
 
@@ -1864,23 +1876,16 @@ impl CastType for ArrayIrType {
         let preserved = operation.validate_declaration(input_types)?;
         match (&input_types[0], &operation.output_type) {
             (Self::Array(input), Self::Array(output)) => {
-                // The validation above guarantees that the declared first input has the supplied input's member kind.
-                let Self::Array(declared) = &operation.input_types[0] else { unreachable!() };
-
                 // Arrays preserve the input value properties and static extents. Layout and explicit placement may
-                // change, while auto/manual placement, manual variation, and reduction state remain constrained.
-                if declared.unreduced_axes() != input.unreduced_axes()
-                    || declared.reduced_axes() != input.reduced_axes()
-                {
-                    return Err(TypeError::invalid(format!(
-                        "`{CAST_OPERATION_NAME}` supplied input changes the declared reduction state",
-                    )));
-                }
-
+                // change, while manual placement, manual variation, and reduction state remain constrained. The
+                // validation above already requires the supplied input to refine the declared first input, which
+                // admits no manual variation or reduction state that the declaration lacks, so the supplied input
+                // has the declared variation and reduction state.
                 if input.data_type() != output.data_type()
                     || input.rank() != output.rank()
                     || input.memory() != output.memory()
                     || input.unreduced_axes() != output.unreduced_axes()
+                    || input.unreduced_kind() != output.unreduced_kind()
                     || input.reduced_axes() != output.reduced_axes()
                     || input.shape().dimensions().iter().zip(output.shape().dimensions()).any(|(input, output)| {
                         matches!(
@@ -1897,12 +1902,6 @@ impl CastType for ArrayIrType {
                 // These are semantic dependencies, not optional placement constraints. An absent sharding is invariant,
                 // and changing variation requires the corresponding operation (whose transpose performs the required
                 // reduction).
-                if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[declared, input]).is_err() {
-                    return Err(TypeError::invalid(format!(
-                        "`{CAST_OPERATION_NAME}` supplied input changes the declared manual variation",
-                    )));
-                }
-
                 if ArrayType::check_matching_manual_variation(CAST_OPERATION_NAME, &[input, output]).is_err() {
                     return Err(TypeError::invalid(format!(
                         "`{CAST_OPERATION_NAME}` cannot change varying manual axes; use `parallel_vary` to add \
@@ -1911,55 +1910,44 @@ impl CastType for ArrayIrType {
                 }
 
                 // Placement follows the rules of `reshard` (i.e., the type system tracks placement over explicit
-                // mesh axes, so the output may request a new one, whereas placement over auto axes belongs to backend
-                // compilers and transitions over manual axes require manual collectives). The output therefore names
-                // the same auto and manual axes as the input on every dimension, in the same position relative to the
-                // explicit axes (refer to the check below). Carrying them forward requests no redistribution, and an
-                // output without a sharding stays untracked rather than requesting replication.
+                // mesh axes, so the output may request a new one, whereas transitions over manual axes require manual
+                // collectives). The output therefore names the same manual axes as the input on every dimension, in
+                // the same position relative to the explicit axes (refer to the check below). Carrying them forward
+                // requests no redistribution, and an output without a sharding stays untracked rather than requesting
+                // replication. Neither type places a dimension over auto mesh axes, because array types cannot record
+                // such placement (refer to `ArrayType::with_sharding`), so no auto placement needs to be preserved.
                 if let Some(output_sharding) = output.sharding() {
-                    let named_axes = |sharding: &Sharding, dimension: usize, axis_type: MeshAxisType| match &sharding
-                        .dimensions()[dimension]
-                    {
+                    let manual_axes = |sharding: &Sharding, dimension: usize| match &sharding.dimensions()[dimension] {
                         ShardingDimension::Sharded(axis_names) => axis_names
                             .iter()
-                            .filter(|name| sharding.mesh().axis_type(name) == Some(axis_type))
+                            .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual))
                             .cloned()
                             .collect::<Vec<_>>(),
                         ShardingDimension::Replicated | ShardingDimension::Unconstrained => Vec::new(),
                     };
 
-                    for (axis_type, remedy) in [
-                        (
-                            MeshAxisType::Auto,
-                            format!("use `{CONSTRAIN_SHARDING_OPERATION_NAME}` to constrain placement over them"),
-                        ),
-                        (MeshAxisType::Manual, "use manual collectives for transitions over them".to_owned()),
-                    ] {
-                        if (0..output.rank()).any(|dimension| {
-                            named_axes(output_sharding, dimension, axis_type)
-                                != input
-                                    .sharding()
-                                    .map(|sharding| named_axes(sharding, dimension, axis_type))
-                                    .unwrap_or_default()
-                        }) {
-                            return Err(TypeError::invalid(format!(
-                                "`{CAST_OPERATION_NAME}` cannot change placement over {axis_type} mesh axes; {remedy}",
-                            )));
-                        }
+                    if (0..output.rank()).any(|dimension| {
+                        manual_axes(output_sharding, dimension)
+                            != input.sharding().map(|sharding| manual_axes(sharding, dimension)).unwrap_or_default()
+                    }) {
+                        return Err(TypeError::invalid(format!(
+                            "`{CAST_OPERATION_NAME}` cannot change placement over manual mesh axes; use manual \
+                             collectives for transitions over them",
+                        )));
                     }
 
-                    // Comparing names per axis type is not sufficient, because the axes that shard a dimension are
-                    // ordered from major to minor: the sizes of all axes up to and including an auto or manual axis
-                    // determine which block of the dimension each of its shards holds. Reordering those axes, or
-                    // adding or removing an explicit axis major to one of them, would move data between auto or manual
-                    // shards (i.e., perform an implicit collective). Each dimension must therefore keep its axes up to
-                    // and including its last auto or manual axis, and only explicit axes minor to them may change.
+                    // Comparing manual axis names is not sufficient, because the axes that shard a dimension are
+                    // ordered from major to minor: the sizes of all axes up to and including a manual axis determine
+                    // which block of the dimension each of its shards holds. Reordering those axes, or adding or
+                    // removing an explicit axis major to one of them, would move data between manual shards (i.e.,
+                    // perform an implicit collective). Each dimension must therefore keep its axes up to and including
+                    // its last manual axis, and only explicit axes minor to them may change.
                     fn preserved_prefix(sharding: &Sharding, dimension: usize) -> &[String] {
                         match &sharding.dimensions()[dimension] {
                             ShardingDimension::Sharded(axis_names) => {
                                 let end = axis_names
                                     .iter()
-                                    .rposition(|name| sharding.mesh().axis_type(name) != Some(MeshAxisType::Explicit))
+                                    .rposition(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual))
                                     .map_or(0, |index| index + 1);
                                 &axis_names[..end]
                             }
@@ -1975,19 +1963,19 @@ impl CastType for ArrayIrType {
                                 .unwrap_or_default()
                     }) {
                         return Err(TypeError::invalid(format!(
-                            "`{CAST_OPERATION_NAME}` cannot change the mesh axes up to the last auto or manual mesh \
-                             axis of dimension {dimension}; only explicit mesh axes minor to every auto and manual \
-                             axis may change",
+                            "`{CAST_OPERATION_NAME}` cannot change the mesh axes up to the last manual mesh \
+                             axis of dimension {dimension}; only explicit mesh axes minor to every manual axis may \
+                             change",
                         )));
                     }
 
                     // The checks above compare axis names only, but the size and type of a mesh axis are semantic:
                     // the sizes of all axes in the preserved prefix of a dimension, explicit axes included, fix the
-                    // blocks of its auto and manual shards. Every axis in such a prefix, and every axis of any type
-                    // that carries manual variation or reduction state, must therefore keep its definition. An
-                    // explicit axis is exempt only when it is minor to every auto and manual axis of each dimension
-                    // that it shards and carries no such state. The output mesh may still add or drop other axes
-                    // (e.g., to request an explicit redistribution).
+                    // blocks of its manual shards. Every axis in such a prefix, and every axis of any type that
+                    // carries manual variation or reduction state, must therefore keep its definition. An explicit
+                    // axis is exempt only when it is minor to every manual axis of each dimension that it shards and
+                    // carries no such state. The output mesh may still add or drop other axes (e.g., to request an
+                    // explicit redistribution).
                     if let Some(input_sharding) = input.sharding() {
                         let input_mesh = input_sharding.mesh();
                         let output_mesh = output_sharding.mesh();
@@ -2244,7 +2232,7 @@ impl CastType for ArrayIrType {
 /// relationship in staged and compiled programs too, whereas [`cast_unchecked`](Self::cast_unchecked) assumes it there.
 ///
 /// Placement over explicit mesh axes may change under the rules of [`Reshard`](crate::Reshard), whereas placement
-/// over auto and manual mesh axes is preserved (refer to [`CastOperation`]). The XLA backend requires finite dimension
+/// over manual mesh axes is preserved (refer to [`CastOperation`]). The XLA backend requires finite dimension
 /// bounds when changing physical allocation bounds, and constrains placement only when the explicit placement changes.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
@@ -2440,8 +2428,8 @@ mod tests {
         Array, ArrayBatch, ArrayElement, ArrayIrBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
         DimensionVariable, Layout, LogicalMesh, MAX_DIMENSION_EXTENT, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
-        ShardingDimension, StridedLayout, Tile, TileDimension, TiledLayout, bf16, f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2,
-        u4,
+        ShardingDimension, ShardingError, StridedLayout, Tile, TileDimension, TiledLayout, UnreducedKind, bf16,
+        f8e4m3fn, f8e5m2, f8e8m0fnu, i4, u2, u4,
     };
     use crate::batching::{BatchAxis, BatchedProgram, BatchingTracer, ProgramBatchingOutputAxesPolicy};
     use crate::captures::CaptureReference;
@@ -2699,8 +2687,36 @@ mod tests {
         );
         assert_eq!(
             ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true).infer_output_types(&[output], &[]),
-            Ok(vec![input]),
+            Ok(vec![input.clone()]),
         );
+
+        // Reinterpreting the bits of per-device summands or candidate extrema does not reinterpret their combination,
+        // so unreduced inputs of every kind are rejected unless the element type is unchanged, in which case the
+        // bitcast is the identity and preserves the pending reduction.
+        for kind in [UnreducedKind::Sum, UnreducedKind::Max] {
+            let unreduced = ArrayType::new_static(DataType::U32, [4])
+                .with_sharding(
+                    Sharding::replicated(input.sharding().unwrap().mesh().clone(), 1)
+                        .with_unreduced_axes(["x"])
+                        .unwrap()
+                        .with_unreduced_kind(kind)
+                        .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true)
+                    .infer_output_types(std::slice::from_ref(&unreduced), &[]),
+                Ok(vec![unreduced.clone()]),
+            );
+            assert_eq!(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true)
+                    .infer_output_types(&[unreduced], &[]),
+                Err(TypeError::invalid(
+                    "`convert_element_type` in bitcast mode does not support unreduced inputs unless the source and \
+                     destination element types match",
+                )),
+            );
+        }
     }
 
     #[test]
@@ -2915,7 +2931,8 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_differentiation_layout() {
-        // Conversions between different storage widths discard byte layouts in both primal and tangent outputs.
+        // Tangents carry no explicit layout, so a laid out primal takes a tangent without one, and conversions between
+        // different storage widths produce tangents without one in both directions.
         let layout = Layout::Strided(StridedLayout::new(vec![1]));
         let laid_outf32 =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
@@ -2924,7 +2941,7 @@ mod tests {
         let plainf32 = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]));
 
         let (_, tangent) = differentiate_at(Array::from_elements::<f32>(laid_outf32.clone(), &[2.0]).unwrap())
-            .jvp(Array::from_elements::<f32>(laid_outf32.clone(), &[3.0]).unwrap(), |value| {
+            .jvp(Array::from_elements::<f32>(plainf32.clone(), &[3.0]).unwrap(), |value| {
                 value.convert_element_type(DataType::F8E8M0FNU)
             })
             .unwrap();
@@ -3051,7 +3068,7 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_transposition_low_precision_layout() {
-        // Cotangents recover the input differential layout in both low-precision conversion directions.
+        // Cotangents carry no explicit layout in either low-precision conversion direction, even for laid out inputs.
         let layout = Layout::Strided(StridedLayout::new(vec![1]));
         let laid_out_f32 =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
@@ -3065,7 +3082,7 @@ mod tests {
             cases = [{
                 inputs = [(@linear(type = laid_out_f32.clone()))],
                 output_cotangents = [Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap()],
-                input_cotangents = [Array::from_elements::<f32>(laid_out_f32.clone(), &[3.0]).unwrap()],
+                input_cotangents = [Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap()],
             }],
         );
 
@@ -4625,16 +4642,17 @@ mod tests {
     #[test]
     fn test_cast_type_inference_distributed_semantics() {
         // Manual variation and reduction state are semantic rather than optional placement: a supplied input may not
-        // carry variation or reduction state that the declared source lacks, and the output may not add or drop them,
-        // even when the supplied input matches the requested output exactly.
+        // carry variation or reduction state that the declared source lacks (which the refinement of the declaration
+        // rejects), and the output may not add or drop them, even when the supplied input matches the requested output
+        // exactly.
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh, 1);
         let varying = plain.clone().with_sharding(replicated.clone().with_varying_manual_axes(["x"]).unwrap()).unwrap();
         let unreduced = plain.clone().with_sharding(replicated.clone().with_unreduced_axes(["x"]).unwrap()).unwrap();
         let reduced = plain.clone().with_sharding(replicated.with_reduced_axes(["x"]).unwrap()).unwrap();
-        let variation = TypeError::invalid("`cast` supplied input changes the declared manual variation");
-        let reduction = TypeError::invalid("`cast` supplied input changes the declared reduction state");
+        let refinement =
+            |actual: &ArrayType| TypeError::invalid(format!("type {actual} does not refine declared type {plain}"));
         let variation_change = TypeError::invalid(
             "`cast` cannot change varying manual axes; use `parallel_vary` to add variation or a reduction to \
              remove it",
@@ -4645,9 +4663,9 @@ mod tests {
                     .unwrap()
                     .infer_output_types(&[actual.clone()], &[])
             };
-            assert_eq!(infer(&varying, &plain, &varying), Err(variation.clone()));
-            assert_eq!(infer(&unreduced, &plain, &unreduced), Err(reduction.clone()));
-            assert_eq!(infer(&reduced, &plain, &reduced), Err(reduction.clone()));
+            assert_eq!(infer(&varying, &plain, &varying), Err(refinement(&varying)));
+            assert_eq!(infer(&unreduced, &plain, &unreduced), Err(refinement(&unreduced)));
+            assert_eq!(infer(&reduced, &plain, &reduced), Err(refinement(&reduced)));
             assert_eq!(infer(&varying, &plain, &plain), Err(variation_change.clone()));
             assert_eq!(infer(&plain, &varying, &varying), Err(variation_change.clone()));
             assert_eq!(
@@ -4684,8 +4702,8 @@ mod tests {
         assert_eq!(
             CastOperation::<ArrayIrType>::checked(varying.clone().into(), vec![plain.clone().into()])
                 .unwrap()
-                .infer_output_types(&[varying.into()], &[]),
-            Err(variation),
+                .infer_output_types(&[varying.clone().into()], &[]),
+            Err(refinement(&varying)),
         );
         assert_eq!(
             CastOperation::<ArrayIrType>::unchecked(plain.clone().into(), vec![reduced.clone().into()])
@@ -4701,8 +4719,8 @@ mod tests {
     #[test]
     fn test_cast_type_inference_placement() {
         // Placement follows the rules of `reshard`: explicit placement may be requested, changed, and dropped from
-        // tracking, whereas the auto and manual axes that each dimension names are carried forward unchanged, together
-        // with every explicit axis major to them.
+        // tracking, whereas the manual axes that each dimension names are carried forward unchanged, together with
+        // every explicit axis major to them. Array types never place dimensions over auto mesh axes.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -4716,16 +4734,17 @@ mod tests {
         };
         let sharded = |axes: &[&str]| ShardingDimension::sharded(axes.iter().copied());
         let replicated = ShardingDimension::replicated;
-        let auto_error = TypeError::invalid(
-            "`cast` cannot change placement over auto mesh axes; use `constrain_sharding` to constrain placement \
-             over them",
+        let auto_sharding = Sharding::new(mesh.clone(), vec![sharded(&["a"]), replicated()]).unwrap();
+        assert_eq!(
+            plain.clone().with_sharding(auto_sharding.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: auto_sharding }),
         );
         let manual_error = TypeError::invalid(
             "`cast` cannot change placement over manual mesh axes; use manual collectives for transitions over them",
         );
         let order_error = TypeError::invalid(
-            "`cast` cannot change the mesh axes up to the last auto or manual mesh axis of dimension 0; only explicit \
-             mesh axes minor to every auto and manual axis may change",
+            "`cast` cannot change the mesh axes up to the last manual mesh axis of dimension 0; only explicit \
+             mesh axes minor to every manual axis may change",
         );
         let cases = [
             (plain.clone(), placed([sharded(&["x"]), replicated()]), Ok(())),
@@ -4733,36 +4752,26 @@ mod tests {
             (placed([sharded(&["x"]), replicated()]), plain.clone(), Ok(())),
             // Replicating over a mesh with auto axes names none of them.
             (plain.clone(), placed([replicated(), replicated()]), Ok(())),
-            // Auto placement is carried forward or left untracked, never introduced, dropped, or moved, and the
-            // explicit axes major to it are fixed because they determine which block each auto shard holds.
-            (
-                placed([sharded(&["a"]), replicated()]),
-                placed([sharded(&["x", "a"]), replicated()]),
-                Err(order_error.clone()),
-            ),
-            (
-                placed([sharded(&["x", "a"]), replicated()]),
-                placed([sharded(&["a"]), replicated()]),
-                Err(order_error.clone()),
-            ),
-            (placed([sharded(&["a", "x"]), replicated()]), placed([sharded(&["a", "y"]), replicated()]), Ok(())),
-            (placed([sharded(&["a"]), replicated()]), plain.clone(), Ok(())),
-            (plain.clone(), placed([sharded(&["a"]), replicated()]), Err(auto_error.clone())),
-            (placed([sharded(&["a"]), replicated()]), placed([replicated(), replicated()]), Err(auto_error.clone())),
-            (placed([sharded(&["a"]), replicated()]), placed([replicated(), sharded(&["a"])]), Err(auto_error)),
             // Manual placement is carried forward, never introduced or dropped, and only explicit axes minor to it
-            // may change. Neither manual nor auto axes may be reordered relative to each other or to explicit axes.
+            // may change. The explicit axes major to it are fixed because they determine which block each manual
+            // shard holds, and manual axes may not be reordered relative to explicit axes.
             (placed([sharded(&["m"]), replicated()]), placed([sharded(&["m"]), sharded(&["x"])]), Ok(())),
             (placed([sharded(&["m", "x"]), replicated()]), placed([sharded(&["m"]), replicated()]), Ok(())),
             (placed([sharded(&["m"]), replicated()]), placed([sharded(&["m", "x"]), replicated()]), Ok(())),
+            (placed([sharded(&["m", "x"]), replicated()]), placed([sharded(&["m", "y"]), replicated()]), Ok(())),
             (
-                placed([sharded(&["m", "x"]), replicated()]),
+                placed([sharded(&["m"]), replicated()]),
                 placed([sharded(&["x", "m"]), replicated()]),
                 Err(order_error.clone()),
             ),
             (
-                placed([sharded(&["a", "m"]), replicated()]),
-                placed([sharded(&["m", "a"]), replicated()]),
+                placed([sharded(&["x", "m"]), replicated()]),
+                placed([sharded(&["m"]), replicated()]),
+                Err(order_error.clone()),
+            ),
+            (
+                placed([sharded(&["m", "x"]), replicated()]),
+                placed([sharded(&["x", "m"]), replicated()]),
                 Err(order_error),
             ),
             (plain.clone(), placed([sharded(&["m"]), replicated()]), Err(manual_error.clone())),
@@ -4789,11 +4798,12 @@ mod tests {
 
     #[test]
     fn test_cast_type_inference_mesh_axis_definitions() {
-        // Auto and manual axes that the output carries forward keep their mesh axis definitions (size and type), even
-        // when only their names are compared for placement and manual variation, whereas the output mesh may still add
-        // or drop unrelated axes. Axes that carry reduction state, and explicit axes major to an auto or manual axis in
-        // a dimension (whose sizes fix the blocks of its shards), keep their definitions, whereas explicit axes minor to
-        // every auto and manual axis and referenced only by dimension placement may be redefined or replaced.
+        // Manual axes that the output carries forward keep their mesh axis definitions (size and type), even when only
+        // their names are compared for placement and manual variation, whereas the output mesh may still add or drop
+        // unrelated axes. Axes that carry reduction state, and explicit axes major to a manual axis in a dimension
+        // (whose sizes fix the blocks of its shards), keep their definitions, whereas explicit axes minor to every
+        // manual axis and referenced only by dimension placement may be redefined or replaced. Array types never
+        // place dimensions or reduction state over auto mesh axes.
         let mesh = |axes: &[(&str, usize, MeshAxisType)]| {
             LogicalMesh::new(
                 axes.iter().map(|(name, size, r#type)| MeshAxis::new(*name, *size, *r#type).unwrap()).collect(),
@@ -4825,21 +4835,14 @@ mod tests {
                 .unwrap()
         };
         let sharded = ShardingDimension::sharded(["x"]);
-        let auto = |size: usize| mesh(&[("x", size, MeshAxisType::Auto)]);
         let manual = |size: usize| mesh(&[("x", size, MeshAxisType::Manual)]);
         let explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Explicit)]);
-        let with_explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Auto), ("y", 2, MeshAxisType::Explicit)]);
-        let major_explicit = ShardingDimension::sharded(["x", "a"]);
+        let with_explicit = |size: usize| mesh(&[("x", size, MeshAxisType::Manual), ("y", 2, MeshAxisType::Explicit)]);
         let major_manual = ShardingDimension::sharded(["x", "m"]);
-        let minor_explicit = ShardingDimension::sharded(["a", "x"]);
+        let minor = ShardingDimension::sharded(["m", "x"]);
         let with_minor_explicit =
-            mesh(&[("a", 2, MeshAxisType::Auto), ("x", 2, MeshAxisType::Explicit), ("y", 2, MeshAxisType::Explicit)]);
+            mesh(&[("m", 2, MeshAxisType::Manual), ("x", 2, MeshAxisType::Explicit), ("y", 2, MeshAxisType::Explicit)]);
         let cases = [
-            (
-                placed(auto(2), sharded.clone()),
-                placed(auto(4), sharded.clone()),
-                Err(TypeError::invalid("`cast` cannot redefine preserved auto mesh axis `'x'=2:auto` as `'x'=4:auto`")),
-            ),
             (
                 placed(manual(2), sharded.clone()),
                 placed(manual(4), sharded.clone()),
@@ -4854,8 +4857,8 @@ mod tests {
                     "`cast` cannot redefine preserved manual mesh axis `'x'=2:manual` as `'x'=4:manual`",
                 )),
             ),
-            (placed(auto(2), sharded.clone()), placed(with_explicit(2), sharded.clone()), Ok(())),
-            (placed(with_explicit(2), sharded.clone()), placed(auto(2), sharded.clone()), Ok(())),
+            (placed(manual(2), sharded.clone()), placed(with_explicit(2), sharded.clone()), Ok(())),
+            (placed(with_explicit(2), sharded.clone()), placed(manual(2), sharded.clone()), Ok(())),
             (
                 unreduced(explicit(2)),
                 unreduced(explicit(4)),
@@ -4879,22 +4882,8 @@ mod tests {
             ),
             (
                 unreduced(explicit(2)),
-                unreduced(auto(2)),
-                Err(TypeError::invalid(
-                    "`cast` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as `'x'=2:auto`",
-                )),
-            ),
-            (
-                unreduced(explicit(2)),
                 unreduced(mesh(&[("x", 2, MeshAxisType::Explicit), ("y", 2, MeshAxisType::Explicit)])),
                 Ok(()),
-            ),
-            (
-                placed(mesh(&[("x", 2, MeshAxisType::Explicit), ("a", 2, MeshAxisType::Auto)]), major_explicit.clone()),
-                placed(mesh(&[("x", 4, MeshAxisType::Explicit), ("a", 2, MeshAxisType::Auto)]), major_explicit.clone()),
-                Err(TypeError::invalid(
-                    "`cast` cannot redefine preserved explicit mesh axis `'x'=2:explicit` as `'x'=4:explicit`",
-                )),
             ),
             (
                 placed(mesh(&[("x", 2, MeshAxisType::Explicit), ("m", 2, MeshAxisType::Manual)]), major_manual.clone()),
@@ -4904,13 +4893,13 @@ mod tests {
                 )),
             ),
             (
-                placed(mesh(&[("a", 2, MeshAxisType::Auto), ("x", 2, MeshAxisType::Explicit)]), minor_explicit.clone()),
-                placed(mesh(&[("a", 2, MeshAxisType::Auto), ("x", 4, MeshAxisType::Explicit)]), minor_explicit.clone()),
+                placed(mesh(&[("m", 2, MeshAxisType::Manual), ("x", 2, MeshAxisType::Explicit)]), minor.clone()),
+                placed(mesh(&[("m", 2, MeshAxisType::Manual), ("x", 4, MeshAxisType::Explicit)]), minor.clone()),
                 Ok(()),
             ),
             (
-                placed(with_minor_explicit.clone(), minor_explicit),
-                placed(with_minor_explicit, ShardingDimension::sharded(["a", "y"])),
+                placed(with_minor_explicit.clone(), minor),
+                placed(with_minor_explicit, ShardingDimension::sharded(["m", "y"])),
                 Ok(()),
             ),
             (placed(explicit(2), sharded.clone()), placed(explicit(4), sharded), Ok(())),
@@ -6532,9 +6521,9 @@ mod tests {
 
     #[test]
     fn test_cast_batching_manual_variation() {
-        // Batching over a manual mesh axis adds that axis's variation to every mapped value. An identity cast keeps
-        // the item's own variation, an unspecified output placement still receives the batch axis's variation, and
-        // existing variation on another axis cannot be dropped by the original cast.
+        // Batching over a manual mesh axis adds no variation to the mapped values. An identity cast keeps the item's
+        // own variation and disappears, a cast to an unspecified placement remains a cast, and existing variation on
+        // another axis cannot be dropped by the original cast.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -6587,18 +6576,29 @@ mod tests {
                     .unwrap()
                     .into_parts();
                 assert_eq!(axes, vec![BatchAxis::new(0)]);
-                assert_eq!(
-                    program.to_string(),
+                let packed_output = output.batched(0, Dimension::Static(4), ShardingDimension::sharded(["x"])).unwrap();
+                let expected_batched = if item == output {
                     formatdoc! {"
                         lambda %0:{packed} .
-                        in (%0)"},
-                );
+                        in (%0)"}
+                } else {
+                    formatdoc! {"
+                        lambda %0:{packed} .
+                        let %1:{packed_output} = cast [
+                            type={packed_output},
+                            inputs=[{packed}],
+                        ] %0
+                        in (%1)"}
+                };
+                assert_eq!(program.to_string(), expected_batched);
                 let value = Array::from_elements(packed.clone(), &[1f32; 8]).unwrap();
-                assert_eq!(program.interpret(vec![value.clone()]), Ok(vec![value]));
+                let output = Array::from_elements(packed_output, &[1f32; 8]).unwrap();
+                assert_eq!(program.interpret(vec![value]), Ok(vec![output]));
             }
         }
 
-        // Only x belongs to this mapped axis. An unexpected change on y must remain an input-contract error.
+        // Variation that the declaration does not have, on `x` or `y`, remains an input-contract error, which the
+        // validation of the lifted declaration reports for sharded and unannotated declarations alike.
         let packed = plain.batched(0, Dimension::Static(4), ShardingDimension::sharded(["x"])).unwrap();
         let wrong_type = packed
             .clone()
@@ -6608,16 +6608,16 @@ mod tests {
             .with_axis_sharding(ShardingDimension::sharded(["x"]));
         let input =
             ArrayBatch::new(Array::from_elements(wrong_type.clone(), &[1f32; 8]).unwrap(), BatchAxis::new(0)).unwrap();
-        for declared in [plain, unannotated] {
+        for (declared, message) in [
+            (plain, format!("type {wrong_type} does not refine declared type {packed}")),
+            (unannotated, format!("type {wrong_type} does not refine declared type f32[4, 2]")),
+        ] {
             assert_eq!(
                 CastOperation::checked(declared.clone(), vec![declared])
                     .unwrap()
                     .batch(&context, &EmptyRegionDriver, &[input.clone()])
                     .map(|_| ()),
-                Err(ProgramError::Type(TypeError::invalid(format!(
-                    "type {wrong_type} does not refine declared type {packed}"
-                )))
-                .into()),
+                Err(ProgramError::Type(TypeError::invalid(message)).into()),
             );
         }
     }
@@ -6919,7 +6919,8 @@ mod tests {
         )
         .unwrap();
         // The static input proves the relationship, so the checked cast is bound unchecked and linearization keeps
-        // no residual: the tangent program converts the tangent representation on its own.
+        // no residual. The tangent program converts the tangent sharding on its own, and its tangent has no explicit
+        // layout.
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -6932,7 +6933,14 @@ mod tests {
         );
         let linearization = program.to_flat_program().linearize().unwrap();
         assert_eq!(linearization.primal().to_string(), program.to_string());
-        assert_eq!(linearization.tangent().to_string(), program.to_string());
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[][sharding={mesh<['x'=1:explicit]>, []}] = cast [type=f64[][sharding={mesh<['x'=1:explicit]>, []}], inputs=[f64[]]] %0
+                in (%1)"},
+        );
+        let tangent_type = output_type.clone().with_layout(None);
         for checked in [true, false] {
             let input = Array::scalar(2f64).unwrap();
             let (primal, tangent) = differentiate_at(input.clone())
@@ -6945,7 +6953,7 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(primal, Array::from_elements(output_type.clone(), &[2f64]).unwrap());
-            assert_eq!(tangent, Array::from_elements(output_type.clone(), &[3f64]).unwrap());
+            assert_eq!(tangent, Array::from_elements(tangent_type.clone(), &[3f64]).unwrap());
             // Reverse mode must restore its exact nominal accumulator descriptor, rather than inheriting the output's
             // optional annotations into the inverse cast. Concrete results must honor that representation too.
             check_gradient!(
@@ -6963,9 +6971,10 @@ mod tests {
 
     #[test]
     fn test_cast_differentiation_refined_representation() {
-        // Layout and sharding change directly, with one tangent conversion and no erased intermediate. The static
-        // input type proves the relationship, so the JVP normalizes the checked primal cast as well, and split
-        // linearization needs no primal residual for ordering. The array IR universe stages the same programs.
+        // Layout and sharding change directly with no erased intermediate. Tangents carry no explicit layout, so a
+        // layout change needs no tangent conversion, while a sharding change needs one. The static input type proves
+        // the relationship, so the JVP normalizes the checked primal cast as well, and split linearization needs no
+        // primal residual for ordering. The array IR universe stages the same programs.
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
@@ -6974,10 +6983,9 @@ mod tests {
         let sharded_input = plain.clone().with_sharding(Sharding::replicated(first_mesh, 1)).unwrap();
         let sharded_output = plain.clone().with_sharding(Sharding::replicated(second_mesh, 1)).unwrap();
         let expected_layout = formatdoc! {"
-            lambda %0:{input}, %1:{input} .
+            lambda %0:{input}, %1:{plain} .
             let %2:{output} = cast [type={output}, inputs=[f32[2]]] %0
-                %3:{output} = cast [type={output}, inputs=[{input}]] %1
-            in (%2, %3)"};
+            in (%2, %1)"};
         let expected_sharding = formatdoc! {"
             lambda %0:{sharded_input}, %1:{sharded_input} .
             let %2:{sharded_output} = cast [type={sharded_output}, inputs=[f32[2]]] %0
@@ -6987,9 +6995,8 @@ mod tests {
                 ] %1
             in (%2, %3)"};
         let expected_tangent_layout = formatdoc! {"
-            lambda %0:{input} .
-            let %1:{output} = cast [type={output}, inputs=[{input}]] %0
-            in (%1)"};
+            lambda %0:{plain} .
+            in (%0)"};
         let expected_tangent_sharding = formatdoc! {"
             lambda %0:{sharded_input} .
             let %1:{sharded_output} = cast [
@@ -6997,9 +7004,16 @@ mod tests {
                 inputs=[{sharded_input}],
             ] %0
             in (%1)"};
-        for (input, output, expected, expected_tangent) in [
-            (input, output, expected_layout, expected_tangent_layout),
-            (sharded_input, sharded_output, expected_sharding, expected_tangent_sharding),
+        for (input, output, tangent_input, tangent_output, expected, expected_tangent) in [
+            (input, output, plain.clone(), plain.clone(), expected_layout, expected_tangent_layout),
+            (
+                sharded_input.clone(),
+                sharded_output.clone(),
+                sharded_input,
+                sharded_output,
+                expected_sharding,
+                expected_tangent_sharding,
+            ),
         ] {
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
                 let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -7018,10 +7032,10 @@ mod tests {
                 let jvp = program.jvp().unwrap();
                 assert_eq!(jvp.to_string(), expected);
                 let primal = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
-                let tangent = Array::from_elements(input.clone(), &[3f32, 4f32]).unwrap();
+                let tangent = Array::from_elements(tangent_input.clone(), &[3f32, 4f32]).unwrap();
                 let expected_values = vec![
                     Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap(),
-                    Array::from_elements(output.clone(), &[3f32, 4f32]).unwrap(),
+                    Array::from_elements(tangent_output.clone(), &[3f32, 4f32]).unwrap(),
                 ];
                 assert_eq!(jvp.interpret(vec![primal.clone(), tangent.clone()]), Ok(expected_values.clone()));
                 let linearization = program.linearize().unwrap();
@@ -7044,8 +7058,8 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let declared = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let input = declared.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
-        let output =
-            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![12])));
+        let plain_output = ArrayType::new_static(DataType::F32, [2]);
+        let output = plain_output.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let result = builder
@@ -7059,30 +7073,28 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder]).unwrap();
         let jvp = program.jvp().unwrap();
-        // One retained source carries n and the primal check into the fused tangent conversion.
+        // One retained source carries n and the primal check into the fused tangent conversion, whose tangents have
+        // no explicit layout.
         assert_eq!(
             jvp.to_string(),
             formatdoc! {"
-                lambda %0:{input}, %1:{input} .
+                lambda %0:{input}, %1:{declared} .
                 let %2:{output} = cast [type={output}, inputs=[{declared}], checked=true] %0
                     %3:{input} = cast [
                         type={input},
                         inputs=[{input}, {output}],
                     ] %0 %2
-                    %4:{output} = cast [
-                        type={output},
-                        inputs=[{input}, {input}],
-                    ] %1 %3
+                    %4:{plain_output} = cast [type={plain_output}, inputs=[{declared}, {input}]] %1 %3
                 in (%2, %4)"},
         );
         let exact = input.clone().with_shape(Shape::new(vec![Dimension::Static(2)]));
-        let primal = Array::from_elements(exact.clone(), &[1f32, 2f32]).unwrap();
-        let tangent = Array::from_elements(exact, &[3f32, 4f32]).unwrap();
+        let primal = Array::from_elements(exact, &[1f32, 2f32]).unwrap();
+        let tangent = Array::from_elements(plain_output.clone(), &[3f32, 4f32]).unwrap();
         assert_eq!(
             jvp.interpret(vec![primal, tangent]),
             Ok(vec![
                 Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap(),
-                Array::from_elements(output.clone(), &[3f32, 4f32]).unwrap(),
+                Array::from_elements(plain_output, &[3f32, 4f32]).unwrap(),
             ]),
         );
         let wrong_type = input.with_shape(Shape::new(vec![Dimension::Static(3)]));
@@ -7101,7 +7113,7 @@ mod tests {
         let declared = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
-        let output = plain.with_layout(Layout::Strided(StridedLayout::new(vec![12])));
+        let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let witness = builder.add_input(declared.clone());
@@ -7117,14 +7129,12 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         // The source has an exact shape. The fused tangent depends on the checked result without introducing n, and
-        // split linearization needs no residual once the primal has completed.
+        // split linearization needs no residual once the primal has completed. Tangents have no explicit layout, so
+        // the linearized tangent program needs no conversion at all.
         let expected = formatdoc! {"
-            lambda %0:{input}, %1:{declared}, %2:{input}, %3:{declared} .
+            lambda %0:{input}, %1:{declared}, %2:{plain}, %3:{declared} .
             let %4:{output} = cast [type={output}, inputs=[{declared}, {declared}], checked=true] %0 %1
-                %5:{output} = cast [
-                    type={output},
-                    inputs=[{input}, {output}],
-                ] %2 %4
+                %5:{plain} = cast [type={plain}, inputs=[{plain}, {output}]] %2 %4
             in (%4, %5)"};
         assert_eq!(program.jvp().unwrap().to_string(), expected);
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
@@ -7132,17 +7142,16 @@ mod tests {
         assert_eq!(
             linearization.tangent().to_string(),
             formatdoc! {"
-                lambda %0:{input} .
-                let %1:{output} = cast [type={output}, inputs=[{input}]] %0
-                in (%1)"},
+                lambda %0:{plain} .
+                in (%0)"},
         );
-        let primal = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
-        let tangent = Array::from_elements(input, &[3f32, 4f32]).unwrap();
+        let primal = Array::from_elements(input, &[1f32, 2f32]).unwrap();
+        let tangent = Array::from_elements(plain.clone(), &[3f32, 4f32]).unwrap();
         let witness = Array::vector(vec![0f32; 2]).unwrap();
         let inputs = vec![primal, witness.clone(), tangent, witness];
         let expected_values = vec![
-            Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap(),
-            Array::from_elements(output, &[3f32, 4f32]).unwrap(),
+            Array::from_elements(output, &[1f32, 2f32]).unwrap(),
+            Array::from_elements(plain, &[3f32, 4f32]).unwrap(),
         ];
         assert_eq!(program.jvp().unwrap().interpret(inputs.clone()), Ok(expected_values.clone()));
         let array_ir = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
@@ -7231,17 +7240,18 @@ mod tests {
     fn test_cast_transposition() {
         let exact = ArrayType::new_static(DataType::F32, [2]);
         let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+
+        // Cotangents have no explicit layout, so transposing a layout change needs no inverse cast.
         check_operation_transposition!(
             @exact,
-            operation = CastOperation::unchecked(laid_out.clone(), vec![exact.clone()]).unwrap(),
+            operation = CastOperation::unchecked(laid_out, vec![exact.clone()]).unwrap(),
             cases = [{
                 inputs = [(@linear(type = exact.clone()))],
-                output_cotangents = [Array::from_elements(laid_out, &[1f32, 2f32]).unwrap()],
+                output_cotangents = [Array::vector(vec![1f32, 2f32]).unwrap()],
                 input_cotangents = [Array::vector(vec![1f32, 2f32]).unwrap()],
                 pullback = indoc! {"
-                    lambda %0:f32[2][layout=strided{8}] .
-                    let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}]]] %0
-                    in (%1)"},
+                    lambda %0:f32[2] .
+                    in (%0)"},
             }],
         );
 
@@ -7338,8 +7348,9 @@ mod tests {
 
     #[test]
     fn test_cast_transposition_refined_representation() {
-        // Reversing a representation change restores the exact nominal input representation, in both modes and
-        // universes, directly and through linearization.
+        // Reversing a sharding change restores the exact nominal input sharding, and reversing a layout change needs no
+        // conversion because cotangents have no explicit layout, in both modes and universes, directly and through
+        // linearization.
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
@@ -7348,9 +7359,8 @@ mod tests {
         let sharded_input = plain.clone().with_sharding(Sharding::replicated(first_mesh, 1)).unwrap();
         let sharded_output = plain.clone().with_sharding(Sharding::replicated(second_mesh, 1)).unwrap();
         let expected_layout = formatdoc! {"
-            lambda %0:{output} .
-            let %1:{input} = cast [type={input}, inputs=[{output}]] %0
-            in (%1)"};
+            lambda %0:{plain} .
+            in (%0)"};
         let expected_sharding = formatdoc! {"
             lambda %0:{sharded_output} .
             let %1:{sharded_input} = cast [
@@ -7358,8 +7368,8 @@ mod tests {
                 inputs=[{sharded_output}],
             ] %0
             in (%1)"};
-        let cotangent = Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap();
-        let expected_cotangent = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
+        let cotangent = Array::from_elements(plain.clone(), &[1f32, 2f32]).unwrap();
+        let expected_cotangent = Array::from_elements(plain.clone(), &[1f32, 2f32]).unwrap();
         let sharded_cotangent = Array::from_elements(sharded_output.clone(), &[1f32, 2f32]).unwrap();
         let expected_sharded_cotangent = Array::from_elements(sharded_input.clone(), &[1f32, 2f32]).unwrap();
         check_operation_transposition!(
@@ -7425,8 +7435,8 @@ mod tests {
             }],
         );
 
-        // Linearizing first changes nothing: the shape is already proven, so the tangent program is the same unchecked
-        // cast and its pullback is the same inverse cast.
+        // Linearizing first changes nothing. The shape is already proven, so the pullback of the linearized tangent
+        // program is the same as the direct pullback.
         for (input, output, expected, cotangent, expected_cotangent) in [
             (input, output, expected_layout, cotangent, expected_cotangent),
             (sharded_input, sharded_output, expected_sharding, sharded_cotangent, expected_sharded_cotangent),
@@ -7467,16 +7477,12 @@ mod tests {
         let exact = ArrayType::new_static(DataType::F32, [2]);
         let layout = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
 
-        // A checked cast whose relationship the input types prove transposes like an unchecked one.
+        // A checked cast whose relationship the input types prove transposes like an unchecked one. Cotangents have no
+        // explicit layout, so the transpose of this layout change needs no inverse cast.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(exact.clone());
         let output = builder
-            .add_instruction(
-                CastOperation::checked(layout.clone(), vec![exact.clone()]).unwrap(),
-                vec![],
-                vec![input],
-                None,
-            )
+            .add_instruction(CastOperation::checked(layout, vec![exact.clone()]).unwrap(), vec![], vec![input], None)
             .unwrap()[0];
         let proven = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
@@ -7486,12 +7492,11 @@ mod tests {
         assert_eq!(
             proven.to_string(),
             indoc! {"
-                lambda %0:f32[2][layout=strided{8}] .
-                let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}]]] %0
-                in (%1)"},
+                lambda %0:f32[2] .
+                in (%0)"},
         );
         assert_eq!(
-            proven.interpret(vec![Array::from_elements(layout, &[1f32, 2f32]).unwrap()]),
+            proven.interpret(vec![Array::vector(vec![1f32, 2f32]).unwrap()]),
             Ok(vec![Array::vector(vec![1f32, 2f32]).unwrap()]),
         );
 
@@ -7746,7 +7751,8 @@ mod tests {
             );
         }
 
-        // A representation change still needs no value from an irrelevant static linear witness.
+        // A layout change still needs no value from an irrelevant static linear witness. Cotangents have no explicit
+        // layout, so its transpose needs no inverse cast either.
         let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(value, witness)| value.cast_unchecked(output.clone(), &[witness]),
@@ -7764,12 +7770,11 @@ mod tests {
         assert_eq!(
             transposed.to_string(),
             indoc! {"
-                lambda %0:f32[2][layout=strided{8}] .
-                let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}]]] %0
-                    %2:f32[3] = zero [type=f32[3]]
-                in (%1, %2)"},
+                lambda %0:f32[2] .
+                let %1:f32[3] = zero [type=f32[3]]
+                in (%0, %1)"},
         );
-        let value = Array::from_elements(output, &[1f32, 2f32]).unwrap();
+        let value = Array::vector(vec![1f32, 2f32]).unwrap();
         assert_eq!(
             transposed.interpret(vec![value]),
             Ok(vec![Array::vector(vec![1f32, 2f32]).unwrap(), Array::vector(vec![0f32; 3]).unwrap()]),
@@ -7808,16 +7813,16 @@ mod tests {
         check_operation_transposition!(
             @exact,
             operation = CastOperation::unchecked(
-                laid_out.clone(),
+                laid_out,
                 vec![exact.clone(), ArrayType::new_static(DataType::F32, [3])],
             ).unwrap(),
             cases = [{
                 inputs = [(@linear(type = exact.clone())), (@known, Array::vector(vec![1f32; 3]).unwrap())],
-                output_cotangents = [Array::from_elements(laid_out, &[1f32, 2f32]).unwrap()],
+                output_cotangents = [Array::vector(vec![1f32, 2f32]).unwrap()],
                 input_cotangents = [Array::vector(vec![1f32, 2f32]).unwrap()],
                 pullback = indoc! {"
-                    lambda %0:f32[2][layout=strided{8}], %1:f32[3] .
-                    let %2:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}], f32[3]]] %0 %1
+                    lambda %0:f32[2], %1:f32[3] .
+                    let %2:f32[2] = cast [type=f32[2], inputs=[f32[2], f32[3]]] %0 %1
                     in (%2)"},
             }],
         );

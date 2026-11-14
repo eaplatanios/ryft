@@ -16,6 +16,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero::Zero;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance,
@@ -277,21 +278,11 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         check_count!("input", input_axes, inputs.len(), ProgramError);
         let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
 
-        // A completely replicated call at an unnamed batching level needs no structural region rewrite, and keeping the
-        // original call avoids manufacturing a batch axis that neither region observes. What makes that shortcut sound
-        // is the level being unnamed rather than the inputs being replicated: an attached region's value can vary per
-        // batch item with no mapped input at all, but only by addressing the level _by name_ (e.g., an `axis_index`
-        // or a collective over this level's axis, both of which a transposed program naturally contains because
-        // `parallel_all_gather` transposes to `parallel_sum_scatter` and vice versa). Every named-axis operation
-        // resolves the level it belongs to by comparing its own axis name against `BatchingContext::axis_name`, so an
-        // unnamed level is provably invisible to all of them, including those of operation families this crate does not
-        // know about. A named level therefore batches its regions structurally, which is also what lets the named-axis
-        // operations inside them resolve against it.
-        if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
-            let outputs = context.parent().bind(self.clone(), driver.region_programs(), input_values.as_slice())?;
-            return Ok(outputs.into_iter().map(P::replicated).collect());
-        }
-
+        // A completely replicated call batches its regions structurally as well. At an unnamed level their values
+        // are the same for every batch item, because a value can vary per batch item with no mapped input only by
+        // addressing the level by name (e.g., an `axis_index` or a collective over the axis of the level). Batching
+        // can still stage work in the regions, though (e.g., an operation with a custom batching rule applies that
+        // rule whenever it is batched, whatever its inputs), which keeping the original regions would drop.
         let (residual_axes, linear_axes) = input_axes.split_at(self.residual_count);
         let (forward, output_axes) = P::adapt_batched_program(
             driver.batch_program(
@@ -496,6 +487,20 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCa
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         driver.interpret_region(context, 0, inputs.to_vec())
+    }
+}
+
+// The reference backend emulation of a `shard_map` runs this call once for all devices when its forward region
+// communicates across them. Like interpretation, the call executes only its forward region, once, on its inputs.
+impl<T: DifferentiableType, O: Operation<Type = ArrayIrType>> LockstepOperation<O> for LinearCallOperation<T> {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(driver.interpret_region(context, 0, inputs.to_vec()))
     }
 }
 
@@ -783,7 +788,9 @@ pub(crate) mod tests {
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
         DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
     };
-    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
+    use crate::batching::{
+        BatchAxis, BatchingLevelExtent, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch,
+    };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         CotangentDestinationKind, DifferentiationError, TransposableOperation, TransposedProgram,
@@ -791,17 +798,19 @@ pub(crate) mod tests {
     };
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::axis_index::AxisIndexOperation;
+    use crate::operations::composites::composite;
     use crate::operations::constants::zero::ZeroOperation;
+    use crate::operations::debugging::Print;
     use crate::operations::manipulation::conversions::ConvertElementTypeOperation;
     use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        AttachedRegions, EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, ReferenceType, RegionDriver,
-        RegionRef, RegionSlot,
+        AttachedRegions, EffectClass, EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, ReferenceType,
+        RegionDriver, RegionRef, RegionSlot, ValueProjection,
     };
     use crate::tests::{ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue};
-    use crate::tracing::TracingContext;
+    use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
 
@@ -1109,6 +1118,80 @@ pub(crate) mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &Array::vector(vec![0.0, 2.0, 4.0]).unwrap());
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_applies_custom_batching_rules_to_replicated_inputs() {
+        // The forward region calls an identity composite whose custom batching rule prints its input. A custom batching
+        // rule is applied whenever its call is batched, whatever its inputs, so batching the linear call at an unnamed
+        // level with a replicated input batches its regions as well, and the batched forward region prints.
+        type IrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let function = composite(|x: Tracer<IrContext>| Ok(x)).with_batching(
+            |x: Tracer<IrContext>, axis: BatchAxis, _: BatchingLevelExtent<Tracer<IrContext>>| {
+                let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                Ok((x.print_with_effect_class("batched", EffectClass::DeviceOrderedIo)?.into_value(), axis))
+            },
+        );
+        let (_, region) = IrContext::trace(
+            |inputs: Vec<Tracer<IrContext>>| Ok(vec![function.call(inputs[0].clone())?]),
+            vec![scalar_type.clone()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(scalar_type.clone());
+        let forward = builder.import_program(region);
+        let mut transpose = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let cotangent = transpose.add_input(scalar_type);
+        let transpose = transpose
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![cotangent],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let transpose = builder.import_program(transpose);
+        let operation = LinearCallOperation::<ArrayIrType>::new(0);
+        let outputs = builder.add_instruction(operation, vec![forward, transpose], vec![input], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        assert_eq!(batched.output_axes(), &[BatchAxis::replicated()]);
+        assert_eq!(
+            batched.into_parts().0.to_string(),
+            indoc! {r#"
+                lambda %0:dimension<2>, %1:f32[] .
+                let %2:f32[] = linear_call [residual_count=1] %0 %1 [
+                    forward={
+                        lambda %0:dimension<2>, %1:f32[] .
+                        let %2:f32[] = composite [
+                            name="composite",
+                            non_differentiated_count=1,
+                            batching=[(extent=dimension<2>, input_axes=[replicated], output_axes=[replicated])],
+                        ] %0 %1 [
+                            primal={
+                                lambda %0:dimension<2>, %1:f32[] .
+                                let %2:f32[] = print [label=batched, effect_class=device_ordered_io] %1
+                                in (%2)
+                            },
+                        ]
+                        in (%2)
+                    },
+                    transpose={
+                        lambda %0:dimension<2>, %1:f32[] .
+                        in (%1)
+                    },
+                ]
+                in (%0, %2)"#},
+        );
     }
 
     #[test]

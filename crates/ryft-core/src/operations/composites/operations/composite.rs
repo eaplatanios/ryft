@@ -1,7 +1,10 @@
+use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
+use crate::arrays::ArrayIrType;
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingLevelExtent,
@@ -16,24 +19,29 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
-use crate::operations::composites::derive_bijective_identity_renaming;
-use crate::operations::composites::describe_composite;
+use crate::operations::collectives::{CollectiveAxes, CollectiveOperation, HiddenAxes};
 use crate::operations::composites::operations::composite_transpose::{
     CompositeTransposeOperation, CompositeTransposeRules,
 };
 use crate::operations::composites::operations::{CompositeConversion, transpose_carrier_batching};
+use crate::operations::composites::rules::definitions::CompositeKey;
 use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
 use crate::operations::composites::rules::{
     CustomRuleBatching, CustomRuleBatchingLevel, CustomRuleBatchingSpecializationKey, CustomRuleDerivationKind,
     CustomRuleDerivedDefinitionKey, CustomRuleForwardSpecializationKey, CustomRuleReference, CustomRuleSource,
     CustomRuleTracer,
 };
+use crate::operations::composites::{derive_bijective_identity_renaming, describe_composite};
 use crate::operations::constants::zero::Zero;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::parameters::{Parameter, Placeholder};
-use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::partial::{
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation,
+};
 use crate::programs::{
-    EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
-    OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary,
+    AttachedRegions, EffectsSummary, InputRegionProvenance, MaybeZero, Operation, OperationBoundaryPruning,
+    OperationFormatter, OperationProvider, OutputRegionProvenance, ProgramBuilder, ProgramError, ReferenceBoundary,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, RegionDataFlow, RegionInterface, RegionLiveness, RegionRef, RegionSlot, Type,
     TypeError, TypeIdentityRenaming, Typed, TypedProgram, Value,
@@ -164,8 +172,16 @@ pub const COMPOSITE_OPERATION_NAME: &str = "composite";
 /// primal boundary, stays whole, and so does a call whose forward mode rule is derived from its primal while its rules
 /// have a custom batching rule, because the derived calls that its derivatives stage apply that rule to every output.
 ///
+/// # Named Composite Calls
+///
+/// A call of a [`NamedComposite`](crate::NamedComposite) attaches the definition's cached body for its input types as
+/// its primal region, shared through [`AttachedRegions::Callees`], so a program imports each body once however many
+/// calls attach it, and every transform treats the call like any other call with retained rules. Refer to the
+/// documentation of [`Self::key`] for more information.
+///
 /// Equality and hashing of calls with retained rules use the identity of the shared definition (i.e.,
-/// [`Arc::ptr_eq`](std::sync::Arc::ptr_eq)), while rendering prints its human-readable name.
+/// [`Arc::ptr_eq`](std::sync::Arc::ptr_eq)), while rendering prints the complete key of a named definition, or the
+/// human-readable name of any other definition.
 pub struct CompositeOperation<V: Typed + Parameter, O, S = CustomRuleReference<V, O>> {
     /// Number of leading inputs that parameterize the call without being differentiated, including the boundary inputs
     /// that the batching levels of a call with retained rules prepended to its inputs.
@@ -241,6 +257,18 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
         match &self.rules {
             CompositeRules::Attached { .. } => None,
             CompositeRules::Retained { rules, .. } => Some(rules),
+        }
+    }
+
+    /// Returns the semantic identity of this call if it is a call of a [`NamedComposite`](crate::NamedComposite) whose
+    /// primal region is still the definition's body, and [`None`] otherwise. Batching, pruning, and reference discharge
+    /// rewrite the region of a call into another computation, so such calls keep the rules of their definition but no
+    /// longer call the definition itself, and backends must not replace them by its key.
+    #[inline]
+    pub fn key(&self) -> Option<&CompositeKey> {
+        match &self.rules {
+            CompositeRules::Retained { rules, batching: None, discharged: false, kept_outputs: None } => rules.key(),
+            _ => None,
         }
     }
 
@@ -725,7 +753,9 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
 
     #[inline]
     fn region_data_flow(&self) -> RegionDataFlow<'_> {
-        RegionDataFlow::Provenance
+        // The primal region executes once per call, as its provenance declares, but residual policies classify a call
+        // as one producer and replay it whole, as JAX's policies treat `custom_jvp_call` and `custom_vjp_call`.
+        RegionDataFlow::Atomic
     }
 
     fn prune_boundary(
@@ -856,7 +886,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         // Attached rule regions render under their slot names, so their fields appear only for the non-differentiated
         // split and for a forward mode rule derived from the primal region, both exactly where they exist. Retained
-        // rules render the name of their definition and the state of the call that their specializations depend on.
+        // rules render the complete key of a named definition (i.e., including its version and attributes), so that
+        // renderings, and the structural deduplication of the regions that contain such calls, distinguish calls of
+        // different named computations, or the name of any other definition, followed by the state of the call that
+        // their specializations depend on.
         let operation = OperationFormatter::new(formatter, indentation, COMPOSITE_OPERATION_NAME)?;
         match &self.rules {
             CompositeRules::Attached { jvp_rule, .. } => {
@@ -875,7 +908,10 @@ impl<V: Typed<Type: DifferentiableType + Eq + Hash> + Parameter, O, S: CustomRul
             }
             CompositeRules::Retained { rules, batching, discharged, kept_outputs } => {
                 operation.bracketed(|operation| {
-                    operation.field("name", format_args!("{:?}", rules.name()))?;
+                    match rules.key() {
+                        Some(key) => operation.field("key", format_args!("{:?}", key.to_string()))?,
+                        None => operation.field("name", format_args!("{:?}", rules.name()))?,
+                    }
                     if self.non_differentiated_count > 0 {
                         operation.field("non_differentiated_count", self.non_differentiated_count)?;
                     }
@@ -949,6 +985,32 @@ where
     }
 }
 
+impl<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>> CollectiveOperation
+    for CompositeOperation<V, O, S>
+{
+    #[inline]
+    fn axes(&self) -> Cow<'_, CollectiveAxes> {
+        // A composite call is not a collective, and its primal and attached rule regions reveal their own axes.
+        Cow::Owned(CollectiveAxes::default())
+    }
+
+    #[inline]
+    fn hidden_axes(&self) -> HiddenAxes {
+        // Retained custom differentiation and batching rules are traced only when a transform requests them, in the
+        // scope of that request, so their axes are hidden, and only the declaration of their definition names them.
+        // A forward mode rule derived from the primal region and the sequential batching of calls without a custom
+        // batching rule use only the axes of the primal region.
+        match &self.rules {
+            CompositeRules::Retained { rules, .. }
+                if rules.has_jvp() || rules.has_vjp() || rules.has_batching_rule() =>
+            {
+                rules.rule_axes().map_or(HiddenAxes::Unknown, |axis_names| HiddenAxes::Named(axis_names.to_vec()))
+            }
+            CompositeRules::Attached { .. } | CompositeRules::Retained { .. } => HiddenAxes::None,
+        }
+    }
+}
+
 // Interpretation replays only the primal region, so it applies in every context, including contexts of families that
 // embed this call's family (e.g., kernel bodies).
 impl<
@@ -972,13 +1034,52 @@ impl<
     }
 }
 
-// The default partial-evaluation rule is the desired one here as it interprets the primal region when every input is
-// known and otherwise residualizes the complete call, so that its rules remain available to later differentiation.
+// The reference backend emulation of a `shard_map` runs this call once for all devices when its primal region
+// communicates across them. Like interpretation, the call executes only its primal region, once, on its inputs,
+// and none of its rules.
+impl<V: Typed + Parameter, P, S, O: Operation<Type = ArrayIrType>> LockstepOperation<O>
+    for CompositeOperation<V, P, S>
+{
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(driver.interpret_region(context, 0, inputs.to_vec()))
+    }
+}
+
+// The default partial-evaluation semantics are the desired ones here, as they fold the call when every input is known
+// and otherwise residualize the complete call, so that its rules remain available to later differentiation. A call
+// whose primal region is an interned shared callee (e.g., a named composite call) folds or residualizes with that
+// callee instead of a materialized copy of its body, so that partial evaluation keeps sharing it rather than copying
+// it per call.
 impl<C: Context<Type: DifferentiableType + Eq + Hash>, S: CustomRuleSource<C::Constant, C::Operation>>
     PartiallyEvaluatableOperation<C> for CompositeOperation<C::Constant, C::Operation, S>
 where
     C::Operation: From<CompositeOperation<C::Constant, C::Operation, S>>,
 {
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        let callee = match driver.region_count() {
+            1 => driver.region(0).ok().and_then(|region| region.interned_callee().cloned()),
+            _ => None,
+        };
+        match callee {
+            Some(callee) => context.fold_or_residualize(
+                self.clone(),
+                AttachedRegions::Callees(std::slice::from_ref(&callee)),
+                inputs,
+            ),
+            None => context.fold_or_residualize(self.clone(), driver.region_programs(), inputs),
+        }
+    }
 }
 
 impl<C, P, S> BatchableOperation<C, P> for CompositeOperation<C::Constant, C::Operation, S>
@@ -1263,7 +1364,7 @@ where
                                 (0..rule_output_count).filter(|&index| kept_outputs[index]).collect::<Vec<_>>();
                             let output_axes =
                                 kept_indices.iter().map(|&index| specialization.output_axes[index]).collect();
-                            (specialization.program.with_outputs(&kept_indices)?, output_axes)
+                            (specialization.program.clone().with_outputs(&kept_indices)?, output_axes)
                         }
                     }
                 } else {
@@ -2226,8 +2327,8 @@ where
             // only valid for a pure primal, because the effects of any other primal (e.g., reference updates, or
             // reference reads that later effects would change) must run once, when the known side runs, so it is
             // linearized inline instead.
-            let pushforward =
-                jvp_program.with_outputs(&(output_count..jvp_program.output_count()).collect::<Vec<_>>())?;
+            let tangent_outputs = (output_count..jvp_program.output_count()).collect::<Vec<_>>();
+            let pushforward = Arc::unwrap_or_clone(jvp_program).with_outputs(&tangent_outputs)?;
             let outputs = context.primal().bind(call.clone(), vec![primal_region.to_program()], primals.as_slice())?;
             let mut tangent_inputs =
                 primals.into_iter().map(|primal| context.primal_to_tangent(primal)).collect::<Result<Vec<_>, _>>()?;
@@ -2301,7 +2402,7 @@ mod tests {
     use crate::operations::composites::rules::{CustomRuleRegistration, LiftedCustomRules};
     use crate::operations::composites::tests::{
         MemberDefinition, RuleCounters, TestContext, TestDefinition, TestRegistration, call_jvp, cube_definition,
-        cube_program, custom_rule_program, member_cube_definition, ownership_probe,
+        cube_program, custom_rule_program, member_cube_definition, named_cube_definition, ownership_probe,
     };
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
@@ -3101,8 +3202,8 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let vector_type = ArrayType::new_static(DataType::F64, [2]);
         let operation = ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, false);
-        let primal_interface = sin_program(&scalar_type).interface();
-        let jvp_interface = doubled_sin_jvp_program(&scalar_type).interface();
+        let primal_interface = sin_program(&scalar_type).interface().clone();
+        let jvp_interface = doubled_sin_jvp_program(&scalar_type).interface().clone();
 
         // The primal region receives the call inputs, the JVP region receives `(inputs..., input_tangents...)`, and a
         // rule that satisfies the interface contract makes the call produce the primal outputs.
@@ -3283,9 +3384,9 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let vector_type = ArrayType::new_static(DataType::F64, [2]);
         let operation = ArrayComposite::from_rule_regions(CompositeJvpRule::Absent, true);
-        let primal_interface = sin_program(&scalar_type).interface();
-        let forward_interface = sin_forward_program(&scalar_type).interface();
-        let backward_interface = tripled_sin_backward_program(&scalar_type).interface();
+        let primal_interface = sin_program(&scalar_type).interface().clone();
+        let forward_interface = sin_forward_program(&scalar_type).interface().clone();
+        let backward_interface = tripled_sin_backward_program(&scalar_type).interface().clone();
 
         // The primal and forward regions receive the call inputs, the backward region receives the trailing forward
         // residuals followed by one cotangent per primal output, and rules that satisfy the interface contract make the
@@ -3680,9 +3781,9 @@ mod tests {
     fn test_composite_region_data_flow() {
         // The primal computation region receives every input at its own position and its outputs are the call's
         // outputs one for one, while the dormant rule regions, which reference analysis does not enter, declare no
-        // input provenance.
+        // input provenance. Residual policies nevertheless see the call itself as the producer of its outputs.
         let operation = ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, true);
-        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
+        assert!(matches!(operation.region_data_flow(), RegionDataFlow::Atomic));
         assert_eq!(operation.input_region_provenance(0, 0), InputRegionProvenance::Input { index: 0 });
         assert_eq!(operation.input_region_provenance(0, 1), InputRegionProvenance::Input { index: 1 });
         assert_eq!(operation.input_region_provenance(1, 1), InputRegionProvenance::None);
@@ -4555,6 +4656,48 @@ mod tests {
             Ok(vec![Array::scalar(8f64).unwrap(), Array::scalar(4f64).unwrap()]),
         );
         assert_eq!(counters.counts(), (1, 0, 0));
+    }
+
+    #[test]
+    fn test_composite_partial_evaluation_shared_body() {
+        // Residualizing named calls that share one interned body keeps sharing it, rather than copying it per call.
+        let traces = Arc::new(AtomicUsize::new(0));
+        let key = CompositeKey::new("ryft.tests.partial_evaluation_shared_body", 1);
+        let registration = CustomRuleRegistration::new(named_cube_definition(key, &traces));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let body = registration.reference().body(std::slice::from_ref(&scalar_type)).unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let mut value = builder.add_input(scalar_type.clone());
+        let mut outputs = Vec::new();
+        for _ in 0..2 {
+            let region = builder.intern_callee(&body, None).unwrap();
+            let operation = CompositeOperation::new(registration.reference());
+            value = builder.add_instruction(operation, vec![region], vec![value], None).unwrap()[0];
+            outputs.push(value);
+        }
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder], vec![Placeholder; 2]).unwrap();
+        let evaluation = program.partially_evaluate(&[PartialValue::Unknown(scalar_type)]).unwrap();
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = composite [key=\"ryft.tests.partial_evaluation_shared_body.v1\"] %0 [
+                    primal=^0={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                            %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                    %2:f64[] = composite [key=\"ryft.tests.partial_evaluation_shared_body.v1\"] %1 [
+                        primal=^0,
+                    ]
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(traces.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -8255,7 +8398,7 @@ mod tests {
 
         // Projecting the program onto the first output keeps the two-output call, so its second output's seed reaches
         // the call's transpose rule as a structural zero rather than being pruned away beforehand.
-        let projected = program.with_outputs(&[0]).unwrap();
+        let projected = program.clone().with_outputs(&[0]).unwrap();
         assert_eq!(
             projected.to_string(),
             indoc! {"

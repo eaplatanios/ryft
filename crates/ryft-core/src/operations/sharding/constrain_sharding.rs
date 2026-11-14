@@ -67,21 +67,19 @@ impl ConstrainShardingOperation {
     /// its axes and gains the constraint's auto axes after them, or stays as is where the constraint is replicated or
     /// unconstrained, whereas a tracked replicated dimension takes the constraint's entry, since a tracked type is
     /// only replicated over the axes the type system governs and leaves the auto axes to the compiler). The tracked
-    /// unreduced, reduced, and varying manual axes are carried over as well.
+    /// unreduced, reduced, and varying manual axes are carried over as well, and an input and a constraint that are
+    /// both unreduced must agree on their [`UnreducedKind`](crate::UnreducedKind).
     ///
     /// # Parameters
     ///
     ///   - `input_type`: Type of the input this operation is applied to, whose rank and mesh (if it carries a
     ///     sharding) must match those of this constraint.
     pub fn lowered_sharding(&self, input_type: &ArrayType) -> Result<Sharding, TypeError> {
+        // Types never name auto axes (refer to `ArrayType::with_sharding`), so the tracked placement is exactly the
+        // placement that the type system governs, and this constraint adds the auto axes that the compiler decides.
         let Some(tracked) = input_type.sharding() else {
             return Ok(self.sharding.clone());
         };
-
-        // A tracked type may still name auto axes (e.g., the actual placement of a concrete input), but placement
-        // over those axes is the compiler's to decide and exactly what this constraint overrides, so only the
-        // placement the type system governs is carried over.
-        let tracked = tracked.without_auto_axes();
         if tracked.rank() != self.sharding.rank() {
             return Err(TypeError::invalid(format!(
                 "`{}` rank ({}) does not match the input rank ({})",
@@ -113,11 +111,27 @@ impl ConstrainShardingOperation {
             })
             .collect();
 
+        // A sharding records one kind for all of its unreduced axes, so a constraint can only extend a pending
+        // reduction of the same kind.
+        let unreduced_kind = match (tracked.unreduced_axes().is_empty(), self.sharding.unreduced_axes().is_empty()) {
+            (false, false) if tracked.unreduced_kind() != self.sharding.unreduced_kind() => {
+                return Err(TypeError::invalid(format!(
+                    "`{}` cannot constrain a value that is unreduced with kind `{}` to kind `{}`",
+                    CONSTRAIN_SHARDING_OPERATION_NAME,
+                    tracked.unreduced_kind(),
+                    self.sharding.unreduced_kind(),
+                )));
+            }
+            (false, _) => tracked.unreduced_kind(),
+            (true, _) => self.sharding.unreduced_kind(),
+        };
+
         self.sharding
             .with_dimensions(dimensions)
             .and_then(|sharding| {
                 sharding.with_unreduced_axes(tracked.unreduced_axes().union(self.sharding.unreduced_axes()).cloned())
             })
+            .and_then(|sharding| sharding.with_unreduced_kind(unreduced_kind))
             .and_then(|sharding| {
                 sharding.with_reduced_axes(tracked.reduced_axes().union(self.sharding.reduced_axes()).cloned())
             })
@@ -432,7 +446,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis,
-        Shape,
+        Shape, ShardingError,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -551,23 +565,16 @@ mod tests {
         let tracked = Sharding::new(mesh.clone(), vec![ShardingDimension::unconstrained(); 3]).unwrap();
         assert_eq!(operation.lowered_sharding(&input_type.clone().with_sharding(tracked).unwrap()), Ok(constraint));
 
-        // Tracked placement over auto axes is the compiler's to decide and is overridden by the constraint.
-        let tracked = Sharding::new(
+        // Placement over auto axes is the compiler's to decide, so no tracked type can carry one for the constraint
+        // to override.
+        let auto_placement = Sharding::new(
             mesh.clone(),
             vec![ShardingDimension::replicated(), ShardingDimension::sharded(["a"]), ShardingDimension::replicated()],
         )
         .unwrap();
         assert_eq!(
-            operation.lowered_sharding(&input_type.clone().with_sharding(tracked).unwrap()),
-            Ok(Sharding::new(
-                mesh.clone(),
-                vec![
-                    ShardingDimension::sharded(["a"]),
-                    ShardingDimension::replicated(),
-                    ShardingDimension::unconstrained(),
-                ],
-            )
-            .unwrap()),
+            input_type.clone().with_sharding(auto_placement.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: auto_placement }),
         );
 
         // A tracked sharding on another mesh or of another rank cannot be merged.

@@ -1,7 +1,7 @@
 use std::any::{Any, TypeId};
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::num::NonZeroUsize;
@@ -20,7 +20,7 @@ use crate::operations::composites::rules::{
     CustomRuleForwardSpecializationKey, CustomRuleSpecialization, CustomRuleSpecializationRequest,
 };
 use crate::parameters::Parameter;
-use crate::programs::{ProgramError, Type, Typed};
+use crate::programs::{Program, ProgramError, Type, Typed};
 use crate::specialization::{ReentrantSpecializationError, SpecializationCache, SpecializationCacheError};
 
 /// Maximum number of specializations that each rule of a [`CustomRuleDefinition`] retains.
@@ -29,6 +29,9 @@ const CUSTOM_RULE_SPECIALIZATION_CAPACITY: usize = 16;
 /// [`SpecializationCache`]es of one registered [`CustomRuleDefinition`], keyed by static information only and
 /// owned by its [`CustomRuleRegistration`] handle.
 struct CustomRuleCaches<V: Typed + Parameter, O> {
+    /// Bodies of a named composite, keyed by the input types of their calls.
+    body_specializations: SpecializationCache<Vec<V::Type>, Arc<Program<V, O, Vec<V>, Vec<V>>>>,
+
     /// Specializations of the forward mode differentiation rule.
     jvp_specializations:
         SpecializationCache<CustomRuleForwardSpecializationKey<V::Type>, Arc<CustomRuleSpecialization<V, O>>>,
@@ -62,6 +65,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleCaches<V, O> {
     /// of each rule and as many derived registrations.
     fn new() -> Self {
         Self {
+            body_specializations: SpecializationCache::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY),
             jvp_specializations: SpecializationCache::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY),
             forward_specializations: SpecializationCache::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY),
             backward_specializations: SpecializationCache::new(CUSTOM_RULE_SPECIALIZATION_CAPACITY),
@@ -222,6 +226,70 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
         request: CustomRuleSpecializationRequest<V::Type>,
         produce_fn: F,
     ) -> Result<Arc<CustomRuleSpecialization<V, O>>, DifferentiationError> {
+        self.cached_or_produced(request, produce_fn, |caches, request, produce_fn| match request {
+            CustomRuleSpecializationRequest::Jvp(key) => {
+                caches.jvp_specializations.get_or_try_insert_with(key, produce_fn)
+            }
+            CustomRuleSpecializationRequest::Forward(key) => {
+                caches.forward_specializations.get_or_try_insert_with(key, produce_fn)
+            }
+            CustomRuleSpecializationRequest::Backward(key) => {
+                caches.backward_specializations.get_or_try_insert_with(key, produce_fn)
+            }
+            CustomRuleSpecializationRequest::BatchingRule(key) => {
+                caches.batching_rule_specializations.get_or_try_insert_with(key, produce_fn)
+            }
+            CustomRuleSpecializationRequest::Body(_) => Err(SpecializationCacheError::Production(
+                ProgramError::MalformedProgram(format!(
+                    "{} requested a body as a rule specialization",
+                    describe_composite(COMPOSITE_OPERATION_NAME, self.name()),
+                ))
+                .into(),
+            )),
+        })
+    }
+
+    /// Returns the body of a named composite for `input_types`, produced by `produce_fn` on a miss, which is cached
+    /// like the rule specializations (i.e., using [`Self::specialization`]). The body is shared as an [`Arc`], so
+    /// that every call that attaches it can be interned as one region of the program that stages it.
+    pub(super) fn body_specialization<F: FnOnce() -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, ProgramError>>(
+        &self,
+        input_types: &[V::Type],
+        produce_fn: F,
+    ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, ProgramError> {
+        // Repeated calls find their body without allocating a key, because every call of a named function asks.
+        if let Some(body) = self.caches.upgrade().and_then(|caches| caches.body_specializations.get(input_types)) {
+            return Ok(body);
+        }
+        self.cached_or_produced(
+            CustomRuleSpecializationRequest::Body(input_types.to_vec()),
+            produce_fn,
+            |caches, request, produce_fn| match request {
+                CustomRuleSpecializationRequest::Body(input_types) => {
+                    caches.body_specializations.get_or_try_insert_with(input_types, produce_fn)
+                }
+                _ => unreachable!("body specializations are requested only with body keys"),
+            },
+        )
+    }
+
+    /// Returns the result of `cached_fn` for `request` while the registration's caches are alive, and of `produce_fn`
+    /// otherwise, rejecting a recursive uncached request for the same specialization on the same thread.
+    fn cached_or_produced<T, E, F, G>(
+        &self,
+        request: CustomRuleSpecializationRequest<V::Type>,
+        produce_fn: F,
+        cached_fn: G,
+    ) -> Result<T, E>
+    where
+        E: Debug + Display + From<ProgramError>,
+        F: FnOnce() -> Result<T, E>,
+        G: FnOnce(
+            &CustomRuleCaches<V, O>,
+            CustomRuleSpecializationRequest<V::Type>,
+            F,
+        ) -> Result<T, SpecializationCacheError<E>>,
+    {
         /// Removes an in-flight marker when production finishes, fails, or unwinds.
         struct InFlightMarker<'o, T: Type + Eq + Hash> {
             /// Set from which the marker is removed.
@@ -237,6 +305,16 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
             }
         }
 
+        // Constructs a diagnostic naming this composite when the same thread requests a specialization it is already
+        // producing. Both the cache and the uncached in-flight markers use this conversion into the caller's error
+        // type.
+        let reentrant = || {
+            let error = SpecializationCacheError::<E>::Reentrant(ReentrantSpecializationError);
+            E::from(ProgramError::UnsupportedOperation {
+                message: format!("{} makes a {}", describe_composite(COMPOSITE_OPERATION_NAME, self.name()), error),
+            })
+        };
+
         let Some(caches) = self.caches.upgrade() else {
             let marker = (std::thread::current().id(), request);
             if !self
@@ -246,36 +324,15 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleReference<V, O> {
                 .expect("custom rule in-flight mutex is poisoned")
                 .insert(marker.clone())
             {
-                let error = SpecializationCacheError::<DifferentiationError>::Reentrant(ReentrantSpecializationError);
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!("{} makes a {error}", describe_composite(COMPOSITE_OPERATION_NAME, self.name())),
-                }
-                .into());
+                return Err(reentrant());
             }
             let _marker = InFlightMarker { in_flight: self.definition.uncached_specializations(), marker };
             return produce_fn();
         };
 
-        match request {
-            CustomRuleSpecializationRequest::Jvp(key) => {
-                caches.jvp_specializations.get_or_try_insert_with(key, produce_fn)
-            }
-            CustomRuleSpecializationRequest::Forward(key) => {
-                caches.forward_specializations.get_or_try_insert_with(key, produce_fn)
-            }
-            CustomRuleSpecializationRequest::Backward(key) => {
-                caches.backward_specializations.get_or_try_insert_with(key, produce_fn)
-            }
-            CustomRuleSpecializationRequest::BatchingRule(key) => {
-                caches.batching_rule_specializations.get_or_try_insert_with(key, produce_fn)
-            }
-        }
-        .map_err(|error| match error {
+        cached_fn(&caches, request, produce_fn).map_err(|error| match error {
             SpecializationCacheError::Production(error) => error,
-            error @ SpecializationCacheError::Reentrant(_) => ProgramError::UnsupportedOperation {
-                message: format!("{} makes a {error}", describe_composite(COMPOSITE_OPERATION_NAME, self.name())),
-            }
-            .into(),
+            SpecializationCacheError::Reentrant(_) => reentrant(),
         })
     }
 
@@ -398,10 +455,12 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingLevel, BatchingLevelExtent};
     use crate::contexts::Context;
     use crate::operations::composites::operations::CompositeOperation;
+    use crate::operations::composites::rules::definitions::CompositeKey;
     use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
     use crate::operations::composites::rules::{CustomRuleBatchingLevel, CustomRuleDerivationKind, CustomRuleTracer};
     use crate::operations::composites::tests::{
         RuleCounters, TestDefinition, call_jvp, cube_definition, cube_program, custom_rule_program,
+        named_cube_definition,
     };
     use crate::tests::hash_of;
     use crate::tracing::TracingContext;
@@ -945,6 +1004,26 @@ mod tests {
         let second = program.linearize().unwrap();
         assert_eq!(second.tangent().to_string(), first.tangent().to_string());
         assert_eq!(counters.counts(), (1, 0, 0));
+    }
+
+    #[test]
+    fn test_custom_rule_reference_body_specialization_eviction() {
+        // Body specializations are bounded like the rule specializations, evicting the least recently used one.
+        let key = CompositeKey::new("ryft.tests.body_specialization_eviction", 1);
+        let traces = Arc::new(AtomicUsize::new(0));
+        let registration = CustomRuleRegistration::new(named_cube_definition(key, &traces));
+        let specialize = |extent: usize| {
+            let r#type = ArrayType::new_static(DataType::F64, [extent]);
+            registration.reference().body(&[r#type]).unwrap();
+        };
+        for extent in 1..=CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1 {
+            specialize(extent);
+        }
+        assert_eq!(registration.caches.body_specializations.len(), CUSTOM_RULE_SPECIALIZATION_CAPACITY);
+        assert_eq!(traces.load(Ordering::SeqCst), CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1);
+        specialize(1);
+        specialize(CUSTOM_RULE_SPECIALIZATION_CAPACITY + 1);
+        assert_eq!(traces.load(Ordering::SeqCst), CUSTOM_RULE_SPECIALIZATION_CAPACITY + 2);
     }
 
     #[test]

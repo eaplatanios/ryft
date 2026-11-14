@@ -788,7 +788,7 @@ where
 
         if let Some(output_sharding) = self.output_sharding() {
             operation.options.output_sharding =
-                Some(output_sharding.with_leading_batch_axis(ArrayBatch::sharding_for_inputs(inputs)?)?);
+                Some(output_sharding.batched(0, ArrayBatch::sharding_for_inputs(inputs)?)?);
         }
 
         Ok(operation.interpret_with_batch_axes(context, &aligned, &[BatchAxis::from_position(0)])?)
@@ -1542,6 +1542,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
         }
 
         let unreduced_axes = input_sharding.map(Sharding::unreduced_axes).cloned().unwrap_or_default();
+        let unreduced_kind = input.unreduced_kind();
         let reduced_axes = input_sharding.map(Sharding::reduced_axes).cloned().unwrap_or_default();
         let mut varying_manual_axes = input_sharding.map(Sharding::varying_manual_axes).cloned().unwrap_or_default();
         if let Some(sharding) = indices_sharding {
@@ -1577,6 +1578,7 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
             }
 
             if requested.unreduced_axes() != &unreduced_axes
+                || requested.unreduced_kind() != unreduced_kind
                 || requested.reduced_axes() != &reduced_axes
                 || requested.varying_manual_axes() != &varying_manual_axes
             {
@@ -1687,7 +1689,9 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
                 })
                 .collect();
 
-            // Gather preserves the input reduction state only with the invariant index contract checked above.
+            // Gather preserves the input reduction state only with the invariant index contract checked above. The
+            // placement comes from the input and index types, which never name auto mesh axes (refer to
+            // `ArrayType::with_sharding`), so neither does the inferred sharding.
             let map_sharding_error = |error| {
                 TypeError::invalid(format!("`{GATHER_OPERATION_NAME}` output sharding construction failed: {error}"))
             };
@@ -1695,11 +1699,13 @@ impl<Stored: Value<Type = ArrayType>> Gather<Stored> for ArrayType {
                 .map_err(&map_sharding_error)?
                 .with_unreduced_axes(unreduced_axes)
                 .map_err(&map_sharding_error)?
+                .with_unreduced_kind(unreduced_kind)
+                .map_err(&map_sharding_error)?
                 .with_reduced_axes(reduced_axes)
                 .map_err(&map_sharding_error)?
                 .with_varying_manual_axes(varying_manual_axes)
                 .map_err(map_sharding_error)?;
-            Some(sharding.without_auto_axes())
+            Some(sharding)
         } else {
             None
         };
@@ -1944,8 +1950,8 @@ where
 impl<Stored: Value<Type = ArrayType>, V: Value<Type = ArrayIrType, Dispatch = ValueDomainDispatch>>
     DynamicGather<Stored, ArrayIrType> for V
 where
-    V: DimensionSize
-        + DynamicBroadcast<ArrayIrType>
+    V: DimensionSize<Extent = V>
+        + DynamicBroadcast<V, ArrayIrType>
         + ManualVariationAlignment<ArrayIrType>
         + ValueProjection<ArrayType>,
     V::Projected: Gather<Stored>,
@@ -2506,7 +2512,7 @@ mod tests {
                 input.gather(&indices, operation.dimensions(), operation.slice_sizes(), operation.options())
             },
             (input, indices),
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -4226,8 +4232,9 @@ mod tests {
         );
 
         // The transpose explicitly restores the input's distribution even when the forward gather requested a
-        // different output placement. Scatter's zero base also preserves input strides and host memory. A static input
-        // takes the homogeneous rule, while a dynamic input takes the residual-carrying member rule.
+        // different output placement. Scatter's zero base also takes the host memory of the input but not its explicit
+        // strides. A static input takes the homogeneous rule, while a dynamic input takes the residual-carrying member
+        // rule.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(5)).unwrap());
@@ -4264,14 +4271,14 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
                 let %1:i32[2, 1]@Host[Pinned] = const [[1], [3]]
-                    %2:f64[4][layout=strided{16}]@Host[Pinned] = zero [type=f64[4][layout=strided{16}]@Host[Pinned]]
-                    %3:f64[4][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] = scatter [
+                    %2:f64[4]@Host[Pinned] = zero [type=f64[4]@Host[Pinned]]
+                    %3:f64[4][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] = scatter [
                         kind=add,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
                             operand_batching=[], scatter_indices_batching=[]),
                     ] %2 %1 %0
-                    %4:f64[4][layout=strided{16}]@Host[Pinned] = broadcast \
-                        [output_type=f64[4][layout=strided{16}]@Host[Pinned], output_axes=[0]] %3
+                    %4:f64[4]@Host[Pinned] = broadcast \
+                        [output_type=f64[4]@Host[Pinned], output_axes=[0]] %3
                 in (%4)
             "}
             .trim_end(),
@@ -4296,10 +4303,9 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
                 let %1:i32[2, 1]@Host[Pinned] = const [[1], [3]]
-                    %2:f64[4][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = zero [
-                        type=f64[4][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned],
-                    ]
-                    %3:f64[4][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = scatter [
+                    %2:f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = zero \
+                        [type=f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned]]
+                    %3:f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = scatter [
                         kind=add,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
                             operand_batching=[], scatter_indices_batching=[]),
@@ -4336,25 +4342,25 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned], %1:dimension<4> .
                 let %2:i32[2, 1]@Host[Pinned] = const [[1], [3]]
-                    %3:f64[extent][layout=strided{16}]@Host[Pinned] = linear_call [residual_count=2] %2 %1 %0 [
+                    %3:f64[extent]@Host[Pinned] = linear_call [residual_count=2] %2 %1 %0 [
                         forward={
                             lambda %0:i32[2, 1]@Host[Pinned], %1:dimension<4>, \
                                 %2:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
-                            let %3:f64[extent][layout=strided{16}]@Host[Pinned] = zero \
-                                [type=f64[extent][layout=strided{16}]@Host[Pinned]] %1
-                                %4:f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, \
+                            let %3:f64[extent]@Host[Pinned] = zero \
+                                [type=f64[extent]@Host[Pinned]] %1
+                                %4:f64[extent][sharding={mesh<['x'=2:explicit]>, \
                                     [{}]}]@Host[Pinned] = scatter [
                                     kind=add,
                                     dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
                                         operand_batching=[], scatter_indices_batching=[]),
                                 ] %3 %0 %2
-                                %5:f64[extent][layout=strided{16}]@Host[Pinned] = broadcast \
-                                    [output_type=f64[extent][layout=strided{16}]@Host[Pinned], output_axes=[0]] %4
+                                %5:f64[extent]@Host[Pinned] = broadcast \
+                                    [output_type=f64[extent]@Host[Pinned], output_axes=[0]] %4
                             in (%5)
                         },
                         transpose={
                             lambda %0:i32[2, 1]@Host[Pinned], %1:dimension<4>, \
-                                %2:f64[extent][layout=strided{16}]@Host[Pinned] .
+                                %2:f64[extent]@Host[Pinned] .
                             let %3:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] = gather [
                                 dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[]),
                                 slice_sizes=[1],
@@ -4395,17 +4401,15 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned], %1:dimension<4> .
                 let %2:i32[2, 1]@Host[Pinned] = const [[1], [3]]
-                    %3:f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = \
+                    %3:f64[extent][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = \
                         linear_call [residual_count=2] %2 %1 %0 [
                         forward={
                             lambda %0:i32[2, 1]@Host[Pinned], %1:dimension<4>, \
                                 %2:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
-                            let %3:f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, \
-                                [{'x'}]}]@Host[Pinned] = zero [
-                                type=f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, \
-                                    [{'x'}]}]@Host[Pinned],
-                            ] %1
-                                %4:f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, \
+                            let %3:f64[extent][sharding={mesh<['x'=2:explicit]>, \
+                                [{'x'}]}]@Host[Pinned] = zero \
+                                [type=f64[extent][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned]] %1
+                                %4:f64[extent][sharding={mesh<['x'=2:explicit]>, \
                                     [{'x'}]}]@Host[Pinned] = scatter [
                                     kind=add,
                                     dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
@@ -4416,7 +4420,7 @@ mod tests {
                         },
                         transpose={
                             lambda %0:i32[2, 1]@Host[Pinned], %1:dimension<4>, \
-                                %2:f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, \
+                                %2:f64[extent][sharding={mesh<['x'=2:explicit]>, \
                                 [{'x'}]}]@Host[Pinned] .
                             let %3:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] = gather [
                                 dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[]),
@@ -4781,7 +4785,10 @@ mod tests {
         let indices = ArrayType::new_static(DataType::I32, [0])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
             .unwrap();
-        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let named_axes = vec![(
+            "m".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let (output_types, program) =
             TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
                 |inputs: Vec<Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>| {

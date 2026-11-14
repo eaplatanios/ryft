@@ -11,6 +11,7 @@ use crate::programs::{Operation, ProgramError, TypeError, Typed};
 
 pub mod arithmetic;
 pub mod assertions;
+pub mod attention;
 pub mod collectives;
 pub mod comparisons;
 pub mod complex;
@@ -50,15 +51,24 @@ pub use assertions::{
     ASSERT_OPERATION_NAME, ArrayAssertionBatchingPolicy, Assert, AssertOperation, AssertionError, AssertionFailure,
     AssertionValue, GUARD_OPERATION_NAME, GuardOperation,
 };
+pub use attention::{
+    AttentionConfiguration, AttentionImplementation, AttentionInputs, AttentionKey, AttentionOperations,
+    AttentionResiduals, AttentionRules, DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+    DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION,
+    DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, DifferentiableDotProductAttention, DotProductAttention,
+    differentiable_dot_product_attention, dot_product_attention,
+};
 pub use collectives::{
-    AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveMode, CollectiveOperations, CollectiveOptions,
-    ManualVariationAlignment, PARALLEL_ALL_GATHER_OPERATION_NAME, PARALLEL_ALL_TO_ALL_OPERATION_NAME,
+    AXIS_INDEX_OPERATION_NAME, AxisIndex, AxisIndexOperation, CollectiveAxes, CollectiveMode, CollectiveOperation,
+    CollectiveOperations, CollectiveOptions, HiddenAxes, ManualVariationAlignment, PARALLEL_ALL_GATHER_OPERATION_NAME,
+    PARALLEL_ALL_TO_ALL_OPERATION_NAME, PARALLEL_BROADCAST_OPERATION_NAME, PARALLEL_CAST_OPERATION_NAME,
     PARALLEL_PERMUTE_OPERATION_NAME, PARALLEL_RAGGED_ALL_TO_ALL_OPERATION_NAME, PARALLEL_REDUCE_OPERATION_NAME,
     PARALLEL_SUM_SCATTER_OPERATION_NAME, PARALLEL_VARY_OPERATION_NAME, ParallelAllGather, ParallelAllGatherOperation,
-    ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation, ParallelPermute,
-    ParallelPermuteOperation, ParallelRaggedAllToAll, ParallelRaggedAllToAllOperation, ParallelReduce,
-    ParallelReduceOperation, ParallelSumScatter, ParallelSumScatterOperation, ParallelVary, ParallelVaryOperation,
-    ShapeChangingCollectiveValue,
+    ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation, ParallelArgExtrema,
+    ParallelBroadcast, ParallelBroadcastOperation, ParallelBroadcastSource, ParallelCast, ParallelCastOperation,
+    ParallelCastTarget, ParallelPermute, ParallelPermuteOperation, ParallelRaggedAllToAll,
+    ParallelRaggedAllToAllOperation, ParallelReduce, ParallelReduceOperation, ParallelSumScatter,
+    ParallelSumScatterOperation, ParallelVary, ParallelVaryOperation, ShapeChangingCollectiveValue,
 };
 pub use comparisons::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection, ComparisonType};
 pub use complex::{
@@ -68,18 +78,20 @@ pub use complex::{
 };
 pub use composites::{
     AccumulatingVjp, BatchedComposite, BroadcastInvariantBatching, BroadcastSensitiveBatching,
-    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite, CompositeBatching, CompositeCallContext,
-    CompositeConversion, CompositeJvp, CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, CompositeVjp,
-    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleSource, CustomRuleTracer,
-    CustomVjpOperation, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal,
-    LiftedCustomRules, SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules, VjpComposite,
+    COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, Composite, CompositeAttribute, CompositeBatching,
+    CompositeBody, CompositeCallContext, CompositeConversion, CompositeJvp, CompositeJvpRule, CompositeKey,
+    CompositeOperation, CompositeTransposeOperation, CompositeVjp, CustomRuleDefinition, CustomRuleReference,
+    CustomRuleRegistration, CustomRuleSource, CustomRuleTracer, CustomVjpOperation, DefaultBatching, DefaultJvp,
+    DefaultVjp, ExplicitJvp, ExplicitVjp, JvpComposite, JvpFromPrimal, LiftedCustomRules, NamedComposite,
+    SequentialBatching, SymbolicZeroJvp, SymbolicZeroVjp, UnavailableCustomRules, VjpComposite,
     WeakCustomRuleReference, composite,
 };
 pub use constants::{
     CONSTANT_OPERATION_NAME, Constant, ConstantOperation, ConstantOperations, DimensionConstant, DynamicFill,
-    DynamicIota, DynamicOne, DynamicZero, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation, ONE_LIKE_OPERATION_NAME,
-    ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME,
-    Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    DynamicIota, DynamicOne, DynamicZero, FILL_LIKE_OPERATION_NAME, Fill, FillLike, FillLikeOperation,
+    IOTA_LIKE_OPERATION_NAME, IOTA_OPERATION_NAME, Iota, IotaLike, IotaLikeOperation, IotaOperation,
+    ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation,
+    ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 pub use control_flow::scan::scan;
 pub use control_flow::r#while::r#while;
@@ -128,29 +140,29 @@ pub use logical::{
     Or, OrOperation, XOR_OPERATION_NAME, Xor, XorOperation,
 };
 pub use manipulation::{
-    BROADCAST_OPERATION_NAME, BasicIndex, Broadcast, BroadcastOperation, CAST_OPERATION_NAME,
-    CONCATENATE_OPERATION_NAME, CONVERT_ELEMENT_TYPE_OPERATION_NAME, Cast, CastOperation, CastType, Concatenate,
-    ConcatenateOperation, ConvertElementType, ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME,
-    DYNAMIC_UPDATE_SLICE_OPERATION_NAME, DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate,
-    DynamicGather, DynamicManipulationOperations, DynamicPad, DynamicReshape, DynamicReshapeOperation, DynamicScatter,
-    DynamicSlice, DynamicSliceBounds, DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice,
-    DynamicUpdateSliceOperation, ElementType, GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode,
-    GatherOperation, GatherOptions, IndexInteger, IndexMask, IndexSelector, IndexSlice, Indexed, Indexing,
-    ManipulationOperations, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, REDUCE_PRECISION_OPERATION_NAME,
-    RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME, ReducePrecision, ReducePrecisionOperation, Reshape,
-    ReshapeOperation, Reverse, ReverseOperation, SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter,
-    ScatterDimensionNumbers, ScatterMode, ScatterOperation, ScatterOptions, ScatterReductionKind, Slice,
-    SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME, TRANSPOSE_OPERATION_NAME, TransferToMemory,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UPDATE_SLICE_OPERATION_NAME, UpdateSlice,
-    UpdateSliceOperation,
+    BROADCAST_LIKE_OPERATION_NAME, BROADCAST_OPERATION_NAME, BasicIndex, Broadcast, BroadcastLike,
+    BroadcastLikeOperation, BroadcastOperation, CAST_OPERATION_NAME, CONCATENATE_OPERATION_NAME,
+    CONVERT_ELEMENT_TYPE_OPERATION_NAME, Cast, CastOperation, CastType, Concatenate, ConcatenateOperation,
+    ConvertElementType, ConvertElementTypeOperation, DYNAMIC_SLICE_OPERATION_NAME, DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
+    DynamicBroadcast, DynamicBroadcastOperation, DynamicConcatenate, DynamicGather, DynamicManipulationOperations,
+    DynamicPad, DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceBounds,
+    DynamicSliceOperation, DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, ElementType,
+    GATHER_OPERATION_NAME, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, IndexInteger,
+    IndexMask, IndexSelector, IndexSlice, Indexed, Indexing, ManipulationOperations, PAD_OPERATION_NAME, Pad,
+    PadOperation, Permutation, REDUCE_PRECISION_OPERATION_NAME, RESHAPE_OPERATION_NAME, REVERSE_OPERATION_NAME,
+    ReducePrecision, ReducePrecisionOperation, Reshape, ReshapeOperation, Reverse, ReverseOperation,
+    SCATTER_OPERATION_NAME, SLICE_OPERATION_NAME, Scatter, ScatterDimensionNumbers, ScatterMode, ScatterOperation,
+    ScatterOptions, ScatterReductionKind, Slice, SliceOperation, TRANSFER_TO_MEMORY_OPERATION_NAME,
+    TRANSPOSE_OPERATION_NAME, TransferToMemory, TransferToMemoryOperation, Transpose, TransposeOperation,
+    UPDATE_SLICE_OPERATION_NAME, UpdateSlice, UpdateSliceOperation,
 };
 pub use quantization::{
     BlockDequantize, BlockQuantize, BlockQuantizedValue, BlockScaleFormat, BlockScaledDot, BlockScaledDotConfiguration,
     BlockScaledGlobalScaling, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation, block_scaled_dot,
 };
 pub use random::{
-    CategoricalSamplingMode, DynamicRngBitGenerator, RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm,
-    RngBitGenerator, RngBitGeneratorOperation,
+    CategoricalSamplingMode, DROPOUT_OPERATION_NAME, Dropout, DropoutOperation, DynamicRngBitGenerator,
+    RNG_BIT_GENERATOR_OPERATION_NAME, Random, RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation,
 };
 pub use reductions::{
     ARG_MAX_OPERATION_NAME, ARG_MIN_OPERATION_NAME, ArgMax, ArgMaxOperation, ArgMin, ArgMinOperation,
@@ -169,8 +181,11 @@ pub use rounding::{
     RoundOperation, RoundingOperations,
 };
 pub use sharding::{
-    CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch, ConstrainShardingOperation,
-    RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation, ShardingOperations,
+    AxisTypesError, CONSTRAIN_SHARDING_OPERATION_NAME, ConstrainSharding, ConstrainShardingDispatch,
+    ConstrainShardingOperation, LockstepDeviceGrid, LockstepDomain, LockstepOperation, LockstepValue,
+    RESHARD_OPERATION_NAME, Reshard, ReshardDispatch, ReshardOperation, SHARD_MAP_OPERATION_NAME, ShardMap,
+    ShardMapBoundary, ShardMapError, ShardMapOperation, ShardMapOptions, ShardMapValueKind, ShardingOperations,
+    auto_axes, explicit_axes, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
 };
 pub use softmax::{Softmax, SoftmaxCrossEntropyWithTargetLogits, softmax_cross_entropy_with_target_logits};
 pub use sorting::{SORT_OPERATION_NAME, Sort, SortDirection, SortOperation, SortOrdering, TopK};

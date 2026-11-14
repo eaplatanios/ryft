@@ -38,6 +38,7 @@ use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_min::DimensionMin;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalar;
+use crate::operations::extrema::Clamp;
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::conversions::ConvertElementType;
@@ -1383,9 +1384,15 @@ impl DynamicSliceOperation<ArrayType> {
 
 impl DynamicSliceOperation<ArrayIrType> {
     /// Creates a new [`DynamicSliceOperation<ArrayIrType>`] for the provided `rank`, with unit strides and checked
-    /// bounds. Its inputs are the array, `rank` dimension-valued starts, and `rank` dimension-valued sizes, in that
-    /// order. Even static sizes are supplied as dimension inputs. The operation conservatively requires a runtime
-    /// assertion until [`with_input_types`](Self::with_input_types) proves that every possible window fits.
+    /// bounds. Its inputs are the array, `rank` starts, and `rank` dimension-valued sizes, in that order. Even static
+    /// sizes are supplied as dimension inputs. Each start is either a dimension value or a rank-0 integer array, which
+    /// carries a start that may differ across devices (e.g., an offset derived from `axis_index`), because a dimension
+    /// is the same on every device. Array starts follow the start index contract of the homogeneous form (i.e., they
+    /// share one integer type, reside in the memory of the input, carry no reduction state, and vary along the same
+    /// manual axes as the input), and a negative array start is out of bounds under checked bounds and clamped to
+    /// zero under clamped bounds. The operation conservatively requires a runtime assertion until
+    /// [`with_input_types`](Self::with_input_types) proves that every possible window fits,
+    /// which a checked array start never does.
     #[inline]
     pub fn from_rank(rank: usize) -> Self {
         Self {
@@ -1455,24 +1462,31 @@ impl DynamicSliceOperation<ArrayIrType> {
     fn has_proven_window(&self, input_types: &[ArrayIrType]) -> Result<bool, TypeError> {
         let input = <&ArrayType>::try_from(&input_types[0])?;
         for axis in 0..self.strides.len() {
-            let start = <&DimensionType>::try_from(&input_types[1 + axis])?;
             let size = <&DimensionType>::try_from(&input_types[1 + self.strides.len() + axis])?;
             let Some(maximum_size) = size.bounds().upper().and_then(|upper| upper.checked_sub(1)) else {
                 return Ok(false);
             };
+
             let span = if maximum_size == 0 {
                 Some(0)
             } else {
                 (maximum_size - 1).checked_mul(self.strides[axis]).and_then(|span| span.checked_add(1))
             };
-            let maximum_start = match self.bounds {
-                DynamicSliceBounds::Clamp => Some(0),
-                DynamicSliceBounds::Checked => start.bounds().upper().and_then(|upper| upper.checked_sub(1)),
+
+            // The value of an array start is unknown before it runs, so only clamping can prove its window.
+            let maximum_start = match (self.bounds, &input_types[1 + axis]) {
+                (DynamicSliceBounds::Clamp, _) => Some(0),
+                (DynamicSliceBounds::Checked, ArrayIrType::Array(_)) => None,
+                (DynamicSliceBounds::Checked, start) => {
+                    <&DimensionType>::try_from(start)?.bounds().upper().and_then(|upper| upper.checked_sub(1))
+                }
             };
+
             let minimum_input = match input.dimension(axis) {
                 Dimension::Static(size) => size,
                 Dimension::Dynamic(variable) => variable.bounds().lower(),
             };
+
             if maximum_start
                 .zip(span)
                 .and_then(|(start, span)| start.checked_add(span))
@@ -1491,7 +1505,7 @@ impl DynamicSliceOperation<ArrayIrType> {
     /// scatter lowering, rather than becoming extra logical updates here.
     fn apply_adjoint<
         V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant + DynamicIota<V>>
-            + DimensionSize
+            + DimensionSize<Extent = V>
             + DimensionToScalar
             + ValueProjection<ArrayType>
             + ValueProjection<DimensionType>,
@@ -1503,7 +1517,8 @@ impl DynamicSliceOperation<ArrayIrType> {
         dimensions: &[V],
     ) -> Result<V, ProgramError>
     where
-        <V as ValueProjection<ArrayType>>::Projected: Add + Mul + Concatenate + Scatter + TransferToMemory,
+        <V as ValueProjection<ArrayType>>::Projected:
+            Add + Mul + Clamp + Concatenate + ConvertElementType + Scatter + TransferToMemory,
         <V as ValueProjection<DimensionType>>::Projected: Add + SaturatingSub + Mul + DimensionMin,
     {
         let context = cotangent.domain();
@@ -1528,25 +1543,76 @@ impl DynamicSliceOperation<ArrayIrType> {
         query_shape.push(Dimension::Static(1));
         let query_type = ArrayType::new(DataType::I64, Shape::new(query_shape)).with_memory(cotangent_type.memory());
         let one = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(1)?)?;
+        let to_array = |dimension: V| {
+            ValueProjection::<ArrayType>::into_projected(dimension.to_scalar()?)?
+                .transfer_to_memory(cotangent_type.memory())
+        };
+
         let mut coordinates = Vec::with_capacity(rank);
         for axis in 0..rank {
             let step = context.dimension_constant(self.strides[axis])?;
-            let start = if self.bounds == DynamicSliceBounds::Clamp {
-                // `min(size, 1)` makes the span zero for empty windows without a data-dependent branch.
+
+            // Under clamped bounds, a start is at most the input extent minus the span of the window, where
+            // `min(size, 1)` makes the span zero for empty windows without a data-dependent branch.
+            let maximum_start = if self.bounds == DynamicSliceBounds::Clamp {
                 let dimension = ValueProjection::<DimensionType>::into_projected(dimensions[axis].clone())?;
                 let span = dimension
                     .saturating_sub(&one)?
                     .mul(&ValueProjection::<DimensionType>::into_projected(step.clone())?)?
                     .add(&dimension.dimension_min(&one)?)?;
-                let start = ValueProjection::<DimensionType>::into_projected(starts[axis].clone())?;
                 let size = ValueProjection::<DimensionType>::into_projected(zeros.dimension_size(axis)?)?;
-                ValueProjection::<DimensionType>::from_projected(start.dimension_min(&size.saturating_sub(&span)?)?)
+                Some(size.saturating_sub(&span)?)
             } else {
-                starts[axis].clone()
+                None
             };
+
+            // A dimension start is resolved in dimension arithmetic, and an array start (e.g., one that differs across
+            // devices) in array arithmetic over the `i64` type of the coordinates, where clamping also raises negative
+            // starts to zero.
+            let is_array_start = matches!(starts[axis].r#type().as_ref(), ArrayIrType::Array(_));
+            let dimension_start = match (is_array_start, &maximum_start) {
+                (true, _) => None,
+                (false, Some(maximum_start)) => {
+                    let start = ValueProjection::<DimensionType>::into_projected(starts[axis].clone())?;
+                    Some(ValueProjection::<DimensionType>::from_projected(start.dimension_min(maximum_start)?))
+                }
+                (false, None) => Some(starts[axis].clone()),
+            };
+
             let positions = context.dynamic_iota(&query_type, axis, &dynamic_dimensions)?;
-            let start = ValueProjection::<ArrayType>::into_projected(start.to_scalar()?)?
-                .transfer_to_memory(cotangent_type.memory())?;
+            let start = match dimension_start {
+                Some(start) => to_array(start)?,
+                None => {
+                    let start = ValueProjection::<ArrayType>::into_projected(starts[axis].clone())?;
+                    let is_unsigned = start.r#type().data_type().is_unsigned();
+                    let to_coordinate = |start: <V as ValueProjection<ArrayType>>::Projected| {
+                        start.convert_element_type(DataType::I64)?.transfer_to_memory(cotangent_type.memory())
+                    };
+                    match maximum_start {
+                        // An unsigned start can exceed the `i64` range, where converting it first would wrap it to
+                        // a negative value that clamps to zero instead of to the maximum start. It is therefore
+                        // clamped as a `u64` value, which holds every unsigned start and every maximum start.
+                        Some(maximum_start) if is_unsigned => {
+                            let maximum_start =
+                                to_array(ValueProjection::<DimensionType>::from_projected(maximum_start))?
+                                    .convert_element_type(DataType::U64)?;
+                            let start = start
+                                .convert_element_type(DataType::U64)?
+                                .transfer_to_memory(cotangent_type.memory())?;
+                            let zero = to_array(context.dimension_constant(0)?)?.convert_element_type(DataType::U64)?;
+                            start.clamp(&zero, &maximum_start)?.convert_element_type(DataType::I64)?
+                        }
+                        Some(maximum_start) => {
+                            let start = to_coordinate(start)?;
+                            let zero = to_array(context.dimension_constant(0)?)?;
+                            let maximum_start =
+                                to_array(ValueProjection::<DimensionType>::from_projected(maximum_start))?;
+                            start.clamp(&zero, &maximum_start)?
+                        }
+                        None => to_coordinate(start)?,
+                    }
+                }
+            };
             let mut positions = ValueProjection::<ArrayType>::into_projected(positions)?;
             if self.strides[axis] != 1 {
                 let step = ValueProjection::<ArrayType>::into_projected(step.to_scalar()?)?
@@ -1555,6 +1621,7 @@ impl DynamicSliceOperation<ArrayIrType> {
             }
             coordinates.push(positions.add(&start)?);
         }
+
         let coordinates = Concatenate::concatenate(&coordinates, rank as i64)?;
         let dimensions = ScatterDimensionNumbers::new(Vec::new(), (0..rank).collect(), (0..rank).collect());
         let options = ScatterOptions::new().with_mode(ScatterMode::PromiseInBounds).with_unique_indices(true);
@@ -1796,7 +1863,7 @@ where
                 return Ok(vec![ArrayBatch::new(output, BatchAxis::new(0))?]);
             }
 
-            return Ok(batch_by_item_expansion(
+            return batch_by_item_expansion(
                 context,
                 self,
                 inputs,
@@ -1806,8 +1873,7 @@ where
                          known mapped extent",
                     ),
                 })?,
-            )?
-            .into());
+            );
         }
 
         let Some(batch_axis) = batch_axes[0] else {
@@ -1830,9 +1896,11 @@ where
         let zero_index = ArrayBatch::replicated(inputs[1].value().zero_like()?);
         let mut lifted_inputs = inputs.to_vec();
         lifted_inputs.insert(1 + batch_axis, zero_index);
-        Ok(DynamicSliceOperation::new(sizes)
-            .interpret_with_batch_axes(context, lifted_inputs.as_slice(), &[BatchAxis::from_position(batch_axis)])?
-            .into())
+        DynamicSliceOperation::new(sizes).interpret_with_batch_axes(
+            context,
+            lifted_inputs.as_slice(),
+            &[BatchAxis::from_position(batch_axis)],
+        )
     }
 }
 
@@ -2134,8 +2202,36 @@ impl Operation for DynamicSliceOperation<ArrayIrType> {
 
         let starts = &input_types[1..1 + input_type.rank()];
         let sizes = &input_types[1 + input_type.rank()..];
+
+        // Array starts (e.g., per device offsets, which cannot be dimensions because a dimension is the same on every
+        // device) follow the start index contract of the homogeneous form, which includes varying along the same
+        // manual axes as the input, so that the output keeps the variation of the input.
+        let array_starts = starts
+            .iter()
+            .enumerate()
+            .filter_map(|(axis, start)| match start {
+                ArrayIrType::Array(start) => Some((axis, start)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        let type_error = |error: ProgramError| match error {
+            ProgramError::Type(error) => error,
+            error => TypeError::invalid(error.to_string()),
+        };
+
+        validate_dynamic_slice_start_index_types(
+            DYNAMIC_SLICE_OPERATION_NAME,
+            input_type,
+            array_starts.iter().copied(),
+        )
+        .map_err(type_error)?;
+
         for (axis, (start, size)) in starts.iter().zip(sizes).enumerate() {
-            let start = <&DimensionType>::try_from(start)?.bounds().lower();
+            let start = match start {
+                ArrayIrType::Array(_) => 0,
+                start => <&DimensionType>::try_from(start)?.bounds().lower(),
+            };
             let start = if self.bounds == DynamicSliceBounds::Clamp { 0 } else { start };
             let size = <&DimensionType>::try_from(size)?.bounds().lower();
 
@@ -2180,6 +2276,10 @@ impl Operation for DynamicSliceOperation<ArrayIrType> {
                     TypeError::invalid(format!("`{DYNAMIC_SLICE_OPERATION_NAME}` output type is invalid: {error}"))
                 })?
         };
+
+        let array_starts = array_starts.into_iter().map(|(_, start)| start.clone()).collect::<Vec<_>>();
+        let output_type = infer_dynamic_slice_output_type(DYNAMIC_SLICE_OPERATION_NAME, output_type, &array_starts)
+            .map_err(type_error)?;
 
         if !self.requires_runtime_assertion && !self.has_proven_window(input_types)? {
             return Err(TypeError::invalid(format!(
@@ -2250,11 +2350,11 @@ impl<
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
-        // This rule supports replicated first-class starts and sizes. Different sizes can produce nonrectangular
-        // output. Different starts with shared sizes would remain rectangular but need a separate reindexing rule.
-        // Insert a mapped array axis with start zero, the transform's exact extent, and unit stride. The payload's
-        // stride count and the input's rank bound the arity independently as a payload built for another rank must
-        // be rejected rather than indexed.
+        // This rule supports replicated starts (i.e., first-class dimensions or arrays) and replicated first-class
+        // sizes. Different sizes can produce nonrectangular output. Different starts with shared sizes would remain
+        // rectangular but need a separate reindexing rule. Insert a mapped array axis with start zero, the transform's
+        // exact extent, and unit stride. The payload's stride count and the input's rank bound the arity independently
+        // as a payload built for another rank must be rejected rather than indexed.
         check_count!("input", inputs, 1 + 2 * self.strides.len(), ProgramError);
 
         let (input, bounds) = inputs.split_first().unwrap();
@@ -2262,8 +2362,21 @@ impl<
         let input_type = <&ArrayType>::try_from(&unbatched_type)?;
         check_count!("input", inputs, 1 + 2 * input_type.rank(), ProgramError);
 
-        for bound in bounds {
-            bound.validate_replicated_dimension()?;
+        // An array start that differs across batch items would need one window per item, which this rule does not
+        // stage, so array starts must be replicated like dimension bounds.
+        for (index, bound) in bounds.iter().enumerate() {
+            if index < input_type.rank() && matches!(bound.unbatched_type(), ArrayIrType::Array(_)) {
+                if !bound.batch_axis().is_replicated() {
+                    return Err(BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "`{DYNAMIC_SLICE_OPERATION_NAME}` batching requires array start index {index} to be the \
+                             same for every batch item",
+                        ),
+                    });
+                }
+            } else {
+                bound.validate_replicated_dimension()?;
+            }
         }
 
         if input.batch_axis().is_replicated() {
@@ -2304,12 +2417,12 @@ impl<
         let mut strides = self.strides().to_vec();
         strides.insert(batch_axis, 1);
         let operation = Self::from_rank(input_type.rank() + 1).with_strides(strides)?.with_bounds(self.bounds);
-        Ok(context
+        context
             .parent()
             .bind(operation, Vec::new(), packed_inputs.as_slice())?
             .into_iter()
             .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -2321,11 +2434,11 @@ impl_differentiable_operation! {
         C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
         C::Operation: From<DynamicSliceOperation<ArrayIrType>> + From<LinearCallOperation<ArrayIrType>>
             + From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
-        Tracer<NestedTracingContext<C>>: DimensionSize + DimensionToScalar
+        Tracer<NestedTracingContext<C>>: DimensionSize<Extent = Tracer<NestedTracingContext<C>>> + DimensionToScalar
             + ValueProjection<ArrayType>
             + ValueProjection<DimensionType>,
         <Tracer<NestedTracingContext<C>> as ValueProjection<ArrayType>>::Projected:
-            Add + Mul + Concatenate + Scatter + TransferToMemory,
+            Add + Mul + Clamp + Concatenate + ConvertElementType + Scatter + TransferToMemory,
         <Tracer<NestedTracingContext<C>> as ValueProjection<DimensionType>>::Projected:
             Add + SaturatingSub + Mul + DimensionMin,
         NestedTracingContext<C>: StagingContext<
@@ -2393,11 +2506,11 @@ impl_differentiable_operation! {
     where
         V: Value<Type = ArrayIrType>,
         O: Operation<Type = ArrayIrType>,
-        Tracer<TracingContext<V, O>>: DimensionSize + DimensionToScalar
+        Tracer<TracingContext<V, O>>: DimensionSize<Extent = Tracer<TracingContext<V, O>>> + DimensionToScalar
             + ValueProjection<ArrayType>
             + ValueProjection<DimensionType>,
         <Tracer<TracingContext<V, O>> as ValueProjection<ArrayType>>::Projected:
-            Add + Mul + Concatenate + Scatter + TransferToMemory,
+            Add + Mul + Clamp + Concatenate + ConvertElementType + Scatter + TransferToMemory,
         <Tracer<TracingContext<V, O>> as ValueProjection<DimensionType>>::Projected:
             Add + SaturatingSub + Mul + DimensionMin,
         TracingContext<V, O>: DimensionConstant + DynamicIota<Tracer<TracingContext<V, O>>>
@@ -2677,7 +2790,7 @@ impl DynamicSlice for ArrayType {
             .into());
         }
 
-        validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, self, start_indices)?;
+        validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, self, start_indices.iter().enumerate())?;
 
         for (axis, &size) in sizes.iter().enumerate() {
             // Clamping can keep the window in bounds only if it fits every possible input extent. Static axes use
@@ -2741,7 +2854,9 @@ impl DynamicSlice for Array {
     }
 }
 
-impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> DynamicSlice for ArrayIrValue<A> {
+impl<A: DimensionSize<Extent = usize> + Slice + DynamicSlice + Value<Type = ArrayType>> DynamicSlice
+    for ArrayIrValue<A>
+{
     fn dynamic_slice_with_negative_indices(
         &self,
         start_indices: &[Self],
@@ -2806,15 +2921,16 @@ where
 /// input.dynamic_slice_with_dimensions(&[], &[], &[]).unwrap();
 /// ```
 ///
-/// Starts are non-negative dimensions and positive static strides select `start + i * stride`
-/// for `0 <= i < size`. The [`DynamicSliceBounds`] policy decides how starts meet the input: under the default
-/// [`Checked`](DynamicSliceBounds::Checked) policy, every selected element must lie within the input and an empty
-/// axis permits a start at its end, while the [`Clamp`](DynamicSliceBounds::Clamp) policy moves the start so that the
-/// requested window fits without shrinking it. Invalid runtime bounds remain observable even when the result is unused.
-/// The output preserves the input memory space and inferred sharding; an identity slice preserves the input layout and
-/// any other slice uses a fresh dense layout. Array tangents follow the same slice, and reverse mode differentiation
-/// retains the original input extents and adds cotangents at the selected coordinates, treating starts and sizes as
-/// discrete metadata.
+/// Starts are non-negative dimensions or rank-0 integer arrays (e.g., starts that differ across the devices of a manual
+/// region, which a dimension cannot hold because a dimension is the same on every device), and positive static strides
+/// select `start + i * stride` for `0 <= i < size`. The [`DynamicSliceBounds`] policy decides how starts meet the
+/// input: under the default [`Checked`](DynamicSliceBounds::Checked) policy, every selected element must lie within the
+/// input and an empty axis permits a start at its end, while the [`Clamp`](DynamicSliceBounds::Clamp) policy moves the
+/// start so that the requested window fits without shrinking it. Invalid runtime bounds remain observable even when the
+/// result is unused. The output preserves the input memory space and inferred sharding; an identity slice preserves the
+/// input layout and any other slice uses a fresh dense layout. Array tangents follow the same slice, and reverse mode
+/// differentiation retains the original input extents and adds cotangents at the selected coordinates, treating starts
+/// and sizes as discrete metadata.
 ///
 /// Backends may require finite bounds on dimension-sized windows (e.g., the XLA backend). That is, accepting a dynamic
 /// shape in the core does not imply support for unbounded allocation or runtime byte strides for all backends.
@@ -2906,7 +3022,9 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
     ///
     /// # Parameters
     ///
-    ///   - `start_indices`: One non-negative dimension value per input axis, specifying its inclusive start.
+    ///   - `start_indices`: One inclusive start per input axis, which is either a non-negative dimension value or a
+    ///     rank-0 integer array (e.g., a start that differs across devices, which a dimension cannot hold). Refer to
+    ///     [`DynamicSliceOperation::from_rank`] for the contract of array starts.
     ///   - `sizes`: One dimension value per input axis, specifying the number of selected elements.
     ///   - `strides`: One strictly positive static step per input axis.
     ///   - `bounds`: Policy resolving the starts against the input extents.
@@ -3055,7 +3173,7 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
         Self: Value<Type: ArrayMemberType, Domain: DimensionConstant + DynamicIota<Self>>
             + DynamicGather
             + DynamicReshape
-            + DimensionSize
+            + DimensionSize<Extent = Self>
             + DimensionToScalar
             + ValueProjection<ArrayType>,
         Self::Projected: Add + Mul + Broadcast + TransferToMemory,
@@ -3078,8 +3196,8 @@ pub trait DynamicSliceWithDimensions<T = <Self as Capability>::Universe>: Capabi
     }
 }
 
-impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> DynamicSliceWithDimensions<ArrayIrType>
-    for ArrayIrValue<A>
+impl<A: DimensionSize<Extent = usize> + Slice + DynamicSlice + Value<Type = ArrayType> + Concretizable<i128>>
+    DynamicSliceWithDimensions<ArrayIrType> for ArrayIrValue<A>
 {
     fn dynamic_slice_with_bounds(
         &self,
@@ -3096,23 +3214,27 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
             .with_bounds(policy);
         let strides = operation.strides();
 
-        let bounds = start_indices
+        // Array starts are signed or unsigned integers, so they are resolved as `i128` values, which hold both.
+        let starts = start_indices
             .iter()
-            .chain(sizes)
-            .cloned()
-            .map(ValueProjection::<DimensionType>::into_projected)
-            .map(|result| Ok::<_, TypeError>(result?.extent()))
+            .map(|start| match start {
+                Self::Array(start) => start.concretize(),
+                start => Ok(ValueProjection::<DimensionType>::projected(start)?.extent() as i128),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let sizes = sizes
+            .iter()
+            .map(|size| Ok::<_, TypeError>(ValueProjection::<DimensionType>::projected(size)?.extent()))
             .collect::<Result<Vec<_>, _>>()?;
 
-        let (starts, sizes) = bounds.split_at(rank);
-        let mut starts = starts.to_vec();
+        let mut resolved_starts = Vec::with_capacity(rank);
         let limits = starts
-            .iter_mut()
+            .into_iter()
             .zip(sizes)
             .zip(strides)
             .enumerate()
             .map(|(axis, ((start, size), stride))| {
-                let span = if *size == 0 {
+                let span = if size == 0 {
                     0
                 } else {
                     size.checked_sub(1)
@@ -3126,9 +3248,17 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
                 };
 
                 let input_size = input.dimension_size(axis)?;
-                if policy == DynamicSliceBounds::Clamp && span <= input_size {
-                    *start = (*start).min(input_size - span);
-                }
+                let start = match policy {
+                    DynamicSliceBounds::Clamp if span <= input_size => start.clamp(0, (input_size - span) as i128),
+                    DynamicSliceBounds::Clamp => start.max(0),
+                    DynamicSliceBounds::Checked => start,
+                };
+                let start = usize::try_from(start).map_err(|_| ProgramError::InvalidArgument {
+                    message: format!(
+                        "`{DYNAMIC_SLICE_OPERATION_NAME}` start {start} is out of bounds for input axis {axis} \
+                         extent {input_size}",
+                    ),
+                })?;
 
                 let limit = start.checked_add(span).ok_or_else(|| {
                     TypeError::invalid(format!(
@@ -3144,11 +3274,12 @@ impl<A: DimensionSize<usize> + Slice + DynamicSlice + Value<Type = ArrayType>> D
                         ),
                     });
                 }
+                resolved_starts.push(start);
                 Ok(limit)
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
 
-        Ok(<Self as ValueProjection<ArrayType>>::from_projected(input.slice(&starts, &limits, strides)?))
+        Ok(<Self as ValueProjection<ArrayType>>::from_projected(input.slice(&resolved_starts, &limits, strides)?))
     }
 }
 
@@ -3183,6 +3314,9 @@ impl<
         let mut inputs = vec![self.clone()];
         inputs.extend_from_slice(start_indices);
         inputs.extend_from_slice(sizes);
+
+        // Array starts must vary along the same manual axes as the input, while dimensions pass through unchanged.
+        let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
         let operation = operation.with_input_types(&input_types)?;
         let mut outputs = self.domain().bind(operation, Vec::new(), &inputs)?;
@@ -3344,7 +3478,7 @@ where
         let batch_axes = inputs.iter().map(|input| input.batch_axis_position()).collect::<Vec<_>>();
         let axis_size = ArrayBatch::common_batch_size(inputs)?;
         if batch_axes[2..].iter().any(Option::is_some) {
-            return Ok(batch_by_item_expansion(
+            return batch_by_item_expansion(
                 context,
                 self,
                 inputs,
@@ -3354,8 +3488,7 @@ where
                          statically known mapped extent"
                     ),
                 })?,
-            )?
-            .into());
+            );
         }
 
         let Some(batch_axis) = batch_axes[..2].iter().copied().flatten().next() else {
@@ -3375,9 +3508,7 @@ where
         let mut lifted_inputs = vec![input, update];
         lifted_inputs.extend(inputs[2..].iter().cloned());
         lifted_inputs.insert(2 + batch_axis, zero_index);
-        Ok(self
-            .interpret_with_batch_axes(context, lifted_inputs.as_slice(), &[BatchAxis::from_position(batch_axis)])?
-            .into())
+        self.interpret_with_batch_axes(context, lifted_inputs.as_slice(), &[BatchAxis::from_position(batch_axis)])
     }
 }
 
@@ -3928,7 +4059,12 @@ impl DynamicUpdateSlice for ArrayType {
             .into());
         }
 
-        validate_dynamic_slice_start_index_types(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, self, start_indices)?;
+        validate_dynamic_slice_start_index_types(
+            DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
+            self,
+            start_indices.iter().enumerate(),
+        )?;
+
         for axis in 0..rank {
             let update_dimension = update.dimension(axis);
             let Dimension::Static(update_size) = update_dimension else {
@@ -4091,9 +4227,10 @@ fn validate_update_slice_inputs(
 
 /// Computes the output [`Sharding`] for an in-place update (i.e., [`UpdateSlice`] or [`DynamicUpdateSlice`]).
 /// Because the update is written into the input without resharding, the two must agree on placement and reduction state
-/// wherever an [`MeshAxisType::Explicit`] mesh axis is involved. Differences confined to [`MeshAxisType::Manual`] and
-/// [`MeshAxisType::Auto`] axes are tolerated (i.e., are left to the underlying backend). Manual variation must already
-/// match after forward input alignment. The output keeps the input's sharding.
+/// wherever an [`MeshAxisType::Explicit`] mesh axis is involved. Differences confined to [`MeshAxisType::Manual`] axes
+/// are tolerated (i.e., are left to the underlying backend), and types never record placement over
+/// [`MeshAxisType::Auto`] axes. Manual variation must already match after forward input alignment. The output keeps
+/// the input's sharding.
 fn infer_update_slice_output_sharding(
     operation_name: &'static str,
     input: &ArrayType,
@@ -4103,7 +4240,10 @@ fn infer_update_slice_output_sharding(
     let input_reduced = input.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
     let update_unreduced = update.sharding().map(Sharding::unreduced_axes).cloned().unwrap_or_default();
     let update_reduced = update.sharding().map(Sharding::reduced_axes).cloned().unwrap_or_default();
-    if input_unreduced != update_unreduced || input_reduced != update_reduced {
+    if input_unreduced != update_unreduced
+        || input.unreduced_kind() != update.unreduced_kind()
+        || input_reduced != update_reduced
+    {
         return Err(TypeError::invalid(format!(
             "`{operation_name}` input and update must carry identical reduction state",
         )));
@@ -4133,16 +4273,19 @@ fn infer_update_slice_output_sharding(
     Ok(Some(input_sharding.clone()))
 }
 
-/// Validates the scalar integer start-index input types of a dynamic slicing operation. Each index type must be a
-/// rank-0 integer type, all indices must share one integer type, and every index must reside in the input memory space.
-/// The `operation_name` parameter selects the reported operation name because this helper serves both
-/// [`DynamicSliceOperation`] and [`DynamicUpdateSliceOperation`].
-fn validate_dynamic_slice_start_index_types(
+/// Validates the scalar integer start-index input types of a dynamic slicing operation. Each index type must be
+/// a rank-0 integer type, all indices must share one integer type, and every index must reside in the input memory
+/// space. The `operation_name` parameter selects the reported operation name because this helper serves both
+/// [`DynamicSliceOperation`] and [`DynamicUpdateSliceOperation`], and each index type is paired with the position
+/// that diagnostics report, because the array IR form of [`DynamicSliceOperation`] validates only its array starts.
+fn validate_dynamic_slice_start_index_types<'o>(
     operation_name: &'static str,
     input_type: &ArrayType,
-    index_types: &[ArrayType],
+    index_types: impl IntoIterator<Item = (usize, &'o ArrayType)>,
 ) -> Result<(), ProgramError> {
-    for (index, index_type) in index_types.iter().enumerate() {
+    let mut first = None;
+    for (index, index_type) in index_types {
+        let (first_index, first_type): (usize, &ArrayType) = *first.get_or_insert((index, index_type));
         if index_type.rank() != 0 || !index_type.data_type().is_integer() {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` start index {index} must be a scalar integer but has type `{index_type}`",
@@ -4187,10 +4330,10 @@ fn validate_dynamic_slice_start_index_types(
             }
         }
 
-        if index_type.data_type() != index_types[0].data_type() {
+        if index_type.data_type() != first_type.data_type() {
             return Err(TypeError::invalid(format!(
-                "`{}` start indices must share one integer type but index {} has type `{}` and index 0 has type `{}`",
-                operation_name, index, index_type, index_types[0],
+                "`{}` start indices must share one integer type but index {} has type `{}` and index {} has type `{}`",
+                operation_name, index, index_type, first_index, first_type,
             ))
             .into());
         }
@@ -4426,7 +4569,8 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
-        CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationError, differentiate_at,
+        CotangentDestination, CotangentDestinationKind, CotangentSeed, DifferentiationError, Linearization,
+        differentiate_at,
     };
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -5060,7 +5204,6 @@ mod tests {
                     ).unwrap()],
                     input_cotangents = [Array::from_elements::<f64>(
                         ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))
-                            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
                             .with_memory(Memory::Host { pinned: true }),
                         &[0.0, 1.0, 0.0, 2.0, 0.0, 3.0],
                     ).unwrap()],
@@ -5702,14 +5845,12 @@ mod tests {
         assert_eq!(outputs[0].r#type().sharding(), Some(&explicit_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
 
-        // A mapped input varying over a manual mesh axis keeps both its placement and its variation.
+        // A mapped input placed on a manual mesh axis keeps its placement, which adds no variation.
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let manual_sharding = Sharding::new(
             manual_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
         )
-        .unwrap()
-        .with_varying_manual_axes(["x"])
         .unwrap();
         let input_type = ArrayType::new_static(DataType::F64, [2, 4]).with_sharding(manual_sharding.clone()).unwrap();
         let update_type = ArrayType::new_static(DataType::F64, [2])
@@ -5890,7 +6031,8 @@ mod tests {
             }],
         );
 
-        // Slicing the output cotangent back to the update restores the update's complete layout-bearing type.
+        // Slicing the output cotangent back to the update restores the memory placement of the update in its
+        // cotangent but not its explicit layout.
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![4.into()])).with_memory(Memory::Host { pinned: true });
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
@@ -5904,7 +6046,7 @@ mod tests {
                 output_cotangents = [Array::from_elements::<f64>(input_type.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
                     Array::from_elements::<f64>(input_type, &[1.0, 0.0, 0.0, 4.0]).unwrap(),
-                    Array::from_elements::<f64>(update_type, &[2.0, 3.0]).unwrap(),
+                    Array::from_elements::<f64>(update_type.with_layout(None), &[2.0, 3.0]).unwrap(),
                 ],
             }],
         );
@@ -6181,7 +6323,7 @@ mod tests {
         let (_, program) = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::trace_with_named_axes(
             |(input, indices)| input.dynamic_slice(&[indices], &[1]),
             (input, indices),
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -6728,7 +6870,10 @@ mod tests {
                 )
                 .unwrap()
         };
-        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let named_axes = vec![(
+            "m".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(source, starts): (Tracer<TracingContext<Array, ArrayOperation<Array>>>, _)| {
                 let context = BatchingContext::<_, ArrayBatchingPolicy>::new(source.domain(), 2);
@@ -6758,7 +6903,8 @@ mod tests {
                         output_type=i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}],
                         output_axes=[],
                     ] %4
-                    %6:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %1
+                    %6:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = \
+                        zero [type=i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
                     %7:bool[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = compare \
                         [direction=LessThan] %1 %6
                     %8:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = add %1 %5
@@ -6803,7 +6949,8 @@ mod tests {
                         output_type=i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}],
                         output_axes=[],
                     ] %4
-                    %6:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = zero_like %1
+                    %6:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = \
+                        zero [type=i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}]]
                     %7:bool[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = compare \
                         [direction=LessThan] %1 %6
                     %8:i32[2][sharding={mesh<['m'=2:manual]>, [{}], varying_manual={'m'}}] = add %1 %5
@@ -6890,7 +7037,7 @@ mod tests {
                     %3:i32[] = convert_element_type [data_type=i32] %2
                     %4:i32[] = transfer_to_memory [destination=Device] %3
                     %5:i32[2] = broadcast [output_type=i32[2], output_axes=[]] %4
-                    %6:i32[2] = zero_like %1
+                    %6:i32[2] = zero [type=i32[2]]
                     %7:bool[2] = compare [direction=LessThan] %1 %6
                     %8:i32[2] = add %1 %5
                     %9:i32[2] = select %7 %8 %1
@@ -6912,7 +7059,7 @@ mod tests {
                     %3:i32[] = convert_element_type [data_type=i32] %2
                     %4:i32[] = transfer_to_memory [destination=Device] %3
                     %5:i32[256] = broadcast [output_type=i32[256], output_axes=[]] %4
-                    %6:i32[256] = zero_like %1
+                    %6:i32[256] = zero [type=i32[256]]
                     %7:bool[256] = compare [direction=LessThan] %1 %6
                     %8:i32[256] = add %1 %5
                     %9:i32[256] = select %7 %8 %1
@@ -6937,7 +7084,7 @@ mod tests {
                     %3:i32[] = convert_element_type [data_type=i32] %2
                     %4:i32[] = transfer_to_memory [destination=Device] %3
                     %5:i32[2] = broadcast [output_type=i32[2], output_axes=[]] %4
-                    %6:i32[2] = zero_like %1
+                    %6:i32[2] = zero [type=i32[2]]
                     %7:bool[2] = compare [direction=LessThan] %1 %6
                     %8:i32[2] = add %1 %5
                     %9:i32[2] = select %7 %8 %1
@@ -6959,7 +7106,7 @@ mod tests {
                     %3:i32[] = convert_element_type [data_type=i32] %2
                     %4:i32[] = transfer_to_memory [destination=Device] %3
                     %5:i32[256] = broadcast [output_type=i32[256], output_axes=[]] %4
-                    %6:i32[256] = zero_like %1
+                    %6:i32[256] = zero [type=i32[256]]
                     %7:bool[256] = compare [direction=LessThan] %1 %6
                     %8:i32[256] = add %1 %5
                     %9:i32[256] = select %7 %8 %1
@@ -7743,7 +7890,7 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f32[2, 3], %1:i32[] .
-                let %2:i32[] = zero_like %1
+                let %2:i32[] = zero [type=i32[]]
                     %3:f32[2, 2] = dynamic_slice [sizes=[2, 2]] %0 %2 %1
                 in (%3)
             "}
@@ -7969,6 +8116,12 @@ mod tests {
                 },
                 {
                     input_types = [ArrayIrType::Array(input.clone()), ArrayIrType::Array(input.clone()), dimension(1)],
+                    error = format!(
+                        "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `i32[4]`",
+                    ),
+                },
+                {
+                    input_types = [ArrayIrType::Array(input.clone()), dimension(0), ArrayIrType::Array(input.clone())],
                     error = "expected dimension type but got array type",
                 },
             ],
@@ -7982,6 +8135,115 @@ mod tests {
                 error = format!("`{DYNAMIC_SLICE_OPERATION_NAME}` `strides` has length 2 but input has rank 1"),
             }],
         );
+    }
+
+    #[test]
+    fn test_dynamic_slice_array_ir_type_inference_array_starts() {
+        // A rank-0 integer array start (e.g., one that differs across devices) may replace a dimension start on any
+        // axis. Its value is unknown before it runs, so its lower bound is zero and only clamping proves its window.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
+        let input = ArrayType::new_static(DataType::F32, [4, 3]);
+        let varying_input = input
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 2).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let start = ArrayType::scalar(DataType::U64);
+        let varying_start = start.clone().with_sharding(varying.clone()).unwrap();
+        let unreduced_start = start.clone().with_sharding(replicated.with_unreduced_axes(["x"]).unwrap()).unwrap();
+        let dimension =
+            |extent: usize| ArrayIrType::Dimension(DimensionValue::constant(extent).unwrap().r#type().into_owned());
+        check_operation_type_inference!(
+            operation = DynamicSliceOperation::<ArrayIrType>::from_rank(2),
+            cases = [
+                {
+                    input_types = [
+                        ArrayIrType::Array(input.clone()),
+                        ArrayIrType::Array(start.clone()),
+                        dimension(0),
+                        dimension(2),
+                        dimension(3),
+                    ],
+                    output_types = [ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 3]))],
+                },
+                {
+                    input_types = [
+                        ArrayIrType::Array(varying_input.clone()),
+                        ArrayIrType::Array(varying_start.clone()),
+                        ArrayIrType::Array(varying_start.clone()),
+                        dimension(2),
+                        dimension(3),
+                    ],
+                    output_types = [ArrayIrType::Array(
+                        ArrayType::new_static(DataType::F32, [2, 3])
+                            .with_sharding(Sharding::replicated(varying.mesh().clone(), 2)
+                                .with_varying_manual_axes(["x"])
+                                .unwrap())
+                            .unwrap(),
+                    )],
+                },
+                {
+                    input_types = [
+                        ArrayIrType::Array(input.clone()),
+                        ArrayIrType::Array(varying_start.clone()),
+                        dimension(0),
+                        dimension(2),
+                        dimension(3),
+                    ],
+                    error = format!(
+                        "`{DYNAMIC_SLICE_OPERATION_NAME}` inputs must have matching varying manual axes; insert \
+                         `parallel_vary` on the inputs that lack an axis, as `align_manual_variation` does",
+                    ),
+                },
+                {
+                    input_types = [
+                        ArrayIrType::Array(input.clone()),
+                        ArrayIrType::Array(unreduced_start),
+                        dimension(0),
+                        dimension(2),
+                        dimension(3),
+                    ],
+                    error = format!("`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must not carry reduction state"),
+                },
+                {
+                    input_types = [
+                        ArrayIrType::Array(input.clone()),
+                        ArrayIrType::Array(start.clone()),
+                        ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
+                        dimension(2),
+                        dimension(3),
+                    ],
+                    error = format!(
+                        "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must share one integer type but index 1 has \
+                         type `i32[]` and index 0 has type `u64[]`",
+                    ),
+                },
+                {
+                    input_types = [
+                        ArrayIrType::Array(input.clone()),
+                        dimension(0),
+                        ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                        dimension(2),
+                        dimension(3),
+                    ],
+                    error = format!(
+                        "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 1 must be a scalar integer but has type `f32[]`",
+                    ),
+                },
+            ],
+        );
+
+        // A checked array start needs a runtime window check, which a clamped one does not.
+        let input_types =
+            [ArrayIrType::Array(input), ArrayIrType::Array(start), dimension(0), dimension(2), dimension(3)];
+        let checked = DynamicSliceOperation::<ArrayIrType>::from_rank(2).with_input_types(&input_types).unwrap();
+        assert!(checked.requires_runtime_assertion());
+        let clamped = DynamicSliceOperation::<ArrayIrType>::from_rank(2)
+            .with_bounds(DynamicSliceBounds::Clamp)
+            .with_input_types(&input_types)
+            .unwrap();
+        assert!(!clamped.requires_runtime_assertion());
     }
 
     #[test]
@@ -8105,6 +8367,48 @@ mod tests {
                 &[1],
             ),
             Ok(ArrayIrValue::Array(Array::vector(vec![2_i32, 3]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_slice_array_ir_interpretation_array_starts() {
+        // Array starts select the same windows as dimension starts. Checked bounds reject a negative start and a
+        // window past the end, while clamped bounds move both into the input.
+        let input = ArrayIrValue::Array(Array::vector(vec![10_i32, 20, 30, 40]).unwrap());
+        let start = |start: i64| ArrayIrValue::Array(Array::scalar(start).unwrap());
+        let size = ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap());
+        let slice = |start: ArrayIrValue<Array>, bounds: DynamicSliceBounds| {
+            input.dynamic_slice_with_bounds(&[start], std::slice::from_ref(&size), &[1], bounds)
+        };
+        assert_eq!(
+            slice(start(1), DynamicSliceBounds::Checked),
+            Ok(ArrayIrValue::Array(Array::vector(vec![20_i32, 30]).unwrap())),
+        );
+        assert_eq!(
+            slice(ArrayIrValue::Array(Array::scalar(2_u64).unwrap()), DynamicSliceBounds::Checked),
+            Ok(ArrayIrValue::Array(Array::vector(vec![30_i32, 40]).unwrap())),
+        );
+        assert_eq!(
+            slice(start(-1), DynamicSliceBounds::Checked),
+            Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "`{DYNAMIC_SLICE_OPERATION_NAME}` start -1 is out of bounds for input axis 0 extent 4",
+                ),
+            }),
+        );
+        assert_eq!(
+            slice(start(3), DynamicSliceBounds::Checked),
+            Err(ProgramError::InvalidArgument {
+                message: format!("`{DYNAMIC_SLICE_OPERATION_NAME}` limit 5 exceeds input axis 0 extent 4"),
+            }),
+        );
+        assert_eq!(
+            slice(start(-1), DynamicSliceBounds::Clamp),
+            Ok(ArrayIrValue::Array(Array::vector(vec![10_i32, 20]).unwrap())),
+        );
+        assert_eq!(
+            slice(start(3), DynamicSliceBounds::Clamp),
+            Ok(ArrayIrValue::Array(Array::vector(vec![30_i32, 40]).unwrap())),
         );
     }
 
@@ -8308,6 +8612,51 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_slice_array_ir_batching_array_starts() {
+        // A replicated array start selects the same window of every batch item, next to the dimension start that the
+        // rule inserts for the batch axis.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let input = ArrayIrBatch::new(
+            ArrayIrValue::Array(Array::matrix(2, 4, vec![0.0_f32, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]).unwrap()),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        let start = ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(2_i32).unwrap()));
+        let size = ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let outputs = DynamicSliceOperation::<ArrayIrType>::from_rank(1)
+            .batch(&context, &EmptyRegionDriver, &[input.clone(), start, size.clone()])
+            .unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                ArrayIrBatch::new(
+                    ArrayIrValue::Array(Array::matrix(2, 2, vec![2.0_f32, 3.0, 6.0, 7.0]).unwrap()),
+                    BatchAxis::new(0),
+                )
+                .unwrap(),
+            ],
+        );
+
+        // An array start that differs across batch items would need one window per item.
+        let mapped_start =
+            ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![0_i32, 2]).unwrap()), BatchAxis::new(0)).unwrap();
+        assert_eq!(
+            DynamicSliceOperation::<ArrayIrType>::from_rank(1)
+                .batch(&context, &EmptyRegionDriver, &[input, mapped_start, size])
+                .unwrap_err(),
+            BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`{DYNAMIC_SLICE_OPERATION_NAME}` batching requires array start index 0 to be the same for every \
+                     batch item",
+                ),
+            },
+        );
+    }
+
+    #[test]
     fn test_dynamic_slice_array_ir_differentiation() {
         // The slice starts and sizes are discrete, but the array input remains linear: JVP applies the same runtime
         // slice to the primal and tangent instead of treating the complete mixed operation as a constant.
@@ -8405,6 +8754,238 @@ mod tests {
             transpose.interpret(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0]).unwrap())]),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 10.0, 20.0, 0.0]).unwrap())]),
         );
+    }
+
+    #[test]
+    fn test_dynamic_slice_array_ir_transposition_array_starts() {
+        // An array start is resolved in array arithmetic by the adjoint, which clamps it under clamped bounds, so the
+        // cotangent lands on the window that the forward slice selected, for static and dynamically shaped inputs.
+        let program = |input_type: ArrayType, bounds: DynamicSliceBounds| {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let input = builder.add_input(input_type.into());
+            let start = builder.add_input(ArrayType::scalar(DataType::I32).into());
+            let size = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+            let operation = DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_bounds(bounds);
+            let output = builder.add_instruction(operation, Vec::new(), vec![input, start, size], None).unwrap()[0];
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let start = |start: i32| ArrayIrValue::Array(Array::scalar(start).unwrap());
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0]).unwrap());
+
+        // A static input transposes directly.
+        let transpose = program(ArrayType::new_static(DataType::F64, [4]), DynamicSliceBounds::Checked)
+            .transpose_with_respect_to(&[0], &[])
+            .unwrap();
+        assert_eq!(
+            transpose.to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:i32[] .
+                let %2:dimension<2> = const 2
+                    %3:f64[4] = zero [type=f64[4]]
+                    %4:dimension<2> = constant [value=2]
+                    %5:dimension<1> = constant [value=1]
+                    %6:dimension<1> = constant [value=1]
+                    %7:i64[2, 1] = iota [type=i64[2, 1], dimension=0]
+                    %8:i64[] = convert_element_type [data_type=i64] %1
+                    %9:i64[] = transfer_to_memory [destination=Device] %8
+                    %10:i64[2, 1] = add %7 %9
+                    %11:f64[4] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                operand_batching=[], scatter_indices_batching=[]),
+                        unique_indices=true,
+                    ] %3 %10 %0
+                in (%11)"},
+        );
+        assert_eq!(
+            transpose.interpret(vec![cotangent.clone(), start(1)]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 10.0, 20.0, 0.0]).unwrap())]),
+        );
+
+        // A dynamically shaped input retains its extent and the start for the pullback, which converts the start
+        // in its forward region (i.e., the adjoint of the slice) and clamps it there under clamped bounds.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(6)).unwrap());
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap());
+        let pullback_values = |linearization: &Linearization<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+                               start_value: i32| {
+            let mut residuals = linearization.primal().interpret(vec![input.clone(), start(start_value)]).unwrap();
+            residuals.remove(0);
+            let mut inputs = vec![cotangent.clone()];
+            inputs.extend(residuals);
+            linearization.pullback().unwrap().into_program().interpret(inputs)
+        };
+        let checked = program(input_type.clone(), DynamicSliceBounds::Checked).linearize().unwrap();
+        assert_eq!(
+            checked.pullback().unwrap().into_program().to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:i32[], %2:dimension<extent ∈ [2, 6)> .
+                let %3:dimension<2> = const 2
+                    %4:f64[extent] = linear_call [residual_count=3] %1 %3 %2 %0 [
+                        forward={
+                            lambda %0:i32[], %1:dimension<2>, %2:dimension<extent ∈ [2, 6)>, %3:f64[2] .
+                            let %4:f64[extent] = zero [type=f64[extent]] %2
+                                %5:i64[2, 1] = iota [type=i64[2, 1], dimension=0]
+                                %6:i64[] = convert_element_type [data_type=i64] %0
+                                %7:i64[] = transfer_to_memory [destination=Device] %6
+                                %8:i64[2, 1] = add %5 %7
+                                %9:f64[extent] = scatter [
+                                    kind=add,
+                                    dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                operand_batching=[], scatter_indices_batching=[]),
+                                    unique_indices=true,
+                                ] %4 %8 %3
+                            in (%9)
+                        },
+                        transpose={
+                            lambda %0:i32[], %1:dimension<2>, %2:dimension<extent ∈ [2, 6)>, %3:f64[extent] .
+                            let %4:f64[2] = dynamic_slice [strides=[1], bounds=checked, \
+                requires_runtime_assertion=true] %3 %0 %1
+                            in (%4)
+                        },
+                    ]
+                in (%4)"},
+        );
+        assert_eq!(
+            pullback_values(&checked, 1),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 10.0, 20.0, 0.0]).unwrap())]),
+        );
+        let clamped = program(input_type, DynamicSliceBounds::Clamp).linearize().unwrap();
+        assert_eq!(
+            clamped.pullback().unwrap().into_program().to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:i32[], %2:dimension<extent ∈ [2, 6)> .
+                let %3:dimension<2> = const 2
+                    %4:f64[extent] = linear_call [residual_count=3] %1 %3 %2 %0 [
+                        forward={
+                            lambda %0:i32[], %1:dimension<2>, %2:dimension<extent ∈ [2, 6)>, %3:f64[2] .
+                            let %4:f64[extent] = zero [type=f64[extent]] %2
+                                %5:i64[2, 1] = iota [type=i64[2, 1], dimension=0]
+                                %6:dimension<0> = constant [value=0]
+                                %7:i64[] = dimension_to_scalar %6
+                                %8:i64[] = transfer_to_memory [destination=Device] %7
+                                %9:i64[] = convert_element_type [data_type=i64] %0
+                                %10:i64[] = transfer_to_memory [destination=Device] %9
+                                %11:dimension<extent ∈ [2, 6)> = dimension_size [axis=0] %4
+                                %12:dimension<1> = constant [value=1]
+                                %13:dimension<1> = saturating_sub %1 %12
+                                %14:dimension<2> = dimension_add %13 %12
+                                %15:dimension<max(0, extent - 2) ∈ [0, 4)> = saturating_sub %11 %14
+                                %16:i64[] = dimension_to_scalar %15
+                                %17:i64[] = transfer_to_memory [destination=Device] %16
+                                %18:i64[] = clamp %8 %10 %17
+                                %19:i64[2, 1] = add %5 %18
+                                %20:f64[extent] = scatter [
+                                    kind=add,
+                                    dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                operand_batching=[], scatter_indices_batching=[]),
+                                    unique_indices=true,
+                                ] %4 %19 %3
+                            in (%20)
+                        },
+                        transpose={
+                            lambda %0:i32[], %1:dimension<2>, %2:dimension<extent ∈ [2, 6)>, %3:f64[extent] .
+                            let %4:f64[2] = dynamic_slice [strides=[1], bounds=clamp, \
+                requires_runtime_assertion=true] %3 %0 %1
+                            in (%4)
+                        },
+                    ]
+                in (%4)"},
+        );
+        assert_eq!(
+            pullback_values(&clamped, 3),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 0.0, 10.0, 20.0]).unwrap())]),
+        );
+        assert_eq!(
+            pullback_values(&clamped, -1),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 0.0, 0.0]).unwrap())]),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_slice_array_ir_transposition_clamps_unsigned_array_starts() {
+        // An unsigned array start can exceed the `i64` range of the coordinates that the adjoint scatters into. Under
+        // clamped bounds, the adjoint clamps such a start as a `u64` value before converting it, so the cotangent
+        // lands on the last window, which the forward slice selects, instead of on the first one.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(6)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input =
+            builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)])).into());
+        let start = builder.add_input(ArrayType::scalar(DataType::U64).into());
+        let size = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let operation = DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_bounds(DynamicSliceBounds::Clamp);
+        let output = builder.add_instruction(operation, Vec::new(), vec![input, start, size], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.pullback().unwrap().into_program().to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:u64[], %2:dimension<extent ∈ [2, 6)> .
+                let %3:dimension<2> = const 2
+                    %4:f64[extent] = linear_call [residual_count=3] %1 %3 %2 %0 [
+                        forward={
+                            lambda %0:u64[], %1:dimension<2>, %2:dimension<extent ∈ [2, 6)>, %3:f64[2] .
+                            let %4:f64[extent] = zero [type=f64[extent]] %2
+                                %5:i64[2, 1] = iota [type=i64[2, 1], dimension=0]
+                                %6:dimension<0> = constant [value=0]
+                                %7:i64[] = dimension_to_scalar %6
+                                %8:i64[] = transfer_to_memory [destination=Device] %7
+                                %9:u64[] = convert_element_type [data_type=u64] %8
+                                %10:u64[] = transfer_to_memory [destination=Device] %0
+                                %11:dimension<extent ∈ [2, 6)> = dimension_size [axis=0] %4
+                                %12:dimension<1> = constant [value=1]
+                                %13:dimension<1> = saturating_sub %1 %12
+                                %14:dimension<2> = dimension_add %13 %12
+                                %15:dimension<max(0, extent - 2) ∈ [0, 4)> = saturating_sub %11 %14
+                                %16:i64[] = dimension_to_scalar %15
+                                %17:i64[] = transfer_to_memory [destination=Device] %16
+                                %18:u64[] = convert_element_type [data_type=u64] %17
+                                %19:u64[] = clamp %9 %10 %18
+                                %20:i64[] = convert_element_type [data_type=i64] %19
+                                %21:i64[2, 1] = add %5 %20
+                                %22:f64[extent] = scatter [
+                                    kind=add,
+                                    dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                operand_batching=[], scatter_indices_batching=[]),
+                                    unique_indices=true,
+                                ] %4 %21 %3
+                            in (%22)
+                        },
+                        transpose={
+                            lambda %0:u64[], %1:dimension<2>, %2:dimension<extent ∈ [2, 6)>, %3:f64[extent] .
+                            let %4:f64[2] = dynamic_slice [strides=[1], bounds=clamp, \
+                requires_runtime_assertion=true] %3 %0 %1
+                            in (%4)
+                        },
+                    ]
+                in (%4)"},
+        );
+
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap());
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0]).unwrap());
+        let pullback_values = |start: u64| {
+            let start = ArrayIrValue::Array(Array::scalar(start).unwrap());
+            let mut residuals = linearization.primal().interpret(vec![input.clone(), start]).unwrap();
+            let output = residuals.remove(0);
+            let mut inputs = vec![cotangent.clone()];
+            inputs.extend(residuals);
+            (output, linearization.pullback().unwrap().into_program().interpret(inputs))
+        };
+        let vector = |values: Vec<f64>| ArrayIrValue::Array(Array::vector(values).unwrap());
+        assert_eq!(pullback_values(1), (vector(vec![2.0, 3.0]), Ok(vec![vector(vec![0.0, 10.0, 20.0, 0.0])])));
+        assert_eq!(pullback_values(u64::MAX), (vector(vec![3.0, 4.0]), Ok(vec![vector(vec![0.0, 0.0, 10.0, 20.0])])));
     }
 
     #[test]
@@ -9156,14 +9737,12 @@ mod tests {
         assert_eq!(outputs[0].r#type().sharding(), Some(&explicit_sharding));
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0, 9.0, 9.0, 3.0, 4.0, 9.0, 9.0, 7.0]);
 
-        // A mapped input varying over a manual mesh axis keeps both its placement and its variation.
+        // A mapped input placed on a manual mesh axis keeps its placement, which adds no variation.
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let manual_sharding = Sharding::new(
             manual_mesh.clone(),
             vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
         )
-        .unwrap()
-        .with_varying_manual_axes(["x"])
         .unwrap();
         let input_type = ArrayType::new_static(DataType::F64, [2, 4]).with_sharding(manual_sharding.clone()).unwrap();
         let update_type = ArrayType::new_static(DataType::F64, [2])
@@ -9177,9 +9756,7 @@ mod tests {
         let update = ArrayBatch::replicated(Array::from_elements::<f64>(update_type, &[9.0, 9.0]).unwrap());
         let start = ArrayBatch::replicated(
             Array::from_elements(
-                ArrayType::scalar(DataType::I32)
-                    .with_sharding(Sharding::replicated(manual_mesh, 0).with_varying_manual_axes(["x"]).unwrap())
-                    .unwrap(),
+                ArrayType::scalar(DataType::I32).with_sharding(Sharding::replicated(manual_mesh, 0)).unwrap(),
                 &[1_i32],
             )
             .unwrap(),
@@ -9412,7 +9989,8 @@ mod tests {
             }],
         );
 
-        // Dynamic update-slice restores the layout-bearing update cotangent after its dynamic slice.
+        // The update cotangent of a dynamic update slice keeps the memory placement of the update after its dynamic
+        // slice but not its explicit layout.
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![4.into()])).with_memory(Memory::Host { pinned: true });
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
@@ -9435,7 +10013,7 @@ mod tests {
                 output_cotangents = [Array::from_elements::<f64>(input_type.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
                     Array::from_elements::<f64>(input_type, &[1.0, 0.0, 0.0, 4.0]).unwrap(),
-                    Array::from_elements::<f64>(update_type, &[2.0, 3.0]).unwrap(),
+                    Array::from_elements::<f64>(update_type.with_layout(None), &[2.0, 3.0]).unwrap(),
                 ],
             }],
         );
@@ -9873,12 +10451,12 @@ mod tests {
         let index = ArrayType::scalar(DataType::I32);
 
         // Scalar integers of one type in the input's memory space pass, including an empty index list.
-        assert_eq!(validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[]), Ok(()));
+        assert_eq!(validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, []), Ok(()));
         assert_eq!(
             validate_dynamic_slice_start_index_types(
                 DYNAMIC_SLICE_OPERATION_NAME,
                 &input,
-                &[index.clone(), index.clone()]
+                [index.clone(), index.clone()].iter().enumerate()
             ),
             Ok(()),
         );
@@ -9888,7 +10466,7 @@ mod tests {
             validate_dynamic_slice_start_index_types(
                 DYNAMIC_SLICE_OPERATION_NAME,
                 &input,
-                &[ArrayType::new_static(DataType::I32, [1])]
+                [ArrayType::new_static(DataType::I32, [1])].iter().enumerate()
             ),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `i32[1]`",
@@ -9899,7 +10477,7 @@ mod tests {
             validate_dynamic_slice_start_index_types(
                 DYNAMIC_UPDATE_SLICE_OPERATION_NAME,
                 &input,
-                &[ArrayType::scalar(DataType::F32)]
+                [ArrayType::scalar(DataType::F32)].iter().enumerate()
             ),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_UPDATE_SLICE_OPERATION_NAME}` start index 0 must be a scalar integer but has type `f32[]`",
@@ -9910,7 +10488,7 @@ mod tests {
             validate_dynamic_slice_start_index_types(
                 DYNAMIC_SLICE_OPERATION_NAME,
                 &input,
-                &[index.clone().with_memory(Memory::Host { pinned: true })],
+                [index.clone().with_memory(Memory::Host { pinned: true })].iter().enumerate(),
             ),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` input and start indices must share one memory space but start \
@@ -9934,17 +10512,29 @@ mod tests {
         ))
         .into());
         assert_eq!(
-            validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[unreduced_index]),
+            validate_dynamic_slice_start_index_types(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                &input,
+                [unreduced_index].iter().enumerate()
+            ),
             reduction_state_error,
         );
         assert_eq!(
-            validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &input, &[reduced_index]),
+            validate_dynamic_slice_start_index_types(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                &input,
+                [reduced_index].iter().enumerate()
+            ),
             reduction_state_error,
         );
         let sharded_input = input.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
         let other_index = index.clone().with_sharding(Sharding::replicated(other_mesh, 0)).unwrap();
         assert_eq!(
-            validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &sharded_input, &[other_index]),
+            validate_dynamic_slice_start_index_types(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                &sharded_input,
+                [other_index].iter().enumerate()
+            ),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` input and start indices must use the same mesh",
             ))
@@ -9959,7 +10549,11 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.clone(), 0).with_varying_manual_axes(["m"]).unwrap())
             .unwrap();
         assert_eq!(
-            validate_dynamic_slice_start_index_types(DYNAMIC_SLICE_OPERATION_NAME, &unreduced_input, &[varying_index]),
+            validate_dynamic_slice_start_index_types(
+                DYNAMIC_SLICE_OPERATION_NAME,
+                &unreduced_input,
+                [varying_index].iter().enumerate(),
+            ),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must be invariant when the input carries reduction \
                  state",
@@ -9971,7 +10565,7 @@ mod tests {
             validate_dynamic_slice_start_index_types(
                 DYNAMIC_SLICE_OPERATION_NAME,
                 &unreduced_input,
-                &[replicated_index]
+                [replicated_index].iter().enumerate(),
             ),
             Ok(()),
         );
@@ -9981,7 +10575,7 @@ mod tests {
             validate_dynamic_slice_start_index_types(
                 DYNAMIC_SLICE_OPERATION_NAME,
                 &input,
-                &[index, ArrayType::scalar(DataType::I64)]
+                [index, ArrayType::scalar(DataType::I64)].iter().enumerate()
             ),
             Err(TypeError::invalid(format!(
                 "`{DYNAMIC_SLICE_OPERATION_NAME}` start indices must share one integer type but index 1 has type \

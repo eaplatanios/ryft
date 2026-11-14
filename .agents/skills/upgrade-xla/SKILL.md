@@ -105,7 +105,7 @@ After publishing or rebuilding artifacts, validate at least one downstream consu
 against the final rebuilt artifact to catch deployment-target mismatches and stale exported symbols. When publication
 is in scope, verify against the finalized published asset. Use CI for platforms unavailable locally and report any
 remaining gap. Once crate code changes, run the full affected crate `--lib` unit
-suites, not only smoke tests; include downstream suites whose contracts changed. Follow the repository's 300-second
+suites, not only smoke tests; include downstream suites whose contracts changed. Follow the repository's 600-second
 local command limits and memory/concurrency safeguards. Verification must exercise the final source and binaries.
 
 Update the changelog of every crate whose public API, wrappers, tests, or generated bindings changed, including

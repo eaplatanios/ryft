@@ -77,6 +77,7 @@ use crate::operations::control_flow::{
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::slicing::DynamicUpdateSlice;
 use crate::operations::reductions::Reduce;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{
     PartialEvaluation, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
@@ -588,7 +589,8 @@ impl<T: WhileType> WhileOperation<T> {
         condition: RegionRef<'_, V, O>,
         body: RegionRef<'_, V, O>,
     ) -> Result<Vec<T>, ProgramError> {
-        let output_types = self.infer_output_types(input_types, &[condition.interface(), body.interface()])?;
+        let output_types =
+            self.infer_output_types(input_types, &[condition.interface().clone(), body.interface().clone()])?;
 
         // The body must return every reference carry as its own body input. This is checked even when no iteration
         // runs, so that whether a loop is accepted does not depend on the transform that reaches it or on how its
@@ -1353,6 +1355,21 @@ impl<C: Domain<Type: WhileType, Value: WhilePredicate>> InterpretableOperation<C
                 .collect::<Result<Vec<_>, _>>()?;
             completed_iterations += 1;
         }
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for WhileOperation<ArrayIrType>
+where
+    Self: InterpretableOperation<LockstepDomain<O>>,
+{
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(self.interpret(context, driver, inputs))
     }
 }
 
@@ -2615,7 +2632,7 @@ where
         let linearization = driver.linearize_program(body, input_indices, Some(activity.output_tangent_liveness()))?;
         let live_tangent_slots = linearization.tangent_output_positions(activity.output_tangent_liveness())?;
         let (primal_program, tangent_program, residual_count, _) = linearization.into_parts();
-        let tangent_program = tangent_program.with_outputs(&live_tangent_slots)?;
+        let tangent_program = Arc::unwrap_or_clone(tangent_program).with_outputs(&live_tangent_slots)?;
         let residual_types = primal_program.output_types().into_owned().split_off(state_count);
         check_count!("output", residual_types, residual_count, ProgramError);
 
@@ -3189,7 +3206,7 @@ where
         let fused_body = if fused_outputs.iter().copied().eq(0..fused_body.output_count()) {
             fused_body
         } else {
-            Arc::new(fused_body.with_outputs(&fused_outputs)?)
+            Arc::new(Arc::unwrap_or_clone(fused_body).with_outputs(&fused_outputs)?)
         };
         let fused_state_types = fused_body.input_types().into_owned();
         check_count!("input", fused_state_types, fused_state_count, ProgramError);
@@ -3403,6 +3420,7 @@ fn bounded_while_scalar_type(data_type: DataType, predicate_type: &ArrayType) ->
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::cell::RefCell;
     use std::collections::HashSet;
     use std::rc::Rc;
@@ -3415,7 +3433,7 @@ mod tests {
         DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
         ShardingDimension, StridedLayout,
     };
-    use crate::axes::{NamedAxes, NamedAxis};
+    use crate::axes::{MeshContext, NamedAxes, NamedAxis};
     use crate::batching::{Batch, batch};
     use crate::captures::ClosedProgram;
     use crate::contexts::{Domain, EagerContext, StagingContext, ValueResolution};
@@ -3452,13 +3470,13 @@ mod tests {
         ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
         ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation,
     };
-    use crate::operations::sharding::shard_map::{ShardMap, ShardMapOperation};
+    use crate::operations::sharding::shard_map::{ShardMapBoundary, ShardMapOperation};
     use crate::operations::trigonometric::{SIN_OPERATION_NAME, SinOperation};
     use crate::parameters::Parameter;
     use crate::partial::{PartialTracer, ResidualInputSource};
     use crate::programs::{
-        AttachedRegions, EffectClasses, InstructionId, Provenance, ProvenanceScope, ReferenceAnalysisError,
-        ReferenceRoot, ReferenceSource, ReferenceType, RegionDataFlowRegionBoundary, RegionDriver,
+        AttachedRegions, EffectClasses, InstructionId, NoIdentity, Provenance, ProvenanceScope, ReferenceAnalysisError,
+        ReferenceRoot, ReferenceSource, ReferenceType, RegionDataFlowRegionBoundary, RegionDriver, ValueDirectDispatch,
     };
     use crate::tracing::{DomainTracingContext, Tracer, TracingContext};
 
@@ -4726,7 +4744,7 @@ mod tests {
         // that maps `f64[extent]` to `f64[3]` is rejected, including through an operation family's derived dispatch
         // (the derive tests own the delegation of the other wrappers).
         let regions = refinement_only_while_regions();
-        let interfaces = regions.each_ref().map(Program::interface);
+        let interfaces = regions.each_ref().map(|program| program.interface().clone());
         let expected = Err(ProgramError::Type(TypeError::invalid(format!(
             "`{WHILE_OPERATION_NAME}` body output type signature mismatch: expected [f64[extent]] but got [f64[3]]",
         ))));
@@ -4790,7 +4808,10 @@ mod tests {
         let state_type = ArrayType::scalar(DataType::F64);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharded_type = state_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
-        let interfaces = countdown_while_regions(state_type.clone()).iter().map(Program::interface).collect::<Vec<_>>();
+        let interfaces = countdown_while_regions(state_type.clone())
+            .iter()
+            .map(|program| program.interface().clone())
+            .collect::<Vec<_>>();
         let operation = WhileOperation::<ArrayType>::new();
         assert_eq!(
             operation.infer_region_input_types(std::slice::from_ref(&state_type), &interfaces),
@@ -4812,7 +4833,7 @@ mod tests {
         let state_type = ArrayType::scalar(DataType::F64);
         let operation = WhileOperation::<ArrayType>::new();
         let regions = countdown_while_regions(state_type.clone());
-        let condition = regions[0].interface();
+        let condition = regions[0].interface().clone();
         let body = regions[1].interface();
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&state_type), &[condition.clone(), body.clone()]),
@@ -4842,8 +4863,10 @@ mod tests {
         let vector_body =
             builder.build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            operation
-                .infer_output_types(std::slice::from_ref(&state_type), &[condition.clone(), vector_body.interface()]),
+            operation.infer_output_types(
+                std::slice::from_ref(&state_type),
+                &[condition.clone(), vector_body.interface().clone()]
+            ),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition/body input type signature mismatch: expected [f64[2]] but got \
                  [f64[]]",
@@ -4863,7 +4886,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 std::slice::from_ref(&state_type),
-                &[multi_output_condition.interface(), body.clone()],
+                &[multi_output_condition.interface().clone(), body.clone()],
             ),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition must return exactly one predicate leaf but returned 2",
@@ -5023,7 +5046,7 @@ mod tests {
         assert_eq!(
             WhileOperation::new().infer_output_types(
                 std::slice::from_ref(&state_type),
-                &[condition.interface(), effectful_body.interface()],
+                &[condition.interface().clone(), effectful_body.interface().clone()],
             ),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` loop with a batched predicate must be pure because observable effects cannot \
@@ -5036,8 +5059,10 @@ mod tests {
             EffectClasses::NONE,
         );
         assert_eq!(
-            WhileOperation::new()
-                .infer_output_types(std::slice::from_ref(&state_type), &[scalar_condition, effectful_body.interface()]),
+            WhileOperation::new().infer_output_types(
+                std::slice::from_ref(&state_type),
+                &[scalar_condition, effectful_body.interface().clone()]
+            ),
             Ok(vec![state_type.clone()]),
         );
     }
@@ -5102,8 +5127,10 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![state], vec![Placeholder], vec![Placeholder]).unwrap()
         };
         assert_eq!(
-            WhileOperation::new()
-                .infer_output_types(std::slice::from_ref(&state_type), &[condition.interface(), body.interface()]),
+            WhileOperation::new().infer_output_types(
+                std::slice::from_ref(&state_type),
+                &[condition.interface().clone(), body.interface().clone()]
+            ),
             Err(TypeError::invalid(format!(
                 "`{WHILE_OPERATION_NAME}` condition predicate shape must be a prefix of every array state shape, but \
                  predicate `bool[3]` is not a prefix of state `f64[2]`",
@@ -5174,6 +5201,34 @@ mod tests {
     }
 
     #[test]
+    fn test_while_type_inference_rejects_varying_inputs_of_state_declared_without_sharding() {
+        // A state element declared without a sharding is invariant, so the loop could not report the variation
+        // of an initial state that varies over `m` on its outputs, and it rejects that initial state.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let state_type = ArrayType::scalar(DataType::F32);
+        let varying_type = state_type
+            .clone()
+            .with_sharding(Sharding::replicated(mesh, 0).with_varying_manual_axes(["m"]).unwrap())
+            .unwrap();
+        let state_types = vec![ArrayIrType::Array(state_type)];
+        let interfaces = [
+            RegionInterface::new(
+                state_types.clone(),
+                vec![ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))],
+                EffectClasses::NONE,
+            ),
+            RegionInterface::new(state_types.clone(), state_types, EffectClasses::NONE),
+        ];
+        assert_eq!(
+            WhileOperation::new().infer_output_types(&[ArrayIrType::Array(varying_type)], &interfaces),
+            Err(TypeError::invalid(format!(
+                "`{WHILE_OPERATION_NAME}` input 0 has type `f32[][sharding={{mesh<['m'=2:manual]>, [], \
+                 varying_manual={{'m'}}}}]`, which does not refine its state type `f32[]`",
+            ))),
+        );
+    }
+
+    #[test]
     fn test_while_type_inference_refines_input_types() {
         // Inputs only need to refine the state types, so actual types that carry metadata the state types leave
         // unspecified (e.g., the normalized shardings of concrete backend array types) are accepted, and the outputs
@@ -5182,7 +5237,10 @@ mod tests {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
         let sharded_type = state_type.clone().with_sharding(Sharding::replicated(mesh, 0)).unwrap();
         let operation = WhileOperation::new();
-        let interfaces = countdown_while_regions(state_type.clone()).iter().map(Program::interface).collect::<Vec<_>>();
+        let interfaces = countdown_while_regions(state_type.clone())
+            .iter()
+            .map(|program| program.interface().clone())
+            .collect::<Vec<_>>();
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&sharded_type), interfaces.as_slice()),
             Ok(vec![state_type.clone()]),
@@ -7848,7 +7906,7 @@ mod tests {
                 let %3:f64[], %4:f64[], %5:f64[] = while [iteration_bound=8] %0 %1 %2 [
                     condition={
                         lambda %0:f64[], %1:f64[], %2:f64[] .
-                        let %3:f64[] = zero_like %0
+                        let %3:f64[] = zero [type=f64[]]
                             %4:bool[] = compare [direction=GreaterThan] %0 %3
                         in (%4)
                     },
@@ -8312,7 +8370,7 @@ mod tests {
                 let %2:i32[], %3:i32[] = while %0 %1 [
                     condition={
                         lambda %0:i32[], %1:i32[] .
-                        let %2:i32[] = zero_like %0
+                        let %2:i32[] = zero [type=i32[]]
                             %3:bool[] = compare [direction=GreaterThan] %0 %2
                         in (%3)
                     },
@@ -9462,7 +9520,7 @@ mod tests {
                 let %2:f64[], %3:f64[3] = while %0 %1 [
                     condition={
                         lambda %0:f64[], %1:f64[3] .
-                        let %2:f64[] = zero_like %0
+                        let %2:f64[] = zero [type=f64[]]
                             %3:bool[] = compare [direction=GreaterThan] %0 %2
                         in (%3)
                     },
@@ -9512,7 +9570,7 @@ mod tests {
                 let %1:f64[3] = while %0 [
                     condition={
                         lambda %0:f64[3] .
-                        let %1:f64[3] = zero_like %0
+                        let %1:f64[3] = zero [type=f64[3]]
                             %2:bool[3] = compare [direction=GreaterThan] %0 %1
                         in (%2)
                     },
@@ -9548,7 +9606,7 @@ mod tests {
                 let %1:f64[3] = while [iteration_bound=2] %0 [
                     condition={
                         lambda %0:f64[3] .
-                        let %1:f64[3] = zero_like %0
+                        let %1:f64[3] = zero [type=f64[3]]
                             %2:bool[3] = compare [direction=GreaterThan] %0 %1
                         in (%2)
                     },
@@ -9599,7 +9657,7 @@ mod tests {
                 let %1:f64[3] = while %0 [
                     condition={
                         lambda %0:f64[3] .
-                        let %1:f64[3] = zero_like %0
+                        let %1:f64[3] = zero [type=f64[3]]
                             %2:bool[3] = compare [direction=GreaterThan] %0 %1
                         in (%2)
                     },
@@ -9821,7 +9879,7 @@ mod tests {
                     %4:dimension<2>, %5:f32[], %6:ref<f32[2]> = while %0 %1 %3 [
                         condition={
                             lambda %0:dimension<2>, %1:f32[], %2:ref<f32[2]> .
-                            let %3:f32[] = zero_like %1
+                            let %3:f32[] = zero [type=f32[]]
                                 %4:bool[] = compare [direction=GreaterThan] %1 %3
                             in (%4)
                         },
@@ -9847,7 +9905,7 @@ mod tests {
                 let %3:dimension<2>, %4:f32[], %5:f32[2] = while %0 %1 %2 [
                     condition={
                         lambda %0:dimension<2>, %1:f32[], %2:f32[2] .
-                        let %3:f32[] = zero_like %1
+                        let %3:f32[] = zero [type=f32[]]
                             %4:bool[] = compare [direction=GreaterThan] %1 %3
                         in (%4)
                     },
@@ -9907,7 +9965,7 @@ mod tests {
         let expected = [
             indoc! {"
                 lambda %0:dimension<3>, %1:f64[3] .
-                let %2:f64[3] = zero_like %1
+                let %2:f64[3] = zero [type=f64[3]]
                     %3:bool[3] = compare [direction=GreaterThan] %1 %2
                 in (%0, %3)"},
             indoc! {"
@@ -10186,6 +10244,295 @@ mod tests {
             step = 1e-4,
             tolerance = 1e-3,
         );
+    }
+
+    #[test]
+    fn test_while_differentiation_supports_custom_while_types() {
+        // The shared differentiation rule applies to a custom type family that exposes its array members only through
+        // the projection contracts (i.e., `ArrayMemberType`, `ValueProjection`, and `OperationProjection`), without any
+        // array capability implementations on its own tracers.
+        /// Custom type family that wraps an [`ArrayType`].
+        #[derive(Clone, Debug, PartialEq)]
+        struct CustomType(ArrayType);
+
+        impl Display for CustomType {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                Display::fmt(&self.0, formatter)
+            }
+        }
+
+        impl Parameter for CustomType {}
+
+        impl Type for CustomType {
+            type Identity = NoIdentity;
+            type Refinements = ();
+
+            fn is_convertible_to(&self, other: &Self) -> bool {
+                self.0.is_convertible_to(&other.0)
+            }
+
+            fn is_refined_by(&self, other: &Self) -> bool {
+                self.0.is_refined_by(&other.0)
+            }
+
+            fn is_scalar(&self) -> bool {
+                self.0.is_scalar()
+            }
+
+            fn is_complex(&self) -> bool {
+                self.0.is_complex()
+            }
+        }
+
+        impl From<ArrayType> for CustomType {
+            fn from(r#type: ArrayType) -> Self {
+                Self(r#type)
+            }
+        }
+
+        impl<'t> TryFrom<&'t CustomType> for &'t ArrayType {
+            type Error = TypeError;
+
+            fn try_from(r#type: &'t CustomType) -> Result<Self, TypeError> {
+                Ok(&r#type.0)
+            }
+        }
+
+        impl ArrayMemberType for CustomType {
+            fn as_array_type(&self) -> Result<&ArrayType, TypeError> {
+                Ok(&self.0)
+            }
+        }
+
+        impl WhileType for CustomType {
+            fn validate_while_predicate(&self, state_types: &[Self]) -> Result<(), TypeError> {
+                self.0
+                    .validate_while_predicate(&state_types.iter().map(|r#type| r#type.0.clone()).collect::<Vec<_>>())
+            }
+
+            fn is_batched_while_predicate(&self) -> bool {
+                self.0.is_batched_while_predicate()
+            }
+
+            fn is_loop_invariant_state(&self) -> bool {
+                false
+            }
+        }
+
+        impl DifferentiableType for CustomType {
+            fn is_zero_space(&self) -> bool {
+                self.0.is_zero_space()
+            }
+
+            fn tangent(&self) -> Result<Self, DifferentiationError> {
+                self.0.tangent().map(Self)
+            }
+
+            fn cotangent(&self) -> Result<Self, DifferentiationError> {
+                self.0.cotangent().map(Self)
+            }
+        }
+
+        /// Concrete value of [`CustomType`], which wraps an [`Array`].
+        #[derive(Clone, Debug)]
+        struct CustomValue(Array);
+
+        impl Display for CustomValue {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                Display::fmt(&self.0, formatter)
+            }
+        }
+
+        impl Parameter for CustomValue {}
+
+        impl Typed for CustomValue {
+            type Type = CustomType;
+
+            fn r#type(&self) -> Cow<'_, Self::Type> {
+                Cow::Owned(CustomType(self.0.r#type().into_owned()))
+            }
+        }
+
+        /// Domain of [`CustomValue`], which is only used to name its type, value, and operation families.
+        struct CustomDomain;
+
+        impl Domain for CustomDomain {
+            type Type = CustomType;
+            type Value = CustomValue;
+            type Constant = CustomValue;
+            type Operation = CustomOperation;
+        }
+
+        impl Value for CustomValue {
+            type Dispatch = ValueDirectDispatch;
+            type Domain = CustomDomain;
+
+            fn domain(&self) -> Self::Domain {
+                CustomDomain
+            }
+        }
+
+        impl ValueProjection<ArrayType> for CustomValue {
+            type Projected = Array;
+            type ProjectedRef<'v> = &'v Array;
+
+            fn from_projected(value: Array) -> Self {
+                Self(value)
+            }
+
+            fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+            where
+                ArrayType: 'v,
+            {
+                Ok(&self.0)
+            }
+
+            fn into_projected(self) -> Result<Array, TypeError> {
+                Ok(self.0)
+            }
+        }
+
+        /// Operation family of [`CustomDomain`], which reaches array operations through projection.
+        #[derive(Clone)]
+        enum CustomOperation {
+            Array(ArrayOperation<Array>),
+            While(WhileOperation<CustomType>),
+            Guard(GuardOperation<CustomType>),
+            Zero(ZeroOperation<CustomType>),
+        }
+
+        impl Operation for CustomOperation {
+            type Type = CustomType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Array(operation) => operation.name(),
+                    Self::While(operation) => operation.name(),
+                    Self::Guard(operation) => operation.name(),
+                    Self::Zero(operation) => operation.name(),
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Array(operation) => operation.region_slots(),
+                    Self::While(operation) => operation.region_slots(),
+                    Self::Guard(operation) => operation.region_slots(),
+                    Self::Zero(operation) => operation.region_slots(),
+                }
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[CustomType],
+                region_interfaces: &[RegionInterface<CustomType>],
+            ) -> Result<Vec<CustomType>, TypeError> {
+                match self {
+                    Self::Array(operation) => {
+                        let input_types = input_types.iter().map(|r#type| r#type.0.clone()).collect::<Vec<_>>();
+                        let region_interfaces = region_interfaces
+                            .iter()
+                            .map(|region| {
+                                RegionInterface::new(
+                                    region.input_types().iter().map(|r#type| r#type.0.clone()).collect(),
+                                    region.output_types().iter().map(|r#type| r#type.0.clone()).collect(),
+                                    region.effects(),
+                                )
+                                .with_deferred_work(region.has_deferred_work())
+                            })
+                            .collect::<Vec<_>>();
+                        operation
+                            .infer_output_types(&input_types, &region_interfaces)
+                            .map(|types| types.into_iter().map(CustomType).collect())
+                    }
+                    Self::While(operation) => operation.infer_output_types(input_types, region_interfaces),
+                    Self::Guard(operation) => operation.infer_output_types(input_types, region_interfaces),
+                    Self::Zero(operation) => operation.infer_output_types(input_types, region_interfaces),
+                }
+            }
+
+            fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+                match self {
+                    Self::Array(operation) => operation.render(formatter, indentation),
+                    Self::While(operation) => operation.render(formatter, indentation),
+                    Self::Guard(operation) => operation.render(formatter, indentation),
+                    Self::Zero(operation) => operation.render(formatter, indentation),
+                }
+            }
+        }
+
+        impl From<ArrayOperation<Array>> for CustomOperation {
+            fn from(operation: ArrayOperation<Array>) -> Self {
+                Self::Array(operation)
+            }
+        }
+
+        impl From<WhileOperation<CustomType>> for CustomOperation {
+            fn from(operation: WhileOperation<CustomType>) -> Self {
+                Self::While(operation)
+            }
+        }
+
+        impl From<ConditionOperation<CustomType>> for CustomOperation {
+            fn from(_operation: ConditionOperation<CustomType>) -> Self {
+                Self::Array(ArrayOperation::Condition(ConditionOperation::new()))
+            }
+        }
+
+        impl From<ScanOperation<CustomType>> for CustomOperation {
+            fn from(operation: ScanOperation<CustomType>) -> Self {
+                // This family contains arrays only, so its scan descriptor uses the ordinary array semantics.
+                let scan = ScanOperation::new(operation.carry_count(), operation.iteration_count().clone())
+                    .with_reverse(operation.reverse())
+                    .with_unroll(operation.unroll())
+                    .unwrap()
+                    .with_stacked_axis_shardings(operation.stacked_axis_shardings().to_vec());
+                Self::Array(ArrayOperation::Scan(scan))
+            }
+        }
+
+        impl From<GuardOperation<CustomType>> for CustomOperation {
+            fn from(operation: GuardOperation<CustomType>) -> Self {
+                Self::Guard(operation)
+            }
+        }
+
+        impl From<ZeroOperation<CustomType>> for CustomOperation {
+            fn from(operation: ZeroOperation<CustomType>) -> Self {
+                Self::Zero(operation)
+            }
+        }
+
+        impl OperationProjection<ArrayType> for CustomOperation {
+            type Projected = ArrayOperation<Array>;
+        }
+
+        impl ResidualZeroProvider<CustomType> for CustomOperation {}
+
+        impl ResidualStorageOperation<CustomType> for CustomOperation {
+            fn residual_to_storage(_residual_type: &CustomType) -> Result<Option<Self>, TypeError> {
+                Ok(None)
+            }
+
+            fn residual_from_storage(_residual_type: &CustomType) -> Result<Option<Self>, TypeError> {
+                Ok(None)
+            }
+
+            fn residual_from_carrier(
+                _residual_type: &CustomType,
+                _carrier_type: &CustomType,
+            ) -> Result<Option<Self>, TypeError> {
+                Ok(None)
+            }
+        }
+
+        fn assert_differentiable<C: Context<Type = CustomType>>()
+        where
+            WhileOperation<CustomType>: DifferentiableOperation<C>,
+        {
+        }
+
+        assert_differentiable::<TracingContext<CustomValue, CustomOperation>>();
     }
 
     #[test]
@@ -12627,7 +12974,7 @@ mod tests {
                 bind_while(WhileOperation::new().with_iteration_bound(3)?, vec![condition, body], &inputs)
             },
             vec![counter_type, state_type],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let jvp = program.to_flat_program().jvp_with_respect_to(&[1]).unwrap();
@@ -13284,7 +13631,7 @@ mod tests {
                 bind_while(WhileOperation::new().with_iteration_bound(3)?, vec![condition, body], &inputs)
             },
             vec![state_type],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(
@@ -13338,7 +13685,7 @@ mod tests {
                 bind_while(WhileOperation::new().with_iteration_bound(3)?, vec![condition, body], &inputs)
             },
             vec![counter_type, state_type],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let jvp = program.to_flat_program().jvp_with_respect_to(&[1]).unwrap();
@@ -13436,7 +13783,7 @@ mod tests {
                 bind_while(WhileOperation::new().with_iteration_bound(3)?, vec![condition, body], &inputs)
             },
             vec![state_type.clone()],
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let program = program.to_flat_program();
@@ -13589,7 +13936,7 @@ mod tests {
         /// Builds a program that applies `shard_map` to inputs of the `global_types`, with a body that runs the
         /// bounded `while` loop over the condition and body `regions` on the local values of those inputs.
         fn mapped_while_program(
-            shard_map: ShardMap,
+            boundary: ShardMapBoundary,
             global_types: Vec<ArrayType>,
             regions: Vec<TestIrProgram>,
         ) -> TestIrProgram {
@@ -13599,7 +13946,7 @@ mod tests {
             let inputs = global_types
                 .iter()
                 .enumerate()
-                .map(|(index, r#type)| map_body.add_input(shard_map.local_input_type(index, r#type).unwrap().into()))
+                .map(|(index, r#type)| map_body.add_input(boundary.local_input_type(index, r#type).unwrap().into()))
                 .collect();
             let while_operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
             let outputs = map_body.add_instruction(while_operation, regions, inputs, None).unwrap().to_vec();
@@ -13611,7 +13958,7 @@ mod tests {
                 )
                 .unwrap();
             let global_types = global_types.into_iter().map(ArrayIrType::from).collect::<Vec<_>>();
-            let operation = ShardMapOperation::from_program(&map_body, global_types.clone(), shard_map).unwrap();
+            let operation = ShardMapOperation::from_program(&map_body, global_types.clone(), boundary).unwrap();
             let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
             let map_body = builder.import_program(map_body);
             let inputs = global_types.into_iter().map(|r#type| builder.add_input(r#type)).collect();
@@ -13641,8 +13988,9 @@ mod tests {
         // two iterations of the masked form, whose per-item masks differ across devices. Locally
         // `f = [x⁴, x², x², x⁴]`, with value `[16, 25, 25, 81]` and derivative
         // `[4 x³, 2 x, 2 x, 4 x³] = [32, 10, 10, 108]`.
-        let shard_map = ShardMap::new(mesh.clone(), vec![sharded.clone()], vec![sharded.clone()], Vec::new()).unwrap();
-        let local_type = shard_map.local_input_type(0, &global_type).unwrap();
+        let boundary =
+            ShardMapBoundary::new(mesh.clone(), vec![sharded.clone()], vec![sharded.clone()], Vec::new()).unwrap();
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
         let mut condition = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let state = condition.add_input(local_type.clone().into());
         let limit = condition.add_constant(array(Array::from_elements(local_type.clone(), &[10f32, 10.0]).unwrap()));
@@ -13656,7 +14004,7 @@ mod tests {
         let body = body
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![squared], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let program = mapped_while_program(shard_map, vec![global_type.clone()], vec![condition, body]);
+        let program = mapped_while_program(boundary, vec![global_type.clone()], vec![condition, body]);
         let x = array(Array::vector(vec![2f32, 5.0, 5.0, 3.0]).unwrap());
 
         // Each device stages the masked augmented loop and the masked tangent scan over its own shard, so the counter,
@@ -13680,8 +14028,8 @@ mod tests {
                 lambda %0:f32[4], %1:f32[4] .
                 let %2:{global_state}, %3:{global_state} = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[{global_sharding}, {global_sharding}],
-                    out_shardings=[{global_sharding}, {global_sharding}],
+                    input_shardings=[{global_sharding}, {global_sharding}],
+                    output_shardings=[{global_sharding}, {global_sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global_state}, {global_state}],
                     global_output_types=[{global_state}, {global_state}],
@@ -13776,15 +14124,15 @@ mod tests {
         // is invariant while the stored residual `x` varies, and forward mode, linearization, and the pullback still
         // read each device's own residual stack. Two iterations give `[x⁴, …] = [16, 625, 625, 81]` with derivative
         // `4 x³ = [32, 500, 500, 108]`.
-        let shard_map = ShardMap::new(
+        let boundary = ShardMapBoundary::new(
             mesh.clone(),
             vec![replicated.clone(), sharded.clone()],
             vec![replicated.clone(), sharded],
             Vec::new(),
         )
         .unwrap();
-        let counter_type = shard_map.local_input_type(0, &ArrayType::scalar(DataType::I64)).unwrap();
-        let local_type = shard_map.local_input_type(1, &global_type).unwrap();
+        let counter_type = boundary.local_input_type(0, &ArrayType::scalar(DataType::I64)).unwrap();
+        let local_type = boundary.local_input_type(1, &global_type).unwrap();
         let mut condition = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let counter = condition.add_input(counter_type.clone().into());
         condition.add_input(local_type.clone().into());
@@ -13814,7 +14162,7 @@ mod tests {
             )
             .unwrap();
         let program =
-            mapped_while_program(shard_map, vec![ArrayType::scalar(DataType::I64), global_type], vec![condition, body]);
+            mapped_while_program(boundary, vec![ArrayType::scalar(DataType::I64), global_type], vec![condition, body]);
         let counter = array(Array::scalar(0i64).unwrap());
         let x = array(Array::vector(vec![2f32, 5.0, 5.0, 3.0]).unwrap());
         let final_counter = array(
@@ -15508,12 +15856,13 @@ mod tests {
             .unwrap();
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let replicated = Sharding::replicated(mesh.clone(), 0);
-        let shard_map = ShardMap::new(mesh, vec![replicated.clone(), replicated], Vec::new(), Vec::new()).unwrap();
+        let boundary =
+            ShardMapBoundary::new(mesh, vec![replicated.clone(), replicated], Vec::new(), Vec::new()).unwrap();
         let input_types = vec![ArrayIrType::from(scalar_type.clone()); 2];
         let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
         let map_body = builder.import_program(map_body);
         let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let operation = ShardMapOperation::from_boundary(shard_map, input_types, Vec::<ArrayIrType>::new());
+        let operation = ShardMapOperation::from_boundary(boundary, input_types, Vec::<ArrayIrType>::new());
         builder.add_instruction(operation, vec![map_body], inputs, None).unwrap();
         let mapped = builder
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
@@ -16143,7 +16492,10 @@ mod tests {
                     ArrayIrType::Array(invariant_type.clone()),
                     ArrayIrType::Array(varying_type.clone()),
                 ],
-                vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+                vec![(
+                    "m".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
             )
             .unwrap();
             assert_eq!(
@@ -16167,7 +16519,7 @@ mod tests {
             );
 
             // Under `shard_map`, every device rotates its own copy of the state, so the outputs are varying.
-            let map = ShardMap::new(
+            let map = ShardMapBoundary::new(
                 mesh.clone(),
                 vec![replicated.clone(), replicated.clone(), sharded.clone()],
                 vec![sharded.clone(); 3],
@@ -16235,7 +16587,10 @@ mod tests {
                 Ok(vec![counter, value])
             },
             vec![ArrayIrType::Array(varying_type.clone()), ArrayIrType::Array(invariant_type.clone())],
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "m".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -16262,7 +16617,8 @@ mod tests {
         );
 
         // Device 0 counts from 0 and doubles the value three times, while device 1 counts from 2 and doubles it once.
-        let map = ShardMap::new(mesh, vec![sharded.clone(), replicated], vec![sharded.clone(); 2], Vec::new()).unwrap();
+        let map = ShardMapBoundary::new(mesh, vec![sharded.clone(), replicated], vec![sharded.clone(); 2], Vec::new())
+            .unwrap();
         let global_types =
             vec![ArrayType::new_static(DataType::F32, [2]).into(), ArrayType::new_static(DataType::F32, [1]).into()];
         let operation = ShardMapOperation::from_program(&program, global_types, map).unwrap();
@@ -16312,7 +16668,7 @@ mod tests {
                 ArrayIrType::Array(varying_type.clone()),
                 ArrayIrType::Reference(ReferenceType::new(invariant_type.clone())),
             ],
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         );
         assert_eq!(
             result.map(|_| ()),
@@ -16396,11 +16752,18 @@ mod tests {
                     axis: 0,
                     size: 2,
                     mesh: LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                    checks_manual_variation: true,
                 })
             }
 
             fn named_axes(&self) -> Vec<(String, NamedAxis)> {
                 vec![("m".to_string(), self.named_axis("m").unwrap())]
+            }
+        }
+
+        impl MeshContext for RecordingContext {
+            fn default_mesh(&self) -> Option<LogicalMesh> {
+                self.named_axis("m").and_then(|axis| axis.mesh().cloned())
             }
         }
 

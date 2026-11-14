@@ -23,13 +23,14 @@
 //! than once per way of supplying regions. [`EmptyRegionDriver`] supplies the read-side contract, and a transform
 //! driver that performs no recursion, for applications with no attached regions (e.g., direct rule invocations).
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Index;
 use std::rc::{Rc, Weak};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use serde::Serialize;
 
@@ -389,12 +390,83 @@ impl<V: Typed + Parameter, O> Region<V, O> {
     pub(crate) fn invalidate_transform_cache(&mut self) {
         self.transform_cache = RegionTransformCache::new();
     }
+
+    /// Returns whether output-rooted simplification emits every atom and instruction in this region in its original
+    /// position. This region must already be sealed and have no instruction retained when unused. Matching the next
+    /// expected source index proves that the emitted atom mapping and instruction order are both the identity,
+    /// without rebuilding either.
+    pub(super) fn simplification_is_identity(&self) -> bool {
+        /// A source dependency visit or instruction emission in simplification's post-order walk.
+        enum Step {
+            /// Visits the next source atom, reusing any already emitted prefix atom.
+            Visit(AtomId),
+
+            /// Checks one instruction after every input has been emitted.
+            Emit(usize),
+        }
+
+        let shape = RegionSimplificationShape::of(self);
+        if !shape.atoms_pin_every_instruction
+            || !shape.atoms_are_instruction_ordered
+            || self.input_ids().iter().enumerate().any(|(index, input)| input.index() != index)
+        {
+            return false;
+        }
+
+        let instruction_by_output = self.instruction_by_output();
+        let mut pending = Vec::new();
+        let mut next_atom = self.input_ids().len();
+        let mut next_instruction = 0;
+        for output in self.output_ids().iter().copied() {
+            pending.push(Step::Visit(output));
+            while let Some(step) = pending.pop() {
+                match step {
+                    Step::Visit(atom) if atom.index() < next_atom => {}
+                    Step::Visit(atom) => match &self.atoms()[atom.index()] {
+                        Atom::Constant(_) => {
+                            if atom.index() != next_atom {
+                                return false;
+                            }
+                            next_atom += 1;
+                        }
+                        Atom::Variable(_) => {
+                            let Some(instruction) = instruction_by_output[atom.index()] else {
+                                return false;
+                            };
+                            pending.push(Step::Emit(instruction));
+                            pending.extend(
+                                self.instructions()[instruction].inputs().iter().rev().copied().map(Step::Visit),
+                            );
+                        }
+                    },
+                    Step::Emit(instruction) => {
+                        if instruction != next_instruction {
+                            return false;
+                        }
+                        for output in self.instructions()[instruction].outputs() {
+                            if output.index() != next_atom {
+                                return false;
+                            }
+                            next_atom += 1;
+                        }
+                        next_instruction += 1;
+                    }
+                }
+            }
+        }
+        next_atom == self.atoms().len() && next_instruction == self.instructions().len()
+    }
 }
 
 /// Sealed [`Region`] stored together with metadata derived from its immutable contents and already-sealed descendants.
 /// Keeping the metadata in the same arena entry makes it impossible for a published [`RegionArena`] to pair a region
 /// with a stale [`EffectsSummary`] or with a [`TypeIdentitySignature`] derived from a different region.
-#[derive(Clone, Debug)]
+///
+/// Arenas share entries through [`Arc`]s and copy them on write. A copied entry keeps all of its metadata, including
+/// the lazily cached interface and simplification answer, so a mutation through [`Arc::make_mut`] may change only what
+/// that metadata does not depend on: the attached [`RegionId`]s, through [`Self::relocate`], and the transform cache.
+/// Any other change to a sealed region must seal a new entry instead using [`RegionArena::push`].
+#[derive(Clone)]
 struct RegionWithMetadata<V: Typed + Parameter, O> {
     /// Immutable computation [`Region`].
     region: Region<V, O>,
@@ -404,6 +476,15 @@ struct RegionWithMetadata<V: Typed + Parameter, O> {
 
     /// Structurally closed [`TypeIdentitySignature`] of `region`.
     type_identity_signature: TypeIdentitySignature<<V::Type as Type>::Identity>,
+
+    /// Lazily derived boundary interface, shared only between faithful copies of this sealed region. Copies keep it,
+    /// so only mutations that preserve the boundary and effects are allowed.
+    interface: OnceLock<Arc<RegionInterface<V::Type>>>,
+
+    /// Lazily cached result of [`Self::simplification_is_identity()`]. Caching it in the sealed entry means that it is
+    /// computed once per sealed region rather than once per simplification, which matters because callee regions are
+    /// shared by many programs and are simplified again in each of them.
+    simplification_is_identity: OnceLock<bool>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
@@ -411,7 +492,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
     /// `sealed_regions`, which must contain every region it references. A sealed region that attaches descendants
     /// starts over with no derived transforms because the identifiers it attaches acquire their meaning here.
     #[inline]
-    fn new(region: Region<V, O>, sealed_regions: &[Self]) -> Result<Self, ProgramError> {
+    fn new(region: Region<V, O>, sealed_regions: &[Arc<Self>]) -> Result<Self, ProgramError> {
         Self::seal(region, sealed_regions, TransformCachePolicy::Mint)
     }
 
@@ -419,14 +500,17 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
     /// already derived from its contents. Refer to [`TransformCachePolicy::Preserve`] for the closure-preservation
     /// precondition every caller must guarantee.
     #[inline]
-    fn new_preserving_transform_cache(region: Region<V, O>, sealed_regions: &[Self]) -> Result<Self, ProgramError> {
+    fn new_preserving_transform_cache(
+        region: Region<V, O>,
+        sealed_regions: &[Arc<Self>],
+    ) -> Result<Self, ProgramError> {
         Self::seal(region, sealed_regions, TransformCachePolicy::Preserve)
     }
 
     /// Seals `region` against `sealed_regions` under the provided [`TransformCachePolicy`].
     fn seal(
         mut region: Region<V, O>,
-        sealed_regions: &[Self],
+        sealed_regions: &[Arc<Self>],
         transform_cache_policy: TransformCachePolicy,
     ) -> Result<Self, ProgramError> {
         // Sealing is the point at which the region's attached identifiers acquire meaning, so it is also the point at
@@ -494,9 +578,9 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
 
         // Constants must be storable per the `Value` rendering contract (i.e., deterministic, semantically complete
         // renderings), because program renderings double as structural fingerprints. Sealing is the one boundary that
-        // every region construction path crosses (i.e., program builders, `Program::new`, and region imports alike),
-        // so values with process-local identity, such as mutable reference holders, are rejected for every region,
-        // including nested ones.
+        // every new region construction path crosses (i.e., program builders and `Program::new`), while faithful
+        // imports retain the already checked source metadata. Values with process-local identity, such as mutable
+        // reference holders, are therefore rejected for every region, including nested ones.
         for atom in region.atoms.iter() {
             if let Atom::Constant(value) = atom {
                 value.validate_as_constant()?;
@@ -519,7 +603,168 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
             },
         )?;
         let type_identity_signature = region.type_identity_signature()?;
-        Ok(Self { region, effects, type_identity_signature })
+        Ok(Self {
+            region,
+            effects,
+            type_identity_signature,
+            interface: OnceLock::new(),
+            simplification_is_identity: OnceLock::new(),
+        })
+    }
+
+    /// Relocates this sealed entry in place by changing only attached identifiers, copying it first only when it is
+    /// shared and an identifier changes. The mapping must name faithful copies of the same descendants, so all source
+    /// metadata and retained transforms remain valid.
+    fn relocate(region: &mut Arc<Self>, remapping: impl Fn(RegionId) -> RegionId) {
+        let needs_relocation = region
+            .region
+            .instructions
+            .iter()
+            .flat_map(|instruction| instruction.regions())
+            .any(|attached| remapping(*attached) != *attached);
+        if needs_relocation {
+            for instruction in &mut Arc::make_mut(region).region.instructions {
+                for attached in &mut instruction.regions {
+                    *attached = remapping(*attached);
+                }
+            }
+        }
+    }
+
+    /// Returns the interface derived from this sealed region's immutable boundaries and recursive effects.
+    fn interface(&self) -> &RegionInterface<V::Type> {
+        self.interface
+            .get_or_init(|| {
+                Arc::new(
+                    RegionInterface::new(self.region.input_types(), self.region.output_types(), self.effects.classes())
+                        .with_deferred_work(self.effects.has_deferred_work()),
+                )
+            })
+            .as_ref()
+    }
+
+    /// Returns whether simplifying this region on its own would return it unchanged (i.e., whether every atom and
+    /// instruction is live and already in the order that simplification emits). Simplification uses this to keep the
+    /// sealed entry, with its metadata and transform cache, instead of rebuilding it, and to return a program unchanged
+    /// when the answer holds for all of its regions. The answer is conservatively `false` when the region contains
+    /// instructions retained when unused (e.g., effects). It does not cover whether the region's descendants change
+    /// or whether a program still reaches it, since those depend on other regions, so callers check them separately.
+    /// The answer is computed on first use and then cached.
+    fn simplification_is_identity(&self) -> bool {
+        *self
+            .simplification_is_identity
+            .get_or_init(|| !self.effects.is_retained_when_unused() && self.region.simplification_is_identity())
+    }
+}
+
+impl<V: Typed + Parameter + Debug, O: Debug> Debug for RegionWithMetadata<V, O> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Lazy metadata initialization is an implementation detail, so it must not change arena diagnostics.
+        formatter
+            .debug_struct("RegionWithMetadata")
+            .field("region", &self.region)
+            .field("effects", &self.effects)
+            .field("type_identity_signature", &self.type_identity_signature)
+            .finish()
+    }
+}
+
+/// Contents shape of a [`Region`], captured before [`Program`] simplification rebuilds it so that the rebuild can be
+/// recognized as the identity on that region's contents. This type exists to keep [`Region`] transform caches alive
+/// across simplification. Every content-changing region construction must mint a fresh [`RegionTransformCache`],
+/// because that cache retains pure functions of the region's contents. Simplification, however, runs on essentially
+/// every built [`Program`] (i.e., the standard pipeline is [`ProgramBuilder::build`] followed by
+/// [`Program::into_simplified`]), and it usually rebuilds regions _without changing them_. If those identity rebuilds
+/// also minted fresh caches, transform caching would be severed at the one pipeline every program flows through,
+/// and a callee's retained linearization or transposition could never be shared with any program that imports it.
+/// Simplification therefore captures this shape before rebuilding a region and asks [`Self::is_identity_rebuild`]
+/// afterward whether the rebuild was the identity. If so, the rebuilt region adopts the source region's cache, and
+/// otherwise it keeps its fresh one. Note that the recognition is deliberately conservative. A false negative merely
+/// misses a cache share and costs repeated transform work. A false positive would share cached transforms across
+/// regions with different contents and produce wrong programs. Every field and check below is therefore chosen
+/// so that recognition can only fail toward the safe side.
+pub(super) struct RegionSimplificationShape {
+    /// Number of [`Atom`]s in the source [`Region`].
+    atom_count: usize,
+
+    /// Number of [`Instruction`]s in the source [`Region`].
+    instruction_count: usize,
+
+    /// Boolean indicating whether every source [`Instruction`] is pinned to its position by at least one output
+    /// [`Atom`]. The only per-instruction evidence [`Self::is_identity_rebuild`] receives is the source-to-rebuilt
+    /// [`Atom`] identifier mapping, so an instruction can be proven preserved only _through the atoms it produces_:
+    /// an identity mapping over every source atom pins the producing instruction of each atom to its original position.
+    /// An instruction with no outputs (i.e., a purely effectful one, such as a print) is invisible to that evidence
+    /// (i.e., the mapping cannot show whether it survived or where it ended up) so when this is `false`, identity
+    /// recognition is refused outright rather than risking a cache share that no atom can attest to.
+    atoms_pin_every_instruction: bool,
+
+    /// Boolean indicating whether the source [`Instruction`]s' first output [`Atom`] identifiers strictly increase
+    /// with instruction order. Atom evidence pins each instruction to the atoms it produces, but the rebuild emits
+    /// instructions in the order in which their outputs are reached, not in source instruction order. Those two
+    /// orders agree exactly when the source [`Region`] numbers its atoms in instruction order, which every
+    /// [`ProgramBuilder`] region does because each instruction appends its outputs to the atom table as it is added.
+    /// A hand-built region that numbers its atoms against its instruction order can instead be rebuilt with a permuted,
+    /// data-independent, instruction sequence that the mapping alone cannot distinguish from the identity, so when this
+    /// is `false`, identity recognition is refused.
+    atoms_are_instruction_ordered: bool,
+}
+
+impl RegionSimplificationShape {
+    /// Captures the [`RegionSimplificationShape`] of `region`.
+    pub(super) fn of<V: Typed + Parameter, O>(region: &Region<V, O>) -> Self {
+        let mut atoms_pin_every_instruction = true;
+        let mut atoms_are_instruction_ordered = true;
+        let mut previous_first_output = None;
+        for instruction in region.instructions() {
+            let Some(first_output) = instruction.outputs().first().copied() else {
+                atoms_pin_every_instruction = false;
+                continue;
+            };
+            if previous_first_output.is_some_and(|previous| first_output <= previous) {
+                atoms_are_instruction_ordered = false;
+            }
+            previous_first_output = Some(first_output);
+        }
+        Self {
+            atom_count: region.atoms().len(),
+            instruction_count: region.instructions().len(),
+            atoms_pin_every_instruction,
+            atoms_are_instruction_ordered,
+        }
+    }
+
+    /// Returns whether simplification rebuilt this region with exactly its original contents, which is the precondition
+    /// for `rebuilt` to share the source region's transform cache. [`Program`] simplification copies surviving
+    /// [`Atom`]s and [`Instruction`]s unchanged and only renumbers atom identifiers, so the rebuild is the identity
+    /// exactly when no atom was dropped, none was renumbered, and no instruction was dropped or reordered. Equal atom
+    /// and instruction counts together with an identity mapping over every source atom establish all of that, provided
+    /// both shape flags hold: (1) an output-free instruction's survival and position are invisible to the mapping
+    /// (i.e., [`Self::atoms_pin_every_instruction`]), and (2) atom evidence pins instruction order only when the source
+    /// numbers its atoms in instruction order (i.e., [`Self::atoms_are_instruction_ordered`]). The rebuilt region's
+    /// instructions may still have their attached [`RegionId`]s renumbered afterward by
+    /// [`RegionArena::try_rebuild_regions`], so the recognized identity is an identity _up to region-identifier
+    /// renumbering_. That is sound for cache sharing for the same reason [`RegionArena::append`] keeps derived metadata
+    /// valid: renumbering preserves the complete reachable region graph's topology and changes no region boundary,
+    /// [`Operation`], or [`Atom`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `atom_id_mapping`: Source-to-rebuilt [`AtomId`] mapping indexed by source atom position, with one slot
+    ///     per source atom.
+    ///   - `rebuilt`: [`Region`] that simplification rebuilt from this shape's source region.
+    pub(super) fn is_identity_rebuild<V: Typed + Parameter, O>(
+        &self,
+        atom_id_mapping: &[Option<AtomId>],
+        rebuilt: &Region<V, O>,
+    ) -> bool {
+        self.atoms_pin_every_instruction
+            && self.atoms_are_instruction_ordered
+            && rebuilt.instructions().len() == self.instruction_count
+            && atom_id_mapping.len() == self.atom_count
+            && rebuilt.atoms().len() == self.atom_count
+            && atom_id_mapping.iter().enumerate().all(|(index, mapped)| *mapped == Some(AtomId::new(index)))
     }
 }
 
@@ -537,14 +782,19 @@ enum TransformCachePolicy {
     Preserve,
 }
 
-/// Append-only arena of sealed [`Region`]s and their immutable derived metadata. [`RegionId`]s are stable indexes into
-/// this arena. A region may reference only entries that precede it, allowing construction to validate and derive
+/// Append-only arena of sealed [`Region`]s and their immutable derived metadata. [`RegionId`]s are stable indexes
+/// into this arena. A region may reference only entries that precede it, allowing construction to validate and derive
 /// recursive metadata like [`EffectClasses`] and [`TypeIdentitySignature`]s in one ascending pass. Built [`Program`]s
-/// retain this arena without exposing mutable access to either regions or metadata.
+/// retain this arena without exposing mutable access to either regions or metadata. Note that clones share the sealed
+/// entries. Rebasing a region or detaching its transform cache makes a private copy of that entry, preserving the
+/// contents and cache identities visible through other arenas.
 #[derive(Clone, Debug)]
 pub struct RegionArena<V: Typed + Parameter, O> {
-    /// Sealed [`Region`]s and their derived metadata, in [`RegionId`] order.
-    regions: Vec<RegionWithMetadata<V, O>>,
+    /// Shared sealed [`Region`]s and their derived metadata, in [`RegionId`] order. Mutations use copy-on-write.
+    regions: Vec<Arc<RegionWithMetadata<V, O>>>,
+
+    /// Shared callee [`Program`]s whose entry regions this arena holds as plain interned roots.
+    callees: RegionArenaCallees<V, O>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
@@ -613,32 +863,47 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
         self.regions.get(id.index()).map(|region| &region.type_identity_signature)
     }
 
+    /// Returns the lazily derived and cached [`RegionInterface`] of the [`Region`] with the provided [`RegionId`] in
+    /// this [`RegionArena`].
+    #[inline]
+    pub(super) fn interface(&self, id: RegionId) -> Option<&RegionInterface<V::Type>> {
+        self.regions.get(id.index()).map(|region| region.interface())
+    }
+
+    /// Returns whether output-rooted simplification preserves a sealed pure body exactly, without considering
+    /// whether its descendants change or whether other arena entries become unreachable.
+    #[inline]
+    pub(super) fn simplification_is_identity(&self, id: RegionId) -> Option<bool> {
+        self.regions.get(id.index()).map(|region| region.simplification_is_identity())
+    }
+
     /// Returns the [`RegionTransformCache`] of the [`Region`] with the provided [`RegionId`] in this [`RegionArena`].
     #[inline]
     pub(crate) fn transform_cache(&self, id: RegionId) -> Option<&RegionTransformCache<V, O>> {
         self.get(id).map(Region::transform_cache)
     }
 
-    /// Makes the [`Region`] with the provided [`RegionId`] share `transform_cache`. Refer to
-    /// [`Region::adopt_transform_cache`] for the contents-equality precondition every caller must guarantee.
-    #[inline]
-    pub(crate) fn adopt_transform_cache(&mut self, id: RegionId, transform_cache: RegionTransformCache<V, O>) {
-        if let Some(region) = self.regions.get_mut(id.index()) {
-            region.region.adopt_transform_cache(transform_cache);
-        }
-    }
-
-    /// Detaches every [`Region`] whose [`RegionTransformCache`] is pointer-identical to `source` by minting
-    /// a fresh empty cache for it, preserving every unrelated cache. This is the arena-level worker behind
-    /// [`Program::detach_transform_cache`], which documents the publish-time cycle-prevention purpose and why
-    /// pointer-identical detachment is both necessary and sufficient. It iterates every region (including the entry
-    /// region) so no copy of the source can smuggle the storing cell into a published artifact. This function is
-    /// private to this crate deliberately as cache provenance must never be manipulated externally.
+    /// Detaches every [`Region`] whose [`RegionTransformCache`] is pointer-identical to `source` by minting a fresh
+    /// empty cache for it, while preserving every unrelated cache (in particular, the caches of descendants, whose
+    /// retained transforms remain reusable inside the published artifact). It iterates every region, including the
+    /// entry region, so no copy of the source can smuggle the storing cell into a published artifact.
+    ///
+    /// This is the publish-time sanitization step of [`RegionRef::transform`]. Cache cells ride region copies by strong
+    /// [`Arc`], and copy paths such as [`RegionRef::to_program`] deliberately adopt the source's cell to preserve
+    /// sharing. A derived program that legitimately contains a copy of its source region therefore carries the very
+    /// cell the artifact is about to be stored in, and publishing it unsanitized would close a strong reference cycle
+    /// (i.e., `cache -> artifact -> program -> region copy -> cache`) that leaks both once every public handle drops.
+    /// Detaching only the pointer-identical cells removes exactly the one self-edge a contract-abiding derivation can
+    /// create. Refer to the ownership-cycle discussion in the documentation of
+    /// [`transforms`](crate::programs::transforms) for why that is sufficient.
+    ///
+    /// This function is private to this crate deliberately as it is sound only as part of the sanitize-then-publish
+    /// sequence, and external transforms must never manipulate cache provenance directly.
     #[inline]
     pub(crate) fn detach_transform_cache(&mut self, source: &RegionTransformCache<V, O>) {
         for region in &mut self.regions {
             if region.region.transform_cache.ptr_eq(source) {
-                region.region.invalidate_transform_cache();
+                Arc::make_mut(region).region.invalidate_transform_cache();
             }
         }
     }
@@ -646,7 +911,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
     /// Consumes this arena and returns its [`Region`]s in [`RegionId`] order.
     #[inline]
     pub fn into_regions(self) -> Vec<Region<V, O>> {
-        self.regions.into_iter().map(|region| region.region).collect()
+        self.regions.into_iter().map(|region| Arc::unwrap_or_clone(region).region).collect()
     }
 
     /// Seals and appends the provided [`Region`] to this [`RegionArena`], returning its stable identifier. A region
@@ -655,18 +920,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
     #[inline]
     pub fn push(&mut self, region: Region<V, O>) -> Result<RegionId, ProgramError> {
         let id = RegionId::new(self.regions.len());
-        self.regions.push(RegionWithMetadata::new(region, self.regions.as_slice())?);
-        Ok(id)
-    }
-
-    /// Seals and appends the provided [`Region`] exactly like [`Self::push`], except that it keeps the transforms
-    /// already derived from its contents. Refer to [`Region::adopt_transform_cache`] for the closure-preservation
-    /// precondition every caller must guarantee.
-    #[inline]
-    pub(crate) fn push_preserving_transform_cache(&mut self, region: Region<V, O>) -> Result<RegionId, ProgramError> {
-        let id = RegionId::new(self.regions.len());
-        self.regions
-            .push(RegionWithMetadata::new_preserving_transform_cache(region, self.regions.as_slice())?);
+        self.regions.push(Arc::new(RegionWithMetadata::new(region, self.regions.as_slice())?));
         Ok(id)
     }
 
@@ -677,27 +931,172 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
     pub fn append(&mut self, mut other: Self) -> usize {
         let offset = self.regions.len();
         for region in &mut other.regions {
-            for instruction in &mut region.region.instructions {
-                for attached in &mut instruction.regions {
-                    *attached = RegionId::new(attached.index() + offset);
-                }
-            }
+            RegionWithMetadata::relocate(region, |attached| RegionId::new(attached.index() + offset));
         }
         self.regions.append(&mut other.regions);
+        self.callees.entries.extend(
+            other
+                .callees
+                .entries
+                .into_iter()
+                .map(|(region, callee)| (RegionId::new(region.index() + offset), callee)),
+        );
         offset
     }
 
     /// Removes and returns the last [`Region`] in this [`RegionArena`].
-    #[inline]
     pub fn pop(&mut self) -> Option<Region<V, O>> {
-        self.regions.pop().map(|region| region.region)
+        let region = self.regions.pop()?;
+        let removed_id = RegionId::new(self.regions.len());
+        self.callees.entries.retain(|(id, _)| *id != removed_id);
+        Some(Arc::unwrap_or_clone(region).region)
+    }
+
+    /// Appends a faithful relocation of the sealed `source`, retaining its already validated recursive metadata.
+    /// Every attached source identifier must have a destination in `remapping` naming a faithful copy of the same
+    /// descendant. Source contents remain shared when their attached identifiers already name those destinations.
+    /// Renumbering changes no region boundary, operation, effect, or type identity, as for [`Self::append`].
+    pub(super) fn push_relocated_region(
+        &mut self,
+        source: RegionRef<'_, V, O>,
+        remapping: &HashMap<RegionId, RegionId>,
+    ) -> RegionId {
+        let mut region = source.arena.regions[source.id.index()].clone();
+        RegionWithMetadata::relocate(&mut region, |attached| remapping[&attached]);
+        let id = RegionId::new(self.regions.len());
+        self.regions.push(region);
+        id
+    }
+
+    /// Returns every interned callee root of this arena together with the shared callee [`Program`] whose entry region
+    /// it is, in recording order.
+    pub(super) fn callee_entries(&self) -> impl '_ + Iterator<Item = (RegionId, &Arc<Program<V, O, Vec<V>, Vec<V>>>)> {
+        self.callees.entries.iter().map(|(id, callee)| (*id, callee))
+    }
+
+    /// Returns the shared callee [`Program`] whose entry region is the root `id` of this arena, if `id` is an interned
+    /// callee root. Refer to the documentation of [`RegionArenaCallees`] for more information.
+    pub(super) fn callee(&self, id: RegionId) -> Option<&Arc<Program<V, O, Vec<V>, Vec<V>>>> {
+        self.callees.entries.iter().find_map(|(region, callee)| (*region == id).then_some(callee))
+    }
+
+    /// Returns `true` if this arena holds any interned callee root.
+    pub(super) fn has_callees(&self) -> bool {
+        !self.callees.entries.is_empty()
+    }
+
+    /// Records that the root `id` of this arena is the entry region of the shared `callee`.
+    pub(super) fn record_callee(&mut self, id: RegionId, callee: Arc<Program<V, O, Vec<V>, Vec<V>>>) {
+        self.callees.entries.push((id, callee));
+    }
+
+    /// Rebuilds selected region bodies, retaining sealed metadata when a body's identity proof and every attached
+    /// descendant permit it. The callback must return a body with a fresh transform cache, as constructed by
+    /// [`Region::new`], and may return the separate source cache only for an exact body identity rebuild. That handle
+    /// is the only permission to reuse a source cache; it is adopted only when every descendant is also preserved.
+    /// Reachability and compaction run after every body is decided, so unreferenced rebuilt regions are dropped before
+    /// sealing. The returned preservation mask and identifier mapping support faithful callee-record retention.
+    pub(super) fn try_rebuild_regions<
+        F: FnMut(RegionId, Region<V, O>) -> Result<(Region<V, O>, Option<RegionTransformCache<V, O>>), ProgramError>,
+    >(
+        self,
+        identity_bodies: &[bool],
+        entry: RegionId,
+        mut rebuild_fn: F,
+    ) -> Result<(Self, RegionId, Vec<bool>, Vec<Option<RegionId>>), ProgramError> {
+        /// A retained sealed entry or a changed body awaiting reachability and compaction before sealing.
+        enum Rebuild<V: Typed + Parameter, O> {
+            /// Original metadata whose complete attached closure remains unchanged.
+            Sealed(Arc<RegionWithMetadata<V, O>>),
+
+            /// Simplified body whose metadata must be derived after its live descendants have been selected.
+            Unsealed(Region<V, O>),
+        }
+
+        let mut bodies = Vec::with_capacity(self.regions.len());
+        let mut preserved = Vec::with_capacity(self.regions.len());
+        for (index, source) in self.regions.into_iter().enumerate() {
+            let descendants_preserved = |region: &Region<V, O>| {
+                region
+                    .instructions()
+                    .iter()
+                    .flat_map(|instruction| instruction.regions())
+                    .all(|attached| preserved.get(attached.index()).copied().unwrap_or(false))
+            };
+            if identity_bodies[index] && descendants_preserved(&source.region) {
+                bodies.push(Rebuild::Sealed(source));
+                preserved.push(true);
+                continue;
+            }
+
+            let source = match Arc::try_unwrap(source) {
+                Ok(source) => source.region,
+                Err(source) => source.region.clone(),
+            };
+            let (mut region, source_cache) = rebuild_fn(RegionId::new(index), source)?;
+
+            // Transforms of a region consume its attached descendants too, so a body whose descendant changed no
+            // longer has the contents that its retained transforms were derived from.
+            let keep_cache = source_cache.is_some() && descendants_preserved(&region);
+            if keep_cache {
+                region.adopt_transform_cache(source_cache.unwrap());
+            }
+
+            bodies.push(Rebuild::Unsealed(region));
+            preserved.push(keep_cache);
+        }
+
+        let reachable = reachable_region_mask(bodies.len(), [entry], |id| match &bodies[id.index()] {
+            Rebuild::Sealed(region) => &region.region,
+            Rebuild::Unsealed(region) => region,
+        });
+        let mut remapping = vec![None; bodies.len()];
+        let mut kept = 0;
+        for (index, reachable) in reachable.into_iter().enumerate() {
+            if reachable {
+                remapping[index] = Some(RegionId::new(kept));
+                kept += 1;
+            }
+        }
+
+        let mut arena = Self::new();
+        for (index, body) in bodies.into_iter().enumerate() {
+            if remapping[index].is_none() {
+                continue;
+            }
+            match body {
+                Rebuild::Sealed(mut region) => {
+                    RegionWithMetadata::relocate(&mut region, |attached| remapping[attached.index()].unwrap());
+                    arena.regions.push(region);
+                }
+                Rebuild::Unsealed(mut region) => {
+                    for instruction in &mut region.instructions {
+                        for attached in &mut instruction.regions {
+                            *attached = remapping[attached.index()].unwrap();
+                        }
+                    }
+                    arena.push_preserving_transform_cache(region)?;
+                }
+            }
+        }
+        Ok((arena, remapping[entry.index()].unwrap(), preserved, remapping))
+    }
+
+    /// Seals and appends the provided [`Region`] exactly like [`Self::push`], except that it keeps the transforms
+    /// already derived from its contents. Refer to [`Region::adopt_transform_cache`] for the closure-preservation
+    /// precondition every caller must guarantee.
+    fn push_preserving_transform_cache(&mut self, region: Region<V, O>) -> Result<RegionId, ProgramError> {
+        let id = RegionId::new(self.regions.len());
+        self.regions
+            .push(Arc::new(RegionWithMetadata::new_preserving_transform_cache(region, self.regions.as_slice())?));
+        Ok(id)
     }
 }
 
 impl<V: Typed + Parameter, O> Default for RegionArena<V, O> {
     #[inline]
     fn default() -> Self {
-        Self { regions: Vec::new() }
+        Self { regions: Vec::new(), callees: RegionArenaCallees::default() }
     }
 }
 
@@ -720,10 +1119,39 @@ impl<'r, V: Typed + Parameter, O> IntoIterator for &'r RegionArena<V, O> {
     }
 }
 
+/// Shared callee [`Program`]s whose entry regions a [`RegionArena`] holds as plain interned roots (and which were
+/// interned using [`ProgramBuilder::intern_callee`]), keyed by the root's [`RegionId`]. Importing such a root into
+/// another builder interns the same callee there instead of copying it, so the callee stays shared when a program
+/// that interns it is replayed or imported (e.g., when a transform replays a cached rule program that calls a named
+/// composite). Each entry holds its callee alive, so the provenance can never refer to a later allocation. Renamed or
+/// rebuilt arenas (e.g., pruned or converted programs) do not inherit these entries, so their roots are copied, while
+/// programs materialized from a region through a builder record the callees that they import again. Simplification and
+/// entry-boundary filtering are the exception, because they keep the entries of the roots whose complete reachable
+/// contents they carry over unchanged.
+#[derive(Clone)]
+struct RegionArenaCallees<V: Typed + Parameter, O> {
+    /// Interned roots and the callee [`Program`]s whose entry regions they are.
+    entries: Vec<(RegionId, Arc<Program<V, O, Vec<V>, Vec<V>>>)>,
+}
+
+impl<V: Typed + Parameter, O> Default for RegionArenaCallees<V, O> {
+    #[inline]
+    fn default() -> Self {
+        Self { entries: Vec::new() }
+    }
+}
+
+impl<V: Typed + Parameter, O> Debug for RegionArenaCallees<V, O> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(self.entries.iter().map(|(region, _)| region)).finish()
+    }
+}
+
 /// Borrowing [`Iterator`] over the [`Region`]s in a [`RegionArena`], in [`RegionId`] order.
 pub struct RegionArenaIterator<'r, V: Typed + Parameter, O> {
     /// [`Iterator`] over the [`RegionArena`]'s sealed [`Region`] entries.
-    regions: std::slice::Iter<'r, RegionWithMetadata<V, O>>,
+    regions: std::slice::Iter<'r, Arc<RegionWithMetadata<V, O>>>,
 }
 
 impl<'r, V: Typed + Parameter, O> Iterator for RegionArenaIterator<'r, V, O> {
@@ -786,6 +1214,21 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     #[inline]
     pub fn arena(self) -> &'r RegionArena<V, O> {
         self.arena
+    }
+
+    /// Returns the shared callee [`Program`] recorded for this root by [`ProgramBuilder::intern_callee`], if any.
+    /// Operation and transform rules can clone the returned [`Arc`] and supply it through [`AttachedRegions::Callees`]
+    /// to preserve sharing without materializing the root through [`Self::to_program`]. The returned program represents
+    /// the same rooted computation with the same input and output type identities. Cloning its [`Arc`] keeps it alive
+    /// independently of this region's arena.
+    ///
+    /// Returns [`None`] when no shared callee is recorded. Availability depends on construction history and
+    /// preservation through transforms, so callers must support this case (e.g., by materializing the root with
+    /// [`Self::to_program`]). The recorded allocation identity does not establish semantic equivalence with other
+    /// programs or eligibility for backend replacement.
+    #[inline]
+    pub fn interned_callee(self) -> Option<&'r Arc<Program<V, O, Vec<V>, Vec<V>>>> {
+        self.arena.callee(self.id())
     }
 
     /// Returns the rooted [`Region`].
@@ -851,15 +1294,11 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         })
     }
 
-    /// Returns the [`RegionInterface`] of the rooted [`Region`].
+    /// Returns the [`RegionInterface`] of the rooted [`Region`], which is derived once and cached with the sealed
+    /// region.
     #[inline]
-    pub fn interface(self) -> RegionInterface<V::Type>
-    where
-        O: Operation<Type = V::Type>,
-    {
-        let effects = self.effects();
-        RegionInterface::new(self.input_types(), self.output_types(), effects.classes())
-            .with_deferred_work(effects.has_deferred_work())
+    pub fn interface(self) -> &'r RegionInterface<V::Type> {
+        self.arena.interface(self.id).unwrap()
     }
 
     /// Returns the owned [`RegionKey`] of this [`Region`] and every region reachable from it through attached regions,
@@ -1166,26 +1605,21 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// region with placeholder input/output structures matching its input/output boundary. This operation takes time
     /// and space proportional to the size of the complete reachable region graph.
     pub fn to_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
-        // Importing appends the root after all of its descendants. Removing that final region leaves the complete
-        // descendant arena in place, and `build` assigns the promoted entry the same identifier the imported root had.
+        // Importing copies only the reachable closure, appends its root last, and preserves the source's already
+        // validated atoms and boundaries. The imported root can therefore become the public entry directly, so the
+        // `unwrap` is safe.
         let mut builder = ProgramBuilder::<V, O>::new();
-        let root = builder.import_region(self);
-        let Region { atoms, input_ids, output_ids, instructions, transform_cache } = builder.regions.pop().unwrap();
-        debug_assert_eq!(root.index(), builder.regions.len());
-        let input_count = input_ids.len();
-        let output_count = output_ids.len();
-        builder.atoms = atoms;
-        builder.input_ids = input_ids;
-        builder.instructions = instructions;
-        let mut program =
-            builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap();
-
-        // The promoted entry is this region's body with its descendants copied faithfully beneath it, so the
-        // materialized program's entry keeps the transforms already derived from these exact contents. Importing
-        // rebases the copied descendants' identifiers, which is exactly the renumbering that adoption tolerates.
-        let entry = program.entry();
-        program.regions.adopt_transform_cache(entry, transform_cache);
-        program
+        let entry = builder.import_region(self);
+        for (callee, region) in builder.callees {
+            builder.regions.record_callee(region, callee);
+        }
+        Program::from_sealed_regions(
+            vec![Placeholder; self.input_ids().len()],
+            vec![Placeholder; self.output_ids().len()],
+            builder.regions,
+            entry,
+        )
+        .unwrap()
     }
 }
 
@@ -1255,11 +1689,11 @@ impl RegionSlot {
 /// derived [`EffectClasses`] and deferred work obligation, so that region-carrying operations can validate and consume
 /// the boundary contracts of their attached regions (e.g., a condition operation checking that its branches agree, or
 /// a while operation rejecting an effectful body or deferred work when its predicate is batched) without ever seeing
-/// the region contents. [`ProgramBuilder`]s derive [`RegionInterface`]s from their own region arenas immediately before
-/// invoking [`Operation::infer_output_types`] and never store them. Final [`Program`] validation independently derives
-/// them again so that callers cannot inject stale interface metadata into an [`Instruction`]. Note, though,
-/// that constructing a [`RegionInterface`] directly is still allowed as passing synthetic interfaces to
-/// [`Operation::infer_output_types`] performs a pure hypothetical inference and cannot mutate or create a [`Program`].
+/// the region contents. [`ProgramBuilder`]s obtain interfaces only from immutable sealed regions in their own arenas.
+/// Those regions may cache their derived interfaces, and faithful relocations retain them because they preserve every
+/// boundary type and recursive effect. Rebuilding a region seals fresh metadata, so callers cannot inject stale
+/// interfaces into an [`Instruction`]. Constructing a [`RegionInterface`] directly remains allowed: passing a synthetic
+/// interface to [`Operation::infer_output_types`] performs pure hypothetical inference and cannot create a [`Program`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct RegionInterface<T: Type> {
     /// [`Type`]s derived from the [`Region`]'s input [`Atom`]s, in [`Region::input_ids`] order.
@@ -1316,6 +1750,20 @@ impl<T: Type> RegionInterface<T> {
     #[inline]
     pub fn has_deferred_work(&self) -> bool {
         self.has_deferred_work
+    }
+
+    /// Returns `interfaces` as one slice, in order (e.g., for [`Operation::infer_output_types`]). An empty list and a
+    /// single interface are borrowed, while several interfaces are cloned into an owned list, because a slice stores
+    /// its elements contiguously.
+    pub(crate) fn collect<'r, I: IntoIterator<Item = &'r Self>>(interfaces: I) -> Cow<'r, [Self]> {
+        let mut interfaces = interfaces.into_iter();
+        let Some(first) = interfaces.next() else {
+            return Cow::Borrowed(&[]);
+        };
+        let Some(second) = interfaces.next() else {
+            return Cow::Borrowed(std::slice::from_ref(first));
+        };
+        Cow::Owned([first, second].into_iter().chain(interfaces).cloned().collect())
     }
 }
 
@@ -1414,10 +1862,16 @@ pub trait RegionDriver<V: Value, O: Operation<Type = V::Type>> {
     }
 
     /// Returns the [`RegionInterface`]s of every [`Region`] attached to the current operation application, in
-    /// operation-defined order (e.g., for [`Operation::validate_region_interfaces`]).
+    /// operation-defined order (e.g., for [`Operation::validate_region_interfaces`]). Interfaces are cached on their
+    /// immutable sealed regions. An empty application or one attached region borrows its interface slice; several
+    /// attached regions return an owned list cloned from their cached interfaces.
     #[inline]
-    fn region_interfaces(&self) -> Vec<RegionInterface<V::Type>> {
-        self.regions().map(RegionRef::interface).collect()
+    fn region_interfaces<'r>(&'r self) -> Cow<'r, [RegionInterface<V::Type>]>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        RegionInterface::collect(self.regions().map(RegionRef::interface))
     }
 
     /// Returns an owned [`Program`] representing each attached [`Region`], in order. Rules that forward their regions
@@ -1673,6 +2127,14 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> ReplayRegionDriver<'r, V, O> {
                     Some(source) => RegionRef::new(&source.arena, *root)?,
                     None => self.source.with_id(*root)?,
                 };
+
+                // A root that interns a shared callee is interned again through the builder's own instantiation cache,
+                // which every replay of the root reuses instead of deriving its formal input renaming again. Renamed
+                // source views hold no interned callees, so only replays without a substitution reach this path.
+                if let Some(callee) = region.arena().callee(*root) {
+                    let callee = callee.clone();
+                    return builder.intern_callee(&callee, input_types.as_deref());
+                }
 
                 // No requested input signature and no replay substitution. Import directly through the shared
                 // region ID map. It records descendants too, so two attached roots can reuse one imported child.
@@ -2078,7 +2540,9 @@ pub trait RegionLiveness {
 /// which values produce each boundary value and which region outputs executing the operation demands. The two layers
 /// can differ: the provenance of a `while` loop correctly maps each body input to the corresponding instruction input,
 /// but the body also receives the outputs of its previous iteration, and so its data flow is [`Custom`](Self::Custom).
-/// Kernel calls, in turn, declare operation-local region inputs while their data flow is [`Opaque`](Self::Opaque).
+/// Kernel calls, in turn, declare operation-local region inputs while their data flow is [`Opaque`](Self::Opaque), and
+/// composite calls declare exact provenance while their data flow is [`Atomic`](Self::Atomic), because residual
+/// planning treats each call as one producer rather than looking through it.
 ///
 /// No declaration implies equal runtime values or reference identity; reference contracts remain separate. Pass
 /// the declaration returned by [`Operation::region_data_flow`] to queries with that same operation and its actual
@@ -2097,6 +2561,17 @@ pub enum RegionDataFlow<'o> {
     /// region outputs that [`Operation::output_region_provenance`] names, without feedback or bypasses.
     Provenance,
 
+    /// Declares that the operation is one producer of its outputs, like an operation without regions, even though its
+    /// computation regions execute once per application as [`Provenance`](Self::Provenance) declares. Every output
+    /// has [`Unknown`](RegionDataFlowSources::Unknown) sources (i.e., the operation itself produces it), so analyses
+    /// never look through the operation to the producers inside its regions. Unlike [`Opaque`](Self::Opaque)
+    /// declarations, this grants permission to replay the whole operation, which recomputes its outputs, whenever
+    /// its effects allow replay. Region inputs and execution demands are those of [`Provenance`](Self::Provenance)
+    /// declarations. Composite calls declare this data flow, which matches how JAX's residual policies treat
+    /// `custom_jvp_call` and `custom_vjp_call`, whose outputs a policy classifies by the call itself and which
+    /// are replayed whole when the policy does not save them, whatever work the call contains.
+    Atomic,
+
     /// Borrows the operation's own [`RegionDataFlowRule`] for recurrences, bypasses, or regions that execute without
     /// producing any output of the operation (e.g., the condition of a `while` loop).
     ///
@@ -2110,9 +2585,10 @@ pub enum RegionDataFlow<'o> {
 
 impl RegionDataFlow<'_> {
     /// Returns the validated producer sources of one input of an attached computation region. For
-    /// [`Provenance`](Self::Provenance) declarations, the sources come from [`Operation::input_region_provenance`],
-    /// and an input without declared provenance has [`Unknown`](RegionDataFlowSources::Unknown) sources, like every
-    /// input of an [`Opaque`](Self::Opaque) declaration.
+    /// [`Provenance`](Self::Provenance) and [`Atomic`](Self::Atomic) declarations, the sources come
+    /// from [`Operation::input_region_provenance`], and an input without declared provenance has
+    /// [`Unknown`](RegionDataFlowSources::Unknown) sources, like every input of an [`Opaque`](Self::Opaque)
+    /// declaration.
     ///
     /// # Parameters
     ///
@@ -2145,7 +2621,7 @@ impl RegionDataFlow<'_> {
         }
         let sources = match self {
             Self::Opaque => RegionDataFlowSources::Unknown,
-            Self::Provenance => match operation.input_region_provenance(region_index, input_index) {
+            Self::Provenance | Self::Atomic => match operation.input_region_provenance(region_index, input_index) {
                 InputRegionProvenance::None => RegionDataFlowSources::Unknown,
                 InputRegionProvenance::Local => RegionDataFlowSources::Known(Vec::new()),
                 InputRegionProvenance::Input { index } => {
@@ -2161,8 +2637,8 @@ impl RegionDataFlow<'_> {
     /// Returns the validated producer sources of one instruction output. For [`Provenance`](Self::Provenance)
     /// declarations, the sources come from [`Operation::output_region_provenance`], and an output without declared
     /// provenance has [`Unknown`](RegionDataFlowSources::Unknown) sources, because the operation itself produces it.
-    /// Every output of an [`Opaque`](Self::Opaque) declaration also has unknown sources. Only a custom rule can
-    /// declare that an output has no producers, by returning an empty source list.
+    /// Every output of an [`Opaque`](Self::Opaque) or [`Atomic`](Self::Atomic) declaration also has unknown sources.
+    /// Only a custom rule can declare that an output has no producers, by returning an empty source list.
     ///
     /// # Parameters
     ///
@@ -2190,7 +2666,7 @@ impl RegionDataFlow<'_> {
             )));
         }
         let sources = match self {
-            Self::Opaque => RegionDataFlowSources::Unknown,
+            Self::Opaque | Self::Atomic => RegionDataFlowSources::Unknown,
             Self::Provenance => {
                 let origins = operation.output_region_provenance(output_index);
                 if origins.is_empty() {
@@ -2209,10 +2685,11 @@ impl RegionDataFlow<'_> {
     /// [`RegionDataFlowRule::execution_demands`]. For [`Provenance`](Self::Provenance) declarations, each used
     /// instruction output demands the region outputs that its [`Operation::output_region_provenance`] names, every
     /// computation region executes the work that it retains for its effects, and rule regions never execute. When
-    /// a used output has no declared provenance, every output of every computation region is demanded. Every output
-    /// of every computation region is also demanded for [`Opaque`](Self::Opaque) declarations, used outputs or not,
-    /// because their regions may execute for their effects. Both cases over-approximate the executed work rather
-    /// than describing it precisely.
+    /// a used output has no declared provenance, every output of every computation region is demanded.
+    /// [`Atomic`](Self::Atomic) declarations demand what [`Provenance`](Self::Provenance) declarations demand,
+    /// because their regions execute in the same way. Every output of every computation region is also demanded
+    /// for [`Opaque`](Self::Opaque) declarations, used outputs or not, because their regions may execute for their
+    /// effects. Both cases over-approximate the executed work rather than describing it precisely.
     ///
     /// # Parameters
     ///
@@ -2245,7 +2722,7 @@ impl RegionDataFlow<'_> {
         }
 
         let demand = match self {
-            Self::Opaque | Self::Provenance => {
+            Self::Opaque | Self::Provenance | Self::Atomic => {
                 let mut demand = boundary
                     .regions
                     .iter()
@@ -2263,7 +2740,10 @@ impl RegionDataFlow<'_> {
                         continue;
                     }
 
-                    match self.output_sources(operation, output_index, boundary)? {
+                    // Atomic outputs hide their sources only from producer queries, while their regions execute like
+                    // those of provenance declarations.
+                    let declaration = if matches!(self, Self::Atomic) { Self::Provenance } else { self };
+                    match declaration.output_sources(operation, output_index, boundary)? {
                         RegionDataFlowSources::Unknown => unknown = true,
                         RegionDataFlowSources::Known(sources) => {
                             for source in sources {
@@ -2412,6 +2892,7 @@ impl Debug for RegionDataFlow<'_> {
         match self {
             Self::Opaque => formatter.write_str("Opaque"),
             Self::Provenance => formatter.write_str("Provenance"),
+            Self::Atomic => formatter.write_str("Atomic"),
             Self::Custom(_) => {
                 // Custom rules are trait objects without a `Debug` bound, so only their variant is shown.
                 formatter.debug_tuple("Custom").finish_non_exhaustive()
@@ -2627,6 +3108,7 @@ pub(crate) mod tests {
     use std::fmt::Display;
     use std::sync::Arc;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use ryft_macros::{Operation, Parameter};
@@ -2912,7 +3394,7 @@ pub(crate) mod tests {
             })
         }
 
-        fn is_compatible_with(&self, other: &Self) -> bool {
+        fn is_convertible_to(&self, other: &Self) -> bool {
             self == other
         }
 
@@ -3542,6 +4024,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_region_simplification_shape_is_identity_rebuild_refuses_output_free_instructions() {
+        // An instruction with no outputs produces no atom, so the source-to-rebuilt atom mapping cannot attest to its
+        // survival or its position. Even the strongest possible evidence (i.e., the region rebuilt as itself under an
+        // identity mapping) must therefore be refused.
+        let scalar = ArrayType::scalar(DataType::F64);
+        let region: Region<Array, TestRegionOperation> = Region::new(
+            vec![Atom::Variable(scalar.clone()), Atom::Variable(scalar)],
+            vec![AtomId::new(0)],
+            vec![AtomId::new(1)],
+            vec![
+                Instruction::new(
+                    TestRegionOperation::Add,
+                    vec![AtomId::new(0), AtomId::new(0)],
+                    vec![AtomId::new(1)],
+                    Vec::new(),
+                ),
+                Instruction::new(
+                    TestRegionOperation::Effectful(EffectClass::OrderedIo),
+                    vec![AtomId::new(0)],
+                    Vec::new(),
+                    Vec::new(),
+                ),
+            ],
+        );
+        let identity_mapping = (0..region.atoms().len()).map(|index| Some(AtomId::new(index))).collect::<Vec<_>>();
+        let shape = RegionSimplificationShape::of(&region);
+        assert!(!shape.atoms_pin_every_instruction);
+        assert!(!shape.is_identity_rebuild(&identity_mapping, &region));
+    }
+
+    #[test]
     fn test_region_arena_rejects_unsealed_region_reference() {
         let input = AtomId::new(0);
         let output = AtomId::new(1);
@@ -3601,6 +4114,193 @@ pub(crate) mod tests {
             program.entry_region_ref().type_identity_signature(),
             program.entry_region_ref().type_identity_signature(),
         ));
+    }
+
+    #[test]
+    fn test_region_arena_clone_preserves_source_on_cache_detachment() {
+        let program = program_with_reused_region();
+        let source_cache = program.entry_region().transform_cache().clone();
+        let leaf_cache = program.regions()[0].transform_cache().clone();
+        let mut copied = program.clone();
+        copied.regions.detach_transform_cache(&source_cache);
+        assert_eq!(program.to_string(), copied.to_string());
+        assert!(program.entry_region().transform_cache().ptr_eq(&source_cache));
+        assert!(!copied.entry_region().transform_cache().ptr_eq(&source_cache));
+        assert!(copied.regions()[0].transform_cache().ptr_eq(&leaf_cache));
+        assert_eq!(program.effects(), copied.effects());
+        assert_eq!(program.type_identity_signature(), copied.type_identity_signature());
+    }
+
+    #[test]
+    fn test_region_arena_push_relocated_region() {
+        let (source, [shared, first, second, root]) = diamond_closure_arena();
+        let mut destination = RegionArena::new();
+        let mut remapping = HashMap::new();
+        for source_id in [shared, first, second, root] {
+            let imported = destination.push_relocated_region(RegionRef::new(&source, source_id).unwrap(), &remapping);
+            remapping.insert(source_id, imported);
+        }
+        assert_eq!(destination.effects(root), source.effects(root));
+        assert_eq!(destination.type_identity_signature(root), source.type_identity_signature(root));
+
+        let mut relocated = RegionArena::new();
+        relocated.push(Region::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())).unwrap();
+        let mut remapping = HashMap::new();
+        for source_id in [shared, first, second, root] {
+            let imported = relocated.push_relocated_region(RegionRef::new(&source, source_id).unwrap(), &remapping);
+            remapping.insert(source_id, imported);
+            assert_eq!(imported, RegionId::new(source_id.index() + 1));
+        }
+        assert_eq!(relocated[2].instructions()[0].regions(), &[RegionId::new(1)]);
+        assert_eq!(relocated[3].instructions()[0].regions(), &[RegionId::new(1)]);
+        assert_eq!(relocated[4].instructions()[0].regions(), &[RegionId::new(2), RegionId::new(3)]);
+        assert_eq!(relocated.effects(RegionId::new(4)), source.effects(root));
+        assert_eq!(relocated.type_identity_signature(RegionId::new(4)), source.type_identity_signature(root));
+        assert!(relocated[4].transform_cache().ptr_eq(source[root.index()].transform_cache()));
+        assert_eq!(source[root.index()].instructions()[0].regions(), &[first, second]);
+    }
+
+    #[test]
+    fn test_region_arena_try_rebuild_regions() {
+        let program = program_with_reused_region();
+        let mut source = RegionArena::new();
+        source.push(Region::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())).unwrap();
+        source.append(program.regions().clone());
+        let original = source.clone();
+        let source_cache = original[2].transform_cache().clone();
+        let (rebuilt, entry, preserved, remapping) = source
+            .try_rebuild_regions(&[false, true, false], RegionId::new(2), |id, region| {
+                if id == RegionId::new(0) {
+                    // This changed body is deliberately malformed. It is orphaned, so compaction must remove it
+                    // before sealing, as in the original rebuild-then-compact simplification pipeline.
+                    return Ok((
+                        Region::new(
+                            vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
+                            Vec::new(),
+                            vec![AtomId::new(0)],
+                            Vec::new(),
+                        ),
+                        None,
+                    ));
+                }
+                assert_eq!(id, RegionId::new(2));
+                let Region { atoms, input_ids, output_ids, instructions, transform_cache } = region;
+                Ok((Region::new(atoms, input_ids, output_ids, instructions), Some(transform_cache)))
+            })
+            .unwrap();
+        assert_eq!(preserved, vec![false, true, true]);
+        assert_eq!(remapping, vec![None, Some(RegionId::new(0)), Some(RegionId::new(1))]);
+        assert_eq!(entry, RegionId::new(1));
+        assert_eq!(rebuilt.len(), 2);
+        assert_eq!(rebuilt[1].instructions()[0].regions(), &[RegionId::new(0)]);
+        assert_eq!(original[2].instructions()[0].regions(), &[RegionId::new(1)]);
+        assert!(rebuilt[1].transform_cache().ptr_eq(&source_cache));
+        assert_eq!(RegionRef::new(&rebuilt, entry).unwrap().to_program().to_string(), program.to_string());
+    }
+
+    #[test]
+    fn test_region_arena_simplification_is_identity() {
+        let program = program_with_reused_region();
+        let arena = program.regions();
+        let entry = program.entry();
+        assert!(arena.regions[entry.index()].simplification_is_identity.get().is_none());
+        let debug_before = format!("{arena:?}");
+        assert_eq!(arena.simplification_is_identity(entry), Some(true));
+        assert_eq!(arena.regions[entry.index()].simplification_is_identity.get(), Some(&true));
+        assert_eq!(format!("{arena:?}"), debug_before);
+        assert_eq!(arena.simplification_is_identity(RegionId::new(arena.len())), None);
+
+        let mut relocated = RegionArena::new();
+        relocated.push(Region::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())).unwrap();
+        let offset = relocated.append(arena.clone());
+        let entry = RegionId::new(entry.index() + offset);
+        assert_eq!(relocated.regions[entry.index()].simplification_is_identity.get(), Some(&true));
+        assert_eq!(relocated.simplification_is_identity(entry), Some(true));
+        assert_eq!(relocated[entry.index()].instructions()[0].regions(), &[RegionId::new(1)]);
+
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(TestRegionOperation::Deferred, Vec::new(), vec![input], None).unwrap()[0];
+        let deferred =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            deferred.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = deferred %0
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert!(deferred.entry_region().simplification_is_identity());
+        assert_eq!(deferred.regions().simplification_is_identity(deferred.entry()), Some(false));
+        assert_eq!(deferred.regions().regions[deferred.entry().index()].simplification_is_identity.get(), Some(&false));
+    }
+
+    #[test]
+    fn test_region_arena_simplification_is_identity_resets_for_rebuilds() {
+        let program = program_with_reused_region();
+        let entry = program.entry();
+        assert_eq!(program.regions().simplification_is_identity(entry), Some(true));
+
+        let mut changed_atoms = program.regions().clone().into_regions();
+        changed_atoms[entry.index()].atoms.push(Atom::Constant(Array::scalar(3.0f64).unwrap()));
+        let changed_atoms = RegionArena::from_regions(changed_atoms).unwrap();
+        assert!(changed_atoms.regions[entry.index()].simplification_is_identity.get().is_none());
+        assert_eq!(changed_atoms.simplification_is_identity(entry), Some(false));
+
+        let mut changed_boundary = program.regions().clone().into_regions();
+        changed_boundary[entry.index()].output_ids.clear();
+        let changed_boundary = RegionArena::from_regions(changed_boundary).unwrap();
+        assert!(changed_boundary.regions[entry.index()].simplification_is_identity.get().is_none());
+        assert_eq!(changed_boundary.simplification_is_identity(entry), Some(false));
+        assert_eq!(program.regions().simplification_is_identity(entry), Some(true));
+    }
+
+    #[test]
+    fn test_region_arena_interface() {
+        let program = program_with_reused_region();
+        let entry = program.entry();
+        let arena = program.regions();
+        assert!(arena.regions[entry.index()].interface.get().is_none());
+        let debug_before = format!("{arena:?}");
+        let first = arena.interface(entry).unwrap();
+        assert_eq!(format!("{arena:?}"), debug_before);
+        assert_eq!(first.input_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(first.output_types(), &[ArrayType::scalar(DataType::F64)]);
+        assert_eq!(first.effects(), program.effects().classes());
+        assert!(!first.has_deferred_work());
+        assert_eq!(arena.interface(RegionId::new(arena.len())), None);
+
+        let mut relocated = RegionArena::new();
+        relocated.push(Region::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())).unwrap();
+        let offset = relocated.append(arena.clone());
+        let relocated_entry = RegionId::new(entry.index() + offset);
+        assert_eq!(relocated.interface(relocated_entry), Some(first));
+        assert_eq!(relocated[relocated_entry.index()].instructions()[0].regions(), &[RegionId::new(1)]);
+        assert_eq!(arena[entry.index()].instructions()[0].regions(), &[RegionId::new(0)]);
+    }
+
+    #[test]
+    fn test_region_arena_interface_rebuilds_fresh_boundaries() {
+        let source = identity_program(ArrayType::scalar(DataType::F64));
+        let source_interface = source.regions().interface(source.entry()).unwrap();
+        let mut changed_type = source.entry_region().clone();
+        changed_type.atoms[0] = Atom::Variable(ArrayType::scalar(DataType::F32));
+        let typed = RegionArena::from_regions(vec![changed_type]).unwrap();
+        assert!(typed.regions[0].interface.get().is_none());
+        let typed_interface = typed.interface(RegionId::new(0)).unwrap();
+        assert_eq!(typed_interface.input_types(), &[ArrayType::scalar(DataType::F32)]);
+        assert_eq!(typed_interface.output_types(), &[ArrayType::scalar(DataType::F32)]);
+
+        let mut changed_boundary = source.entry_region().clone();
+        changed_boundary.output_ids.clear();
+        let projected = RegionArena::from_regions(vec![changed_boundary]).unwrap();
+        assert!(projected.regions[0].interface.get().is_none());
+        let projected_interface = projected.interface(RegionId::new(0)).unwrap();
+        assert_eq!(projected_interface.input_types(), source_interface.input_types());
+        assert_eq!(projected_interface.output_types(), &[]);
+        assert_eq!(source_interface.output_types(), &[ArrayType::scalar(DataType::F64)]);
     }
 
     #[test]
@@ -4137,7 +4837,12 @@ pub(crate) mod tests {
     #[test]
     fn test_region_ref_to_program() {
         let program = program_with_reused_region();
+        let source_artifact = program.entry_region_ref().retained_identity_transform();
         let materialized = program.entry_region_ref().to_program();
+        assert_eq!(materialized.to_string(), program.to_string());
+        assert_eq!(materialized.effects(), program.effects());
+        assert_eq!(materialized.type_identity_signature(), program.type_identity_signature());
+        assert!(Arc::ptr_eq(&source_artifact, &materialized.entry_region_ref().retained_identity_transform()));
         assert_eq!(materialized.regions().len(), 2);
         assert_eq!(materialized.instructions()[0].regions(), materialized.instructions()[1].regions());
         assert_eq!(materialized.input_types(), vec![ArrayType::scalar(DataType::F64)]);
@@ -4177,6 +4882,85 @@ pub(crate) mod tests {
         let interface = program.entry_region_ref().interface();
         assert_eq!(interface.effects(), EffectClasses::NONE);
         assert!(interface.has_deferred_work());
+    }
+
+    #[test]
+    fn test_region_interface_preserves_auto_traits() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+
+        // These generic bodies prove each independent public bound, including Send types that are not Sync.
+        fn assert_interface_send<T: Type + Send>() {
+            assert_send::<RegionInterface<T>>();
+        }
+        fn assert_interface_sync<T: Type + Sync>() {
+            assert_sync::<RegionInterface<T>>();
+        }
+        fn assert_arena_send_sync<
+            V: Value + Send + Sync + Typed<Type: Send + Sync + Type<Identity: Send + Sync>>,
+            O: Operation<Type = V::Type> + Send + Sync,
+        >() {
+            assert_send::<RegionArena<V, O>>();
+            assert_sync::<RegionArena<V, O>>();
+        }
+
+        assert_interface_send::<DataType>();
+        assert_interface_sync::<DataType>();
+        assert_arena_send_sync::<Array, TestRegionOperation>();
+    }
+
+    #[test]
+    fn test_region_driver_region_interfaces() {
+        let empty = AttachedRegions::<Array, TestRegionOperation>::Empty;
+        assert!(matches!(empty.region_interfaces(), Cow::Borrowed([])));
+
+        let scalar = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = builder.add_input(scalar.clone());
+        let effect = builder
+            .add_instruction(TestRegionOperation::Effectful(EffectClass::OrderedIo), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(TestRegionOperation::Deferred, Vec::new(), vec![effect], None).unwrap()[0];
+        let program = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = effectful %0
+                    %2:f32[] = deferred %1
+                in (%2)"},
+        );
+        let expected =
+            RegionInterface::new(vec![scalar.clone()], vec![scalar], EffectClasses::single(EffectClass::OrderedIo))
+                .with_deferred_work(true);
+        let callees = [Arc::clone(&program)];
+        let shared = AttachedRegions::Callees(&callees);
+        let shared_interfaces = shared.region_interfaces();
+        assert!(matches!(shared_interfaces, Cow::Borrowed(_)));
+        assert_eq!(shared_interfaces.as_ref(), std::slice::from_ref(&expected));
+
+        let owned = AttachedRegions::Owned(vec![program.entry_region_ref().to_program()]);
+        let owned_interfaces = owned.region_interfaces();
+        assert!(matches!(owned_interfaces, Cow::Borrowed(_)));
+        assert_eq!(owned_interfaces.as_ref(), std::slice::from_ref(&expected));
+
+        let roots = [program.entry()];
+        let mappings = RegionReplayMappings::new();
+        let replay =
+            AttachedRegions::from(ReplayRegionDriver::new(program.entry_region_ref(), &roots, &mappings).unwrap());
+        let replay_interfaces = replay.region_interfaces();
+        assert!(matches!(replay_interfaces, Cow::Borrowed(_)));
+        assert_eq!(replay_interfaces.as_ref(), std::slice::from_ref(&expected));
+
+        let other = Arc::new(identity_program(ArrayType::scalar(DataType::F64)));
+        let callees = [Arc::clone(&program), Arc::clone(&other)];
+        let multiple = AttachedRegions::Callees(&callees);
+        let multiple_interfaces = multiple.region_interfaces();
+        assert!(matches!(multiple_interfaces, Cow::Owned(_)));
+        assert_eq!(multiple_interfaces.as_ref(), &[expected, other.entry_region_ref().interface().clone()]);
+        assert!(other.regions().regions[other.entry().index()].interface.get().is_some());
     }
 
     #[test]
@@ -4527,10 +5311,14 @@ pub(crate) mod tests {
             RegionDataFlow::Provenance.input_sources(&operation, 1, 0, boundary),
             Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(0)])),
         );
-        // Opaque declarations ignore the declared provenance.
+        // Opaque declarations ignore the declared provenance, while atomic declarations keep it.
         assert_eq!(
             RegionDataFlow::Opaque.input_sources(&operation, 0, 0, boundary),
             Ok(RegionDataFlowSources::Unknown),
+        );
+        assert_eq!(
+            RegionDataFlow::Atomic.input_sources(&operation, 0, 0, boundary),
+            Ok(RegionDataFlowSources::Known(vec![RegionDataFlowSource::InstructionInput(2)])),
         );
 
         // Noncontiguous, cross-region feedback preserves declared source order alongside the initial binding.
@@ -4553,7 +5341,9 @@ pub(crate) mod tests {
         ];
         let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
         let rule = DataFlowRuleFixture::default();
-        for data_flow in [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Custom(&rule)] {
+        for data_flow in
+            [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Atomic, RegionDataFlow::Custom(&rule)]
+        {
             for (region_index, input_index, message) in [
                 (3, 0, "operation `with_regions` declares region 3 but has 3 attached regions"),
                 (2, 0, "operation `with_regions` declares data flow through non-computation region 2"),
@@ -4607,6 +5397,8 @@ pub(crate) mod tests {
             Ok(RegionDataFlowSources::Unknown),
         );
         assert_eq!(RegionDataFlow::Opaque.output_sources(&operation, 0, boundary), Ok(RegionDataFlowSources::Unknown));
+        // Atomic declarations keep the operation itself as the producer of each output, despite declared provenance.
+        assert_eq!(RegionDataFlow::Atomic.output_sources(&operation, 0, boundary), Ok(RegionDataFlowSources::Unknown));
         let empty =
             DataFlowRuleFixture { sources: Some(RegionDataFlowSources::Known(Vec::new())), ..Default::default() };
         assert_eq!(
@@ -4630,7 +5422,9 @@ pub(crate) mod tests {
         ];
         let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
         let rule = DataFlowRuleFixture::default();
-        for data_flow in [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Custom(&rule)] {
+        for data_flow in
+            [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Atomic, RegionDataFlow::Custom(&rule)]
+        {
             assert_eq!(
                 data_flow.output_sources(&operation, 2, boundary),
                 Err(ProgramError::MalformedProgram(
@@ -4743,6 +5537,13 @@ pub(crate) mod tests {
             RegionDataFlow::Provenance.execution_demands(&operation, &[false, false], boundary, &mut liveness),
             Ok(vec![Some(vec![false, false]), Some(vec![false]), None]),
         );
+        // Atomic declarations demand what provenance declarations demand.
+        for used_outputs in [[true, false], [false, true], [false, false]] {
+            assert_eq!(
+                RegionDataFlow::Atomic.execution_demands(&operation, &used_outputs, boundary, &mut liveness),
+                RegionDataFlow::Provenance.execution_demands(&operation, &used_outputs, boundary, &mut liveness),
+            );
+        }
         // Opaque declarations demand every computation-region output, even without used outputs.
         for used_outputs in [[true, false], [false, false]] {
             assert_eq!(
@@ -4792,7 +5593,9 @@ pub(crate) mod tests {
         ];
         let boundary = RegionDataFlowBoundary { input_count: 3, output_count: 2, regions: &boundaries };
         let empty = DataFlowRuleFixture::default();
-        for data_flow in [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Custom(&empty)] {
+        for data_flow in
+            [RegionDataFlow::Opaque, RegionDataFlow::Provenance, RegionDataFlow::Atomic, RegionDataFlow::Custom(&empty)]
+        {
             assert_eq!(
                 data_flow.execution_demands(&operation, &[true], boundary, &mut DataFlowLivenessFixture::default()),
                 Err(ProgramError::MalformedProgram(
@@ -4894,6 +5697,7 @@ pub(crate) mod tests {
     fn test_region_data_flow_debug() {
         assert_eq!(format!("{:?}", RegionDataFlow::Opaque), "Opaque");
         assert_eq!(format!("{:?}", RegionDataFlow::Provenance), "Provenance");
+        assert_eq!(format!("{:?}", RegionDataFlow::Atomic), "Atomic");
         assert_eq!(format!("{:?}", RegionDataFlow::Custom(&DataFlowRuleFixture::default())), "Custom(..)");
     }
 

@@ -1372,7 +1372,7 @@ mod tests {
                         %6:f64[] = abs %0
                         %7:f64[] = max %5 %6
                         %8:f64[] = stop_gradient %7
-                        %9:f64[] = zero_like %8
+                        %9:f64[] = zero [type=f64[]]
                         %10:f64[] = one_like %8
                         %11:f64[] = sub %8 %8
                         %12:bool[] = compare [direction=Equal] %11 %9
@@ -1712,7 +1712,7 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| input.tanh_with_accuracy(Accuracy::Highest),
             varying_type,
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(

@@ -4,13 +4,46 @@ use std::sync::Arc;
 
 use crate::captures::CaptureConstant;
 use crate::compilation::functions::{
-    CompilationTracer, CompiledFunctionDispatcher, DEFAULT_JIT_CACHE_CAPACITY, ExecutableFunction, StagedFunction,
-    StagedProgram, StatefulExecution,
+    CompilationTracer, CompiledFunctionDispatcher, ExecutableFunction, StagedFunction, StagedProgram, StatefulExecution,
 };
 use crate::contexts::{Domain, StagingContext};
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{ProgramError, TypedProgram, Value};
 use crate::tracing::DomainTracingContext;
+
+/// Default number of compiled specializations retained by one [`CompiledFunctionDispatcher`].
+const DEFAULT_JIT_CACHE_CAPACITY: usize = 256;
+
+/// Inputs used to derive a [`CompilationDomain::dispatch_signature`]. [`Self::Types`] requests a staged call within an
+/// enclosing computation. [`Self::Values`] requests an independently dispatched executable and makes runtime metadata
+/// available to its specialization policy. The iterator and its values have separate borrow lifetimes so a short-lived
+/// iterator can visit longer-lived values.
+pub enum DispatchInputs<'o, 'v, V: Value + 'v> {
+    /// Abstract input types of a staged call. Executable policies such as input-bound bucketing do not apply.
+    Types(Vec<V::Type>),
+
+    /// Runtime inputs of an independently dispatched executable and their effective types.
+    Values {
+        /// Runtime input values, in the same order and number as `types`.
+        values: &'o mut dyn Iterator<Item = &'v V>,
+
+        /// Effective types validated by the caller against `values`, including any
+        /// [`declared staging types`](CompiledFunctionDispatcher::with_staged_input_types). A concrete extent may
+        /// therefore be represented by a symbolic dimension here, which extracting raw value types cannot recover.
+        types: Vec<V::Type>,
+    },
+}
+
+impl<V: Value> DispatchInputs<'_, '_, V> {
+    /// Consumes this request and returns its effective input types, discarding any runtime value iterator.
+    /// Backends whose dispatch policies depend only on types can use this function for both request variants.
+    #[inline]
+    pub fn into_types(self) -> Vec<V::Type> {
+        match self {
+            Self::Types(types) | Self::Values { types, .. } => types,
+        }
+    }
+}
 
 /// [`CompilationDomain`]s are [`Domain`]s that support lowering, compiling, and executing staged programs.
 /// Compilation is deliberately split into four phases:
@@ -18,7 +51,7 @@ use crate::tracing::DomainTracingContext;
 ///   1. [`StagedProgram::stage`] traces a flat closure into a [`StagedProgram`], typically through
 ///      [`StagedFunction::stage`] or [`Compile::stage`] for typed callers.
 ///   2. [`Self::lower`] lowers a [`StagedProgram`] into a [`Self::LoweredProgram`], typically through
-///      [`StagedFunction::lower`](crate::StagedFunction::lower).
+///      [`StagedFunction::lower`](StagedFunction::lower).
 ///   3. [`Self::compile`] compiles a [`Self::LoweredProgram`] into a [`Self::CompiledProgram`], typically
 ///      through [`LoweredFunction::compile`](crate::LoweredFunction::compile).
 ///   4. [`Self::execute`] executes a [`Self::CompiledProgram`] on flat runtime inputs, typically through
@@ -28,7 +61,7 @@ use crate::tracing::DomainTracingContext;
 /// closures, lifts runtime captures into leading program inputs, checks input counts and compiled output types, and
 /// reconstructs structured outputs. Backends implement [`Self::lower`], [`Self::compile`], and [`Self::execute`] over
 /// flat programs, types, and values, including any backend validation, caching, or runtime conversion. Staging traces
-/// exactly the input types that it receives. Backends apply options that change input types before staging (e.g., in
+/// exactly the input types that it receives. Backends apply options that change input types before staging (i.e., in
 /// [`Self::dispatch_signature`] for retained dispatch), apply options that change output types during lowering, and
 /// reject staged functions that they cannot execute during lowering as well.
 pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
@@ -49,19 +82,30 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     /// which is why it requires [`From<ProgramError>`].
     type Error: std::error::Error + From<ProgramError>;
 
-    /// Derives the effective staged input types and their dispatch key from one runtime input signature. Most domains
-    /// return the input types unchanged and use them as the key. Backends may instead apply a semantics preserving
-    /// dispatch policy such as bounded shape bucketing. The returned key must compare equal exactly when the returned
-    /// effective types are interchangeable for tracing, lowering, compilation, and calls. The effective types are
-    /// returned as a shared slice so that key construction on the hot path of retained dispatch never clones the type
-    /// vector deeply. Domains whose key embeds the effective types (e.g., exact dispatch) share one allocation between
-    /// the key and the returned signature, and the caller clones individual types only on a specialization miss, when
-    /// it prepares the staging request.
+    /// Derives the dispatch key, effective staged input types, and optional specialized options for `inputs`.
+    /// [`DispatchInputs::Types`] requests a staged call that is lowered with its enclosing computation, so its
+    /// signature applies semantic declarations from `options` but no executable policy. Its returned dispatch key
+    /// is unused because staged specializations are keyed by their effective types. [`DispatchInputs::Values`]
+    /// requests an independently dispatched executable, so it may additionally apply a semantics preserving policy
+    /// such as input-bound bucketing or specialize on runtime metadata absent from the types, such as placement over
+    /// auto mesh axes. Such metadata must participate in both the key and the specialized options used for lowering.
+    ///
+    /// Returning [`None`] for the specialized options uses `options` unchanged. Equal keys must identify types
+    /// and options that are interchangeable for tracing, lowering, compilation, and calls. The shared type slice lets
+    /// exact dispatch share one allocation with its key, avoiding deep type clones on specialization hits. Most
+    /// backends preserve the requested types and return no specialized options. For type requests, equal effective
+    /// types must also imply interchangeable specialized options because staged calls are keyed by those types.
+    ///
+    /// This function needs no domain instance because staging a call does not require a retained dispatcher to have
+    /// selected its execution domain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `options` are incompatible with `inputs` or their dispatch policy.
     fn dispatch_signature(
-        &self,
-        input_types: Vec<Self::Type>,
+        inputs: DispatchInputs<'_, '_, Self::Value>,
         options: &Self::Options,
-    ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>), Self::Error>;
+    ) -> Result<(Self::DispatchKey, Arc<[Self::Type]>, Option<Self::Options>), Self::Error>;
 
     /// Lowers `staged` into the lowered program representation of this backend. Callers typically use
     /// [`StagedFunction::lower`] rather than calling this function directly. The lowered program must capture every
@@ -74,11 +118,23 @@ pub trait CompilationDomain: Domain<Constant: CaptureConstant> + Clone {
     ///     source program with captures lifted into leading inputs.
     fn lower(&self, staged: &StagedProgram<Self>) -> Result<Self::LoweredProgram, Self::Error>;
 
-    /// Compiles a lowered program into an executable program of this backend. Callers use
-    /// [`LoweredFunction::compile`](crate::LoweredFunction::compile) rather than calling this function directly, which
-    /// also checks that the output types of the compiled program refine those of the lowered program. Caching backends
-    /// usually implement this function via [`CompilationContext::compile`](crate::CompilationContext::compile).
-    fn compile(&self, program: &Self::LoweredProgram) -> Result<Arc<Self::CompiledProgram>, Self::Error>;
+    /// Compiles a lowered program into an executable program of this backend, and returns it together with the runtime
+    /// values of the hidden captures that lowering introduced in addition to the captures of its staged source. A
+    /// backend introduces such captures for runtime values that the staged program refers to through lifetime-free
+    /// constants retained outside of it (e.g., by a runtime session), so that the executable depends only on their
+    /// types, and most backends return none. A [`CompiledFunction`](crate::CompiledFunction) supplies them after the
+    /// source captures on every call. Callers use [`LoweredFunction::compile`](crate::LoweredFunction::compile) rather
+    /// than calling this function directly, which also checks that the output types of the compiled program refine
+    /// those of the lowered program.
+    ///
+    /// Caching backends usually obtain the executable through
+    /// [`CompilationContext::compile`](crate::CompilationContext::compile). The cache must store only the executable,
+    /// which callers with different captured values share, while the hidden capture values belong to `program` and are
+    /// resolved for every request, including cache hits.
+    fn compile(
+        &self,
+        program: &Self::LoweredProgram,
+    ) -> Result<(Arc<Self::CompiledProgram>, Vec<Self::Value>), Self::Error>;
 
     /// Executes a compiled program on flat runtime `inputs` and returns its flat outputs. Callers typically use
     /// [`ExecutableFunction::execute`] rather than calling this function directly. The backend retains any declaration
@@ -204,9 +260,7 @@ pub trait AnalyzableCompilationDomain: CompilationDomain {
     fn analyze<Input: Parameterized<Self::Type>, Output: Parameterized<Self::Type>>(
         &self,
         executable: &ExecutableFunction<Self, Input, Output>,
-    ) -> Result<Self::Analysis, Self::Error>
-    where
-        Self: Sized;
+    ) -> Result<Self::Analysis, Self::Error>;
 }
 
 /// Typed staging and retained compilation through an explicit [`CompilationDomain`]. Retained dispatchers bind to
@@ -451,7 +505,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::compilation::functions::{CompilationTracer, CompiledFunctionDispatcher};
     use crate::compilation::tests::{
         CarriedArray, CarriedDomain, CarriedOptions, TestDomain, compile_from_one_call_site,
@@ -459,6 +513,33 @@ mod tests {
     use crate::operations::NegOperation;
 
     use super::*;
+
+    #[test]
+    fn test_dispatch_inputs_into_types() {
+        let input = Array::vector(vec![1f32, 2.0]).unwrap();
+        let declared = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new(
+                "items",
+                DimensionBounds::new(0, Some(5)).unwrap(),
+            ))]),
+        );
+        assert_eq!(DispatchInputs::<Array>::Types(vec![declared.clone()]).into_types(), vec![declared.clone()]);
+
+        // Runtime dispatch retains the validated declaration rather than re-extracting a concrete extent of 2.
+        let mut values = std::iter::once(&input);
+        assert_eq!(
+            DispatchInputs::Values { values: &mut values, types: vec![declared.clone()] }.into_types(),
+            vec![declared],
+        );
+        assert_eq!(values.next(), Some(&input));
+
+        assert_eq!(DispatchInputs::<Array>::Types(Vec::new()).into_types(), Vec::<ArrayType>::new());
+        assert_eq!(
+            DispatchInputs::<Array>::Values { values: &mut std::iter::empty(), types: Vec::new() }.into_types(),
+            Vec::<ArrayType>::new(),
+        );
+    }
 
     #[test]
     fn test_compile_stage() {
@@ -546,7 +627,7 @@ mod tests {
         assert_eq!(function.execute(false, domain.scalar(2.0)), Ok(domain.scalar(2.0)));
         assert_eq!(function.execute(true, domain.scalar(2.0)), Ok(domain.scalar(-2.0)));
         assert_eq!(function.execute(false, domain.scalar(2.0)), Ok(domain.scalar(2.0)));
-        assert_eq!(function.specialization_count(), 1);
+        assert_eq!(function.executable_specialization_count(), 1);
         assert_eq!(function.statistics().dispatch_misses, 3);
         assert_eq!(domain.compilation_count(), 3);
     }

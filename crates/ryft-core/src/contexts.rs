@@ -838,11 +838,11 @@ pub trait StagingContext:
             let region_interfaces = regions.region_interfaces();
             operation.validate_region_interfaces(&region_interfaces).map_err(|error| context.error(error))?;
             let (input_types, region_interfaces, region_input_types) = if declared_region_count == 0 {
-                (None, Vec::new(), Vec::new())
+                (None, region_interfaces, Vec::new())
             } else {
                 let input_types = inputs.iter().map(|input| input.borrow().r#type().into_owned()).collect::<Vec<_>>();
                 let region_input_types = operation
-                    .infer_region_input_types(input_types.as_slice(), region_interfaces.as_slice())
+                    .infer_region_input_types(input_types.as_slice(), region_interfaces.as_ref())
                     .map_err(|error| context.error(error.into()))?;
                 if region_input_types.len() != declared_region_count {
                     return Err(context.error(ProgramError::MalformedProgram(format!(
@@ -879,12 +879,12 @@ pub trait StagingContext:
                             )?;
                             match renaming {
                                 Some(renaming) => {
-                                    Ok(region.to_program().rename_type_identities(&renaming)?.interface())
+                                    Ok(region.to_program().rename_type_identities(&renaming)?.interface().clone())
                                 }
-                                None => Ok(region.interface()),
+                                None => Ok(region.interface().clone()),
                             }
                         }
-                        None => Ok(region.interface()),
+                        None => Ok(region.interface().clone()),
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?;
                 let output_types =
@@ -951,7 +951,7 @@ pub trait StagingContext:
                     let input_types = input_types.as_ref().unwrap();
                     let mut interfaces = region_ids
                         .iter()
-                        .map(|id| region_builder.borrow().region_ref(*id).map(|region| region.interface()))
+                        .map(|id| region_builder.borrow().region_ref(*id).map(|region| region.interface().clone()))
                         .collect::<Result<Vec<_>, _>>()
                         .map_err(|error| context.error(error))?;
                     let mut requests = operation
@@ -991,7 +991,8 @@ pub trait StagingContext:
                             })
                         {
                             region_ids[index] = *specialized_id;
-                            interfaces[index] = region_builder.borrow().region_ref(*specialized_id)?.interface();
+                            interfaces[index] =
+                                region_builder.borrow().region_ref(*specialized_id)?.interface().clone();
                         } else {
                             let source_id = region_ids[index];
                             let region = region_builder.borrow().region_ref(source_id)?.to_program();
@@ -999,7 +1000,7 @@ pub trait StagingContext:
                                 specialization_failed = true;
                                 break;
                             };
-                            interfaces[index] = specialized.interface();
+                            interfaces[index] = specialized.interface().clone();
                             region_ids[index] = region_builder.borrow_mut().import_program(specialized);
                             specialized_regions.push((source_id, requested.clone(), region_ids[index]));
                         }
