@@ -230,11 +230,11 @@ impl Type for ArrayIrType {
     }
 
     #[inline]
-    fn is_compatible_with(&self, other: &Self) -> bool {
+    fn is_convertible_to(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Array(left), Self::Array(right)) => left.is_compatible_with(right),
-            (Self::Dimension(left), Self::Dimension(right)) => left.is_compatible_with(right),
-            (Self::Reference(left), Self::Reference(right)) => left.is_compatible_with(right),
+            (Self::Array(left), Self::Array(right)) => left.is_convertible_to(right),
+            (Self::Dimension(left), Self::Dimension(right)) => left.is_convertible_to(right),
+            (Self::Reference(left), Self::Reference(right)) => left.is_convertible_to(right),
             _ => false,
         }
     }
@@ -939,8 +939,8 @@ mod tests {
         assert!(!stored.is_complex());
         assert!(stored.is_reference());
         assert_eq!(stored.referent(), Some(&array));
-        assert!(!stored.is_compatible_with(&ArrayIrType::Array(array.clone())));
-        assert!(!ArrayIrType::Array(array.clone()).is_compatible_with(&stored));
+        assert!(!stored.is_convertible_to(&ArrayIrType::Array(array.clone())));
+        assert!(!ArrayIrType::Array(array.clone()).is_convertible_to(&stored));
         assert!(!stored.is_refined_by(&ArrayIrType::Array(array.clone())));
         assert!(!ArrayIrType::Array(array).is_refined_by(&stored));
         assert_eq!(

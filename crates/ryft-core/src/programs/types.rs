@@ -210,7 +210,7 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// `f16` is compatible with (i.e., promotable to) `f32` but does not refine it, while a dynamically shaped `f32`
     /// array type of shape `[?, 3]` is refined by an `f32` array type of shape `[2, 3]` with no conversion involved
     /// at all.
-    fn is_compatible_with(&self, other: &Self) -> bool;
+    fn is_convertible_to(&self, other: &Self) -> bool;
 
     /// Returns `true` if every value described by `other` is also described by this [`Type`]. The receiver is the more
     /// general type (e.g., a declared or staged type) and the argument is the more precise one (e.g., the actual type
@@ -226,7 +226,7 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     ///
     /// Reading each [`Type`] as the set of values it describes, this relation is equivalent to set inclusion
     /// (i.e., argument ⊆ receiver) and forms a partial ordering (i.e., semantic subtyping where `other` is a subtype of
-    /// the receiver, with no conversion involved). This is what distinguishes it from [`Self::is_compatible_with`],
+    /// the receiver, with no conversion involved). This is what distinguishes it from [`Self::is_convertible_to`],
     /// whose promotion- and broadcasting-based notions describe *implicit convertibility* between values of different
     /// types rather than containment. This is also consistent with the notion of refinement in
     /// [StableHLO](https://openxla.org/stablehlo/dynamism) and MLIR.
@@ -1048,7 +1048,7 @@ mod tests {
         );
 
         // Implicit promotion does not make a differently typed value a valid input to an f32 program.
-        assert!(DataType::F16.is_compatible_with(&DataType::F32));
+        assert!(DataType::F16.is_convertible_to(&DataType::F32));
         assert_eq!(
             <() as TypeRefinements<DataType>>::new([DataType::F32], [DataType::F16]),
             Err(TypeError::invalid("type f16 does not refine declared type f32")),
@@ -1057,7 +1057,7 @@ mod tests {
         // Broadcasting is likewise a conversion, not ordinary entry admission.
         let declared = ArrayType::new_static(DataType::F32, [2, 3]);
         let actual = ArrayType::new_static(DataType::F32, [1, 3]);
-        assert!(actual.is_compatible_with(&declared));
+        assert!(actual.is_convertible_to(&declared));
         assert!(ArrayTypeRefinements::new([declared], [actual]).is_err());
     }
 

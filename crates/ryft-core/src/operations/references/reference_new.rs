@@ -450,10 +450,10 @@ mod tests {
                 })
             }
 
-            fn is_compatible_with(&self, other: &Self) -> bool {
+            fn is_convertible_to(&self, other: &Self) -> bool {
                 match (self, other) {
-                    (Self::Reference(left), Self::Reference(right)) => left.is_compatible_with(right),
-                    (Self::Nested(left), Self::Nested(right)) => left.is_compatible_with(right),
+                    (Self::Reference(left), Self::Reference(right)) => left.is_convertible_to(right),
+                    (Self::Nested(left), Self::Nested(right)) => left.is_convertible_to(right),
                     _ => false,
                 }
             }

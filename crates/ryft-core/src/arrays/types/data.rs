@@ -1408,7 +1408,7 @@ impl Type for DataType {
     type Refinements = ();
 
     #[inline]
-    fn is_compatible_with(&self, other: &Self) -> bool {
+    fn is_convertible_to(&self, other: &Self) -> bool {
         // Note that this compatibility relationship is not quite a subtyping relationship in that certain type
         // promotions can result in loss of information for values of those types (e.g., `DataType::U64` to
         // `DataType::F64`). However, it is intended to make ergonomics better for when working with `ryft`
@@ -1420,7 +1420,7 @@ impl Type for DataType {
     fn is_refined_by(&self, other: &Self) -> bool {
         // This relation is simply data type equality. For example, `f32` is not refined by `f16`. However, `f16`
         // is *compatible* with `f32` (i.e., `f16` values can be promoted to `f32` values). This compatibility
-        // relationship is exposed via `Type::is_compatible_with` instead of this function.
+        // relationship is exposed via `Type::is_convertible_to` instead of this function.
         self == other
     }
 
@@ -2168,10 +2168,10 @@ mod tests {
     }
 
     #[test]
-    fn test_data_type_is_compatible_with_and_is_refined_by() {
-        assert!(DataType::F16.is_compatible_with(&DataType::F32));
-        assert!(!DataType::F32.is_compatible_with(&DataType::F16));
-        assert!(DataType::F32.is_compatible_with(&DataType::F32));
+    fn test_data_type_is_convertible_to_and_is_refined_by() {
+        assert!(DataType::F16.is_convertible_to(&DataType::F32));
+        assert!(!DataType::F32.is_convertible_to(&DataType::F16));
+        assert!(DataType::F32.is_convertible_to(&DataType::F32));
         assert!(DataType::F32.is_refined_by(&DataType::F32));
         assert!(!DataType::F16.is_refined_by(&DataType::F32));
         assert!(!DataType::F32.is_refined_by(&DataType::F16));

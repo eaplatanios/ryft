@@ -532,7 +532,7 @@ impl Type for DimensionType {
     }
 
     #[inline]
-    fn is_compatible_with(&self, other: &Self) -> bool {
+    fn is_convertible_to(&self, other: &Self) -> bool {
         self == other
     }
 

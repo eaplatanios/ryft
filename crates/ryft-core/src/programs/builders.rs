@@ -2518,7 +2518,7 @@ mod tests {
             type Identity = NoIdentity;
             type Refinements = ();
 
-            fn is_compatible_with(&self, other: &Self) -> bool {
+            fn is_convertible_to(&self, other: &Self) -> bool {
                 self == other
             }
 

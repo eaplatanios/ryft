@@ -680,7 +680,7 @@ impl Type for ArrayType {
     }
 
     #[inline]
-    fn is_compatible_with(&self, other: &Self) -> bool {
+    fn is_convertible_to(&self, other: &Self) -> bool {
         // Note that this compatibility relationship is defined here as a "broadcastability" relationship.
         self.is_broadcastable_to(other)
     }
@@ -1517,14 +1517,14 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_is_compatible_with() {
-        // `Type::is_compatible_with` is the interoperability relation (i.e., the "broadcastability" relation),
+    fn test_array_type_is_convertible_to() {
+        // `Type::is_convertible_to` is the interoperability relation (i.e., the "broadcastability" relation),
         // and it is distinct from the refinement relation tested by `test_array_type_is_refined_by`.
         let vector = ArrayType::new(F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(3)]));
         let matrix = ArrayType::new(F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        assert!(vector.is_compatible_with(&matrix));
-        assert!(!matrix.is_compatible_with(&vector));
-        assert!(matrix.is_compatible_with(&matrix));
+        assert!(vector.is_convertible_to(&matrix));
+        assert!(!matrix.is_convertible_to(&vector));
+        assert!(matrix.is_convertible_to(&matrix));
     }
 
     #[test]

@@ -1721,18 +1721,24 @@ pub const SHARD_MAP_OPERATION_NAME: &str = "shard_map";
 /// # Boundary Validation
 ///
 /// Binding the operation with a body always validates the body against the boundary through
-/// [`Operation::infer_output_types`], not only checked construction through [`Self::from_program`]. Each ordinary
-/// (non-reference) body input must be the local shard that its input sharding derives from the declared global input
-/// type (refer to [`ShardMapBoundary::local_input_type`]), and each ordinary body output must derive, through its
-/// output sharding, the declared global output type. Every input must also agree with its declared global input type,
-/// and an input that carries a sharding must be placed over the mesh of the [`ShardMapBoundary`] up to its axis types
-/// (otherwise, it is rejected with [`ShardMapError::InputMeshMismatch`]). These checks compare shapes, element types,
-/// layouts, and manually varying axes exactly, the latter over every mesh axis, and they require the unreduced and
-/// reduced axes of the type to equal those of the derivation (a type without a sharding has none). A type that carries
-/// a sharding must also be placed over a mesh with the topology of the mesh of the derivation, so a local body type
-/// over another topology is rejected like a caller's input over one. They tolerate the other metadata that the type
-/// carries beyond the derivation (i.e., its dimension shardings, the types of its mesh axes, and its memory kind).
-/// The boundary therefore implicitly places a caller's array input by its input sharding and moves it into
+/// [`Operation::infer_output_types`], not only checked construction through [`Self::from_program`]. Direct binding can
+/// reach interpretation and transform rules without the type inference that staging runs, so every rule validates the
+/// complete input and region interfaces before forwarding, partitioning, executing, or staging anything. Each rule uses
+/// the input types of its application (e.g., primal types for differentiation and unbatched types for batching).
+/// Otherwise, a rule that assumes the inputs and body match the boundary could drop an incompatible input,
+/// index past the inputs or body outputs, or run an effect before reporting the mismatch.
+///
+/// Each ordinary (non-reference) body input must be the local shard that its input sharding derives from the declared
+/// global input type (refer to [`ShardMapBoundary::local_input_type`]), and each ordinary body output must derive,
+/// through its output sharding, the declared global output type. Every input must also agree with its declared global
+/// input type, and an input that carries a sharding must be placed over the mesh of the [`ShardMapBoundary`] up to
+/// its axis types (otherwise, it is rejected with [`ShardMapError::InputMeshMismatch`]). These checks compare shapes,
+/// element types, layouts, and manually varying axes exactly, the latter over every mesh axis, and they require the
+/// unreduced and reduced axes of the type to equal those of the derivation (a type without a sharding has none). A type
+/// that carries a sharding must also be placed over a mesh with the topology of the mesh of the derivation, so a local
+/// body type over another topology is rejected like a caller's input over one. They tolerate the other metadata that
+/// the type carries beyond the derivation (i.e., its dimension shardings, the types of its mesh axes, and its memory
+/// kind). The boundary therefore implicitly places a caller's array input by its input sharding and moves it into
 /// device memory, which transposition undoes for its cotangent, while a reference input crosses by identity and is
 /// only viewed under its input sharding. Since the local body types follow the declared types, the exact variation
 /// check is what makes the body inputs the shards of the actual inputs (as JAX's `_shard_map_typecheck` requires).
@@ -2024,28 +2030,6 @@ impl ShardMapOperation {
             return Err(ShardMapError::OrderedIoNotSupported);
         }
         Ok(())
-    }
-
-    // TODO(eaplatanios): Inline this function.
-    /// Validates the application of this `shard_map` to inputs of the types `input_types` with attached regions whose
-    /// interfaces are `region_interfaces` through [`Operation::infer_output_types`], and returns its output types. A
-    /// direct bind can reach any rule of this operation without the type inference that staging runs, so every rule
-    /// (i.e., interpretation, partial evaluation, batching, differentiation, transposition, and reference discharge)
-    /// validates the complete application first, before it forwards, partitions, executes, or stages anything.
-    /// Otherwise, a rule that relies on its inputs and body matching the boundary could drop an incompatible input,
-    /// index past the inputs or the body outputs, or run an effect before the mismatch is reported.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_types`: Types of the inputs of the application as the calling rule sees them (e.g., the primal types
-    ///     for differentiation and the unbatched types for batching).
-    ///   - `region_interfaces`: Interfaces of the attached regions, in slot order.
-    fn validate_application(
-        &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<ArrayIrType>, ProgramError> {
-        Ok(self.infer_output_types(input_types, region_interfaces)?)
     }
 
     /// Validates the local `body` against the reference contract of the ``# References Under `shard_map` `` section of
@@ -3225,7 +3209,7 @@ where
         // leaves the rebuilt map as a trailing output under its input sharding.
         let name = self.name();
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, &driver.region_interfaces())?;
+        self.infer_output_types(&input_types, &driver.region_interfaces())?;
         let body = driver.region(0)?;
         let allocations =
             inputs.iter().map(|input| context.boundary_allocation(input)).collect::<Result<Vec<_>, _>>()?;
@@ -3448,7 +3432,7 @@ where
         // then the body are validated first, so that an invalid application or a malformed body is reported as such
         // rather than forwarded, split, or residualized silently, and before the known side executes anything.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, &driver.region_interfaces())?;
+        self.infer_output_types(&input_types, &driver.region_interfaces())?;
         let body_program = driver.region(0)?;
         self.validate_body(body_program)?;
 
@@ -3570,7 +3554,7 @@ where
             })
             .collect::<Vec<_>>();
 
-        self.validate_application(&input_types, &driver.region_interfaces())?;
+        self.infer_output_types(&input_types, &driver.region_interfaces()).map_err(ProgramError::from)?;
         self.validate_body(driver.region(0)?)?;
 
         let input_values = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
@@ -4100,7 +4084,7 @@ where
         // before the body, before any tangent work, and before the derived bodies index the body outputs.
         let output_count = self.output_types.len();
         let input_types = inputs.iter().map(|input| input.primal().r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, &driver.region_interfaces())?;
+        self.infer_output_types(&input_types, &driver.region_interfaces()).map_err(ProgramError::from)?;
 
         let body_program = driver.region(0)?;
         self.validate_body(body_program)?;
@@ -4290,7 +4274,7 @@ where
         // The application of the map being transposed (i.e., of a tangent map to its known residual inputs and its
         // linear inputs, typed as tangents) is validated first, before any cotangent destination is resolved.
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        self.validate_application(&input_types, &driver.region_interfaces())?;
+        self.infer_output_types(&input_types, &driver.region_interfaces()).map_err(ProgramError::from)?;
         check_count!("output", outputs, self.output_types.len(), ProgramError);
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
@@ -6329,7 +6313,7 @@ where
             let input_types =
                 inputs.iter().map(|values| values[device].r#type().into_owned()).collect::<Vec<ArrayIrType>>();
             if !validated_input_types.contains(&input_types) {
-                operation.validate_application(&input_types, &body_interfaces)?;
+                operation.infer_output_types(&input_types, &body_interfaces)?;
                 validated_input_types.push(input_types);
             }
         }
@@ -8048,7 +8032,7 @@ mod tests {
         (operation, body, outputless_body)
     }
 
-    /// Error with which [`ShardMapOperation::validate_application`] rejects the `f32[2]` second input of the map of
+    /// Error with which [`Operation::infer_output_types`] rejects the `f32[2]` second input of the map of
     /// [`first_input_shard_map`].
     fn incompatible_second_input_error() -> ProgramError {
         ProgramError::Type(TypeError::invalid(
@@ -8057,7 +8041,7 @@ mod tests {
         ))
     }
 
-    /// Error with which [`ShardMapOperation::validate_application`] rejects a body without outputs for the map of
+    /// Error with which [`Operation::infer_output_types`] rejects a body without outputs for the map of
     /// [`first_input_shard_map`].
     fn outputless_body_error() -> ProgramError {
         ProgramError::Type(TypeError::invalid("expected 1 body output but got 0"))
@@ -13544,6 +13528,56 @@ mod tests {
                  the same data type and extents"
                     .to_string(),
             )),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_accepts_layouts_that_differ_across_devices() {
+        // The devices of a map that does not check manual variation take different branches of a `condition`. One
+        // branch forwards a scalar with an explicit layout and the other returns a constant without one, and both
+        // refine the output type that the branches declare, which has no layout. The values of the devices therefore
+        // differ in their layouts but agree in data type and extents, which is all that the devices must agree on,
+        // and the map returns the value `7` that every device holds.
+        let mesh = manual_mesh();
+        let boundary = ShardMapBoundary::new(
+            mesh.clone(),
+            vec![sharded_along_x(), Sharding::replicated(mesh.clone(), 0)],
+            vec![Sharding::replicated(mesh, 0)],
+            Vec::new(),
+        )
+        .unwrap()
+        .with_check_manual_variation(false);
+        let predicate_type = ArrayType::new_static(DataType::Boolean, [2]);
+        let value_type = f32_type(&[], None).with_layout(Layout::Strided(StridedLayout::new(Vec::new())));
+        let local_predicate_type = boundary.local_input_type(0, &predicate_type).unwrap();
+        let local_value_type = boundary.local_input_type(1, &value_type).unwrap();
+        let declared_type = local_value_type.clone().with_layout(None);
+        let forward = build_program(vec![ArrayIrType::Array(declared_type.clone())], |_, inputs| inputs.to_vec());
+        let constant = build_program(vec![ArrayIrType::Array(declared_type.clone())], |builder, _| {
+            vec![builder.add_constant(f32_value(declared_type, &[7.0]))]
+        });
+        let body = build_program(
+            vec![ArrayIrType::Array(local_predicate_type), ArrayIrType::Array(local_value_type)],
+            |builder, inputs| {
+                let reshape = ArrayOperation::Reshape(ReshapeOperation::new(
+                    Shape::new(vec![Dimension::Static(1)]),
+                    Shape::new(Vec::new()),
+                ));
+                let predicate = builder.add_instruction(reshape, Vec::new(), vec![inputs[0]], None).unwrap()[0];
+                let regions = vec![builder.import_program(forward), builder.import_program(constant)];
+                let condition = ConditionOperation::<ArrayIrType>::new();
+                builder.add_instruction(condition, regions, vec![predicate, inputs[1]], None).unwrap().to_vec()
+            },
+        );
+        let input_types = vec![ArrayIrType::Array(predicate_type.clone()), ArrayIrType::Array(value_type.clone())];
+        let program = caller_typed_shard_map_program(body, input_types, boundary);
+        let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Array(Array::from_elements(predicate_type, &[true, false]).unwrap()),
+                f32_value(value_type, &[7.0]),
+            ]),
+            Ok(vec![f32_value(output_type, &[7.0])]),
         );
     }
 
