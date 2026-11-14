@@ -4,6 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use crate::arrays::ArrayIrType;
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingLevelExtent,
@@ -32,6 +33,7 @@ use crate::operations::composites::rules::{
 };
 use crate::operations::composites::{derive_bijective_identity_renaming, describe_composite};
 use crate::operations::constants::zero::Zero;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
@@ -1029,6 +1031,23 @@ impl<
         // `ẏ` or the residuals `r`) and would charge every non-differentiated execution for it, so interpretation
         // delegates solely to the primal region at slot `0`.
         driver.interpret_region(context, 0, inputs.to_vec())
+    }
+}
+
+// The reference backend emulation of a `shard_map` runs this call once for all devices when its primal region
+// communicates across them. Like interpretation, the call executes only its primal region, once, on its inputs,
+// and none of its rules.
+impl<V: Typed + Parameter, P, S, O: Operation<Type = ArrayIrType>> LockstepOperation<O>
+    for CompositeOperation<V, P, S>
+{
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(driver.interpret_region(context, 0, inputs.to_vec()))
     }
 }
 

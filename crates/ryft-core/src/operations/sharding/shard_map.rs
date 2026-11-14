@@ -249,20 +249,24 @@
 //!     inputs have the same data type and extents on every device, as every value does (including the iteration count
 //!     of a `scan`, whose extent is its trip count), and the devices must agree on every `while` and `condition`
 //!     predicate. Either way, a `scan` slice whose manual variation differs from that of its stack widens both to the
-//!     join of their variation, as eager interpretation does. `composite`, `linear_call`, and `rematerialize` replay
-//!     their primal region, and a nested `shard_map` extends the device set by its own active manual axes. Devices that
-//!     disagree on a predicate cannot run such regions in lockstep, and every other region operation that needs
-//!     lockstep execution is rejected, both with [`ProgramError::UnsupportedOperation`].
+//!     join of their variation, as eager interpretation does. `composite`, `linear_call`, and `rematerialize` run their
+//!     region once on their inputs, and a nested `shard_map` extends the device set by its own active manual axes. Each
+//!     of these operations has a rule over all devices (refer to [`LockstepOperation`]), through which the emulator
+//!     runs it, and a collective that has attached regions runs them through its rule as well. Devices that disagree on
+//!     a predicate cannot run such regions in lockstep, and a region operation without such a rule that needs lockstep
+//!     execution is rejected, both with [`ProgramError::UnsupportedOperation`].
 //!
 //! These rejections are deliberate limitations of the emulation rather than of `shard_map`. Running a region operation
-//! in lockstep requires knowing how its regions are sequenced (e.g., how many times and with which inputs), which the
-//! emulator knows only for the operations above, because the eager rule of any other region operation runs its regions
-//! on one device's values at a time, which cannot compute a collective across devices. Requiring every device to take
-//! the same path through a lockstep region is also stricter than necessary when a predicate varies only along axes that
-//! the collectives of the region do not use. For example, a `condition` on `axis_index('y') == 0` whose one branch
-//! reduces with `parallel_reduce` over `x` while the other returns its input unchanged is valid on a device runtime,
-//! because the devices along `x` that reduce together take the same branch, but the emulator rejects it. Backends
-//! with a device runtime execute all of these bodies.
+//! in lockstep requires knowing how it uses its regions (e.g., how many times it runs them, and what it computes from
+//! its inputs before and from their outputs after), which only its rule over all devices states, because the eager rule
+//! of an operation runs its regions on one device's values at a time, which cannot compute a collective across devices.
+//! The emulator never replaces an operation by its region on the strength of its declared data flow, because that data
+//! flow does not say that the operation computes nothing else. Requiring every device to take the same path through a
+//! lockstep region is also stricter than necessary when a predicate varies only along axes that the collectives of the
+//! region do not use. For example, a `condition` on `axis_index('y') == 0` whose one branch reduces with
+//! `parallel_reduce` over `x` while the other returns its input unchanged is valid on a device runtime, because the
+//! devices along `x` that reduce together take the same branch, but the emulator rejects it. Backends with a device
+//! runtime execute all of these bodies.
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -328,10 +332,10 @@ use crate::partial::{
     PartiallyEvaluatableOperation, ResidualInputSource,
 };
 use crate::programs::{
-    AtomId, AttachedRegions, Concretizable, EffectClass, EffectClasses, Effects, EmptyRegionDriver, ErasedOperation,
-    FlatProgram, InputRegionProvenance, Instruction, MaybeZero, Operation, OperationBoundaryPruning,
-    OperationFormatter, OperationPayloadProjection, OperationProjection, OperationProvider, OutputRegionProvenance,
-    Program, ProgramBuilder, ProgramError, ProjectedValue, ReferenceDischargeContext, ReferenceDischargeDriver,
+    AtomId, AttachedRegions, Concretizable, EffectClass, EffectClasses, ErasedOperation, FlatProgram,
+    InputRegionProvenance, Instruction, MaybeZero, Operation, OperationBoundaryPruning, OperationFormatter,
+    OperationPayloadProjection, OperationProjection, OperationProvider, OutputRegionProvenance, Program,
+    ProgramBuilder, ProgramError, ProjectedValue, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
     ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceRoot, ReferenceType, Region, RegionArena, RegionDataFlow, RegionDriver,
@@ -2119,7 +2123,7 @@ impl ShardMapOperation {
             if let Some(gather) = instruction.operation().projected_payload::<ParallelAllGatherOperation>()
                 && gather.mesh().is_none()
                 && gather.output_variance() == ParallelAllGatherOutputVariance::Invariant
-                && let Some(axis) = self.boundary.manual_axes().iter().find(|axis| gather.axes().contains(*axis))
+                && let Some(axis) = self.boundary.manual_axes().iter().find(|axis| gather.axes().contains(axis))
             {
                 return Err(ProgramError::MalformedProgram(format!(
                     "`{name}` body uses `{PARALLEL_ALL_GATHER_OPERATION_NAME}` without a mesh and with invariant \
@@ -6625,15 +6629,34 @@ where
     ) -> Result<Vec<Vec<ArrayIrValue<Array>>>, ProgramError> {
         let operation = instruction.operation();
 
-        // A collective over an emulated axis communicates across the devices, so it runs its own rule over all of them
-        // (refer to `LockstepOperation`). That rule executes no regions, so it needs no driver.
-        let collective_axes = operation.axes();
-        if collective_axes.names().iter().any(|name| self.domain.grid().axis(name).is_some()) {
-            let inputs = inputs
+        // An operation with a rule over all devices (refer to `LockstepOperation`) runs that rule with one value
+        // per device. The rule requests the execution of the regions of the instruction through this driver, and the
+        // emulator replays them in lockstep. Such a rule validates its application once for all devices from the types
+        // of the values of device zero, which the values of every other device agree with in data type and extents,
+        // because every value of a replayed region does (refer to `Self::run_region`). The devices therefore take the
+        // same path through the operation (e.g., they agree on the extent of the iteration count of a `scan`, which is
+        // its trip count).
+        let regions = instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
+        let driver = LockstepInterpretationDriver {
+            regions: regions.as_slice(),
+            interpret_region: |region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
+                               inputs: Vec<LockstepValue<C::Operation>>| {
+                let outputs = self.run_region(region, inputs.into_iter().map(|input| input.values).collect())?;
+                outputs.into_iter().map(|output| LockstepValue::new(output, &self.domain)).collect()
+            },
+        };
+        let lockstep_inputs = || {
+            inputs
                 .iter()
                 .map(|values| LockstepValue::new(values.clone(), &self.domain))
-                .collect::<Result<Vec<_>, _>>()?;
-            return match operation.interpret_in_lockstep(&self.domain, &EmptyRegionDriver, &inputs) {
+                .collect::<Result<Vec<_>, ProgramError>>()
+        };
+
+        // A collective over an emulated axis communicates across the devices, so it runs its own rule over all of them.
+        // That rule may execute the regions of the collective, like the rule of any other operation.
+        let collective_axes = operation.axes();
+        if collective_axes.names().iter().any(|name| self.domain.grid().axis(name).is_some()) {
+            return match operation.interpret_in_lockstep(&self.domain, &driver, &lockstep_inputs()?) {
                 Some(outputs) => Ok(outputs?.into_iter().map(|output| output.values).collect()),
                 None => Err(ProgramError::UnsupportedOperation {
                     message: format!(
@@ -6653,7 +6676,6 @@ where
         // operation is bound once per device, in device order, with the inputs of that device and the regions of the
         // instruction. No `shard_map` makes an emulated axis manual again, because the body validation of every
         // enclosing map rejects that nesting.
-        let regions = instruction.regions().iter().map(|id| region.with_id(*id)).collect::<Result<Vec<_>, _>>()?;
         let uses_emulated_axes = regions
             .iter()
             .enumerate()
@@ -6677,62 +6699,18 @@ where
             return Ok(outputs);
         }
 
-        // The regions of the instruction communicate across the emulated devices, so they must run in lockstep.
+        // The regions of the instruction communicate across the emulated devices, so they must run in lockstep, which
+        // only the rule of the operation over all devices can do, because only the operation knows how it uses its
+        // regions (e.g., how many times it runs them, and what it computes from its inputs before and from their
+        // outputs after). A nested `shard_map` extends the device set by its own active manual axes.
         operation
             .validate_region_interfaces(&regions.iter().map(|region| region.interface().clone()).collect::<Vec<_>>())?;
-
-        // An operation with a rule over all devices (refer to `LockstepOperation`) runs that rule with one value per
-        // device. The rule only requests the execution of the regions, which this emulator replays in lockstep. Such
-        // a rule validates its application once for all devices from the types of the values of device zero, which
-        // the values of every other device agree with in data type and extents, because every value of a replayed
-        // region does (refer to `Self::run_region`). The devices therefore take the same path through the operation
-        // (e.g., they agree on the extent of the iteration count of a `scan`, which is its trip count).
-        let driver = LockstepInterpretationDriver {
-            regions: regions.as_slice(),
-            interpret_region: |region: RegionRef<'_, ArrayIrValue<Array>, C::Operation>,
-                               inputs: Vec<LockstepValue<C::Operation>>| {
-                let outputs = self.run_region(region, inputs.into_iter().map(|input| input.values).collect())?;
-                outputs.into_iter().map(|output| LockstepValue::new(output, &self.domain)).collect()
-            },
-        };
-        let lockstep_inputs = inputs
-            .iter()
-            .map(|values| LockstepValue::new(values.clone(), &self.domain))
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(outputs) = operation.interpret_in_lockstep(&self.domain, &driver, &lockstep_inputs) {
+        if let Some(outputs) = operation.interpret_in_lockstep(&self.domain, &driver, &lockstep_inputs()?) {
             return Ok(outputs?.into_iter().map(|output| output.values).collect());
         }
 
         if let Some(operation) = operation.projected_payload::<ShardMapOperation>() {
             return self.run_shard_map(operation, regions[0], inputs.to_vec());
-        }
-
-        // An operation whose application executes one computation region once, on its inputs and for its outputs,
-        // position by position, and that has no effects of its own, behaves like that region on every device, so the
-        // region is replayed in its place. The operation declares this through its region data flow, its region
-        // provenance, and its effects (e.g., composite calls, linear calls, and rematerialized calls do), so no
-        // operation is named here. An operation with effects of its own (i.e., ones that its regions do not perform)
-        // is not replaced, because replaying its region would skip them, so it needs a lockstep rule of its own.
-        let mut computation_regions =
-            operation.region_slots().iter().enumerate().filter(|(_, slot)| slot.role == RegionRole::Computation);
-        if let (Some((region_index, _)), None) = (computation_regions.next(), computation_regions.next())
-            && matches!(operation.region_data_flow(), RegionDataFlow::Provenance | RegionDataFlow::Atomic)
-            && operation.effects().as_ref() == Effects::empty()
-        {
-            let interface = regions[region_index].interface();
-            let output_count = instruction.outputs().len();
-            let forwards_inputs = interface.input_types().len() == inputs.len()
-                && (0..inputs.len()).all(|index| {
-                    operation.input_region_provenance(region_index, index) == InputRegionProvenance::Input { index }
-                });
-            let forwards_outputs = interface.output_types().len() == output_count
-                && (0..output_count).all(|output_index| {
-                    operation.output_region_provenance(output_index)
-                        == [OutputRegionProvenance { region_index, output_index }]
-                });
-            if forwards_inputs && forwards_outputs {
-                return self.run_region(regions[region_index], inputs.to_vec());
-            }
         }
 
         Err(ProgramError::UnsupportedOperation {
@@ -6869,18 +6847,21 @@ struct ShardMapResidualEdge {
 impl ShardMapResidualEdge {
     /// Creates a new [`ShardMapResidualEdge`] that carries residual `residual_index` of local type `local_type` across
     /// the `shard_map` `boundary`. The local type of the edge is the residual's own type, except that the edge of a
-    /// reference residual carries its referent (i.e., a snapshot of its state), that a first-class dimension crosses
-    /// as its integer scalar value, and that a scalar that varies along some active manual axes gains a leading
-    /// dimension of size one. A residual that is replicated along every active manual axis crosses as itself, under
-    /// its local placement. A residual that varies along some active manual axes has one distinct value per device
-    /// along those axes, so its leading dimension is tiled along them (in mesh order and ahead of the free axes that
-    /// already place that dimension), and the global edge concatenates the local values along that dimension. This is
-    /// JAX's residual specification `P(order_wrt_mesh(mesh, vma))` in `_shard_map_partial_eval` and
-    /// `_shard_map_linearize`, and, because the local shard is the residual itself, neither body converts a non-scalar
-    /// residual at the boundary (a varying scalar is promoted to a single-element vector first, as by JAX's
-    /// `_promote_scalar_residuals`). The global type of the edge keeps the variation of the residual along the manual
-    /// axes of enclosing manual regions, as well as its unreduced and reduced axes, layout, and memory kind, while its
-    /// boundary sharding records only its placement, like the shardings that [`ShardMapBoundary::new`] builds.
+    /// reference residual carries its referent (i.e., a snapshot of its state), that a first-class dimension crosses as
+    /// its integer scalar value, and that a scalar that varies along some active manual axes gains a leading dimension
+    /// of size one. A residual that is replicated along every active manual axis crosses as itself, under its local
+    /// placement. A residual that varies along some active manual axes has one distinct value per device along those
+    /// axes, so its leading dimension is tiled along them (in mesh order and ahead of the free axes that already place
+    /// that dimension), and the global edge concatenates the local values along that dimension. This is JAX's residual
+    /// specification `P(order_wrt_mesh(mesh, vma))` in `_shard_map_partial_eval` and `_shard_map_linearize`, and,
+    /// because the local shard is the residual itself, neither body converts a non-scalar residual at the boundary (a
+    /// varying scalar is promoted to a single-element vector first, as by JAX's `_promote_scalar_residuals`). The
+    /// global type of the edge keeps the variation of the residual along the manual axes of enclosing manual regions,
+    /// as well as its unreduced and reduced axes, layout, and memory kind, while its boundary sharding records only its
+    /// placement, like the shardings that [`ShardMapBoundary::new`] builds. The one exception is a varying residual
+    /// whose layout cannot address the tiled global shape (e.g., column-major byte strides), which crosses without its
+    /// layout, so both bodies convert it at the boundary, where the consuming body restores the layout that it
+    /// declares.
     ///
     /// # Errors
     ///
@@ -6888,8 +6869,7 @@ impl ShardMapResidualEdge {
     /// a dimension identity defined inside the body across the static `shard_map` boundary (refer to the `# Static
     /// Boundaries` section of the documentation of [`ShardMapOperation`]), [`ShardMapError::ArithmeticOverflow`]
     /// when the global extent of the tiled dimension overflows `usize`, and [`ShardMapError::Sharding`] or
-    /// [`ShardMapError::Program`] when the global type or its sharding cannot be constructed, including when the
-    /// layout of the residual does not address the tiled global shape.
+    /// [`ShardMapError::Program`] when the global type or its sharding cannot be constructed.
     fn new(
         residual_index: usize,
         local_type: &ArrayIrType,
@@ -6995,10 +6975,19 @@ impl ShardMapResidualEdge {
         let shape = Shape::new(shape.into_iter().map(Dimension::Static).collect());
         let global_type = boundary_type.clone().with_shape(shape).with_sharding(global_sharding)?;
 
-        // The edge keeps the layout of the residual, which describes the storage of the local shape, so it need not
-        // address the tiled global shape (e.g., column-major byte strides make the tiles of the leading dimension
-        // overlap).
-        global_type.validate_layout().map_err(ProgramError::from)?;
+        // The edge keeps the layout of the residual when that layout also addresses the tiled global shape. A layout
+        // describes the storage of the local shape, so it need not do so (e.g., column-major byte strides make the
+        // tiles of the leading dimension overlap). Such a residual crosses without a layout instead, and the
+        // conversions at the boundary of each body restore the layout that the body declares (refer to
+        // `reshape_program_boundary`), because the body never requested the global layout, which only
+        // this transform would create.
+        if global_type.validate_layout().is_err() {
+            return Ok(ShardMapResidualEdge {
+                global_type: global_type.with_layout(None),
+                local_type: boundary_type.with_layout(None),
+                sharding,
+            });
+        }
 
         Ok(ShardMapResidualEdge { global_type, local_type: boundary_type, sharding })
     }
@@ -7248,6 +7237,11 @@ where
                 }
                 let operation = DimensionFromScalarOperation::new(target.clone());
                 bind(builder, operation.into(), value)
+            }
+            (ArrayIrType::Array(source), ArrayIrType::Array(target))
+                if source.shape() == target.shape() && source.sharding() == target.sharding() =>
+            {
+                Ok(value)
             }
             _ => reshape_array(builder, value, <&ArrayType>::try_from(target)?),
         }?;
@@ -7799,8 +7793,8 @@ mod tests {
         PartialEvaluationInput, PartialEvaluationOutput, PartialTracer, PartitionedProgram, ResidualPolicyReference,
     };
     use crate::programs::{
-        ExternalReferenceBinding, InstructionId, RecursiveReferenceDischargeDriver, ReferenceAnalysisError,
-        ReferenceDischargeTarget, ReferenceSource,
+        EmptyRegionDriver, ExternalReferenceBinding, InstructionId, RecursiveReferenceDischargeDriver,
+        ReferenceAnalysisError, ReferenceDischargeTarget, ReferenceSource,
     };
 
     use super::*;
@@ -7810,8 +7804,9 @@ mod tests {
     type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
 
     /// Region operation that runs its only computation region once on its inputs and counts its own applications. The
-    /// count stands for an effect that the operation performs itself, in addition to the effects of its region, which
-    /// it declares as [`EffectClass::DeviceOrderedIo`].
+    /// count stands for work that the operation does itself in addition to running its region (e.g., an effect, or a
+    /// computation on its inputs before the region runs), which its declared region data flow does not describe. It
+    /// has no rule over all devices.
     #[derive(Clone, Debug)]
     struct CountedCallOperation(Arc<AtomicUsize>);
 
@@ -7849,10 +7844,6 @@ mod tests {
         fn region_data_flow(&self) -> RegionDataFlow<'_> {
             RegionDataFlow::Provenance
         }
-
-        fn effects(&self) -> Cow<'_, Effects> {
-            Cow::Owned(Effects::new(EffectClasses::single(EffectClass::DeviceOrderedIo), Vec::new()).unwrap())
-        }
     }
 
     impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for CountedCallOperation {
@@ -7872,7 +7863,72 @@ mod tests {
     {
     }
 
-    /// Operation family that adds [`CountedCallOperation`] to the array operations and `shard_map`.
+    /// Collective over the axis `x` with an attached region. Its rule over all devices sums its input across the
+    /// devices along `x` and then runs its region on the sum. It cannot run on one device alone.
+    #[derive(Clone, Debug)]
+    struct RegionCollectiveOperation;
+
+    impl Operation for RegionCollectiveOperation {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            "region_collective"
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            const { &[RegionSlot::computation("body")] }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayIrType],
+            region_interfaces: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            check_count!("region", region_interfaces, 1, TypeError);
+            if input_types != region_interfaces[0].input_types() {
+                return Err(TypeError::invalid("`region_collective` inputs must have the input types of its region"));
+            }
+            Ok(region_interfaces[0].output_types().to_vec())
+        }
+    }
+
+    impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for RegionCollectiveOperation {
+        fn interpret<D: InterpretationDriver<C>>(
+            &self,
+            _context: &C,
+            _driver: &D,
+            _inputs: &[C::Value],
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            Err(ProgramError::UnsupportedOperation { message: "`region_collective` needs a manual region".to_string() })
+        }
+    }
+
+    impl<C: Context<Type = ArrayIrType, Operation: From<RegionCollectiveOperation>>> PartiallyEvaluatableOperation<C>
+        for RegionCollectiveOperation
+    {
+    }
+
+    impl CollectiveOperation for RegionCollectiveOperation {
+        fn axes(&self) -> Cow<'_, CollectiveAxes> {
+            Cow::Owned(CollectiveAxes::from(vec!["x".to_string()]))
+        }
+    }
+
+    impl<O: Operation<Type = ArrayIrType>> LockstepOperation<O> for RegionCollectiveOperation {
+        fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+            &self,
+            context: &LockstepDomain<O>,
+            driver: &D,
+            inputs: &[LockstepValue<O>],
+        ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+            let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string());
+            let sums = LockstepOperation::<O>::interpret_in_lockstep(&sum, context, &EmptyRegionDriver, inputs)?;
+            Some(sums.and_then(|sums| driver.interpret_region(context, 0, sums)))
+        }
+    }
+
+    /// Operation family that adds [`CountedCallOperation`] and [`RegionCollectiveOperation`] to the array operations
+    /// and `shard_map`.
     #[derive(Clone, Debug, ryft_macros::Operation)]
     #[ryft(type(ArrayIrType), constant(TestValue), members(ArrayType))]
     enum CountedOperation {
@@ -7880,6 +7936,8 @@ mod tests {
         Array(ArrayOperation<Array>),
         Map(ShardMapOperation),
         Counted(CountedCallOperation),
+        #[ryft(collective, lockstep)]
+        RegionCollective(RegionCollectiveOperation),
     }
 
     /// Tracing context over the array IR test family, whose tracers are the values that `shard_map` is invoked on.
@@ -8597,7 +8655,7 @@ mod tests {
         let output = context
             .shard_map(
                 |context: &ProjectedContext<DomainTracingContext<TestContext>, ArrayType>, ()| {
-                    Ok(context.axis_index("x")?.reshape([1])?)
+                    context.axis_index("x")?.reshape([1])
                 },
                 (),
                 manual_mesh(),
@@ -8976,7 +9034,7 @@ mod tests {
         let varying = sharded.clone().with_varying_manual_axes(["x"]).unwrap();
         let boundary =
             ShardMapBoundary::new(mesh, vec![varying.clone()], vec![varying], vec!["y".to_string()]).unwrap();
-        assert_eq!(boundary.input_shardings(), &[sharded.clone()]);
+        assert_eq!(boundary.input_shardings(), std::slice::from_ref(&sharded));
         assert_eq!(boundary.output_shardings(), &[sharded]);
     }
 
@@ -11530,13 +11588,17 @@ mod tests {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(f32_type(&[4], None)));
         let value_type = ArrayIrType::Array(f32_type(&[4], None));
         assert_eq!(
-            operation.infer_output_types(&[reference_type.clone(), value_type.clone()], &[body_interface.clone()]),
+            operation.infer_output_types(
+                &[reference_type.clone(), value_type.clone()],
+                std::slice::from_ref(&body_interface)
+            ),
             Ok(vec![value_type.clone()]),
         );
 
         // Input kinds must match the declared boundary positions.
         assert_eq!(
-            operation.infer_output_types(&[value_type.clone(), value_type.clone()], &[body_interface.clone()]),
+            operation
+                .infer_output_types(&[value_type.clone(), value_type.clone()], std::slice::from_ref(&body_interface)),
             Err(TypeError::invalid("expected reference type but got array type")),
         );
         assert_eq!(
@@ -11575,16 +11637,20 @@ mod tests {
             vec![value_type.clone(), reference_type.clone()],
         );
         assert_eq!(
-            forwarding_operation
-                .infer_output_types(&[reference_type.clone(), value_type.clone()], &[forwarding_body.clone()]),
+            forwarding_operation.infer_output_types(
+                &[reference_type.clone(), value_type.clone()],
+                std::slice::from_ref(&forwarding_body)
+            ),
             Err(TypeError::invalid(
                 "`shard_map` output #1 is a reference whose forwarded input the operation does not declare",
             )),
         );
         let forwarding_operation = forwarding_operation.with_output_forwarding(vec![None, Some(0)]).unwrap();
         assert_eq!(
-            forwarding_operation
-                .infer_output_types(&[reference_type.clone(), value_type.clone()], &[forwarding_body.clone()]),
+            forwarding_operation.infer_output_types(
+                &[reference_type.clone(), value_type.clone()],
+                std::slice::from_ref(&forwarding_body)
+            ),
             Ok(vec![value_type.clone(), reference_type.clone()]),
         );
         let misdeclared_type = ArrayIrType::Reference(ReferenceType::new(f32_type(&[8], None)));
@@ -11596,7 +11662,7 @@ mod tests {
             )
             .with_output_forwarding(vec![None, Some(0)])
             .unwrap()
-            .infer_output_types(&[reference_type.clone(), value_type.clone()], &[forwarding_body.clone()]),
+            .infer_output_types(&[reference_type.clone(), value_type.clone()], std::slice::from_ref(&forwarding_body)),
             Err(TypeError::invalid(
                 "`shard_map` output #1 has declared type `ref<f32[8]>`, but it forwards reference input #0 of type \
                  `ref<f32[4]>`",
@@ -11609,7 +11675,10 @@ mod tests {
                 .clone()
                 .with_output_forwarding(vec![Some(1), Some(0)])
                 .unwrap()
-                .infer_output_types(&[reference_type.clone(), value_type.clone()], &[forwarding_body.clone()]),
+                .infer_output_types(
+                    &[reference_type.clone(), value_type.clone()],
+                    std::slice::from_ref(&forwarding_body)
+                ),
             Err(TypeError::invalid(
                 "`shard_map` output #0 is an array but the operation declares that it forwards input #1; only \
                  reference outputs forward inputs",
@@ -11618,10 +11687,10 @@ mod tests {
 
         // The body must forward the declared input by identity.
         assert_eq!(
-            forwarding_operation
-                .with_output_forwarding(vec![None, Some(1)])
-                .unwrap()
-                .infer_output_types(&[reference_type.clone(), value_type.clone()], &[forwarding_body.clone()]),
+            forwarding_operation.with_output_forwarding(vec![None, Some(1)]).unwrap().infer_output_types(
+                &[reference_type.clone(), value_type.clone()],
+                std::slice::from_ref(&forwarding_body)
+            ),
             Err(TypeError::invalid("`shard_map` output #1 does not forward reference input #1 by identity")),
         );
         let replicated = Sharding::replicated(manual_mesh(), 1);
@@ -13307,7 +13376,8 @@ mod tests {
             let driver = PrintRecordingDriver { regions: Vec::new(), prints: &prints };
             let context = TestEagerContext::new();
             let operation = TestOperation::ShardMap(operation.clone());
-            let result = driver.bind_recording(&context, operation, vec![body.entry_region_ref()], &[input.clone()]);
+            let result =
+                driver.bind_recording(&context, operation, vec![body.entry_region_ref()], std::slice::from_ref(&input));
             assert_eq!(result, Err(expected.clone()));
             assert_eq!(prints.into_inner(), Vec::new());
         }
@@ -13329,7 +13399,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "x")?),
+                        |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "x"),
                         inputs[0].clone(),
                         mesh.clone(),
                         input_sharding.clone(),
@@ -13931,11 +14001,12 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_interpretation_does_not_replace_operations_with_effects_of_their_own_by_their_regions() {
-        // `counted_call` runs its region once and counts its own applications, which stands for an effect that the
-        // operation performs itself. Without a collective it is bound once per device, so it is applied twice. With a
-        // reduction over the manual axis in its region it needs lockstep execution, which the emulator cannot provide
-        // by replaying the region in place of the operation, because that would skip the effect, so the map is
+    fn test_shard_map_interpretation_does_not_replace_operations_by_their_regions() {
+        // `counted_call` runs its region once and counts its own applications, which stands for work that the operation
+        // does itself. Without a collective it is bound once per device, so it is applied twice. With a reduction over
+        // the manual axis in its region it needs lockstep execution, which only a rule over all devices can provide.
+        // It has none, and the emulator does not replay its region in its place, although its declared data flow
+        // forwards its inputs and outputs position by position, because that would skip its own work, so the map is
         // rejected instead of running without it.
         let sharded = sharded_along_x();
         let global_type = f32_type(&[2], None);
@@ -13993,6 +14064,49 @@ mod tests {
             }),
         );
         assert_eq!(applications.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_runs_the_regions_of_collectives_through_their_rules() {
+        // `region_collective` is a collective over `x` whose rule over all devices sums its input across the devices
+        // and then runs its attached region on the sum, so the emulator gives that rule the regions of the
+        // instruction. The region doubles its input, and every device returns twice the sum of both shards.
+        let sharded = sharded_along_x();
+        let global_type = f32_type(&[2], None);
+        let boundary = ShardMapBoundary::new(manual_mesh(), vec![sharded.clone()], vec![sharded.clone()], Vec::new())
+            .unwrap()
+            .with_check_manual_variation(false);
+        let local_type = ArrayIrType::Array(boundary.local_input_type(0, &global_type).unwrap());
+        let mut builder = ProgramBuilder::<TestValue, CountedOperation>::new();
+        let input = builder.add_input(local_type.clone());
+        let double = ArrayOperation::Add(AddOperation::new());
+        let output = builder.add_instruction(double, Vec::new(), vec![input, input], None).unwrap()[0];
+        let region = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, CountedOperation>::new();
+        let input = builder.add_input(local_type);
+        let region = builder.import_program(region);
+        let outputs = builder
+            .add_instruction(RegionCollectiveOperation, vec![region], vec![input], None)
+            .unwrap()
+            .to_vec();
+        let body = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let operation =
+            ShardMapOperation::from_program(&body, vec![ArrayIrType::Array(global_type.clone())], boundary).unwrap();
+        let mut builder = ProgramBuilder::<TestValue, CountedOperation>::new();
+        let input = builder.add_input(ArrayIrType::Array(global_type.clone()));
+        let body = builder.import_program(body);
+        let outputs = builder.add_instruction(operation, vec![body], vec![input], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.interpret(vec![f32_value(global_type, &[2.0, 5.0])]),
+            Ok(vec![f32_value(f32_type(&[2], Some(sharded)), &[14.0, 14.0])]),
+        );
     }
 
     #[test]
@@ -14712,7 +14826,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_vary("x")?),
+                        |x: TestTracer| x.parallel_vary("x"),
                         inputs[0].clone(),
                         mesh.clone(),
                         replicated.clone(),
@@ -14742,7 +14856,7 @@ mod tests {
                 |inputs| {
                     vec![
                         shard_map(
-                            |x: TestTracer| Ok(x.parallel_reduce(kind, "x")?),
+                            |x: TestTracer| x.parallel_reduce(kind, "x"),
                             inputs[0].clone(),
                             mesh.clone(),
                             sharded.clone(),
@@ -14807,11 +14921,11 @@ mod tests {
                 vec![
                     shard_map(
                         |x: TestTracer| {
-                            Ok(x.parallel_reduce_with_axis_index_groups(
+                            x.parallel_reduce_with_axis_index_groups(
                                 ReductionKind::Sum,
                                 "x",
                                 vec![vec![0, 1], vec![2, 3]],
-                            )?)
+                            )
                         },
                         inputs[0].clone(),
                         mesh.clone(),
@@ -14843,7 +14957,7 @@ mod tests {
             let w = w.parallel_cast("x", ParallelCastTarget::Reduced)?;
             let w = w.parallel_cast("x", ParallelCastTarget::Varying)?;
             let product = (w * v).parallel_cast("x", ParallelCastTarget::Unreduced)?;
-            Ok(product.parallel_reduce(ReductionKind::Sum, "x")?)
+            product.parallel_reduce(ReductionKind::Sum, "x")
         };
         let shardings = (replicated.clone(), sharded.clone());
         let program = trace_test_program(
@@ -14966,7 +15080,7 @@ mod tests {
                         None => vec![pending],
                         Some(reduction) => vec![
                             shard_map(
-                                |u: TestTracer| Ok(u.parallel_reduce(reduction, "x")?),
+                                |u: TestTracer| u.parallel_reduce(reduction, "x"),
                                 pending,
                                 mesh.clone(),
                                 unreduced(kind),
@@ -15001,7 +15115,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |u: TestTracer| Ok(u.parallel_reduce(ReductionKind::Max, "x")?),
+                        |u: TestTracer| u.parallel_reduce(ReductionKind::Max, "x"),
                         inputs[0].clone(),
                         mesh.clone(),
                         unreduced(UnreducedKind::Max),
@@ -15011,7 +15125,7 @@ mod tests {
                     .unwrap(),
                 ]
             },
-            vec![f32_type(&[2], Some(unreduced(UnreducedKind::Max))).into()],
+            vec![f32_type(&[2], Some(unreduced(UnreducedKind::Max)))],
             Vec::new(),
         );
         assert_eq!(
@@ -15130,7 +15244,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_all_gather_tiled("x", 0usize)?),
+                        |x: TestTracer| x.parallel_all_gather_tiled("x", 0usize),
                         inputs[0].clone(),
                         mesh.clone(),
                         sharded.clone(),
@@ -15139,7 +15253,7 @@ mod tests {
                     )
                     .unwrap(),
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_all_gather("x", 0usize)?),
+                        |x: TestTracer| x.parallel_all_gather("x", 0usize),
                         inputs[0].clone(),
                         mesh.clone(),
                         sharded.clone(),
@@ -15171,7 +15285,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_sum_scatter_tiled("x", 0usize)?),
+                        |x: TestTracer| x.parallel_sum_scatter_tiled("x", 0usize),
                         inputs[0].clone(),
                         mesh.clone(),
                         sharded.clone(),
@@ -15254,7 +15368,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_all_to_all_tiled("x", 1usize, 0usize)?),
+                        |x: TestTracer| x.parallel_all_to_all_tiled("x", 1usize, 0usize),
                         inputs[0].clone(),
                         mesh.clone(),
                         rows.clone(),
@@ -15282,7 +15396,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_permute("x", vec![(0, 1)])?),
+                        |x: TestTracer| x.parallel_permute("x", vec![(0, 1)]),
                         inputs[0].clone(),
                         mesh.clone(),
                         sharded.clone(),
@@ -15313,7 +15427,7 @@ mod tests {
                 |inputs| {
                     vec![
                         shard_map(
-                            |x: TestTracer| Ok(x.parallel_broadcast("x", source)?),
+                            |x: TestTracer| x.parallel_broadcast("x", source),
                             inputs[0].clone(),
                             mesh.clone(),
                             sharded.clone(),
@@ -18901,7 +19015,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "x")?),
+                        |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "x"),
                         inputs[0].clone(),
                         mesh.clone(),
                         sharded.clone(),
@@ -20052,7 +20166,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "y")?),
+                        |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "y"),
                         inputs[0].clone(),
                         mesh.clone(),
                         sharded.clone(),
@@ -20143,7 +20257,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "y")?),
+                        |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "y"),
                         inputs[0].clone(),
                         mesh.clone(),
                         replicated.clone(),
@@ -20229,7 +20343,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "y")?),
+                        |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "y"),
                         inputs[0].clone(),
                         mesh.clone(),
                         sharded.clone(),
@@ -20459,7 +20573,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "y")?),
+                        |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "y"),
                         inputs[0].clone(),
                         mesh.clone(),
                         sharded.clone(),
@@ -20557,8 +20671,8 @@ mod tests {
                                 } else {
                                     function.call(x.into_value())?
                                 };
-                                Ok(ValueProjection::<ArrayType>::into_projected(output)?
-                                    .parallel_reduce(ReductionKind::Sum, "x")?)
+                                ValueProjection::<ArrayType>::into_projected(output)?
+                                    .parallel_reduce(ReductionKind::Sum, "x")
                             },
                             inputs[0].clone(),
                             mesh.clone(),
@@ -21644,7 +21758,7 @@ mod tests {
 
         // A reduction over `x` sums the copies of each batch item along `x`.
         assert_eq!(
-            batched_results(|_, a| Ok(a.parallel_reduce(ReductionKind::Sum, "x")?), true),
+            batched_results(|_, a| a.parallel_reduce(ReductionKind::Sum, "x"), true),
             Ok(vec![f32_value(output_type.clone(), &[2.0, 4.0, 6.0, 8.0])]),
         );
 
@@ -21653,7 +21767,7 @@ mod tests {
             batched_results(
                 |context, a| {
                     let index = context.axis_index("x")?.convert_element_type(DataType::F32)?;
-                    Ok((a * index).parallel_reduce(ReductionKind::Sum, "x")?)
+                    (a * index).parallel_reduce(ReductionKind::Sum, "x")
                 },
                 true,
             ),
@@ -21670,7 +21784,7 @@ mod tests {
                         CollectiveOptions::default(),
                         ParallelAllGatherOutputVariance::Invariant,
                     )?;
-                    Ok(gathered.reduce(&[0], ReductionKind::Sum)?)
+                    gathered.reduce(&[0], ReductionKind::Sum)
                 },
                 true,
             ),
@@ -21680,7 +21794,7 @@ mod tests {
         // A permutation along `x` exchanges the copies of each batch item, which leaves it unchanged. The output varies
         // along `x` by type, so the map promises its replication without checking it.
         assert_eq!(
-            batched_results(|_, a| Ok(a.parallel_permute("x", vec![(0, 1), (1, 0)])?), false),
+            batched_results(|_, a| a.parallel_permute("x", vec![(0, 1), (1, 0)]), false),
             Ok(vec![f32_value(output_type.clone(), &[1.0, 2.0, 3.0, 4.0])]),
         );
 
@@ -21706,7 +21820,7 @@ mod tests {
                         CollectiveOptions::default(),
                         ParallelAllGatherOutputVariance::Invariant,
                     )?;
-                    Ok(gathered.reduce(&[0], ReductionKind::Sum)?)
+                    gathered.reduce(&[0], ReductionKind::Sum)
                 },
                 true,
             ),
@@ -22024,7 +22138,7 @@ mod tests {
                 |inputs| {
                     vec![
                         shard_map(
-                            |x: TestTracer| Ok(x.print_with_effect_class("body", effect_class)?),
+                            |x: TestTracer| x.print_with_effect_class("body", effect_class),
                             inputs[0].clone(),
                             mesh.clone(),
                             sharded.clone(),
@@ -22463,7 +22577,7 @@ mod tests {
                     |item| {
                         let item = ValueProjection::<ArrayType>::into_projected(item)?;
                         let output = shard_map(
-                            |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "items")?),
+                            |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "items"),
                             item,
                             mesh.clone(),
                             sharded.clone(),
@@ -22601,7 +22715,7 @@ mod tests {
                     |item| {
                         let item = ValueProjection::<ArrayType>::into_projected(item)?;
                         let output = shard_map(
-                            |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "items")?),
+                            |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "items"),
                             item,
                             mesh.clone(),
                             sharded.clone(),
@@ -22666,7 +22780,7 @@ mod tests {
                     |item| {
                         let output = item.domain().shard_map(
                             |context: &ProjectedContext<DomainTracingContext<TestContext>, ArrayType>, ()| {
-                                Ok(context.axis_index("items")?)
+                                context.axis_index("items")
                             },
                             (),
                             mesh.clone(),
@@ -22817,7 +22931,7 @@ mod tests {
                     |item| {
                         let item = ValueProjection::<ArrayType>::into_projected(item)?;
                         let output = shard_map(
-                            |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "x")?),
+                            |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "x"),
                             item,
                             mesh.clone(),
                             sharded.clone(),
@@ -22875,7 +22989,7 @@ mod tests {
                 |item| {
                     let item = ValueProjection::<ArrayType>::into_projected(item)?;
                     let output = shard_map(
-                        |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "x")?),
+                        |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "x"),
                         item,
                         mesh.clone(),
                         sharded.clone(),
@@ -22907,7 +23021,7 @@ mod tests {
                             |item| {
                                 let item = ValueProjection::<ArrayType>::into_projected(item)?;
                                 let output = shard_map(
-                                    |x: TestTracer| Ok(x.parallel_reduce(ReductionKind::Sum, "items")?),
+                                    |x: TestTracer| x.parallel_reduce(ReductionKind::Sum, "items"),
                                     item,
                                     mesh.clone(),
                                     sharded.clone(),
@@ -23909,7 +24023,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.reshape(Shape::new(Vec::new()))?.sin()?.reshape([1])?),
+                        |x: TestTracer| x.reshape(Shape::new(Vec::new()))?.sin()?.reshape([1]),
                         inputs[0].clone(),
                         manual_mesh(),
                         sharded_along_x(),
@@ -24058,6 +24172,94 @@ mod tests {
         assert_eq!(
             evaluate_linearization(&program, vec![x.clone()], vec![tangent.clone()]),
             evaluate_linearization(&unmapped, vec![x], vec![tangent]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_differentiation_carries_residuals_whose_layouts_do_not_address_the_global_shape() {
+        // The body repacks its local `f32[2, 2]` shard with column-major byte strides before taking its sine, so the
+        // residual `cos` of the repacked shard has those strides, which cannot address the `f32[4, 2]` edge that tiles
+        // its leading dimension along `x`. The residual therefore crosses without a layout. The primal body drops the
+        // layout with an unchecked cast and the tangent body restores it with another one, so each body computes with
+        // the layout that it declares.
+        let mesh = manual_mesh();
+        let input_sharding = sharding(&mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated]);
+        let boundary = ShardMapBoundary::new(mesh, vec![input_sharding], vec![sharded_along_x()], Vec::new()).unwrap();
+        let global_type = f32_type(&[4, 2], None);
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
+        let column_major_type = local_type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4, 8])));
+        let body = build_program(vec![ArrayIrType::Array(local_type.clone())], |builder, inputs| {
+            let repack = CastOperation::<ArrayType>::unchecked(column_major_type, vec![local_type]).unwrap();
+            let repacked =
+                builder.add_instruction(ArrayOperation::Cast(repack), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            let sine = ArrayOperation::Sin(SinOperation::new());
+            let sine = builder.add_instruction(sine, Vec::new(), vec![repacked], None).unwrap()[0];
+            let sum = ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Sum));
+            builder.add_instruction(sum, Vec::new(), vec![sine], None).unwrap().to_vec()
+        });
+        let program = caller_typed_shard_map_program(body, vec![ArrayIrType::Array(global_type)], boundary);
+        let linearization = program.linearize().unwrap();
+        let tiled = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let edge_sharding = "{mesh<['x'=2:manual]>, [{'x'}, {}]}";
+        let edge = format!("f32[4, 2][sharding={edge_sharding}]");
+        let local_sharding = "{mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}";
+        let local = format!("f32[2, 2][sharding={local_sharding}]");
+        let packed = format!("f32[2, 2][layout=strided{{4,8}}][sharding={local_sharding}]");
+        let row = "f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
+        assert_eq!(
+            linearization.primal().to_string(),
+            formatdoc! {"
+                lambda %0:f32[4, 2] .
+                let %1:f32[4][sharding={tiled}], %2:{edge} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{edge_sharding}],
+                    output_shardings=[{tiled}, {edge_sharding}],
+                    manual_axes=['x'],
+                    global_input_types=[{edge}],
+                    global_output_types=[f32[4][sharding={tiled}], {edge}],
+                ] %0 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:{packed} = cast [
+                            type={packed},
+                            inputs=[{local}],
+                        ] %0
+                            %2:{packed} = sin %1
+                            %3:{row} = reduce [kind=sum, axes=[1]] %2
+                            %4:{packed} = cos %1
+                            %5:{local} = cast [
+                                type={local},
+                                inputs=[{packed}],
+                            ] %4
+                        in (%3, %5)
+                    }},
+                ]
+                in (%1, %2)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            formatdoc! {"
+                lambda %0:f32[4, 2], %1:{edge} .
+                let %2:f32[4][sharding={tiled}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{edge_sharding}, {edge_sharding}],
+                    output_shardings=[{tiled}],
+                    manual_axes=['x'],
+                    global_input_types=[{edge}, {edge}],
+                    global_output_types=[f32[4][sharding={tiled}]],
+                ] %0 %1 [
+                    body={{
+                        lambda %0:{local}, %1:{local} .
+                        let %2:{packed} = cast [
+                            type={packed},
+                            inputs=[{local}],
+                        ] %1
+                            %3:{local} = mul %2 %0
+                            %4:{row} = reduce [kind=sum, axes=[1]] %3
+                        in (%4)
+                    }},
+                ]
+                in (%2)"},
         );
     }
 
@@ -24752,7 +24954,7 @@ mod tests {
                             let x = x.reshape(Shape::new(Vec::new()))?.into_value();
                             let reference = x.reference_new()?;
                             let output = function.call((reference, x))?;
-                            Ok(ValueProjection::<ArrayType>::into_projected(output)?.reshape([1])?)
+                            ValueProjection::<ArrayType>::into_projected(output)?.reshape([1])
                         },
                         inputs[0].clone(),
                         manual_mesh(),
@@ -24873,7 +25075,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map(
-                        |x: TestTracer| Ok(x.stop_gradient()?),
+                        |x: TestTracer| x.stop_gradient(),
                         inputs[0].clone(),
                         manual_mesh(),
                         replicated.clone(),
@@ -25600,7 +25802,7 @@ mod tests {
             let w = w.parallel_cast("x", ParallelCastTarget::Reduced)?;
             let w = w.parallel_cast("x", ParallelCastTarget::Varying)?;
             let product = (w * v).parallel_cast("x", ParallelCastTarget::Unreduced)?;
-            Ok(product.parallel_reduce(ReductionKind::Sum, "x")?)
+            product.parallel_reduce(ReductionKind::Sum, "x")
         };
         let w = f32_value(f32_type(&[2], None), &[2.0, 3.0]);
         let v = f32_value(f32_type(&[4], None), &[1.0, 4.0, 5.0, 7.0]);
@@ -25641,7 +25843,7 @@ mod tests {
                 .gradient(|u| {
                     let u = ValueProjection::<ArrayType>::into_projected(u)?;
                     let output = shard_map(
-                        |u: TestTracer| Ok(u.parallel_reduce(ReductionKind::Max, "x")?),
+                        |u: TestTracer| u.parallel_reduce(ReductionKind::Max, "x"),
                         u,
                         mesh.clone(),
                         unreduced.clone(),
@@ -26235,7 +26437,7 @@ mod tests {
         let output = context
             .shard_map(
                 |context: &ProjectedContext<DomainTracingContext<TestContext>, ArrayType>, ()| {
-                    Ok(context.lift(Array::scalar(3.0f32)?)?.reshape([1])?)
+                    context.lift(Array::scalar(3.0f32)?)?.reshape([1])
                 },
                 (),
                 manual_mesh(),
@@ -26627,7 +26829,7 @@ mod tests {
                 |inputs| {
                     vec![
                         shard_map(
-                            |x: TestTracer| Ok(x.parallel_broadcast("x", source)?),
+                            |x: TestTracer| x.parallel_broadcast("x", source),
                             inputs[0].clone(),
                             mesh.clone(),
                             sharded.clone(),
@@ -28881,7 +29083,7 @@ mod tests {
                         .shard_map(
                             |context: &ProjectedContext<DomainTracingContext<TestContext>, ArrayType>, ()| {
                                 body_named_axes.replace(Some(context.named_axes()));
-                                Ok(context.axis_index("x")?.reshape([1])?)
+                                context.axis_index("x")?.reshape([1])
                             },
                             (),
                             mesh.clone(),
@@ -30198,7 +30400,7 @@ mod tests {
                 let output = shard_map(
                     |(input, scale): (TestTracer, TestTracer)| {
                         let scalar = round_trip(input)?.convert_element_type(DataType::F32)?;
-                        Ok(scalar.mul(&scale)?.reshape(Shape::new(vec![Dimension::Static(1)]))?)
+                        scalar.mul(&scale)?.reshape(Shape::new(vec![Dimension::Static(1)]))
                     },
                     (inputs[0].clone(), inputs[1].clone()),
                     mesh.clone(),
@@ -30633,7 +30835,7 @@ mod tests {
             |inputs| {
                 vec![
                     shard_map_with_inferred_input_shardings(
-                        |x: TestTracer| Ok(x.exp()?),
+                        |x: TestTracer| x.exp(),
                         inputs[0].clone(),
                         mesh.clone(),
                         Sharding::replicated(mesh.clone(), 1),
@@ -31393,7 +31595,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            domain.validate_collective(&vary("x"), Some(&foreign_mesh), &[invariant.clone()]),
+            domain.validate_collective(&vary("x"), Some(&foreign_mesh), std::slice::from_ref(&invariant)),
             Err(ProgramError::MalformedProgram(
                 "`parallel_vary` operation mesh does not match the enclosing manual axis `x` mesh".to_string(),
             )),
@@ -31409,12 +31611,12 @@ mod tests {
         // A collective staged without tracking metadata trusts the program under unchecked owners. Under checked
         // owners, its outputs must vary along every axis that it names (e.g., a grouped reduction of a varying input),
         // because outputs typed as invariant could hold different values on different devices.
-        assert_eq!(domain.validate_collective(&index("y"), None, &[invariant.clone()]), Ok(()));
+        assert_eq!(domain.validate_collective(&index("y"), None, std::slice::from_ref(&invariant)), Ok(()));
         let grouped =
             ParallelReduceOperation::grouped(ReductionKind::Sum, "x".to_string(), 2, vec![vec![0], vec![1]]).unwrap();
         assert_eq!(domain.validate_collective(&grouped, None, &[varying_along(&["x"])]), Ok(()));
         assert_eq!(
-            domain.validate_collective(&index("x"), None, &[invariant.clone()]),
+            domain.validate_collective(&index("x"), None, std::slice::from_ref(&invariant)),
             Err(ProgramError::MalformedProgram(
                 "`axis_index` without tracked mesh metadata types its outputs as invariant along manual axis `x` \
                  inside a checked manual region"
@@ -31432,7 +31634,10 @@ mod tests {
 
         // A multi-axis collective resolves the owner of each axis, and those owners must agree on their policy. Under
         // checked owners, its outputs must vary along all of its axes.
-        assert_eq!(domain.validate_collective(&gather(["x", "w"]), Some(&mesh), &[invariant.clone()]), Ok(()));
+        assert_eq!(
+            domain.validate_collective(&gather(["x", "w"]), Some(&mesh), std::slice::from_ref(&invariant)),
+            Ok(())
+        );
         assert_eq!(domain.validate_collective(&gather(["x", "w"]), None, &[varying_along(&["w", "x"])]), Ok(()));
         assert_eq!(
             domain.validate_collective(&gather(["x", "w"]), None, &[varying_along(&["x"])]),
@@ -31633,10 +31838,11 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_residual_edge_new_rejects_layouts_that_do_not_address_the_global_shape() {
-        // The edge keeps the layout of the residual and tiles its leading dimension along `x`. Column-major byte
-        // strides `[4, 8]` address a local `f32[2, 2]` array, but a leading dimension of four elements spans sixteen
-        // bytes, so columns that are eight bytes apart would overlap.
+    fn test_shard_map_residual_edge_new_drops_layouts_that_do_not_address_the_global_shape() {
+        // The edge tiles the leading dimension of the residual along `x`. Column-major byte strides `[4, 8]` address a
+        // local `f32[2, 2]` array, but a leading dimension of four elements spans sixteen bytes, so columns that are
+        // eight bytes apart would overlap. The body never requested that global layout, so the edge carries the
+        // residual without a layout, and the boundary conversions of the bodies restore the layout that they declare.
         let mesh = manual_mesh();
         let boundary =
             ShardMapBoundary::from_validated_shardings(mesh.clone(), Vec::new(), Vec::new(), vec!["x".to_string()]);
@@ -31647,13 +31853,10 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(local_type(vec![4, 8]).validate_layout(), Ok(()));
-        assert_eq!(
-            ShardMapResidualEdge::new(0, &local_type(vec![4, 8]).into(), &boundary),
-            Err(ShardMapError::Program(ProgramError::Type(TypeError::invalid(
-                "strided layout stride 8 on axis 1 is smaller than the 16-byte span occupied by more minor axes and \
-                 may alias array elements",
-            )))),
-        );
+        let edge = ShardMapResidualEdge::new(0, &local_type(vec![4, 8]).into(), &boundary).unwrap();
+        assert_eq!(edge.local_type, local_type(vec![4, 8]).with_layout(None));
+        assert_eq!(edge.global_type.static_shape().unwrap().dimensions(), [4, 2]);
+        assert_eq!(edge.global_type.layout(), None);
 
         // Row-major byte strides keep addressing the tiled leading dimension, so the edge keeps them.
         let edge = ShardMapResidualEdge::new(0, &local_type(vec![8, 4]).into(), &boundary).unwrap();

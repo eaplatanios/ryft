@@ -16,6 +16,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::constants::zero::Zero;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProvider, OutputRegionProvenance,
@@ -496,6 +497,20 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCa
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         driver.interpret_region(context, 0, inputs.to_vec())
+    }
+}
+
+// The reference backend emulation of a `shard_map` runs this call once for all devices when its forward region
+// communicates across them. Like interpretation, the call executes only its forward region, once, on its inputs.
+impl<T: DifferentiableType, O: Operation<Type = ArrayIrType>> LockstepOperation<O> for LinearCallOperation<T> {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(driver.interpret_region(context, 0, inputs.to_vec()))
     }
 }
 

@@ -686,6 +686,7 @@ where
 
     /// Backend-owned composite call whose primal region can contain XLA operations, with either attached rule regions
     /// that can contain XLA operations or retained rules registered in this family, which are traced lazily.
+    #[ryft(lockstep)]
     Composite(CompositeOperation<Payload, Operation<Payload>>),
 
     /// Reverse-mode carrier of a [`Composite`](Self::Composite) call, which transposition replaces with the call's
@@ -694,9 +695,11 @@ where
 
     /// Differentiation-owned call to an explicitly transposable linear map with ordinary trailing residual operands,
     /// which lowers by inlining its forward region.
+    #[ryft(lockstep)]
     LinearCall(LinearCallOperation<ArrayIrType>),
 
     /// Backend-owned rematerialized call whose body can contain XLA operations.
+    #[ryft(lockstep)]
     Rematerialize(RematerializeOperation<ArrayIrType>),
 
     /// Composite call whose retained rules are registered in the [`ArrayOperation`] member family, promoted from its

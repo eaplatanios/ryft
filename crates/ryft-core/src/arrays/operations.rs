@@ -145,7 +145,9 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Scan(ScanOperation<ArrayType>),
     StopGradient(StopGradientOperation<ArrayType>),
     Tag(TagOperation<ArrayType>),
+    #[ryft(lockstep)]
     Rematerialize(RematerializeOperation<ArrayType>),
+    #[ryft(lockstep)]
     LinearCall(LinearCallOperation<ArrayType>),
     RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
     Dropout(DropoutOperation),
@@ -154,7 +156,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Guard(GuardOperation<ArrayType>),
     Cast(CastOperation<ArrayType>),
     CustomCall(CustomCallOperation),
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     Composite(CompositeOperation<V, ArrayOperation<V>>),
     #[ryft(collective)]
     CompositeTranspose(CompositeTransposeOperation<V, ArrayOperation<V>>),
@@ -442,9 +444,11 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     Scan(ScanOperation<ArrayIrType>),
 
     /// Rematerialized call with an array IR body.
+    #[ryft(lockstep)]
     Rematerialize(RematerializeOperation<ArrayIrType>),
 
     /// Differentiation-owned linear call with ordinary trailing residual inputs.
+    #[ryft(lockstep)]
     LinearCall(LinearCallOperation<ArrayIrType>),
 
     /// Bit generator with trailing dimension inputs for its dynamic bits-output axes.
@@ -468,7 +472,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// uses this variant because those regions convert with the primal. Calls with retained array-only callbacks
     /// instead use [`LiftedComposite`](Self::LiftedComposite). Reference inputs are allowed only in the leading
     /// non-differentiated segment and reference outputs are rejected.
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     Composite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
     /// Temporary reverse mode carrier of [`Composite`](Self::Composite) calls with custom backward rules. It represents
@@ -486,7 +490,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// This uses the same [`CompositeOperation`] as [`Composite`](Self::Composite), with a different rule-source type
     /// that adapts the retained array-only rules. Calls with attached rule programs need no such adapter: their rules
     /// convert with the primal, so they use [`Composite`](Self::Composite) even when promoted from [`ArrayOperation`].
-    #[ryft(collective)]
+    #[ryft(collective, lockstep)]
     LiftedComposite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>),
 
     /// Temporary reverse mode carrier of [`LiftedComposite`](Self::LiftedComposite), with the same role as

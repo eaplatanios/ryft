@@ -19,6 +19,7 @@ use crate::macros::{check_count, check_types};
 use crate::operations::arithmetic::AddOperation;
 use crate::operations::manipulation::conversions::ReducePrecisionOperation;
 use crate::operations::references::ReferenceNewOperation;
+use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
 use crate::partial::residuals::{ResidualPlacement, ResidualRounding, RoundedResidualPlacement};
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationOutput, PartialEvaluationValue, PartialValue,
@@ -368,6 +369,20 @@ impl<C: Domain<Type: 'static>> InterpretableOperation<C> for RematerializeOperat
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
         driver.interpret_region(context, 0, inputs.to_vec())
+    }
+}
+
+// The reference backend emulation of a `shard_map` runs this call once for all devices when its body communicates
+// across them. Like interpretation, the call executes only its body, once, on its inputs.
+impl<T: Type, O: Operation<Type = ArrayIrType>> LockstepOperation<O> for RematerializeOperation<T> {
+    #[inline]
+    fn interpret_in_lockstep<D: InterpretationDriver<LockstepDomain<O>>>(
+        &self,
+        context: &LockstepDomain<O>,
+        driver: &D,
+        inputs: &[LockstepValue<O>],
+    ) -> Option<Result<Vec<LockstepValue<O>>, ProgramError>> {
+        Some(driver.interpret_region(context, 0, inputs.to_vec()))
     }
 }
 
