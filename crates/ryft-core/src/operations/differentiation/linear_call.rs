@@ -278,21 +278,11 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         check_count!("input", input_axes, inputs.len(), ProgramError);
         let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
 
-        // A completely replicated call at an unnamed batching level needs no structural region rewrite, and keeping the
-        // original call avoids manufacturing a batch axis that neither region observes. What makes that shortcut sound
-        // is the level being unnamed rather than the inputs being replicated: an attached region's value can vary per
-        // batch item with no mapped input at all, but only by addressing the level _by name_ (e.g., an `axis_index`
-        // or a collective over this level's axis, both of which a transposed program naturally contains because
-        // `parallel_all_gather` transposes to `parallel_sum_scatter` and vice versa). Every named-axis operation
-        // resolves the level it belongs to by comparing its own axis name against `BatchingContext::axis_name`, so an
-        // unnamed level is provably invisible to all of them, including those of operation families this crate does not
-        // know about. A named level therefore batches its regions structurally, which is also what lets the named-axis
-        // operations inside them resolve against it.
-        if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
-            let outputs = context.parent().bind(self.clone(), driver.region_programs(), input_values.as_slice())?;
-            return Ok(outputs.into_iter().map(P::replicated).collect());
-        }
-
+        // A completely replicated call batches its regions structurally as well. At an unnamed level their values
+        // are the same for every batch item, because a value can vary per batch item with no mapped input only by
+        // addressing the level by name (e.g., an `axis_index` or a collective over the axis of the level). Batching
+        // can still stage work in the regions, though (e.g., an operation with a custom batching rule applies that
+        // rule whenever it is batched, whatever its inputs), which keeping the original regions would drop.
         let (residual_axes, linear_axes) = input_axes.split_at(self.residual_count);
         let (forward, output_axes) = P::adapt_batched_program(
             driver.batch_program(

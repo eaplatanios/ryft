@@ -4,7 +4,7 @@ use std::rc::Rc;
 
 use crate::arrays::{ArrayIrType, ArrayType, DataType};
 use crate::batching::{
-    BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+    BatchableOperation, BatchedProgram, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain, StagingContext};
@@ -499,15 +499,12 @@ impl<T: 'static + Type, C: Context<Type = T, Operation: From<RematerializeOperat
     ) -> Result<Vec<P::Batch>, BatchingError> {
         // Batch the body at its natural output axes and bind the call over the resulting packed values. Policy
         // boundary inputs (e.g., a first-class mapped extent) become additional leading call and body inputs with
-        // zero-space tangents. A completely replicated call at an unnamed level stays unchanged. Otherwise, specialize
-        // the batched body to the packed input types so that symbolic extents agree with the call's exact interface.
+        // zero-space tangents. A completely replicated call is batched as well, because batching its body can stage
+        // work even then (e.g., an operation with a custom batching rule applies that rule whenever it is batched,
+        // whatever its inputs), which keeping the original body would drop. Specialize the batched body to the packed
+        // input types so that symbolic extents agree with the call's exact interface.
         let input_axes = inputs.iter().map(P::batch_axis).collect::<Vec<_>>();
         let input_values = inputs.iter().map(P::value).cloned().collect::<Vec<_>>();
-        if input_axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
-            let regions = driver.region_programs();
-            let outputs = context.parent().bind(self.clone(), regions, input_values.as_slice())?;
-            return Ok(outputs.into_iter().map(P::replicated).collect::<Vec<_>>());
-        }
         let body = driver.region(0)?;
         let batched_body =
             driver.batch_program(context, body, input_axes.as_slice(), ProgramBatchingOutputAxesPolicy::Natural)?;

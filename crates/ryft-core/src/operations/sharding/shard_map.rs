@@ -2793,13 +2793,14 @@ impl ShardMapOperation {
 
     /// Binds the fused forward mode `shard_map` of this operation in the shared primal and tangent context of `context`
     /// (refer to the forward mode rule of [`ShardMapOperation`]) and returns the output duals, or [`None`] when no
-    /// output tangent is live, in which case nothing is bound. The fused body is the fused JVP program of `body` with
-    /// respect to the inputs that `activity` marks as active, which maps `[inputs..., active(input_tangents)...]` to
-    /// `[outputs..., output_tangents...]`, projected onto the outputs followed by the live output tangents with its
-    /// dead work removed (refer to [`Program::with_outputs`] and [`Program::into_simplified`]). An output tangent is
-    /// live when it depends on some active input tangent (JAX's `which_nz_out`), and every other output receives a
-    /// structurally zero tangent. Each input tangent crosses the boundary under the input sharding of its primal,
-    /// and each output tangent under the output sharding of its primal, as in JAX's `_shard_map_jvp`.
+    /// output tangent is live or when the fused body accesses references, in which case nothing is bound and the caller
+    /// binds the two-map form. The fused body is the fused JVP program of `body` with respect to the inputs that
+    /// `activity` marks as active, which maps `[inputs..., active(input_tangents)...]` to `[outputs...,
+    /// output_tangents...]`, projected onto the outputs followed by the live output tangents with its dead work removed
+    /// (refer to [`Program::with_outputs`] and [`Program::into_simplified`]). An output tangent is live when it depends
+    /// on some active input tangent (JAX's `which_nz_out`), and every other output receives a structurally zero
+    /// tangent. Each input tangent crosses the boundary under the input sharding of its primal, and each output tangent
+    /// under the output sharding of its primal, as in JAX's `_shard_map_jvp`.
     fn fused_jvp<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
         context: &DifferentiationContext<C, P>,
@@ -2854,6 +2855,14 @@ impl ShardMapOperation {
         } else {
             fused_body
         };
+
+        // The partial evaluation rule of this operation keeps a body with reference accesses whole, so a fused map
+        // with such a body could not be split when the fused program is partitioned later. The rules of the body can
+        // introduce such accesses although the source body has none (e.g., a custom forward mode rule that accumulates
+        // its tangent in a local reference), so the derived body decides, after its dead work is removed.
+        if fused_body.entry_region_ref().contains_reference_accesses_in_closure() {
+            return Ok(None);
+        }
 
         let boundary = self.boundary();
         let mut input_shardings = boundary.input_shardings().to_vec();
@@ -3607,15 +3616,12 @@ where
         // communication across devices.
         let axis_name = context.axis_name().filter(|axis_name| self.boundary.mesh().axis_index(axis_name).is_none());
 
-        // A call whose inputs are all unbatched computes the same values for every batch item when no collective in its
-        // body can refer to this level, which holds for an anonymous or shadowed level, so it keeps its boundary. A
-        // named level batches the body structurally even then, and an output that the consumed collectives map (e.g.,
+        // The body is batched structurally even when no input is mapped. Its values are then the same for every batch
+        // item unless a collective in it refers to this level by name, but batching can still stage work in it (e.g.,
+        // an operation with a custom batching rule applies that rule whenever it is batched, whatever its inputs),
+        // which keeping the original body would drop. An output that such a rule or a consumed collective maps (e.g.,
         // the `axis_index` of this level) takes the mapped path, so the errors below also apply to such a call.
         let input_positions = inputs.iter().map(ArrayIrBatch::batch_axis_position).collect::<Vec<_>>();
-        if axis_name.is_none() && input_positions.iter().all(Option::is_none) {
-            let outputs = context.parent().bind(self.clone(), vec![driver.region(0)?.to_program()], &input_values)?;
-            return Ok(outputs.into_iter().map(ArrayIrBatch::replicated).collect::<Vec<_>>());
-        }
 
         // Boundary types are static (refer to the `# Static Boundaries` section of the documentation of
         // `ShardMapOperation`), so the batch extent must be static whenever a boundary position is mapped or the body
@@ -4143,8 +4149,9 @@ where
         // by the partial evaluation rule of this operation, which must keep every output known. A body that the partial
         // evaluation rule keeps whole therefore keeps the two-map form even in a fused context, which is a body with
         // references or with a dynamically shaped value anywhere in its region closure (which could be a residual that
-        // cannot cross the static boundary). A body none of whose output tangents is live also keeps the two-map form,
-        // which then binds no tangent map at all.
+        // cannot cross the static boundary). The same holds for a body whose fused JVP program accesses references
+        // that the body itself does not (refer to `ShardMapOperation::fused_jvp`). A body none of whose output
+        // tangents is live also keeps the two-map form, which then binds no tangent map at all.
         let has_references = body_program.input_types().iter().any(Type::is_reference)
             || body_program.output_types().iter().any(Type::is_reference)
             || body_program.contains_reference_accesses_in_closure();
@@ -20972,6 +20979,83 @@ mod tests {
     }
 
     #[test]
+    fn test_shard_map_batching_applies_custom_batching_rules_to_replicated_inputs() {
+        // The custom batching rule of an identity composite prints its input. A custom batching rule is applied
+        // whenever its call is batched, whatever its inputs, so batching the map at an unnamed level with a replicated
+        // input batches its body as well, and the batched body prints.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function = composite(|x: BodyTracer| Ok(x)).with_batching(
+                                |x: BodyTracer, axis: BatchAxis, _: BatchingLevelExtent<BodyTracer>| {
+                                    let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                                    let x = x.print_with_effect_class("batched", EffectClass::DeviceOrderedIo)?;
+                                    Ok((x.into_value(), axis))
+                                },
+                            );
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[], None)],
+            Vec::new(),
+        );
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        assert_eq!(batched.output_axes(), &[BatchAxis::replicated()]);
+        let replicated = "{mesh<['x'=2:manual]>, []}";
+        let local = format!("f32[][sharding={replicated}]");
+        assert_eq!(
+            batched.into_parts().0.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<2>, %1:f32[] .
+                let %2:{local} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{replicated}],
+                    manual_axes=['x'],
+                    global_input_types=[{local}],
+                    global_output_types=[{local}],
+                ] %1 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{local} = composite [
+                                name=\"composite\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<2>, input_axes=[replicated], output_axes=[replicated])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{local} .
+                                    let %2:{local} = print [label=batched, effect_class=device_ordered_io] %1
+                                    in (%2)
+                                }},
+                            ]
+                        in (%2)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
+    }
+
+    #[test]
     fn test_shard_map_batching_follows_the_layouts_of_mapped_outputs_of_custom_batching_rules() {
         // The custom batching rule of an identity composite returns its batched input with an explicit layout, so the
         // mapped output of the batched body has that layout. Inserting the batch dimension into the declared output
@@ -24173,6 +24257,90 @@ mod tests {
             evaluate_linearization(&program, vec![x.clone()], vec![tangent.clone()]),
             evaluate_linearization(&unmapped, vec![x], vec![tangent]),
         );
+    }
+
+    #[test]
+    fn test_shard_map_differentiation_keeps_two_maps_when_the_fused_body_accesses_references() {
+        // The body calls an identity composite whose forward mode rule accumulates its tangent in a local reference, so
+        // the fused JVP program of the body accesses a reference although the body itself does not. Partial evaluation
+        // keeps a map whose body accesses references whole, so a fused map could not be split when the fused program
+        // is partitioned later. The forward mode rule therefore binds the two-map form, and linearizing a
+        // rematerialized call of the map, which partitions the fused program of its body, succeeds.
+        let sharded = sharded_along_x();
+        let global_type = f32_type(&[4], Some(sharded.clone()));
+        let mapped = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function =
+                                composite(|x: BodyTracer| Ok(x)).with_jvp(|x: BodyTracer, tangent: BodyTracer| {
+                                    let accumulator = tangent.reference_new()?;
+                                    accumulator.write(&tangent)?;
+                                    Ok((x, accumulator.read()?))
+                                });
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        manual_mesh(),
+                        sharded.clone(),
+                        sharded.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![global_type.clone()],
+            Vec::new(),
+        );
+        let tiled = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let global = format!("f32[4][sharding={tiled}]");
+        let local = "f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
+        assert_eq!(
+            mapped.jvp().unwrap().to_string(),
+            formatdoc! {"
+                lambda %0:{global}, %1:{global} .
+                let %2:{global} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{tiled}],
+                    output_shardings=[{tiled}],
+                    manual_axes=['x'],
+                    global_input_types=[{global}],
+                    global_output_types=[{global}],
+                ] %0 [
+                    body={{
+                        lambda %0:{local} .
+                        in (%0)
+                    }},
+                ]
+                    %3:{global} = shard_map [
+                        mesh=['x'=2:manual],
+                        input_shardings=[{tiled}],
+                        output_shardings=[{tiled}],
+                        manual_axes=['x'],
+                        global_input_types=[{global}],
+                        global_output_types=[{global}],
+                    ] %1 [
+                        body={{
+                            lambda %0:{local} .
+                            let %1:ref<{local}> = reference_new %0
+                                () = reference_write %1 %0
+                                %2:{local} = reference_read %1
+                            in (%2)
+                        }},
+                    ]
+                in (%2, %3)"},
+        );
+
+        let program = build_program(vec![ArrayIrType::Array(global_type)], |builder, inputs| {
+            let body = builder.import_program(mapped);
+            let rematerialize =
+                RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(NothingSavable));
+            builder.add_instruction(rematerialize, vec![body], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.primal().to_string(), "");
+        assert_eq!(linearization.tangent().to_string(), "");
     }
 
     #[test]
