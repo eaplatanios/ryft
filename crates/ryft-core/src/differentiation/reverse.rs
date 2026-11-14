@@ -1673,7 +1673,9 @@ impl<
                         ),
                     });
                 }
-            } else if cotangent.r#type().as_ref() != &expected_type {
+            } else if !expected_type.is_interchangeable_with(cotangent.r#type().as_ref()) {
+                // A live cotangent may be stored differently than its type describes (e.g., with the explicit layout
+                // that a seed or a primal value contributed), because that type has no explicit layout.
                 return Err(ProgramError::InvalidArgument {
                     message: format!(
                         "pullback cotangent {} has type {} but its primal input requires cotangent type {}",
@@ -5832,7 +5834,8 @@ pub(crate) mod tests {
     #[test]
     fn test_pullback_apply_interchangeable_cotangent_seeds() {
         // The cotangent type of an output with an explicit layout has none, and a pullback accepts a seed that is
-        // stored like that output as well as one that is not. The gradient has no explicit layout either.
+        // stored like that output as well as one that is not. The gradient is an array of the cotangent type of the
+        // input, however the operations that computed it stored it.
         let plain = ArrayType::new_static(DataType::F32, [2, 2]);
         let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![16, 8])));
         let primal = Array::from_elements(strided.clone(), &[1f32, 2.0, 3.0, 4.0]).unwrap();
@@ -5841,7 +5844,7 @@ pub(crate) mod tests {
         for seed_type in [&plain, &strided] {
             let seed = Array::from_elements(seed_type.clone(), &[0.5f32, 1.5, 2.5, 3.5]).unwrap();
             let gradient: Array = pullback.apply_materialized(seed).unwrap();
-            assert_eq!(gradient.r#type().as_ref(), &plain);
+            assert!(plain.is_interchangeable_with(gradient.r#type().as_ref()));
             assert_eq!(gradient.elements::<f32>().unwrap(), vec![1.0, 6.0, 15.0, 28.0]);
         }
     }

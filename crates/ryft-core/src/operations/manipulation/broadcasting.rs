@@ -5266,7 +5266,7 @@ mod tests {
         pullback_inputs.extend(residuals);
         assert_eq!(
             pullback.interpret(pullback_inputs).unwrap()[0],
-            ArrayIrValue::Array(Array::from_elements(concrete_type, &[6f32, 15.]).unwrap(),)
+            ArrayIrValue::Array(Array::from_elements(concrete_type.with_layout(None), &[6f32, 15.]).unwrap(),)
         );
 
         // An identity broadcast can add layout metadata that must be removed from its input cotangent.

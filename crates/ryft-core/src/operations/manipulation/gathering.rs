@@ -4303,9 +4303,8 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
                 let %1:i32[2, 1]@Host[Pinned] = const [[1], [3]]
-                    %2:f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = zero [
-                        type=f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned],
-                    ]
+                    %2:f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = zero \
+                        [type=f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned]]
                     %3:f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = scatter [
                         kind=add,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \

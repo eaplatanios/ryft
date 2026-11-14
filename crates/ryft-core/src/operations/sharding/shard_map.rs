@@ -207,18 +207,20 @@
 //!     by their logical bytes and rejects a map whose copies differ with [`ProgramError::MalformedProgram`], whether
 //!     its boundary trusts output replication or proves it from the types of its body. The reference backend is an
 //!     oracle, so a type that fails to report manual variation becomes an error instead of the copy of coordinate zero.
-//!   - **References are copied in and written back.** The current referent of a reference input is split like an
-//!     array input, and each device receives its shard as a fresh local [`ArrayReference`] root that it owns. After
-//!     the body, the final local shards are assembled like an output at the input sharding and written back into the
-//!     caller's reference. Along an active manual axis along which a reference is unreduced, the devices hold partial
-//!     states, which are summed (as the final-state output of the discharged map, whose output sharding is the input
-//!     sharding, sums them). Along an active manual axis along which a reference is otherwise replicated, every device
-//!     holds its own copy, and the reference contract of `shard_map` admits only mutations that keep the copies
-//!     identical, so the copy of the device at coordinate zero is written back after checking that every copy agrees
-//!     with it. Distinct reference inputs must denote distinct allocations, as in reference discharge, so two inputs
-//!     that denote the same allocation are rejected with [`ShardMapError::RepeatedReferenceInputAllocation`], because
-//!     each one is copied in and written back independently, which would lose the writes through all but one of them.
-//!     A reference output forwards a reference input, so it is the caller's reference itself.
+//!   - **References are copied in and written back.** The current referent of a reference input is split like an array
+//!     input, and each device receives its shard as a fresh local [`ArrayReference`] root that it owns. After the body,
+//!     the final local shards of every reference that the body mutates (as its reference analysis reports, so a
+//!     reference that it only reads or forwards is left untouched) are assembled like an output at the input sharding
+//!     and written back into the caller's reference. Along an active manual axis along which a reference is unreduced,
+//!     the devices hold partial states, which are summed (as the final-state output of the discharged map, whose output
+//!     sharding is the input sharding, sums them). Along an active manual axis along which a reference is otherwise
+//!     replicated, every device holds its own copy, and the reference contract of `shard_map` admits only mutations
+//!     that keep the copies identical, so the copy of the device at coordinate zero is written back after checking that
+//!     every copy agrees with it. Distinct reference inputs must denote distinct allocations, as in reference
+//!     discharge, so two inputs that denote the same allocation are rejected with
+//!     [`ShardMapError::RepeatedReferenceInputAllocation`], because each one is copied in and written back
+//!     independently, which would lose the writes through all but one of them. A reference output forwards a reference
+//!     input, so it is the caller's reference itself.
 //!   - **Ordinary operations bind once per device.** They bind in device order through [`InterpretationDriver::bind`]
 //!     with exactly the local values of that device, so effects such as `print` occur per device, in device order.
 //!   - **Every device computes values of the same data type and extents.** The devices run the same program, so their
@@ -2985,7 +2987,17 @@ impl Operation for ShardMapOperation {
                 declared => {
                     let actual = <&ArrayType>::try_from(actual)?;
                     let declared = <&ArrayType>::try_from(declared)?;
-                    if !boundary_types_match(actual, declared) {
+
+                    // A declaration without a layout admits an array with any layout, as type refinement does, so
+                    // that an input whose layout is only known when the map runs (e.g., one that a `condition` branch
+                    // with a declared output type without a layout forwards) remains valid. The shards of the input
+                    // are copied into the local type, which the declaration determines.
+                    let matches = if declared.layout().is_none() && actual.layout().is_some() {
+                        boundary_types_match(&actual.clone().with_layout(None), declared)
+                    } else {
+                        boundary_types_match(actual, declared)
+                    };
+                    if !matches {
                         return Err(TypeError::invalid(format!(
                             "`{name}` input #{index} has type `{actual}` but its declared global input type \
                              is `{declared}`",
@@ -4022,15 +4034,16 @@ where
             .with_manual_variation_checks(self.boundary.manual_variation_checks);
         }
 
-        // Batching the body keeps the data type and shape of an output that is not mapped, but it can change its layout
-        // (e.g., consuming a reduction over a named batch axis reduces over the batch dimension, which clears the
-        // layout of the result). An unmapped array output therefore declares the layout of the global type that its
-        // batched body output has through the boundary. Mapped outputs insert the batch dimension, which clears their
-        // layouts, into their declared types above, and forwarded reference outputs keep the types of the inputs that
+        // Batching the body can change the layout of an output. An output that is not mapped keeps its data type and
+        // shape but can lose its layout (e.g., consuming a reduction over a named batch axis reduces over the batch
+        // dimension, which clears the layout of the result), and a mapped output, whose declared type lost its layout
+        // when the batch dimension was inserted above, can gain one (e.g., from a custom batching rule that returns an
+        // array with an explicit layout). Every array output therefore declares the layout of the global type that its
+        // batched body output has through the boundary. Forwarded reference outputs keep the types of the inputs that
         // they forward.
         let body_output_types = batched_body.output_types();
-        for (index, position) in output_positions.iter().enumerate() {
-            if let (None, ArrayIrType::Array(declared)) = (position, &mut output_types[index]) {
+        for (index, output_type) in output_types.iter_mut().enumerate() {
+            if let ArrayIrType::Array(declared) = output_type {
                 let body_output_type = <&ArrayType>::try_from(&body_output_types[index])?;
                 let global_type = boundary.global_output_type(index, body_output_type).map_err(to_batching_error)?;
                 *declared = declared.clone().with_layout(global_type.layout().cloned());
@@ -6494,8 +6507,18 @@ where
         // Along an active manual axis along which it is otherwise replicated, every device holds its own copy, which
         // the reference contract requires identical final copies, so assembling takes the copy of the device at
         // coordinate zero, after checking that every other copy agrees with it.
+        //
+        // Only the references that the body mutates are written back, as reference discharge publishes a final state
+        // only for those. A write advances the state of the caller's reference even when it stores the value that the
+        // reference already holds, which would invalidate the observations of a reference that the body only reads or
+        // forwards. Whether the body mutates a reference is decided by its reference analysis and not by comparing the
+        // final state with the initial one, because a mutation that happens to restore the initial value is still one.
+        let analysis = body.reference_analysis(0)?;
         let mut reference_updates = Vec::with_capacity(reference_inputs.len());
         for (index, reference, roots) in reference_inputs {
+            if !analysis.is_mutated(ReferenceRoot::RegionInput { region: body.id(), input_index: index }) {
+                continue;
+            }
             let shards = roots
                 .iter()
                 .map(|root| Ok(ArrayIrValue::Array(root.read()?)))
