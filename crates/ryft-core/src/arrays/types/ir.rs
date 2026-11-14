@@ -250,6 +250,14 @@ impl Type for ArrayIrType {
     }
 
     #[inline]
+    fn is_interchangeable_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Array(r#type), Self::Array(other)) => r#type.is_interchangeable_with(other),
+            _ => self == other,
+        }
+    }
+
+    #[inline]
     fn is_scalar(&self) -> bool {
         match self {
             Self::Array(r#type) => r#type.is_scalar(),

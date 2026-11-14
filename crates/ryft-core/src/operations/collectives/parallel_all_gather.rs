@@ -29,9 +29,9 @@ use crate::operations::collectives::parallel_vary::{
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveAxes, CollectiveMode, CollectiveOperation, CollectiveOptions,
     LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
-    ShapeChangingCollectiveValue, infer_array_ir_shape_changing_collective_output_type,
+    ShapeChangingCollectiveValue, adapt_linear_call_cotangent, infer_array_ir_shape_changing_collective_output_type,
     infer_linear_collective_operation_output_type, resolve_collective_axes, validate_manual_mesh_axes_input,
-    validate_participant_types, with_cotangent_type, with_transpose_output_type,
+    validate_participant_types, with_cotangent_type,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -1266,7 +1266,7 @@ where
                         )?;
                         check_count!("output", outputs, 1, ProgramError);
                         let target = transpose_target_type.into();
-                        Ok(vec![with_transpose_output_type(&transpose_context, outputs.remove(0), target)?])
+                        Ok(vec![adapt_linear_call_cotangent(&transpose_context, outputs.remove(0), target)?])
                     },
                 )?
                 .remove(0);
@@ -3762,10 +3762,10 @@ mod tests {
 
     #[test]
     fn test_parallel_all_gather_differentiation_array_ir_keeps_static_cotangents_of_nominal_singleton_extents() {
-        // The bounds of the nominal extent `n` admit only the extent 2, so the gathered output and its cotangent have
-        // static extents, and the selection of the invariant gather's pullback returns a static `f32[2]` cotangent.
-        // No value of the pullback carries `n`, but the linear call accepts that cotangent, whose type and the input
-        // cotangent type `f32[n]` refine each other, so it is returned without a cast.
+        // The bounds of the nominal extent `n` admit only the extent 2, so the gathered output, its cotangent, and
+        // the retained input extent are static, and the selection of the invariant gather's transpose returns a static
+        // `f32[2]` cotangent. No value of the transpose region carries `n`, but the linear call accepts that cotangent,
+        // whose type and the input cotangent type `f32[n]` refine each other, so it is returned without a cast.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let n = DimensionVariable::new("n", DimensionBounds::new(2, Some(3)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]))
@@ -3785,7 +3785,50 @@ mod tests {
         )
         .unwrap();
         let linearization = program.to_flat_program().linearize().unwrap();
-        assert_eq!(linearization.pullback().unwrap().into_program().to_string(), "");
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:dimension<4>, \
+                    %2:dimension<2> .
+                let %3:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] = linear_call [residual_count=2] %1 %2 %0 [
+                    forward={
+                        lambda %0:dimension<4>, %1:dimension<2>, \
+                            %2:f32[n][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                        let %3:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_all_gather [
+                            axes=\"x\",
+                            axis_size=2,
+                            concatenation_axis=0,
+                            options=Tiled,
+                            output_variance=Invariant,
+                            mesh=['x'=2:manual],
+                        ] %2 %0
+                        in (%3)
+                    },
+                    transpose={
+                        lambda %0:dimension<4>, %1:dimension<2>, %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                        let %3:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary \
+                            [axis_name=\"x\"] %2
+                            %4:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = axis_index \
+                                [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %5:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = convert_element_type \
+                                [data_type=i64] %4
+                            %6:i64[] = dimension_to_scalar %1
+                            %7:i64[][sharding={mesh<['x'=2:manual]>, []}] = broadcast \
+                                [output_type=i64[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %6
+                            %8:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary \
+                                [axis_name=\"x\"] %7
+                            %9:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %5 %8
+                            %10:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = dynamic_slice \
+                                [strides=[1], bounds=checked, requires_runtime_assertion=true] %3 %9 %1
+                            %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape \
+                                [output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %10 %1
+                        in (%11)
+                    },
+                ]
+                in (%3)
+            "}
+            .trim_end(),
+        );
     }
 
     #[test]

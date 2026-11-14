@@ -3250,6 +3250,7 @@ mod tests {
     use crate::operations::dimensions::dimension_size::DIMENSION_SIZE_OPERATION_NAME;
     use crate::operations::manipulation::slicing::Slice;
     use crate::operations::random::DROPOUT_OPERATION_NAME;
+    use crate::programs::Type;
     use crate::tests::hash_of;
     use crate::tracing::Trace;
 
@@ -6585,6 +6586,48 @@ mod tests {
         for (gradient, plain_gradient) in gradients.parameters().zip(plain_gradients.parameters()) {
             assert_eq!(gradient.r#type().as_ref(), &placed_type);
             assert_eq!(gradient.elements::<f32>().unwrap(), plain_gradient.elements::<f32>().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_batching_layout() {
+        // The rules of a call that is batched after it was staged are traced at the types of its batch items, which
+        // cannot describe how the packed inputs are stored, so the cotangents of packed inputs with an explicit layout
+        // return without it. Reverse mode accumulates them into the cotangents of those inputs anyway, because the
+        // layout does not change which array a type describes, and it sums them with the contributions of other
+        // operations whose cotangents do have that layout (e.g., the square of the query below).
+        let plain_type = ArrayType::new_static(DataType::F32, [2, 2, 2, 1, 2]);
+        let packed_type = plain_type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![32, 16, 8, 8, 4])));
+        let inputs = |r#type: &ArrayType| {
+            let array = |start: f32| {
+                let elements = (0..16).map(|index| start + 0.25 * index as f32).collect::<Vec<_>>();
+                Array::from_elements(r#type.clone(), elements.as_slice()).unwrap()
+            };
+            AttentionInputs::new(array(-1.0), array(0.5), array(-2.0))
+        };
+        let axes = AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0));
+        let function = differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let gradients = |r#type: &ArrayType, square_query: bool| -> AttentionInputs<Array> {
+            differentiate_at(inputs(r#type))
+                .gradient(|inputs| {
+                    let query = inputs.query.clone();
+                    let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                        .map_err(ProgramError::from)?;
+                    let loss = outputs.mul(&outputs)?.reduce(&[0, 1, 2, 3, 4], ReductionKind::Sum)?;
+                    match square_query {
+                        true => loss.add(&query.mul(&query)?.reduce(&[0, 1, 2, 3, 4], ReductionKind::Sum)?),
+                        false => Ok(loss),
+                    }
+                })
+                .unwrap()
+        };
+        for square_query in [false, true] {
+            let (gradients, plain_gradients) =
+                (gradients(&packed_type, square_query), gradients(&plain_type, square_query));
+            for (gradient, plain_gradient) in gradients.parameters().zip(plain_gradients.parameters()) {
+                assert!(packed_type.is_interchangeable_with(gradient.r#type().as_ref()));
+                assert_eq!(gradient.elements::<f32>().unwrap(), plain_gradient.elements::<f32>().unwrap());
+            }
         }
     }
 

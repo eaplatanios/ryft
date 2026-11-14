@@ -464,9 +464,13 @@ impl CotangentAccumulator {
     /// Adds a contribution to this input's cotangent. Structural zeros emit no work, ignored contributions are
     /// discarded, and reference destinations are updated immediately. Value contributions are summed as they arrive
     /// and extracted by [`TranspositionContext::take_cotangents`]. Every contribution is validated before any storage
-    /// is changed, including contributions to ignored inputs. Live reference-state cotangents cannot use this additive
-    /// interface. The first value is reused directly; subsequent additions preserve submission order and combine the
-    /// provenance of their contributions.
+    /// is changed, including contributions to ignored inputs. A contribution must have a type that is interchangeable
+    /// with the cotangent type of the input (refer to [`Type::is_interchangeable_with`]), so it may be stored
+    /// differently (e.g., without the explicit layout of the input), because the operations that compute it do not
+    /// always know how the input is stored (e.g., the rules of a call that was batched after it was staged are traced
+    /// at the types of its batch items). Live reference-state cotangents cannot use this additive interface. The first
+    /// value is reused directly; subsequent additions preserve submission order and combine the provenance of their
+    /// contributions.
     pub fn accumulate<
         V: Value,
         O: Operation<Type = V::Type> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
@@ -481,7 +485,7 @@ impl CotangentAccumulator {
         // Validate the handle's context identity and the contribution's type before changing any storage,
         // even when this input does not need a cotangent.
         let storage = context.cotangent_storage(self)?;
-        if contribution.r#type() != storage.r#type() {
+        if !storage.r#type().is_interchangeable_with(&contribution.r#type()) {
             return Err(TypeError::invalid(format!(
                 "cotangent contribution has type {} but its accumulator expects {}",
                 contribution.r#type(),
@@ -4447,7 +4451,7 @@ pub(crate) mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionError, DimensionType,
-        DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
+        DimensionValue, DimensionVariable, Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, StridedLayout,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -5213,6 +5217,37 @@ pub(crate) mod tests {
         assert_eq!(values[1].as_value().unwrap().atom_id().unwrap(), sum);
         assert_eq!(context.builder().borrow().instructions().len(), 2);
         assert!(context.take_cotangents(&[accumulator]).unwrap()[0].is_zero());
+    }
+
+    #[test]
+    fn test_cotangent_accumulator_accumulate_interchangeable_contributions() {
+        // The operations that compute a contribution do not always know how the input is stored, so a contribution
+        // may have another explicit layout than the cotangent type of the input, or none. Such contributions are
+        // summed like any others, while a contribution that describes other values is still rejected.
+        let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
+        let plain = ArrayType::new_static(DataType::F32, [2, 3]);
+        let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![16, 4])));
+        let accumulator = context.cotangent_accumulator(strided.clone(), true);
+        let first = context.input(plain.clone());
+        let second = context.input(strided.clone());
+        accumulator.accumulate(&mut context, MaybeZero::Value(first.clone())).unwrap();
+        accumulator.accumulate(&mut context, MaybeZero::Value(second.clone())).unwrap();
+        assert_eq!(
+            accumulator.accumulate(&mut context, MaybeZero::Zero(plain.clone().with_data_type(DataType::F64))),
+            Err(TypeError::invalid(format!(
+                "cotangent contribution has type {} but its accumulator expects {strided}",
+                plain.clone().with_data_type(DataType::F64),
+            ))
+            .into()),
+        );
+        let builder = context.builder().borrow();
+        assert_eq!(builder.instructions().len(), 1);
+        assert_eq!(builder.instructions()[0].operation().name(), "add");
+        assert_eq!(builder.instructions()[0].inputs(), &[first.atom_id().unwrap(), second.atom_id().unwrap()]);
+        let sum = builder.instructions()[0].outputs()[0];
+        drop(builder);
+        let values = context.take_cotangents(&[accumulator]).unwrap();
+        assert_eq!(values[0].as_value().unwrap().atom_id().unwrap(), sum);
     }
 
     #[test]

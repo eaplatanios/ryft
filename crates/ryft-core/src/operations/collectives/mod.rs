@@ -993,7 +993,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
                         let mut outputs = transpose_context.bind(adjoint, Vec::new(), adjoint_inputs.as_slice())?;
                         check_count!("output", outputs, 1, ProgramError);
                         let target = transpose_target_type.into();
-                        Ok(vec![with_transpose_output_type(&transpose_context, outputs.remove(0), target)?])
+                        Ok(vec![adapt_linear_call_cotangent(&transpose_context, outputs.remove(0), target)?])
                     },
                 )?
                 .remove(0);
@@ -1816,7 +1816,7 @@ where
 /// refines `target` in both directions (e.g., the static extent of a nominal dimension whose bounds admit only that
 /// extent, for which no value of the region carries the nominal identity), so such an output is returned unchanged,
 /// and any other output is converted by [`with_cotangent_type`] (e.g., one whose layout differs).
-fn with_transpose_output_type<C: Context<Type = ArrayIrType>>(
+fn adapt_linear_call_cotangent<C: Context<Type = ArrayIrType>>(
     context: &C,
     output: C::Value,
     target: ArrayIrType,

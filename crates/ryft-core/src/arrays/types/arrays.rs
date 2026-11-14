@@ -699,6 +699,12 @@ impl Type for ArrayType {
     }
 
     #[inline]
+    fn is_interchangeable_with(&self, other: &Self) -> bool {
+        // An explicit layout describes how one array is stored, not which array it is.
+        self == other || self.clone().with_layout(None) == other.clone().with_layout(None)
+    }
+
+    #[inline]
     fn is_scalar(&self) -> bool {
         self.rank() == 0
     }
@@ -1150,6 +1156,27 @@ mod tests {
         assert_eq!(renamed.layout(), source.layout());
         assert_eq!(renamed.sharding(), source.sharding());
         assert_ne!(source, renamed);
+    }
+
+    #[test]
+    fn test_array_type_is_interchangeable_with() {
+        let plain = ArrayType::new_static(F32, [2, 3]);
+        let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![16, 4])));
+        let tiled = plain.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
+
+        // Types that differ at most in their explicit layout describe the same arrays.
+        assert!(plain.is_interchangeable_with(&plain));
+        assert!(plain.is_interchangeable_with(&strided));
+        assert!(strided.is_interchangeable_with(&plain));
+        assert!(strided.is_interchangeable_with(&tiled));
+
+        // Every other difference changes which arrays the type describes or where they live.
+        assert!(!strided.is_interchangeable_with(&strided.clone().with_data_type(F64)));
+        assert!(!strided.is_interchangeable_with(&ArrayType::new_static(F32, [3, 2])));
+        assert!(!strided.is_interchangeable_with(&strided.clone().with_memory(Memory::Host { pinned: true })));
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let replicated = strided.clone().with_sharding(Sharding::replicated(mesh, 2)).unwrap();
+        assert!(!strided.is_interchangeable_with(&replicated));
     }
 
     #[test]

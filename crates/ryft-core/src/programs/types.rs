@@ -232,6 +232,17 @@ pub trait Type: Clone + Debug + Display + PartialEq + Parameter {
     /// [StableHLO](https://openxla.org/stablehlo/dynamism) and MLIR.
     fn is_refined_by(&self, other: &Self) -> bool;
 
+    /// Returns whether values of `other` can stand in for values of this type without converting their elements (i.e.,
+    /// whether the two types describe the same values and differ at most in metadata about how one value is stored,
+    /// such as the explicit layout of an array). Consumers that combine values which were computed independently of
+    /// how the value that they stand in for is stored use this instead of type equality (e.g., the contributions that
+    /// reverse mode differentiation accumulates into the cotangent of an input). The default is type equality, which
+    /// is exact for every type family without such metadata.
+    #[inline]
+    fn is_interchangeable_with(&self, other: &Self) -> bool {
+        self == other
+    }
+
     /// Returns `true` if this [`Type`] describes a single scalar (i.e., a rank-`0` array/tensor) value. This predicate
     /// exists to let reverse mode differentiation enforce scalar-output functions. Reverse mode differentiation seeds
     /// the output cotangent with the multiplicative identity (i.e., a value of one) and pulls it back to the inputs.
