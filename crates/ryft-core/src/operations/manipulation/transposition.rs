@@ -1272,8 +1272,8 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
             .with_memory(Memory::Host { pinned: true });
         let placed_output_type = output_type.clone().with_memory(Memory::Host { pinned: true });
-        // The inverse permutation restores the complete input cotangent type, including placement metadata that the
-        // forward transpose intentionally clears because it cannot infer a new physical layout.
+        // The inverse permutation restores the memory placement of the input in its cotangent, but not the explicit
+        // layout that the forward transpose clears because it cannot infer a new physical layout.
         check_operation_transposition!(
             @exact,
             operation = TransposeOperation::new(vec![1, 0]),
@@ -1284,7 +1284,7 @@ mod tests {
                     &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                 ).unwrap()],
                 input_cotangents = [Array::from_elements::<f64>(
-                    placed_input_type,
+                    placed_input_type.with_layout(None),
                     &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0],
                 ).unwrap()],
             }],

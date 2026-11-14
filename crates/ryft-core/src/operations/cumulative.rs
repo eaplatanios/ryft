@@ -1722,22 +1722,24 @@ mod tests {
     #[test]
     fn test_cumulative_differentiation_layout() {
         // The decomposition's manipulation primitives drop an explicit layout, so the rule constrains its output back
-        // onto the input's layout, and the primal and tangent outputs have exactly the primitive's output type. The
-        // layout leaves their logical values, the running maximum of each row and its tangent, unchanged.
+        // onto the input's layout, and the primal output has exactly the primitive's output type. The tangent output
+        // has no explicit layout, because a tangent need not be stored like its primal. The layout leaves the logical
+        // values, the running maximum of each row and its tangent, unchanged.
         let laid_out =
             ArrayType::new_static(DataType::F64, [2, 2]).with_layout(Layout::Strided(StridedLayout::new(vec![8, 16])));
+        let tangent = ArrayType::new_static(DataType::F64, [2, 2]);
         let jvp = cumulative_program(CumulativeOperation::new(1, CumulativeKind::Max), laid_out.clone())
             .jvp()
             .unwrap();
-        assert_eq!(jvp.output_types(), vec![laid_out.clone(), laid_out.clone()]);
+        assert_eq!(jvp.output_types(), vec![laid_out.clone(), tangent.clone()]);
         assert_eq!(
             jvp.interpret(vec![
                 Array::from_elements::<f64>(laid_out.clone(), &[1.0, 3.0, 2.0, 0.0]).unwrap(),
-                Array::from_elements::<f64>(laid_out.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap(),
+                Array::from_elements::<f64>(tangent.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap(),
             ]),
             Ok(vec![
-                Array::from_elements::<f64>(laid_out.clone(), &[1.0, 3.0, 2.0, 2.0]).unwrap(),
-                Array::from_elements::<f64>(laid_out, &[1.0, 2.0, 3.0, 3.0]).unwrap(),
+                Array::from_elements::<f64>(laid_out, &[1.0, 3.0, 2.0, 2.0]).unwrap(),
+                Array::from_elements::<f64>(tangent, &[1.0, 2.0, 3.0, 3.0]).unwrap(),
             ]),
         );
     }

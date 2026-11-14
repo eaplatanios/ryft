@@ -2389,9 +2389,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_sum_scatter_transposition_restores_input_cotangent_layouts() {
-        // The adjoint all-gather resizes the scattered axis, which clears the explicit layout of the input, so the
-        // transpose casts its result to the exact input cotangent type, which the cotangent accumulator requires.
+    fn test_parallel_sum_scatter_transposition_input_cotangents_have_no_layout() {
+        // An input cotangent has no explicit layout, because a cotangent need not be stored like its input. The adjoint
+        // all-gather produces no layout, so the transpose returns its result as the exact input cotangent type without
+        // a cast.
         let input_type =
             ArrayType::new_static(DataType::F32, [4]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let operation = ParallelSumScatterOperation::new("x", 2, 0, CollectiveOptions::tiled());
@@ -2407,8 +2408,7 @@ mod tests {
                     options=Tiled,
                     output_variance=Varying,
                 ] %0
-                    %2:f32[4][layout=strided{4}] = cast [type=f32[4][layout=strided{4}], inputs=[f32[4]]] %1
-                in (%2)"
+                in (%1)"
             },
         );
         assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);

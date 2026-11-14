@@ -4511,9 +4511,11 @@ mod tests {
         // Whether each broadcast along the class axis keeps the explicit layout of the logits. The normalizations of
         // the target logits and of the logits each broadcast their class indices, pivot, and correction, where the
         // floating-point ones keep the layout. The derivative rule then broadcasts its offset, centering sum,
-        // closeness test, correction, and residual with the default layout.
+        // closeness test, correction, and residual with the default layout. The tangent of the logits has no
+        // explicit layout, because a tangent need not be stored like its primal.
         let layout = Layout::Strided(StridedLayout::new(vec![12, 4]));
-        let r#type = ArrayType::new_static(DataType::F32, [2, 3]).with_layout(layout);
+        let tangent_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let r#type = tangent_type.clone().with_layout(layout);
         let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
         let (_, program) = ArrayContext::trace(
             |(logits, target_logits, tangent): (_, _, _)| {
@@ -4523,7 +4525,7 @@ mod tests {
                     .map(|(_, tangent)| tangent)
                     .map_err(ProgramError::from)
             },
-            (r#type.clone(), r#type.clone(), r#type),
+            (r#type.clone(), r#type, tangent_type),
         )
         .unwrap();
         let layouts = program

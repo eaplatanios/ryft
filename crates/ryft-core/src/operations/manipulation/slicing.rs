@@ -5204,7 +5204,6 @@ mod tests {
                     ).unwrap()],
                     input_cotangents = [Array::from_elements::<f64>(
                         ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))
-                            .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
                             .with_memory(Memory::Host { pinned: true }),
                         &[0.0, 1.0, 0.0, 2.0, 0.0, 3.0],
                     ).unwrap()],
@@ -6032,7 +6031,8 @@ mod tests {
             }],
         );
 
-        // Slicing the output cotangent back to the update restores the update's complete layout-bearing type.
+        // Slicing the output cotangent back to the update restores the memory placement of the update in its
+        // cotangent but not its explicit layout.
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![4.into()])).with_memory(Memory::Host { pinned: true });
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
@@ -6046,7 +6046,7 @@ mod tests {
                 output_cotangents = [Array::from_elements::<f64>(input_type.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
                     Array::from_elements::<f64>(input_type, &[1.0, 0.0, 0.0, 4.0]).unwrap(),
-                    Array::from_elements::<f64>(update_type, &[2.0, 3.0]).unwrap(),
+                    Array::from_elements::<f64>(update_type.with_layout(None), &[2.0, 3.0]).unwrap(),
                 ],
             }],
         );
@@ -9989,7 +9989,8 @@ mod tests {
             }],
         );
 
-        // Dynamic update-slice restores the layout-bearing update cotangent after its dynamic slice.
+        // The update cotangent of a dynamic update slice keeps the memory placement of the update after its dynamic
+        // slice but not its explicit layout.
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![4.into()])).with_memory(Memory::Host { pinned: true });
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
@@ -10012,7 +10013,7 @@ mod tests {
                 output_cotangents = [Array::from_elements::<f64>(input_type.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
                     Array::from_elements::<f64>(input_type, &[1.0, 0.0, 0.0, 4.0]).unwrap(),
-                    Array::from_elements::<f64>(update_type, &[2.0, 3.0]).unwrap(),
+                    Array::from_elements::<f64>(update_type.with_layout(None), &[2.0, 3.0]).unwrap(),
                 ],
             }],
         );

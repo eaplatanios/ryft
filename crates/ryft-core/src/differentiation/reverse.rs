@@ -2018,7 +2018,10 @@ impl<
                             ),
                         });
                     }
-                    if value.r#type().as_ref() != &cotangent_type {
+
+                    // A seed may be stored differently than the cotangent type describes (e.g., with the explicit
+                    // layout of the primal output), because that type has no explicit layout.
+                    if !cotangent_type.is_interchangeable_with(value.r#type().as_ref()) {
                         return Err(ProgramError::MalformedProgram(format!(
                             "pullback cotangent {} has type {} but its primal boundary requires cotangent type {}",
                             index,
@@ -2026,6 +2029,7 @@ impl<
                             cotangent_type,
                         )));
                     }
+
                     if has_slot {
                         program_inputs.push(value);
                     }
@@ -5823,6 +5827,23 @@ pub(crate) mod tests {
         let (_, pullback) = differentiate_at(Array::scalar(1.0).unwrap()).vjp(|x| Ok(x.clone() * x)).unwrap();
         assert_eq!(pullback.linear_program().input_types().len(), 1 + pullback.residuals().len());
         assert_eq!(pullback.linear_program().output_types(), vec![ArrayType::scalar(DataType::F64)]);
+    }
+
+    #[test]
+    fn test_pullback_apply_interchangeable_cotangent_seeds() {
+        // The cotangent type of an output with an explicit layout has none, and a pullback accepts a seed that is
+        // stored like that output as well as one that is not. The gradient has no explicit layout either.
+        let plain = ArrayType::new_static(DataType::F32, [2, 2]);
+        let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![16, 8])));
+        let primal = Array::from_elements(strided.clone(), &[1f32, 2.0, 3.0, 4.0]).unwrap();
+        let (output, pullback) = differentiate_at(primal).vjp(|input| Ok(input.clone() * input)).unwrap();
+        assert_eq!(output.r#type().as_ref(), &strided);
+        for seed_type in [&plain, &strided] {
+            let seed = Array::from_elements(seed_type.clone(), &[0.5f32, 1.5, 2.5, 3.5]).unwrap();
+            let gradient: Array = pullback.apply_materialized(seed).unwrap();
+            assert_eq!(gradient.r#type().as_ref(), &plain);
+            assert_eq!(gradient.elements::<f32>().unwrap(), vec![1.0, 6.0, 15.0, 28.0]);
+        }
     }
 
     #[test]

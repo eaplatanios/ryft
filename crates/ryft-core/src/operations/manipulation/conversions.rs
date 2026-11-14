@@ -2931,7 +2931,8 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_differentiation_layout() {
-        // Conversions between different storage widths discard byte layouts in both primal and tangent outputs.
+        // Tangents carry no explicit layout, so a laid out primal takes a tangent without one, and conversions between
+        // different storage widths produce tangents without one in both directions.
         let layout = Layout::Strided(StridedLayout::new(vec![1]));
         let laid_outf32 =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
@@ -2940,7 +2941,7 @@ mod tests {
         let plainf32 = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)]));
 
         let (_, tangent) = differentiate_at(Array::from_elements::<f32>(laid_outf32.clone(), &[2.0]).unwrap())
-            .jvp(Array::from_elements::<f32>(laid_outf32.clone(), &[3.0]).unwrap(), |value| {
+            .jvp(Array::from_elements::<f32>(plainf32.clone(), &[3.0]).unwrap(), |value| {
                 value.convert_element_type(DataType::F8E8M0FNU)
             })
             .unwrap();
@@ -3067,7 +3068,7 @@ mod tests {
 
     #[test]
     fn test_convert_element_type_transposition_low_precision_layout() {
-        // Cotangents recover the input differential layout in both low-precision conversion directions.
+        // Cotangents carry no explicit layout in either low-precision conversion direction, even for laid out inputs.
         let layout = Layout::Strided(StridedLayout::new(vec![1]));
         let laid_out_f32 =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).with_layout(layout.clone());
@@ -3081,7 +3082,7 @@ mod tests {
             cases = [{
                 inputs = [(@linear(type = laid_out_f32.clone()))],
                 output_cotangents = [Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap()],
-                input_cotangents = [Array::from_elements::<f32>(laid_out_f32.clone(), &[3.0]).unwrap()],
+                input_cotangents = [Array::from_elements::<f32>(plain_f32.clone(), &[3.0]).unwrap()],
             }],
         );
 
@@ -6918,7 +6919,8 @@ mod tests {
         )
         .unwrap();
         // The static input proves the relationship, so the checked cast is bound unchecked and linearization keeps
-        // no residual: the tangent program converts the tangent representation on its own.
+        // no residual. The tangent program converts the tangent sharding on its own, and its tangent has no explicit
+        // layout.
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -6931,7 +6933,14 @@ mod tests {
         );
         let linearization = program.to_flat_program().linearize().unwrap();
         assert_eq!(linearization.primal().to_string(), program.to_string());
-        assert_eq!(linearization.tangent().to_string(), program.to_string());
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[][sharding={mesh<['x'=1:explicit]>, []}] = cast [type=f64[][sharding={mesh<['x'=1:explicit]>, []}], inputs=[f64[]]] %0
+                in (%1)"},
+        );
+        let tangent_type = output_type.clone().with_layout(None);
         for checked in [true, false] {
             let input = Array::scalar(2f64).unwrap();
             let (primal, tangent) = differentiate_at(input.clone())
@@ -6944,7 +6953,7 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(primal, Array::from_elements(output_type.clone(), &[2f64]).unwrap());
-            assert_eq!(tangent, Array::from_elements(output_type.clone(), &[3f64]).unwrap());
+            assert_eq!(tangent, Array::from_elements(tangent_type.clone(), &[3f64]).unwrap());
             // Reverse mode must restore its exact nominal accumulator descriptor, rather than inheriting the output's
             // optional annotations into the inverse cast. Concrete results must honor that representation too.
             check_gradient!(
@@ -6962,9 +6971,10 @@ mod tests {
 
     #[test]
     fn test_cast_differentiation_refined_representation() {
-        // Layout and sharding change directly, with one tangent conversion and no erased intermediate. The static
-        // input type proves the relationship, so the JVP normalizes the checked primal cast as well, and split
-        // linearization needs no primal residual for ordering. The array IR universe stages the same programs.
+        // Layout and sharding change directly with no erased intermediate. Tangents carry no explicit layout, so a
+        // layout change needs no tangent conversion, while a sharding change needs one. The static input type proves
+        // the relationship, so the JVP normalizes the checked primal cast as well, and split linearization needs no
+        // primal residual for ordering. The array IR universe stages the same programs.
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
@@ -6973,10 +6983,9 @@ mod tests {
         let sharded_input = plain.clone().with_sharding(Sharding::replicated(first_mesh, 1)).unwrap();
         let sharded_output = plain.clone().with_sharding(Sharding::replicated(second_mesh, 1)).unwrap();
         let expected_layout = formatdoc! {"
-            lambda %0:{input}, %1:{input} .
+            lambda %0:{input}, %1:{plain} .
             let %2:{output} = cast [type={output}, inputs=[f32[2]]] %0
-                %3:{output} = cast [type={output}, inputs=[{input}]] %1
-            in (%2, %3)"};
+            in (%2, %1)"};
         let expected_sharding = formatdoc! {"
             lambda %0:{sharded_input}, %1:{sharded_input} .
             let %2:{sharded_output} = cast [type={sharded_output}, inputs=[f32[2]]] %0
@@ -6986,9 +6995,8 @@ mod tests {
                 ] %1
             in (%2, %3)"};
         let expected_tangent_layout = formatdoc! {"
-            lambda %0:{input} .
-            let %1:{output} = cast [type={output}, inputs=[{input}]] %0
-            in (%1)"};
+            lambda %0:{plain} .
+            in (%0)"};
         let expected_tangent_sharding = formatdoc! {"
             lambda %0:{sharded_input} .
             let %1:{sharded_output} = cast [
@@ -6996,9 +7004,16 @@ mod tests {
                 inputs=[{sharded_input}],
             ] %0
             in (%1)"};
-        for (input, output, expected, expected_tangent) in [
-            (input, output, expected_layout, expected_tangent_layout),
-            (sharded_input, sharded_output, expected_sharding, expected_tangent_sharding),
+        for (input, output, tangent_input, tangent_output, expected, expected_tangent) in [
+            (input, output, plain.clone(), plain.clone(), expected_layout, expected_tangent_layout),
+            (
+                sharded_input.clone(),
+                sharded_output.clone(),
+                sharded_input,
+                sharded_output,
+                expected_sharding,
+                expected_tangent_sharding,
+            ),
         ] {
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
                 let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -7017,10 +7032,10 @@ mod tests {
                 let jvp = program.jvp().unwrap();
                 assert_eq!(jvp.to_string(), expected);
                 let primal = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
-                let tangent = Array::from_elements(input.clone(), &[3f32, 4f32]).unwrap();
+                let tangent = Array::from_elements(tangent_input.clone(), &[3f32, 4f32]).unwrap();
                 let expected_values = vec![
                     Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap(),
-                    Array::from_elements(output.clone(), &[3f32, 4f32]).unwrap(),
+                    Array::from_elements(tangent_output.clone(), &[3f32, 4f32]).unwrap(),
                 ];
                 assert_eq!(jvp.interpret(vec![primal.clone(), tangent.clone()]), Ok(expected_values.clone()));
                 let linearization = program.linearize().unwrap();
@@ -7043,8 +7058,8 @@ mod tests {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let declared = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let input = declared.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
-        let output =
-            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![12])));
+        let plain_output = ArrayType::new_static(DataType::F32, [2]);
+        let output = plain_output.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let result = builder
@@ -7058,30 +7073,28 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder], vec![Placeholder]).unwrap();
         let jvp = program.jvp().unwrap();
-        // One retained source carries n and the primal check into the fused tangent conversion.
+        // One retained source carries n and the primal check into the fused tangent conversion, whose tangents have
+        // no explicit layout.
         assert_eq!(
             jvp.to_string(),
             formatdoc! {"
-                lambda %0:{input}, %1:{input} .
+                lambda %0:{input}, %1:{declared} .
                 let %2:{output} = cast [type={output}, inputs=[{declared}], checked=true] %0
                     %3:{input} = cast [
                         type={input},
                         inputs=[{input}, {output}],
                     ] %0 %2
-                    %4:{output} = cast [
-                        type={output},
-                        inputs=[{input}, {input}],
-                    ] %1 %3
+                    %4:{plain_output} = cast [type={plain_output}, inputs=[{declared}, {input}]] %1 %3
                 in (%2, %4)"},
         );
         let exact = input.clone().with_shape(Shape::new(vec![Dimension::Static(2)]));
-        let primal = Array::from_elements(exact.clone(), &[1f32, 2f32]).unwrap();
-        let tangent = Array::from_elements(exact, &[3f32, 4f32]).unwrap();
+        let primal = Array::from_elements(exact, &[1f32, 2f32]).unwrap();
+        let tangent = Array::from_elements(plain_output.clone(), &[3f32, 4f32]).unwrap();
         assert_eq!(
             jvp.interpret(vec![primal, tangent]),
             Ok(vec![
                 Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap(),
-                Array::from_elements(output.clone(), &[3f32, 4f32]).unwrap(),
+                Array::from_elements(plain_output, &[3f32, 4f32]).unwrap(),
             ]),
         );
         let wrong_type = input.with_shape(Shape::new(vec![Dimension::Static(3)]));
@@ -7100,7 +7113,7 @@ mod tests {
         let declared = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
-        let output = plain.with_layout(Layout::Strided(StridedLayout::new(vec![12])));
+        let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let value = builder.add_input(input.clone());
         let witness = builder.add_input(declared.clone());
@@ -7116,14 +7129,12 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         // The source has an exact shape. The fused tangent depends on the checked result without introducing n, and
-        // split linearization needs no residual once the primal has completed.
+        // split linearization needs no residual once the primal has completed. Tangents have no explicit layout, so
+        // the linearized tangent program needs no conversion at all.
         let expected = formatdoc! {"
-            lambda %0:{input}, %1:{declared}, %2:{input}, %3:{declared} .
+            lambda %0:{input}, %1:{declared}, %2:{plain}, %3:{declared} .
             let %4:{output} = cast [type={output}, inputs=[{declared}, {declared}], checked=true] %0 %1
-                %5:{output} = cast [
-                    type={output},
-                    inputs=[{input}, {output}],
-                ] %2 %4
+                %5:{plain} = cast [type={plain}, inputs=[{plain}, {output}]] %2 %4
             in (%4, %5)"};
         assert_eq!(program.jvp().unwrap().to_string(), expected);
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
@@ -7131,17 +7142,16 @@ mod tests {
         assert_eq!(
             linearization.tangent().to_string(),
             formatdoc! {"
-                lambda %0:{input} .
-                let %1:{output} = cast [type={output}, inputs=[{input}]] %0
-                in (%1)"},
+                lambda %0:{plain} .
+                in (%0)"},
         );
-        let primal = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
-        let tangent = Array::from_elements(input, &[3f32, 4f32]).unwrap();
+        let primal = Array::from_elements(input, &[1f32, 2f32]).unwrap();
+        let tangent = Array::from_elements(plain.clone(), &[3f32, 4f32]).unwrap();
         let witness = Array::vector(vec![0f32; 2]).unwrap();
         let inputs = vec![primal, witness.clone(), tangent, witness];
         let expected_values = vec![
-            Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap(),
-            Array::from_elements(output, &[3f32, 4f32]).unwrap(),
+            Array::from_elements(output, &[1f32, 2f32]).unwrap(),
+            Array::from_elements(plain, &[3f32, 4f32]).unwrap(),
         ];
         assert_eq!(program.jvp().unwrap().interpret(inputs.clone()), Ok(expected_values.clone()));
         let array_ir = program.into_unprojected::<ArrayIrValue<Array>, ArrayIrOperation<Array>>().unwrap();
@@ -7230,17 +7240,18 @@ mod tests {
     fn test_cast_transposition() {
         let exact = ArrayType::new_static(DataType::F32, [2]);
         let laid_out = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+
+        // Cotangents have no explicit layout, so transposing a layout change needs no inverse cast.
         check_operation_transposition!(
             @exact,
-            operation = CastOperation::unchecked(laid_out.clone(), vec![exact.clone()]).unwrap(),
+            operation = CastOperation::unchecked(laid_out, vec![exact.clone()]).unwrap(),
             cases = [{
                 inputs = [(@linear(type = exact.clone()))],
-                output_cotangents = [Array::from_elements(laid_out, &[1f32, 2f32]).unwrap()],
+                output_cotangents = [Array::vector(vec![1f32, 2f32]).unwrap()],
                 input_cotangents = [Array::vector(vec![1f32, 2f32]).unwrap()],
                 pullback = indoc! {"
-                    lambda %0:f32[2][layout=strided{8}] .
-                    let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}]]] %0
-                    in (%1)"},
+                    lambda %0:f32[2] .
+                    in (%0)"},
             }],
         );
 
@@ -7337,8 +7348,9 @@ mod tests {
 
     #[test]
     fn test_cast_transposition_refined_representation() {
-        // Reversing a representation change restores the exact nominal input representation, in both modes and
-        // universes, directly and through linearization.
+        // Reversing a sharding change restores the exact nominal input sharding, and reversing a layout change needs no
+        // conversion because cotangents have no explicit layout, in both modes and universes, directly and through
+        // linearization.
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let input = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![12])));
@@ -7347,9 +7359,8 @@ mod tests {
         let sharded_input = plain.clone().with_sharding(Sharding::replicated(first_mesh, 1)).unwrap();
         let sharded_output = plain.clone().with_sharding(Sharding::replicated(second_mesh, 1)).unwrap();
         let expected_layout = formatdoc! {"
-            lambda %0:{output} .
-            let %1:{input} = cast [type={input}, inputs=[{output}]] %0
-            in (%1)"};
+            lambda %0:{plain} .
+            in (%0)"};
         let expected_sharding = formatdoc! {"
             lambda %0:{sharded_output} .
             let %1:{sharded_input} = cast [
@@ -7357,8 +7368,8 @@ mod tests {
                 inputs=[{sharded_output}],
             ] %0
             in (%1)"};
-        let cotangent = Array::from_elements(output.clone(), &[1f32, 2f32]).unwrap();
-        let expected_cotangent = Array::from_elements(input.clone(), &[1f32, 2f32]).unwrap();
+        let cotangent = Array::from_elements(plain.clone(), &[1f32, 2f32]).unwrap();
+        let expected_cotangent = Array::from_elements(plain.clone(), &[1f32, 2f32]).unwrap();
         let sharded_cotangent = Array::from_elements(sharded_output.clone(), &[1f32, 2f32]).unwrap();
         let expected_sharded_cotangent = Array::from_elements(sharded_input.clone(), &[1f32, 2f32]).unwrap();
         check_operation_transposition!(
@@ -7424,8 +7435,8 @@ mod tests {
             }],
         );
 
-        // Linearizing first changes nothing: the shape is already proven, so the tangent program is the same unchecked
-        // cast and its pullback is the same inverse cast.
+        // Linearizing first changes nothing. The shape is already proven, so the pullback of the linearized tangent
+        // program is the same as the direct pullback.
         for (input, output, expected, cotangent, expected_cotangent) in [
             (input, output, expected_layout, cotangent, expected_cotangent),
             (sharded_input, sharded_output, expected_sharding, sharded_cotangent, expected_sharded_cotangent),
@@ -7466,12 +7477,13 @@ mod tests {
         let exact = ArrayType::new_static(DataType::F32, [2]);
         let layout = exact.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
 
-        // A checked cast whose relationship the input types prove transposes like an unchecked one.
+        // A checked cast whose relationship the input types prove transposes like an unchecked one. Cotangents have no
+        // explicit layout, so the transpose of this layout change needs no inverse cast.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(exact.clone());
         let output = builder
             .add_instruction(
-                CastOperation::checked(layout.clone(), vec![exact.clone()]).unwrap(),
+                CastOperation::checked(layout, vec![exact.clone()]).unwrap(),
                 vec![],
                 vec![input],
                 None,
@@ -7485,12 +7497,11 @@ mod tests {
         assert_eq!(
             proven.to_string(),
             indoc! {"
-                lambda %0:f32[2][layout=strided{8}] .
-                let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}]]] %0
-                in (%1)"},
+                lambda %0:f32[2] .
+                in (%0)"},
         );
         assert_eq!(
-            proven.interpret(vec![Array::from_elements(layout, &[1f32, 2f32]).unwrap()]),
+            proven.interpret(vec![Array::vector(vec![1f32, 2f32]).unwrap()]),
             Ok(vec![Array::vector(vec![1f32, 2f32]).unwrap()]),
         );
 
@@ -7745,7 +7756,8 @@ mod tests {
             );
         }
 
-        // A representation change still needs no value from an irrelevant static linear witness.
+        // A layout change still needs no value from an irrelevant static linear witness. Cotangents have no explicit
+        // layout, so its transpose needs no inverse cast either.
         let output = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(value, witness)| value.cast_unchecked(output.clone(), &[witness]),
@@ -7763,12 +7775,11 @@ mod tests {
         assert_eq!(
             transposed.to_string(),
             indoc! {"
-                lambda %0:f32[2][layout=strided{8}] .
-                let %1:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}]]] %0
-                    %2:f32[3] = zero [type=f32[3]]
-                in (%1, %2)"},
+                lambda %0:f32[2] .
+                let %1:f32[3] = zero [type=f32[3]]
+                in (%0, %1)"},
         );
-        let value = Array::from_elements(output, &[1f32, 2f32]).unwrap();
+        let value = Array::vector(vec![1f32, 2f32]).unwrap();
         assert_eq!(
             transposed.interpret(vec![value]),
             Ok(vec![Array::vector(vec![1f32, 2f32]).unwrap(), Array::vector(vec![0f32; 3]).unwrap()]),
@@ -7807,16 +7818,16 @@ mod tests {
         check_operation_transposition!(
             @exact,
             operation = CastOperation::unchecked(
-                laid_out.clone(),
+                laid_out,
                 vec![exact.clone(), ArrayType::new_static(DataType::F32, [3])],
             ).unwrap(),
             cases = [{
                 inputs = [(@linear(type = exact.clone())), (@known, Array::vector(vec![1f32; 3]).unwrap())],
-                output_cotangents = [Array::from_elements(laid_out, &[1f32, 2f32]).unwrap()],
+                output_cotangents = [Array::vector(vec![1f32, 2f32]).unwrap()],
                 input_cotangents = [Array::vector(vec![1f32, 2f32]).unwrap()],
                 pullback = indoc! {"
-                    lambda %0:f32[2][layout=strided{8}], %1:f32[3] .
-                    let %2:f32[2] = cast [type=f32[2], inputs=[f32[2][layout=strided{8}], f32[3]]] %0 %1
+                    lambda %0:f32[2], %1:f32[3] .
+                    let %2:f32[2] = cast [type=f32[2], inputs=[f32[2], f32[3]]] %0 %1
                     in (%2)"},
             }],
         );

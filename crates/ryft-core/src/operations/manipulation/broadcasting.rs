@@ -4141,7 +4141,7 @@ mod tests {
             program.jvp().unwrap().to_string(),
             indoc! {"
                 lambda \
-                    %0:f8e8m0fnu[3], %1:f32[2, 3][layout=strided{12,4}], %2:f32[3], %3:f32[2, 3][layout=strided{12,4}] .
+                    %0:f8e8m0fnu[3], %1:f32[2, 3][layout=strided{12,4}], %2:f32[3], %3:f32[2, 3] .
                 let %4:f8e8m0fnu[2, 3] = broadcast_like [output_axes=[1]] %0 %1
                     %5:f32[2, 3] = broadcast_like [output_axes=[1]] %2 %4
                 in (%4, %5)
@@ -5246,7 +5246,10 @@ mod tests {
             .unwrap();
         let linearization = program.linearize().unwrap();
         let pullback = linearization.pullback().unwrap().into_program();
-        assert_eq!(pullback.outputs().next().unwrap().r#type().as_ref(), &ArrayIrType::Array(input_type));
+        assert_eq!(
+            pullback.outputs().next().unwrap().r#type().as_ref(),
+            &ArrayIrType::Array(input_type.with_layout(None)),
+        );
         let concrete_type =
             ArrayType::new_static(DataType::F32, [2, 1]).with_layout(Layout::Strided(StridedLayout::new(vec![4, 4])));
         let mut primal_outputs = linearization

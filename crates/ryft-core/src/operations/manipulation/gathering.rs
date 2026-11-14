@@ -4232,8 +4232,9 @@ mod tests {
         );
 
         // The transpose explicitly restores the input's distribution even when the forward gather requested a
-        // different output placement. Scatter's zero base also preserves input strides and host memory. A static input
-        // takes the homogeneous rule, while a dynamic input takes the residual-carrying member rule.
+        // different output placement. Scatter's zero base also takes the host memory of the input but not its explicit
+        // strides. A static input takes the homogeneous rule, while a dynamic input takes the residual-carrying member
+        // rule.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(4, Some(5)).unwrap());
@@ -4270,14 +4271,14 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
                 let %1:i32[2, 1]@Host[Pinned] = const [[1], [3]]
-                    %2:f64[4][layout=strided{16}]@Host[Pinned] = zero [type=f64[4][layout=strided{16}]@Host[Pinned]]
-                    %3:f64[4][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] = scatter [
+                    %2:f64[4]@Host[Pinned] = zero [type=f64[4]@Host[Pinned]]
+                    %3:f64[4][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] = scatter [
                         kind=add,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
                             operand_batching=[], scatter_indices_batching=[]),
                     ] %2 %1 %0
-                    %4:f64[4][layout=strided{16}]@Host[Pinned] = broadcast \
-                        [output_type=f64[4][layout=strided{16}]@Host[Pinned], output_axes=[0]] %3
+                    %4:f64[4]@Host[Pinned] = broadcast \
+                        [output_type=f64[4]@Host[Pinned], output_axes=[0]] %3
                 in (%4)
             "}
             .trim_end(),
@@ -4302,10 +4303,10 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
                 let %1:i32[2, 1]@Host[Pinned] = const [[1], [3]]
-                    %2:f64[4][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = zero [
-                        type=f64[4][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned],
+                    %2:f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = zero [
+                        type=f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned],
                     ]
-                    %3:f64[4][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = scatter [
+                    %3:f64[4][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = scatter [
                         kind=add,
                         dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
                             operand_batching=[], scatter_indices_batching=[]),
@@ -4342,25 +4343,25 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned], %1:dimension<4> .
                 let %2:i32[2, 1]@Host[Pinned] = const [[1], [3]]
-                    %3:f64[extent][layout=strided{16}]@Host[Pinned] = linear_call [residual_count=2] %2 %1 %0 [
+                    %3:f64[extent]@Host[Pinned] = linear_call [residual_count=2] %2 %1 %0 [
                         forward={
                             lambda %0:i32[2, 1]@Host[Pinned], %1:dimension<4>, \
                                 %2:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
-                            let %3:f64[extent][layout=strided{16}]@Host[Pinned] = zero \
-                                [type=f64[extent][layout=strided{16}]@Host[Pinned]] %1
-                                %4:f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, \
+                            let %3:f64[extent]@Host[Pinned] = zero \
+                                [type=f64[extent]@Host[Pinned]] %1
+                                %4:f64[extent][sharding={mesh<['x'=2:explicit]>, \
                                     [{}]}]@Host[Pinned] = scatter [
                                     kind=add,
                                     dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
                                         operand_batching=[], scatter_indices_batching=[]),
                                 ] %3 %0 %2
-                                %5:f64[extent][layout=strided{16}]@Host[Pinned] = broadcast \
-                                    [output_type=f64[extent][layout=strided{16}]@Host[Pinned], output_axes=[0]] %4
+                                %5:f64[extent]@Host[Pinned] = broadcast \
+                                    [output_type=f64[extent]@Host[Pinned], output_axes=[0]] %4
                             in (%5)
                         },
                         transpose={
                             lambda %0:i32[2, 1]@Host[Pinned], %1:dimension<4>, \
-                                %2:f64[extent][layout=strided{16}]@Host[Pinned] .
+                                %2:f64[extent]@Host[Pinned] .
                             let %3:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] = gather [
                                 dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[]),
                                 slice_sizes=[1],
@@ -4401,17 +4402,17 @@ mod tests {
             indoc! {"
                 lambda %0:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned], %1:dimension<4> .
                 let %2:i32[2, 1]@Host[Pinned] = const [[1], [3]]
-                    %3:f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = \
+                    %3:f64[extent][sharding={mesh<['x'=2:explicit]>, [{'x'}]}]@Host[Pinned] = \
                         linear_call [residual_count=2] %2 %1 %0 [
                         forward={
                             lambda %0:i32[2, 1]@Host[Pinned], %1:dimension<4>, \
                                 %2:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] .
-                            let %3:f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, \
+                            let %3:f64[extent][sharding={mesh<['x'=2:explicit]>, \
                                 [{'x'}]}]@Host[Pinned] = zero [
-                                type=f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, \
+                                type=f64[extent][sharding={mesh<['x'=2:explicit]>, \
                                     [{'x'}]}]@Host[Pinned],
                             ] %1
-                                %4:f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, \
+                                %4:f64[extent][sharding={mesh<['x'=2:explicit]>, \
                                     [{'x'}]}]@Host[Pinned] = scatter [
                                     kind=add,
                                     dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
@@ -4422,7 +4423,7 @@ mod tests {
                         },
                         transpose={
                             lambda %0:i32[2, 1]@Host[Pinned], %1:dimension<4>, \
-                                %2:f64[extent][layout=strided{16}][sharding={mesh<['x'=2:explicit]>, \
+                                %2:f64[extent][sharding={mesh<['x'=2:explicit]>, \
                                 [{'x'}]}]@Host[Pinned] .
                             let %3:f64[2][sharding={mesh<['x'=2:explicit]>, [{}]}]@Host[Pinned] = gather [
                                 dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[]),

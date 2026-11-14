@@ -2727,8 +2727,8 @@ mod tests {
             }],
         );
 
-        // Reshaping back to the input shape restores its complete cotangent type after the forward reshape has
-        // intentionally cleared physical layout metadata.
+        // Reshaping back to the input shape restores the memory placement of the input in its cotangent, but not the
+        // explicit layout that the forward reshape cleared.
         let layout = Layout::Strided(StridedLayout::new(vec![8]));
         let placed_input_type = ArrayType::new(DataType::F64, Shape::new(vec![6.into()]))
             .with_layout(layout)
@@ -2745,7 +2745,7 @@ mod tests {
                     &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                 ).unwrap()],
                 input_cotangents = [Array::from_elements::<f64>(
-                    placed_input_type,
+                    placed_input_type.with_layout(None),
                     &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                 ).unwrap()],
             }],
@@ -5447,8 +5447,9 @@ mod tests {
         pullback_inputs.extend(residuals);
         assert_eq!(linearization.pullback().unwrap().program().interpret(pullback_inputs), Ok(vec![cotangent]));
 
-        // The inverse restores metadata that the forward reshape removed or introduced. In particular, replicated
-        // bridge sharding must not escape into the cotangent of an originally unsharded input.
+        // The inverse restores sharding metadata that the forward reshape removed or introduced, but the cotangent
+        // does not take the explicit layout of its input. In particular, replicated bridge sharding must not escape
+        // into the cotangent of an originally unsharded input.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
         let plain_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent.clone()), Dimension::Static(4)]));
@@ -5500,7 +5501,9 @@ mod tests {
             pullback_inputs.extend(residuals);
             assert_eq!(
                 linearization.pullback().unwrap().program().interpret(pullback_inputs),
-                Ok(vec![ArrayIrValue::Array(Array::from_elements::<f64>(concrete_type, &cotangent_values).unwrap())]),
+                Ok(vec![ArrayIrValue::Array(
+                    Array::from_elements::<f64>(concrete_type.with_layout(None), &cotangent_values).unwrap()
+                )]),
             );
         }
     }

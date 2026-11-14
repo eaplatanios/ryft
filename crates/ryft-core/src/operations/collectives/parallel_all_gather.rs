@@ -3647,10 +3647,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_all_gather_differentiation_array_ir_restores_input_cotangent_layouts() {
-        // Resizing the gathered axis clears the explicit layout of the input, so neither the selection of an invariant
-        // gather nor the adjoint sum-scatter of a varying gather restores it. Both pullbacks therefore cast their
-        // result to the exact input cotangent type, whose layout the linear call requires.
+    fn test_parallel_all_gather_differentiation_array_ir_input_cotangents_have_no_layout() {
+        // An input cotangent has no explicit layout, because a cotangent need not be stored like its input. Neither the
+        // selection of an invariant gather nor the adjoint sum-scatter of a varying gather produces a layout, so both
+        // pullbacks return their result as the exact input cotangent type without a cast.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [2])
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
@@ -3672,7 +3672,7 @@ mod tests {
             pullback(ParallelAllGatherOutputVariance::Invariant),
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}], %1:dimension<4> .
-                let %2:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                let %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     linear_call [residual_count=1] %1 %0 [
                     forward={
                         lambda %0:dimension<4>, %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] .
@@ -3693,16 +3693,10 @@ mod tests {
                                 [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %9 %5
                             %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape \
                                 [output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %10 %5
-                            %12:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
-                                varying_manual={'x'}}] = cast [
-                                type=f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
-                                    varying_manual={'x'}}],
-                                inputs=[f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]],
-                            ] %11
-                        in (%12)
+                        in (%11)
                     },
                     transpose={
-                        lambda %0:dimension<4>, %1:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
+                        lambda %0:dimension<4>, %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], \
                             varying_manual={'x'}}] .
                         let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_all_gather [
                             axes=\"x\",
@@ -3723,7 +3717,7 @@ mod tests {
             pullback(ParallelAllGatherOutputVariance::Varying),
             indoc! {"
                 lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:dimension<4> .
-                let %2:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                let %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     linear_call [residual_count=1] %1 %0 [
                     forward={
                         lambda %0:dimension<4>, %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
@@ -3731,16 +3725,10 @@ mod tests {
                             %3:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                                 parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=0, options=Tiled, \
                                 mesh=['x'=2:manual]] %1 %2
-                            %4:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
-                                varying_manual={'x'}}] = cast [
-                                type=f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
-                                    varying_manual={'x'}}],
-                                inputs=[f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]],
-                            ] %3
-                        in (%4)
+                        in (%3)
                     },
                     transpose={
-                        lambda %0:dimension<4>, %1:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
+                        lambda %0:dimension<4>, %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], \
                             varying_manual={'x'}}] .
                         let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                             parallel_all_gather [
@@ -4313,10 +4301,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_all_gather_transposition_restores_input_cotangent_layouts() {
-        // Resizing the gathered axis clears the explicit layout of the input, so neither the selection of an invariant
-        // gather nor the adjoint sum-scatter of a varying gather restores it. Both transposes therefore cast their
-        // result to the exact input cotangent type, which the cotangent accumulator requires.
+    fn test_parallel_all_gather_transposition_input_cotangents_have_no_layout() {
+        // An input cotangent has no explicit layout, because a cotangent need not be stored like its input. Neither the
+        // selection of an invariant gather nor the adjoint sum-scatter of a varying gather produces a layout, so both
+        // transposes return their result as the exact input cotangent type without a cast.
         let input_type =
             ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let pullback = |output_variance| {
@@ -4334,8 +4322,7 @@ mod tests {
                     %3:u64[] = zero [type=u64[]]
                     %4:f32[1, 2] = dynamic_slice [sizes=[1, 2]] %1 %2 %3
                     %5:f32[2] = reshape [shape=[2]] %4
-                    %6:f32[2][layout=strided{4}] = cast [type=f32[2][layout=strided{4}], inputs=[f32[2]]] %5
-                in (%6)"
+                in (%5)"
             },
         );
         assert_eq!(invariant.output_types(), vec![input_type.cotangent().unwrap()]);
@@ -4345,8 +4332,7 @@ mod tests {
             indoc! {"
                 lambda %0:f32[4] .
                 let %1:f32[2] = parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %0
-                    %2:f32[2][layout=strided{4}] = cast [type=f32[2][layout=strided{4}], inputs=[f32[2]]] %1
-                in (%2)"
+                in (%1)"
             },
         );
         assert_eq!(varying.output_types(), vec![input_type.cotangent().unwrap()]);

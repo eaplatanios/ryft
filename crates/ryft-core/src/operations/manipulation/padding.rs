@@ -3095,8 +3095,8 @@ mod tests {
             }],
         );
 
-        // The pullback restores the complete cotangent types of both inputs after slicing and reducing the output
-        // cotangent.
+        // After slicing and reducing the output cotangent, the input cotangents keep the memory placements of their
+        // inputs but not their explicit layouts.
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![3.into()]))
             .with_layout(Layout::Strided(StridedLayout::new(vec![8])))
             .with_memory(Memory::Host { pinned: true });
@@ -3115,8 +3115,8 @@ mod tests {
                     &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
                 ).unwrap()],
                 input_cotangents = [
-                    Array::from_elements::<f64>(input_type, &[2.0, 4.0, 6.0]).unwrap(),
-                    Array::from_elements::<f64>(padding_type, &[24.0]).unwrap(),
+                    Array::from_elements::<f64>(input_type.with_layout(None), &[2.0, 4.0, 6.0]).unwrap(),
+                    Array::from_elements::<f64>(padding_type.with_layout(None), &[24.0]).unwrap(),
                 ],
             }],
         );
@@ -5068,7 +5068,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_pad_differentiation_restores_dynamic_layouts() {
+    fn test_array_ir_pad_differentiation_drops_dynamic_layouts() {
         let size = DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap());
         let output_size = DimensionVariable::new("output_size", DimensionBounds::new(3, Some(7)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]))
@@ -5111,11 +5111,12 @@ mod tests {
             Array::from_elements(ArrayType::new_static(DataType::F32, [4]), &[1_f32, 2., 3., 4.]).unwrap(),
         )];
         pullback_inputs.extend(residuals);
+        // The input cotangents do not take the explicit layouts of their inputs.
         assert_eq!(
             linearization.pullback().unwrap().program().interpret(pullback_inputs),
             Ok(vec![
-                ArrayIrValue::Array(Array::from_elements(concrete_input_type, &[2_f32, 3.]).unwrap()),
-                ArrayIrValue::Array(Array::from_elements(padding_type, &[5_f32]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements(concrete_input_type.with_layout(None), &[2_f32, 3.]).unwrap()),
+                ArrayIrValue::Array(Array::from_elements(padding_type.with_layout(None), &[5_f32]).unwrap()),
             ])
         );
     }

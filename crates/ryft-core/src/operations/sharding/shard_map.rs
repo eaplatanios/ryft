@@ -27056,10 +27056,10 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_map_transposition_normalizes_strided_low_precision_unchecked_body_seeds() {
-        // The byte strides of an `f16` seed do not address its `f32` temporaries, which therefore take the default
-        // layout, and the normalized seed regains the strides that the transposed body declares through a cast. The
-        // unchecked body divides the replicated seed over both devices and sums their contributions afterwards.
+    fn test_shard_map_transposition_strided_low_precision_unchecked_body_seeds_have_no_layout() {
+        // A cotangent need not be stored like its primal, so the `f16` seed of a strided output has no explicit layout
+        // and the transposed body needs no cast after narrowing its `f32` temporaries. The unchecked body divides the
+        // replicated seed over both devices and sums their contributions afterwards.
         let mesh = manual_mesh();
         let replicated = Sharding::replicated(mesh.clone(), 1);
         let global_type =
@@ -27072,37 +27072,32 @@ mod tests {
         let program = caller_typed_shard_map_program(body, vec![ArrayIrType::Array(global_type.clone())], boundary);
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
         let sharding = "{mesh<['x'=2:manual]>, [{}]}";
-        let strided = format!("f16[4][layout=strided{{2}}][sharding={sharding}]");
+        let seed = format!("f16[4][sharding={sharding}]");
         let widened = format!("f32[4][sharding={sharding}]");
-        let narrowed = format!("f16[4][sharding={sharding}]");
         let scalar = "f32[][sharding={mesh<['x'=2:manual]>, []}]";
-        let caller = "f16[4][layout=strided{2}]";
+        let caller = "f16[4]";
         assert_eq!(
             pullback.to_string(),
             formatdoc! {"
-                lambda %0:{strided} .
-                let %1:{strided} = shard_map [
+                lambda %0:{seed} .
+                let %1:{seed} = shard_map [
                     mesh=['x'=2:manual],
                     input_shardings=[{sharding}],
                     output_shardings=[{sharding}],
                     manual_axes=['x'],
                     check_manual_variation=false,
-                    global_input_types=[{strided}],
-                    global_output_types=[{strided}],
+                    global_input_types=[{seed}],
+                    global_output_types=[{seed}],
                 ] %0 [
                     body={{
-                        lambda %0:{strided} .
+                        lambda %0:{seed} .
                         let %1:{widened} = convert_element_type [data_type=f32] %0
                             %2:{scalar} = constant [value=2.0]
                             %3:{widened} = broadcast [output_type={widened}, output_axes=[]] %2
                             %4:{widened} = div %1 %3
-                            %5:{narrowed} = convert_element_type [data_type=f16] %4
-                            %6:{strided} = cast [
-                                type={strided},
-                                inputs=[{narrowed}],
-                            ] %5
-                            %7:{strided} = parallel_reduce [kind=sum, axis_name=\"x\"] %6
-                        in (%7)
+                            %5:{seed} = convert_element_type [data_type=f16] %4
+                            %6:{seed} = parallel_reduce [kind=sum, axis_name=\"x\"] %5
+                        in (%6)
                     }},
                 ]
                     %2:{caller} = broadcast [output_type={caller}, output_axes=[0]] %1
@@ -27111,14 +27106,15 @@ mod tests {
         let values = Array::vector(vec![1f32, 2.0, 3.0, 4.0]).unwrap().converted_to(DataType::F16).unwrap();
         let seed_type = <&ArrayType>::try_from(&pullback.input_types()[0]).unwrap().clone();
         let seed = Array::from_logical_bytes(seed_type, &values.logical_bytes()).unwrap();
-        let cotangent = Array::from_logical_bytes(global_type, &values.logical_bytes()).unwrap();
+        let cotangent_type = ArrayType::new_static(DataType::F16, [4]);
+        let cotangent = Array::from_logical_bytes(cotangent_type, &values.logical_bytes()).unwrap();
         assert_eq!(pullback.interpret(vec![TestValue::Array(seed)]), Ok(vec![TestValue::Array(cotangent)]));
     }
 
     #[test]
-    fn test_shard_map_transposition_normalizes_strided_low_precision_trusted_output_seeds() {
+    fn test_shard_map_transposition_strided_low_precision_trusted_output_seeds_have_no_layout() {
         // A checked body with a trusted replicated output divides its `f16` seed over the axis whose variation the
-        // boundary forgot, with the same layouts as an unchecked body.
+        // boundary forgot. As for an unchecked body, the seed of a strided output has no explicit layout.
         let mesh = manual_mesh();
         let sharded = sharding(&mesh, vec![ShardingDimension::sharded(["x"])]);
         let replicated = Sharding::replicated(mesh.clone(), 1);
@@ -27134,13 +27130,12 @@ mod tests {
         let replicated = "{mesh<['x'=2:manual]>, [{}]}";
         let tiled = "{mesh<['x'=2:manual]>, [{'x'}]}";
         let varying = "{mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}";
-        let seed = format!("f16[2][layout=strided{{2}}][sharding={replicated}]");
-        let varying_seed = format!("f16[2][layout=strided{{2}}][sharding={varying}]");
+        let seed = format!("f16[2][sharding={replicated}]");
+        let varying_seed = format!("f16[2][sharding={varying}]");
         let widened = format!("f32[2][sharding={varying}]");
-        let narrowed = format!("f16[2][sharding={varying}]");
         let scalar = "f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]";
-        let cotangent = format!("f16[4][layout=strided{{2}}][sharding={tiled}]");
-        let caller = "f16[4][layout=strided{2}]";
+        let cotangent = format!("f16[4][sharding={tiled}]");
+        let caller = "f16[4]";
         assert_eq!(
             pullback.to_string(),
             formatdoc! {"
@@ -27163,12 +27158,8 @@ mod tests {
                                 output_axes=[],
                             ] %3
                             %5:{widened} = div %2 %4
-                            %6:{narrowed} = convert_element_type [data_type=f16] %5
-                            %7:{varying_seed} = cast [
-                                type={varying_seed},
-                                inputs=[{narrowed}],
-                            ] %6
-                        in (%7)
+                            %6:{varying_seed} = convert_element_type [data_type=f16] %5
+                        in (%6)
                     }},
                 ]
                     %2:{caller} = broadcast [output_type={caller}, output_axes=[0]] %1
@@ -27178,7 +27169,8 @@ mod tests {
         let seed = Array::vector(vec![1f32, 2.0]).unwrap().converted_to(DataType::F16).unwrap();
         let seed = Array::from_logical_bytes(seed_type, &seed.logical_bytes()).unwrap();
         let cotangent = Array::vector(vec![0.5f32, 1.0, 0.5, 1.0]).unwrap().converted_to(DataType::F16).unwrap();
-        let cotangent = Array::from_logical_bytes(global_type, &cotangent.logical_bytes()).unwrap();
+        let cotangent_type = ArrayType::new_static(DataType::F16, [4]);
+        let cotangent = Array::from_logical_bytes(cotangent_type, &cotangent.logical_bytes()).unwrap();
         assert_eq!(pullback.interpret(vec![TestValue::Array(seed)]), Ok(vec![TestValue::Array(cotangent)]));
     }
 

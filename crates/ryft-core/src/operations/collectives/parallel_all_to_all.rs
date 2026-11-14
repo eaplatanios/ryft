@@ -3288,10 +3288,10 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_all_to_all_transposition_restores_input_cotangent_layouts() {
-        // An exchange that splits one axis and concatenates along another resizes both, which clears the explicit
-        // layout of the input, so the transpose casts the result of the adjoint exchange to the exact input cotangent
-        // type, which the cotangent accumulator requires.
+    fn test_parallel_all_to_all_transposition_input_cotangents_have_no_layout() {
+        // An input cotangent has no explicit layout, because a cotangent need not be stored like its input. The adjoint
+        // exchange produces no layout, so the transpose returns its result as the exact input cotangent type without a
+        // cast.
         let input_type =
             ArrayType::new_static(DataType::F32, [2, 4]).with_layout(Layout::Strided(StridedLayout::new(vec![16, 4])));
         let operation = ParallelAllToAllOperation::new("x", 2, 1, 0, CollectiveOptions::tiled());
@@ -3302,9 +3302,7 @@ mod tests {
                 lambda %0:f32[4, 2] .
                 let %1:f32[2, 4] = parallel_all_to_all [axes=\"x\", axis_size=2, split_axis=0, concatenation_axis=1, \
                     options=Tiled] %0
-                    %2:f32[2, 4][layout=strided{16,4}] = \
-                    cast [type=f32[2, 4][layout=strided{16,4}], inputs=[f32[2, 4]]] %1
-                in (%2)"
+                in (%1)"
             },
         );
         assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);

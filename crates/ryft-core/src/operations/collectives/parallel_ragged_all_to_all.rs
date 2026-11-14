@@ -4708,17 +4708,18 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_ragged_all_to_all_transposition_restores_input_cotangent_layouts() {
-        // The cotangent accumulator requires the exact cotangent type of each data input. The adjoint exchange has
-        // the type of its `output` input, which is a zero of the operand cotangent type, so the operand cotangent keeps
-        // its explicit layout. The receive mask restores the shape of the output cotangent but not its layout, so the
-        // transpose casts that one. The values match the first case of `test_parallel_ragged_all_to_all_transposition`.
+    fn test_parallel_ragged_all_to_all_transposition_input_cotangents_have_no_layout() {
+        // A cotangent has no explicit layout, because it need not be stored like its primal. The output cotangent seed,
+        // the zero `output` input of the adjoint exchange, and both data input cotangents therefore have no layout, and
+        // the transpose needs no cast. The values match the first case of
+        // `test_parallel_ragged_all_to_all_transposition`.
         let data_type =
             ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let cotangent_type = ArrayType::new_static(DataType::F32, [2]);
         let program = constant_metadata_exchange_program(
             ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
             data_type.clone(),
-            data_type.clone(),
+            data_type,
             [
                 Array::vector(vec![0i32, 0]).unwrap(),
                 Array::vector(vec![1i32, 1]).unwrap(),
@@ -4730,7 +4731,7 @@ mod tests {
         assert_eq!(
             pullback.to_string(),
             indoc! {"
-                lambda %0:f32[2][layout=strided{4}] .
+                lambda %0:f32[2] .
                 let %1:i32[2] = const [0, 0]
                     %2:i32[2] = const [1, 1]
                     %3:i32[2] = const [0, 1]
@@ -4739,8 +4740,8 @@ mod tests {
                     options=Tiled] %3
                     %6:i32[2] = parallel_all_to_all [axes=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
                     options=Tiled] %1
-                    %7:f32[2][layout=strided{4}] = zero [type=f32[2][layout=strided{4}]]
-                    %8:f32[2][layout=strided{4}] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=1, \
+                    %7:f32[2] = zero [type=f32[2]]
+                    %8:f32[2] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=1, \
                     update_kind=Add] %0 %7 %5 %4 %6 %2
                     %9:u64[2] = convert_element_type [data_type=u64] %5
                     %10:u64[2] = convert_element_type [data_type=u64] %4
@@ -4764,18 +4765,17 @@ mod tests {
                     %20:i64[2] = slice [start_indices=[0], limits=[2]] %19
                     %21:i64[2] = zero [type=i64[2]]
                     %22:bool[2] = compare [direction=NotEqual] %20 %21
-                    %23:f32[2][layout=strided{4}] = zero [type=f32[2][layout=strided{4}]]
+                    %23:f32[2] = zero [type=f32[2]]
                     %24:f32[2] = select %22 %23 %0
-                    %25:f32[2][layout=strided{4}] = cast [type=f32[2][layout=strided{4}], inputs=[f32[2]]] %24
-                in (%8, %25)"
+                in (%8, %24)"
             },
         );
-        let seed = Array::from_elements(data_type.clone(), &[3.0f32, 5.0]).unwrap();
+        let seed = Array::from_elements(cotangent_type.clone(), &[3.0f32, 5.0]).unwrap();
         assert_eq!(
             pullback.interpret(vec![seed]),
             Ok(vec![
-                Array::from_elements(data_type.clone(), &[8.0f32, 0.0]).unwrap(),
-                Array::from_elements(data_type, &[0.0f32, 0.0]).unwrap(),
+                Array::from_elements(cotangent_type.clone(), &[8.0f32, 0.0]).unwrap(),
+                Array::from_elements(cotangent_type, &[0.0f32, 0.0]).unwrap(),
             ]),
         );
     }

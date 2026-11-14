@@ -6291,7 +6291,8 @@ mod tests {
             }],
         );
 
-        // The dual gather restores the update cotangent's complete layout-bearing type.
+        // The update cotangent of the dual gather keeps the memory placement of the updates but not their explicit
+        // layout.
         let input_type =
             ArrayType::new(DataType::F64, Shape::new(vec![4.into()])).with_memory(Memory::Host { pinned: true });
         let update_type = ArrayType::new(DataType::F64, Shape::new(vec![2.into()]))
@@ -6317,7 +6318,7 @@ mod tests {
                 output_cotangents = [Array::from_elements::<f64>(input_type.clone(), &[1.0, 2.0, 3.0, 4.0]).unwrap()],
                 input_cotangents = [
                     Array::from_elements::<f64>(input_type, &[1.0, 2.0, 3.0, 4.0]).unwrap(),
-                    Array::from_elements::<f64>(update_type, &[2.0, 4.0]).unwrap(),
+                    Array::from_elements::<f64>(update_type.with_layout(None), &[2.0, 4.0]).unwrap(),
                 ],
             }],
         );

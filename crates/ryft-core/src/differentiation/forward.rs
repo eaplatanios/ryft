@@ -60,15 +60,17 @@ impl<V: Value<Type: DifferentiableType>> DifferentiationDual<V> {
     ///
     /// # Errors
     ///
-    /// Returns a [`DifferentiationError`] if `primal` has no tangent representation or if a live `tangent` does not
-    /// have the tangent type required by `primal`.
+    /// Returns a [`DifferentiationError`] if `primal` has no tangent representation or if the type of a live `tangent`
+    /// is not interchangeable with the tangent type required by `primal` (refer to
+    /// [`Type::is_interchangeable_with`]), so a tangent may be stored differently than that type describes (e.g., with
+    /// the explicit layout of its primal).
     #[inline]
     pub fn new<T: Into<MaybeZero<V>>>(primal: V, tangent: T) -> Result<Self, DifferentiationError> {
         let tangent_type = primal.r#type().tangent()?;
         let tangent = match tangent.into() {
             MaybeZero::Zero(_) => MaybeZero::Zero(tangent_type),
             MaybeZero::Value(tangent) => {
-                if tangent.r#type().as_ref() != &tangent_type {
+                if !tangent_type.is_interchangeable_with(tangent.r#type().as_ref()) {
                     return Err(TypeError::invalid(format!(
                         "tangent type {} does not match type {} required by primal type {}",
                         tangent.r#type().as_ref(),
@@ -956,12 +958,13 @@ impl<
                 .map(|(index, value)| (DifferentiationBoundaryPosition::Tangent(index), value)),
         )?;
 
-        // Validate every public tangent against the tangent type derived from its primal leaf. Forward only the
+        // Validate every public tangent against the tangent type derived from its primal leaf, which a tangent that
+        // is stored differently (e.g., with the explicit layout of its primal) still satisfies. Forward only the
         // information-carrying values because the compact program has no SSA input for a zero differential space.
         let mut program_inputs = Vec::new();
         for (index, (value, primal_type)) in public_tangents.into_iter().zip(&self.primal_input_types).enumerate() {
             let tangent_type = primal_type.tangent()?;
-            if value.r#type().as_ref() != &tangent_type {
+            if !tangent_type.is_interchangeable_with(value.r#type().as_ref()) {
                 return Err(ProgramError::MalformedProgram(format!(
                     "pushforward tangent {} has type {} but its primal boundary requires tangent type {}",
                     index,
@@ -4133,7 +4136,7 @@ pub(crate) mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceTransform,
         ArrayReferenceTransformIndex, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
-        DimensionVariable, Shape, ShardingDimension,
+        DimensionVariable, Layout, Shape, ShardingDimension, StridedLayout,
     };
     use crate::batching::{BatchAxis, BatchedProgram, ProgramBatchingOutputAxesPolicy, batch};
     use crate::contexts::{Context, EagerContext};
@@ -4453,6 +4456,38 @@ pub(crate) mod tests {
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == "tangent type token[] does not match type zero[] required by primal type token[]",
         ));
+
+        // A tangent type has no explicit layout, and a tangent may be stored like its primal or in any other way.
+        let plain = ArrayType::new_static(DataType::F32, [2]);
+        let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
+        let primal = Array::from_elements(strided.clone(), &[1f32, 2.0]).unwrap();
+        for tangent_type in [&plain, &strided] {
+            let tangent = Array::from_elements(tangent_type.clone(), &[3f32, 4.0]).unwrap();
+            let (_, tangent) = DifferentiationDual::new(primal.clone(), tangent.clone()).unwrap().into_parts();
+            assert!(matches!(tangent, MaybeZero::Value(value) if value.r#type().as_ref() == tangent_type));
+        }
+        assert!(matches!(
+            DifferentiationDual::new(primal, Array::from_elements(plain.with_data_type(DataType::F64), &[3f64, 4.0]).unwrap()),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "tangent type f64[2] does not match type f32[2] required by primal type \
+                               f32[2][layout=strided{8}]",
+        ));
+    }
+
+    #[test]
+    fn test_pushforward_apply_interchangeable_tangents() {
+        // The tangent type of a primal with an explicit layout has none, and a pushforward accepts a tangent that is
+        // stored like its primal as well as one that is not.
+        let plain = ArrayType::new_static(DataType::F32, [2, 2]);
+        let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![16, 8])));
+        let primal = Array::from_elements(strided.clone(), &[1f32, 2.0, 3.0, 4.0]).unwrap();
+        let (_, pushforward) = differentiate_at(primal).linearize(|input| Ok(input.clone() * input)).unwrap();
+        for tangent_type in [&plain, &strided] {
+            let tangent = Array::from_elements(tangent_type.clone(), &[0.5f32, 1.5, 2.5, 3.5]).unwrap();
+            let output: Array = pushforward.apply(tangent).unwrap();
+            assert!(plain.is_interchangeable_with(output.r#type().as_ref()));
+            assert_eq!(output.elements::<f32>().unwrap(), vec![1.0, 6.0, 15.0, 28.0]);
+        }
     }
 
     #[test]

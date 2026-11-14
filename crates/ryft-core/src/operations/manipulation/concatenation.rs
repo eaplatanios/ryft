@@ -2073,8 +2073,8 @@ mod tests {
                         &[1.0, 2.0, 3.0, 4.0, 5.0],
                     ).unwrap()],
                     input_cotangents = [
-                        Array::from_elements::<f64>(placed_left_type, &[1.0, 2.0]).unwrap(),
-                        Array::from_elements::<f64>(placed_right_type, &[3.0, 4.0, 5.0]).unwrap(),
+                        Array::from_elements::<f64>(placed_left_type.with_layout(None), &[1.0, 2.0]).unwrap(),
+                        Array::from_elements::<f64>(placed_right_type.with_layout(None), &[3.0, 4.0, 5.0]).unwrap(),
                     ],
                 },
                 {
@@ -3345,11 +3345,10 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_concatenate_differentiation_restores_dynamic_input_layouts() {
+    fn test_array_ir_concatenate_differentiation_drops_dynamic_input_layouts() {
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
         let layout = Layout::Strided(StridedLayout::new(vec![16, 4]));
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![2.into(), columns.into()])).with_layout(layout.clone());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), columns.into()])).with_layout(layout);
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let first = builder.add_input(input_type.clone().into());
         let second = builder.add_input(input_type.clone().into());
@@ -3370,8 +3369,8 @@ mod tests {
             )
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        // The cotangent slices are layout-free, so each input's strided layout is restored by a broadcast into the
-        // exact input type.
+        // The input cotangents are the layout-free cotangent slices themselves, because a cotangent does not take the
+        // strided layout of its input.
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -3381,23 +3380,20 @@ mod tests {
                     %3:dimension<columns ∈ [1, 5)> = dimension_size [axis=1] %0
                     %4:dimension<2> = constant [value=2]
                     %5:f32[2, columns] = dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %2 %2 %4 %3
-                    %6:f32[2, columns][layout=strided{16,4}] = \
-                broadcast [output_type=f32[2, columns][layout=strided{16,4}], output_axes=[0, 1]] %5
+                    %6:dimension<2> = constant [value=2]
                     %7:dimension<2> = constant [value=2]
-                    %8:dimension<2> = constant [value=2]
-                    %9:f32[2, columns] = dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %7 %2 %8 %3
-                    %10:f32[2, columns][layout=strided{16,4}] = \
-                broadcast [output_type=f32[2, columns][layout=strided{16,4}], output_axes=[0, 1]] %9
-                in (%6, %10)
+                    %8:f32[2, columns] = dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %6 %2 %7 %3
+                in (%5, %8)
             "}
             .trim_end(),
         );
-        assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(input_type.clone()); 2]);
+        let cotangent_type = input_type.with_layout(None);
+        assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(cotangent_type.clone()); 2]);
         assert_eq!(
             program.linearize().unwrap().pullback().unwrap().program().output_types(),
-            vec![ArrayIrType::Array(input_type); 2]
+            vec![ArrayIrType::Array(cotangent_type); 2]
         );
-        let concrete_type = ArrayType::new_static(DataType::F32, [2, 2]).with_layout(layout);
+        let concrete_type = ArrayType::new_static(DataType::F32, [2, 2]);
         assert_eq!(
             pullback.interpret(vec![ArrayIrValue::Array(
                 Array::from_elements(
