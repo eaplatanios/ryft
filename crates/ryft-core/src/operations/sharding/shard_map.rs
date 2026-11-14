@@ -7743,7 +7743,7 @@ mod tests {
     use crate::operations::exponential::Exp;
     use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
     use crate::operations::manipulation::conversions::{
-        CastOperation, ConvertElementType, ConvertElementTypeOperation,
+        Cast, CastOperation, ConvertElementType, ConvertElementTypeOperation,
     };
     use crate::operations::manipulation::reshaping::Reshape;
     use crate::operations::reductions::{Reduce, ReduceOperation};
@@ -13602,6 +13602,87 @@ mod tests {
             ]),
             Ok(vec![f32_value(output_type, &[7.0])]),
         );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_accepts_inputs_whose_layouts_refine_their_declared_types() {
+        // Both branches of a `condition` declare an output type without a layout and forward their input, which has an
+        // explicit layout, so the value that the map receives when it runs refines the type that it was staged with.
+        // A declared input type without a layout admits that value, and the map returns its elements.
+        let mesh = manual_mesh();
+        let sharded = sharded_along_x();
+        let boundary = ShardMapBoundary::new(mesh, vec![sharded.clone()], vec![sharded.clone()], Vec::new()).unwrap();
+        let declared_type = f32_type(&[4], None);
+        let strided_type = declared_type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let local_type = boundary.local_input_type(0, &declared_type).unwrap();
+        let body = build_program(vec![ArrayIrType::Array(local_type)], |_, inputs| inputs.to_vec());
+        let operation =
+            ShardMapOperation::from_program(&body, vec![ArrayIrType::Array(declared_type.clone())], boundary).unwrap();
+        let forward = || build_program(vec![ArrayIrType::Array(declared_type.clone())], |_, inputs| inputs.to_vec());
+        let program = build_program(vec![ArrayIrType::Array(strided_type.clone())], |builder, inputs| {
+            let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
+            let regions = vec![builder.import_program(forward()), builder.import_program(forward())];
+            let condition = ConditionOperation::<ArrayIrType>::new();
+            let refined = builder.add_instruction(condition, regions, vec![predicate, inputs[0]], None).unwrap()[0];
+            let body = builder.import_program(body);
+            builder.add_instruction(operation, vec![body], vec![refined], None).unwrap().to_vec()
+        });
+        assert_eq!(
+            program.interpret(vec![f32_value(strided_type, &[1.0, 2.0, 3.0, 4.0])]),
+            Ok(vec![f32_value(f32_type(&[4], Some(sharded)), &[1.0, 2.0, 3.0, 4.0])]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_writes_back_only_mutated_references() {
+        // A map whose body only forwards or only reads its reference input leaves the caller's reference untouched, so
+        // the generation of its state does not advance and earlier observations of it stay valid. A body that writes
+        // the reference publishes a new state, even when it writes the value that the reference already holds, because
+        // the write back follows the reference analysis of the body and not a comparison of the final state.
+        let sharded = sharded_along_x();
+        let boundary = |output_shardings: Vec<Sharding>| {
+            ShardMapBoundary::new(manual_mesh(), vec![sharded.clone()], output_shardings, Vec::new()).unwrap()
+        };
+        let global_type = f32_type(&[2], None);
+        let local_type = boundary(Vec::new()).local_input_type(0, &global_type).unwrap();
+        let local_reference_type = ArrayIrType::Reference(ReferenceType::new(local_type));
+        let global_reference_type = ArrayIrType::Reference(ReferenceType::new(global_type.clone()));
+        let forward = build_program(vec![local_reference_type.clone()], |_, inputs| inputs.to_vec());
+        let read = build_program(vec![local_reference_type.clone()], |builder, inputs| {
+            builder
+                .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![inputs[0]], None)
+                .unwrap()
+                .to_vec()
+        });
+        let write = build_program(vec![local_reference_type], |builder, inputs| {
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![inputs[0], value], None)
+                .unwrap();
+            vec![value]
+        });
+        let generation = |reference: &ArrayReference| reference.lock_storage().unwrap().observe().unwrap().generation();
+        let run = |body: TestProgram, output_shardings: Vec<Sharding>| {
+            let program =
+                caller_typed_shard_map_program(body, vec![global_reference_type.clone()], boundary(output_shardings));
+            let reference = ArrayReference::new(Array::from_elements(global_type.clone(), &[3.0f32, 4.0]).unwrap());
+            let before = generation(&reference);
+            let outputs = program.interpret(vec![ArrayIrValue::Reference(reference.clone())]).unwrap();
+            (outputs, reference.read().unwrap(), generation(&reference) == before)
+        };
+        let state = Array::from_elements(global_type.clone(), &[3.0f32, 4.0]).unwrap();
+        let value = f32_value(f32_type(&[2], Some(sharded.clone())), &[3.0, 4.0]);
+
+        let (outputs, final_state, unchanged) = run(forward, vec![sharded.clone()]);
+        assert!(matches!(outputs.as_slice(), [ArrayIrValue::Reference(_)]));
+        assert_eq!((final_state, unchanged), (state.clone(), true));
+
+        let (outputs, final_state, unchanged) = run(read, vec![sharded.clone()]);
+        assert_eq!((outputs, final_state, unchanged), (vec![value.clone()], state.clone(), true));
+
+        let (outputs, final_state, unchanged) = run(write, vec![sharded.clone()]);
+        assert_eq!((outputs, final_state, unchanged), (vec![value], state, false));
     }
 
     #[test]
@@ -19888,10 +19969,10 @@ mod tests {
 
     #[test]
     fn test_shard_map_batching_gathers_batch_axes_into_the_memory_of_the_sliced_outputs() {
-        // The body varies its input along `x`, sums it along `x`, and transfers the sum to pinned host memory, so a batch axis placed on `x`
-        // is gathered and the output is sliced in pinned host memory. The zero start index is created there, and the
-        // coordinate along `x` is transferred there, because `dynamic_slice` requires its starts to reside in the
-        // memory of the value that they slice.
+        // The body varies its input along `x`, sums it along `x`, and transfers the sum to pinned host memory, so a
+        // batch axis placed on `x` is gathered and the output is sliced in pinned host memory. The zero start index is
+        // created there, and the coordinate along `x` is transferred there, because `dynamic_slice` requires its starts
+        // to reside in the memory of the value that they slice.
         let host = Memory::Host { pinned: true };
         let replicated = Sharding::replicated(manual_mesh(), 0);
         let boundary =
@@ -20377,6 +20458,61 @@ mod tests {
         let mut pullback_inputs = vec![unit_seed(&outputs[1])];
         pullback_inputs.extend(residuals);
         assert_eq!(arrays_f64(pullback.interpret(pullback_inputs).unwrap()), vec![vec![1.0, 1.0]]);
+    }
+
+    #[test]
+    fn test_shard_map_batching_follows_the_layouts_of_mapped_outputs_of_custom_batching_rules() {
+        // The custom batching rule of an identity composite returns its batched input with an explicit layout, so the
+        // mapped output of the batched body has that layout. Inserting the batch dimension into the declared output
+        // type clears its layout, so the batched map takes the layout of its output from its batched body.
+        let mesh = manual_mesh();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let program = trace_test_program(
+            |inputs| {
+                vec![
+                    shard_map(
+                        |x: TestTracer| {
+                            let function = composite(|x: BodyTracer| Ok(x)).with_batching(
+                                |x: BodyTracer, axis: BatchAxis, _: BatchingLevelExtent<BodyTracer>| {
+                                    let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                                    let strided_type = x
+                                        .r#type()
+                                        .into_owned()
+                                        .with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+                                    Ok((x.cast_unchecked(strided_type, &[])?.into_value(), axis))
+                                },
+                            );
+                            Ok(ValueProjection::<ArrayType>::into_projected(function.call(x.into_value())?)?)
+                        },
+                        inputs[0].clone(),
+                        mesh.clone(),
+                        replicated.clone(),
+                        replicated.clone(),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap(),
+                ]
+            },
+            vec![f32_type(&[], None)],
+            Vec::new(),
+        );
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(batched.to_string(), "");
+        let extent = TestValue::Dimension(DimensionValue::constant(2).unwrap());
+        let output_type = boundary_array_type(&batched.output_types()[1]).unwrap().clone();
+        assert_eq!(
+            batched.interpret(vec![extent.clone(), f32_value(f32_type(&[2], None), &[3.0, 4.0])]),
+            Ok(vec![extent, f32_value(output_type, &[3.0, 4.0])]),
+        );
     }
 
     #[test]
@@ -21944,9 +22080,9 @@ mod tests {
 
     #[test]
     fn test_shard_map_batching_consumes_collectives_over_the_batch_axis_into_outputs_without_layouts() {
-        // The body sums its scalar input with an explicit layout over `items`. Batching consumes that sum as a reduction
-        // over the batch dimension, whose result has no layout, so the unmapped output of the batched map declares no
-        // layout, even though the source map declares the layout of its input.
+        // The body sums its scalar input with an explicit layout over `items`. Batching consumes that sum as a
+        // reduction over the batch dimension, whose result has no layout, so the unmapped output of the batched map
+        // declares no layout, even though the source map declares the layout of its input.
         let replicated = Sharding::replicated(manual_mesh(), 0);
         let boundary =
             ShardMapBoundary::new(manual_mesh(), vec![replicated.clone()], vec![replicated], Vec::new()).unwrap();
@@ -24340,8 +24476,8 @@ mod tests {
 
     #[test]
     fn test_shard_map_differentiation_skips_tangent_maps_keeping_the_differentiated_primal() {
-        // The body calls a composite whose primal is the identity and whose explicit forward mode rule prints its primal
-        // input and returns a tangent that depends on no input tangent. No output tangent is live, so no tangent
+        // The body calls a composite whose primal is the identity and whose explicit forward mode rule prints its
+        // primal input and returns a tangent that depends on no input tangent. No output tangent is live, so no tangent
         // `shard_map` is staged, but the primal `shard_map` runs the differentiated primal, which keeps the print of
         // the rule, as differentiating the body without the map does.
         let replicated = Sharding::replicated(manual_mesh(), 0);

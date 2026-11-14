@@ -7482,12 +7482,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(exact.clone());
         let output = builder
-            .add_instruction(
-                CastOperation::checked(layout, vec![exact.clone()]).unwrap(),
-                vec![],
-                vec![input],
-                None,
-            )
+            .add_instruction(CastOperation::checked(layout, vec![exact.clone()]).unwrap(), vec![], vec![input], None)
             .unwrap()[0];
         let proven = builder
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder])
