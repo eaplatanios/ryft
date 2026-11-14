@@ -1116,7 +1116,7 @@ where
 // input still has its axis and extent validated.
 impl<V: Value<Type = ArrayIrType> + DynamicConcatenate<ArrayIrType>> Concatenate<ArrayIrType> for V
 where
-    V: DimensionSize + ValueProjection<DimensionType>,
+    V: DimensionSize<Extent = V> + ValueProjection<DimensionType>,
     V::Projected: Add,
 {
     fn concatenate<'i, I: IntoIterator<Item = &'i Self>, A: Into<Axis>>(
@@ -1239,7 +1239,7 @@ pub trait DynamicConcatenate<T = <Self as Capability>::Universe>: Capability + S
     }
 }
 
-impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<usize>> DynamicConcatenate<ArrayIrType>
+impl<A: Value<Type = ArrayType> + Concatenate + DimensionSize<Extent = usize>> DynamicConcatenate<ArrayIrType>
     for ArrayIrValue<A>
 {
     fn concatenate_with_known_extent<'i, I: IntoIterator<Item = &'i Self>, AxisValue: Into<Axis>>(
@@ -1386,9 +1386,10 @@ fn validate_concatenation_inputs(inputs: &[&ArrayType], axis: usize) -> Result<O
     Ok(all_static.then_some(concatenated_static))
 }
 
-/// Infers the output [`Sharding`] for a concatenation operation by requiring identical spatial placement and varying
-/// manual axes. Non-empty reduced and unreduced axis sets must agree independently. Reduction-state transitions require
-/// their own semantic operations and cannot be supplied by concatenation.
+/// Infers the output [`Sharding`] for a concatenation operation by requiring identical spatial placement
+/// and varying manual axes. Non-empty reduced and unreduced axis sets must agree independently, and so must the
+/// [`UnreducedKind`](crate::UnreducedKind)s of the inputs with non-empty unreduced axis sets. Reduction-state
+/// transitions require their own semantic operations and cannot be supplied by concatenation.
 fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding>, TypeError> {
     /// Merges one non-empty reduced or unreduced axis set into the corresponding concatenation result state.
     fn merge_concatenation_axis_set(
@@ -1418,11 +1419,25 @@ fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding
         .unwrap_or_default();
     let mut spatial_sharding: Option<&Sharding> = None;
     let mut unreduced_axes = None;
+    let mut unreduced_kind = None;
     let mut reduced_axes = None;
     for input in inputs {
         let normalized_reduced_axes = input.reduced_axes().clone();
         unreduced_axes = merge_concatenation_axis_set(unreduced_axes, input.unreduced_axes(), "unreduced")?;
         reduced_axes = merge_concatenation_axis_set(reduced_axes, &normalized_reduced_axes, "reduced")?;
+        if !input.unreduced_axes().is_empty() {
+            match unreduced_kind {
+                Some(kind) if kind != input.unreduced_kind() => {
+                    return Err(TypeError::invalid(format!(
+                        "`{}` inputs must be unreduced with the same kind but got `{}` and `{}`",
+                        CONCATENATE_OPERATION_NAME,
+                        kind,
+                        input.unreduced_kind(),
+                    )));
+                }
+                _ => unreduced_kind = Some(input.unreduced_kind()),
+            }
+        }
 
         let Some(sharding) = input.sharding().filter(|sharding| sharding.mesh().rank() > 0) else {
             continue;
@@ -1445,6 +1460,7 @@ fn infer_concatenation_sharding(inputs: &[&ArrayType]) -> Result<Option<Sharding
     let Some(spatial_sharding) = spatial_sharding else { return Ok(None) };
     Sharding::new(spatial_sharding.mesh().clone(), spatial_sharding.dimensions().to_vec())
         .and_then(|sharding| sharding.with_unreduced_axes(unreduced_axes.unwrap_or_default()))
+        .and_then(|sharding| sharding.with_unreduced_kind(unreduced_kind.unwrap_or_default()))
         .and_then(|sharding| sharding.with_reduced_axes(reduced_axes.unwrap_or_default()))
         .and_then(|sharding| sharding.with_varying_manual_axes(varying_manual_axes))
         .map(Some)
@@ -1463,7 +1479,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
-        MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+        MeshAxisType, Sharding, ShardingDimension, StridedLayout, UnreducedKind,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingTracer, RecursiveBatchingDriver};
     use crate::contexts::{EagerContext, StagingContext};
@@ -1729,9 +1745,9 @@ mod tests {
         assert_eq!(operation.infer_output_types(&[row(Some(spatial.clone())), row(None)], &[]), Ok(vec![expected]),);
         assert_eq!(operation.infer_output_types(&[row(None), row(None)], &[]).unwrap()[0].sharding(), None);
 
-        // Explicit, manual, and automatic placement differences all conflict; this is intentionally stricter than
-        // checking only explicit mesh axes.
-        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual, MeshAxisType::Auto] {
+        // Explicit and manual placement differences both conflict; this is intentionally stricter than checking only
+        // explicit mesh axes. Array types cannot place dimensions over auto mesh axes at all.
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
             let placement_mesh = LogicalMesh::new(vec![MeshAxis::new("p", 2, axis_type).unwrap()]).unwrap();
             let placed = Sharding::new(
                 placement_mesh.clone(),
@@ -1803,6 +1819,23 @@ mod tests {
             ),
             Err(TypeError::invalid(format!(
                 "`{CONCATENATE_OPERATION_NAME}` output sharding is invalid: mesh axis name `m` appears more than once"
+            ))),
+        );
+
+        // The kind of a pending reduction propagates with its axes, and inputs pending different kinds conflict.
+        let unreduced_sum = replicated.clone().with_unreduced_axes(["m"]).unwrap();
+        let unreduced_max = unreduced_sum.clone().with_unreduced_kind(UnreducedKind::Max).unwrap();
+        assert_eq!(
+            operation
+                .infer_output_types(&[row(Some(unreduced_max.clone())), row(Some(unreduced_max.clone()))], &[])
+                .unwrap()[0]
+                .sharding(),
+            Some(&unreduced_max),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[row(Some(unreduced_sum)), row(Some(unreduced_max))], &[]),
+            Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` inputs must be unreduced with the same kind but got `sum` and `max`",
             ))),
         );
 
@@ -1944,8 +1977,6 @@ mod tests {
             let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
             let physical_sharding =
                 Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                    .unwrap()
-                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
                     .unwrap();
             let physical_type =
                 ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
@@ -2042,8 +2073,8 @@ mod tests {
                         &[1.0, 2.0, 3.0, 4.0, 5.0],
                     ).unwrap()],
                     input_cotangents = [
-                        Array::from_elements::<f64>(placed_left_type, &[1.0, 2.0]).unwrap(),
-                        Array::from_elements::<f64>(placed_right_type, &[3.0, 4.0, 5.0]).unwrap(),
+                        Array::from_elements::<f64>(placed_left_type.with_layout(None), &[1.0, 2.0]).unwrap(),
+                        Array::from_elements::<f64>(placed_right_type.with_layout(None), &[3.0, 4.0, 5.0]).unwrap(),
                     ],
                 },
                 {
@@ -3314,11 +3345,10 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_concatenate_differentiation_restores_dynamic_input_layouts() {
+    fn test_array_ir_concatenate_differentiation_drops_dynamic_input_layouts() {
         let columns = DimensionVariable::new("columns", DimensionBounds::new(1, Some(5)).unwrap());
         let layout = Layout::Strided(StridedLayout::new(vec![16, 4]));
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![2.into(), columns.into()])).with_layout(layout.clone());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![2.into(), columns.into()])).with_layout(layout);
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let first = builder.add_input(input_type.clone().into());
         let second = builder.add_input(input_type.clone().into());
@@ -3339,8 +3369,8 @@ mod tests {
             )
             .unwrap();
         let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        // The cotangent slices are layout-free, so each input's strided layout is restored by a broadcast into the
-        // exact input type.
+        // The input cotangents are the layout-free cotangent slices themselves, because a cotangent does not take the
+        // strided layout of its input.
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -3350,23 +3380,20 @@ mod tests {
                     %3:dimension<columns ∈ [1, 5)> = dimension_size [axis=1] %0
                     %4:dimension<2> = constant [value=2]
                     %5:f32[2, columns] = dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %2 %2 %4 %3
-                    %6:f32[2, columns][layout=strided{16,4}] = \
-                broadcast [output_type=f32[2, columns][layout=strided{16,4}], output_axes=[0, 1]] %5
+                    %6:dimension<2> = constant [value=2]
                     %7:dimension<2> = constant [value=2]
-                    %8:dimension<2> = constant [value=2]
-                    %9:f32[2, columns] = dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %7 %2 %8 %3
-                    %10:f32[2, columns][layout=strided{16,4}] = \
-                broadcast [output_type=f32[2, columns][layout=strided{16,4}], output_axes=[0, 1]] %9
-                in (%6, %10)
+                    %8:f32[2, columns] = dynamic_slice [strides=[1, 1], bounds=checked, requires_runtime_assertion=true] %0 %6 %2 %7 %3
+                in (%5, %8)
             "}
             .trim_end(),
         );
-        assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(input_type.clone()); 2]);
+        let cotangent_type = input_type.with_layout(None);
+        assert_eq!(pullback.output_types(), vec![ArrayIrType::Array(cotangent_type.clone()); 2]);
         assert_eq!(
             program.linearize().unwrap().pullback().unwrap().program().output_types(),
-            vec![ArrayIrType::Array(input_type); 2]
+            vec![ArrayIrType::Array(cotangent_type); 2]
         );
-        let concrete_type = ArrayType::new_static(DataType::F32, [2, 2]).with_layout(layout);
+        let concrete_type = ArrayType::new_static(DataType::F32, [2, 2]);
         assert_eq!(
             pullback.interpret(vec![ArrayIrValue::Array(
                 Array::from_elements(

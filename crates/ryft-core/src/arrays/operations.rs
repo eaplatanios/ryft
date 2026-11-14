@@ -9,32 +9,33 @@ use crate::arrays::types::dimensions::DimensionType;
 use crate::arrays::types::ir::ArrayIrType;
 use crate::operations::{
     AbsOperation, Add, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, ArithmeticOperations, Assert,
-    AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastOperation, Capability, CastOperation, CeilOperation,
-    ClampOperation, CollectiveOperations, Compare, CompareOperation, ComplexOperation, ComplexOperations,
-    CompositeConversion, CompositeOperation, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation,
-    ConjugateOperation, ConstantOperation, ConstantOperations, ConstrainShardingOperation, ConvertElementTypeOperation,
-    CosOperation, Cumulative, CumulativeOperation, CustomCall, CustomCallOperation, DimensionAddOperation,
-    DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation,
-    DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow, DimensionPowOperation,
-    DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation, DimensionToScalar,
-    DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, DynamicBroadcastOperation,
-    DynamicManipulationOperations, DynamicReshapeOperation, DynamicRngBitGenerator, DynamicSliceOperation,
-    DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation, ExpOperation, ExponentialOperations,
-    ExtremaOperations, FloorOperation, GatherOperation, GuardOperation, ImaginaryOperation, IotaOperation,
-    LiftedCustomRules, LinearCallOperation, Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations,
-    LogisticOperation, ManipulationOperations, MaxOperation, MinOperation, Mul, MulOperation, NegOperation,
-    NotOperation, OneLikeOperation, OneOperation, OrOperation, PadOperation, ParallelAllGatherOperation,
-    ParallelAllToAllOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
+    AssertOperation, Atan2Operation, AxisIndexOperation, BroadcastLikeOperation, BroadcastOperation, Capability,
+    CastOperation, CeilOperation, ClampOperation, CollectiveOperations, Compare, CompareOperation, ComplexOperation,
+    ComplexOperations, CompositeConversion, CompositeOperation, CompositeTransposeOperation, ConcatenateOperation,
+    ConditionOperation, ConjugateOperation, ConstantOperation, ConstantOperations, ConstrainShardingOperation,
+    ConvertElementTypeOperation, CosOperation, Cumulative, CumulativeOperation, CustomCall, CustomCallOperation,
+    DimensionAddOperation, DimensionDivOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
+    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
+    DimensionPowOperation, DimensionRemOperation, DimensionSize, DimensionSizeOperation, DimensionSubOperation,
+    DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, DotOperation, DotOperations, Dropout,
+    DropoutOperation, DynamicBroadcastOperation, DynamicManipulationOperations, DynamicReshapeOperation,
+    DynamicRngBitGenerator, DynamicSliceOperation, DynamicUpdateSliceOperation, Erf, ErfOperation, ExpM1Operation,
+    ExpOperation, ExponentialOperations, ExtremaOperations, FillLikeOperation, FloorOperation, GatherOperation,
+    GuardOperation, ImaginaryOperation, IotaLikeOperation, IotaOperation, LiftedCustomRules, LinearCallOperation,
+    Ln1pOperation, LogAddExpOperation, LogOperation, LogicalOperations, LogisticOperation, ManipulationOperations,
+    MaxOperation, MinOperation, Mul, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
+    OrOperation, PadOperation, ParallelAllGatherOperation, ParallelAllToAllOperation, ParallelBroadcastOperation,
+    ParallelCastOperation, ParallelPermuteOperation, ParallelRaggedAllToAllOperation, ParallelReduceOperation,
     ParallelSumScatterOperation, ParallelVaryOperation, PowOperation, Print, PrintOperation, RaggedDotOperation,
     RealOperation, ReduceOperation, ReducePrecisionOperation, ReductionOperations, ReferenceAddUpdateOperation,
     ReferenceAtomicAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperations,
     ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, Rem, RemOperation, RematerializeOperation,
     ReshapeOperation, ReshardOperation, ReverseOperation, RngBitGenerator, RngBitGeneratorOperation, RoundOperation,
     RoundingOperations, RsqrtOperation, SaturatingSub, SaturatingSubOperation, ScaledDotOperation, ScanOperation,
-    ScatterOperation, Select, SelectOperation, ShardingOperations, SignOperation, SinOperation, SliceOperation,
-    Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, Tag,
-    TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation, TrigonometricOperations,
-    UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
+    ScatterOperation, Select, SelectOperation, ShardMapOperation, ShardingOperations, SignOperation, SinOperation,
+    SliceOperation, Softmax, Sort, SortOperation, SqrtOperation, StopGradient, StopGradientOperation, Sub,
+    SubOperation, Tag, TagOperation, TanOperation, TanhOperation, TransferToMemoryOperation, TransposeOperation,
+    TrigonometricOperations, UpdateSliceOperation, WhileOperation, XorOperation, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{OperationProjection, Value, ValueProjection};
 
@@ -51,6 +52,8 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     OneLike(OneLikeOperation<ArrayType>),
     Constant(ConstantOperation<Array>),
     Iota(IotaOperation<ArrayType>),
+    FillLike(FillLikeOperation<ArrayType>),
+    IotaLike(IotaLikeOperation<ArrayType>),
     Min(MinOperation<ArrayType>),
     Max(MaxOperation<ArrayType>),
     Clamp(ClampOperation<ArrayType>),
@@ -97,13 +100,25 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Dot(DotOperation),
     RaggedDot(RaggedDotOperation),
     ScaledDot(ScaledDotOperation),
+    #[ryft(collective, lockstep)]
     AxisIndex(AxisIndexOperation),
+    #[ryft(collective, lockstep)]
     ParallelReduce(ParallelReduceOperation),
+    #[ryft(collective, lockstep)]
     ParallelVary(ParallelVaryOperation),
+    #[ryft(collective, lockstep)]
+    ParallelCast(ParallelCastOperation),
+    #[ryft(collective, lockstep)]
     ParallelAllGather(ParallelAllGatherOperation),
+    #[ryft(collective, lockstep)]
     ParallelSumScatter(ParallelSumScatterOperation),
+    #[ryft(collective, lockstep)]
     ParallelPermute(ParallelPermuteOperation),
+    #[ryft(collective, lockstep)]
+    ParallelBroadcast(ParallelBroadcastOperation),
+    #[ryft(collective, lockstep)]
     ParallelAllToAll(ParallelAllToAllOperation),
+    #[ryft(collective, lockstep)]
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
     Compare(CompareOperation<ArrayType>),
     Select(SelectOperation<ArrayType>),
@@ -111,6 +126,7 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Reverse(ReverseOperation),
     Reshape(ReshapeOperation),
     Broadcast(BroadcastOperation),
+    BroadcastLike(BroadcastLikeOperation),
     Pad(PadOperation<ArrayType>),
     Concatenate(ConcatenateOperation<ArrayType>),
     Gather(GatherOperation),
@@ -129,15 +145,20 @@ pub enum ArrayOperation<V: Value<Type = ArrayType>> {
     Scan(ScanOperation<ArrayType>),
     StopGradient(StopGradientOperation<ArrayType>),
     Tag(TagOperation<ArrayType>),
+    #[ryft(lockstep)]
     Rematerialize(RematerializeOperation<ArrayType>),
+    #[ryft(lockstep)]
     LinearCall(LinearCallOperation<ArrayType>),
     RngBitGenerator(RngBitGeneratorOperation<ArrayType>),
+    Dropout(DropoutOperation),
     Print(PrintOperation<ArrayType>),
     Assert(AssertOperation<ArrayType>),
     Guard(GuardOperation<ArrayType>),
     Cast(CastOperation<ArrayType>),
     CustomCall(CustomCallOperation),
+    #[ryft(collective, lockstep)]
     Composite(CompositeOperation<V, ArrayOperation<V>>),
+    #[ryft(collective)]
     CompositeTranspose(CompositeTransposeOperation<V, ArrayOperation<V>>),
 }
 
@@ -187,6 +208,7 @@ pub trait ArrayOperations<T = <Self as Capability>::Universe>:
     + StopGradient<T>
     + Tag<T>
     + RngBitGenerator<T>
+    + Dropout<T>
     + Print<T>
     + Assert<T>
     + CustomCall<T>
@@ -219,6 +241,7 @@ impl<
         + StopGradient<T>
         + Tag<T>
         + RngBitGenerator<T>
+        + Dropout<T>
         + Print<T>
         + Assert<T>
         + CustomCall<T>,
@@ -327,7 +350,7 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Attached regions belong to the array IR universe and cannot pass through this projection. Region-carrying
     /// operations must instead use dedicated array IR family variants that retain access to their regions. Transforms
     /// reject a region-carrying payload constructed here directly, with a diagnostic naming its operation.
-    #[ryft(projected(ArrayType), skip_from)]
+    #[ryft(projected(ArrayType), collective, lockstep, skip_from)]
     Array(ArrayOperation<A>),
 
     /// Homogeneous [`DimensionOperation`] member.
@@ -365,20 +388,20 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
 
     /// All-gather with explicit result extents.
-    #[ryft(mixed)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelAllGather(ParallelAllGatherOperation),
 
     /// Sum-scatter with explicit result extents.
-    #[ryft(mixed)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelSumScatter(ParallelSumScatterOperation),
 
     /// All-to-all with explicit result extents.
-    #[ryft(mixed)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelAllToAll(ParallelAllToAllOperation),
 
     /// Array-only ragged all-to-all. It needs an explicit carrier because [`Array`](Self::Array) is already the single
     /// canonical projected carrier for [`ArrayType`].
-    #[ryft(mixed)]
+    #[ryft(mixed, collective, lockstep)]
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
 
     /// Compares two dimensions, producing a rank-zero Boolean array: `(Dimension, Dimension) -> Array(Boolean scalar)`.
@@ -402,20 +425,30 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Slices using first-class dimension inputs for starts and output sizes.
     DynamicSlice(DynamicSliceOperation<ArrayIrType>),
 
+    /// Manual Single Program Multiple Data (SPMD) computation whose array IR body runs once per device coordinate along
+    /// its active manual axes. Refer to [`ShardMapOperation`] for array/reference boundaries and first-class dimensions
+    /// inside the body.
+    ShardMap(ShardMapOperation),
+
     /// Branches between array IR regions.
+    #[ryft(lockstep)]
     Condition(ConditionOperation<ArrayIrType>),
 
     /// Loops over array IR condition and body regions.
+    #[ryft(lockstep)]
     While(WhileOperation<ArrayIrType>),
 
     /// Scans an array IR body, including first-class dimension carries, dynamic trip counts, reference carries,
     /// and reference stacks.
+    #[ryft(lockstep)]
     Scan(ScanOperation<ArrayIrType>),
 
     /// Rematerialized call with an array IR body.
+    #[ryft(lockstep)]
     Rematerialize(RematerializeOperation<ArrayIrType>),
 
     /// Differentiation-owned linear call with ordinary trailing residual inputs.
+    #[ryft(lockstep)]
     LinearCall(LinearCallOperation<ArrayIrType>),
 
     /// Bit generator with trailing dimension inputs for its dynamic bits-output axes.
@@ -439,12 +472,14 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// uses this variant because those regions convert with the primal. Calls with retained array-only callbacks
     /// instead use [`LiftedComposite`](Self::LiftedComposite). Reference inputs are allowed only in the leading
     /// non-differentiated segment and reference outputs are rejected.
+    #[ryft(collective, lockstep)]
     Composite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
     /// Temporary reverse mode carrier of [`Composite`](Self::Composite) calls with custom backward rules. It represents
     /// the tangent map whose transpose is the backward rule, and has no executable forward program. Transposition
     /// replaces it with the backward computation. The corresponding carrier for retained array-only rules is
     /// [`LiftedCompositeTranspose`](Self::LiftedCompositeTranspose).
+    #[ryft(collective)]
     CompositeTranspose(CompositeTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>>),
 
     /// Calls an array IR primal region while retaining custom transform callbacks registered for the original
@@ -455,12 +490,14 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// This uses the same [`CompositeOperation`] as [`Composite`](Self::Composite), with a different rule-source type
     /// that adapts the retained array-only rules. Calls with attached rule programs need no such adapter: their rules
     /// convert with the primal, so they use [`Composite`](Self::Composite) even when promoted from [`ArrayOperation`].
+    #[ryft(collective, lockstep)]
     LiftedComposite(CompositeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>),
 
     /// Temporary reverse mode carrier of [`LiftedComposite`](Self::LiftedComposite), with the same role as
     /// [`CompositeTranspose`](Self::CompositeTranspose). It retains the original array-only rule definition through
     /// [`LiftedCustomRules`], which specializes and converts the backward program into array IR during transposition.
     /// Like the native carrier, it has no executable forward program and is replaced by the backward computation.
+    #[ryft(collective)]
     LiftedCompositeTranspose(
         CompositeTransposeOperation<ArrayIrValue<A>, ArrayIrOperation<A>, LiftedCustomRules<A, ArrayOperation<A>>>,
     ),
@@ -497,8 +534,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// assert_eq!(left.mul(&right)?, ArrayIrValue::Array(Array::vector(vec![8.0f64, 15.0]).unwrap()));
 ///
 /// // The same array IR universe also holds first-class dimension values representing extents.
-/// let rows = ArrayIrValue::Dimension(DimensionValue::constant(2)?);
-/// let columns = ArrayIrValue::Dimension(DimensionValue::constant(3)?);
+/// let rows = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(2)?);
+/// let columns = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3)?);
 ///
 /// // Project those members so that `mul` uses checked dimension arithmetic.
 /// let rows = ValueProjection::<DimensionType>::into_projected(rows)?;
@@ -522,7 +559,7 @@ pub trait ArrayIrOperations:
     + ArrayOperations<ArrayIrType>
     + ValueProjection<ArrayType, Projected: ArrayOperations<ArrayType>>
     + ValueProjection<DimensionType, Projected: DimensionOperations<DimensionType>>
-    + DimensionSize
+    + DimensionSize<Extent = Self>
     + DimensionFromScalar
     + DimensionToScalar
     + ReferenceOperations<ArrayReferenceTransform, ArrayIrType>
@@ -536,7 +573,7 @@ impl<
         + ArrayOperations<ArrayIrType>
         + ValueProjection<ArrayType>
         + ValueProjection<DimensionType>
-        + DimensionSize
+        + DimensionSize<Extent = V>
         + DimensionFromScalar
         + DimensionToScalar
         + ReferenceOperations<ArrayReferenceTransform, ArrayIrType>
@@ -607,12 +644,13 @@ mod tests {
     };
     use crate::macros::check_operation_type_inference;
     use crate::operations::{
-        AddOperation, AssertOperation, CollectiveMode, CollectiveOptions, ComparisonDirection, CompositeJvpRule,
-        CompositeOperation, CompositeTransposeOperation, ConcatenateOperation, ConditionOperation,
-        CustomRuleDefinition, CustomRuleRegistration, DimensionAddOperation, DimensionFromScalarOperation,
-        DimensionMulOperation, DimensionSizeOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
-        MulOperation, ParallelAllGatherOutputVariance, RandomAlgorithm, ReduceOperation, ReductionKind,
-        RematerializationOptimizationBarrier, ScanOperation, WhileOperation, ZeroOperation,
+        AddOperation, AssertOperation, CollectiveAxes, CollectiveMode, CollectiveOperation, CollectiveOptions,
+        ComparisonDirection, CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConcatenateOperation,
+        ConditionOperation, CustomRuleDefinition, CustomRuleRegistration, DimensionAddOperation,
+        DimensionFromScalarOperation, DimensionMulOperation, DimensionSizeOperation, DynamicBroadcastOperation,
+        DynamicReshapeOperation, MulOperation, ParallelAllGatherOutputVariance, ParallelCastTarget, RandomAlgorithm,
+        ReduceOperation, ReductionKind, RematerializationOptimizationBarrier, ScanOperation, ShardMapBoundary,
+        WhileOperation, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialValue, ResidualPolicyReference};
@@ -798,6 +836,60 @@ mod tests {
         assert_eq!(constant(f64::NAN), constant(f64::NAN));
         assert_eq!(hash_of(&constant(f64::NAN)), hash_of(&constant(f64::NAN)));
         assert_ne!(constant(-0.0), constant(0.0));
+    }
+
+    #[test]
+    fn test_array_operation_axes() {
+        let x = CollectiveAxes::from("x");
+        let xy = CollectiveAxes::from(["x", "y"]);
+
+        // Every collective reports the axes that it communicates along, as does `axis_index`, which observes its axis.
+        let operation = ArrayOperation::<Array>::AxisIndex(AxisIndexOperation::new("x".to_string()));
+        assert_eq!(operation.axes().as_ref(), &x);
+        let operation =
+            ArrayOperation::<Array>::ParallelReduce(ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string()));
+        assert_eq!(operation.axes().as_ref(), &x);
+        let operation = ArrayOperation::<Array>::ParallelVary(ParallelVaryOperation::new("x".to_string()));
+        assert_eq!(operation.axes().as_ref(), &x);
+        let operation = ArrayOperation::<Array>::ParallelCast(ParallelCastOperation::new(
+            "x".to_string(),
+            ParallelCastTarget::Varying,
+        ));
+        assert_eq!(operation.axes().as_ref(), &x);
+        let operation = ArrayOperation::<Array>::ParallelAllGather(ParallelAllGatherOperation::new(
+            ["x", "y"],
+            4,
+            0,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Varying,
+        ));
+        assert_eq!(operation.axes().as_ref(), &xy);
+        let operation = ArrayOperation::<Array>::ParallelSumScatter(ParallelSumScatterOperation::new(
+            ["x", "y"],
+            4,
+            0,
+            CollectiveOptions::default(),
+        ));
+        assert_eq!(operation.axes().as_ref(), &xy);
+        let operation =
+            ArrayOperation::<Array>::ParallelPermute(ParallelPermuteOperation::new(["x", "y"], 4, vec![(0, 1)]));
+        assert_eq!(operation.axes().as_ref(), &xy);
+        let operation = ArrayOperation::<Array>::ParallelBroadcast(ParallelBroadcastOperation::new(["x", "y"], 4, 0));
+        assert_eq!(operation.axes().as_ref(), &xy);
+        let operation = ArrayOperation::<Array>::ParallelAllToAll(ParallelAllToAllOperation::new(
+            ["x", "y"],
+            4,
+            0,
+            1,
+            CollectiveOptions::default(),
+        ));
+        assert_eq!(operation.axes().as_ref(), &xy);
+        let operation =
+            ArrayOperation::<Array>::ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation::new("x".to_string(), 4));
+        assert_eq!(operation.axes().as_ref(), &x);
+
+        // Every other operation is not a collective, so it communicates along no axis.
+        assert_eq!(ArrayOperation::<Array>::Add(AddOperation::new()).axes().as_ref(), &CollectiveAxes::default());
     }
 
     #[test]
@@ -1277,6 +1369,22 @@ mod tests {
                 ArrayIrOperation::DynamicSlice(DynamicSliceOperation::<ArrayIrType>::from_rank(1)),
                 DimensionMixed,
             ),
+            ShardMap => (
+                {
+                    let body = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
+                        .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), Vec::new(), Vec::new())
+                        .unwrap();
+                    let boundary = ShardMapBoundary::new(
+                        LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap(),
+                        Vec::new(),
+                        Vec::new(),
+                        vec!["x".to_string()],
+                    )
+                    .unwrap();
+                    ArrayIrOperation::ShardMap(ShardMapOperation::from_program(&body, Vec::new(), boundary).unwrap())
+                },
+                RegionForwarding,
+            ),
             Condition => (
                 ArrayIrOperation::Condition(ConditionOperation::new()),
                 RegionForwarding,
@@ -1514,6 +1622,52 @@ mod tests {
         let operation = ArrayIrOperation::<Array>::from(assertion.clone());
         assert_eq!(operation.effects(), assertion.effects());
         assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+    }
+
+    #[test]
+    fn test_array_ir_operation_axes() {
+        let x = CollectiveAxes::from("x");
+        let xy = CollectiveAxes::from(["x", "y"]);
+
+        // A collective of the array member family reports its axes through the projected variant.
+        let permute = ParallelPermuteOperation::new(["x", "y"], 4, vec![(0, 1)]);
+        let operation = ArrayIrOperation::<Array>::Array(ArrayOperation::ParallelPermute(permute));
+        assert_eq!(operation.axes().as_ref(), &xy);
+
+        // The mixed collectives, which take their result extents as dimension inputs, report their axes directly.
+        let operation = ArrayIrOperation::<Array>::ParallelAllGather(ParallelAllGatherOperation::new(
+            ["x", "y"],
+            4,
+            0,
+            CollectiveOptions::default(),
+            ParallelAllGatherOutputVariance::Varying,
+        ));
+        assert_eq!(operation.axes().as_ref(), &xy);
+        let operation = ArrayIrOperation::<Array>::ParallelSumScatter(ParallelSumScatterOperation::new(
+            ["x", "y"],
+            4,
+            0,
+            CollectiveOptions::default(),
+        ));
+        assert_eq!(operation.axes().as_ref(), &xy);
+        let operation = ArrayIrOperation::<Array>::ParallelAllToAll(ParallelAllToAllOperation::new(
+            ["x", "y"],
+            4,
+            0,
+            1,
+            CollectiveOptions::default(),
+        ));
+        assert_eq!(operation.axes().as_ref(), &xy);
+        let operation =
+            ArrayIrOperation::<Array>::ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation::new("x".to_string(), 4));
+        assert_eq!(operation.axes().as_ref(), &x);
+
+        // Neither an array member that is not a collective nor an operation of the array IR family itself is one, so
+        // both communicate along no axis.
+        let operation = ArrayIrOperation::<Array>::Array(ArrayOperation::Add(AddOperation::new()));
+        assert_eq!(operation.axes().as_ref(), &CollectiveAxes::default());
+        let operation = ArrayIrOperation::<Array>::from(AssertOperation::<ArrayIrType>::new("unused"));
+        assert_eq!(operation.axes().as_ref(), &CollectiveAxes::default());
     }
 
     #[test]

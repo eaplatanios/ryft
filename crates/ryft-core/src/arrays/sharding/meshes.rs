@@ -121,11 +121,21 @@ fn interned_logical_meshes() -> &'static Mutex<HashMap<LogicalMeshKey, Weak<Logi
 /// of a mesh: it provides enough information to validate partition specifications and generate sharding-related code
 /// (e.g., [Shardy](https://openxla.org/shardy) MLIR attributes), but it does not carry any device-specific information.
 /// Note that equivalent meshes are interned within the process and so repeated constructions share immutable storage.
+///
+/// Every [`LogicalMesh`] has a device count (i.e., the product of its axis sizes) that fits `usize`, because
+/// [`Self::new`] is the only way to construct one, and it rejects other meshes. The product of the sizes of any subset
+/// of the axes of one mesh therefore also fits `usize`, so code that multiplies the sizes of axes of one mesh needs
+/// no overflow checks.
 #[derive(Clone, PartialEq, Eq)]
 pub struct LogicalMesh(Arc<LogicalMeshPayload>);
 
 impl LogicalMesh {
     /// Creates a new [`LogicalMesh`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardingError::DuplicateMeshAxisName`] when two axes share a name, and
+    /// [`ShardingError::MeshDeviceCountOverflow`] when the product of the axis sizes does not fit `usize`.
     #[inline]
     pub fn new(axes: Vec<MeshAxis>) -> Result<Self, ShardingError> {
         let mut axis_indices = HashMap::with_capacity(axes.len());
@@ -134,6 +144,11 @@ impl LogicalMesh {
                 return Err(ShardingError::DuplicateMeshAxisName { name: axis.name.clone() });
             }
         }
+
+        if axes.iter().try_fold(1usize, |count, axis| count.checked_mul(axis.size)).is_none() {
+            return Err(ShardingError::MeshDeviceCountOverflow { sizes: axes.iter().map(|axis| axis.size).collect() });
+        }
+
         let mut interner = interned_logical_meshes().lock().expect("poisoned logical mesh interner mutex");
         match interner.entry(LogicalMeshKey { axes }) {
             Entry::Occupied(mut occupied) => {
@@ -151,6 +166,30 @@ impl LogicalMesh {
                 Ok(Self(mesh))
             }
         }
+    }
+
+    /// Returns this [`LogicalMesh`] with the axes named `axis_names` retyped as `r#type`, keeping the names, sizes, and
+    /// order of all axes and the types of the other axes, so that the result has the same topology as this mesh (refer
+    /// to [`Self::has_same_topology`]). This is the analogue of JAX's `AbstractMesh.update_axis_types`, which
+    /// [`auto_axes`](crate::auto_axes) and [`explicit_axes`](crate::explicit_axes) use to switch axis types.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ShardingError::UnknownMeshAxisName`] when a name in `axis_names` is not an axis of this mesh.
+    pub fn with_axis_types<S: AsRef<str>, I: IntoIterator<Item = S>>(
+        &self,
+        axis_names: I,
+        r#type: MeshAxisType,
+    ) -> Result<Self, ShardingError> {
+        let mut axes = self.0.axes.clone();
+        for axis_name in axis_names {
+            let axis_name = axis_name.as_ref();
+            let axis_index = self
+                .axis_index(axis_name)
+                .ok_or_else(|| ShardingError::UnknownMeshAxisName { name: axis_name.to_string() })?;
+            axes[axis_index].r#type = r#type;
+        }
+        Self::new(axes)
     }
 
     /// Returns the rank (i.e., number of axes) of this [`LogicalMesh`].
@@ -183,10 +222,43 @@ impl LogicalMesh {
         self.0.axis_indices.get(axis_name.as_ref()).map(|axis_index| self.0.axes[*axis_index].r#type)
     }
 
-    /// Returns the total number of devices that the topology defined by this [`LogicalMesh`] contains.
+    /// Returns the total number of devices that the topology defined by this [`LogicalMesh`] contains (i.e., the
+    /// product of its axis sizes). This product never overflows, because [`Self::new`] rejects meshes whose device
+    /// count does not fit `usize`.
     #[inline]
     pub fn device_count(&self) -> usize {
-        self.0.axes.iter().fold(1usize, |count, axis| count * axis.size)
+        self.0.axes.iter().map(|axis| axis.size).product()
+    }
+
+    /// Returns `true` when this [`LogicalMesh`] and `other` define the same topology (i.e., the same axes, with the
+    /// same names and sizes in the same order, irrespective of their [`MeshAxisType`]s). Axis types describe how values
+    /// are typed over the mesh rather than which devices it arranges (e.g., the mesh of a `shard_map` types the axes
+    /// that it makes manual as [`Manual`](MeshAxisType::Manual), while its callers may type them as
+    /// [`Explicit`](MeshAxisType::Explicit)), so values whose meshes differ only in axis types
+    /// share device placements.
+    #[inline]
+    pub fn has_same_topology(&self, other: &Self) -> bool {
+        self.axes().len() == other.axes().len()
+            && self
+                .axes()
+                .iter()
+                .zip(other.axes())
+                .all(|(left, right)| left.name == right.name && left.size == right.size)
+    }
+
+    /// Returns `true` when this [`LogicalMesh`] and `other` define the same topology (i.e., computed via
+    /// [`Self::has_same_topology`]) and type the same axes as [`Manual`](MeshAxisType::Manual), so that they describe
+    /// the same manual region while possibly typing its free axes differently (e.g., the mesh of a `shard_map` body and
+    /// that mesh with a free axis switched by [`auto_axes`](crate::auto_axes)). Collectives over manual axes accept
+    /// inputs over any such mesh, as JAX's do inside `auto_axes` and `explicit_axes`, which retype its context mesh.
+    #[inline]
+    pub fn has_same_manual_axes(&self, other: &Self) -> bool {
+        self.has_same_topology(other)
+            && self
+                .axes()
+                .iter()
+                .zip(other.axes())
+                .all(|(left, right)| (left.r#type == MeshAxisType::Manual) == (right.r#type == MeshAxisType::Manual))
     }
 }
 
@@ -409,6 +481,21 @@ mod tests {
         assert_eq!(mesh.axis_type("z"), Some(MeshAxisType::Explicit));
         assert_eq!(mesh.axis_type("w"), None);
         assert_eq!(mesh.device_count(), 6);
+        let retyped = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("z", 1, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let reordered = LogicalMesh::new(vec![
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        assert!(mesh.has_same_topology(&retyped));
+        assert!(!mesh.has_same_topology(&reordered));
+        assert!(!mesh.has_same_topology(&LogicalMesh::new(Vec::new()).unwrap()));
         assert_eq!(mesh.to_string(), "['x'=2:auto, 'y'=3:manual, 'z'=1:explicit]");
         assert_eq!(LogicalMesh::new(Vec::new()).unwrap().to_string(), "[]");
         assert_eq!(
@@ -438,6 +525,26 @@ mod tests {
             Err(ShardingError::DuplicateMeshAxisName { name }) if name == "x",
         ));
 
+        // Axis sizes that each fit `usize` are rejected when their product (i.e., the device count) does not.
+        let largest_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", usize::MAX / 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(largest_mesh.device_count(), usize::MAX - 1);
+        let overflowing_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", usize::MAX / 2 + 1, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ]);
+        assert_eq!(
+            overflowing_mesh,
+            Err(ShardingError::MeshDeviceCountOverflow { sizes: vec![usize::MAX / 2 + 1, 2] }),
+        );
+        assert_eq!(
+            overflowing_mesh.unwrap_err().to_string(),
+            format!("mesh with axis sizes [{}, 2] has a device count that does not fit `usize`", usize::MAX / 2 + 1),
+        );
+
         let mesh_0 = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
             MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
@@ -455,6 +562,30 @@ mod tests {
         .unwrap();
         assert!(Arc::ptr_eq(&mesh_0.0, &mesh_1.0));
         assert!(!Arc::ptr_eq(&mesh_0.0, &mesh_2.0));
+    }
+
+    #[test]
+    fn test_logical_mesh_with_axis_types() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("z", 1, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+
+        // Only the named axes change type, and the result keeps the topology (and is interned like any other mesh).
+        let retyped = mesh.with_axis_types(["x", "z"], MeshAxisType::Auto).unwrap();
+        assert_eq!(retyped.to_string(), "['x'=2:auto, 'y'=3:manual, 'z'=1:auto]");
+        assert!(retyped.has_same_topology(&mesh));
+        assert_eq!(retyped.with_axis_types(["x", "z"], MeshAxisType::Explicit).unwrap(), mesh);
+        assert!(Arc::ptr_eq(&retyped.with_axis_types(["x", "z"], MeshAxisType::Explicit).unwrap().0, &mesh.0));
+        assert_eq!(mesh.with_axis_types(Vec::<String>::new(), MeshAxisType::Auto).unwrap(), mesh);
+        assert_eq!(mesh.with_axis_types(["x"], MeshAxisType::Explicit).unwrap(), mesh);
+
+        assert!(matches!(
+            mesh.with_axis_types(["x", "w"], MeshAxisType::Auto),
+            Err(ShardingError::UnknownMeshAxisName { name }) if name == "w",
+        ));
     }
 
     #[test]

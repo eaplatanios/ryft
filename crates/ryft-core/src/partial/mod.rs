@@ -116,7 +116,7 @@ pub mod values;
 
 pub use contexts::{PartialEvaluationContext, PartialTracer, ReferencePlacement};
 pub use evaluations::PartialEvaluation;
-pub use operations::{PartialEvaluationDriver, PartiallyEvaluatableOperation};
+pub use operations::{PartialEvaluationDriver, PartiallyEvaluatableOperation, ResidualDemandSplit};
 pub use partitions::{PartitionMetadata, PartitionedProgram};
 pub use residuals::{
     ErasedResidualStorage, NativeResidualPolicies, NoStorage, ProjectionFallbackCandidate, ResidualCandidate,

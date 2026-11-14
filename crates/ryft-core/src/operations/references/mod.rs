@@ -192,7 +192,7 @@ pub(crate) mod tests {
             Ok(Self { identity: renaming.rename(&self.identity), precision: self.precision })
         }
 
-        fn is_compatible_with(&self, other: &Self) -> bool {
+        fn is_convertible_to(&self, other: &Self) -> bool {
             self.identity == other.identity && self.precision <= other.precision
         }
 
@@ -307,10 +307,10 @@ pub(crate) mod tests {
             })
         }
 
-        fn is_compatible_with(&self, other: &Self) -> bool {
+        fn is_convertible_to(&self, other: &Self) -> bool {
             match (self, other) {
-                (Self::Value(left), Self::Value(right)) => left.is_compatible_with(right),
-                (Self::Reference(left), Self::Reference(right)) => left.is_compatible_with(right),
+                (Self::Value(left), Self::Value(right)) => left.is_convertible_to(right),
+                (Self::Reference(left), Self::Reference(right)) => left.is_convertible_to(right),
                 _ => false,
             }
         }
@@ -377,10 +377,10 @@ pub(crate) mod tests {
                     })
                 }
 
-                fn is_compatible_with(&self, other: &Self) -> bool {
+                fn is_convertible_to(&self, other: &Self) -> bool {
                     match (self, other) {
-                        (Self::Value(left), Self::Value(right)) => left.is_compatible_with(right),
-                        (Self::Reference(left), Self::Reference(right)) => left.is_compatible_with(right),
+                        (Self::Value(left), Self::Value(right)) => left.is_convertible_to(right),
+                        (Self::Reference(left), Self::Reference(right)) => left.is_convertible_to(right),
                         _ => false,
                     }
                 }

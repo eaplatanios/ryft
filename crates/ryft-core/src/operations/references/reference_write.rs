@@ -662,7 +662,9 @@ mod tests {
     #[test]
     fn test_reference_write_type_inference_manual_variation() {
         // Inside a manual region, a write at an index that varies along a manual axis would write a different element
-        // on every device, so it is rejected unless the referent varies along that axis as well.
+        // on every device, so it is rejected unless the referent varies along that axis as well. A replacement value
+        // that varies along a manual axis would likewise make the copies of an invariant referent diverge, so its type
+        // must exactly match the referent type.
         let operation = TestIrReferenceWriteOperation::new().with_transforms(vec![ArrayReferenceTransform::Index {
             axis: 0,
             index: ArrayReferenceTransformIndex::Dynamic,
@@ -692,7 +694,7 @@ mod tests {
                     input_types = [
                         manual_reference_type(DataType::F32, &[2], true),
                         manual_array_type(DataType::F32, &[], true),
-                        invariant_index,
+                        invariant_index.clone(),
                     ],
                     output_types = [],
                 },
@@ -703,6 +705,16 @@ mod tests {
                         varying_index,
                     ],
                     error = VARYING_INDEX_MUTATION_ERROR,
+                },
+                {
+                    input_types = [
+                        manual_reference_type(DataType::F32, &[2], false),
+                        manual_array_type(DataType::F32, &[], true),
+                        invariant_index,
+                    ],
+                    error = "`reference_write` replacement type \
+                        `f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]` must exactly match \
+                        reference referent type `f32[][sharding={mesh<['x'=2:manual]>, []}]`",
                 },
             ],
         );

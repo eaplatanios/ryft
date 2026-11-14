@@ -8,7 +8,7 @@ use crate::arrays::{
 };
 use crate::axes::Axis;
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain};
+use crate::contexts::{Context, Domain, StagingContext};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
@@ -21,6 +21,7 @@ use crate::programs::{
     Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, Type, TypeError,
     TypeIdentityRenaming, Typed, Value, ValueDomainDispatch, ValueProjection,
 };
+use crate::tracing::Tracer;
 
 /// Canonical operation name for [`DimensionSizeOperation`].
 pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
@@ -188,7 +189,7 @@ impl_reference_dischargeable_operation!(@reference_free DimensionSizeOperation);
 
 impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for DimensionSizeOperation
 where
-    C::Value: DimensionSize<C::Value>,
+    C::Value: DimensionSize<Extent = C::Value>,
 {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -245,11 +246,11 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 
 /// Reads the runtime extent of one array axis.
 ///
-/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation is
-/// selected by `Output` (e.g., a materialized array backend can return its host extent, while an array IR program value
-/// returns a dimension value that can be passed explicitly to shape-carrying operations and combined with other
-/// dimension operations). A program output is not an integer array; convert it to ordinary scalar data explicitly when
-/// a numerical computation needs the extent as data.
+/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The representation of the extent
+/// is the associated type [`Self::Extent`] of the implementor (e.g., a materialized array backend returns its host
+/// extent, while an array IR program value returns a dimension value that can be passed explicitly to shape-carrying
+/// operations and combined with other dimension operations). A program output is not an integer array; convert it to
+/// ordinary scalar data explicitly when a numerical computation needs the extent as data.
 ///
 /// In an array IR trace, the capability works both on the outer array member and on a [`ProjectedValue<ArrayType, V>`].
 /// The projected form stages into and returns the parent array IR carrier, allowing an array operation output to feed
@@ -261,6 +262,10 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// implementations return a dimension literal through [`DimensionConstant`] instead of reading it back from the array,
 /// and staged programs therefore contain no `dimension_size` reads whose outputs the type system already knows. Eager
 /// implementations return the host extent either way.
+///
+/// Note that homogeneous array programs have no dimension values, so their tracers return the static extent that their
+/// type records as a host extent without staging anything, and they report an error for dynamic axes, whose extents
+/// have no corresponding host value representation before the program runs.
 ///
 /// During batching, each item shares the array axis extent, so the resulting dimension remains replicated.
 ///
@@ -283,9 +288,14 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// # }
 /// ```
 #[capability]
-pub trait DimensionSize<Output = Self, T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Returns the runtime extent of `axis` in the representation selected by `Output`.
-    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<Output, ProgramError>;
+pub trait DimensionSize<T = <Self as Capability>::Universe>: Capability + Sized {
+    /// Representation of the extent of one axis (e.g., `usize` for values whose extents are host numbers, and a
+    /// first-class dimension value for array IR values). Generic code names it to pass extents to the capabilities
+    /// that accept them (e.g., [`DynamicReshape`](crate::DynamicReshape)).
+    type Extent;
+
+    /// Returns the runtime extent of `axis`.
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<Self::Extent, ProgramError>;
 }
 
 impl<
@@ -297,8 +307,10 @@ impl<
                 Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
             >,
         >,
-> DimensionSize<V, ArrayIrType> for V
+> DimensionSize<ArrayIrType> for V
 {
+    type Extent = V;
+
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
         let r#type = self.r#type();
         let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
@@ -315,7 +327,32 @@ impl<
     }
 }
 
-impl DimensionSize<usize, ArrayType> for Array {
+impl<C: StagingContext<Type = ArrayType>> DimensionSize<ArrayType> for Tracer<C> {
+    type Extent = usize;
+
+    fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
+        // Constructing the operation validates and normalizes `axis`. Nothing is staged, because the type of the
+        // tracer already records every extent that a homogeneous array program can name.
+        let r#type = self.r#type();
+        let operation = DimensionSizeOperation::new(r#type.as_ref(), axis)?;
+        match operation.input_dimension() {
+            Dimension::Static(extent) => Ok(*extent),
+            dimension => Err(TypeError::invalid(format!(
+                "`{}` cannot return the dynamic extent `{}` of axis {} of `{}` as a host extent; \
+                 use array IR values for dynamic extents",
+                DIMENSION_SIZE_OPERATION_NAME,
+                dimension,
+                operation.axis(),
+                r#type.as_ref(),
+            ))
+            .into()),
+        }
+    }
+}
+
+impl DimensionSize<ArrayType> for Array {
+    type Extent = usize;
+
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
         let axis = axis.into();
         let position = axis.normalize(self.r#type().rank()).map_err(|_| {
@@ -335,12 +372,14 @@ impl DimensionSize<usize, ArrayType> for Array {
     }
 }
 
-impl<A: DimensionSize<usize> + Value<Type = ArrayType>> DimensionSize<Self, ArrayIrType> for ArrayIrValue<A> {
+impl<A: DimensionSize<Extent = usize> + Value<Type = ArrayType>> DimensionSize<ArrayIrType> for ArrayIrValue<A> {
+    type Extent = Self;
+
     fn dimension_size<I: Into<Axis>>(&self, axis: I) -> Result<Self, ProgramError> {
         let array = <Self as ValueProjection<ArrayType>>::projected(self)?;
         let input_type = array.r#type();
         let operation = DimensionSizeOperation::new(input_type.as_ref(), axis)?;
-        let extent = <A as DimensionSize<usize>>::dimension_size(array, operation.axis())?;
+        let extent = array.dimension_size(operation.axis())?;
         Ok(Self::Dimension(DimensionValue::new(operation.output_type().clone(), extent)?))
     }
 }
@@ -354,8 +393,10 @@ impl<
                 Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
             >,
         >,
-> DimensionSize<V, ArrayType> for ProjectedValue<ArrayType, V>
+> DimensionSize<ArrayType> for ProjectedValue<ArrayType, V>
 {
+    type Extent = V;
+
     fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<V, ProgramError> {
         // The projected view stages into and returns the parent array IR carrier, folding static axes exactly like the
         // array IR implementation above.
@@ -373,7 +414,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionOperation, DimensionValue, Shape,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionOperation,
+        DimensionValue, Shape,
     };
     use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
@@ -500,6 +542,45 @@ mod tests {
         assert!(matches!(read.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 0));
         assert!(matches!(literal.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
         assert!(literal.inputs().is_empty());
+    }
+
+    #[test]
+    fn test_dimension_size_homogeneous_tracers() {
+        // Tracers of homogeneous array programs return the static extents that their types record as host extents,
+        // and they stage nothing.
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows), Dimension::Static(3)]));
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |array| {
+                assert_eq!(array.dimension_size(1), Ok(3));
+                assert_eq!(array.dimension_size(-1), Ok(3));
+
+                // A dynamic extent has no host value before the program runs.
+                assert_eq!(
+                    array.dimension_size(0),
+                    Err(ProgramError::Type(TypeError::invalid(format!(
+                        "`{DIMENSION_SIZE_OPERATION_NAME}` cannot return the dynamic extent `rows` of axis 0 of \
+                         `f32[rows, 3]` as a host extent; use array IR values for dynamic extents",
+                    )))),
+                );
+                assert_eq!(
+                    array.dimension_size(2),
+                    Err(ProgramError::Type(TypeError::invalid(format!(
+                        "`{DIMENSION_SIZE_OPERATION_NAME}` axis 2 is out of bounds for rank 2",
+                    )))),
+                );
+                Ok(array)
+            },
+            input_type,
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[rows, 3] .
+                in (%0)"},
+        );
     }
 
     #[test]

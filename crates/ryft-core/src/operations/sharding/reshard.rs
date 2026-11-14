@@ -46,9 +46,11 @@ pub const RESHARD_OPERATION_NAME: &str = "reshard";
 /// their corresponding collectives. Refer to the documentation of [`Reshard`] for more information.
 ///
 /// Interpretation passes the value through and records the target on its type. Batching inserts the mapped axis's
-/// sharding into the target at the new batch axis. Differentiation reshards the tangent to the same target, and
-/// transposition reshards the cotangent to the dual of the input's sharding, so that the input cotangent is
-/// distributed like the input.
+/// sharding into the target at the new batch axis, without the axes that are auto in the target mesh (which the target
+/// cannot name). Differentiation reshards the tangent to the same target, and transposition reshards the cotangent to
+/// the explicit part of the dual of the input's sharding, so that the input cotangent is distributed like the input.
+/// The target cannot name auto axes, so placement along auto axes that the input's type records (e.g., that of a
+/// concrete input) is restored by a placement-only broadcast to the input's cotangent type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReshardOperation {
     /// Target [`Sharding`] that the input is resharded to.
@@ -186,6 +188,17 @@ impl Operation for ReshardOperation {
             )));
         }
 
+        // The target restates the kind of the pending reduction along with its axes. That kind also covers the manual
+        // unreduced axes carried forward below, because a sharding records one kind for all of its unreduced axes.
+        if !self.sharding.unreduced_axes().is_empty() && self.sharding.unreduced_kind() != input.unreduced_kind() {
+            return Err(TypeError::invalid(format!(
+                "`{}` cannot change the unreduced kind from `{}` to `{}`",
+                RESHARD_OPERATION_NAME,
+                input.unreduced_kind(),
+                self.sharding.unreduced_kind(),
+            )));
+        }
+
         // Explicit redistribution preserves manual variation and reduction obligations. Their transitions belong
         // to manual collectives, including when a cotangent dual swaps reduced and unreduced state.
         let input_sharding = input.sharding();
@@ -211,6 +224,7 @@ impl Operation for ReshardOperation {
             .sharding
             .clone()
             .with_unreduced_axes(self.sharding.unreduced_axes().iter().cloned().chain(manual_unreduced))
+            .and_then(|sharding| sharding.with_unreduced_kind(input.unreduced_kind()))
             .and_then(|sharding| {
                 sharding.with_reduced_axes(self.sharding.reduced_axes().iter().cloned().chain(manual_reduced))
             })
@@ -261,12 +275,36 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        // The lifted reshard's target sharding gains the mapped axis's sharding (derived from the batched inputs via
-        // `ArrayBatch::sharding_for_inputs`) at the new batch dimension. Lifting needs only the batch axis's position
-        // and placement, never its extent, so mapped axes with dynamic extents lift as well.
+        // The lifted reshard's target sharding gains the placement of this batching level at the new batch dimension,
+        // as JAX's reshard batching rule places it along the level's `explicit_mesh_axis`. The level's placement rather
+        // than that of the input is used so that a batch dimension whose placement an earlier reshard left to the
+        // compiler (e.g., inside `auto_axes` that switches the axis that the batch is placed along) is placed along
+        // that axis again once the axis is explicit. A target can only name the axes that the type system governs, so
+        // the batch dimension loses its placement along the axes that are auto in (or absent from) the target mesh,
+        // which leaves that placement to the compiler. Lifting needs only the batch axis's position and placement,
+        // never its extent, so mapped axes with dynamic extents lift as well.
         check_count!("input", inputs, 1, ProgramError);
         let lifted_sharding = match inputs[0].batch_axis_position() {
-            Some(batch_axis) => self.sharding().batched(batch_axis, ArrayBatch::sharding_for_inputs(inputs)?)?,
+            Some(batch_axis) => {
+                let target_mesh = self.sharding().mesh();
+                let batch_axis_sharding = match context.axis_sharding().clone() {
+                    ShardingDimension::Sharded(axis_names) => {
+                        let axis_names = axis_names
+                            .into_iter()
+                            .filter(|axis_name| {
+                                target_mesh.axis_type(axis_name).is_some_and(|r#type| r#type != MeshAxisType::Auto)
+                            })
+                            .collect::<Vec<_>>();
+                        if axis_names.is_empty() {
+                            ShardingDimension::Replicated
+                        } else {
+                            ShardingDimension::Sharded(axis_names)
+                        }
+                    }
+                    dimension => dimension,
+                };
+                self.sharding().batched(batch_axis, batch_axis_sharding)?
+            }
             None => self.sharding().clone(),
         };
 
@@ -320,7 +358,19 @@ impl_differentiable_operation! {
                         Some(input_cotangent_sharding) => {
                             // The operation carries only explicit placement; the input cotangent already carries
                             // the preserved manual reduction state, so it must not be requested as a transition.
-                            cotangent.reshard(&input_cotangent_sharding.without_manual_reduction_axes())?
+                            // A reshard cannot name auto axes either, so placement along auto axes that the input's
+                            // type records (e.g., that of a concrete input) is restored by a placement-only broadcast,
+                            // as `shard_map` transposition does for caller placements over auto axes.
+                            let target = input_cotangent_sharding.without_manual_reduction_axes().without_auto_axes();
+                            let resharded = cotangent.reshard(&target)?;
+                            if resharded.r#type().as_ref() == &input_cotangent_type {
+                                resharded
+                            } else {
+                                resharded.broadcast(
+                                    input_cotangent_type.clone(),
+                                    &(0..input_cotangent_type.shape().rank()).collect::<Vec<_>>(),
+                                )?
+                            }
                         },
                         None => cotangent.broadcast(
                             input_cotangent_type.clone(),
@@ -471,7 +521,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, Dimension, DimensionBounds,
         DimensionType, DimensionValue, DimensionVariable, DynamicArrayExtentBatchingPolicy, LogicalMesh, MeshAxis,
-        Shape, f8e8m0fnu,
+        Shape, ShardingError, UnreducedKind, f8e8m0fnu,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{EagerContext, ProjectedContext, StagingContext};
@@ -706,9 +756,8 @@ mod tests {
     #[test]
     fn test_reshard_type_inference_reduction_state() {
         // A reshard changes placement but never reduction state: the target must restate the input's unreduced and
-        // reduced explicit axes exactly, reduction state over auto axes cannot be restated (the target cannot name auto
-        // axes) and is therefore rejected rather than dropped, and manual reduction state is carried forward without
-        // being restated.
+        // reduced explicit axes exactly, and manual reduction state is carried forward without being restated. Array
+        // types never carry reduction state over auto axes, so no input can require restating one.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -722,8 +771,11 @@ mod tests {
         let with_sharding = |sharding: Sharding| input_type.clone().with_sharding(sharding).unwrap();
         let unreduced_input_type = with_sharding(replicated.clone().with_unreduced_axes(["x", "m"]).unwrap());
         let reduced_input_type = with_sharding(replicated.clone().with_reduced_axes(["x"]).unwrap());
-        let auto_unreduced_input_type = with_sharding(replicated.clone().with_unreduced_axes(["a"]).unwrap());
-        let auto_reduced_input_type = with_sharding(replicated.clone().with_reduced_axes(["a"]).unwrap());
+        let auto_unreduced = replicated.clone().with_unreduced_axes(["a"]).unwrap();
+        assert_eq!(
+            input_type.clone().with_sharding(auto_unreduced.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: auto_unreduced }),
+        );
         let error = format!(
             "`{RESHARD_OPERATION_NAME}` cannot change reduction state over explicit or auto mesh axes; use a reduction \
              (or the corresponding collective) instead",
@@ -751,6 +803,37 @@ mod tests {
                 error = error.clone(),
             }],
         );
+
+        // The target restates the kind of a pending explicit reduction as well, and manual reduction state carried
+        // forward keeps the input's kind.
+        let max_kind = |sharding: Sharding| sharding.with_unreduced_kind(UnreducedKind::Max).unwrap();
+        let unreduced_max_input_type =
+            with_sharding(max_kind(replicated.clone().with_unreduced_axes(["x", "m"]).unwrap()));
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(max_kind(placed.clone().with_unreduced_axes(["x"]).unwrap())),
+            cases = [{
+                input_types = [unreduced_max_input_type.clone()],
+                output_types = [with_sharding(max_kind(placed.clone().with_unreduced_axes(["x", "m"]).unwrap()))],
+            }, {
+                input_types = [unreduced_input_type.clone()],
+                error = format!("`{RESHARD_OPERATION_NAME}` cannot change the unreduced kind from `sum` to `max`"),
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(placed.clone().with_unreduced_axes(["x"]).unwrap()),
+            cases = [{
+                input_types = [unreduced_max_input_type],
+                error = format!("`{RESHARD_OPERATION_NAME}` cannot change the unreduced kind from `max` to `sum`"),
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ReshardOperation::new(placed.clone()),
+            cases = [{
+                input_types = [with_sharding(max_kind(replicated.clone().with_unreduced_axes(["m"]).unwrap()))],
+                output_types = [with_sharding(max_kind(placed.clone().with_unreduced_axes(["m"]).unwrap()))],
+            }],
+        );
+
         check_operation_type_inference!(
             operation = ReshardOperation::new(placed),
             cases = [{
@@ -758,12 +841,6 @@ mod tests {
                 error = error.clone(),
             }, {
                 input_types = [reduced_input_type],
-                error = error.clone(),
-            }, {
-                input_types = [auto_unreduced_input_type],
-                error = error.clone(),
-            }, {
-                input_types = [auto_reduced_input_type],
                 error = error,
             }],
         );
@@ -859,6 +936,37 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(shardings, vec![expected_lifted]);
+    }
+
+    #[test]
+    fn test_reshard_batching_drops_auto_axes_from_the_batch_dimension() {
+        // The mapped axis is placed along `x`, which the target mesh types as auto, so the lifted target cannot name
+        // it and leaves the batch dimension replicated over the governed axes, as JAX's batching rule does when its
+        // target canonicalization drops auto axes.
+        let source_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let target_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let input_sharding =
+            Sharding::new(source_mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
+                .unwrap();
+        let target = Sharding::new(target_mesh, vec![ShardingDimension::sharded(["y"])]).unwrap();
+        let expected_lifted = target.with_inserted_dimension(0, ShardingDimension::Replicated).unwrap();
+        let (output_type, _) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |x| {
+                let target = target.clone();
+                Ok(batch(move |item| item.reshard(&target), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
+            },
+            ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(input_sharding).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(output_type.sharding(), Some(&expected_lifted));
     }
 
     #[test]
@@ -986,7 +1094,7 @@ mod tests {
                 operation => panic!("unexpected operation `{operation}`"),
             })
             .collect::<Vec<_>>();
-        assert_eq!(shardings, vec![input_sharding.cotangent()]);
+        assert_eq!(shardings, vec![input_sharding.cotangent().unwrap()]);
     }
 
     #[test]

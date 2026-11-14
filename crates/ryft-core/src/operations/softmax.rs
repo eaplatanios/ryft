@@ -17,14 +17,16 @@
 //!     [`SoftmaxCrossEntropyWithTargetLogits`] function that scores predictions against a fixed target distribution
 //!     supplied as logits rather than rounded probabilities.
 //!
-//! Inputs have real floating-point elements and static shapes, with at least one class along every class axis. Narrow
-//! floating-point formats compute in `f32` while `f64` keeps its precision, and outputs retain the input element type.
-//! Several class axes are normalized jointly as one flattened class axis in increasing axis order, which also orders
-//! integer labels. Logits of negative infinity represent excluded classes, and a row that contains NaN or positive
-//! infinity, or only excluded classes, produces NaNs. Inputs may vary over manual mesh axes, and inputs whose sharding
-//! records unreduced or reduced mesh axes are rejected, because a nonlinear normalization preserves neither partial
-//! sums nor zero-filled replicas. Batching follows the staged operations: every batch item is normalized independently
-//! and the mapped axis keeps its position.
+//! Inputs have real floating-point elements, with at least one class along every class axis. Their shapes may have
+//! dynamic dimensions when there is a single class axis. A dynamic class axis must have a positive lower bound, so
+//! that it is provably non-empty, and several class axes require a static shape. Narrow floating-point formats compute
+//! in `f32` while `f64` keeps its precision, and outputs retain the input element type. Several class axes are
+//! normalized jointly as one flattened class axis in increasing axis order, which also orders integer labels. Logits
+//! of negative infinity represent excluded classes, and a row that contains NaN or positive infinity, or only excluded
+//! classes, produces NaNs. Inputs may vary over manual mesh axes, and inputs whose sharding records unreduced or
+//! reduced mesh axes are rejected, because a nonlinear normalization preserves neither partial sums nor zero-filled
+//! replicas. Batching follows the staged operations: every batch item is normalized independently and the mapped axis
+//! keeps its position.
 //!
 //! # Differentiation
 //!
@@ -58,7 +60,7 @@
 
 use ryft_macros::capability;
 
-use crate::arrays::{ArrayIrType, ArrayType, DataType};
+use crate::arrays::{ArrayIrType, ArrayType, DataType, Dimension};
 use crate::axes::{Axes, AxisError};
 use crate::contexts::{Domain, StagingContext};
 use crate::differentiation::DifferentiableType;
@@ -67,14 +69,14 @@ use crate::operations::arithmetic::{Abs, Mul, Neg, Sub};
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
 use crate::operations::comparisons::Compare;
 use crate::operations::composites::{CompositeCallContext, JvpComposite, composite};
-use crate::operations::constants::fill::Fill;
-use crate::operations::constants::iota::Iota;
+use crate::operations::constants::fill_like::FillLike;
+use crate::operations::constants::iota_like::IotaLike;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::exponential::{Exp, ExpM1, Ln1p};
 use crate::operations::logical::{And, Or};
-use crate::operations::manipulation::broadcasting::Broadcast;
+use crate::operations::manipulation::broadcasting::BroadcastLike;
 use crate::operations::manipulation::conversions::ConvertElementType;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::transposition::Transpose;
@@ -85,13 +87,15 @@ use crate::tracing::{DomainTracer, DomainTracingContext};
 /// Capability that provides support for stable softmax normalization and cross-entropy along one or more class axes.
 /// `axes` accepts one axis or a list of axes, and negative axes count from the end. Several class axes are normalized
 /// jointly, as if they were flattened into one class axis in increasing axis order, which is also the order in which
-/// an integer label indexes the classes. Inputs have real floating-point elements and static shapes, with at least one
-/// class along every class axis. Half-precision and smaller formats use `f32` arithmetic internally; `f64` keeps its
-/// precision. Normalization outputs retain the input element type. Logits of negative infinity represent excluded
-/// classes. A row containing NaN or positive infinity, or consisting entirely of negative infinity, produces NaNs.
-/// A finite singleton has probability one and log-probability zero, subject to the final element-format conversion.
-/// Formats that cannot represent an output (e.g., zero or negative log-probabilities in `f8e8m0fnu`) follow
-/// [`ConvertElementType`]'s conversion semantics and can produce NaNs.
+/// an integer label indexes the classes. Inputs have real floating-point elements, with at least one class along every
+/// class axis. Their shapes may have dynamic dimensions when there is a single class axis, whose extents are read when
+/// the program runs. A dynamic class axis must have a positive lower bound, so that it is provably non-empty, and
+/// several class axes require a static shape. Half-precision and smaller formats use `f32` arithmetic internally;
+/// `f64` keeps its precision. Normalization outputs retain the input element type. Logits of negative infinity
+/// represent excluded classes. A row containing NaN or positive infinity, or consisting entirely of negative infinity,
+/// produces NaNs. A finite singleton has probability one and log-probability zero, subject to the final
+/// element-format conversion. Formats that cannot represent an output (e.g., zero or negative log-probabilities in
+/// `f8e8m0fnu`) follow [`ConvertElementType`]'s conversion semantics and can produce NaNs.
 ///
 /// The `masked_*` functions take a Boolean `mask` with the logits' shape that selects the classes taking part. A class
 /// outside the mask has probability zero and log-probability negative infinity, contributes nothing to a loss, and
@@ -127,8 +131,9 @@ pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
     ///
     /// # Errors
     ///
-    /// Returns a [`ProgramError`] for non-real-floating inputs, dynamic shapes, invalid, duplicate, or empty class
-    /// axes, inputs with unreduced or reduced mesh axes, or an operation binding failure.
+    /// Returns a [`ProgramError`] for non-real-floating inputs, invalid, duplicate, or possibly empty class axes,
+    /// dynamic shapes with several class axes, inputs with unreduced or reduced mesh axes, or an operation binding
+    /// failure.
     fn softmax<A: Into<Axes>>(&self, axes: A) -> Result<Self, ProgramError>;
 
     /// Returns probabilities `qᵢ = exp(xᵢ) / ∑ⱼ∈M exp(xⱼ)` for logits `x = self` and selected classes `i ∈ M`.
@@ -232,8 +237,10 @@ pub trait Softmax<T = <Self as Capability>::Universe>: Capability + Sized {
 }
 
 impl<
-    V: Value<Type = ArrayType, Domain: Fill<f64, V> + Iota<V>>
+    V: Value<Type = ArrayType>
         + ZeroLike
+        + FillLike
+        + IotaLike
         + Neg
         + Sub
         + Mul
@@ -242,7 +249,7 @@ impl<
         + Compare
         + And
         + Select
-        + Broadcast
+        + BroadcastLike
         + ConvertElementType
         + Reshape
         + Transpose
@@ -282,20 +289,20 @@ impl<
         let zero = input.zero_like()?;
         let pivot_value = mask.select(&input, &zero)?.reduce_sum(&[axis], None)?;
         let output_axes = (0..input.r#type().rank()).filter(|&index| index != axis).collect::<Vec<_>>();
-        let pivot_value = pivot_value.broadcast(input.r#type().into_owned(), &output_axes)?;
+        let pivot_value = pivot_value.broadcast_like(&input, &output_axes)?;
 
         // The pivot must be a constant zero rather than `input[pivot] - input[pivot]`: the latter permits an automatic
         // differentiation implementation to subtract two rounded coefficients and erase its small gradient. Selecting
         // one index also preserves the full derivative at ties, unlike treating every maximum as a constant zero.
         let shifted = mask.select(&zero, &input.sub(&pivot_value)?)?;
         let tail = mask.select(&zero, &shifted.exp()?)?.reduce_sum(&[axis], None)?;
-        let correction = tail.ln_1p()?.broadcast(input.r#type().into_owned(), &output_axes)?;
+        let correction = tail.ln_1p()?.broadcast_like(&input, &output_axes)?;
         let output = shifted.sub(&correction)?;
 
         // A singleton still follows the documented non-finite semantics. The finite test also propagates a NaN
         // chosen by argmax without relying on arithmetic in an otherwise excluded slot.
         let finite = pivot_value.sub(&pivot_value)?.equal(&zero)?;
-        let nan = input.domain().fill(&input.r#type(), f64::NAN)?;
+        let nan = input.fill_like(f64::NAN)?;
         let output = finite.select(&output, &nan)?;
         flattened.restore(output)?.convert_element_type(self.r#type().data_type())
     }
@@ -311,7 +318,7 @@ impl<
         // Unselected classes are excluded exactly like `-∞` logits, which also discards any NaN they hold. A row
         // without a selected class normalizes to NaNs, which the final selection replaces by `-∞`. The literal is
         // a non-differentiable constant, so it carries the input's placement and variation directly.
-        let negative_infinity = input.domain().fill(&input.r#type(), f64::NEG_INFINITY)?;
+        let negative_infinity = input.fill_like(f64::NEG_INFINITY)?;
         let log_probabilities = mask.select(&input, &negative_infinity)?.log_softmax(flattened.axis)?;
         let output = mask.select(&log_probabilities, &negative_infinity)?;
         flattened.restore(output)?.convert_element_type(self.r#type().data_type())
@@ -423,10 +430,10 @@ where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     /// Computes cross-entropy between the fixed distribution from `target_logits` and the predictions from `logits`,
-    /// reducing the class axes. Both inputs must have the same real floating-point element type and static shape.
-    /// Target derivatives are explicitly stopped, so differentiation over both inputs returns a zero target gradient.
-    /// Manual variation is aligned before the composite boundary, so its transpose sums replicated inputs'
-    /// contributions once.
+    /// reducing the class axes. Both inputs must have the same real floating-point element type and shape, which
+    /// must be static when there are several class axes. Target derivatives are explicitly stopped, so differentiation
+    /// over both inputs returns a zero target gradient. Manual variation is aligned before the composite boundary, so
+    /// its transpose sums replicated inputs' contributions once.
     ///
     /// The inputs' domain supplies the call context, so this function can be reused with eager and transformed values
     /// that share its constant and operation types.
@@ -457,10 +464,11 @@ where
 
 /// Creates cross-entropy function with a target distribution supplied as logits rather than rounded probabilities.
 /// Each call returns `-sum(softmax(target_logits) * log_softmax(logits), axes)` and removes the class axes, which
-/// are normalized jointly as in [`Softmax`]. The inputs must have equal static shapes and real floating-point element
-/// types; every class axis must be non-empty. Negative axes count from the end. Computation uses `f32` for narrower
-/// inputs and restores the original output element type. Negative infinity can mask classes; NaN, positive infinity,
-/// and rows containing only masked logits produce NaNs as in [`Softmax`].
+/// are normalized jointly as in [`Softmax`]. The inputs must have equal shapes and real floating-point element types,
+/// every class axis must be provably non-empty, and several class axes require static shapes. Negative axes count
+/// from the end. Computation uses `f32` for narrower inputs and restores the original output element type. Negative
+/// infinity can mask classes; NaN, positive infinity, and rows containing only masked logits produce NaNs as in
+/// [`Softmax`].
 ///
 /// Near matching distributions, the custom Jacobian-Vector Product (JVP) rule of the returned function computes the
 /// probability difference with `exp_m1` and `ln_1p` before rounding either distribution to probabilities. Distant
@@ -497,11 +505,12 @@ pub fn softmax_cross_entropy_with_target_logits<D: Domain<Type = ArrayType, Cons
 where
     DomainTracer<D>: Abs
         + And
-        + Broadcast
+        + BroadcastLike
         + Compare
         + ConvertElementType
         + Exp
         + ExpM1
+        + FillLike
         + Ln1p
         + Mul
         + Neg
@@ -512,8 +521,7 @@ where
         + Softmax
         + Sub
         + Transpose,
-    DomainTracingContext<D>:
-        StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation> + Fill<f64, DomainTracer<D>>,
+    DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     let axes = axes.into();
     let primal_axes = axes.clone();
@@ -525,7 +533,7 @@ where
 
             // Avoid multiplying zero target probabilities by masked log-probabilities. This literal has the
             // logits' placement and variation because it is a non-differentiable constant.
-            let zero = target_probabilities.domain().fill(target_probabilities.r#type().as_ref(), 0.0)?;
+            let zero = target_probabilities.fill_like(0.0)?;
             let log_probabilities = target_probabilities.equal(&zero)?.select(&zero, &log_probabilities)?;
             target_probabilities
                 .mul(&log_probabilities)?
@@ -543,7 +551,7 @@ where
 
             // Avoid multiplying zero target probabilities by masked log-probabilities. This literal has the
             // logits' placement and variation because it is a non-differentiable constant.
-            let zero = target_probabilities.domain().fill(target_probabilities.r#type().as_ref(), 0.0)?;
+            let zero = target_probabilities.fill_like(0.0)?;
             let log_probabilities = target_probabilities.equal(&zero)?.select(&zero, &log_probabilities)?;
             let loss = target_probabilities
                 .mul(&log_probabilities)?
@@ -552,26 +560,29 @@ where
                 .convert_element_type(output_data_type)?;
 
             // Compute the stable probability difference, retaining differentiable dependence on the prediction logits.
-            let input_type = logits.r#type().into_owned();
-            let broadcast_axes = (0..input_type.rank()).filter(|&dimension| dimension != axis).collect::<Vec<_>>();
+            let broadcast_axes = (0..logits.r#type().rank()).filter(|&dimension| dimension != axis).collect::<Vec<_>>();
 
-            // Broadcast outputs take the default layout, like the class coordinates, because the logits' layout
-            // need not apply to another element type.
-            let broadcast = |value: DomainTracer<D>| {
-                let output_type = input_type.clone().with_data_type(value.r#type().data_type()).with_layout(None);
-                value.broadcast(output_type, &broadcast_axes)
-            };
-
-            // Literals inherit the inputs' placement and variation; none can carry a tangent.
-            let zero = logits.domain().fill(&input_type, 0.0)?;
-            let one = logits.domain().fill(&input_type, 1.0)?;
-            let infinity = logits.domain().fill(&input_type, f64::INFINITY)?;
-            let negative_infinity = logits.domain().fill(&input_type, f64::NEG_INFINITY)?;
+            // Literals inherit the inputs' placement and variation, and none can carry a tangent.
+            let zero = logits.fill_like(0.0)?;
+            let one = logits.fill_like(1.0)?;
+            let infinity = logits.fill_like(f64::INFINITY)?;
+            let negative_infinity = logits.fill_like(f64::NEG_INFINITY)?;
 
             // A class that both distributions mask has zero probability on both sides, so it contributes nothing to
             // the gradient. Its raw difference is `-∞ - -∞ = NaN`, which must neither take part in the arithmetic
             // nor decide which formula the row uses.
-            let excluded = target_logits.equal(&negative_infinity)?.and(&logits.equal(&negative_infinity)?)?;
+            let masked_target_logits = target_logits.equal(&negative_infinity)?;
+            let masked_logits = logits.equal(&negative_infinity)?;
+            let excluded = masked_target_logits.and(&masked_logits)?;
+
+            // Broadcast outputs take the shape of the logits, whose class axis they replicate along, and the default
+            // layout, like the class coordinates, because the layout of the logits need not apply to another element
+            // type. A broadcast keeps the layout of its exemplar only for the same element type, so floating-point
+            // values are broadcast like the Boolean mask of the logits and Boolean values like the logits.
+            let broadcast = |value: DomainTracer<D>| {
+                let exemplar = if value.r#type().data_type() == DataType::Boolean { &logits } else { &masked_logits };
+                value.broadcast_like(exemplar, &broadcast_axes)
+            };
             let difference = logits.sub(&target_logits)?;
             let finite_difference = difference.abs()?.less_than(&infinity)?;
 
@@ -580,9 +591,8 @@ where
             // gradient for equal softmax computations. Only finite differences take part in the offset; a row
             // without any keeps a zero offset, which keeps the discarded branch finite.
             let offset = finite_difference.select(&difference, &negative_infinity)?.reduce_max(&[axis])?;
-            let offset_type = offset.r#type().into_owned();
-            let finite_offset = offset.abs()?.less_than(&logits.domain().fill(&offset_type, f64::INFINITY)?)?;
-            let offset = broadcast(finite_offset.select(&offset, &logits.domain().fill(&offset_type, 0.0)?)?)?;
+            let finite_offset = offset.abs()?.less_than(&offset.fill_like(f64::INFINITY)?)?;
+            let offset = broadcast(finite_offset.select(&offset, &offset.fill_like(0.0)?)?)?;
             let difference = finite_difference.select(&difference.sub(&offset)?, &zero)?;
             let centered =
                 difference.sub(&broadcast(target_probabilities.mul(&difference)?.reduce_sum(&[axis], None)?)?)?;
@@ -632,9 +642,10 @@ struct FlattenedClassInputs<V> {
 
 impl<V: Value<Type = ArrayType> + Reshape + Transpose> FlattenedClassInputs<V> {
     /// Creates a new [`FlattenedClassInputs`] instance by flattening the class `axes` of `inputs`. Callers provide at
-    /// least one input, a shared static shape, and non-empty, distinct axes validated for that shape in increasing
-    /// order. Several class axes are moved to the end and merged into one; a single class axis leaves the inputs
-    /// unchanged.
+    /// least one input, a shared shape, and non-empty, distinct axes validated for that shape in increasing order.
+    /// Several class axes are moved to the end and merged into one, which requires the shared shape to be static
+    /// (refer to [`validate_normalization`]), while a single class axis leaves the inputs unchanged, whatever their
+    /// shape.
     ///
     /// # Errors
     ///
@@ -763,11 +774,29 @@ fn validate_normalization(
 
     validate_normalization_placement(function, input_type)?;
 
-    let shape = input_type
-        .static_shape()
-        .ok_or_else(|| TypeError::invalid(format!("`{function}` requires a static input shape")))?;
-    if axes.iter().any(|&axis| shape[axis] == 0) {
-        return Err(TypeError::invalid(format!("`{function}` requires a non-empty class axis")).into());
+    // Every class axis must be provably non-empty. A static extent proves that directly, and a dynamic extent proves
+    // it through the lower bound of its dimension, because its runtime value is not available here.
+    for &axis in &axes {
+        match input_type.dimension(axis) {
+            Dimension::Static(0) => {
+                return Err(TypeError::invalid(format!("`{function}` requires a non-empty class axis")).into());
+            }
+            dimension @ Dimension::Dynamic(_) if dimension.bounds().contains(0) => {
+                return Err(TypeError::invalid(format!(
+                    "`{function}` requires a non-empty class axis but class axis {axis} has size `{dimension}`, \
+                     whose lower bound is zero",
+                ))
+                .into());
+            }
+            _ => {}
+        }
+    }
+
+    // Several class axes are merged by a reshape to a static shape (refer to `FlattenedClassInputs`).
+    if axes.len() > 1 && input_type.static_shape().is_none() {
+        return Err(
+            TypeError::invalid(format!("`{function}` over several class axes requires a static input shape")).into()
+        );
     }
 
     let r#type = if input_type.data_type() == DataType::F64 { DataType::F64 } else { DataType::F32 };
@@ -842,7 +871,7 @@ fn validate_normalization_labels(
 /// [`Softmax::masked_log_softmax`]; the loss follows [`Softmax::masked_softmax_cross_entropy`]. The caller supplies
 /// validated, aligned inputs with targets and log-probabilities in working precision.
 fn cross_entropy_loss<
-    V: Value<Type = ArrayType, Domain: Fill<f64, V>> + ZeroLike + Neg + Mul + Compare + And + Select + Reduce,
+    V: Value<Type = ArrayType> + ZeroLike + FillLike + Neg + Mul + Compare + And + Select + Reduce,
 >(
     targets: &V,
     log_probabilities: &V,
@@ -850,7 +879,7 @@ fn cross_entropy_loss<
     axis: usize,
 ) -> Result<V, ProgramError> {
     let zero = targets.zero_like()?;
-    let negative_infinity = log_probabilities.domain().fill(&log_probabilities.r#type(), f64::NEG_INFINITY)?;
+    let negative_infinity = log_probabilities.fill_like(f64::NEG_INFINITY)?;
     let excluded_zero = targets.equal(&zero)?.and(&log_probabilities.equal(&negative_infinity)?)?;
     let log_probabilities = excluded_zero.select(&zero, log_probabilities)?;
 
@@ -874,12 +903,14 @@ fn cross_entropy_loss<
 /// [`Softmax::masked_softmax_cross_entropy_with_integer_labels`]. The caller supplies validated, aligned inputs,
 /// `i64` labels, and log-probabilities computed in working precision over the same optional `mask`.
 fn cross_entropy_loss_with_integer_labels<
-    V: Value<Type = ArrayType, Domain: Fill<f64, V> + Iota<V>>
+    V: Value<Type = ArrayType>
         + ZeroLike
+        + FillLike
+        + IotaLike
         + Neg
         + Compare
         + Select
-        + Broadcast
+        + BroadcastLike
         + ConvertElementType
         + Reduce,
 >(
@@ -897,7 +928,7 @@ fn cross_entropy_loss_with_integer_labels<
         .convert_element_type(DataType::I64)?
         .reduce_sum(&[axis], None)?
         .greater_than(&labels.zero_like()?)?;
-    let nan = loss.domain().fill(&loss.r#type(), f64::NAN)?;
+    let nan = loss.fill_like(f64::NAN)?;
     let loss = valid.select(&loss, &nan)?;
     match mask {
         Some(mask) => mask.reduce_any(&[axis])?.select(&loss, &loss.zero_like()?),
@@ -909,18 +940,17 @@ fn cross_entropy_loss_with_integer_labels<
 /// The `indices` have `i64` elements and the input shape with `axis` removed; out-of-range indices select nothing.
 /// The mask preserves the input's placement and manual variation. Indices must already vary over the input's manual
 /// axes.
-fn one_hot_mask<V: Value<Type = ArrayType, Domain: Iota<V>> + Compare + Broadcast>(
+fn one_hot_mask<V: Value<Type = ArrayType> + IotaLike + Compare + BroadcastLike>(
     input: &V,
     indices: &V,
     axis: usize,
 ) -> Result<V, ProgramError> {
-    let index_type = input.r#type().into_owned().with_data_type(DataType::I64).with_layout(None);
-
-    // Coordinates are non-differentiable constants, so they can carry the input's variation directly.
-    // No skipped `parallel_vary` transpose is needed for these constants.
-    let coordinates = input.domain().iota(&index_type, axis)?;
+    // Coordinates are non-differentiable constants, so they can carry the input's variation directly. No skipped
+    // `parallel_vary` transpose is needed for these constants. They take the input's runtime shape and the default
+    // layout, because the input's layout need not apply to their element type.
+    let coordinates = input.iota_like(axis, DataType::I64)?;
     let output_axes = (0..input.r#type().rank()).filter(|&index| index != axis).collect::<Vec<_>>();
-    coordinates.equal(&indices.broadcast(index_type, &output_axes)?)
+    coordinates.equal(&indices.broadcast_like(&coordinates, &output_axes)?)
 }
 
 #[cfg(test)]
@@ -930,8 +960,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, Dimension, DimensionBounds, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, bf16, f8e4m3fn, f8e8m0fnu, f16,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, Dimension, DimensionBounds, DimensionVariable, Layout,
+        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, bf16, f8e4m3fn,
+        f8e8m0fnu, f16,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, batch};
@@ -940,11 +971,11 @@ mod tests {
     use crate::macros::check_gradient;
     use crate::operations::manipulation::reshaping::Reshape;
     use crate::operations::manipulation::slicing::Slice;
-    use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
+    use crate::operations::sharding::shard_map::{ShardMapOptions, shard_map};
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue, PartialTracer, PartialValue,
     };
-    use crate::programs::ValueProjection;
+    use crate::programs::{ProjectedValue, ValueProjection};
     use crate::tracing::{Trace, TracingContext};
 
     use super::*;
@@ -1069,7 +1100,24 @@ mod tests {
         );
         assert_eq!(
             ArrayContext::trace(|input| input.softmax(0), dynamic).map(|(output_type, _)| output_type),
-            Err(ProgramError::Type(TypeError::invalid("`softmax` requires a static input shape"))),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`softmax` requires a non-empty class axis but class axis 0 has size `n`, whose lower bound is zero",
+            ))),
+        );
+
+        // Several class axes are merged through a static reshape, so they reject dynamic shapes.
+        let dynamic = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::positive(None).unwrap())),
+                2.into(),
+            ]),
+        );
+        assert_eq!(
+            ArrayContext::trace(|input| input.softmax([0, 1]), dynamic).map(|(output_type, _)| output_type),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`softmax` over several class axes requires a static input shape",
+            ))),
         );
         let (mesh, _, _) = manual_types(ArrayType::new_static(DataType::F32, [2]));
         let reduced = ArrayType::new_static(DataType::F32, [2])
@@ -1115,7 +1163,7 @@ mod tests {
                 %3:i64[2] = iota [type=i64[2], dimension=0]
                 %4:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %2
                 %5:bool[2] = compare [direction=Equal] %3 %4
-                %6:f32[2] = zero_like %1
+                %6:f32[2] = zero [type=f32[2]]
                 %7:f32[2] = select %5 %1 %6
                 %8:f32[] = reduce [kind=sum, axes=[0]] %7
                 %9:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %8
@@ -1163,7 +1211,8 @@ mod tests {
                 %3:i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
                     broadcast [output_type=i64[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}], output_axes=[]] %1
                 %4:bool[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = compare [direction=Equal] %2 %3
-                %5:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = zero_like %0
+                %5:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
+                    zero [type=f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}]]
                 %6:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = select %4 %0 %5
                 %7:f32[][sharding={mesh<['d'=2:explicit]>, []}] = reduce [kind=sum, axes=[0]] %6
                 %8:f32[4][sharding={mesh<['d'=2:explicit]>, [{'d'}]}] = \
@@ -1207,7 +1256,7 @@ mod tests {
                 %4:i64[3, 4] = iota [type=i64[3, 4], dimension=1]
                 %5:i64[3, 4] = broadcast [output_type=i64[3, 4], output_axes=[0]] %3
                 %6:bool[3, 4] = compare [direction=Equal] %4 %5
-                %7:f32[3, 4] = zero_like %2
+                %7:f32[3, 4] = zero [type=f32[3, 4]]
                 %8:f32[3, 4] = select %6 %2 %7
                 %9:f32[3] = reduce [kind=sum, axes=[1]] %8
                 %10:f32[3, 4] = broadcast [output_type=f32[3, 4], output_axes=[0]] %9
@@ -1237,6 +1286,244 @@ mod tests {
     }
 
     #[test]
+    fn test_softmax_staging_dynamic_shapes() {
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap());
+        let classes = DimensionVariable::new("classes", DimensionBounds::positive(Some(8)).unwrap());
+
+        // A dynamic class axis is only known when the program runs, so the class coordinates, the literals, and the
+        // broadcasts along the class axis all take their shape from the logits.
+        let r#type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Dynamic(classes)]),
+        );
+        let (output_type, program) = ArrayContext::trace(|input| input.softmax(1), r#type.clone()).unwrap();
+        assert_eq!(output_type, r#type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[batch, classes] .
+                let %1:i64[batch] = argmax [axis=1, index_data_type=i64] %0
+                    %2:i64[batch, classes] = iota_like [dimension=1, data_type=i64] %0
+                    %3:i64[batch, classes] = broadcast_like [output_axes=[0]] %1 %2
+                    %4:bool[batch, classes] = compare [direction=Equal] %2 %3
+                    %5:f32[batch, classes] = zero_like %0
+                    %6:f32[batch, classes] = select %4 %0 %5
+                    %7:f32[batch] = reduce [kind=sum, axes=[1]] %6
+                    %8:f32[batch, classes] = broadcast_like [output_axes=[0]] %7 %0
+                    %9:f32[batch, classes] = sub %0 %8
+                    %10:f32[batch, classes] = select %4 %5 %9
+                    %11:f32[batch, classes] = exp %10
+                    %12:f32[batch, classes] = select %4 %5 %11
+                    %13:f32[batch] = reduce [kind=sum, axes=[1]] %12
+                    %14:f32[batch] = ln_1p %13
+                    %15:f32[batch, classes] = broadcast_like [output_axes=[0]] %14 %0
+                    %16:f32[batch, classes] = sub %10 %15
+                    %17:f32[batch, classes] = sub %8 %8
+                    %18:bool[batch, classes] = compare [direction=Equal] %17 %5
+                    %19:f32[batch, classes] = fill_like [value=NaN] %0
+                    %20:f32[batch, classes] = select %18 %16 %19
+                    %21:f32[batch, classes] = exp %20
+                in (%21)
+            "}
+            .trim_end(),
+        );
+        let input = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, -1.0, 0.0, 4.0]).unwrap();
+        assert_eq!(program.interpret(input.clone()), Ok(input.softmax(1).unwrap()));
+        let input = Array::matrix(3, 1, vec![1.0f32, -2.0, 0.5]).unwrap();
+        assert_eq!(program.interpret(input.clone()), Ok(input.softmax(1).unwrap()));
+        let empty = Array::matrix(0, 3, Vec::<f32>::new()).unwrap();
+        assert_eq!(program.interpret(empty.clone()), Ok(empty));
+
+        // With a static class axis, the broadcasts along it need no runtime extent, because the dynamic batch extent
+        // passes through from their inputs, while the class coordinates and the literal still read the logits.
+        let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), 3.into()]));
+        let (output_type, program) = ArrayContext::trace(|input| input.softmax(1), r#type.clone()).unwrap();
+        assert_eq!(output_type, r#type);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[batch, 3] .
+                let %1:i64[batch] = argmax [axis=1, index_data_type=i64] %0
+                    %2:i64[batch, 3] = iota_like [dimension=1, data_type=i64] %0
+                    %3:i64[batch, 3] = broadcast [output_type=i64[batch, 3], output_axes=[0]] %1
+                    %4:bool[batch, 3] = compare [direction=Equal] %2 %3
+                    %5:f32[batch, 3] = zero_like %0
+                    %6:f32[batch, 3] = select %4 %0 %5
+                    %7:f32[batch] = reduce [kind=sum, axes=[1]] %6
+                    %8:f32[batch, 3] = broadcast [output_type=f32[batch, 3], output_axes=[0]] %7
+                    %9:f32[batch, 3] = sub %0 %8
+                    %10:f32[batch, 3] = select %4 %5 %9
+                    %11:f32[batch, 3] = exp %10
+                    %12:f32[batch, 3] = select %4 %5 %11
+                    %13:f32[batch] = reduce [kind=sum, axes=[1]] %12
+                    %14:f32[batch] = ln_1p %13
+                    %15:f32[batch, 3] = broadcast [output_type=f32[batch, 3], output_axes=[0]] %14
+                    %16:f32[batch, 3] = sub %10 %15
+                    %17:f32[batch, 3] = sub %8 %8
+                    %18:bool[batch, 3] = compare [direction=Equal] %17 %5
+                    %19:f32[batch, 3] = fill_like [value=NaN] %0
+                    %20:f32[batch, 3] = select %18 %16 %19
+                    %21:f32[batch, 3] = exp %20
+                in (%21)
+            "}
+            .trim_end(),
+        );
+        let input = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, -1.0, 0.0, 4.0]).unwrap();
+        assert_eq!(program.interpret(input.clone()), Ok(input.softmax(1).unwrap()));
+    }
+
+    #[test]
+    fn test_softmax_dynamic_shapes() {
+        // Every normalization and loss accepts dynamic shapes with one class axis, in both array universes, and its
+        // staged program computes what the eager function computes at the runtime shape.
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap());
+        let classes = DimensionVariable::new("classes", DimensionBounds::positive(Some(8)).unwrap());
+        let shape = Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Dynamic(classes)]);
+        let logits_type = ArrayType::new(DataType::F32, shape.clone());
+        let mask_type = ArrayType::new(DataType::Boolean, shape);
+        let labels_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(batch)]));
+        let logits = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, -1.0, 0.0, 4.0]).unwrap();
+        let targets = Array::matrix(2, 3, vec![0.5f32, 0.25, 0.25, 0.0, 1.0, 0.0]).unwrap();
+        let mask = Array::matrix(2, 3, vec![true, false, true, true, true, false]).unwrap();
+        let labels = Array::vector(vec![2i32, 0]).unwrap();
+
+        let (_, program) = ArrayContext::trace(
+            |(logits, mask): (_, _)| logits.masked_log_softmax(&mask, 1),
+            (logits_type.clone(), mask_type.clone()),
+        )
+        .unwrap();
+        let expected = logits.masked_log_softmax(&mask, 1).unwrap();
+        assert_eq!(program.interpret((logits.clone(), mask.clone())), Ok(expected));
+        let (_, program) = ArrayContext::trace(
+            |(logits, targets): (_, _)| logits.softmax_cross_entropy(&targets, 1),
+            (logits_type.clone(), logits_type.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((logits.clone(), targets.clone())),
+            Ok(logits.softmax_cross_entropy(&targets, 1).unwrap()),
+        );
+        let (_, program) = ArrayContext::trace(
+            |(logits, labels, mask): (_, _, _)| {
+                logits.masked_softmax_cross_entropy_with_integer_labels(&labels, &mask, 1)
+            },
+            (logits_type.clone(), labels_type.clone(), mask_type),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((logits.clone(), labels.clone(), mask.clone())),
+            Ok(logits.masked_softmax_cross_entropy_with_integer_labels(&labels, &mask, 1).unwrap()),
+        );
+        let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(1);
+        let (_, program) = ArrayContext::trace(
+            |(logits, target_logits): (_, _)| function.call(logits, target_logits),
+            (logits_type.clone(), logits_type.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((logits.clone(), targets.clone())),
+            Ok(function.call(logits.clone(), targets).unwrap()),
+        );
+
+        // Array IR values reach the same programs through their array members.
+        let (_, program) = ArrayIrContext::trace(
+            |(logits, labels): (_, _)| logits.softmax_cross_entropy_with_integer_labels(&labels, 1),
+            (ArrayIrType::Array(logits_type), ArrayIrType::Array(labels_type)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret((ArrayIrValue::Array(logits.clone()), ArrayIrValue::Array(labels.clone()))),
+            Ok(ArrayIrValue::Array(logits.softmax_cross_entropy_with_integer_labels(&labels, 1).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_softmax_dynamic_shapes_batching() {
+        // A staged batch over dynamic shapes normalizes the classes of every batch item at the runtime shape, with
+        // mapped and with replicated inputs.
+        let rows = DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let classes = DimensionVariable::new("classes", DimensionBounds::positive(Some(8)).unwrap());
+        let logits_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![2.into(), Dimension::Dynamic(rows.clone()), Dimension::Dynamic(classes)]),
+        );
+        let labels_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(rows)]));
+        let elements = vec![1.0f64, 2.0, 3.0, -1.0, 0.0, 4.0, 0.5, 0.5, 0.5, 7.0, -7.0, 0.0];
+        let logits = Array::from_elements(ArrayType::new_static(DataType::F64, [2, 2, 3]), &elements).unwrap();
+        let labels = Array::vector(vec![2i32, 0]).unwrap();
+
+        let (_, program) = ArrayContext::trace(
+            |logits| {
+                batch(|logits: _| logits.log_softmax(1), logits, BatchAxis::new(0), BatchAxis::new(0), None)
+                    .map_err(ProgramError::from)
+            },
+            logits_type.clone(),
+        )
+        .unwrap();
+        assert_eq!(program.interpret(logits.clone()), Ok(logits.log_softmax(2).unwrap()));
+        let (_, program) = ArrayContext::trace(
+            |(logits, labels): (_, _)| {
+                batch(
+                    |(logits, labels): (_, _)| logits.softmax_cross_entropy_with_integer_labels(&labels, 1),
+                    (logits, labels),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxis::new(0),
+                    None,
+                )
+                .map_err(ProgramError::from)
+            },
+            (logits_type, labels_type),
+        )
+        .unwrap();
+        let expected = batch(
+            |(logits, labels): (_, _)| logits.softmax_cross_entropy_with_integer_labels(&labels, 1),
+            (logits.clone(), labels.clone()),
+            (BatchAxis::new(0), BatchAxis::replicated()),
+            BatchAxis::new(0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(program.interpret((logits, labels)), Ok(expected));
+    }
+
+    #[test]
+    fn test_softmax_dynamic_shapes_differentiation() {
+        // Reverse mode needs the runtime extents of the reduced axes, which array IR programs retain as dimension
+        // residuals. The staged gradient then matches the eager gradient at the runtime shape.
+        let batch = DimensionVariable::new("batch", DimensionBounds::non_negative(Some(8)).unwrap());
+        let classes = DimensionVariable::new("classes", DimensionBounds::positive(Some(8)).unwrap());
+        let logits_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(batch.clone()), Dimension::Dynamic(classes)]),
+        );
+        let labels_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(batch)]));
+        let (_, program) = ArrayIrContext::trace(
+            |(logits, labels): (_, _)| {
+                differentiate_at(logits)
+                    .with_captures(labels)
+                    .gradient(|logits, labels| {
+                        logits.softmax_cross_entropy_with_integer_labels(&labels, 1)?.reduce_sum(&[0], None)
+                    })
+                    .map_err(ProgramError::from)
+            },
+            (ArrayIrType::Array(logits_type), ArrayIrType::Array(labels_type)),
+        )
+        .unwrap();
+        let logits = Array::matrix(2, 3, vec![1.0f64, 2.0, 3.0, -1.0, 0.0, 4.0]).unwrap();
+        let labels = Array::vector(vec![2i32, 0]).unwrap();
+        let expected = differentiate_at(logits.clone())
+            .with_captures(labels.clone())
+            .gradient(|logits, labels| {
+                logits.softmax_cross_entropy_with_integer_labels(&labels, 1)?.reduce_sum(&[0], None)
+            })
+            .unwrap();
+        assert_eq!(
+            program.interpret((ArrayIrValue::Array(logits), ArrayIrValue::Array(labels))),
+            Ok(ArrayIrValue::Array(expected)),
+        );
+    }
+
+    #[test]
     fn test_softmax_manual_variation() {
         let (_, varying, _) = manual_types(ArrayType::new_static(DataType::F32, [2]));
         let input = Array::from_elements(varying.clone(), &[0.0f32, 0.0]).unwrap();
@@ -1262,31 +1549,30 @@ mod tests {
         );
         assert_eq!(known.outputs(), &[PartialEvaluationOutput::Known(input.softmax(0).unwrap())]);
 
-        // With unknown logits, the class coordinates and the NaN fill fold into known residual inputs.
+        // With unknown logits, the class coordinates, the zero, and the NaN fill fold into known residual inputs.
         let unknown = program.partially_evaluate(&[PartialValue::Unknown(input.r#type().into_owned())]).unwrap();
         assert_eq!(unknown.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(
             unknown.program().to_string(),
             indoc! {"
-            lambda %0:f64[3], %1:i64[3], %2:f64[3] .
-            let %3:i64[] = argmax [axis=0, index_data_type=i64] %0
-                %4:i64[3] = broadcast [output_type=i64[3], output_axes=[]] %3
-                %5:bool[3] = compare [direction=Equal] %1 %4
-                %6:f64[3] = zero_like %0
-                %7:f64[3] = select %5 %0 %6
+            lambda %0:f64[3], %1:i64[3], %2:f64[3], %3:f64[3] .
+            let %4:i64[] = argmax [axis=0, index_data_type=i64] %0
+                %5:i64[3] = broadcast [output_type=i64[3], output_axes=[]] %4
+                %6:bool[3] = compare [direction=Equal] %1 %5
+                %7:f64[3] = select %6 %0 %2
                 %8:f64[] = reduce [kind=sum, axes=[0]] %7
                 %9:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %8
                 %10:f64[3] = sub %9 %9
-                %11:bool[3] = compare [direction=Equal] %10 %6
+                %11:bool[3] = compare [direction=Equal] %10 %2
                 %12:f64[3] = sub %0 %9
-                %13:f64[3] = select %5 %6 %12
+                %13:f64[3] = select %6 %2 %12
                 %14:f64[3] = exp %13
-                %15:f64[3] = select %5 %6 %14
+                %15:f64[3] = select %6 %2 %14
                 %16:f64[] = reduce [kind=sum, axes=[0]] %15
                 %17:f64[] = ln_1p %16
                 %18:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %17
                 %19:f64[3] = sub %13 %18
-                %20:f64[3] = select %11 %19 %2
+                %20:f64[3] = select %11 %19 %3
                 %21:f64[3] = exp %20
             in (%21)
         "}
@@ -1457,9 +1743,12 @@ mod tests {
                 .with_auxiliary_output()
                 .value_and_gradient(|logits, mask| {
                     let (output, selected) = shard_map(
-                        |(logits, mask): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
-                            let output = logits.masked_softmax(&mask, 0).unwrap();
-                            (output.clone(), output.slice_axis(0, 0, 1, 1).unwrap())
+                        |(logits, mask): (
+                            ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                            ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                        )| {
+                            let output = logits.masked_softmax(&mask, 0)?;
+                            Ok((output.clone(), output.slice_axis(0, 0, 1, 1)?))
                         },
                         (
                             ValueProjection::<ArrayType>::into_projected(logits)?,
@@ -1468,6 +1757,7 @@ mod tests {
                         mesh.clone(),
                         input_shardings,
                         (sharded.clone(), sharded.clone()),
+                        ShardMapOptions::new(),
                     )?;
                     Ok::<_, ProgramError>((selected.reduce_sum(&[0], None)?.into_value(), output.into_value()))
                 })
@@ -1653,7 +1943,7 @@ mod tests {
                 %2:i64[2] = iota [type=i64[2], dimension=0]
                 %3:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %1
                 %4:bool[2] = compare [direction=Equal] %2 %3
-                %5:f32[2] = zero_like %0
+                %5:f32[2] = zero [type=f32[2]]
                 %6:f32[2] = select %4 %0 %5
                 %7:f32[] = reduce [kind=sum, axes=[0]] %6
                 %8:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %7
@@ -1697,31 +1987,30 @@ mod tests {
         );
         assert_eq!(known.outputs(), &[PartialEvaluationOutput::Known(input.log_softmax(0).unwrap())]);
 
-        // With unknown logits, only the constants fold: the class coordinates and the NaN fill become known residual
-        // inputs of the residual program.
+        // With unknown logits, only the constants fold: the class coordinates, the zero, and the NaN fill become known
+        // residual inputs of the residual program.
         let unknown = program.partially_evaluate(&[PartialValue::Unknown(input.r#type().into_owned())]).unwrap();
         assert_eq!(
             unknown.program().to_string(),
             indoc! {"
-            lambda %0:f32[2], %1:i64[2], %2:f32[2] .
-            let %3:i64[] = argmax [axis=0, index_data_type=i64] %0
-                %4:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %3
-                %5:bool[2] = compare [direction=Equal] %1 %4
-                %6:f32[2] = zero_like %0
-                %7:f32[2] = select %5 %0 %6
+            lambda %0:f32[2], %1:i64[2], %2:f32[2], %3:f32[2] .
+            let %4:i64[] = argmax [axis=0, index_data_type=i64] %0
+                %5:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %4
+                %6:bool[2] = compare [direction=Equal] %1 %5
+                %7:f32[2] = select %6 %0 %2
                 %8:f32[] = reduce [kind=sum, axes=[0]] %7
                 %9:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %8
                 %10:f32[2] = sub %9 %9
-                %11:bool[2] = compare [direction=Equal] %10 %6
+                %11:bool[2] = compare [direction=Equal] %10 %2
                 %12:f32[2] = sub %0 %9
-                %13:f32[2] = select %5 %6 %12
+                %13:f32[2] = select %6 %2 %12
                 %14:f32[2] = exp %13
-                %15:f32[2] = select %5 %6 %14
+                %15:f32[2] = select %6 %2 %14
                 %16:f32[] = reduce [kind=sum, axes=[0]] %15
                 %17:f32[] = ln_1p %16
                 %18:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %17
                 %19:f32[2] = sub %13 %18
-                %20:f32[2] = select %11 %19 %2
+                %20:f32[2] = select %11 %19 %3
             in (%20)
         "}
             .trim_end(),
@@ -1870,7 +2159,7 @@ mod tests {
                 %6:i64[2] = iota [type=i64[2], dimension=0]
                 %7:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %5
                 %8:bool[2] = compare [direction=Equal] %6 %7
-                %9:f32[2] = zero_like %4
+                %9:f32[2] = zero [type=f32[2]]
                 %10:f32[2] = select %8 %4 %9
                 %11:f32[] = reduce [kind=sum, axes=[0]] %10
                 %12:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %11
@@ -1908,9 +2197,12 @@ mod tests {
                 .with_auxiliary_output()
                 .value_and_gradient(|logits, mask| {
                     let (output, selected) = shard_map(
-                        |(logits, mask): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
-                            let output = logits.masked_log_softmax(&mask, 0).unwrap();
-                            (output.clone(), output.slice_axis(0, 0, 1, 1).unwrap())
+                        |(logits, mask): (
+                            ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                            ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                        )| {
+                            let output = logits.masked_log_softmax(&mask, 0)?;
+                            Ok((output.clone(), output.slice_axis(0, 0, 1, 1)?))
                         },
                         (
                             ValueProjection::<ArrayType>::into_projected(logits)?,
@@ -1919,6 +2211,7 @@ mod tests {
                         mesh.clone(),
                         input_shardings,
                         (sharded.clone(), sharded.clone()),
+                        ShardMapOptions::new(),
                     )?;
                     Ok::<_, ProgramError>((selected.reduce_sum(&[0], None)?.into_value(), output.into_value()))
                 })
@@ -2088,7 +2381,7 @@ mod tests {
                 %3:i64[2] = iota [type=i64[2], dimension=0]
                 %4:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %2
                 %5:bool[2] = compare [direction=Equal] %3 %4
-                %6:f32[2] = zero_like %0
+                %6:f32[2] = zero [type=f32[2]]
                 %7:f32[2] = select %5 %0 %6
                 %8:f32[] = reduce [kind=sum, axes=[0]] %7
                 %9:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %8
@@ -2105,7 +2398,7 @@ mod tests {
                 %20:f32[] = constant [value=NaN]
                 %21:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %20
                 %22:f32[2] = select %19 %17 %21
-                %23:f32[2] = zero_like %1
+                %23:f32[2] = zero [type=f32[2]]
                 %24:f32[] = constant [value=-inf]
                 %25:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %24
                 %26:bool[2] = compare [direction=Equal] %1 %23
@@ -2135,7 +2428,7 @@ mod tests {
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(logits, targets)| logits.softmax_cross_entropy(&targets, 0),
             (varying.clone(), invariant.clone()),
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         let (_, expected_type, _) = manual_types(ArrayType::scalar(DataType::F32));
@@ -2158,7 +2451,8 @@ mod tests {
                 ] %3
                 %6:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     compare [direction=Equal] %4 %5
-                %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %0
+                %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %6 %0 %7
                 %9:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %8
                 %10:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -2185,7 +2479,8 @@ mod tests {
                     output_axes=[],
                 ] %21
                 %23:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %20 %18 %22
-                %24:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %2
+                %24:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %25:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=-inf]
                 %26:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
                     output_type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}],
@@ -2209,7 +2504,8 @@ mod tests {
     #[test]
     fn test_softmax_cross_entropy_partial_evaluation() {
         // Known logits fold the whole normalization into residual inputs (the excluded-class mask and the
-        // log-probabilities); the loss over the unknown targets remains.
+        // log-probabilities), which also receive the zero that the targets are compared with, because its type
+        // determines it. The loss over the unknown targets remains.
         let (_, program) = ArrayContext::trace(
             |inputs: Vec<_>| inputs[0].softmax_cross_entropy(&inputs[1], 0).map(|output| vec![output]),
             vec![ArrayType::new_static(DataType::F32, [2]), ArrayType::new_static(DataType::F32, [2])],
@@ -2226,11 +2522,10 @@ mod tests {
         assert_eq!(
             known.program().to_string(),
             indoc! {"
-            lambda %0:f32[2], %1:bool[2], %2:f32[2] .
-            let %3:f32[2] = zero_like %0
-                %4:bool[2] = compare [direction=Equal] %0 %3
-                %5:bool[2] = and %4 %1
-                %6:f32[2] = select %5 %3 %2
+            lambda %0:f32[2], %1:f32[2], %2:bool[2], %3:f32[2] .
+            let %4:bool[2] = compare [direction=Equal] %0 %1
+                %5:bool[2] = and %4 %2
+                %6:f32[2] = select %5 %1 %3
                 %7:f32[2] = mul %0 %6
                 %8:f32[] = reduce [kind=sum, axes=[0]] %7
                 %9:f32[] = neg %8
@@ -2408,10 +2703,10 @@ mod tests {
             .value_and_gradient(|logits, (targets, mask)| {
                 let loss = shard_map(
                     |(logits, targets, mask): (
-                        ShardMapTracer<ArrayIrTracingContext>,
-                        ShardMapTracer<ArrayIrTracingContext>,
-                        ShardMapTracer<ArrayIrTracingContext>,
-                    )| logits.masked_softmax_cross_entropy(&targets, &mask, 1).unwrap(),
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>,
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>,
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>,
+                    )| logits.masked_softmax_cross_entropy(&targets, &mask, 1),
                     (
                         ValueProjection::<ArrayType>::into_projected(logits)?,
                         ValueProjection::<ArrayType>::into_projected(targets)?,
@@ -2420,6 +2715,7 @@ mod tests {
                     mesh,
                     (replicated.clone(), replicated, sharded_mask),
                     sharded_loss.clone(),
+                    ShardMapOptions::new(),
                 )?;
                 Ok::<_, ProgramError>((loss.reduce_sum(&[0], None)?.into_value(), loss.into_value()))
             })
@@ -2466,14 +2762,13 @@ mod tests {
         assert_eq!(
             known.program().to_string(),
             indoc! {"
-                lambda %0:f64[3], %1:bool[3], %2:f64[3], %3:bool[3] .
-                let %4:f64[3] = zero_like %0
-                    %5:bool[3] = compare [direction=Equal] %0 %4
-                    %6:bool[3] = and %5 %1
-                    %7:f64[3] = select %6 %4 %2
-                    %8:f64[3] = select %3 %7 %4
+                lambda %0:f64[3], %1:f64[3], %2:bool[3], %3:f64[3], %4:bool[3] .
+                let %5:bool[3] = compare [direction=Equal] %0 %1
+                    %6:bool[3] = and %5 %2
+                    %7:f64[3] = select %6 %1 %3
+                    %8:f64[3] = select %4 %7 %1
                     %9:f64[3] = mul %0 %8
-                    %10:f64[3] = select %3 %9 %4
+                    %10:f64[3] = select %4 %9 %1
                     %11:f64[] = reduce [kind=sum, axes=[0]] %10
                     %12:f64[] = neg %11
                 in (%12)
@@ -2671,7 +2966,7 @@ mod tests {
                 %4:i64[2, 3] = iota [type=i64[2, 3], dimension=1]
                 %5:i64[2, 3] = broadcast [output_type=i64[2, 3], output_axes=[0]] %3
                 %6:bool[2, 3] = compare [direction=Equal] %4 %5
-                %7:f32[2, 3] = zero_like %0
+                %7:f32[2, 3] = zero [type=f32[2, 3]]
                 %8:f32[2, 3] = select %6 %0 %7
                 %9:f32[2] = reduce [kind=sum, axes=[1]] %8
                 %10:f32[2, 3] = broadcast [output_type=f32[2, 3], output_axes=[0]] %9
@@ -2691,13 +2986,13 @@ mod tests {
                 %24:i64[2, 3] = iota [type=i64[2, 3], dimension=1]
                 %25:i64[2, 3] = broadcast [output_type=i64[2, 3], output_axes=[0]] %2
                 %26:bool[2, 3] = compare [direction=Equal] %24 %25
-                %27:f32[2, 3] = zero_like %23
+                %27:f32[2, 3] = zero [type=f32[2, 3]]
                 %28:f32[2, 3] = select %26 %23 %27
                 %29:f32[2] = reduce [kind=sum, axes=[1]] %28
                 %30:f32[2] = neg %29
                 %31:i64[2, 3] = convert_element_type [data_type=i64] %26
                 %32:i64[2] = reduce [kind=sum, axes=[1]] %31
-                %33:i64[2] = zero_like %2
+                %33:i64[2] = zero [type=i64[2]]
                 %34:bool[2] = compare [direction=GreaterThan] %32 %33
                 %35:f32[] = constant [value=NaN]
                 %36:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %35
@@ -2720,7 +3015,10 @@ mod tests {
         // coordinates, which carry the logits' variation, are compared with the labels.
         let (mesh, varying, invariant) = manual_types(ArrayType::new_static(DataType::F32, [2]));
         let (_, varying_labels, invariant_labels) = manual_types(ArrayType::scalar(DataType::I32));
-        let named_axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })];
+        let named_axes = vec![(
+            "x".to_string(),
+            NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+        )];
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(logits, labels)| logits.softmax_cross_entropy_with_integer_labels(&labels, 0),
             (varying, invariant_labels),
@@ -2747,7 +3045,8 @@ mod tests {
                 ] %4
                 %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     compare [direction=Equal] %5 %6
-                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %0
+                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %0 %8
                 %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %9
                 %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -2784,14 +3083,16 @@ mod tests {
                 ] %3
                 %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     compare [direction=Equal] %25 %26
-                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %24
+                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %27 %24 %28
                 %30:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %29
                 %31:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = neg %30
                 %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     convert_element_type [data_type=i64] %27
                 %33:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %32
-                %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %3
+                %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    zero [type=i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
                 %35:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
                     compare [direction=GreaterThan] %33 %34
                 %36:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
@@ -2829,7 +3130,8 @@ mod tests {
                 ] %4
                 %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     compare [direction=Equal] %5 %6
-                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %3
+                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %3 %8
                 %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %9
                 %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -2866,14 +3168,16 @@ mod tests {
                 ] %2
                 %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     compare [direction=Equal] %25 %26
-                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %24
+                %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %27 %24 %28
                 %30:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %29
                 %31:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = neg %30
                 %32:i64[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
                     convert_element_type [data_type=i64] %27
                 %33:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %32
-                %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %2
+                %34:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                    zero [type=i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
                 %35:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
                     compare [direction=GreaterThan] %33 %34
                 %36:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = constant [value=NaN]
@@ -2912,9 +3216,9 @@ mod tests {
             .value_and_gradient(|logits, labels| {
                 let loss = shard_map(
                     |(logits, labels): (
-                        ShardMapTracer<ArrayIrTracingContext>,
-                        ShardMapTracer<ArrayIrTracingContext>,
-                    )| logits.softmax_cross_entropy_with_integer_labels(&labels, 1).unwrap(),
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>,
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrTracingContext>>,
+                    )| logits.softmax_cross_entropy_with_integer_labels(&labels, 1),
                     (
                         ValueProjection::<ArrayType>::into_projected(logits)?,
                         ValueProjection::<ArrayType>::into_projected(labels)?,
@@ -2922,6 +3226,7 @@ mod tests {
                     mesh,
                     (sharded_rows, replicated),
                     sharded.clone(),
+                    ShardMapOptions::new(),
                 )?;
                 Ok::<_, ProgramError>((loss.reduce_sum(&[0], None)?.into_value(), loss.into_value()))
             })
@@ -2969,30 +3274,28 @@ mod tests {
         assert_eq!(
             known.program().to_string(),
             indoc! {"
-            lambda %0:f32[2], %1:i64[2], %2:f32[2], %3:bool[2], %4:bool[], %5:f32[] .
-            let %6:i64[] = argmax [axis=0, index_data_type=i64] %0
-                %7:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %6
-                %8:bool[2] = compare [direction=Equal] %1 %7
-                %9:f32[2] = zero_like %0
-                %10:f32[2] = select %8 %0 %9
-                %11:f32[] = reduce [kind=sum, axes=[0]] %10
-                %12:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %11
-                %13:f32[2] = sub %12 %12
-                %14:bool[2] = compare [direction=Equal] %13 %9
-                %15:f32[2] = sub %0 %12
-                %16:f32[2] = select %8 %9 %15
-                %17:f32[2] = exp %16
-                %18:f32[2] = select %8 %9 %17
-                %19:f32[] = reduce [kind=sum, axes=[0]] %18
-                %20:f32[] = ln_1p %19
-                %21:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %20
-                %22:f32[2] = sub %16 %21
-                %23:f32[2] = select %14 %22 %2
-                %24:f32[2] = zero_like %23
-                %25:f32[2] = select %3 %23 %24
+            lambda %0:f32[2], %1:i64[2], %2:f32[2], %3:f32[2], %4:bool[2], %5:f32[2], %6:bool[], %7:f32[] .
+            let %8:i64[] = argmax [axis=0, index_data_type=i64] %0
+                %9:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %8
+                %10:bool[2] = compare [direction=Equal] %1 %9
+                %11:f32[2] = select %10 %0 %2
+                %12:f32[] = reduce [kind=sum, axes=[0]] %11
+                %13:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %12
+                %14:f32[2] = sub %13 %13
+                %15:bool[2] = compare [direction=Equal] %14 %2
+                %16:f32[2] = sub %0 %13
+                %17:f32[2] = select %10 %2 %16
+                %18:f32[2] = exp %17
+                %19:f32[2] = select %10 %2 %18
+                %20:f32[] = reduce [kind=sum, axes=[0]] %19
+                %21:f32[] = ln_1p %20
+                %22:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %21
+                %23:f32[2] = sub %17 %22
+                %24:f32[2] = select %15 %23 %3
+                %25:f32[2] = select %4 %24 %5
                 %26:f32[] = reduce [kind=sum, axes=[0]] %25
                 %27:f32[] = neg %26
-                %28:f32[] = select %4 %27 %5
+                %28:f32[] = select %6 %27 %7
             in (%28)
         "}
             .trim_end(),
@@ -3263,7 +3566,8 @@ mod tests {
             ArrayContext::trace(|(logits, targets)| function.call(logits, targets), (dynamic.clone(), dynamic))
                 .map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid(
-                "`softmax_cross_entropy_with_target_logits` requires a static input shape",
+                "`softmax_cross_entropy_with_target_logits` requires a non-empty class axis but class axis 0 has size \
+                 `n`, whose lower bound is zero",
             ))),
         );
 
@@ -3300,7 +3604,7 @@ mod tests {
             TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
                 |(student, teacher): (_, _)| function.call(student, teacher),
                 (varying, reduced),
-                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+                vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
             )
             .map(|(output_type, _)| output_type),
             Err(ProgramError::Type(TypeError::invalid(
@@ -3416,7 +3720,7 @@ mod tests {
                             %3:i64[2] = iota [type=i64[2], dimension=0]
                             %4:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %2
                             %5:bool[2] = compare [direction=Equal] %3 %4
-                            %6:f32[2] = zero_like %0
+                            %6:f32[2] = zero [type=f32[2]]
                             %7:f32[2] = select %5 %0 %6
                             %8:f32[] = reduce [kind=sum, axes=[0]] %7
                             %9:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %8
@@ -3438,7 +3742,7 @@ mod tests {
                             %25:i64[2] = iota [type=i64[2], dimension=0]
                             %26:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %24
                             %27:bool[2] = compare [direction=Equal] %25 %26
-                            %28:f32[2] = zero_like %1
+                            %28:f32[2] = zero [type=f32[2]]
                             %29:f32[2] = select %27 %1 %28
                             %30:f32[] = reduce [kind=sum, axes=[0]] %29
                             %31:f32[2] = broadcast [output_type=f32[2], output_axes=[]] %30
@@ -3481,7 +3785,8 @@ mod tests {
         // constants they create carry it.
         let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
         let (mesh, varying, invariant) = manual_types(ArrayType::new_static(DataType::F32, [2]));
-        let named_axes = vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })];
+        let named_axes =
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })];
         let (output_type, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |(student, teacher): (_, _)| function.call(student, teacher),
             (varying.clone(), invariant.clone()),
@@ -3509,7 +3814,8 @@ mod tests {
                                 output_axes=[],
                             ] %2
                             %5:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %3 %4
-                            %6:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %0
+                            %6:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                                zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                             %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %5 %0 %6
                             %8:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %7
                             %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -3546,7 +3852,8 @@ mod tests {
                                 output_axes=[],
                             ] %24
                             %27:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %25 %26
-                            %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %1
+                            %28:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                                zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                             %29:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %27 %1 %28
                             %30:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %29
                             %31:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -3621,7 +3928,8 @@ mod tests {
                     output_axes=[],
                 ] %5
                 %7:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %4 %6
-                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %2
+                %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %9:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %7 %2 %8
                 %10:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %9
                 %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -3664,7 +3972,8 @@ mod tests {
                     output_axes=[],
                 ] %30
                 %32:bool[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = compare [direction=Equal] %29 %31
-                %33:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = zero_like %3
+                %33:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    zero [type=f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]]
                 %34:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = select %32 %3 %33
                 %35:f32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=sum, axes=[0]] %34
                 %36:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = broadcast [
@@ -3810,9 +4119,10 @@ mod tests {
             .with_auxiliary_output()
             .value_and_gradient(|student, teacher| {
                 let loss = shard_map(
-                    |(student, teacher): (ShardMapTracer<ArrayIrContext>, ShardMapTracer<ArrayIrContext>)| {
-                        function.call(student, teacher).unwrap()
-                    },
+                    |(student, teacher): (
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                        ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>,
+                    )| { function.call(student, teacher) },
                     (
                         ValueProjection::<ArrayType>::into_projected(student)?,
                         ValueProjection::<ArrayType>::into_projected(teacher)?,
@@ -3820,6 +4130,7 @@ mod tests {
                     mesh.clone(),
                     (sharded_rows.clone(), replicated.clone()),
                     sharded.clone(),
+                    ShardMapOptions::new(),
                 )?;
                 Ok::<_, ProgramError>((loss.reduce_sum(&[0], None)?.into_value(), loss.into_value()))
             })
@@ -3882,7 +4193,7 @@ mod tests {
                         %3:i64[] = argmax [axis=0, index_data_type=i64] %0
                         %4:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %3
                         %5:bool[2] = compare [direction=Equal] %2 %4
-                        %6:f64[2] = zero_like %0
+                        %6:f64[2] = zero [type=f64[2]]
                         %7:f64[2] = select %5 %0 %6
                         %8:f64[] = reduce [kind=sum, axes=[0]] %7
                         %9:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %8
@@ -3907,7 +4218,7 @@ mod tests {
                         %28:i64[] = argmax [axis=0, index_data_type=i64] %1
                         %29:i64[2] = broadcast [output_type=i64[2], output_axes=[]] %28
                         %30:bool[2] = compare [direction=Equal] %27 %29
-                        %31:f64[2] = zero_like %1
+                        %31:f64[2] = zero [type=f64[2]]
                         %32:f64[2] = select %30 %1 %31
                         %33:f64[] = reduce [kind=sum, axes=[0]] %32
                         %34:f64[2] = broadcast [output_type=f64[2], output_axes=[]] %33
@@ -4193,6 +4504,52 @@ mod tests {
             .unwrap();
         let expected = 5.0 * (1.0 / (1.0 + (-1.0f64).exp()) - 0.5);
         assert_abs_diff_eq!(tangent.elements::<f64>().unwrap()[0], expected, epsilon = 1e-15);
+    }
+
+    #[test]
+    fn test_softmax_cross_entropy_with_target_logits_differentiation_layout() {
+        // Whether each broadcast along the class axis keeps the explicit layout of the logits. The normalizations of
+        // the target logits and of the logits each broadcast their class indices, pivot, and correction, where the
+        // floating-point ones keep the layout. The derivative rule then broadcasts its offset, centering sum,
+        // closeness test, correction, and residual with the default layout. The tangent of the logits has no
+        // explicit layout, because a tangent need not be stored like its primal.
+        let layout = Layout::Strided(StridedLayout::new(vec![12, 4]));
+        let tangent_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let r#type = tangent_type.clone().with_layout(layout);
+        let function = softmax_cross_entropy_with_target_logits::<ArrayContext>(-1);
+        let (_, program) = ArrayContext::trace(
+            |(logits, target_logits, tangent): (_, _, _)| {
+                differentiate_at(logits)
+                    .with_captures(target_logits)
+                    .jvp(tangent, |logits, target_logits| function.call(logits, target_logits))
+                    .map(|(_, tangent)| tangent)
+                    .map_err(ProgramError::from)
+            },
+            (r#type.clone(), r#type, tangent_type),
+        )
+        .unwrap();
+        let layouts = program
+            .regions()
+            .iter()
+            .flat_map(|region| {
+                region.instructions().iter().filter_map(|instruction| match instruction.operation() {
+                    ArrayOperation::Broadcast(operation) if operation.output_axes() == [0] => {
+                        let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
+                        Some((output_type.data_type(), output_type.layout().is_some()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let normalization = [(DataType::I64, false), (DataType::F32, true), (DataType::F32, true)];
+        let rule = [
+            (DataType::F32, false),
+            (DataType::F32, false),
+            (DataType::Boolean, false),
+            (DataType::F32, false),
+            (DataType::F32, false),
+        ];
+        assert_eq!(layouts, [normalization.as_slice(), normalization.as_slice(), rule.as_slice()].concat());
     }
 
     #[test]

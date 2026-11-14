@@ -604,11 +604,7 @@ impl Sharding {
             return Ok(self.clone());
         }
         let dimensions = permutation.iter().map(|axis| self.dimensions()[*axis].clone()).collect();
-        Sharding::new(self.mesh().clone(), dimensions)
-            .and_then(|sharding| sharding.with_unreduced_axes(self.unreduced_axes().clone()))
-            .and_then(|sharding| sharding.with_reduced_axes(self.reduced_axes().clone()))
-            .and_then(|sharding| sharding.with_varying_manual_axes(self.varying_manual_axes().clone()))
-            .map_err(|error| TypeError::invalid(error.to_string()).into())
+        self.with_dimensions(dimensions).map_err(|error| TypeError::invalid(error.to_string()).into())
     }
 }
 
@@ -623,7 +619,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable,
         Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout, Tile,
-        TileDimension, TiledLayout, f8e8m0fnu,
+        TileDimension, TiledLayout, UnreducedKind, f8e8m0fnu,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -822,7 +818,8 @@ mod tests {
         ])
         .unwrap();
 
-        // The first input dimension is sharded over `x`; reduction and manual-axis state rides along untouched.
+        // The first input dimension is sharded over `x`; reduction and manual-axis state (including the kind of the
+        // pending reduction) rides along untouched.
         let input_sharding = Sharding::new(
             mesh.clone(),
             vec![
@@ -835,6 +832,8 @@ mod tests {
         .with_reduced_axes(["r"])
         .unwrap()
         .with_unreduced_axes(["u"])
+        .unwrap()
+        .with_unreduced_kind(UnreducedKind::Max)
         .unwrap()
         .with_varying_manual_axes(["v"])
         .unwrap();
@@ -864,6 +863,8 @@ mod tests {
             .with_reduced_axes(["r"])
             .unwrap()
             .with_unreduced_axes(["u"])
+            .unwrap()
+            .with_unreduced_kind(UnreducedKind::Max)
             .unwrap()
             .with_varying_manual_axes(["v"])
             .unwrap(),
@@ -1271,8 +1272,8 @@ mod tests {
             .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
             .with_memory(Memory::Host { pinned: true });
         let placed_output_type = output_type.clone().with_memory(Memory::Host { pinned: true });
-        // The inverse permutation restores the complete input cotangent type, including placement metadata that the
-        // forward transpose intentionally clears because it cannot infer a new physical layout.
+        // The inverse permutation restores the memory placement of the input in its cotangent, but not the explicit
+        // layout that the forward transpose clears because it cannot infer a new physical layout.
         check_operation_transposition!(
             @exact,
             operation = TransposeOperation::new(vec![1, 0]),
@@ -1283,7 +1284,7 @@ mod tests {
                     &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
                 ).unwrap()],
                 input_cotangents = [Array::from_elements::<f64>(
-                    placed_input_type,
+                    placed_input_type.with_layout(None),
                     &[1.0, 3.0, 5.0, 2.0, 4.0, 6.0],
                 ).unwrap()],
             }],

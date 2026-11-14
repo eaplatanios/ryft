@@ -232,7 +232,7 @@ mod tests {
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace_with_named_axes(
             |input| input.erf(),
             varying_type,
-            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh })],
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
         )
         .unwrap();
         assert_eq!(

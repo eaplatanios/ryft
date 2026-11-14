@@ -523,7 +523,9 @@ const RESERVED_ATTRIBUTE_NAMES: [&str; 6] =
 /// [`Operation`] that calls a foreign kernel registered with the executing backend under a target name. It is the
 /// Ryft analogue of JAX's [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/_autosummary/jax.ffi.ffi_call.html).
 /// This operation is opaque to Ryft: its output types are declared up front instead of inferred, and typed
-/// [`CustomCallAttribute`]s are forwarded verbatim to the kernel as its configuration.
+/// [`CustomCallAttribute`]s are forwarded verbatim to the kernel as its configuration, except for bookkeeping
+/// attributes in namespaces explicitly reserved by the executing backend. Such backend-owned metadata describes
+/// compilation or runtime requirements and does not enter the foreign kernel's attribute ABI.
 ///
 /// This is an [`ArrayType`] operation that participates in two input contracts. In homogeneous array programs it
 /// accepts only the foreign kernel's array inputs, so every declared output must have a static shape. As a mixed member
@@ -1043,32 +1045,9 @@ impl CustomCallOperation {
             .chain(carry_inputs[..extents.len()].iter().copied())
             .collect::<Vec<_>>();
 
-        // Per-item outputs can vary over the mapped axis's manual mesh axes, just as `ArrayType::unbatched` exposes
-        // on input slices. Extend declared shardings accordingly; outputs without a sharding inherit input variation
-        // during inference. Single-call batching records this variation through `ArrayType::batched` instead.
-        let output_types = self
-            .output_types
-            .iter()
-            .map(|output_type| {
-                let Some(sharding) = output_type.sharding() else {
-                    return Ok(output_type.clone());
-                };
-                let manual_axes = context.axis_sharding().manual_axes(sharding.mesh());
-                if manual_axes.is_empty() {
-                    return Ok(output_type.clone());
-                }
-                let mut sharding = sharding.clone();
-                sharding
-                    .extend_varying_manual_axes(manual_axes)
-                    .map_err(|error| TypeError::invalid(error.to_string()))?;
-                output_type.clone().with_sharding(sharding).map_err(|error| TypeError::invalid(error.to_string()))
-            })
-            .collect::<Result<Vec<_>, TypeError>>()?;
-
         // Apply the call to one item and return all invariant carries unchanged. Only the call's results are stacked
         // by the scan, so carried extents remain available to declare the result shapes on every iteration.
-        let operation = Self { output_types, ..self.clone() };
-        let outputs = builder.add_instruction(operation, Vec::new(), call_inputs, None)?.to_vec();
+        let outputs = builder.add_instruction(self.clone(), Vec::new(), call_inputs, None)?.to_vec();
         let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
         let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
             body_outputs,
@@ -1517,7 +1496,8 @@ impl<
         >,
 > MemberInterpretableOperation<C> for CustomCallOperation
 where
-    <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>,
+    <C::Value as ValueProjection<ArrayType>>::Projected:
+        Value<Type = ArrayType> + CustomCall + DimensionSize<Extent = usize>,
 {
     fn interpret_in_parent<D: InterpretationDriver<C>>(
         &self,
@@ -1590,7 +1570,7 @@ impl<
         >,
 > MemberBatchableOperation<C, ArrayIrBatchingPolicy> for CustomCallOperation
 where
-    C::Value: DimensionSize + DynamicBroadcast + ValueProjection<ArrayType>,
+    C::Value: DimensionSize<Extent = C::Value> + DynamicBroadcast + ValueProjection<ArrayType>,
     <C::Value as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + Transpose,
 {
     fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
@@ -1802,7 +1782,9 @@ impl CustomCall for Array {
     }
 }
 
-impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<usize>> CustomCall<ArrayIrType> for ArrayIrValue<A> {
+impl<A: Value<Type = ArrayType> + CustomCall + DimensionSize<Extent = usize>> CustomCall<ArrayIrType>
+    for ArrayIrValue<A>
+{
     #[inline]
     fn custom_call<'o, I: IntoIterator<Item = &'o Self>>(
         operation: &CustomCallOperation,
@@ -2003,7 +1985,9 @@ mod tests {
         }
     }
 
-    impl DimensionSize<usize> for IdentityKernelArray {
+    impl DimensionSize for IdentityKernelArray {
+        type Extent = usize;
+
         fn dimension_size<A: Into<Axis>>(&self, axis: A) -> Result<usize, ProgramError> {
             self.0.dimension_size(axis)
         }
@@ -3779,21 +3763,19 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_call_batching_sequential_manual_axis_aliases() -> Result<(), ProgramError> {
-        // Placing the batch axis on a manual mesh axis makes every per-item value vary along that axis. The scan body
-        // of `Sequential` declares that variation on the call's declared output sharding, exactly as its per-item
-        // inputs carry it, so an alias declared against the unbatched types keeps validating, and the scan gives the
-        // stacked results the batch axis's own placement as its stacked-axis sharding.
+    fn test_custom_call_batching_sequential_manual_placement_aliases() -> Result<(), ProgramError> {
+        // Placing the batch axis on a manual mesh axis adds no variation, so the per-item values of the scan body of
+        // `Sequential` keep the call's declared types, an alias declared against them keeps validating, and the scan
+        // gives the stacked results the batch axis's own placement as its stacked-axis sharding.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
-        let invariant = ArrayType::new_static(DataType::F32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
-        let packed = invariant.batched(0, Dimension::Static(2), ShardingDimension::Sharded(vec!["m".to_string()]))?;
-        let varying = packed.unbatched(BatchAxis::new(0))?;
-        assert_ne!(varying, invariant);
+        let item = ArrayType::new_static(DataType::F32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+        let packed = item.batched(0, Dimension::Static(2), ShardingDimension::Sharded(vec!["m".to_string()]))?;
+        assert_eq!(packed.unbatched(BatchAxis::new(0))?, item);
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = trace.input(packed.clone());
         let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2)
             .with_axis_sharding(ShardingDimension::Sharded(vec!["m".to_string()]));
-        let operation = CustomCallOperation::new("ryft.test.in_place", vec![invariant])
+        let operation = CustomCallOperation::new("ryft.test.in_place", vec![item.clone()])
             .with_input_output_alias(0, 0)?
             .with_batching(CustomCallBatching::Sequential { unroll: CustomCallUnrolling::Disabled });
         let outputs = operation.batch(&context, &EmptyRegionDriver, &[ArrayBatch::new(input, BatchAxis::new(0))?])?;
@@ -3809,8 +3791,8 @@ mod tests {
                 lambda %0:{packed} .
                 let %1:{packed} = scan [carry_count=0, iteration_count=2, reverse=false, stacked_axis_shardings=[{{'m'}}]] %0 [
                     body={{
-                        lambda %0:i64[], %1:{varying} .
-                        let %2:{varying} = custom_call [target=ryft.test.in_place, input_output_alias=0->0, \
+                        lambda %0:i64[], %1:{item} .
+                        let %2:{item} = custom_call [target=ryft.test.in_place, input_output_alias=0->0, \
                 batching=sequential] %1
                         in (%2)
                     }},
@@ -4285,9 +4267,9 @@ mod tests {
 
     #[test]
     fn test_custom_call_batching_broadcast_all_manual_axis_aliases() -> Result<(), ProgramError> {
-        // Placing the batch axis on a manual mesh axis makes every per-item value vary along that axis. `BroadcastAll`
-        // records that variation through the batch-prefixed output declaration, which also gives the result the batch
-        // axis's own placement, so an alias declared against the unbatched types keeps validating.
+        // Placing the batch axis on a manual mesh axis adds no variation. `BroadcastAll` gives the result the batch axis's
+        // own placement through the batch-prefixed output declaration, so an alias declared against the unbatched types
+        // keeps validating.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let invariant = ArrayType::new_static(DataType::F32, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
         let packed = invariant.batched(0, Dimension::Static(2), ShardingDimension::Sharded(vec!["m".to_string()]))?;

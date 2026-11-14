@@ -1,8 +1,3 @@
-//! Rule sources for registered ([`CustomRuleReference`]), unavailable ([`UnavailableCustomRules`]), and lifted
-//! ([`LiftedCustomRules`]) rule sets, which composite calls and carriers inspect through the sealed [`CustomRuleSource`]
-//! interface, together with the internal specialization machinery that traces, batches, and transposes retained rules
-//! into cached programs.
-
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Debug;
@@ -17,13 +12,11 @@ use crate::differentiation::{
     CotangentDestinationKind, DifferentiableType, DifferentiationError, ResidualZeroProvider,
     TransposedProgramCotangent,
 };
-use crate::operations::composites::derive_bijective_identity_renaming;
-use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::{
     COMPOSITE_OPERATION_NAME, COMPOSITE_TRANSPOSE_OPERATION_NAME, CompositeTransposeOperation,
 };
 use crate::operations::composites::rules::definitions::{
-    CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomRuleVjp,
+    CompositeKey, CustomRuleBroadcastSensitivity, CustomRuleDefinition, CustomRuleJvp, CustomRuleJvpRule, CustomRuleVjp,
 };
 use crate::operations::composites::rules::registrations::CustomRuleReference;
 use crate::operations::composites::rules::{
@@ -31,15 +24,13 @@ use crate::operations::composites::rules::{
     CustomRuleBatchingSpecializationKey, CustomRuleDerivationKind, CustomRuleDerivedDefinitionKey,
     CustomRuleForwardSpecializationKey, CustomRuleSpecialization, CustomRuleSpecializationRequest, CustomRuleTracer,
 };
+use crate::operations::composites::{derive_bijective_identity_renaming, describe_composite};
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
     MaybeZero, Operation, Program, ProgramBuilder, ProgramError, Type, TypeError, Typed, TypedProgram, Value,
     ValueProjection,
 };
 use crate::tracing::TracingContext;
-
-#[cfg(doc)]
-use crate::batching::DiagonalBatchingPolicy;
 
 /// Derivation of a definition from a source definition, which is stored in the derived definition as its batching rule.
 pub(super) struct CustomRuleDerivation<V: Typed + Parameter, O> {
@@ -78,6 +69,10 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
     /// Returns the process-unique identity of the source's definition.
     fn id(&self) -> u64;
 
+    /// Returns the semantic identity of the source's definition, or [`None`] for a definition that is not named.
+    /// Refer to [`NamedComposite`](crate::NamedComposite) for more information.
+    fn key(&self) -> Option<&CompositeKey>;
+
     /// Returns the human-readable label of the source's definition.
     fn name(&self) -> &str;
 
@@ -98,6 +93,10 @@ pub trait CustomRuleSource<V: Typed<Type: Eq + Hash> + Parameter, O>:
 
     /// Returns the declared batch axes of the outputs of batched calls, or [`None`] when they are not declared.
     fn batched_output_axes(&self) -> Option<&[BatchAxis]>;
+
+    /// Returns the declared mesh axes that the retained rules may communicate along, or [`None`] when they are not
+    /// declared. Refer to [`CustomRuleDefinition::with_rule_axes`] for more information.
+    fn rule_axes(&self) -> Option<&[String]>;
 
     /// Returns whether the source has a custom batching rule, which takes precedence over structurally batching
     /// the primal region of its calls.
@@ -121,6 +120,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
     #[inline]
     fn id(&self) -> u64 {
         self.definition().id()
+    }
+
+    #[inline]
+    fn key(&self) -> Option<&CompositeKey> {
+        self.definition().named_composite().map(|named_composite| named_composite.key())
     }
 
     #[inline]
@@ -151,6 +155,11 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSource<V, O> for Custom
     #[inline]
     fn batched_output_axes(&self) -> Option<&[BatchAxis]> {
         self.definition().batched_output_axes()
+    }
+
+    #[inline]
+    fn rule_axes(&self) -> Option<&[String]> {
+        self.definition().rule_axes()
     }
 
     #[inline]
@@ -270,7 +279,7 @@ pub(in crate::operations::composites) trait CustomRuleSpecializer<V: Typed<Type:
     ///     the tangents). When the source's rule depends on its input batch axes (refer to
     ///     [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]), the rule is instead applied once, at the
     ///     primal axes, and the tangents of such primals are recovered exactly from an outer product (refer to
-    ///     [`DiagonalBatchingPolicy`]).
+    ///     [`DiagonalBatchingPolicy`](crate::DiagonalBatchingPolicy)).
     ///
     /// Derived definitions are registered by the source's registration, which retains a bounded number of derived
     /// registrations like its specializations. Every request for the same key returns the same derived definition
@@ -352,7 +361,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 // The rule's two result partitions are validated separately before they are flattened,
                 // because the flattened types alone cannot tell a missing output from a misplaced tangent.
                 let output_count = key.rule_output_count()?;
-                let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
+                let (_, program) = TracingContext::<V, O>::trace_in_scope(
                     |values: Vec<CustomRuleTracer<V, O>>| {
                         let (primals, active_tangents) = values.split_at(key.input_types.len());
                         let mut active_tangents = active_tangents.iter().cloned();
@@ -414,8 +423,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         Ok(outputs)
                     },
                     rule_input_types,
-                    self.definition().named_axes().to_vec(),
+                    self.definition().scope().clone(),
                 )?;
+
+                self.definition().validate_rule_program("JVP", &program)?;
 
                 // A call that keeps only some of the rule's outputs receives only those outputs and their tangents,
                 // whose computation is all that remains of the program.
@@ -514,7 +525,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             let Some((inner, level)) = inner else {
                 // The primal outputs are validated as their own partition before the residuals are appended,
                 // because a residual whose type matches a missing output would otherwise pass as that output.
-                let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
+                let (_, program) = TracingContext::<V, O>::trace_in_scope(
                     |values: Vec<CustomRuleTracer<V, O>>| {
                         let (mut outputs, residuals) = forward.apply(&values)?;
                         if outputs.len() != output_count {
@@ -530,8 +541,10 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                         Ok(outputs)
                     },
                     key.input_types.clone(),
-                    self.definition().named_axes().to_vec(),
+                    self.definition().scope().clone(),
                 )?;
+
+                self.definition().validate_rule_program("forward", &program)?;
 
                 let kept_output_indices = key.kept_output_indices(output_count);
                 let program = align_rule_output_type_identities(
@@ -670,6 +683,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                 )?;
                 let linear_inputs = (leading_input_count..input_count).collect::<Vec<_>>();
                 let (program, cotangents) = transposer(&source, &linear_inputs, &key.destination_kinds)?;
+                self.definition().validate_rule_program("backward", &program)?;
                 let program = self.definition().discharge_if(key.discharged, program)?;
                 return Ok(Arc::new(CustomRuleSpecialization { program, output_axes: Vec::new(), cotangents }));
             };
@@ -742,6 +756,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
             return self.specialization(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
                 let CustomRuleSpecialization { program, output_axes, .. } =
                     derivation.batching_rule_specialization(self.name(), &key)?;
+                self.definition().validate_rule_program("batching", &program)?;
                 let program = self.definition().discharge_if(key.discharged, program)?;
                 Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
             });
@@ -750,7 +765,7 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
         self.specialization(CustomRuleSpecializationRequest::BatchingRule(key.clone()), || {
             let boundary_input_count = key.boundary_input_types.len();
             let mut output_axes = Vec::new();
-            let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
+            let (_, program) = TracingContext::<V, O>::trace_in_scope(
                 |values: Vec<CustomRuleTracer<V, O>>| {
                     let (boundary_inputs, inputs) = values.split_at(boundary_input_count);
                     let (outputs, axes) = rule.apply(inputs, &key.input_axes, &key.level, boundary_inputs)?;
@@ -767,8 +782,9 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleSpecializer<V, O> for C
                     Ok(outputs)
                 },
                 key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
-                self.definition().named_axes().to_vec(),
+                self.definition().scope().clone(),
             )?;
+            self.definition().validate_rule_program("batching", &program)?;
             let program = self.definition().discharge_if(key.discharged, program)?;
             Ok(Arc::new(CustomRuleSpecialization::new(program, output_axes)))
         })
@@ -844,6 +860,9 @@ pub struct UnavailableCustomRules {
     /// Process-unique identity of the original definition.
     id: u64,
 
+    /// Semantic identity of the original definition, if it is named.
+    key: Option<CompositeKey>,
+
     /// Human-readable label of the original definition.
     name: Cow<'static, str>,
 
@@ -863,6 +882,9 @@ pub struct UnavailableCustomRules {
     /// Declared batch axes of the outputs of batched calls of the original definition.
     batched_output_axes: Option<Vec<BatchAxis>>,
 
+    /// Declared mesh axes that the retained rules of the original definition may communicate along.
+    rule_axes: Option<Vec<String>>,
+
     /// Whether the original definition has a custom batching rule.
     has_batching_rule: bool,
 
@@ -876,12 +898,14 @@ impl UnavailableCustomRules {
     pub fn from_source<V: Typed<Type: Eq + Hash> + Parameter, O, S: CustomRuleSource<V, O>>(rules: &S) -> Self {
         Self {
             id: rules.id(),
+            key: rules.key().cloned(),
             name: Cow::Owned(rules.name().to_owned()),
             has_jvp: rules.has_jvp(),
             derives_jvp_from_primal: rules.derives_jvp_from_primal(),
             has_vjp: rules.has_vjp(),
             defers_forward: rules.defers_forward(),
             batched_output_axes: rules.batched_output_axes().map(<[BatchAxis]>::to_vec),
+            rule_axes: rules.rule_axes().map(<[String]>::to_vec),
             has_batching_rule: rules.has_batching_rule(),
             has_sequential_batching: rules.has_sequential_batching(),
         }
@@ -1065,6 +1089,14 @@ where
     }
 
     #[inline]
+    fn key(&self) -> Option<&CompositeKey> {
+        match self {
+            Self::Member(rules) => rules.key(),
+            Self::Unavailable(rules) => rules.key.as_ref(),
+        }
+    }
+
+    #[inline]
     fn name(&self) -> &str {
         self.name_or_unavailable()
     }
@@ -1106,6 +1138,14 @@ where
         match self {
             Self::Member(rules) => rules.batched_output_axes(),
             Self::Unavailable(rules) => rules.batched_output_axes.as_deref(),
+        }
+    }
+
+    #[inline]
+    fn rule_axes(&self) -> Option<&[String]> {
+        match self {
+            Self::Member(rules) => rules.rule_axes(),
+            Self::Unavailable(rules) => rules.rule_axes.as_deref(),
         }
     }
 
@@ -1321,10 +1361,11 @@ where
     fn derived(&self, key: CustomRuleDerivedDefinitionKey) -> Result<Self, DifferentiationError> {
         // The member definition derives in its own family, and the derived rules follow the call like the member's
         // rules do. Unavailable rules stay unavailable, so the derived call reports the same error on its first
-        // request.
+        // request. A derived call computes a derivative rather than the named computation of its source, so it
+        // has no key, as for derived member definitions.
         match self {
             Self::Member(rules) => Ok(Self::Member(rules.derived(key)?)),
-            Self::Unavailable(rules) => Ok(Self::Unavailable(rules.clone())),
+            Self::Unavailable(rules) => Ok(Self::Unavailable(UnavailableCustomRules { key: None, ..rules.clone() })),
         }
     }
 }
@@ -1433,7 +1474,7 @@ where
             .map_err(ProgramError::from)?;
 
             // The batched program consumes the level's boundary inputs before the JVP program's own copy of them.
-            let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
+            let (_, program) = TracingContext::<V, O>::trace_in_scope(
                 |values: Vec<CustomRuleTracer<V, O>>| {
                     let context = values[0].context().clone();
                     let mut inputs = values[..boundary_input_count].to_vec();
@@ -1441,7 +1482,7 @@ where
                     batched.interpret_in_context(&context, inputs)
                 },
                 program_types,
-                self.source.definition().named_axes().to_vec(),
+                self.source.definition().scope().clone(),
             )?;
             return Ok(CustomRuleSpecialization::new(program, output_axes));
         }
@@ -1516,7 +1557,7 @@ where
             false => primal_rule.output_axes.iter().copied().chain(tangent_output_axes).collect(),
         };
 
-        let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
+        let (_, program) = TracingContext::<V, O>::trace_in_scope(
             |values: Vec<CustomRuleTracer<V, O>>| {
                 let context = values[0].context().clone();
                 let (boundary_inputs, inputs) = values.split_at(boundary_input_count);
@@ -1540,7 +1581,7 @@ where
                 Ok(outputs)
             },
             program_types,
-            self.source.definition().named_axes().to_vec(),
+            self.source.definition().scope().clone(),
         )?;
 
         Ok(CustomRuleSpecialization::new(program, output_axes))
@@ -1742,7 +1783,7 @@ where
         };
         all_output_axes.extend(output_axes.iter().copied());
 
-        let (_, program) = TracingContext::<V, O>::trace_with_named_axes(
+        let (_, program) = TracingContext::<V, O>::trace_in_scope(
             |values: Vec<CustomRuleTracer<V, O>>| {
                 let context = values[0].context().clone();
                 let (boundary_inputs, inputs) = values.split_at(boundary_input_count);
@@ -1822,7 +1863,7 @@ where
                 Ok(outputs)
             },
             key.boundary_input_types.iter().chain(&key.input_types).cloned().collect::<Vec<_>>(),
-            self.source.definition().named_axes().to_vec(),
+            self.source.definition().scope().clone(),
         )?;
 
         Ok(CustomRuleSpecialization::new(program, all_output_axes))
@@ -1998,6 +2039,80 @@ where
     }
 }
 
+impl<V: Value<Type: Eq + Hash>, O: Operation<Type = V::Type>> CustomRuleReference<V, O>
+where
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    /// Returns a validated specialization of this reference's named composite body for `input_types`, ready to attach
+    /// as the primal region of a composite call. The body is traced in the definition's scope, and its outputs have
+    /// exactly the types, including the type identities, that the definition's output type rule assigns to those calls.
+    /// The returned [`Arc`] lets callers share the program across calls without copying it.
+    ///
+    /// Repeated requests reuse the program while it remains in the caches owned by a live
+    /// [`CustomRuleRegistration`](crate::CustomRuleRegistration). Requests after eviction or after every registration
+    /// handle is dropped trace the body again, so tracing is not guaranteed to run exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ProgramError`] when the definition is not named, when its output type rule rejects `input_types`,
+    /// when tracing the body fails or produces outputs that the rule does not describe, or when the same body
+    /// specialization is requested recursively on the same thread while it is being produced.
+    pub fn body(&self, input_types: &[V::Type]) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, ProgramError> {
+        let Some(named_composite) = self.definition().named_composite() else {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{} is not a named composite and has no retained body",
+                    describe_composite(COMPOSITE_OPERATION_NAME, self.name()),
+                ),
+            });
+        };
+        let body = named_composite.body();
+        self.body_specialization(input_types, || {
+            let output_types = named_composite.output_types(input_types)?;
+            let (_, program) = TracingContext::<V, O>::trace_in_scope(
+                |values: Vec<CustomRuleTracer<V, O>>| {
+                    let outputs = body.apply(&values)?;
+                    if outputs.len() != output_types.len() {
+                        return Err(TypeError::invalid(format!(
+                            "named composite `{}` body returned {} outputs but its output type rule describes {}",
+                            named_composite.key(),
+                            outputs.len(),
+                            output_types.len(),
+                        ))
+                        .into());
+                    }
+                    Ok(outputs)
+                },
+                input_types.to_vec(),
+                self.definition().scope().clone(),
+            )?;
+            let program = align_rule_output_type_identities(self.name(), "body", program, &output_types, None)?;
+
+            // Every call that shares this body has its output types, so an identity that the outputs define rather
+            // than derive from the inputs (e.g., a data-dependent extent) would be defined once per call.
+            let input_identities =
+                input_types.iter().flat_map(Type::identities).map(|(_, identity)| identity).collect::<Vec<_>>();
+            for (index, output_type) in output_types.iter().enumerate() {
+                if let Some((_, identity)) =
+                    output_type.identities().find(|(_, identity)| !input_identities.contains(identity))
+                {
+                    return Err(TypeError::invalid(format!(
+                        "named composite `{}` output {} has type `{}`, whose identity `{}` its inputs do not bind, \
+                         but the outputs of named composites must be functions of their inputs, because every call \
+                         shares the body",
+                        named_composite.key(),
+                        index,
+                        output_type,
+                        identity,
+                    ))
+                    .into());
+                }
+            }
+            Ok(Arc::new(program))
+        })
+    }
+}
+
 /// Validates that `program`, a retained rule of the custom rule set named `name` traced in its own trace, returns the
 /// `expected` types as its leading outputs (or as its outputs at the `selected` positions, when provided), and returns
 /// it with its type identities renamed onto those of `expected`. The trace establishes fresh identities for the extents
@@ -2056,13 +2171,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionBounds,
-        DimensionType, DimensionVariable, Shape, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionType, DimensionVariable, Shape, ShardingDimension,
     };
     use crate::contexts::Context;
     use crate::operations::arithmetic::MulOperation;
+    use crate::operations::composites::rules::definitions::{CompositeKey, NamedComposite};
     use crate::operations::composites::rules::registrations::CustomRuleRegistration;
-    use crate::operations::composites::tests::{MemberDefinition, RuleCounters, member_cube_definition};
+    use crate::operations::composites::tests::{
+        MemberDefinition, RuleCounters, member_cube_definition, named_cube_definition,
+    };
+    use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
+    use crate::operations::manipulation::broadcasting::DynamicBroadcast;
     use crate::programs::ReferenceType;
     use crate::tests::hash_of;
 
@@ -2297,6 +2417,22 @@ mod tests {
         }
         for rules in lifted_forms(&default.reference()) {
             assert_eq!(in_array_ir(&rules).batched_output_axes(), None);
+        }
+    }
+
+    #[test]
+    fn test_custom_rule_source_rule_axes() {
+        // Lifted rules report the declaration of their definition, even when they are unavailable.
+        let rule_axes = ["x".to_string()];
+        let declared = CustomRuleRegistration::new(MemberDefinition::new("pair").with_rule_axes(["x"]));
+        let default = CustomRuleRegistration::new(MemberDefinition::new("pair"));
+        assert_eq!(declared.reference().rule_axes(), Some(rule_axes.as_slice()));
+        assert_eq!(default.reference().rule_axes(), None);
+        for rules in lifted_forms(&declared.reference()) {
+            assert_eq!(in_array_ir(&rules).rule_axes(), Some(rule_axes.as_slice()));
+        }
+        for rules in lifted_forms(&default.reference()) {
+            assert_eq!(in_array_ir(&rules).rule_axes(), None);
         }
     }
 
@@ -2710,9 +2846,9 @@ mod tests {
         assert_eq!(
             format!("{unavailable:?}"),
             format!(
-                "Unavailable(UnavailableCustomRules {{ id: {id}, name: \"cube\", has_jvp: false, \
+                "Unavailable(UnavailableCustomRules {{ id: {id}, key: None, name: \"cube\", has_jvp: false, \
                  derives_jvp_from_primal: false, has_vjp: false, defers_forward: false, batched_output_axes: None, \
-                 has_batching_rule: false, has_sequential_batching: false }})",
+                 rule_axes: None, has_batching_rule: false, has_sequential_batching: false }})",
             ),
         );
     }
@@ -2953,6 +3089,17 @@ mod tests {
         );
         assert!(matches!(derive(&unavailable), LiftedCustomRules::Unavailable(_)));
         assert_eq!(derive(&unavailable), unavailable);
+
+        // A derived call computes a derivative rather than the named computation, so it has no key.
+        let composite_key = CompositeKey::new("ryft.tests.lifted_custom_rules_derived", 1);
+        let named = CustomRuleRegistration::new(
+            named_cube_definition(composite_key.clone(), &Arc::new(AtomicUsize::new(0))).with_jvp_from_primal(),
+        );
+        let unavailable = LiftedCustomRules::<Array, ArrayOperation<Array>>::Unavailable(
+            UnavailableCustomRules::from_source(&named.reference()),
+        );
+        assert!(matches!(&unavailable, LiftedCustomRules::Unavailable(rules) if rules.key == Some(composite_key)));
+        assert!(matches!(derive(&unavailable), LiftedCustomRules::Unavailable(rules) if rules.key.is_none()));
     }
 
     #[test]
@@ -3032,9 +3179,8 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3], %1:f64[], %2:f64[3] .
                 let %3:f64[3] = mul %0 %1
-                    %4:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
-                    %5:f64[3] = mul %4 %2
-                in (%3, %5)
+                    %4:f64[3] = mul %1 %2
+                in (%3, %4)
             "}
             .trim_end(),
         );
@@ -3080,9 +3226,8 @@ mod tests {
                 lambda %0:f64[3, 2], %1:f64[], %2:f64[2, 3] .
                 let %3:f64[3, 2] = transpose [permutation=[1, 0]] %2
                     %4:f64[3, 2] = mul %0 %1
-                    %5:f64[3, 2] = broadcast [output_type=f64[3, 2], output_axes=[]] %1
-                    %6:f64[3, 2] = mul %5 %3
-                in (%4, %6)
+                    %5:f64[3, 2] = mul %1 %3
+                in (%4, %5)
             "}
             .trim_end(),
         );
@@ -3284,18 +3429,17 @@ mod tests {
             indoc! {"
                 lambda %0:f64[3], %1:f64[], %2:f64[3], %3:f64[3] .
                 let %4:f64[3] = mul %0 %1
-                    %5:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
-                    %6:f64[3] = mul %5 %2
-                    %7:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
-                    %8:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %3
-                    %9:f64[3, 3] = mul %7 %8
-                    %10:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
-                    %11:f64[3] = gather [
+                    %5:f64[3] = mul %1 %2
+                    %6:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
+                    %7:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %3
+                    %8:f64[3, 3] = mul %6 %7
+                    %9:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
+                    %10:f64[3] = gather [
                         dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
                         slice_sizes=[1, 1],
-                    ] %9 %10
-                    %12:f64[3] = add %6 %11
-                in (%4, %12)
+                    ] %8 %9
+                    %11:f64[3] = add %5 %10
+                in (%4, %11)
             "}
             .trim_end(),
         );
@@ -3356,5 +3500,112 @@ mod tests {
                 if message == "`composite` `pair` JVP rule output type signature mismatch: expected [f32[n], f32[n]] \
                                but got [f32[n], f32[n]] with different type identities",
         ));
+    }
+
+    #[test]
+    fn test_custom_rule_reference_body() {
+        // The body is traced on the first request for each input types and cached with the registration,
+        // which every reference to it shares.
+        let key = CompositeKey::new("ryft.tests.body", 1);
+        let traces = Arc::new(AtomicUsize::new(0));
+        let registration = CustomRuleRegistration::new(named_cube_definition(key, &traces));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let body = registration.reference().body(std::slice::from_ref(&scalar_type)).unwrap();
+        assert_eq!(
+            body.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = mul %0 %0
+                    %2:f64[] = mul %1 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let repeated = registration.reference().body(std::slice::from_ref(&scalar_type)).unwrap();
+        assert!(Arc::ptr_eq(&body, &repeated));
+        assert_eq!(traces.load(Ordering::SeqCst), 1);
+
+        // Other input types are traced separately.
+        let vector_type = ArrayType::new_static(DataType::F64, [3]);
+        let vector_body = registration.reference().body(std::slice::from_ref(&vector_type)).unwrap();
+        assert_eq!(vector_body.output_types(), vec![vector_type]);
+        assert_eq!(traces.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_custom_rule_reference_body_rejects_output_identities_that_inputs_do_not_bind() {
+        // Every call shares the body, so its outputs cannot define identities (e.g., a data-dependent extent).
+        type IrTracer = CustomRuleTracer<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let key = CompositeKey::new("ryft.tests.body_data_dependent_extent", 1);
+        let output_types = |_: &[ArrayIrType]| -> Result<Vec<ArrayIrType>, ProgramError> {
+            let extent = DimensionVariable::new("extent", DimensionBounds::non_negative(Some(8)).unwrap());
+            Ok(vec![ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])).into()])
+        };
+        let body = |inputs: &[IrTracer]| -> Result<Vec<IrTracer>, ProgramError> {
+            let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+            let extent = inputs[1].to_dimension(DimensionVariable::new("extent", bounds))?;
+            Ok(vec![inputs[0].dynamic_broadcast(&[extent], &[])?])
+        };
+        let registration = CustomRuleRegistration::new(
+            CustomRuleDefinition::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new("filled")
+                .with_named_composite(NamedComposite::new(key, output_types, body)),
+        );
+        let input_types: Vec<ArrayIrType> =
+            vec![ArrayType::scalar(DataType::F32).into(), ArrayType::scalar(DataType::I64).into()];
+        assert!(matches!(
+            registration.reference().body(&input_types),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message.starts_with(
+                    "named composite `ryft.tests.body_data_dependent_extent.v1` output 0 has type `f32[extent]`, \
+                     whose identity `extent` its inputs do not bind",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_custom_rule_reference_body_errors() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let error = |registration: &CustomRuleRegistration<Array, ArrayOperation<Array>>| {
+            registration.reference().body(std::slice::from_ref(&scalar_type)).unwrap_err()
+        };
+        let unsupported = |message: &str| ProgramError::UnsupportedOperation { message: message.to_string() };
+
+        // Only named composites have bodies.
+        let counters = Arc::new(RuleCounters::default());
+        let closure = CustomRuleRegistration::new(member_cube_definition(&counters));
+        assert_eq!(
+            error(&closure),
+            unsupported("`composite` `cube` is not a named composite and has no retained body")
+        );
+
+        // Output type rules that reject the inputs, and bodies whose outputs the rules do not describe, are rejected.
+        let key = CompositeKey::new("ryft.tests.body_errors", 1);
+        let cube = |output_types: fn(&[ArrayType]) -> Result<Vec<ArrayType>, ProgramError>| {
+            CustomRuleRegistration::new(MemberDefinition::new("cube").with_named_composite(NamedComposite::new(
+                key.clone(),
+                output_types,
+                |inputs: &[CustomRuleTracer<Array, ArrayOperation<Array>>]| {
+                    Ok(vec![inputs[0].clone() * inputs[0].clone()])
+                },
+            )))
+        };
+        assert_eq!(
+            error(&cube(|_| Err(TypeError::invalid("rejected").into()))),
+            ProgramError::from(TypeError::invalid("rejected")),
+        );
+        assert_eq!(
+            error(&cube(|types| Ok([types, types].concat()))),
+            ProgramError::from(TypeError::invalid(
+                "named composite `ryft.tests.body_errors.v1` body returned 1 outputs but its output type rule \
+                 describes 2",
+            )),
+        );
+        assert_eq!(
+            error(&cube(|_| Ok(vec![ArrayType::scalar(DataType::F32)]))),
+            ProgramError::from(TypeError::invalid(
+                "`composite` `ryft.tests.body_errors` body rule output type signature mismatch: \
+                 expected [f32[]] but got [f64[]]",
+            )),
+        );
     }
 }

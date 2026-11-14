@@ -1138,7 +1138,7 @@ impl<
 impl<
     V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant>
         + ValueProjection<ArrayType>
-        + DimensionSize
+        + DimensionSize<Extent = V>
         + DimensionToScalar
         + DynamicGather
         + DynamicReshape,
@@ -1212,7 +1212,7 @@ where
 impl<
     V: Value<Type = ArrayIrType, Domain: Context<Type = ArrayIrType> + DimensionConstant>
         + ValueProjection<ArrayType>
-        + DimensionSize
+        + DimensionSize<Extent = V>
         + DimensionToScalar
         + DynamicScatter
         + DynamicReshape
@@ -1648,7 +1648,7 @@ impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + DimensionSize + DimensionToScalar + ValueProjection<ArrayType>>
+impl<V: Value<Type = ArrayIrType> + DimensionSize<Extent = V> + DimensionToScalar + ValueProjection<ArrayType>>
     Indexed<'_, '_, '_, V, ArrayIrType>
 where
     V::Projected: Value<Type = ArrayType, Domain: Context<Operation: From<ConstantOperation<Array>>>>
@@ -2652,7 +2652,10 @@ mod tests {
             ArrayType::new_static(DataType::F32, [0])
                 .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["m"]).unwrap())
                 .unwrap(),
-            vec![("m".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone() })],
+            vec![(
+                "m".to_string(),
+                NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(

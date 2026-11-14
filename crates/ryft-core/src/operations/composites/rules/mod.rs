@@ -33,7 +33,9 @@ pub mod definitions;
 pub mod registrations;
 pub mod specializations;
 
-pub use definitions::{CustomRuleDefinition, CustomVjpOperation};
+pub use definitions::{
+    CompositeAttribute, CompositeBody, CompositeKey, CustomRuleDefinition, CustomVjpOperation, NamedComposite,
+};
 pub use registrations::{CustomRuleReference, CustomRuleRegistration, WeakCustomRuleReference};
 pub use specializations::{CustomRuleSource, LiftedCustomRules, UnavailableCustomRules};
 
@@ -374,6 +376,9 @@ pub(super) struct CustomRuleDerivedDefinitionKey {
 /// that retains it and, when no cache is alive, the in-flight marker that rejects its recursive production.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum CustomRuleSpecializationRequest<T> {
+    /// Body of a named composite for the provided input types.
+    Body(Vec<T>),
+
     /// Specialization of the forward mode differentiation rule.
     Jvp(CustomRuleForwardSpecializationKey<T>),
 

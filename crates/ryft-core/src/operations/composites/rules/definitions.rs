@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::fmt::Debug;
-use std::hash::Hash;
+use std::fmt::{Debug, Display};
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
@@ -20,6 +20,7 @@ use crate::differentiation::{
     TranspositionContext,
 };
 use crate::operations::arithmetic::{Add, AddOperation};
+use crate::operations::collectives::{CollectiveOperation, HiddenAxes};
 use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::COMPOSITE_OPERATION_NAME;
 use crate::operations::composites::rules::specializations::CustomRuleDerivation;
@@ -35,19 +36,398 @@ use crate::programs::{
     ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType, ReferenceTransform,
     ReferenceType, Type, Typed, Value,
 };
-use crate::tracing::TracingContext;
-
-#[cfg(doc)]
-use crate::operations::composites::rules::registrations::{CustomRuleReference, CustomRuleRegistration};
-
-#[cfg(doc)]
-use crate::operations::composites::rules::specializations::CustomRuleSpecializer;
-
-#[cfg(doc)]
-use crate::operations::composites::operations::CompositeTransposeOperation;
+use crate::tracing::{TracingContext, TracingScope};
 
 /// Next process-unique identity assigned to a [`CustomRuleDefinition`].
 static NEXT_CUSTOM_RULE_DEFINITION_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Value of one semantic attribute of a [`CompositeKey`]. Scalars compose into ordered sequences and explicit optional
+/// values, whose structure is part of their identity. Each named composite validates the structure and scalar kinds
+/// that its attributes require. Integer values have a fixed range that includes every signed and unsigned 64-bit value.
+/// Floating-point values compare and hash by their IEEE bits, so that `0.0` and `-0.0`, or two NaN payloads, are
+/// distinct. Their [`Debug`] representation also preserves those bits for semantic-key encoding, while [`Display`]
+/// prints their numerical values.
+///
+/// [`From`] conversions compose through vectors, tuples of up to 12 elements, and optional values. Tuples become
+/// sequences in element order, and `()` becomes an empty sequence. For example, an optional dropout rate and seed
+/// becomes an optional sequence without requiring an attribute variant dedicated to dropout.
+///
+/// ```rust
+/// # use ryft_core::CompositeAttribute;
+/// let dropout = CompositeAttribute::from(Some((0.25f64, u64::MAX)));
+/// assert_eq!(dropout.to_string(), "some([0.25, 18446744073709551615])");
+/// assert_ne!(CompositeAttribute::from(None::<i64>), CompositeAttribute::from(Some(None::<i64>)));
+/// ```
+#[derive(Clone)]
+pub enum CompositeAttribute {
+    Boolean(bool),
+    Integer(i128),
+    Float(f64),
+    DataType(DataType),
+    Sequence(Vec<Self>),
+    Optional(Option<Box<Self>>),
+}
+
+impl Debug for CompositeAttribute {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Boolean(value) => formatter.debug_tuple("Boolean").field(value).finish(),
+            Self::Integer(value) => formatter.debug_tuple("Integer").field(value).finish(),
+            Self::Float(value) => formatter.debug_tuple("Float").field(&value.to_bits()).finish(),
+            Self::DataType(value) => formatter.debug_tuple("DataType").field(value).finish(),
+            Self::Sequence(values) => formatter.debug_tuple("Sequence").field(values).finish(),
+            Self::Optional(value) => formatter.debug_tuple("Optional").field(value).finish(),
+        }
+    }
+}
+
+impl Display for CompositeAttribute {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Renderings of named composite calls contain this representation and structural deduplication compares those
+        // renderings, so it distinguishes every attribute that equality distinguishes, including NaN payloads.
+        match self {
+            Self::Boolean(value) => write!(formatter, "{value}"),
+            Self::Integer(value) => write!(formatter, "{value}"),
+            Self::Float(value) if value.is_nan() => write!(formatter, "nan({:#018x})", value.to_bits()),
+            Self::Float(value) => write!(formatter, "{value:?}"),
+            Self::DataType(value) => write!(formatter, "{value}"),
+            Self::Sequence(values) => {
+                formatter.write_str("[")?;
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        formatter.write_str(", ")?;
+                    }
+                    write!(formatter, "{value}")?;
+                }
+                formatter.write_str("]")
+            }
+            Self::Optional(None) => formatter.write_str("none"),
+            Self::Optional(Some(value)) => write!(formatter, "some({value})"),
+        }
+    }
+}
+
+impl PartialEq for CompositeAttribute {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Boolean(left), Self::Boolean(right)) => left == right,
+            (Self::Integer(left), Self::Integer(right)) => left == right,
+            (Self::Float(left), Self::Float(right)) => left.to_bits() == right.to_bits(),
+            (Self::DataType(left), Self::DataType(right)) => left == right,
+            (Self::Sequence(left), Self::Sequence(right)) => left == right,
+            (Self::Optional(left), Self::Optional(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for CompositeAttribute {}
+
+impl Hash for CompositeAttribute {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Boolean(value) => value.hash(state),
+            Self::Integer(value) => value.hash(state),
+            Self::Float(value) => value.to_bits().hash(state),
+            Self::DataType(value) => value.hash(state),
+            Self::Sequence(values) => values.hash(state),
+            Self::Optional(value) => value.hash(state),
+        }
+    }
+}
+
+impl From<bool> for CompositeAttribute {
+    #[inline]
+    fn from(value: bool) -> Self {
+        Self::Boolean(value)
+    }
+}
+
+/// Implements a lossless integer conversion into [`CompositeAttribute`].
+macro_rules! impl_composite_attribute_from_integer {
+    // This branch converts one integer type whose complete range fits in `i128`.
+    ($type:ty) => {
+        impl From<$type> for CompositeAttribute {
+            #[inline]
+            fn from(value: $type) -> Self {
+                Self::Integer(value as i128)
+            }
+        }
+    };
+}
+
+impl_composite_attribute_from_integer!(i8);
+impl_composite_attribute_from_integer!(i16);
+impl_composite_attribute_from_integer!(i32);
+impl_composite_attribute_from_integer!(i64);
+impl_composite_attribute_from_integer!(i128);
+impl_composite_attribute_from_integer!(isize);
+impl_composite_attribute_from_integer!(u8);
+impl_composite_attribute_from_integer!(u16);
+impl_composite_attribute_from_integer!(u32);
+impl_composite_attribute_from_integer!(u64);
+impl_composite_attribute_from_integer!(usize);
+
+impl From<f64> for CompositeAttribute {
+    #[inline]
+    fn from(value: f64) -> Self {
+        Self::Float(value)
+    }
+}
+
+impl From<DataType> for CompositeAttribute {
+    #[inline]
+    fn from(value: DataType) -> Self {
+        Self::DataType(value)
+    }
+}
+
+impl<T: Into<CompositeAttribute>> From<Vec<T>> for CompositeAttribute {
+    #[inline]
+    fn from(values: Vec<T>) -> Self {
+        Self::Sequence(values.into_iter().map(Into::into).collect())
+    }
+}
+
+/// Implements conversion from a tuple into an ordered [`CompositeAttribute::Sequence`].
+macro_rules! impl_composite_attribute_from_tuple {
+    // This branch converts the empty tuple into an empty sequence.
+    () => {
+        impl From<()> for CompositeAttribute {
+            #[inline]
+            fn from(_: ()) -> Self {
+                Self::Sequence(Vec::new())
+            }
+        }
+    };
+
+    // This branch converts each element of one non-empty tuple in order.
+    ($($type:ident:$index:tt),+ $(,)?) => {
+        impl<$($type: Into<CompositeAttribute>),+> From<($($type,)+)> for CompositeAttribute {
+            #[inline]
+            fn from(values: ($($type,)+)) -> Self {
+                Self::Sequence(vec![$(values.$index.into()),+])
+            }
+        }
+    };
+}
+
+impl_composite_attribute_from_tuple!();
+impl_composite_attribute_from_tuple!(T0:0);
+impl_composite_attribute_from_tuple!(T0:0, T1:1);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10);
+impl_composite_attribute_from_tuple!(T0:0, T1:1, T2:2, T3:3, T4:4, T5:5, T6:6, T7:7, T8:8, T9:9, T10:10, T11:11);
+
+impl<T: Into<CompositeAttribute>> From<Option<T>> for CompositeAttribute {
+    #[inline]
+    fn from(value: Option<T>) -> Self {
+        Self::Optional(value.map(|value| Box::new(value.into())))
+    }
+}
+
+/// Semantic identity of a named composite computation, given by a stable name, a version that changes whenever the
+/// semantics change, and ordered attributes. Two computations with equal keys at equal typed boundaries compute the
+/// same function, so backends may share one lowering between them and recognize the computation by its key (e.g., to
+/// replace it with a fused kernel). The typed boundary is not part of the key.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CompositeKey {
+    /// Stable semantic name (e.g., `ryft.dot_product_attention`).
+    name: Cow<'static, str>,
+
+    /// Semantic version, which changes whenever the semantics of the named computation change.
+    version: u32,
+
+    /// Semantic attributes in their named order.
+    attributes: Vec<(Cow<'static, str>, CompositeAttribute)>,
+}
+
+impl CompositeKey {
+    /// Creates a new [`CompositeKey`] without any attributes.
+    ///
+    /// # Parameters
+    ///
+    ///   - `name`: Stable semantic name of the computation.
+    ///   - `version`: Semantic version of the computation.
+    #[inline]
+    pub fn new<N: Into<Cow<'static, str>>>(name: N, version: u32) -> Self {
+        Self { name: name.into(), version, attributes: Vec::new() }
+    }
+
+    /// Returns this [`CompositeKey`] with the provided attribute appended. Attributes keep the order in which they are
+    /// added, which is part of the identity, so every constructor of a given key must add them in the same order.
+    /// Values convert through [`CompositeAttribute`], so scalars, sequences, and optional values can be supplied
+    /// directly.
+    #[inline]
+    pub fn with_attribute<N: Into<Cow<'static, str>>, V: Into<CompositeAttribute>>(
+        mut self,
+        name: N,
+        value: V,
+    ) -> Self {
+        self.attributes.push((name.into(), value.into()));
+        self
+    }
+
+    /// Returns the semantic name of this key.
+    #[inline]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the semantic version of this key.
+    #[inline]
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Returns the semantic attributes of this key in their named order.
+    #[inline]
+    pub fn attributes(&self) -> &[(Cow<'static, str>, CompositeAttribute)] {
+        &self.attributes
+    }
+}
+
+impl Display for CompositeKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.v{}", self.name, self.version)?;
+        if !self.attributes.is_empty() {
+            write!(formatter, " {{")?;
+            for (index, (name, value)) in self.attributes.iter().enumerate() {
+                if index > 0 {
+                    write!(formatter, ", ")?;
+                }
+                write!(formatter, "{name} = {value}")?;
+            }
+            write!(formatter, "}}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Retained body `x ↦ y` of a [`NamedComposite`], which receives every input of a call and returns its outputs. The
+/// definition traces it lazily, once per input types, when a call with those input types is first staged. Keeping
+/// operation bounds on [`Self::apply`] lets a definition retain the body without an `O: Operation` bound, avoiding a
+/// cycle with the operation family that contains its calls.
+///
+/// Note that closures with the corresponding signature implement this trait automatically. Consumers can use
+/// [`NamedComposite::body`] to access the retained callback for custom tracing.
+pub trait CompositeBody<V, O>: Send + Sync {
+    /// Applies this body to the provided inputs in their tracing context. The caller supplies any named-axis bindings
+    /// and validates the outputs against [`NamedComposite::output_types`]. Calling this function directly does not
+    /// consult or populate the definition's specialization caches.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ProgramError`] reported by the body.
+    fn apply(&self, inputs: &[CustomRuleTracer<V, O>]) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError>
+    where
+        V: Value,
+        O: Operation<Type = V::Type>,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>;
+}
+
+impl<V: Value, O: Operation<Type = V::Type>, F> CompositeBody<V, O> for F
+where
+    F: Fn(&[CustomRuleTracer<V, O>]) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError> + Send + Sync,
+    TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+{
+    #[inline]
+    fn apply(&self, inputs: &[CustomRuleTracer<V, O>]) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError> {
+        self(inputs)
+    }
+}
+
+/// Named computation that a [`CustomRuleDefinition`] optionally specifies, analogous to a StableHLO `composite`,
+/// which consists of a [`CompositeKey`] that gives it semantic identity, an output type rule, and a body (i.e.,
+/// its decomposition). Definitions with equal keys in one operation family and with equal scopes are the same
+/// computation. Their bodies and rules implement one contract, which is an obligation on whoever constructs them
+/// that the key cannot verify. Backends rely on it to replace calls by key and to index the functions that they emit
+/// for calls by key (e.g., the XLA backend), so a computation whose body or rules change requires a new key (e.g., a
+/// new version). A display label never establishes this identity, and neither does a matching body. Equal keys do not
+/// share definitions, though. Whoever constructs a definition registers it and owns its body and specialization caches,
+/// so calls share them by reusing that registration (e.g., by holding one [`Composite`](crate::Composite) value across
+/// calls).
+///
+/// Any backend may replace the calls of a named computation with its own implementation of that contract (e.g., a
+/// fused kernel), and calls that no backend replaces run or lower their body. A computation that should only ever run
+/// a particular implementation encodes that choice in its key (e.g., as an attribute) for the backends that recognize
+/// it to enforce.
+///
+/// The output type rule validates the inputs of calls and determines their outputs, whose types must be functions of
+/// the input types (i.e., they cannot define identities, such as data-dependent extents), because every call shares
+/// the body. The body is traced once per input types and cached with the definition, and calls attach that cached
+/// program as a shared region (refer to [`CompositeOperation`](crate::CompositeOperation)), so a call with cached input
+/// types never traces the body again. Input types include their type identities, so calls whose inputs have fresh
+/// symbolic extents (e.g., in a new trace) trace the body again for those identities.
+pub struct NamedComposite<V: Typed + Parameter, O> {
+    /// Semantic identity.
+    key: CompositeKey,
+
+    /// Output type rule, which validates the input types of a call and returns its output types.
+    output_types: Arc<dyn Fn(&[V::Type]) -> Result<Vec<V::Type>, ProgramError> + Send + Sync>,
+
+    /// Body.
+    body: Arc<dyn CompositeBody<V, O>>,
+}
+
+impl<V: Typed + Parameter, O> NamedComposite<V, O> {
+    /// Creates a new [`NamedComposite`] with the provided key, output type rule, and body. The output type rule must
+    /// accept exactly the input types for which the body is defined and return the types of the body's outputs, which
+    /// are validated whenever the body is traced.
+    #[inline]
+    pub fn new<T, B>(key: CompositeKey, output_types: T, body: B) -> Self
+    where
+        V: Value,
+        O: Operation<Type = V::Type>,
+        T: 'static + Fn(&[V::Type]) -> Result<Vec<V::Type>, ProgramError> + Send + Sync,
+        B: 'static + Fn(&[CustomRuleTracer<V, O>]) -> Result<Vec<CustomRuleTracer<V, O>>, ProgramError> + Send + Sync,
+        TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
+    {
+        Self { key, output_types: Arc::new(output_types), body: Arc::new(body) }
+    }
+
+    /// Returns the semantic identity (i.e., [`CompositeKey`]) of this [`NamedComposite`].
+    #[inline]
+    pub fn key(&self) -> &CompositeKey {
+        &self.key
+    }
+
+    /// Returns the output types of a call with the provided input types.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ProgramError`] of the output type rule when it rejects the input types.
+    #[inline]
+    pub fn output_types(&self, input_types: &[V::Type]) -> Result<Vec<V::Type>, ProgramError> {
+        (self.output_types)(input_types)
+    }
+
+    /// Returns the retained body callback of this [`NamedComposite`] for custom tracing. The [`Arc`] can be cloned
+    /// to retain the callback independently. Applying it directly requires the caller to supply any named-axis
+    /// bindings and validate its outputs against [`Self::output_types`], and does not use specialization caches.
+    #[inline]
+    pub fn body(&self) -> &Arc<dyn CompositeBody<V, O>> {
+        &self.body
+    }
+}
+
+impl<V: Typed + Parameter, O> Debug for NamedComposite<V, O> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("NamedComposite").field("key", &self.key).finish_non_exhaustive()
+    }
+}
 
 // The retained rules are stored behind the following object-safe traits rather than behind `dyn Fn` types because their
 // signatures mention tracing contexts, which require `O: Operation`. Keeping that requirement on the functions leaves
@@ -243,11 +623,11 @@ where
 }
 
 /// Retained accumulating custom Vector-Jacobian Product (VJP) backward rule. It is invoked while transposing a
-/// [`CompositeTransposeOperation`] with the known leading inputs (i.e., `p` followed by the residuals `r`), the
-/// output cotangent seeds, and one [`CotangentAccumulator`] per carrier input, and it submits the contributions
-/// of the differentiated inputs to their accumulators. A single rule therefore serves returned, caller-buffer,
-/// and ignored destinations, and can, for example, update only the affected entries of a caller-provided buffer
-/// instead of returning a full-sized cotangent.
+/// [`CompositeTransposeOperation`](crate::CompositeTransposeOperation) with the known leading inputs (i.e., `p`
+/// followed by the residuals `r`), the output cotangent seeds, and one [`CotangentAccumulator`] per carrier input,
+/// and it submits the contributions of the differentiated inputs to their accumulators. A single rule therefore serves
+/// returned, caller-buffer, and ignored destinations, and can, for example, update only the affected entries of a
+/// caller-provided buffer instead of returning a full-sized cotangent.
 pub trait CustomVjpAccumulatingBackwardRule<V, O>: Send + Sync {
     /// Applies this rule in the provided transposition context.
     fn apply(
@@ -541,6 +921,15 @@ impl<V: Typed + Parameter, O> CustomRuleBatching<V, O> {
         matches!(self.rule, CustomRuleBatchingRule::Derived(_))
     }
 
+    /// Returns whether broadcast-sensitive handling was configured for this rule through
+    /// [`CustomRuleDefinition::with_broadcast_sensitive_batching_rule`]. Derived rules inherit this setting, which
+    /// enables them to recover exact per-item tangents when broadcasting replicated inputs changes the source rule's
+    /// per-item numerical behavior. This reports the configuration without inspecting the callback's behavior.
+    #[inline]
+    pub fn is_broadcast_sensitive(&self) -> bool {
+        self.broadcast_sensitivity.is_some()
+    }
+
     /// Returns the derivation that a derived definition's batching rule applies, or [`None`] for a retained custom
     /// callback. The derivation remains internal because its specialization keys are internal.
     #[inline]
@@ -603,11 +992,12 @@ where
 {
 }
 
-/// Definition of a custom rule set whose derivative rules are retained callbacks that are traced lazily, on the first
-/// request of each specialization. A definition is registered once (refer to [`CustomRuleRegistration`]) and shared by
-/// every call that uses it, and two definitions are the same rule set exactly when they are the same definition (i.e.,
-/// identity is a process-unique identifier assigned at construction rather than structural). [`Self::name`] is a
-/// human-readable label for rendering and diagnostics only; distinct definitions may share it.
+/// Shared definition of a custom rule set whose derivative rules are retained callbacks that are traced lazily, on
+/// the first request of each specialization, and which optionally specifies a named computation that its calls compute
+/// (i.e., a [`NamedComposite`]). A definition is registered once and shared by every call that uses it, and two
+/// definitions are the same rule set exactly when they are the same definition (i.e., identity is a process-unique
+/// identifier assigned at construction rather than structural), including definitions of named computations with equal
+/// keys. [`Self::name`] is a display label for rendering and diagnostics only, and distinct definitions may share it.
 ///
 /// Specialization is deterministic and repeatable but not exactly-once: eviction, retries after a failed
 /// specialization, concurrent cold requests, and requests made after the registration handle was dropped may invoke
@@ -618,11 +1008,11 @@ where
 ///
 /// The specialized programs are not stored in the definition, because a program that calls the definition (e.g., a
 /// rule that calls its own definition, directly or through other definitions) would then keep the definition alive
-/// forever. They are stored in caches owned by the [`CustomRuleRegistration`] handle, while calls and rules refer to
-/// the definition through a [`CustomRuleReference`], which holds the definition strongly and the caches only weakly.
-/// The strong references therefore always point from programs to definitions and from the handle to the caches, and
-/// never back from a definition to a program. Refer to [`CustomRuleRegistration`] for how rules must refer to
-/// definitions.
+/// forever. They are stored in caches owned by the [`CustomRuleRegistration`](crate::CustomRuleRegistration) handle,
+/// while calls and rules refer to the definition through a [`CustomRuleReference`](crate::CustomRuleReference), which
+/// holds the definition strongly and the caches only weakly. The strong references therefore always point from programs
+/// to definitions and from the handle to the caches, and never back from a definition to a program. Refer to
+/// [`CustomRuleRegistration`](crate::CustomRuleRegistration) for how rules must refer to definitions.
 pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Process-unique identity of this definition.
     id: u64,
@@ -630,8 +1020,12 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Human-readable label used for rendering and diagnostics.
     name: Cow<'static, str>,
 
-    /// Named axes with which every rule is traced.
-    named_axes: Vec<(String, NamedAxis)>,
+    /// Scope (i.e., the named axes, the default mesh, and the enclosing manual axes) in which every rule is traced.
+    scope: TracingScope,
+
+    /// Optional named computation that the calls of this definition compute, which definitions derived from
+    /// this definition never inherit because they describe other computations.
+    named_composite: Option<NamedComposite<V, O>>,
 
     /// Optional forward mode differentiation rule.
     jvp: Option<CustomRuleJvp<V, O>>,
@@ -682,6 +1076,17 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// Optional batch axes of the outputs of batched calls, which default to mapping every output at axis 0.
     batched_output_axes: Option<Vec<BatchAxis>>,
 
+    /// Optional mesh axes that the retained rules may communicate along, which definitions derived from this
+    /// definition inherit. Refer to [`Self::with_rule_axes`] for more information.
+    rule_axes: Option<Vec<String>>,
+
+    /// Validation of every traced rule program against [`Self::rule_axes`] (i.e., `validate_rule_axes` for the
+    /// operation family), which is set exactly when the rule axes are declared. It is captured where the family's
+    /// [`CollectiveOperation`] implementation is known, because requiring that implementation on the operations'
+    /// own rules would form a cycle with the payload bounds of the families that contain them.
+    #[allow(clippy::type_complexity)]
+    rule_validator: Option<fn(&Self, &str, &Program<V, O, Vec<V>, Vec<V>>) -> Result<(), ProgramError>>,
+
     /// Optional custom batching rule, which is a derivation for the definitions derived from a definition that has one.
     batching_rule: Option<CustomRuleBatching<V, O>>,
 
@@ -700,9 +1105,9 @@ pub struct CustomRuleDefinition<V: Typed + Parameter, O> {
     /// static keys only, so they never retain a program.
     uncached_specializations: Mutex<HashSet<(ThreadId, CustomRuleSpecializationRequest<V::Type>)>>,
 
-    /// Definitions derived from this definition (refer to [`CustomRuleSpecializer::derived`]), held weakly so that a
-    /// derived definition that some call still holds keeps its identity whether or not its registration is alive,
-    /// while a derived definition, which holds this definition strongly, never forms a cycle with it.
+    /// Definitions derived from this definition, held weakly so that a derived definition that some call still holds
+    /// keeps its identity whether or not its registration is alive, while a derived definition, which holds this
+    /// definition strongly, never forms a cycle with it.
     derived_definitions: Mutex<HashMap<CustomRuleDerivedDefinitionKey, Weak<CustomRuleDefinition<V, O>>>>,
 }
 
@@ -713,13 +1118,16 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         Self {
             id: NEXT_CUSTOM_RULE_DEFINITION_ID.fetch_add(1, Ordering::Relaxed),
             name: name.into(),
-            named_axes: Vec::new(),
+            scope: TracingScope::default(),
+            named_composite: None,
             jvp: None,
             vjp: None,
             deferred_forward: false,
             structural_batcher: None,
             sequential_batching_scan: None,
             batched_output_axes: None,
+            rule_axes: None,
+            rule_validator: None,
             batching_rule: None,
             discharger: None,
             uncached_specializations: Mutex::new(HashSet::new()),
@@ -727,28 +1135,42 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         }
     }
 
-    /// Creates a definition derived from this definition, inheriting its named axes and transform support. The derived
-    /// definition uses its primal region for forward mode and the provided derived batching rule, with no reverse
-    /// mode rules or explicit output batch axes of its own.
+    /// Creates a definition derived from this definition, inheriting its scope and transform support. The derived
+    /// definition uses its primal region for forward mode and the provided derived batching rule, with no reverse mode
+    /// rules or explicit output batch axes of its own.
     pub(super) fn new_derived(&self, name: String, batching_rule: Option<CustomRuleBatching<V, O>>) -> Self {
         Self {
-            named_axes: self.named_axes.clone(),
+            scope: self.scope.clone(),
             jvp: Some(CustomRuleJvp::Derived),
             structural_batcher: self.structural_batcher.clone(),
             sequential_batching_scan: self.sequential_batching_scan.clone(),
+            rule_axes: self.rule_axes.clone(),
+            rule_validator: self.rule_validator,
             batching_rule,
             discharger: self.discharger.clone(),
             ..Self::new(name)
         }
     }
 
-    /// Returns this [`CustomRuleDefinition`] with the provided named axes, with which every rule is traced, so that
-    /// the rules resolve the names bound where the calls that apply them are made (e.g., an `axis_index` over the axis
-    /// of an enclosing batching level). The rules are traced lazily and in fresh traces, which see no enclosing
-    /// bindings otherwise. The definitions that are derived from this definition trace their rules with the same axes.
+    /// Returns this [`CustomRuleDefinition`] with the provided [`TracingScope`] (i.e., the named axes, the default
+    /// mesh, and the enclosing manual axes) in which every rule is traced, so that the rules resolve the names bound,
+    /// the default mesh, and the manual axes where the calls that apply them are made (e.g., an `axis_index` over the
+    /// axis of an enclosing batching level, or a `shard_map` that must not make an enclosing manual axis manual again).
+    /// The rules are traced lazily and in fresh traces, which see an empty scope otherwise. The definitions that are
+    /// derived from this definition trace their rules in the same scope.
     #[inline]
-    pub fn with_named_axes(mut self, named_axes: Vec<(String, NamedAxis)>) -> Self {
-        self.named_axes = named_axes;
+    pub fn with_scope(mut self, scope: TracingScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    /// Returns this [`CustomRuleDefinition`] with the provided named computation (refer to [`NamedComposite`]),
+    /// whose calls this definition then describes, and with the name of its key as the definition's label, so that
+    /// the rendering of its calls depends on the key rather than on the construction.
+    #[inline]
+    pub fn with_named_composite(mut self, named_composite: NamedComposite<V, O>) -> Self {
+        self.name = Cow::Owned(named_composite.key().name().to_owned());
+        self.named_composite = Some(named_composite);
         self
     }
 
@@ -980,12 +1402,12 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     /// Returns this [`CustomRuleDefinition`] with its reverse mode differentiation forward rule deferred to the
     /// backward pass (i.e., the analogue of JAX's `custom_vjp(..., optimize_remat=True)`). Reverse mode then computes
     /// the outputs of a call with its primal region, which is cheaper than the forward rule whenever the residuals cost
-    /// extra work, and stages a [`CompositeTransposeOperation`] carrier whose leading inputs are the call's own inputs
-    /// rather than the residuals. Transposing that carrier replays the forward rule on those inputs to recover the
-    /// residuals and then applies the backward rule. The call's inputs are therefore the only values that its
-    /// derivative keeps alive between the two passes, which residual policies (e.g., that of a
-    /// [`RematerializeOperation`](crate::RematerializeOperation)) save or recompute like any
-    /// other value, and the forward rule runs only once, in the backward pass.
+    /// extra work, and stages a [`CompositeTransposeOperation`](crate::CompositeTransposeOperation) carrier whose
+    /// leading inputs are the call's own inputs rather than the residuals. Transposing that carrier replays the
+    /// forward rule on those inputs to recover the residuals and then applies the backward rule. The call's inputs are
+    /// therefore the only values that its derivative keeps alive between the two passes, which residual policies (e.g.,
+    /// that of a [`RematerializeOperation`](crate::RematerializeOperation)) save or recompute like any other value, and
+    /// the forward rule runs only once, in the backward pass.
     ///
     /// The swap applies whenever reverse mode partitions a call, and it has no effect on a definition without reverse
     /// mode rules (refer to [`Self::with_vjp`]). A call whose unused outputs were pruned (refer to
@@ -1066,6 +1488,60 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     #[inline]
     pub fn with_batched_output_axes(mut self, output_axes: Vec<BatchAxis>) -> Self {
         self.batched_output_axes = Some(output_axes);
+        self
+    }
+
+    /// Returns this [`CustomRuleDefinition`] with a declaration of the mesh axes that its retained rules (i.e., its
+    /// forward mode, reverse mode, and batching rules) may communicate along, where an empty list declares that they
+    /// communicate along no mesh axis. The rules are traced only when a transform requests them, so analyses that must
+    /// prove that a call does not use an axis (refer to [`CollectiveOperation::hidden_axes`]) assume that an undeclared
+    /// definition's rules communicate along every axis, and that a declared definition's rules communicate along the
+    /// declared axes only. The declaration covers the rules only, because the primal region of every call is inspected
+    /// directly. The definitions derived from this definition (e.g., for the derived calls of its forward mode
+    /// derivatives) inherit it, because their rules are derived from these rules.
+    ///
+    /// The declaration exists only to let batching release manual axes (e.g., the batching of an enclosing
+    /// `shard_map`), so it promises everything that releasing another manual axis requires of the rules.
+    /// They communicate only along the declared mesh axes, and they have no effect that runs once per device (i.e.,
+    /// any effect other than an [`EffectClass::OrderedAssertion`](crate::EffectClass::OrderedAssertion) or the
+    /// [`EffectClass::OrderedState`](crate::EffectClass::OrderedState) of structured reference effects, such as I/O or
+    /// opaque state) anywhere in their region closure, including the dormant rule regions of the operations that they
+    /// call, because every device along a manual axis runs its own occurrence of such an effect, which releasing the
+    /// axis would eliminate. A body with such an effect can never have an axis released, so a definition whose rules
+    /// have one gains nothing from a declaration and must leave its rule axes undeclared. Its axes then stay manual
+    /// and its effects keep running once per device.
+    ///
+    /// # Errors
+    ///
+    /// The declaration is checked rather than trusted. Every rule program is validated when it is traced, before it
+    /// is cached or used, so the request that traces a rule (e.g., a derivative or batching request) fails with a
+    /// [`ProgramError::UnsupportedOperation`] when the rule has an effect that runs once per device, communicates along
+    /// a mesh axis of the definition's scope (i.e., one of its manual axes or [`NamedAxis::Mesh`] bindings, whereas a
+    /// batch axis is not restricted) that is not declared, or calls an operation whose hidden axes are unknown or
+    /// include an axis that is not declared (e.g., another composite whose rule axes are not declared).
+    #[inline]
+    pub fn with_rule_axes<A: Into<String>, I: IntoIterator<Item = A>>(self, axis_names: I) -> Self
+    where
+        V: Value,
+        O: Operation<Type = V::Type> + CollectiveOperation,
+    {
+        self.with_validated_rule_axes(axis_names.into_iter().map(Into::into).collect(), validate_rule_axes::<V, O>)
+    }
+
+    /// Returns this [`CustomRuleDefinition`] with the provided rule axes and their validator, which must be
+    /// [`validate_rule_axes`] for the operation family. A [`Composite`](crate::Composite) captures that validator
+    /// where it declares its rule axes, because the registration of its definitions cannot require the family's
+    /// [`CollectiveOperation`] implementation without requiring it of every caller. Refer to [`Self::with_rule_axes`]
+    /// for more information.
+    #[allow(clippy::type_complexity)]
+    #[inline]
+    pub(crate) fn with_validated_rule_axes(
+        mut self,
+        axis_names: Vec<String>,
+        validator: fn(&Self, &str, &Program<V, O, Vec<V>, Vec<V>>) -> Result<(), ProgramError>,
+    ) -> Self {
+        self.rule_axes = Some(axis_names);
+        self.rule_validator = Some(validator);
         self
     }
 
@@ -1214,16 +1690,26 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         self.id
     }
 
-    /// Returns the human-readable label of this [`CustomRuleDefinition`], borrowed without cloning it.
+    /// Returns the display label of this [`CustomRuleDefinition`], borrowed without cloning it, which rendering and
+    /// diagnostics use. It never identifies the definition: distinct definitions may share it, and the label of a named
+    /// computation is the name of its key. Refer to [`Self::with_named_composite`] for more information.
     #[inline]
     pub fn name(&self) -> &str {
         self.name.as_ref()
     }
 
-    /// Returns the named axes with which the rules of this [`CustomRuleDefinition`] are traced.
+    /// Returns the [`TracingScope`] (i.e., the named axes, the default mesh, and the enclosing manual axes) in which
+    /// the rules of this [`CustomRuleDefinition`] are traced.
     #[inline]
-    pub fn named_axes(&self) -> &[(String, NamedAxis)] {
-        &self.named_axes
+    pub fn scope(&self) -> &TracingScope {
+        &self.scope
+    }
+
+    /// Returns the named computation that the calls of this [`CustomRuleDefinition`] compute, or [`None`]
+    /// for a definition whose identity is its process-unique [`Self::id`] only.
+    #[inline]
+    pub fn named_composite(&self) -> Option<&NamedComposite<V, O>> {
+        self.named_composite.as_ref()
     }
 
     /// Returns the configured forward mode rule, or [`None`] when no forward mode rule is configured. An explicit
@@ -1292,6 +1778,13 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     #[inline]
     pub fn batched_output_axes(&self) -> Option<&[BatchAxis]> {
         self.batched_output_axes.as_deref()
+    }
+
+    /// Returns the mesh axes that the retained rules may communicate along, or [`None`] when they are not declared.
+    /// Refer to [`Self::with_rule_axes`] for more information.
+    #[inline]
+    pub fn rule_axes(&self) -> Option<&[String]> {
+        self.rule_axes.as_deref()
     }
 
     /// Returns the configured custom batching rule and its support for derived definitions, or [`None`] when there
@@ -1378,13 +1871,30 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
         };
         Ok(discharger(program)?)
     }
+
+    /// Validates `program`, which was just traced from this definition's `rule` rule (e.g., `"JVP"` or `"backward"`,
+    /// which diagnostics name), against the declaration of its rule axes before the program is cached or used. A
+    /// definition without a declaration accepts every rule program. Refer to [`Self::with_rule_axes`] for the checks.
+    pub(crate) fn validate_rule_program(
+        &self,
+        rule: &str,
+        program: &Program<V, O, Vec<V>, Vec<V>>,
+    ) -> Result<(), ProgramError> {
+        match self.rule_validator {
+            Some(validator) => validator(self, rule, program),
+            None => Ok(()),
+        }
+    }
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O> Debug for CustomRuleDefinition<V, O> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("CustomRuleDefinition")
-            .field("name", &self.name)
+        let mut debug = formatter.debug_struct("CustomRuleDefinition");
+        debug.field("name", &self.name);
+        if let Some(named_composite) = &self.named_composite {
+            debug.field("key", named_composite.key());
+        }
+        debug
             .field("has_jvp", &matches!(self.jvp, Some(CustomRuleJvp::Rule(_) | CustomRuleJvp::SymbolicZeroRule(_))))
             .field("derives_jvp_from_primal", &matches!(self.jvp, Some(CustomRuleJvp::Derived)))
             .field("has_vjp", &self.vjp.is_some())
@@ -1412,6 +1922,81 @@ where
     Ok((Arc::unwrap_or_clone(transposed.into_program()), cotangents))
 }
 
+/// Validates `program`, which was just traced from the `rule` rule of `definition`, against the rule axes that
+/// `definition` declares (refer to [`CustomRuleDefinition::with_rule_axes`]). No instruction in the region closure
+/// of the program, including dormant rule regions, may have an effect that runs once per device (refer to
+/// [`device_count_sensitive_effect_class`](crate::EffectsSummary::device_count_sensitive_effect_class)),
+/// every mesh axis that one of its instructions communicates along must be declared, and every hidden axis of its
+/// instructions must be known and declared. Mesh axes are those of the definition's [`TracingScope`] (i.e., its manual
+/// axes and its [`NamedAxis::Mesh`] bindings), while an axis that the scope binds only to a batching level, or does not
+/// bind at all, cannot be released by batching a manual region and is therefore not restricted.
+pub(crate) fn validate_rule_axes<V, O>(
+    definition: &CustomRuleDefinition<V, O>,
+    rule: &str,
+    program: &Program<V, O, Vec<V>, Vec<V>>,
+) -> Result<(), ProgramError>
+where
+    V: Value<Type: Eq + Hash>,
+    O: Operation<Type = V::Type> + CollectiveOperation,
+{
+    let declared_axes = definition.rule_axes().unwrap_or_default();
+    let violation = |reason: String| ProgramError::UnsupportedOperation {
+        message: format!(
+            "{} {} rule {}, which the rule axes declared with `with_rule_axes` do not allow",
+            describe_composite(COMPOSITE_OPERATION_NAME, definition.name()),
+            rule,
+            reason,
+        ),
+    };
+
+    // Every device along a manual axis runs its own occurrence of such an effect, and a later transform may activate
+    // the dormant rule regions that `Program::effects` excludes, so the whole closure is scanned.
+    if let Some(effect_class) = program
+        .entry_region_ref()
+        .instructions_in_closure()
+        .find_map(|(_, instruction)| instruction.operation().effects().summary().device_count_sensitive_effect_class())
+    {
+        return Err(violation(format!("has the `{effect_class:?}` effect")));
+    }
+
+    let scope = definition.scope();
+    let is_mesh_axis = |axis_name: &String| {
+        scope.manual_axes().iter().any(|(name, _)| name == axis_name)
+            || scope
+                .named_axes()
+                .iter()
+                .any(|(name, axis)| name == axis_name && matches!(axis, NamedAxis::Mesh { .. }))
+    };
+    for (_, instruction) in program.entry_region_ref().instructions_in_closure() {
+        let operation = instruction.operation();
+        let axes = operation.axes();
+        if let Some(axis_name) =
+            axes.names().iter().find(|axis_name| is_mesh_axis(axis_name) && !declared_axes.contains(axis_name))
+        {
+            return Err(violation(format!("communicates along mesh axis `{axis_name}`")));
+        }
+        match operation.hidden_axes() {
+            HiddenAxes::None => {}
+            HiddenAxes::Named(axis_names) => {
+                if let Some(axis_name) = axis_names.iter().find(|axis_name| !declared_axes.contains(axis_name)) {
+                    return Err(violation(format!(
+                        "calls `{}`, whose rules may communicate along axis `{}`",
+                        operation.name(),
+                        axis_name,
+                    )));
+                }
+            }
+            HiddenAxes::Unknown => {
+                return Err(violation(format!(
+                    "calls `{}`, whose rules may communicate along any axis",
+                    operation.name(),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1422,7 +2007,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, ShardingDimension,
     };
-    use crate::axes::AxisError;
+    use crate::axes::{AxisError, NamedAxis};
     use crate::batching::BatchingLevelExtent;
     use crate::differentiation::{CotangentDestinationKind, TransposedProgramCotangent};
     use crate::operations::collectives::axis_index::AxisIndex;
@@ -1512,6 +2097,189 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_attribute_from() {
+        assert_eq!(CompositeAttribute::from(true), CompositeAttribute::Boolean(true));
+        assert_eq!(CompositeAttribute::from(DataType::F32), CompositeAttribute::DataType(DataType::F32));
+        assert_eq!(CompositeAttribute::from(i128::MIN), CompositeAttribute::Integer(i128::MIN));
+        assert_eq!(CompositeAttribute::from(i128::MAX), CompositeAttribute::Integer(i128::MAX));
+        assert_eq!(CompositeAttribute::from(u64::MAX), CompositeAttribute::Integer(18446744073709551615));
+        assert_eq!(CompositeAttribute::from(usize::MAX), CompositeAttribute::Integer(usize::MAX as i128));
+        assert_eq!(CompositeAttribute::from(isize::MIN), CompositeAttribute::Integer(isize::MIN as i128));
+
+        // Each structural conversion composes with the scalar conversions, including the full range of a seed.
+        assert_eq!(
+            CompositeAttribute::from(Some((0.5f64, u64::MAX))),
+            CompositeAttribute::Optional(Some(Box::new(CompositeAttribute::Sequence(vec![
+                CompositeAttribute::Float(0.5),
+                CompositeAttribute::Integer(18446744073709551615),
+            ])))),
+        );
+        assert_eq!(
+            CompositeAttribute::from(vec![vec![-1i64], Vec::new()]),
+            CompositeAttribute::Sequence(vec![
+                CompositeAttribute::Sequence(vec![CompositeAttribute::Integer(-1)]),
+                CompositeAttribute::Sequence(Vec::new()),
+            ]),
+        );
+        assert_eq!(
+            CompositeAttribute::from(Some(None::<u64>)),
+            CompositeAttribute::Optional(Some(Box::new(CompositeAttribute::Optional(None)))),
+        );
+        assert_ne!(CompositeAttribute::from(3), CompositeAttribute::from(Some(3)));
+        assert_ne!(CompositeAttribute::from(None::<u64>), CompositeAttribute::from(Some(None::<u64>)));
+    }
+
+    #[test]
+    fn test_composite_attribute_from_tuple() {
+        // Every supported arity preserves element order, including the empty and singleton tuples.
+        let tuples = [
+            CompositeAttribute::from(()),
+            CompositeAttribute::from((0,)),
+            CompositeAttribute::from((0, 1)),
+            CompositeAttribute::from((0, 1, 2)),
+            CompositeAttribute::from((0, 1, 2, 3)),
+            CompositeAttribute::from((0, 1, 2, 3, 4)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6, 7)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6, 7, 8)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6, 7, 8, 9)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)),
+            CompositeAttribute::from((0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)),
+        ];
+        for (length, attribute) in tuples.into_iter().enumerate() {
+            assert_eq!(
+                attribute,
+                CompositeAttribute::Sequence(
+                    (0..length).map(|value| CompositeAttribute::Integer(value as i128)).collect()
+                ),
+            );
+        }
+
+        // Heterogeneous tuples compose recursively with optional values and nested tuples.
+        assert_eq!(
+            CompositeAttribute::from((true, Some((DataType::F32, 0.5f64, u64::MAX)), None::<()>)),
+            CompositeAttribute::Sequence(vec![
+                CompositeAttribute::Boolean(true),
+                CompositeAttribute::Optional(Some(Box::new(CompositeAttribute::Sequence(vec![
+                    CompositeAttribute::DataType(DataType::F32),
+                    CompositeAttribute::Float(0.5),
+                    CompositeAttribute::Integer(18446744073709551615),
+                ])))),
+                CompositeAttribute::Optional(None),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_composite_attribute_debug() {
+        assert_eq!(format!("{:?}", CompositeAttribute::Float(0.5)), "Float(4602678819172646912)");
+        assert_eq!(
+            format!("{:?}", CompositeAttribute::from(Some((0.5f64, 7u64)))),
+            "Optional(Some(Sequence([Float(4602678819172646912), Integer(7)])))",
+        );
+        assert_eq!(format!("{:?}", CompositeAttribute::from(Some(None::<u64>))), "Optional(Some(Optional(None)))");
+        assert_eq!(
+            format!("{:?}", CompositeAttribute::from(vec![true, false])),
+            "Sequence([Boolean(true), Boolean(false)])"
+        );
+        assert_eq!(format!("{:?}", CompositeAttribute::from(DataType::F32)), "DataType(F32)");
+    }
+
+    #[test]
+    fn test_composite_attribute_display() {
+        assert_eq!(CompositeAttribute::from(vec![vec![vec![1usize], vec![0]], vec![]]).to_string(), "[[[1], [0]], []]");
+        assert_eq!(CompositeAttribute::DataType(DataType::F32).to_string(), DataType::F32.to_string());
+        assert_eq!(CompositeAttribute::Boolean(true).to_string(), "true");
+        assert_eq!(CompositeAttribute::Integer(-3).to_string(), "-3");
+        assert_eq!(CompositeAttribute::Float(0.25).to_string(), "0.25");
+        assert_eq!(CompositeAttribute::Float(-0.0).to_string(), "-0.0");
+        assert_eq!(
+            CompositeAttribute::Float(f64::from_bits(0x7ff8_0000_0000_0001)).to_string(),
+            "nan(0x7ff8000000000001)"
+        );
+        assert_eq!(CompositeAttribute::from(None::<f64>).to_string(), "none");
+        assert_eq!(CompositeAttribute::from(Some(3)).to_string(), "some(3)");
+        assert_eq!(CompositeAttribute::from(Some((0.5f64, 7u64))).to_string(), "some([0.5, 7])");
+        assert_eq!(CompositeAttribute::from(Some(None::<u64>)).to_string(), "some(none)");
+    }
+
+    #[test]
+    fn test_composite_attribute_equality_and_hashing() {
+        let positive_zero = CompositeAttribute::Float(0.0);
+        let negative_zero = CompositeAttribute::Float(-0.0);
+        let positive_infinity = CompositeAttribute::Float(f64::INFINITY);
+        let negative_infinity = CompositeAttribute::Float(f64::NEG_INFINITY);
+        let first_nan = CompositeAttribute::Float(f64::from_bits(0x7ff8_0000_0000_0001));
+        let second_nan = CompositeAttribute::Float(f64::from_bits(0x7ff8_0000_0000_0002));
+        let attributes = HashSet::from([
+            positive_zero.clone(),
+            negative_zero.clone(),
+            positive_infinity.clone(),
+            negative_infinity.clone(),
+            first_nan.clone(),
+            second_nan.clone(),
+            first_nan.clone(),
+        ]);
+        assert_eq!(attributes.len(), 6);
+        assert!(attributes.contains(&positive_zero));
+        assert!(attributes.contains(&negative_zero));
+        assert!(attributes.contains(&positive_infinity));
+        assert!(attributes.contains(&negative_infinity));
+        assert!(attributes.contains(&first_nan));
+        assert!(attributes.contains(&second_nan));
+        assert_ne!(CompositeAttribute::Integer(1), CompositeAttribute::Float(1.0));
+        assert_ne!(CompositeAttribute::from(vec![1, 2]), CompositeAttribute::from(vec![2, 1]));
+        assert_ne!(CompositeAttribute::from(Vec::<i64>::new()), CompositeAttribute::from(None::<i64>));
+
+        // Bitwise identity applies recursively, including when a NaN is nested inside an optional pair.
+        let nested = CompositeAttribute::from(Some((f64::from_bits(0x7ff8_0000_0000_0001), u64::MAX)));
+        let repeated = CompositeAttribute::from(Some((f64::from_bits(0x7ff8_0000_0000_0001), u64::MAX)));
+        let attributes = HashMap::from([(nested, "dropout")]);
+        assert_eq!(attributes.get(&repeated), Some(&"dropout"));
+    }
+
+    #[test]
+    fn test_composite_key() {
+        let key = CompositeKey::new("ryft.example", 2)
+            .with_attribute("causal", true)
+            .with_attribute("scale", Some(0.125f64));
+        assert_eq!(key.name(), "ryft.example");
+        assert_eq!(key.version(), 2);
+        assert_eq!(
+            key.attributes().iter().map(|(name, value)| (name.as_ref(), value.clone())).collect::<Vec<_>>(),
+            vec![("causal", CompositeAttribute::Boolean(true)), ("scale", CompositeAttribute::from(Some(0.125f64))),],
+        );
+        assert_eq!(key.to_string(), "ryft.example.v2 {causal = true, scale = some(0.125)}");
+        assert_eq!(CompositeKey::new("ryft.example", 2).to_string(), "ryft.example.v2");
+    }
+
+    #[test]
+    fn test_composite_key_equality() {
+        // Floating point attributes compare by their IEEE bits, and the version and attribute order are part of the
+        // identity.
+        let key = |value: f64| CompositeKey::new("ryft.example", 0).with_attribute("x", Some(value));
+        let positive_zero = key(0.0);
+        let negative_zero = key(-0.0);
+        assert_eq!(positive_zero, key(0.0));
+        assert_ne!(positive_zero, negative_zero);
+        assert_eq!(key(f64::NAN), key(f64::NAN));
+        assert_ne!(CompositeKey::new("ryft.example", 0), CompositeKey::new("ryft.example", 1));
+        assert_ne!(
+            CompositeKey::new("ryft.example", 0)
+                .with_attribute("a", CompositeAttribute::Boolean(true))
+                .with_attribute("b", CompositeAttribute::Boolean(false)),
+            CompositeKey::new("ryft.example", 0)
+                .with_attribute("b", CompositeAttribute::Boolean(false))
+                .with_attribute("a", CompositeAttribute::Boolean(true)),
+        );
+        let keys = HashSet::from([positive_zero.clone(), negative_zero.clone(), key(0.0)]);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&positive_zero));
+        assert!(keys.contains(&negative_zero));
+    }
+
+    #[test]
     fn test_custom_rule_vjp_forward() {
         // The forward rule of the cube returns its output `x³` followed by the residual `x²`.
         let counters = Arc::new(RuleCounters::default());
@@ -1597,7 +2365,7 @@ mod tests {
         // A new definition has its label and no rules, so every request for a rule is rejected.
         let definition = TestDefinition::new("cube");
         assert_eq!(definition.name(), "cube");
-        assert!(definition.named_axes().is_empty());
+        assert_eq!(definition.scope(), &TracingScope::default());
         assert!(definition.jvp().is_none());
         assert!(definition.vjp().is_none());
         assert!(!definition.deferred_forward());
@@ -1642,10 +2410,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_rule_definition_with_named_axes() {
-        // Every rule is traced with the named axes, so a forward mode rule that scales its tangent by the index along
-        // the batch axis `batch` resolves that axis.
-        let named_axes = vec![("batch".to_string(), NamedAxis::Batched { size: Some(3) })];
+    fn test_custom_rule_definition_with_scope() {
+        // Every rule is traced in the scope, so a forward mode rule that scales its tangent by the index along the
+        // batch axis `batch` resolves that axis.
+        let scope = TracingScope::new(vec![("batch".to_string(), NamedAxis::Batched { size: Some(3) })], None);
         let definition = || {
             MemberDefinition::new("scaled").with_jvp(|primals, tangents| {
                 let index = primals[0].context().axis_index("batch")?.convert_element_type(DataType::F64)?;
@@ -1654,7 +2422,7 @@ mod tests {
         };
         let scalar_type = ArrayType::scalar(DataType::F64);
         let key = unbatched_key(vec![scalar_type.clone()], vec![scalar_type], vec![true]);
-        let registration = CustomRuleRegistration::new(definition().with_named_axes(named_axes.clone()));
+        let registration = CustomRuleRegistration::new(definition().with_scope(scope.clone()));
         let specialization = registration.reference().jvp_specialization(key.clone()).unwrap();
         assert_eq!(
             specialization.program.to_string(),
@@ -1668,18 +2436,17 @@ mod tests {
             .trim_end(),
         );
 
-        // Without the named axes, the fresh trace of the rule cannot resolve the batch axis.
+        // Without the scope, the fresh trace of the rule cannot resolve the batch axis.
         assert!(matches!(
             CustomRuleRegistration::new(definition()).reference().jvp_specialization(key),
             Err(DifferentiationError::Program(ProgramError::Axis(AxisError::UnboundAxisName { name })))
                 if name == "batch",
         ));
 
-        // The definitions derived from the definition inherit its named axes.
-        let registration =
-            CustomRuleRegistration::new(identity_batching_definition().with_named_axes(named_axes.clone()));
+        // The definitions derived from the definition inherit its scope.
+        let registration = CustomRuleRegistration::new(identity_batching_definition().with_scope(scope.clone()));
         let derived = registration.reference().derived(jvp_derivation_key()).unwrap();
-        assert_eq!(derived.definition().named_axes(), named_axes.as_slice());
+        assert_eq!(derived.definition().scope(), &scope);
     }
 
     #[test]
@@ -2011,6 +2778,18 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_rule_definition_with_rule_axes() {
+        // A later declaration replaces an earlier one, an empty declaration differs from no declaration, and the
+        // definitions derived from a definition inherit its declaration, because their rules derive from its rules.
+        let definition = TestDefinition::new("pair").with_rule_axes(["y"]).with_rule_axes(["x", "z"]);
+        assert_eq!(definition.rule_axes(), Some(["x".to_string(), "z".to_string()].as_slice()));
+        assert_eq!(TestDefinition::new("pair").with_rule_axes(Vec::<String>::new()).rule_axes(), Some([].as_slice()));
+        let derived = definition.new_derived("jvp(pair)".to_string(), None);
+        assert_eq!(derived.rule_axes(), Some(["x".to_string(), "z".to_string()].as_slice()));
+        assert_eq!(TestDefinition::new("pair").new_derived("jvp(pair)".to_string(), None).rule_axes(), None);
+    }
+
+    #[test]
     fn test_custom_rule_definition_with_batching_rule() {
         // The rule becomes the definition's own batching rule, which is not broadcast sensitive.
         let definition = MemberDefinition::new("square")
@@ -2147,10 +2926,10 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_rule_definition_named_axes() {
-        let named_axes = vec![("batch".to_string(), NamedAxis::Batched { size: Some(3) })];
-        assert!(TestDefinition::new("cube").named_axes().is_empty());
-        assert_eq!(TestDefinition::new("cube").with_named_axes(named_axes.clone()).named_axes(), named_axes.as_slice());
+    fn test_custom_rule_definition_scope() {
+        let scope = TracingScope::new(vec![("batch".to_string(), NamedAxis::Batched { size: Some(3) })], None);
+        assert_eq!(TestDefinition::new("cube").scope(), &TracingScope::default());
+        assert_eq!(TestDefinition::new("cube").with_scope(scope.clone()).scope(), &scope);
     }
 
     #[test]
@@ -2203,6 +2982,12 @@ mod tests {
         assert_eq!(TestDefinition::new("pair").batched_output_axes(), None);
         let definition = TestDefinition::new("pair").with_batched_output_axes(output_axes.clone());
         assert_eq!(definition.batched_output_axes(), Some(output_axes.as_slice()));
+    }
+
+    #[test]
+    fn test_custom_rule_definition_rule_axes() {
+        assert_eq!(TestDefinition::new("pair").rule_axes(), None);
+        assert_eq!(TestDefinition::new("pair").with_rule_axes(["x"]).rule_axes(), Some(["x".to_string()].as_slice()));
     }
 
     #[test]

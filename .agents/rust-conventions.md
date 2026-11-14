@@ -12,9 +12,14 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   consuming functions, then private helpers. Place `with_*` functions immediately after constructors. Keep private
   constructors with constructors, merge adjacent inherent impl blocks with identical bounds, and order the corresponding
   tests by the public functions while keeping edge cases together.
+- Order the private items of a module as the private types (each followed by its implementation blocks), then the
+  private helper functions, at the end of the module and before its tests. Keep both groups in the same order of the
+  areas that they serve (e.g., boundary, interpretation, partial evaluation, batching, differentiation, transposition).
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - Use the narrowest visibility that reaches actual callers; keep module-internal helpers private.
+- Give trait function arguments descriptive names without a leading underscore. When a default implementation does
+  not use them, start its body with `let _ = (...);` to mark the unused arguments explicitly.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.
 - For a function that queries or validates a particular instance, including a type descriptor, use a receiver such as
   `&self` rather than a named first argument of type `&Self`. Prefer normal method-call syntax for receiver-based calls
@@ -83,6 +88,12 @@ ownership, and synchronization. These shared rules also apply to test code; deta
 ## Formatting & Naming
 
 - Follow workspace formatting (i.e., `rustfmt.toml`): `max_width = 120`.
+- Name a context or callable handle's shared implementation `<Owner>State`, using the owner's full type name
+  (e.g., `PartialEvaluationContextState`), and use `state` for a named field holding it. State may include immutable
+  configuration as well as mutable resources and execution bookkeeping. Use `<Owner>Payload` for the shared backing
+  data of a value or descriptor (e.g., `ArrayTypePayload`) and `payload` for a named field holding it. Payloads may use
+  copy-on-write updates while preserving value semantics. Status enums such as `TracerState` also appropriately use
+  `State`.
 - Write numeric type suffixes without a separating underscore (e.g., `0f32`, `1.0f64`, and `2usize`, instead of `0_f32`,
   `1.0_f64`, or `2_usize`). Keep underscores used as digit separators where useful.
 - Use import grouping in this order:
@@ -119,6 +130,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
   - Facade `pub use` statements refer to their own child modules by relative path (e.g., `pub use types::{...}`
     inside `arrays/mod.rs`), matching the existing facade files; the rules above govern item *imports*, not the
     re-export statements that define the facades.
+  - Public API module facades (e.g., `ryft_core::compilation` and `ryft_xla::domains`) declare their owned API
+    submodules with `pub mod` and re-export their public items with `pub use`. Keep internal helpers and fields at
+    their narrowest visibility independently of the module's public visibility.
   - Test modules follow the same rules for their `crate::...` imports; `use super::*` remains the standard way to
     bring in the owning module's items.
   - `rustfmt.toml` sets `imports_granularity = "Module"`, which enforces the grouping rule under nightly `rustfmt`

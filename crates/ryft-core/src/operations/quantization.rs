@@ -372,7 +372,7 @@ impl<V> BlockQuantize<ArrayIrType> for V
 where
     V: Value<Type = ArrayIrType>
         + Assert
-        + DimensionSize
+        + DimensionSize<Extent = V>
         + DynamicBroadcast
         + DynamicReshape
         + ValueProjection<ArrayType>
@@ -879,7 +879,7 @@ impl<V> BlockDequantize<ArrayIrType> for BlockQuantizedValue<V>
 where
     V: Value<Type = ArrayIrType>
         + Assert
-        + DimensionSize
+        + DimensionSize<Extent = V>
         + DynamicBroadcast
         + DynamicReshape
         + ValueProjection<ArrayType>
@@ -1599,7 +1599,7 @@ where
 
 impl<V> ScaledDot<ArrayIrType, V> for BlockQuantizedValue<V>
 where
-    V: Value<Type = ArrayIrType> + DimensionSize + DynamicBroadcast + Mul + ValueProjection<ArrayType>,
+    V: Value<Type = ArrayIrType> + DimensionSize<Extent = V> + DynamicBroadcast + Mul + ValueProjection<ArrayType>,
     V::Projected: Value<Type = ArrayType> + ConvertElementType,
     BlockQuantizedValue<V::Projected>: ScaledDot<ArrayType, V::Projected>,
 {
@@ -3243,10 +3243,10 @@ mod tests {
         check_gradient, check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference,
     };
     use crate::operations::assertions::AssertionError;
-    use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
+    use crate::operations::sharding::shard_map::{ShardMapOptions, shard_map};
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, TypedProgram};
+    use crate::programs::{EmptyRegionDriver, ProjectedValue, TypedProgram};
     use crate::tracing::{Tracer, TracingContext};
 
     use super::*;
@@ -4014,7 +4014,10 @@ mod tests {
                 Ok(vec![elements, scales])
             },
             varying(DataType::F32, 8),
-            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_types, vec![varying(DataType::F4E2M1FN, 8), varying(DataType::F8E4M3FN, 2)]);
@@ -4147,7 +4150,10 @@ mod tests {
                 Ok(vec![elements, scales])
             },
             varying(DataType::F32, 8),
-            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(output_types, vec![varying(DataType::F8E4M3FN, 8), varying(DataType::F8E8M0FNU, 2)]);
@@ -4442,7 +4448,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
-        let program = program.simplified().unwrap();
+        let program = program.into_simplified().unwrap();
         assert_eq!(
             program.to_string(),
             indoc! {"
@@ -4918,7 +4924,10 @@ mod tests {
                     Ok(vec![elements, scales])
                 },
                 (ArrayIrType::Array(input_type.clone()), ArrayIrType::Array(global_scale_type)),
-                vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+                )],
             )
             .unwrap();
         assert_eq!(
@@ -5707,8 +5716,8 @@ mod tests {
         let (output, pullback) = differentiate_at(quantized)
             .vjp(|quantized| {
                 let output = shard_map(
-                    |quantized: BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>| {
-                        quantized.block_dequantize([0], DataType::F32).unwrap()
+                    |quantized: BlockQuantizedValue<ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>>| {
+                        quantized.block_dequantize([0], DataType::F32)
                     },
                     quantized.try_map_parameters(|value| {
                         ValueProjection::<ArrayType>::into_projected(value).map_err(ProgramError::from)
@@ -5717,6 +5726,7 @@ mod tests {
                     BlockQuantizedValue::new(sharded.clone(), sharded.clone())
                         .with_global_scale(Sharding::replicated(mesh.clone(), 0)),
                     sharded.clone(),
+                    ShardMapOptions::new(),
                 )?;
                 Ok::<_, ProgramError>(output.into_value())
             })
@@ -6735,9 +6745,9 @@ mod tests {
                 })?;
                 let output = shard_map(
                     |(lhs, rhs): (
-                        BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>,
-                        BlockQuantizedValue<ShardMapTracer<EagerArrayIrContext>>,
-                    )| lhs.scaled_dot(&rhs, None, None).unwrap(),
+                        BlockQuantizedValue<ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>>,
+                        BlockQuantizedValue<ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>>,
+                    )| lhs.scaled_dot(&rhs, None, None),
                     (lhs, rhs),
                     mesh.clone(),
                     (
@@ -6747,6 +6757,7 @@ mod tests {
                             .with_global_scale(replicated_scalar.clone()),
                     ),
                     sharded_rows.clone(),
+                    ShardMapOptions::new(),
                 )?;
                 Ok::<_, ProgramError>(output.into_value())
             },
@@ -6775,14 +6786,14 @@ mod tests {
                 lambda %0:f32[2, 4], %1:f32[1, 2], %2:f32[], %3:f32[4, 1], %4:f32[2, 1], %5:f32[] .
                 let %6:f32[2, 1][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}] = shard_map [
                     mesh=['x'=2:manual],
-                    in_shardings=[\
+                    input_shardings=[\
                         {mesh<['x'=2:manual]>, [{'x'}, {}]}, \
                         {mesh<['x'=2:manual]>, [{}, {}]}, \
                         {mesh<['x'=2:manual]>, []}, \
                         {mesh<['x'=2:manual]>, [{}, {}]}, \
                         {mesh<['x'=2:manual]>, [{}, {}]}, \
                         {mesh<['x'=2:manual]>, []}],
-                    out_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
+                    output_shardings=[{mesh<['x'=2:manual]>, [{'x'}, {}]}],
                     manual_axes=['x'],
                     global_input_types=[\
                         f32[2, 4][sharding={mesh<['x'=2:manual]>, [{'x'}, {}]}], \
@@ -7872,10 +7883,10 @@ mod tests {
         .vjp(|(lhs, rhs), state| {
             let output = shard_map(
                 |(lhs, rhs, state): (
-                    ShardMapTracer<EagerArrayIrContext>,
-                    ShardMapTracer<EagerArrayIrContext>,
-                    ShardMapTracer<EagerArrayIrContext>,
-                )| function.call(lhs, rhs, None, None, None, Some(state)).unwrap(),
+                    ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>,
+                    ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>,
+                    ProjectedValue<ArrayType, DomainTracer<EagerArrayIrContext>>,
+                )| function.call(lhs, rhs, None, None, None, Some(state)),
                 (
                     ValueProjection::<ArrayType>::into_projected(lhs)?,
                     ValueProjection::<ArrayType>::into_projected(rhs)?,
@@ -7884,6 +7895,7 @@ mod tests {
                 mesh.clone(),
                 (sharded_rows.clone(), Sharding::replicated(mesh.clone(), 2), Sharding::replicated(mesh.clone(), 1)),
                 sharded_rows.clone(),
+                ShardMapOptions::new(),
             )?;
             Ok::<_, ProgramError>(output.into_value())
         })

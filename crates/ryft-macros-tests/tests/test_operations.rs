@@ -8,20 +8,21 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 use ryft::{
     AddOperation, Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
-    ArrayOperation, ArrayReferenceDischarge, ArrayType, BatchAxis, BatchableOperation, BatchingContext,
-    ConstantOperation, Context, CotangentAccumulator, DataType, DifferentiableOperation, DifferentiableType,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    Dimension, DimensionAddOperation, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
-    DimensionVariable, Domain, EagerContext, EffectClass, EffectClasses, Effects, EmptyRegionDriver, ErasedOperation,
-    GuardOperation, InputRegionProvenance, InterpretableOperation, InterpretationDriver, MaybeZero,
-    MemberDifferentiableOperation, MemberOperation, MemberTransposableOperation, NegOperation, Operation,
-    OperationBoundaryPruning, OperationFoldOutput, OperationPayloadProjection, OperationProjection, OperationProvider,
-    OutputRegionProvenance, PartialEvaluationInput, PartialEvaluationOutput, PartialValue, Placeholder, ProgramBuilder,
-    ProgramError, ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceType, RegionDataFlow, RegionDataFlowBoundary,
-    RegionDataFlowRule, RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRole, RegionSlot, Shape,
-    StagingContext, TagOperation, Tracer, TracingContext, TransposableOperation, TranspositionContext,
-    TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ZeroOperation, check_count,
+    ArrayOperation, ArrayReferenceDischarge, ArrayType, AxisIndexOperation, BatchAxis, BatchableOperation,
+    BatchingContext, CollectiveAxes, CollectiveOperation, ConstantOperation, Context, CotangentAccumulator, DataType,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, Dimension, DimensionAddOperation, DimensionBounds, DimensionOperation,
+    DimensionType, DimensionValue, DimensionVariable, Domain, EagerContext, EffectClass, EffectClasses, Effects,
+    EmptyRegionDriver, ErasedOperation, GuardOperation, InputRegionProvenance, InterpretableOperation,
+    InterpretationDriver, MaybeZero, MemberDifferentiableOperation, MemberOperation, MemberTransposableOperation,
+    NegOperation, Operation, OperationBoundaryPruning, OperationFoldOutput, OperationPayloadProjection,
+    OperationProjection, OperationProvider, OutputRegionProvenance, ParallelPermuteOperation, ParallelVaryOperation,
+    PartialEvaluationInput, PartialEvaluationOutput, PartialValue, Placeholder, ProgramBuilder, ProgramError,
+    ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceFreezeOperation, ReferenceType, RegionDataFlow, RegionDataFlowBoundary, RegionDataFlowRule,
+    RegionDataFlowSources, RegionInterface, RegionLiveness, RegionRole, RegionSlot, Shape, StagingContext,
+    TagOperation, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, TypeError,
+    TypeIdentityRenaming, Typed, Value, ZeroOperation, check_count,
 };
 
 /// Payload that overrides every optional [`Operation`] method with a distinctive answer, so that generated forwarding
@@ -239,7 +240,7 @@ impl<V: Value<Type = ArrayType>> OperationProvider<ArrayType, AddOperation<Array
 #[derive(Clone, Debug, Operation)]
 #[ryft(type(ArrayIrType), constant(ArrayIrValue<A>), members(ArrayType, structural(DimensionType)))]
 enum ArrayIrFamily<A: Value<Type = ArrayType>> {
-    #[ryft(projected(ArrayType))]
+    #[ryft(projected(ArrayType), collective)]
     Array(ArrayOperation<A>),
 
     #[ryft(projected(DimensionType, structural))]
@@ -1249,6 +1250,41 @@ fn test_operation_payload_projection() {
         MixedFamily::<Array>::from_payload(ErasedOperation::new(InterleavedOperation)),
         Ok(MixedFamily::Array(MixedMemberFamily::Interleaved(_))),
     ));
+}
+
+#[test]
+fn test_operation_collective() {
+    /// Homogeneous family that marks a collective that it holds directly and one that it holds boxed, but not its
+    /// `axis_index`.
+    #[derive(Clone, Debug, Operation)]
+    #[ryft(type(ArrayType), constant(Array))]
+    enum CollectiveFamily {
+        #[ryft(collective)]
+        Vary(ParallelVaryOperation),
+        #[ryft(collective)]
+        Permute(Box<ParallelPermuteOperation>),
+        AxisIndex(AxisIndexOperation),
+        Add(AddOperation<ArrayType>),
+    }
+
+    // Marked variants delegate to their payloads, directly and through a box.
+    let x = CollectiveAxes::from("x");
+    let operation = CollectiveFamily::from(ParallelVaryOperation::new("x".to_string()));
+    assert_eq!(operation.axes().as_ref(), &x);
+    let operation = CollectiveFamily::from(ParallelPermuteOperation::new(["x", "y"], 4, vec![(0, 1)]));
+    assert_eq!(operation.axes().as_ref(), &CollectiveAxes::from(["x", "y"]));
+
+    // Unmarked variants report no axes, even when their payloads are collectives.
+    let operation = CollectiveFamily::from(AxisIndexOperation::new("x".to_string()));
+    assert_eq!(operation.axes().as_ref(), &CollectiveAxes::default());
+    let operation = CollectiveFamily::from(AddOperation::new());
+    assert_eq!(operation.axes().as_ref(), &CollectiveAxes::default());
+
+    // A marked projected member delegates to its member family.
+    let operation = ArrayIrFamily::<Array>::Array(ArrayOperation::from(ParallelVaryOperation::new("x".to_string())));
+    assert_eq!(operation.axes().as_ref(), &x);
+    let operation = ArrayIrFamily::<Array>::Array(ArrayOperation::from(AddOperation::new()));
+    assert_eq!(operation.axes().as_ref(), &CollectiveAxes::default());
 }
 
 #[test]

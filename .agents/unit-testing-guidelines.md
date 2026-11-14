@@ -8,6 +8,9 @@ Use this file as the single detailed reference for `ryft` testing conventions.
   cover behavior implemented in that module; move incidental downstream behavior coverage to the operation, transform,
   or helper module that owns it. When moving an implementation, move its owning tests and any exclusive fixtures with
   it, and update their names and order to follow the destination API. Keep shared integration fixtures with their owner.
+  When splitting production modules, put their tests in each owning source file's inline `tests` module rather than
+  creating a parallel `tests/` subtree. Keep helpers shared by those modules in the inline `tests` module of their
+  parent's `mod.rs`, with the narrowest visibility needed by actual consumers.
 - Order a module's unit tests by the production API surface they cover, following the production definitions' order.
   Give each public function a primary test named `test_<owning_type>_<function>` (e.g.,
   `test_program_discharge_references`). Place additional edge-case tests immediately after that primary test and suffix
@@ -27,7 +30,7 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - Keep tests flat and readable; extract helpers only when they encode a repeated semantic testing contract.
 - When testing a later-stage validation error, keep earlier-stage fixtures well-formed unless malformed construction
   is the behavior under test.
-- Run scoped verification for the crate or module touched, using a 300-second timeout for local test commands unless the
+- Run scoped verification for the crate or module touched, using a 600-second timeout for local test commands unless the
   user asks for a longer run.
 - Use `ryft_core::arrays::Array` as the concrete eager value for operation, program, and transform coverage.
   Use rank-zero arrays when testing scalar-shaped behavior. Introduce a narrower test-only value family only when a
@@ -39,7 +42,10 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - Use `TestRegionOperation` for tests that specifically isolate region-carrying program machinery.
 - Keep test-only instrumentation out of production types and functions. Prefer observing existing behavior through
   test fixtures (e.g., counting operation queries) and inspecting actual caches in colocated tests instead of adding
-  conditional counter fields or increments to production analysis.
+  conditional counter fields or increments to production analysis. Do not add `cfg(test)` execution hooks solely to
+  count function calls, allocations, or internal work. Define shared test-only types, state, and injection
+  setters directly in the owning inline `tests` module, and let any required `cfg(test)` execution hooks call those
+  helpers. Keep test support out of production facade re-exports and inherent APIs.
 
 ## Structure
 
@@ -65,8 +71,8 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 
 ## Imports
 
-- Preserve normal import grouping inside test modules:
-  `std`, third-party crates, `crate::...`, then `super::...` when needed.
+- Place imports at the top of the owning `tests` module, never inside individual tests or test helpers. Preserve normal
+  import grouping there: `std`, third-party crates, `crate::...`, then `super::...` when needed.
 - Import only the helpers and types needed by the test module.
 - Import `pretty_assertions::assert_eq` in tests that compare strings, rendered IR, maps, vectors, or larger structs.
 - Import `indoc::indoc` for multiline expected strings instead of concatenating or manually managing indentation.
@@ -200,4 +206,4 @@ Use this file as the single detailed reference for `ryft` testing conventions.
   crate code has changed. Run the full affected crate `--lib` unit suites so printer-format churn, runtime-attribute
   drift, and environment-sensitive assumptions are caught before handoff.
 - Use enabled backend features only when the changed behavior depends on them.
-- Use a 300-second timeout for local test commands unless the user asks for a longer run.
+- Use a 600-second timeout for local test commands unless the user asks for a longer run.

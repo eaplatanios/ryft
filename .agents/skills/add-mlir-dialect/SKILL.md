@@ -88,7 +88,7 @@ Follow module definition order and keep each attribute, type, and operation's co
   Reuse existing shared attribute/type test helpers for common wrapper contracts; also cover the dialect-owned API.
 
 Run scoped dialect tests and affected crate verification against final source, with the repository's initial
-300-second timeout per command. A new native symbol needs a real consumer link against the rebuilt native artifact;
+600-second timeout per command. A new native symbol needs a real consumer link against the rebuilt native artifact;
 Rust type-checking against an older binary cannot establish its availability. Native changes also follow the shim
 reference's verification guidance. If this task upgrades OpenXLA/PJRT/MLIR, use the
 [upgrade-xla skill](../upgrade-xla/SKILL.md) and its full suite/artifact workflow; adding a wrapper alone does not

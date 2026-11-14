@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added adapters from CUDA PJRT clients and XLA FFI streams/buffers to the producer-neutral `ryft-cuda` artifact
   launcher behind the `cuda-12` and `cuda-13` features.
 - Added `Error::MissingFunction`.
+- Added `HostDestination` and `HostDestinationSlice`, a host allocation that several concurrent device-to-host copies
+  fill in place through disjoint owned slices (e.g., every shard of an array copied directly into its range of the
+  array's dense host representation), whose bytes become accessible once every slice has been released.
 - Added per-execution `custom_options` to `LoadedExecutable::execute` and `FfiExecutionContext::custom_options` for
   reading them from an XLA FFI invocation, separately from static call attributes.
 - Added optional recording handlers to `GpuCustomCallTypedHandler` and explicit recording capability detection for
@@ -107,6 +110,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Switched to using `Error::MissingFunction` instead of `Error::Unimplemented` for PJRT dispatch failures,
   distinguishing unavailable functions from native calls that return an unimplemented status.
 - Error buffers now pass their layout through the new `device_layout` field.
+- Changed `LoadedExecutable::execute` to release send, receive, and HLO output callbacks only after every participating
+  device completes, instead of releasing per-device callbacks as each device completes. Executions that supply an
+  execution context or callbacks now require native `PJRT_Event_OnReady` or `PJRT_Event_Await` support and return
+  `Error::MissingFunction` before submission when neither is available.
 
 ### Fixed
 
@@ -115,6 +122,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Required the full function-pointer field to be present before reading it from PJRT API and extension tables,
   preventing out-of-bounds reads from truncated tables.
 - Omit array layouts for native `BufferType::Token` buffers in asynchronous host-to-device transfers.
+- Fixed `LoadedExecutable::execute` destroying its `ExecutionContext` when the call returned, even though PJRT only
+  borrows the context while execution may still be running. The returned `ExecutionFence` now owns the context until
+  every participating device completes and destroys it before reporting readiness.
+- Fixed a use-after-free when dropping the event of a pending `Buffer::copy_to_host` or `Buffer::copy_raw_to_host`
+  before the copy completed, which freed the host destination while PJRT could still write into it. The destination
+  is now retained by a native completion callback until the copy completes, so dropping the event neither frees it
+  nor blocks. If that callback cannot be registered, the destination is leaked rather than freed.
+- Changed `Buffer::copy_to_host_buffer` and `Buffer::copy_raw_to_host_buffer` to take ownership of their host
+  destination (any `AsMut<[u8]> + Send + 'static` buffer, e.g., a reused or pinned allocation) and return it from
+  the completed event, instead of borrowing it. The borrowing versions were unsound, because PJRT writes into the
+  destination until the copy completes, independently of the returned event (which safe code may drop or leak). The
+  destination is retained like that of `Buffer::copy_to_host`, and `Buffer::copy_to_host_buffer` rejects an undersized
+  destination before starting the copy.
+- Made `Buffer::copy_raw_to_host_buffer_future` `unsafe`, because PJRT writes into the destination that its closure
+  receives until the copy completes, which nothing ties to the returned event. Its closure now fails the transfer with
+  an error instead of passing an undersized destination to PJRT.
+- Fixed `LoadedExecutable::execute` releasing launch resources early when a failure occurred after successful native
+  submission. It now waits for every participating device to complete before returning the error.
 
 ### Removed
 

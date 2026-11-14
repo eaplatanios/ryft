@@ -1,5 +1,5 @@
 //! Contains shared differentiation scaffolding for [`ElementwiseOperation`](crate::ElementwiseOperation)s. Elementwise
-//! arithmetic rules all follow the same shape. They first compute the primal through the operation's own value-level
+//! arithmetic rules follow a common shape. They first compute the primal through the operation's own value-level
 //! capability. Then, they resolve the tangent target type of the primal output, convert and broadcast every live input
 //! tangent (and any primal coefficients) into that widened differential representation, and combine the per-input
 //! contributions. Finally, they pair the primal with the combined tangent. This module owns that scaffolding
@@ -8,6 +8,11 @@
 //! (i.e., the primal computation and the per-input tangent terms), and the [`ElementwiseDerivativeAlignment`] trait
 //! those rules (and the broadcasting, selection, and reduction rules) use to align derivative contributions between
 //! input types and the common type inferred for an implicitly broadcasting result.
+//!
+//! Bilinear rules can use [`ElementwiseDerivativeAlignment::align_coefficient`] to promote a coefficient's element
+//! representation while preserving its own shape, placement, manual variation, and reduction state. This keeps
+//! intermediate arithmetic in the output's differential precision without turning a reduced coefficient into a
+//! partial sum.
 
 use crate::arrays::{ArrayType, DataType, Dimension};
 use crate::contexts::Context;
@@ -18,21 +23,28 @@ use crate::macros::check_count;
 use crate::operations::{
     Add, Broadcast, ConvertElementType, Reduce, ReductionKind, Reshape, Reshard, Transpose, ZeroLike,
 };
-use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
+use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
 
-/// [`Value`] whose derivative contributions can be _aligned_ with the common [`Type`](crate::Type) inferred for an
-/// implicitly broadcasting elementwise result and _unaligned_ back to an input type. The two methods form an adjoint
-/// pair: [`align_tangent`](Self::align_tangent) applies the implicit element-type promotion, broadcast, and resharding
-/// an [`ElementwiseOperation`](crate::ElementwiseOperation) performs on an input, and
+/// [`Value`] whose derivative contributions can be _aligned_ with the common [`Type`] inferred for an implicitly
+/// broadcasting elementwise result and _unaligned_ back to an input type. Tangent alignment and cotangent unalignment
+/// form an adjoint pair. [`align_tangent`](Self::align_tangent) applies the implicit element-type promotion, broadcast,
+/// and resharding of an [`ElementwiseOperation`](crate::ElementwiseOperation).
 /// [`unalign_cotangent`](Self::unalign_cotangent) applies the adjoint of that linear map
 /// (i.e., demotion, sum-reduction over broadcasting axes, and the reverse reshard).
 pub trait ElementwiseDerivativeAlignment<T: DifferentiableType>: Value<Type = T> {
+    /// Converts this primal coefficient to `target`'s element representation while preserving its own shape,
+    /// placement, manual variation, and reduction state. Unlike tangent alignment, this function does not broadcast
+    /// or reshard the coefficient. Element conversion may clear a storage layout that cannot survive that conversion.
+    /// Binary derivative rules use this before composing coefficients so intermediate arithmetic uses the promoted
+    /// differential representation without changing the input's reduction semantics.
+    fn align_coefficient(&self, target: &T) -> Result<Self, DifferentiationError>;
+
     /// Aligns this tangent [`Value`] (or primal coefficient) with `target`, converting and broadcasting it
-    /// into that [`Type`](crate::Type).
+    /// into that [`Type`].
     ///
     /// # Parameters
     ///
-    ///   - `target`: [`Type`](crate::Type) to align this [`Value`] with.
+    ///   - `target`: [`Type`] to align this [`Value`] with.
     ///   - `exemplar`: [`Value`] whose type carries `target`'s exact shape (i.e., the same dimensions, including
     ///     any dynamic dimension identities, typically the rule's own primal output or the output cotangent being
     ///     transposed). It is consulted only when `target` has a runtime extent that `self` does not already carry,
@@ -53,12 +65,17 @@ pub trait ElementwiseDerivativeAlignment<T: DifferentiableType>: Value<Type = T>
     ///
     /// # Parameters
     ///
-    ///   - `target`: [`Type`](crate::Type) of the input whose cotangent is being recovered (i.e., the type that
+    ///   - `target`: [`Type`] of the input whose cotangent is being recovered (i.e., the type that
     ///     [`align_tangent`](Self::align_tangent) converted and broadcast _from_).
     fn unalign_cotangent(&self, target: &T) -> Result<Self, DifferentiationError>;
 }
 
 impl<V: Value<Type = DataType> + ConvertElementType> ElementwiseDerivativeAlignment<DataType> for V {
+    #[inline]
+    fn align_coefficient(&self, target: &DataType) -> Result<Self, DifferentiationError> {
+        if self.r#type().as_ref() == target { Ok(self.clone()) } else { Ok(self.convert_element_type(*target)?) }
+    }
+
     #[inline]
     fn align_tangent(&self, target: &DataType, _exemplar: &Self) -> Result<Self, DifferentiationError> {
         if self.r#type().as_ref() == target { Ok(self.clone()) } else { Ok(self.convert_element_type(*target)?) }
@@ -74,6 +91,15 @@ impl<
     V: Value<Type = ArrayType> + ZeroLike + Add + Broadcast + ConvertElementType + Reshape + Transpose + Reduce + Reshard,
 > ElementwiseDerivativeAlignment<ArrayType> for V
 {
+    #[inline]
+    fn align_coefficient(&self, target: &ArrayType) -> Result<Self, DifferentiationError> {
+        if self.r#type().data_type() == target.data_type() {
+            Ok(self.clone())
+        } else {
+            Ok(self.convert_element_type(target.data_type())?)
+        }
+    }
+
     fn align_tangent(&self, target: &ArrayType, exemplar: &Self) -> Result<Self, DifferentiationError> {
         let mut value = if self.r#type().data_type() == target.data_type() {
             self.clone()
@@ -81,7 +107,9 @@ impl<
             self.convert_element_type(target.data_type())?
         };
 
-        if value.r#type().as_ref() == target {
+        // A value that is only stored differently than the target describes (e.g., a primal with an explicit layout,
+        // which a tangent type never has) is already aligned.
+        if target.is_interchangeable_with(value.r#type().as_ref()) {
             return Ok(value);
         }
 
@@ -146,14 +174,14 @@ impl<
         }
 
         // The exemplar path infers its result type from its inputs, so pin any remaining metadata-only difference
-        // (e.g., a memory placement or layout that the addition did not carry) with an axis-identity broadcast, which
-        // maps every axis from an identical input dimension and therefore accepts runtime extents.
-        if requires_runtime_shape && value.r#type().as_ref() != target {
+        // (e.g., a memory placement that the addition did not carry) with an axis-identity broadcast, which maps
+        // every axis from an identical input dimension and therefore accepts runtime extents.
+        if requires_runtime_shape && !target.is_interchangeable_with(value.r#type().as_ref()) {
             let output_axes = (0..target.rank()).collect::<Vec<_>>();
             value = value.broadcast(target.clone(), output_axes.as_slice())?;
         }
 
-        if value.r#type().as_ref() != target {
+        if !target.is_interchangeable_with(value.r#type().as_ref()) {
             return Err(TypeError::invalid(format!(
                 "aligned tangent type `{}` does not match required output tangent type `{}`",
                 value.r#type(),
@@ -236,16 +264,17 @@ where
             contribution = contribution.reshard(&sharding.without_manual_reduction_axes())?;
         }
 
-        // Pin any remaining metadata-only difference (e.g., a layout that no step above can attach) with an
-        // axis-identity broadcast, which carries its full requested output type.
-        if contribution.r#type().as_ref() != target {
+        // Pin any remaining metadata-only difference (e.g., a memory placement that no step above can attach) with
+        // an axis-identity broadcast, which carries its full requested output type. A contribution that is only
+        // stored differently than the target describes needs none.
+        if !target.is_interchangeable_with(contribution.r#type().as_ref()) {
             let output_axes = (0..target.rank()).collect::<Vec<_>>();
             contribution = contribution.broadcast(target.clone(), output_axes.as_slice())?;
         }
 
         // As a defensive final check, report a mismatch instead of returning a mistyped cotangent, because a wrong
         // cotangent type would surface much later as a confusing accumulation or interpretation error.
-        if contribution.r#type().as_ref() != target {
+        if !target.is_interchangeable_with(contribution.r#type().as_ref()) {
             return Err(TypeError::invalid(format!(
                 "unaligned cotangent type {} does not match required input cotangent type {}",
                 contribution.r#type().as_ref(),
@@ -341,22 +370,22 @@ pub(crate) fn reduce_broadcast_cotangent<V: Value<Type = ArrayType> + Reduce + T
 }
 
 /// Represents the inputs handed to the tangent term of a unary elementwise JVP rule by [`unary_elementwise_jvp`]. The
-/// input accessors convert and broadcast lazily to the output tangent [`Type`](crate::Type), while the output primal
-/// stays at its own (possibly narrower) type so terms can reuse it when no widening is required.
+/// input accessors convert and broadcast lazily to the output tangent [`Type`], while the output primal stays at its
+/// own (possibly narrower) type so terms can reuse it when no widening is required.
 pub struct UnaryElementwiseJvpInputs<'o, C: Context, F> {
     /// Context used when re-evaluating a widened primal coefficient for the tangent computation.
     tangent_context: &'o C,
 
-    /// Input primal [`Value`] at its original [`Type`](crate::Type).
+    /// Input primal [`Value`] at its original [`Type`].
     input_primal: &'o C::Value,
 
-    /// Input tangent [`Value`] at its original [`Type`](crate::Type).
+    /// Input tangent [`Value`] at its original [`Type`].
     input_tangent: &'o C::Value,
 
-    /// Primal output [`Value`] of the operation, at its own [`Type`](crate::Type).
+    /// Primal output [`Value`] of the operation, at its own [`Type`].
     output_primal: &'o C::Value,
 
-    /// Tangent target [`Type`](crate::Type) of the primal output [`Value`].
+    /// Tangent target [`Type`] of the primal output [`Value`].
     output_tangent_type: &'o C::Type,
 
     /// Function that evaluates the operation's primal output from its input primal.
@@ -368,25 +397,25 @@ impl<
     F: Fn(&C, &C::Value) -> Result<C::Value, ProgramError>,
 > UnaryElementwiseJvpInputs<'_, C, F>
 {
-    /// Returns the input primal [`Value`] converted and broadcast to the output tangent [`Type`](crate::Type).
+    /// Returns the input primal [`Value`] converted and broadcast to the output tangent [`Type`].
     #[inline]
     pub fn input_primal(&self) -> Result<C::Value, DifferentiationError> {
         self.input_primal.align_tangent(self.output_tangent_type, self.output_primal)
     }
 
-    /// Returns the input tangent [`Value`] converted and broadcast to the output tangent [`Type`](crate::Type).
+    /// Returns the input tangent [`Value`] converted and broadcast to the output tangent [`Type`].
     #[inline]
     pub fn input_tangent(&self) -> Result<C::Value, DifferentiationError> {
         self.input_tangent.align_tangent(self.output_tangent_type, self.output_primal)
     }
 
-    /// Returns the operation's output primal [`Value`] evaluated at the output tangent [`Type`](crate::Type). When the
-    /// original output primal already has that type, this reuses it directly. Otherwise, it re-evaluates the operation
-    /// from the converted input primal so that nonlinear rounding at the narrower primal type does not affect the
-    /// tangent computation.
+    /// Returns the operation's output primal [`Value`] evaluated at the output tangent [`Type`]. When the original
+    /// output primal already has that type, or is only stored differently than that type describes (e.g., with an
+    /// explicit layout), this reuses it directly. Otherwise, it re-evaluates the operation from the converted input
+    /// primal so that nonlinear rounding at the narrower primal type does not affect the tangent computation.
     #[inline]
     pub fn output_primal_at_tangent_type(&self) -> Result<C::Value, DifferentiationError> {
-        if self.output_primal.r#type().as_ref() == self.output_tangent_type {
+        if self.output_tangent_type.is_interchangeable_with(self.output_primal.r#type().as_ref()) {
             Ok(self.output_primal.clone())
         } else {
             Ok((self.evaluate_primal)(self.tangent_context, &self.input_primal()?)?)
@@ -395,10 +424,10 @@ impl<
 }
 
 /// Computes the Jacobian-Vector Product (JVP) for a unary elementwise [`Operation`]. This function computes the output
-/// primal via `primal_fn`, resolves the tangent target [`Type`](crate::Type), converts the input primal and any live
-/// input tangent into that representation, and delegates the mathematical content to `tangent_fn`. The prepared inputs
-/// retain `primal_fn` so that a rule can re-evaluate the output at the tangent type without repeating the evaluator at
-/// the call site. A structural-zero input tangent propagates as a structural zero, including through outputs without a
+/// primal via `primal_fn`, resolves the tangent target [`Type`], converts the input primal and any live input tangent
+/// into that representation, and delegates the mathematical content to `tangent_fn`. The prepared inputs retain
+/// `primal_fn` so that a rule can re-evaluate the output at the tangent type without repeating the evaluator at the
+/// call site. A structural-zero input tangent propagates as a structural zero, including through outputs without a
 /// tangent space (e.g., integer outputs), which only reject *live* tangents.
 ///
 /// # Parameters
@@ -462,28 +491,28 @@ pub struct BinaryElementwiseJvpInputs<'o, T: DifferentiableType, V: ElementwiseD
     /// Primal [`Value`] of the right input.
     right_primal: &'o V,
 
-    /// Primal output [`Value`] of the operation, which carries the result [`Type`](crate::Type).
+    /// Primal output [`Value`] of the operation, which carries the result [`Type`].
     output_primal: &'o V,
 
-    /// Tangent target [`Type`](crate::Type) of the primal output [`Value`].
+    /// Tangent target [`Type`] of the primal output [`Value`].
     output_tangent_type: &'o T,
 }
 
 impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementwiseJvpInputs<'_, T, V> {
-    /// Returns the left input's primal [`Value`] converted and broadcast to the tangent target [`Type`](crate::Type).
+    /// Returns the left input's primal [`Value`] converted and broadcast to the tangent target [`Type`].
     pub fn left_primal(&self) -> Result<V, DifferentiationError> {
         self.left_primal.align_tangent(self.output_tangent_type, self.output_primal)
     }
 
-    /// Returns the right input's primal [`Value`] converted and broadcast to the tangent target [`Type`](crate::Type).
+    /// Returns the right input's primal [`Value`] converted and broadcast to the tangent target [`Type`].
     pub fn right_primal(&self) -> Result<V, DifferentiationError> {
         self.right_primal.align_tangent(self.output_tangent_type, self.output_primal)
     }
 }
 
-/// Computes the Jacobian-Vector Product (JVP) for a binary elementwise [`Operation`]. This function computes the output
-/// primal via `primal_fn`, resolves the tangent target [`Type`](crate::Type), converts each live input tangent into
-/// that representation, and delegates the mathematical content to the per-side terms, invoking each term only when that
+/// Computes the Jacobian-Vector Product (JVP) for a binary elementwise [`Operation`]. This function computes the
+/// output primal via `primal_fn`, resolves the tangent target [`Type`], converts each live input tangent into that
+/// representation, and delegates the mathematical content to the per-side terms, invoking each term only when that
 /// side's tangent is live so terms stay lazy in staged programs. Live contributions are summed, and structural-zero
 /// input tangents propagate as structural zeros, including through outputs without a tangent space (e.g., integer
 /// outputs), which only reject *live* tangents.
@@ -567,7 +596,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Differentiate, differentiate_at};
@@ -580,6 +609,36 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    #[test]
+    fn test_array_elementwise_derivative_coefficient_alignment() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("varying", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("partial", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("reduced", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("sharded", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["sharded"])])
+            .unwrap()
+            .with_unreduced_axes(["partial"])
+            .unwrap()
+            .with_reduced_axes(["reduced"])
+            .unwrap()
+            .with_varying_manual_axes(["varying"])
+            .unwrap();
+        let source = ArrayType::new_static(DataType::F32, [2])
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(sharding)
+            .unwrap();
+        let coefficient = Array::from_elements(source.clone(), &[1.5f32, 2.5]).unwrap();
+        let target = ArrayType::new_static(DataType::F64, [3, 4]);
+        assert_eq!(
+            coefficient.align_coefficient(&target),
+            Ok(Array::from_elements(source.with_data_type(DataType::F64), &[1.5f64, 2.5]).unwrap()),
+        );
+        assert_eq!(coefficient.align_coefficient(&target.with_data_type(DataType::F32)), Ok(coefficient));
+    }
 
     #[test]
     fn test_rank_zero_array_elementwise_derivative_alignment() {

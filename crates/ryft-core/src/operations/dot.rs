@@ -34,7 +34,7 @@ use ryft_macros::capability;
 use crate::arrays::{
     Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType,
     DataType, Dimension, DimensionSource, MeshAxisType, NumericArrayElement, Shape, Sharding, ShardingDimension,
-    StaticShape,
+    StaticShape, UnreducedKind,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -45,7 +45,7 @@ use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, dispatch_on_array_element_type, impl_differentiable_operation};
+use crate::macros::{check_count, check_types, dispatch_on_array_element_type, impl_differentiable_operation};
 use crate::operations::Capability;
 use crate::operations::arithmetic::Add;
 use crate::operations::collectives::parallel_vary::ManualVariationAlignment;
@@ -1959,7 +1959,8 @@ pub(crate) fn validate_common_mapped_dimension<V: Value<Type = ArrayType>>(
 /// The output [`Sharding`] follows the `dot_general` sharding rule of JAX (i.e., `_dot_general_sharding_rule`
 /// in the [JAX implementation](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/lax.py)). The StableHLO
 /// [`dot_general`](https://openxla.org/stablehlo/spec#dot_general) specification describes the underlying
-/// contraction semantics. Placement is inferred as follows:
+/// contraction semantics. The inputs must reside in the same memory space, which the output keeps, because
+/// a contraction never moves values between memory spaces. Placement is inferred as follows:
 ///
 ///   - When `output_sharding` is provided, it is validated and returned directly, bypassing the ordinary input
 ///     consistency checks. Validation checks its rank and mesh, rejects auto axes, and accepts unreduced axes only
@@ -1974,8 +1975,8 @@ pub(crate) fn validate_common_mapped_dimension<V: Value<Type = ArrayType>>(
 ///   - Contracting dimensions sharded over explicit mesh axes on both inputs are an error. Identically sharded ones
 ///     make the output sharding ambiguous and require an explicit output sharding. A contracting dimension sharded on
 ///     only one input is allowed, and its sharding is dropped from the output.
-///   - Result dimension entries are copied from the owning input, and auto mesh axes are stripped from the final
-///     sharding.
+///   - Result dimension entries are copied from the owning input. Input types never place dimensions or reduction
+///     state over auto mesh axes (refer to [`ArrayType::with_sharding`]), so neither does the inferred sharding.
 pub(crate) fn infer_dot_output_type(
     operation_name: &str,
     lhs: &ArrayType,
@@ -1990,6 +1991,16 @@ pub(crate) fn infer_dot_output_type(
     }
 
     validate_dot_data_type(operation_name, lhs.data_type())?;
+
+    // A contraction never moves values between memory spaces, so its inputs must share one, which its output keeps.
+    if lhs.memory() != rhs.memory() {
+        return Err(TypeError::invalid(format!(
+            "`{}` inputs must reside in the same memory space but got `{}` and `{}`",
+            operation_name,
+            lhs.memory(),
+            rhs.memory(),
+        )));
+    }
 
     if let Some(accumulation_type) = accumulation_type {
         // An identical type is valid. Floating-point inputs may accumulate at `f32` or `f64`, and integer inputs may
@@ -2059,6 +2070,9 @@ pub(crate) fn infer_dot_output_type(
         }
     }
 
+    // A dot product is bilinear, so it distributes only over pending sums, including manual ones.
+    check_types!(@sum_unreduced, operation_name, [lhs, rhs]);
+
     let mesh = match (lhs_sharding, rhs_sharding) {
         (Some(left), Some(right)) if left.mesh() != right.mesh() => {
             return Err(TypeError::invalid(format!("`{operation_name}` input shardings must use the same mesh")));
@@ -2115,6 +2129,15 @@ pub(crate) fn infer_dot_output_type(
         // operation instead of materializing it here, so the request is valid only when it names precisely the axes
         // that shard the (identically sharded) contracting dimensions. This is JAX's `_dot_general_unreduced_rule`.
         if !output_sharding.unreduced_axes().is_empty() {
+            if output_sharding.unreduced_kind() != UnreducedKind::Sum {
+                return Err(TypeError::invalid(format!(
+                    "`{}` output sharding supports only unreduced axes of kind `{}` but got kind `{}`",
+                    operation_name,
+                    UnreducedKind::Sum,
+                    output_sharding.unreduced_kind(),
+                )));
+            }
+
             let lhs_contracting_spec: Vec<ShardingDimension> =
                 lhs_contracting.iter().map(|axis| dimension_of(lhs_sharding, *axis)).collect();
             let rhs_contracting_spec: Vec<ShardingDimension> =
@@ -2161,7 +2184,7 @@ pub(crate) fn infer_dot_output_type(
             let right = dimension_of(rhs_sharding, *rhs_axis);
 
             // Only explicit axis sharding of both contracting inputs triggers the ambiguity and consistency errors.
-            // Contracting shardings over only manual or auto axes are left to `shard_map` and the compiler.
+            // Contracting shardings over only manual axes are left to `shard_map`.
             // A contracting dimension sharded on only one input is allowed, and its sharding is dropped from
             // the output, because the partitioner inserts the necessary communication.
             if left.has_explicit_axis(mesh) && right.has_explicit_axis(mesh) {
@@ -2200,8 +2223,8 @@ pub(crate) fn infer_dot_output_type(
                 (ShardingDimension::Sharded(_), ShardingDimension::Sharded(_))
                     if left.has_explicit_axis(mesh) || right.has_explicit_axis(mesh) =>
                 {
-                    // Conflicts over an explicit axis are errors. Conflicts purely over manual or auto axes become
-                    // replicated and are left to `shard_map` and the compiler.
+                    // Conflicts over an explicit axis are errors. Conflicts purely over manual axes become replicated
+                    // and are left to `shard_map`.
                     return Err(TypeError::invalid(format!(
                         "`{operation_name}` batching dimensions must have consistent shardings, but got \
                              `{left}` and `{right}`",
@@ -2239,12 +2262,13 @@ pub(crate) fn infer_dot_output_type(
             .map_err(|error| {
                 TypeError::invalid(format!("`{operation_name}` output sharding construction failed: {error}"))
             })?;
-        Some(sharding.without_auto_axes())
+        Some(sharding)
     } else {
         None
     };
 
     ArrayType::new(accumulation_type.unwrap_or(lhs.data_type()), Shape::new(output_dimensions))
+        .with_memory(lhs.memory())
         .with_sharding(sharding)
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
@@ -2348,7 +2372,8 @@ mod tests {
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh,
-        MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, StridedLayout, f8e4m3fn, f8e8m0fnu, i4,
+        Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StridedLayout, f8e4m3fn,
+        f8e8m0fnu, i4,
     };
     use crate::batching::{
         BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingTracer,
@@ -2643,6 +2668,24 @@ mod tests {
                     error = format!(
                         "`{DOT_OPERATION_NAME}` inputs must have matching varying manual axes; insert \
                          `parallel_vary` on the inputs that lack an axis, as `align_manual_variation` does",
+                    ),
+                },
+                // The inputs reside in one memory space, which the output keeps.
+                {
+                    input_types = [
+                        plain_array(&[2, 3]).with_memory(Memory::Host { pinned: true }),
+                        plain_array(&[3, 4]).with_memory(Memory::Host { pinned: true }),
+                    ],
+                    output_types = [plain_array(&[2, 4]).with_memory(Memory::Host { pinned: true })],
+                },
+                {
+                    input_types = [
+                        plain_array(&[2, 3]).with_memory(Memory::Host { pinned: true }),
+                        plain_array(&[3, 4]),
+                    ],
+                    error = format!(
+                        "`{DOT_OPERATION_NAME}` inputs must reside in the same memory space but got `Host[Pinned]` \
+                         and `Device`",
                     ),
                 },
             ],
@@ -3012,13 +3055,20 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_type_inference_strips_auto_axes() {
+    fn test_dot_type_inference_over_meshes_with_auto_axes() {
+        // Input types cannot place dimensions over auto mesh axes, and the output follows the explicit placement only.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
             MeshAxis::new("m", 2, MeshAxisType::Explicit).unwrap(),
         ])
         .unwrap();
-        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::sharded(["a"]), ShardingDimension::Replicated]);
+        let auto_dimensions = vec![ShardingDimension::sharded(["a"]), ShardingDimension::Replicated];
+        let auto_sharding = Sharding::new(mesh.clone(), auto_dimensions).unwrap();
+        assert_eq!(
+            plain_array(&[4, 8]).with_sharding(auto_sharding.clone()),
+            Err(ShardingError::AutoAxisInArrayType { sharding: auto_sharding }),
+        );
+        let lhs = sharded_array(&mesh, &[4, 8], vec![ShardingDimension::Replicated, ShardingDimension::Replicated]);
         let rhs =
             sharded_array(&mesh, &[8, 16], vec![ShardingDimension::Replicated, ShardingDimension::sharded(["m"])]);
         check_operation_type_inference!(
@@ -3739,22 +3789,31 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_batching_preserves_materialized_batch_placement_manual_variation() -> Result<(), ProgramError> {
-        // Materializing the mapped axis on the replicated right-hand side also gives it the manual variation of the
-        // mapped left-hand side.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+    fn test_dot_batching_aligns_materialized_batch_placement_with_manual_variation() -> Result<(), ProgramError> {
+        // Materializing the mapped axis on the replicated right-hand side gives it the batch placement on `y`, which
+        // adds no variation, so `parallel_vary` aligns it with the left-hand side, which varies along `x`.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
         let left_sharding = Sharding::new(
             mesh.clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
+            vec![ShardingDimension::sharded(["y"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
         )
         .unwrap()
         .with_varying_manual_axes(["x"])
         .unwrap();
-        let right_sharding = Sharding::replicated(mesh, 2);
+        let right_sharding = Sharding::replicated(mesh.clone(), 2);
+        let materialized_sharding = Sharding::new(
+            mesh,
+            vec![ShardingDimension::sharded(["y"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
+        )
+        .unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(left, right)| {
                 let context = BatchingContext::new(left.context().clone(), 2)
-                    .with_axis_sharding(ShardingDimension::sharded(["x"]));
+                    .with_axis_sharding(ShardingDimension::sharded(["y"]));
                 let mut outputs = DotOperation::matmul().batch(
                     &context,
                     &EmptyRegionDriver,
@@ -3771,14 +3830,15 @@ mod tests {
             program.to_string(),
             formatdoc! {"
                 lambda %0:f64[2, 2, 2][sharding={left_sharding}], %1:f64[2, 1][sharding={right_sharding}] .
-                let %2:f64[2, 2, 1][sharding={left_sharding}] = broadcast [
-                    output_type=f64[2, 2, 1][sharding={left_sharding}],
+                let %2:f64[2, 2, 1][sharding={materialized_sharding}] = broadcast [
+                    output_type=f64[2, 2, 1][sharding={materialized_sharding}],
                     output_axes=[1, 2],
                 ] %1
-                    %3:f64[2, 2, 1][sharding={left_sharding}] = dot [
+                    %3:f64[2, 2, 1][sharding={left_sharding}] = parallel_vary [axis_name=\"x\"] %2
+                    %4:f64[2, 2, 1][sharding={left_sharding}] = dot [
                         dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
-                    ] %0 %2
-                in (%3)
+                    ] %0 %3
+                in (%4)
             "}
             .trim_end(),
         );

@@ -2686,7 +2686,7 @@ mod tests {
                 PartialValue::Unknown(right.clone().into()),
             ])
             .unwrap();
-        let simplified = residual.program().simplified().unwrap();
+        let simplified = residual.program().clone().into_simplified().unwrap();
         assert_eq!(
             simplified.to_string(),
             indoc! {r#"
@@ -3097,7 +3097,7 @@ mod tests {
                     %5:i32[batch] = select %1 %4 %3
                     %6:i32[] = reduce [kind=min, axes=[0]] %5
                     %7:bool[] = reduce [kind=all, axes=[0]] %1
-                    %8:i32[] = zero_like %6
+                    %8:i32[] = zero [type=i32[]]
                     %9:i32[] = select %7 %8 %6
                     %10:i32[] = zero [type=i32[]]
                     %11:dimension<1> = constant [value=1]
@@ -3198,7 +3198,10 @@ mod tests {
                 Ok(())
             },
             (ArrayIrType::Dimension(extent_type.clone()), varying(DataType::Boolean), varying(DataType::I32)),
-            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -3218,7 +3221,8 @@ mod tests {
                         axes=[0]] %5
                     %7:bool[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = reduce [kind=all, \
                         axes=[0]] %1
-                    %8:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero_like %6
+                    %8:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = \
+                        zero [type=i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
                     %9:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = select %7 %8 %6
                     %10:i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = zero \
                         [type=i32[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]]
@@ -3453,7 +3457,7 @@ mod tests {
                     %5:i32[batch] = select %1 %4 %3
                     %6:i32[] = reduce [kind=min, axes=[0]] %5
                     %7:bool[] = reduce [kind=all, axes=[0]] %1
-                    %8:i32[] = zero_like %6
+                    %8:i32[] = zero [type=i32[]]
                     %9:i32[] = select %7 %8 %6
                     %10:i32[] = zero [type=i32[]]
                     %11:dimension<1> = constant [value=1]
@@ -3756,7 +3760,10 @@ mod tests {
                 Ok(())
             },
             (condition_type, observation_type),
-            vec![("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2 })],
+            vec![(
+                "x".to_string(),
+                NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true },
+            )],
         )
         .unwrap();
         assert_eq!(
@@ -3900,7 +3907,7 @@ mod tests {
         );
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
-            program.simplified().unwrap().to_string(),
+            program.into_simplified().unwrap().to_string(),
             indoc! {r#"
                 lambda %0:bool[] .
                 let () = assert [message="condition must hold", labels=[]] %0
@@ -4930,7 +4937,8 @@ mod tests {
     #[test]
     fn test_guard_batching_cast() {
         // Entry guards feed casts in replay and derivative programs. Both must lift the original declaration rather
-        // than reconstructing its layout or manual variation from the already packed operand.
+        // than reconstructing its layout or sharding from the already packed operand, so the batched cast to the
+        // unsharded type remains, while the cast that only drops a layout becomes an identity.
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         for (declared, output, axis_sharding) in [
@@ -4991,6 +4999,7 @@ mod tests {
                     .unwrap()
                     .into_parts();
                 assert_eq!(axes, vec![BatchAxis::new(0)]);
+                let packed_output = output.batched(0, Dimension::Static(extent), axis_sharding.clone()).unwrap();
                 let expected = if packed.sharding().is_some() {
                     formatdoc! {r#"
                         lambda %0:{packed} .
@@ -4998,7 +5007,8 @@ mod tests {
                             boundary="entry",
                             declared_types=[{packed}],
                         ] %0
-                        in (%1)"#}
+                            %2:{packed_output} = cast [type={packed_output}, inputs=[{packed}]] %1
+                        in (%2)"#}
                 } else {
                     formatdoc! {r#"
                         lambda %0:{packed} .
@@ -5006,8 +5016,10 @@ mod tests {
                         in (%1)"#}
                 };
                 assert_eq!(program.to_string(), expected);
-                let value = Array::from_elements(packed, &vec![1f32; extent * 2]).unwrap();
-                assert_eq!(program.interpret(vec![value.clone()]), Ok(vec![value]));
+                let value = Array::from_elements(packed.clone(), &vec![1f32; extent * 2]).unwrap();
+                let output_type = if packed.sharding().is_some() { packed_output } else { packed };
+                let output = Array::from_elements(output_type, &vec![1f32; extent * 2]).unwrap();
+                assert_eq!(program.interpret(vec![value]), Ok(vec![output]));
             }
         }
     }

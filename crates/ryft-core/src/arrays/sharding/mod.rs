@@ -7,7 +7,7 @@ pub mod shardings;
 pub mod visualizations;
 
 pub use meshes::{Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex};
-pub use shardings::{Sharding, ShardingDimension};
+pub use shardings::{ReductionStateKind, Sharding, ShardingDimension, UnreducedKind};
 pub use visualizations::ShardingVisualization;
 
 /// Represents sharding-related errors.
@@ -25,7 +25,7 @@ pub enum ShardingError {
     #[error("mesh axis `{name}` must have size > 0")]
     EmptyMeshAxis { name: String },
 
-    #[error("mesh axis `{name}` must have type manual")]
+    #[error("mesh axis `{name}` must have type `manual`")]
     ExpectedManualMeshAxis { name: String },
 
     #[error("cannot remove dimension {dimension} because it is sharded over the non-manual mesh axis `{name}`")]
@@ -36,6 +36,18 @@ pub enum ShardingError {
 
     #[error("manual axis `{name}` cannot be both varying and reduced")]
     ConflictingVaryingAndReducedMeshAxis { name: String },
+
+    #[error("unreduced kind `{kind}` requires at least one unreduced mesh axis")]
+    UnreducedKindWithoutUnreducedAxes { kind: UnreducedKind },
+
+    #[error(
+        "a value that is unreduced with kind `{kind}` has no cotangent, because reverse mode supports only `sum` \
+         unreduced axes"
+    )]
+    UndefinedUnreducedCotangent { kind: UnreducedKind },
+
+    #[error("mesh with axis sizes {sizes:?} has a device count that does not fit `usize`")]
+    MeshDeviceCountOverflow { sizes: Vec<usize> },
 
     #[error("device ID `{id}` appears more than once")]
     DuplicateDeviceId { id: DeviceId },
@@ -51,6 +63,12 @@ pub enum ShardingError {
 
     #[error("sharding rank ({sharding_rank}) does not match array rank ({array_rank})")]
     ShardingRankMismatch { sharding_rank: usize, array_rank: usize },
+
+    #[error(
+        "array types cannot record placement over auto mesh axes, but got sharding `{sharding}`; \
+         constrain the placement with `constrain_sharding` or use explicit mesh axes instead"
+    )]
+    AutoAxisInArrayType { sharding: Sharding },
 
     #[error("dimension index {dimension} is out of bounds for a sharding of rank {rank}")]
     DimensionOutOfBounds { dimension: usize, rank: usize },

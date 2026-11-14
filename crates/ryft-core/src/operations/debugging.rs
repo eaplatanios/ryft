@@ -325,10 +325,10 @@ mod tests {
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_type_inference,
     };
-    use crate::operations::sharding::shard_map::{ShardMapTracer, shard_map};
+    use crate::operations::sharding::shard_map::{ShardMapOptions, shard_map};
     use crate::parameters::{Parameter, Placeholder};
     use crate::partial::PartialValue;
-    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramBuilder, Typed};
+    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramBuilder, ProjectedValue, Typed};
     use crate::tracing::{DomainTracer, Trace, Tracer, TracingContext};
 
     use super::*;
@@ -547,13 +547,14 @@ mod tests {
         let (_, program) = ArrayIrContext::trace(
             |input: Tracer<ArrayIrContext>| {
                 let output = shard_map(
-                    |local: ShardMapTracer<ArrayIrContext>| {
-                        local.print_with_effect_class("body", EffectClass::DeviceOrderedIo).unwrap()
+                    |local: ProjectedValue<ArrayType, DomainTracer<ArrayIrContext>>| {
+                        local.print_with_effect_class("body", EffectClass::DeviceOrderedIo)
                     },
                     ValueProjection::<ArrayType>::into_projected(input)?,
                     mesh,
                     sharding.clone(),
                     sharding,
+                    ShardMapOptions::new(),
                 )?;
                 Ok(output.into_value())
             },
@@ -580,8 +581,8 @@ mod tests {
                 lambda %0:dimension<3>, %1:f32[3, 4] .
                 let %2:{global_type} = shard_map [
                     mesh=['x'=2:manual, 'y'=2:explicit],
-                    in_shardings=[{global_sharding}],
-                    out_shardings=[{global_sharding}],
+                    input_shardings=[{global_sharding}],
+                    output_shardings=[{global_sharding}],
                     manual_axes=['x'],
                     global_input_types=[{global_type}],
                     global_output_types=[{global_type}],

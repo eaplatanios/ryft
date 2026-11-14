@@ -3,40 +3,32 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 
-use crate::axes::{NamedAxes, NamedAxis};
+use crate::axes::{MeshContext, NamedAxes};
 use crate::batching::{BatchAxis, BatchableType, BatchingLevelExtent, RecursiveBatchingPolicy};
 use crate::contexts::{Context, StagingContext};
 use crate::differentiation::{CotangentAccumulator, CotangentBatchingPolicy, DifferentiableType, TranspositionContext};
+use crate::operations::collectives::CollectiveOperation;
 use crate::operations::composites::configurations::{
     AccumulatingVjp, BroadcastInvariantBatching, BroadcastSensitiveBatching, CompositeBatching, CompositeJvp,
     CompositeVjp, DefaultBatching, DefaultJvp, DefaultVjp, ExplicitJvp, ExplicitVjp, JvpFromPrimal, SequentialBatching,
     SymbolicZeroJvp, SymbolicZeroVjp,
 };
+use crate::operations::composites::describe_composite;
 use crate::operations::composites::operations::{COMPOSITE_OPERATION_NAME, CompositeOperation};
+use crate::operations::composites::rules::definitions::validate_rule_axes;
 use crate::operations::composites::rules::{
-    CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer,
+    CompositeKey, CustomRuleDefinition, CustomRuleReference, CustomRuleRegistration, CustomRuleTracer, NamedComposite,
 };
 use crate::operations::custom_call::{CustomCall, CustomCallOperation};
-use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
-use crate::programs::{MaybeZero, Operation, ProgramError, Type, TypeError, Typed, Value};
-use crate::tracing::{DomainTracingContext, TracingContext};
-
-#[cfg(doc)]
-use crate::tracing::DomainTracer;
-
-#[cfg(doc)]
-use crate::batching::{BatchingError, DiagonalBatchingPolicy};
-
-#[cfg(doc)]
-use crate::operations::control_flow::scan::{ScanOperation, ScanType};
-
-#[cfg(doc)]
-use crate::programs::Program;
+use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily, Placeholder};
+use crate::programs::{AttachedRegions, MaybeZero, Operation, Program, ProgramError, Type, TypeError, Typed, Value};
+use crate::tracing::{DomainTracingContext, TracingContext, TracingScope};
 
 /// Collects the [`Context`] bounds required by [`Composite::call`], so that wrappers can reuse them. Implemented for
 /// every context that satisfies these bounds. The call's input, output, and rule configuration bounds remain separate.
 pub trait CompositeCallContext:
     NamedAxes
+    + MeshContext
     + Context<
         Type: Eq
                   + Hash
@@ -56,6 +48,7 @@ pub trait CompositeCallContext:
 
 impl<C> CompositeCallContext for C where
     C: NamedAxes
+        + MeshContext
         + Context<
             Type: Eq
                       + Hash
@@ -73,27 +66,58 @@ impl<C> CompositeCallContext for C where
 {
 }
 
+/// Maximum number of typed call signatures for which a named [`Composite`] remembers the output structure that its
+/// output type rule returned. Refer to [`CompositeRegistrations::get_by_input_types`] for more information.
+const NAMED_OUTPUT_STRUCTURE_CAPACITY: usize = 16;
+
 /// Retained definitions registered by a [`Composite`] in its selected operation family, one per input and output
-/// parameter structure and visible named axes. Their handles live as long as the composite, so calls with the same
-/// structure and named axes share specialization caches. The mutex synchronizes access to the registration handles,
-/// which are not themselves [`Sync`].
+/// parameter structure and [`TracingScope`] (i.e., the named axes, the default mesh, and the enclosing manual axes)
+/// where the calls are made. Their handles live as long as the composite, so calls with the same structure and scope
+/// share specialization caches. The mutex synchronizes access to the registration handles, which are not themselves
+/// [`Sync`].
 struct CompositeRegistrations<V: Typed + Parameter, O, InputStructure, OutputStructure> {
     /// Registrations for the selected family and parameter structure types.
     entries: Mutex<Vec<CompositeRegistration<V, O, InputStructure, OutputStructure>>>,
+
+    /// Output structures that the output type rule of a named composite returned for recent typed call signatures,
+    /// together with the definitions registered for them, most recent last. The output structure of a named composite
+    /// may depend on the types of its inputs and not only on their structure, so it is remembered per types.
+    named_outputs: Mutex<Vec<NamedCompositeOutputCacheEntry<V, O, InputStructure, OutputStructure>>>,
 }
 
 impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
     CompositeRegistrations<V, O, InputStructure, OutputStructure>
 {
-    /// Returns a reference to the [`CustomRuleDefinition`] registered for the provided call structure and named axes,
-    /// registering the definition returned by `register_fn` if there is none yet.
+    /// Returns a reference to the [`CustomRuleDefinition`] registered for the provided call structure and
+    /// [`TracingScope`], registering the definition returned by `register_fn` if there is none yet.
     fn get_or_register<F: FnOnce() -> CustomRuleDefinition<V, O>>(
         &self,
         input_structure: &InputStructure,
         output_structure: &OutputStructure,
-        named_axes: &[(String, NamedAxis)],
+        scope: &TracingScope,
         register_fn: F,
     ) -> CustomRuleReference<V, O>
+    where
+        InputStructure: Clone + PartialEq,
+        OutputStructure: Clone + PartialEq,
+    {
+        let registration = self.get_or_try_register(input_structure, output_structure, scope, || {
+            Ok::<_, ProgramError>(CustomRuleRegistration::new(register_fn()))
+        });
+
+        // Infallible registration functions never fail.
+        registration.unwrap()
+    }
+
+    /// Returns a reference to the definition registered for the provided call structure and [`TracingScope`], retaining
+    /// the registration returned by `register_fn` if there is none yet, and propagating its error otherwise.
+    fn get_or_try_register<F: FnOnce() -> Result<CustomRuleRegistration<V, O>, ProgramError>>(
+        &self,
+        input_structure: &InputStructure,
+        output_structure: &OutputStructure,
+        scope: &TracingScope,
+        register_fn: F,
+    ) -> Result<CustomRuleReference<V, O>, ProgramError>
     where
         InputStructure: Clone + PartialEq,
         OutputStructure: Clone + PartialEq,
@@ -104,20 +128,70 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O, InputStructure, OutputStructure>
             .find(|entry| {
                 &entry.input_structure == input_structure
                     && &entry.output_structure == output_structure
-                    && entry.named_axes == named_axes
+                    && &entry.scope == scope
             })
             .map(|entry| entry.registration.reference());
-        existing.unwrap_or_else(|| {
-            let registration = CustomRuleRegistration::new(register_fn());
-            let reference = registration.reference();
-            entries.push(CompositeRegistration {
-                input_structure: input_structure.clone(),
-                output_structure: output_structure.clone(),
-                named_axes: named_axes.to_vec(),
-                registration,
-            });
-            reference
-        })
+        if let Some(existing) = existing {
+            return Ok(existing);
+        }
+        let registration = register_fn()?;
+        let reference = registration.reference();
+        entries.push(CompositeRegistration {
+            input_structure: input_structure.clone(),
+            output_structure: output_structure.clone(),
+            scope: scope.clone(),
+            registration,
+        });
+        Ok(reference)
+    }
+
+    /// Returns a reference to the definition registered for named calls with the provided flattened input types, input
+    /// structure, and [`TracingScope`], together with the output structure of those calls, if a call with that
+    /// signature was recorded recently with [`Self::record_output_structure`].
+    fn get_by_input_types(
+        &self,
+        input_types: &[V::Type],
+        input_structure: &InputStructure,
+        scope: &TracingScope,
+    ) -> Option<(CustomRuleReference<V, O>, OutputStructure)>
+    where
+        InputStructure: PartialEq,
+        OutputStructure: Clone,
+    {
+        let outputs = self.named_outputs.lock().expect("composite registration mutex is poisoned");
+        outputs
+            .iter()
+            .rev()
+            .find(|output| {
+                output.input_types == input_types
+                    && &output.input_structure == input_structure
+                    && output.reference.definition().scope() == scope
+            })
+            .map(|output| (output.reference.clone(), output.output_structure.clone()))
+    }
+
+    /// Records the output structure and definition of named calls with the provided flattened input types and input
+    /// structure, evicting the least recently recorded signature beyond [`NAMED_OUTPUT_STRUCTURE_CAPACITY`].
+    fn record_output_structure(
+        &self,
+        input_types: &[V::Type],
+        input_structure: &InputStructure,
+        output_structure: &OutputStructure,
+        reference: &CustomRuleReference<V, O>,
+    ) where
+        InputStructure: Clone,
+        OutputStructure: Clone,
+    {
+        let mut outputs = self.named_outputs.lock().expect("composite registration mutex is poisoned");
+        if outputs.len() == NAMED_OUTPUT_STRUCTURE_CAPACITY {
+            outputs.remove(0);
+        }
+        outputs.push(NamedCompositeOutputCacheEntry {
+            input_types: input_types.to_vec(),
+            input_structure: input_structure.clone(),
+            output_structure: output_structure.clone(),
+            reference: reference.clone(),
+        });
     }
 }
 
@@ -126,7 +200,7 @@ impl<V: Typed + Parameter, O, InputStructure, OutputStructure> Default
 {
     #[inline]
     fn default() -> Self {
-        Self { entries: Mutex::new(Vec::new()) }
+        Self { entries: Mutex::new(Vec::new()), named_outputs: Mutex::new(Vec::new()) }
     }
 }
 
@@ -138,11 +212,39 @@ struct CompositeRegistration<V: Typed + Parameter, O, InputStructure, OutputStru
     /// Structure of the calls' outputs.
     output_structure: OutputStructure,
 
-    /// Named axes visible where the calls are made, with which the definition traces its rules.
-    named_axes: Vec<(String, NamedAxis)>,
+    /// Scope (i.e., the named axes, the default mesh, and the enclosing manual axes) where the calls are made,
+    /// in which the definition traces its rules.
+    scope: TracingScope,
 
     /// Registration handle, which owns the definition's specialization caches.
     registration: CustomRuleRegistration<V, O>,
+}
+
+/// Cache entry for the output structure that a named [`Composite`]'s output type rule returned for one typed call
+/// signature, together with the definition registered for calls with that signature.
+struct NamedCompositeOutputCacheEntry<V: Typed + Parameter, O, InputStructure, OutputStructure> {
+    /// Flattened types of the calls' inputs.
+    input_types: Vec<V::Type>,
+
+    /// Structure of the calls' inputs.
+    input_structure: InputStructure,
+
+    /// Structure of the calls' outputs.
+    output_structure: OutputStructure,
+
+    /// Definition registered for calls with this input and output structure.
+    reference: CustomRuleReference<V, O>,
+}
+
+/// Named composite configuration of a [`Composite`]. Refer to [`Composite::with_named_composite`] for more information.
+struct NamedCompositeConfiguration<T, InputStructure, OutputStructure> {
+    /// Semantic identity of the definition that the function registers for calls with the provided input parameter
+    /// structure.
+    key: Arc<dyn Fn(&InputStructure) -> CompositeKey + Send + Sync>,
+
+    /// Output type rule over the parameter structure and flattened types of a call's inputs, returning the parameter
+    /// structure and flattened types of its outputs.
+    output_types: Arc<dyn Fn(&InputStructure, &[T]) -> Result<(OutputStructure, Vec<T>), ProgramError> + Send + Sync>,
 }
 
 /// Function with custom derivative or batching rules, built by [`composite`]. It stores a primal closure together with
@@ -163,15 +265,16 @@ struct CompositeRegistration<V: Typed + Parameter, O, InputStructure, OutputStru
 /// primal and each rule is traced once per specialization and cached.
 ///
 /// The function owns the specialization caches of its calls: calls that share a call structure (i.e., input and output
-/// parameter structure) and named axes share one definition, registered in the function's operation family `(V, O)`,
-/// and its caches for as long as the function lives. Once the function is dropped, the derivative requests of calls
-/// that it staged trace their rules again on every request. The rules of a call cannot discharge reference state, so
-/// differentiating a call whose reference state was discharged is rejected when its rule programs contain reference
-/// state. Refer to [`CustomRuleDefinition::with_reference_discharge`] for more information.
+/// parameter structure) and a [`TracingScope`] share one definition, registered in the function's operation family
+/// `(V, O)`, and its caches for as long as the function lives. Once the function is dropped, the derivative requests
+/// of calls that it staged trace their rules again on every request. The rules of a call cannot discharge reference
+/// state, so differentiating a call whose reference state was discharged is rejected when its rule programs contain
+/// reference state. Refer to [`CustomRuleDefinition::with_reference_discharge`] for more information.
 ///
 /// Reconfiguring this function discards its registered definitions because they retain the previous configuration.
 /// Calls staged earlier keep their definitions, but lose the caches owned by this function and retrace their rules on
-/// later derivative requests.
+/// later derivative requests. For named functions, the semantic key must still describe the computation and its rules.
+/// Refer to [`Self::with_named_composite`] for more information on named functions.
 ///
 /// Each configuration (i.e., `Jvp`, `Vjp`, and `Batching`) is part of the type, and its configuration functions exist
 /// only while it still holds its default (i.e., [`DefaultJvp`], [`DefaultVjp`], or [`DefaultBatching`]). Each mode is
@@ -189,6 +292,11 @@ pub struct Composite<
 > where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
+    /// Optional named composite configuration of this function. Without it, calls are identified by their
+    /// registrations alone.
+    named_configuration:
+        Option<NamedCompositeConfiguration<V::Type, Input::ParameterStructure, Output::ParameterStructure>>,
+
     /// Closure computing the primal output value from the primal input value. The [`Context`] whose universe the
     /// primal and the rules are traced into belongs to the operation family `(V, O)`. Each call recovers its live
     /// context from the input values, so the function stores no context value.
@@ -206,6 +314,18 @@ pub struct Composite<
     /// Batch axes of the flattened output leaves of calls batched without a custom batching rule, which default to
     /// mapping every output leaf at axis `0`. Refer to [`Composite::with_batched_output_axes`] for more information.
     batched_output_axes: Option<Vec<BatchAxis>>,
+
+    /// Mesh axes that the retained rules of this function may communicate along, or [`None`] when they are not
+    /// declared. Refer to [`Composite::with_rule_axes`] for more information.
+    rule_axes: Option<Vec<String>>,
+
+    /// Validator of the traced rule programs against [`Self::rule_axes`], which is set exactly when the rule axes
+    /// are declared. [`Composite::with_rule_axes`] captures it because it is the one function that can require the
+    /// [`CollectiveOperation`] implementation of the operation family, and every definition that a call registers
+    /// receives it together with the rule axes (refer to [`CustomRuleDefinition::with_rule_axes`]).
+    #[allow(clippy::type_complexity)]
+    rule_validator:
+        Option<fn(&CustomRuleDefinition<V, O>, &str, &Program<V, O, Vec<V>, Vec<V>>) -> Result<(), ProgramError>>,
 
     /// Number of leading flattened input leaves that parameterize the call without being differentiated.
     non_differentiated_count: usize,
@@ -257,6 +377,81 @@ impl<
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
+    /// Returns this function configured as a [`NamedComposite`] with the provided semantic identity and output type
+    /// rule, whose primal closure is its body. The output type rule validates the types of a call's inputs and returns
+    /// the types of its outputs, and it must agree with the body for every input it accepts.
+    ///
+    /// Calls of a named function share one definition per input and output structure and [`TracingScope`], together
+    /// with its rules and its specialization caches, for as long as the caller holds this [`Composite`] value (refer to
+    /// [`CustomRuleRegistration`]). The body is traced once per input types and cached with the definition, and each
+    /// call attaches it as a shared region, which a staging program imports once however many calls attach it, rather
+    /// than tracing the primal on every call. Callers should therefore construct a named function once and reuse it,
+    /// because a new value traces its body again. Distinct values never share a definition, even with equal keys, and
+    /// reconfiguring a function (e.g., with [`Self::with_jvp_from_primal`]) returns a new value with fresh caches.
+    ///
+    /// The key is an _obligation_ meaning that functions with equal keys must compute the same function and have the
+    /// same rules, because backends may replace calls by their key (e.g., with a fused kernel) and index the functions
+    /// that they emit for calls by key, while calls that no backend replaces lower their body. Changing a computation
+    /// therefore requires a new key (e.g., a new version). A backend that lowers the calls of distinct values with an
+    /// equal key to shared functions keeps structurally different bodies apart, but it cannot detect rules that differ.
+    ///
+    /// Unlike other functions, a named function without derivative rules does not derive its forward mode rule
+    /// from its primal, so it rejects differentiation like an operation without derivative rules. Configure
+    /// [`Self::with_jvp_from_primal`] to differentiate its body explicitly.
+    ///
+    /// Every call of the returned function has the same key, whatever the parameter structure of its inputs. Use
+    /// [`Self::with_named_composite_per_structure`] when that structure changes the computation (e.g., when optional
+    /// inputs may be absent).
+    #[inline]
+    pub fn with_named_composite<R>(self, key: CompositeKey, output_types: R) -> Self
+    where
+        R: 'static + Fn(Input::To<V::Type>) -> Result<Output::To<V::Type>, ProgramError> + Send + Sync,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::To<V::Type>: Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
+        Output::Family: ParameterizedFamily<V::Type>,
+        Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
+    {
+        self.with_named_composite_per_structure(move |_| key.clone(), output_types)
+    }
+
+    /// Returns this function configured as a [`NamedComposite`] whose semantic identity depends on the parameter
+    /// structure of the inputs of each call. It behaves like [`Self::with_named_composite`], except that `key` maps
+    /// the input parameter structure of a call to the [`CompositeKey`] of the definition that serves it. One function
+    /// can therefore serve calls whose input structures change the computation (e.g., calls with and without an
+    /// optional input) while every one of its definitions keeps a key that describes exactly what it computes.
+    ///
+    /// The returned function registers one definition per input and output structure and [`TracingScope`],
+    /// and it evaluates `key` once for each of them, when the definition is registered. The key _obligation_ of
+    /// [`Self::with_named_composite`] applies to every key that `key` returns, so input structures whose computations
+    /// or rules differ must map to different keys.
+    ///
+    /// # Parameters
+    ///
+    ///   - `key`: Function from the parameter structure of a call's inputs to the semantic identity of its definition.
+    ///   - `output_types`: Output type rule, which validates the types of a call's inputs and returns the types of
+    ///     its outputs. It must agree with the body for every input that it accepts.
+    pub fn with_named_composite_per_structure<K, R>(self, key: K, output_types: R) -> Self
+    where
+        K: 'static + Fn(&Input::ParameterStructure) -> CompositeKey + Send + Sync,
+        R: 'static + Fn(Input::To<V::Type>) -> Result<Output::To<V::Type>, ProgramError> + Send + Sync,
+        Input::Family: ParameterizedFamily<V::Type>,
+        Input::To<V::Type>: Parameterized<V::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
+        Output::Family: ParameterizedFamily<V::Type>,
+        Output::To<V::Type>: Parameterized<V::Type, Family = Output::Family, To<CustomRuleTracer<V, O>> = Output>,
+    {
+        let output_types = Arc::new(move |input_structure: &Input::ParameterStructure, input_types: &[V::Type]| {
+            let input_types =
+                Input::To::<V::Type>::from_parameters(input_structure.clone(), input_types.iter().cloned())?;
+            let output_types = output_types(input_types)?;
+            Ok((output_types.parameter_structure(), output_types.into_parameters().collect()))
+        });
+        Self {
+            named_configuration: Some(NamedCompositeConfiguration { key: Arc::new(key), output_types }),
+            registrations: CompositeRegistrations::default(),
+            ..self
+        }
+    }
+
     /// Returns this function with the leading `non_differentiated_count` flattened input leaves treated as
     /// non-differentiated _plumbing_ inputs. Refer to the documentation of the [`composite`] function for the semantics
     /// of non-differentiated inputs. Calls staged before this reconfiguration keep their original rules. The rules
@@ -309,13 +504,27 @@ where
     /// ```
     #[inline]
     pub fn with_non_differentiated_count(self, non_differentiated_count: usize) -> Self {
-        let Self { primal, jvp, vjp, batching, batched_output_axes, name, .. } = self;
-        Composite {
+        let Self {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
+            rule_validator,
+            name,
+            ..
+        } = self;
+        Composite {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -326,17 +535,106 @@ where
     /// Calls staged before this reconfiguration keep their original name.
     #[inline]
     pub fn with_name<N: Into<Cow<'static, str>>>(self, name: N) -> Self {
-        let Self { primal, jvp, vjp, batching, batched_output_axes, non_differentiated_count, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            ..
+        } = self;
         Composite {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name: name.into(),
+            registrations: CompositeRegistrations::default(),
+        }
+    }
+
+    /// Returns this function with a declaration of the mesh axes that its retained rules (i.e., its custom forward
+    /// mode, reverse mode, and batching rules) may communicate along, where an empty list declares that they
+    /// communicate along no mesh axis. The rules are traced only when a transform requests them, so analyses of a
+    /// program that calls this function cannot see the collectives that they stage. Without a declaration, those
+    /// analyses must assume that the rules communicate along every axis (e.g., batching a `shard_map` whose body calls
+    /// this function then keeps every active manual axis that the batch is placed on manual and gathers the batch
+    /// along it, which multiplies the work of the body by the size of that axis). With a declaration, they assume that
+    /// the rules communicate along the declared axes only, so batching can release the other axes, as it releases
+    /// the axes of any body that does not use them. The primal is not covered by the declaration, because analyses
+    /// always inspect the instructions that it stages. Calls staged before this reconfiguration keep their original
+    /// declaration.
+    ///
+    /// The declaration exists only to let batching release manual axes, so it promises everything that releasing
+    /// another manual axis requires of the rules. They communicate only along the declared mesh axes, and they have
+    /// no effect that runs once per device (i.e., any effect other than an
+    /// [`EffectClass::OrderedAssertion`](crate::EffectClass::OrderedAssertion) or the
+    /// [`EffectClass::OrderedState`](crate::EffectClass::OrderedState) of structured reference effects, such as I/O or
+    /// opaque state), anywhere in their region closure, including the dormant rule regions of the operations that they
+    /// call, because every device along a manual axis runs its own occurrence of such an effect, which releasing the
+    /// axis would eliminate. A body with such an effect can never have an axis released, so a function whose rules
+    /// have one (e.g., a backward rule that prints) gains nothing from a declaration and must leave its rule axes
+    /// undeclared. Its axes then stay manual and its effects keep running once per device.
+    ///
+    /// # Errors
+    ///
+    /// The declaration is checked rather than trusted. Every rule is validated when it is traced, before its program
+    /// is cached or used, so the request that traces a rule (e.g., a derivative or batching request) fails with a
+    /// [`ProgramError::UnsupportedOperation`] when the rule has an effect that runs once per device, communicates along
+    /// a mesh axis of the scope of its call (i.e., an axis that an enclosing manual region made manual, whereas the
+    /// axis of an enclosing batching level is not restricted) that is not declared, or calls an operation whose hidden
+    /// axes are unknown or include an axis that is not declared (e.g., another function whose rule axes are not
+    /// declared). Refer to [`CustomRuleDefinition::with_rule_axes`] for more information.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis_names`: Names of the mesh axes that the retained rules may communicate along.
+    #[inline]
+    pub fn with_rule_axes<A: Into<String>, I: IntoIterator<Item = A>>(self, axis_names: I) -> Self
+    where
+        V::Type: Eq + Hash,
+        O: CollectiveOperation,
+    {
+        let Self {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching,
             batched_output_axes,
             non_differentiated_count,
-            name: name.into(),
+            name,
+            ..
+        } = self;
+        Composite {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            batching,
+            batched_output_axes,
+            rule_axes: Some(axis_names.into_iter().map(Into::into).collect()),
+            rule_validator: Some(validate_rule_axes::<V, O>),
+            non_differentiated_count,
+            name,
             registrations: CompositeRegistrations::default(),
         }
+    }
+
+    /// Returns the mesh axes that the retained rules of this function may communicate along, or [`None`] when they
+    /// are not declared. Refer to [`Self::with_rule_axes`] for more information.
+    #[inline]
+    pub fn rule_axes(&self) -> Option<&[String]> {
+        self.rule_axes.as_deref()
     }
 }
 
@@ -414,14 +712,28 @@ where
         self,
         jvp: Jvp,
     ) -> Composite<V, O, Input, Output, ExplicitJvp<Input, Output>, Vjp, Batching> {
-        let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            vjp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let jvp = ExplicitJvp { jvp: Arc::new(jvp) };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -432,16 +744,32 @@ where
     /// differentiates the primal, reusable linearization partitions that derivative once, and reverse mode transposes
     /// it unless reverse mode rules are configured as well). A function without derivative rules already derives its
     /// forward mode differentiation rule from its primal, so this configuration is needed only to pair reverse mode
-    /// rules with the derived forward mode rule, which would otherwise make forward mode reject the calls.
+    /// rules with the derived forward mode rule, which would otherwise make forward mode reject the calls. Named
+    /// functions are the exception, because they never derive a rule implicitly, so they need this configuration
+    /// to differentiate their body. Refer to [`Self::with_named_composite`] for more information.
     #[inline]
     pub fn with_jvp_from_primal(self) -> Composite<V, O, Input, Output, JvpFromPrimal, Vjp, Batching> {
-        let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            vjp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         Composite {
+            named_configuration,
             primal,
             jvp: JvpFromPrimal,
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -510,14 +838,28 @@ where
             + Send
             + Sync,
     {
-        let Self { primal, vjp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            vjp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let jvp = SymbolicZeroJvp { jvp: Arc::new(jvp) };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -635,14 +977,28 @@ where
         Forward: 'static + Fn(Input) -> Result<(Output, Residual), ProgramError> + Send + Sync,
         Backward: 'static + Fn(Residual, Output) -> Result<Input, ProgramError> + Send + Sync,
     {
-        let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let vjp = ExplicitVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -711,14 +1067,28 @@ where
             + Send
             + Sync,
     {
-        let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let vjp = SymbolicZeroVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -766,14 +1136,28 @@ where
             + Send
             + Sync,
     {
-        let Self { primal, jvp, batching, batched_output_axes, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            batching,
+            batched_output_axes,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let vjp = AccumulatingVjp { forward: Arc::new(forward), backward: Arc::new(backward), deferred_forward: false };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching,
             batched_output_axes,
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -816,9 +1200,10 @@ where
     ///
     /// `forward` runs in the backward pass, where its effects would execute out of order with the rest of the program,
     /// so reverse mode rejects a call whose `forward` has effects (e.g., a `print` or a reference update) with a
-    /// [`ProgramError::UnsupportedOperation`] that names this function. Batching a call before differentiating it is
-    /// supported, but batching a reverse mode derivative after it is taken and before it is transposed (e.g., batching
-    /// a linearization) is rejected with a [`BatchingError::UnsupportedOperation`] that names this function.
+    /// [`ProgramError::UnsupportedOperation`] that names this function. Batching a call before differentiating it
+    /// is supported, but batching a reverse mode derivative after it is taken and before it is transposed
+    /// (e.g., batching a linearization) is rejected with a
+    /// [`BatchingError::UnsupportedOperation`](crate::BatchingError::UnsupportedOperation) that names this function.
     ///
     /// # Examples
     ///
@@ -979,14 +1364,27 @@ where
             + Send
             + Sync,
     {
-        let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let batching = BroadcastInvariantBatching { rule: Arc::new(rule) };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching,
             batched_output_axes: None,
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1007,7 +1405,7 @@ where
     /// The outer product costs one application of the rule's derivative with respect to those inputs per batch item,
     /// which is why a rule that only computes the batched primal (and therefore gives the same values when an input
     /// is broadcast) should use [`Self::with_batching`] instead. The family's batching policy must support taking
-    /// diagonals (refer to [`DiagonalBatchingPolicy`]).
+    /// diagonals (refer to [`DiagonalBatchingPolicy`](crate::DiagonalBatchingPolicy)).
     #[inline]
     pub fn with_broadcast_sensitive_batching<Rule>(
         self,
@@ -1025,14 +1423,27 @@ where
             + Send
             + Sync,
     {
-        let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         let batching = BroadcastSensitiveBatching { rule: Arc::new(rule) };
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching,
             batched_output_axes: None,
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1040,16 +1451,16 @@ where
     }
 
     /// Returns this function with sequential batching, which batches its calls by looping over the batch items with a
-    /// scan (refer to [`ScanOperation`]) whose body applies the unbatched call to one item at a time, instead of
-    /// structurally batching its primal. This is the Ryft analogue of JAX's
+    /// scan (refer to [`ScanOperation`](crate::ScanOperation)) whose body applies the unbatched call to one item at a
+    /// time, instead of structurally batching its primal. This is the Ryft analogue of JAX's
     /// [`custom_batching.sequential_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.sequential_vmap.html),
     /// and a convenience over [`Self::with_batching`] for primals that have no batched form (e.g., a foreign kernel
     /// called by [`Self::from_custom_call`] that processes one item at a time): the mapped inputs are moved to axis
     /// `0` and sliced by the scan, the replicated inputs are passed to every iteration unchanged, and every output is
     /// mapped at axis `0`. The batch extent must be statically known, including when represented by a first-class
-    /// dimension, and the context's family must support scans (i.e., its types implement [`ScanType`] and its
-    /// operations contain [`ScanOperation`]). The batch axis must be unnamed because the scan does not bind
-    /// named collectives across its items for the primal or derivative rules.
+    /// dimension, and the context's family must support scans (i.e., its types implement [`ScanType`](crate::ScanType)
+    /// and its operations contain [`ScanOperation`](crate::ScanOperation)). The batch axis must be unnamed because the
+    /// scan does not bind named collectives across its items for the primal or derivative rules.
     ///
     /// Unlike a custom batching rule, which replaces the call's primal while preserving the call, batching replaces
     /// the call with the scan, whose body calls the unbatched function. The function's derivative rules therefore keep
@@ -1083,13 +1494,26 @@ where
     /// ```
     #[inline]
     pub fn with_sequential_batching(self) -> Composite<V, O, Input, Output, Jvp, Vjp, SequentialBatching> {
-        let Self { primal, jvp, vjp, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching: SequentialBatching,
             batched_output_axes: None,
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1109,13 +1533,27 @@ where
     ///   - `output_axes`: Batch axis of each flattened output leaf, in leaf order.
     #[inline]
     pub fn with_batched_output_axes(self, output_axes: Vec<BatchAxis>) -> Self {
-        let Self { primal, jvp, vjp, batching, non_differentiated_count, name, .. } = self;
+        let Self {
+            named_configuration,
+            primal,
+            jvp,
+            vjp,
+            batching,
+            rule_axes,
+            rule_validator,
+            non_differentiated_count,
+            name,
+            ..
+        } = self;
         Composite {
+            named_configuration,
             primal,
             jvp,
             vjp,
             batching,
             batched_output_axes: Some(output_axes),
+            rule_axes,
+            rule_validator,
             non_differentiated_count,
             name,
             registrations: CompositeRegistrations::default(),
@@ -1138,11 +1576,13 @@ where
     /// `input`, which is exactly the context the call is staged into. It is therefore never named at a construction or
     /// call site, while the stored closures still pin the tracers that this universe must produce.
     ///
-    /// The primal and the rules are traced in fresh traces rather than in `C` itself, so each trace is seeded with the
-    /// named axes in scope in `C` (refer to [`NamedAxes::named_axes`]). Code in the closures therefore resolves the
-    /// axes of enclosing transforms (e.g., an `axis_index` or a collective over the axis of an enclosing `batch`) as it
-    /// would if it were inlined. Rules traced under different bindings may differ, so calls under different named axes
-    /// register separate rule definitions.
+    /// The primal and the rules are traced in fresh traces rather than in `C` itself, so each trace is seeded
+    /// with the [`TracingScope`] of `C` (i.e., the named axes, the default mesh, and the enclosing manual axes that
+    /// [`NamedAxes::named_axes`], [`MeshContext::default_mesh`], and [`MeshContext::manual_axes`] report). Code in the
+    /// closures therefore resolves the axes of enclosing transforms (e.g., an `axis_index` or a collective over the
+    /// axis of an enclosing `batch`), the mesh of an enclosing manual region, and the axes that enclosing manual
+    /// regions made manual (even when a `batch` level shadows one of them) as it would if it were inlined. Rules
+    /// traced in different scopes may differ, so calls in different scopes register separate rule definitions.
     ///
     /// # Errors
     ///
@@ -1159,6 +1599,10 @@ where
         input: InputValues,
     ) -> Result<<Output::To<C::Type> as Parameterized<C::Type>>::To<InputValue>, ProgramError>
     where
+        V: 'static,
+        O: 'static,
+        Input: 'static,
+        Output: 'static,
         V::Type: BatchableType,
         Input::Family: ParameterizedFamily<C::Type> + ParameterizedFamily<V>,
         Input::To<C::Type>: Clone + Parameterized<C::Type, Family = Input::Family, To<CustomRuleTracer<V, O>> = Input>,
@@ -1190,20 +1634,135 @@ where
             .into());
         }
 
+        // Named composite calls attach the cached body of their definition as a shared region, which the staging
+        // program imports once, instead of tracing the primal on every call. The output type rule validates the inputs
+        // and determines the output structure.
+        if let Some(named_configuration) = &self.named_configuration {
+            let scope = TracingScope::from_context(&first.domain());
+            let input_structure = input_types.parameter_structure();
+            let flat_input_types = input_values.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+
+            // The output type rule determines the output structure, which may depend on the input types, once per typed
+            // call signature, and calls whose output structures differ use different definitions.
+            let registered = self.registrations.get_by_input_types(&flat_input_types, &input_structure, &scope);
+            let (rules, output_structure) = match registered {
+                Some(registered) => registered,
+                None => {
+                    let (output_structure, _) =
+                        (named_configuration.output_types)(&input_structure, &flat_input_types)?;
+                    let rules =
+                        self.registrations.get_or_try_register(&input_structure, &output_structure, &scope, || {
+                            let paths = |structure: Vec<(ParameterPath, &Placeholder)>| {
+                                structure.into_iter().map(|(path, _)| path).collect::<Vec<_>>()
+                            };
+                            let output_paths = paths(output_structure.named_parameters().collect());
+                            let definition = {
+                                // Parameter structures need not be `Sync`, so the retained rules clone the input
+                                // structure through a mutex and compare output structures by their parameter paths.
+                                let shared_input_structure = Arc::new(Mutex::new(input_structure.clone()));
+                                let rule_input_structure = shared_input_structure.clone();
+                                let output_type_rule = named_configuration.output_types.clone();
+                                let output_types = move |input_types: &[V::Type]| {
+                                    let input_structure = rule_input_structure
+                                        .lock()
+                                        .expect("composite structure mutex is poisoned")
+                                        .clone();
+                                    output_type_rule(&input_structure, input_types)
+                                        .map(|(_, output_types)| output_types)
+                                };
+                                let named_definition = {
+                                    // The key of a definition is the key of its input structure.
+                                    let key = (named_configuration.key)(&input_structure);
+                                    let (primal, name) = (self.primal.clone(), key.name().to_owned());
+                                    let body_input_structure = shared_input_structure;
+                                    NamedComposite::new(
+                                        key,
+                                        output_types,
+                                        move |inputs: &[CustomRuleTracer<V, O>]| {
+                                            let input_structure = body_input_structure
+                                                .lock()
+                                                .expect("composite structure mutex is poisoned")
+                                                .clone();
+                                            let output = primal(Input::from_parameters(
+                                                input_structure,
+                                                inputs.iter().cloned(),
+                                            )?)?;
+                                            let paths =
+                                                output.named_parameters().map(|(path, _)| path).collect::<Vec<_>>();
+                                            if paths != output_paths {
+                                                let name = describe_composite(COMPOSITE_OPERATION_NAME, &name);
+                                                let message = format!(
+                                                    "{name} body output structure differs from its output type rule",
+                                                );
+                                                return Err(TypeError::invalid(message).into());
+                                            }
+                                            Ok(output.into_parameters().collect())
+                                        },
+                                    )
+                                };
+                                let definition = CustomRuleDefinition::new(self.name.clone())
+                                    .with_scope(scope.clone())
+                                    .with_batching_support()
+                                    .with_named_composite(named_definition);
+                                let definition = definition.configure_jvp(
+                                    &self.jvp,
+                                    &input_structure,
+                                    &output_structure,
+                                    self.non_differentiated_count,
+                                );
+                                let definition = definition.configure_vjp(
+                                    &self.vjp,
+                                    &input_structure,
+                                    &output_structure,
+                                    self.non_differentiated_count,
+                                );
+                                let definition = match &self.batched_output_axes {
+                                    Some(output_axes) => definition.with_batched_output_axes(output_axes.clone()),
+                                    None => definition,
+                                };
+                                let definition = match (&self.rule_axes, self.rule_validator) {
+                                    (Some(axis_names), Some(validator)) => {
+                                        definition.with_validated_rule_axes(axis_names.clone(), validator)
+                                    }
+                                    _ => definition,
+                                };
+                                definition.configure_batching(&self.batching, &input_structure, &output_structure)
+                            };
+                            Ok::<_, ProgramError>(CustomRuleRegistration::new(definition))
+                        })?;
+                    self.registrations.record_output_structure(
+                        &flat_input_types,
+                        &input_structure,
+                        &output_structure,
+                        &rules,
+                    );
+                    (rules, output_structure)
+                }
+            };
+            let operation =
+                CompositeOperation::new(rules.clone()).with_non_differentiated_count(self.non_differentiated_count)?;
+            let body = rules.body(&flat_input_types)?;
+            let outputs =
+                first
+                    .domain()
+                    .bind(operation, AttachedRegions::Callees(std::slice::from_ref(&body)), &input_values)?;
+            return Ok(Parameterized::from_parameters(output_structure, outputs)?);
+        }
+
         // Only the primal is traced now. The rules are registered with the call structure and traced lazily. The primal
-        // and the rules are traced in fresh traces, which are seeded with the named axes that are visible where the
-        // function is called (e.g., the axis of an enclosing batching level), so that they resolve the same names as
-        // the function would if it were inlined. Rules traced under different bindings may differ, so the named axes
-        // are part of the registration key.
-        let named_axes = first.domain().named_axes();
+        // and the rules are traced in fresh traces, which are seeded with the scope of the calling context (i.e., the
+        // named axes that are visible where the function is called, such as the axis of an enclosing batching level,
+        // the default mesh, and the enclosing manual axes), so that they resolve the same names, mesh, and manual axes
+        // as the function would if it were inlined. Rules traced in different scopes may differ, so the scope is part
+        // of the registration key.
+        let scope = TracingScope::from_context(&first.domain());
         let (output_types, primal) =
-            DomainTracingContext::<C>::trace_with_named_axes(&*self.primal, input_types.clone(), named_axes.clone())?;
+            DomainTracingContext::<C>::trace_in_scope(&*self.primal, input_types.clone(), scope.clone())?;
         let input_structure = input_types.parameter_structure();
         let output_structure = output_types.parameter_structure();
-        let rules = self.registrations.get_or_register(&input_structure, &output_structure, &named_axes, || {
-            let definition = CustomRuleDefinition::new(self.name.clone())
-                .with_named_axes(named_axes.clone())
-                .with_batching_support();
+        let rules = self.registrations.get_or_register(&input_structure, &output_structure, &scope, || {
+            let definition =
+                CustomRuleDefinition::new(self.name.clone()).with_scope(scope.clone()).with_batching_support();
             let definition =
                 definition.configure_jvp(&self.jvp, &input_structure, &output_structure, self.non_differentiated_count);
             let definition =
@@ -1219,6 +1778,12 @@ where
             let definition = match &self.batched_output_axes {
                 Some(output_axes) => definition.with_batched_output_axes(output_axes.clone()),
                 None => definition,
+            };
+            let definition = match (&self.rule_axes, self.rule_validator) {
+                (Some(axis_names), Some(validator)) => {
+                    definition.with_validated_rule_axes(axis_names.clone(), validator)
+                }
+                _ => definition,
             };
             definition.configure_batching(&self.batching, &input_structure, &output_structure)
         });
@@ -1279,10 +1844,10 @@ pub type VjpComposite<V, O, Input, Output, Residual> =
 pub type BatchedComposite<V, O, Input, Output> =
     Composite<V, O, Input, Output, DefaultJvp, DefaultVjp, BroadcastInvariantBatching<V, O, Input, Output>>;
 
-/// Creates a [`Composite`] from a primal closure `x ↦ y = f(x)` over values of [`DomainTracer`]s, without any custom
-/// rule. It is the one entry point for custom rules of every transform, and its configuration functions add them,
-/// where each configuration is the Ryft analogue of one JAX entry point: [`Composite::with_jvp`] of
-/// [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html), [`Composite::with_vjp`]
+/// Creates a [`Composite`] from a primal closure `x ↦ y = f(x)` over values of [`DomainTracer`](crate::DomainTracer)s,
+/// without any custom rule. It is the one entry point for custom rules of every transform, and its configuration
+/// functions add them, where each configuration is the Ryft analogue of one JAX entry point: [`Composite::with_jvp`]
+/// of [`jax.custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html), [`Composite::with_vjp`]
 /// of [`jax.custom_vjp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_vjp.html),
 /// and [`Composite::with_batching`] of
 /// [`jax.custom_batching.custom_vmap`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_batching.custom_vmap.html),
@@ -1358,12 +1923,12 @@ pub type BatchedComposite<V, O, Input, Output> =
 ///
 /// # Calling Convention
 ///
-/// All closures operate on [`Parameterized`] values of [`DomainTracer`]s (i.e., Ryft's analogue of JAX pytrees), so
-/// inputs, outputs, and residuals may each be a single tracer, a tuple, or any other parameterized structure. Tangents
-/// and cotangents have the parameter structures of their primal values. Because this function builds a reusable
-/// function before any input is known, the primal closure must annotate the tracer type of its input (e.g.,
-/// `|x: DomainTracer<C>| ...`), from which the composite's operation family `(V, O)` is inferred and which fixes the
-/// input types of the rule closures. Static configuration should be captured by the closures, while a dynamic value
+/// All closures operate on [`Parameterized`] values of [`DomainTracer`](crate::DomainTracer)s (i.e., Ryft's analogue
+/// of JAX pytrees), so inputs, outputs, and residuals may each be a single tracer, a tuple, or any other parameterized
+/// structure. Tangents and cotangents have the parameter structures of their primal values. Because this function
+/// builds a reusable function before any input is known, the primal closure must annotate the tracer type of its input
+/// (e.g., `|x: DomainTracer<C>| ...`), from which the composite's operation family `(V, O)` is inferred and which fixes
+/// the input types of the rule closures. Static configuration should be captured by the closures, while a dynamic value
 /// should remain an explicit input, either as a non-differentiated input (see below) or as an ordinary input whose
 /// derivative the rules treat as zero.
 ///
@@ -1420,7 +1985,13 @@ pub type BatchedComposite<V, O, Input, Output> =
 ///   - _dead code elimination_ (i.e., [`Program::into_pruned`]) prunes the unused outputs of a call from its primal
 ///     while keeping every input, as JAX does for its custom derivative calls, and the call's rules are projected onto
 ///     its remaining outputs, except that a call whose forward mode rule is derived from its primal and that has a
-///     custom batching rule stays whole.
+///     custom batching rule stays whole, and
+///   - _rematerialization_ (refer to [`rematerialize`](crate::rematerialize)) treats a call that differentiation
+///     leaves intact (e.g., a call whose inputs are all known) as one producer of its outputs, as JAX's residual
+///     policies treat its custom derivative calls. A policy classifies those outputs by the call itself (i.e., by
+///     a producer named [`COMPOSITE_OPERATION_NAME`]), without seeing the work or the tags inside the call, and
+///     the backward pass replays the whole call when the policy does not save them. A call that its rules
+///     differentiate is replaced by those rules, whose operations the policy classifies like any other.
 ///
 /// # Differences from JAX
 ///
@@ -1460,11 +2031,14 @@ where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
 {
     Composite {
+        named_configuration: None,
         primal: Arc::new(primal),
         jvp: DefaultJvp,
         vjp: DefaultVjp,
         batching: DefaultBatching,
         batched_output_axes: None,
+        rule_axes: None,
+        rule_validator: None,
         non_differentiated_count: 0,
         name: Cow::Borrowed(COMPOSITE_OPERATION_NAME),
         registrations: CompositeRegistrations::default(),
@@ -1484,7 +2058,7 @@ mod tests {
         ArraySliceAxis, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, LogicalMesh,
         MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
-    use crate::axes::AxisError;
+    use crate::axes::{AxisError, NamedAxis};
     use crate::batching::{
         BatchAxis, BatchAxisSpecification, BatchedProgram, BatchingError, ProgramBatchingOutputAxesPolicy, batch,
     };
@@ -1497,9 +2071,12 @@ mod tests {
     use crate::operations::arithmetic::{AddOperation, MulOperation};
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
+    use crate::operations::collectives::{CollectiveOperation, HiddenAxes};
+    use crate::operations::composites::operations::CompositeJvpRule;
     use crate::operations::composites::rules::specializations::CustomRuleSource;
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;
+    use crate::operations::debugging::{Print, PrintOperation};
     use crate::operations::differentiation::stop_gradient::StopGradient;
     use crate::operations::dimensions::dimension_size::DimensionSize;
     use crate::operations::dot::{Dot, DotDimensionNumbers};
@@ -1513,7 +2090,9 @@ mod tests {
     };
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::parameters::Placeholder;
-    use crate::programs::{FlatProgram, MaybeZero, ReferenceType, ValueProjection};
+    use crate::programs::{
+        EffectClass, FlatProgram, Instruction, MaybeZero, ProgramBuilder, ReferenceType, ValueProjection,
+    };
     use crate::tracing::{DomainTracer, Trace};
 
     use super::*;
@@ -1559,6 +2138,20 @@ mod tests {
             Array::vector(x.iter().map(|x| 2.0 * f64::sin(*x)).collect()).unwrap(),
             Array::vector(x.iter().map(|x| 2.0 * f64::cos(*x)).collect()).unwrap(),
         )
+    }
+
+    /// Returns a named `x ↦ x³` with the provided key, whose primal counts its traces in `traces`.
+    fn named_cube(
+        key: &'static str,
+        traces: &Arc<AtomicUsize>,
+    ) -> Composite<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer> {
+        let traces = traces.clone();
+        composite(move |x: ArrayTracer| {
+            traces.fetch_add(1, Ordering::SeqCst);
+            Ok(x.clone() * x.clone() * x)
+        })
+        .with_name("cube")
+        .with_named_composite(CompositeKey::new(key, 1), |x: ArrayType| Ok(x))
     }
 
     #[test]
@@ -1725,6 +2318,238 @@ mod tests {
     }
 
     #[test]
+    fn test_composite_with_named_composite() {
+        // Calls of one named function share one definition, and every call in a program attaches the body for its
+        // input types as one shared region, which is traced once per input types.
+        let traces = Arc::new(AtomicUsize::new(0));
+        let first = named_cube("ryft.tests.composite_named", &traces);
+        let (_, program) = ArrayContext::trace(
+            |(x, y): (ArrayTracer, ArrayTracer)| Ok((first.call(x.clone())?, first.call(x)?, first.call(y)?)),
+            (ArrayType::scalar(DataType::F64), ArrayType::new_static(DataType::F64, [2])),
+        )
+        .unwrap();
+        assert_eq!(traces.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[2] .
+                let %2:f64[] = composite [key=\"ryft.tests.composite_named.v1\"] %0 [
+                    primal=^0={
+                        lambda %0:f64[] .
+                        let %1:f64[] = mul %0 %0
+                            %2:f64[] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                    %3:f64[] = composite [key=\"ryft.tests.composite_named.v1\"] %0 [
+                        primal=^0,
+                    ]
+                    %4:f64[2] = composite [key=\"ryft.tests.composite_named.v1\"] %1 [
+                        primal={
+                            lambda %0:f64[2] .
+                            let %1:f64[2] = mul %0 %0
+                                %2:f64[2] = mul %1 %0
+                            in (%2)
+                        },
+                    ]
+                in (%2, %3, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::vector(vec![1.0, 3.0]).unwrap())),
+            Ok((Array::scalar(8.0).unwrap(), Array::scalar(8.0).unwrap(), Array::vector(vec![1.0, 27.0]).unwrap())),
+        );
+
+        // Another value with an equal key owns another definition, so it traces its body again.
+        let second = named_cube("ryft.tests.composite_named", &traces);
+        ArrayContext::trace(|x| second.call(x), ArrayType::scalar(DataType::F64)).unwrap();
+        assert_eq!(traces.load(Ordering::SeqCst), 3);
+
+        // Batching structurally batches the shared body.
+        assert_eq!(
+            batch(
+                |x| first.call(x),
+                Array::vector(vec![1.0, 2.0]).unwrap(),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None
+            ),
+            Ok(Array::vector(vec![1.0, 8.0]).unwrap()),
+        );
+
+        // The output type rule validates every call.
+        let rejecting = composite(|x: ArrayTracer| Ok(x))
+            .with_named_composite(CompositeKey::new("ryft.tests.composite_named_rejecting", 1), |_: ArrayType| {
+                Err(TypeError::invalid("rejected").into())
+            });
+        assert_eq!(
+            ArrayContext::trace(|x| rejecting.call(x), ArrayType::scalar(DataType::F64)).map(|_| ()),
+            Err(ProgramError::from(TypeError::invalid("rejected"))),
+        );
+    }
+
+    #[test]
+    fn test_composite_with_named_composite_per_structure() {
+        // The key of every definition is derived from the input structure of its calls, so one function serves calls
+        // with different numbers of inputs under different keys, and calls with the same structure share a definition.
+        let function = composite(|inputs: Vec<ArrayTracer>| {
+            let mut inputs = inputs.into_iter();
+            let first = inputs.next().unwrap();
+            Ok(inputs.fold(first, |product, input| product * input))
+        })
+        .with_name("product")
+        .with_named_composite_per_structure(
+            |inputs| {
+                CompositeKey::new("ryft.tests.composite_named_per_structure", 1).with_attribute("count", inputs.len())
+            },
+            |inputs: Vec<ArrayType>| Ok(inputs[0].clone()),
+        );
+        let (_, program) = ArrayContext::trace(
+            |(x, y): (ArrayTracer, ArrayTracer)| {
+                Ok((
+                    function.call(vec![x.clone()])?,
+                    function.call(vec![x.clone(), y.clone()])?,
+                    function.call(vec![y, x])?,
+                ))
+            },
+            (ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = composite [key=\"ryft.tests.composite_named_per_structure.v1 {count = 1}\"] %0 [
+                    primal={
+                        lambda %0:f64[] .
+                        in (%0)
+                    },
+                ]
+                    %3:f64[] = composite [key=\"ryft.tests.composite_named_per_structure.v1 {count = 2}\"] %0 %1 [
+                        primal=^1={
+                            lambda %0:f64[], %1:f64[] .
+                            let %2:f64[] = mul %0 %1
+                            in (%2)
+                        },
+                    ]
+                    %4:f64[] = composite [key=\"ryft.tests.composite_named_per_structure.v1 {count = 2}\"] %1 %0 [
+                        primal=^1,
+                    ]
+                in (%2, %3, %4)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            program.interpret((Array::scalar(2.0).unwrap(), Array::scalar(3.0).unwrap())),
+            Ok((Array::scalar(2.0).unwrap(), Array::scalar(6.0).unwrap(), Array::scalar(6.0).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_composite_with_named_composite_type_dependent_output_structure() {
+        // The output structure may depend on the input types and not only on their structure, even when the structures
+        // have the same (i.e., no) leaves, so it is determined for every typed call signature.
+        let nested = composite(|x: ArrayTracer| -> Result<Vec<Vec<ArrayTracer>>, ProgramError> {
+            Ok(if x.r#type().rank() == 0 { vec![Vec::new()] } else { Vec::new() })
+        })
+        .with_named_composite(CompositeKey::new("ryft.tests.composite_named_type_dependent", 1), |x: ArrayType| {
+            Ok(if x.rank() == 0 { vec![Vec::new()] } else { Vec::new() })
+        });
+        let ((scalar, vector), _) = ArrayContext::trace(
+            |(x, y): (ArrayTracer, ArrayTracer)| Ok((nested.call(x)?, nested.call(y)?)),
+            (ArrayType::scalar(DataType::F64), ArrayType::new_static(DataType::F64, [2])),
+        )
+        .unwrap();
+        assert_eq!((scalar, vector), (vec![Vec::new()], Vec::new()));
+    }
+
+    #[test]
+    fn test_composite_with_named_composite_differentiation() {
+        // Named functions without rules reject differentiation, like operations without derivative rules.
+        let traces = Arc::new(AtomicUsize::new(0));
+        let cube = named_cube("ryft.tests.composite_named_differentiation", &traces);
+        let error = differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| cube.call(x));
+        assert_eq!(
+            error.map(|_| ()),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation {
+                message:
+                    "cannot differentiate a `composite` call of `ryft.tests.composite_named_differentiation` that has \
+                          no derivative rule"
+                        .to_string(),
+            })),
+        );
+
+        // An explicitly derived forward mode rule differentiates the body, in forward and reverse mode.
+        let cube = named_cube("ryft.tests.composite_named_differentiation_derived", &traces).with_jvp_from_primal();
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| cube.call(x)),
+            Ok((Array::scalar(8.0).unwrap(), Array::scalar(12.0).unwrap())),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).value_and_gradient(|x| cube.call(x).unwrap()),
+            Ok((Array::scalar(8.0).unwrap(), Array::scalar(12.0).unwrap())),
+        );
+
+        // Reverse mode rules apply as for any other function.
+        let cube = named_cube("ryft.tests.composite_named_differentiation_vjp", &traces).with_vjp(
+            |x: ArrayTracer| Ok((x.clone() * x.clone() * x.clone(), x)),
+            |x: ArrayTracer, cotangent: ArrayTracer| Ok(x.clone() * x * cotangent),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).gradient(|x| cube.call(x)),
+            Ok(Array::scalar(4.0).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_composite_with_named_composite_identity() {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+
+        // Calls keep their named identity only while their region is the definition's body.
+        fn named<I: Parameterized<Array>, O: Parameterized<Array>>(
+            program: &crate::programs::Program<Array, ArrayOperation<Array>, I, O>,
+        ) -> Option<CompositeKey> {
+            program
+                .entry_region_ref()
+                .instructions()
+                .iter()
+                .find_map(|instruction| match instruction.operation() {
+                    ArrayOperation::Composite(operation) => Some(operation.key().cloned()),
+                    _ => None,
+                })
+                .unwrap()
+        }
+        let cube = named_cube("ryft.tests.composite_named_shared_definition_cube", &Arc::new(AtomicUsize::new(0)));
+        let (_, program) = ArrayContext::trace(|x| cube.call(x), scalar_type).unwrap();
+        assert_eq!(named(&program), Some(CompositeKey::new("ryft.tests.composite_named_shared_definition_cube", 1)),);
+        let (_, program) = ArrayContext::trace(
+            |x: ArrayTracer| {
+                batch(|x| cube.call(x), x, BatchAxis::new(0), BatchAxis::new(0), None).map_err(ProgramError::from)
+            },
+            ArrayType::new_static(DataType::F64, [2]),
+        )
+        .unwrap();
+        assert_eq!(named(&program), None);
+    }
+
+    #[test]
+    fn test_composite_with_named_composite_reconfiguration() {
+        // A reconfigured function is a new value with its own definition, so its rules take effect immediately,
+        // even while calls of the original function are alive.
+        let traces = Arc::new(AtomicUsize::new(0));
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let cube = named_cube("ryft.tests.composite_named_reconfiguration", &traces);
+        let (_, program) = ArrayContext::trace(|x| cube.call(x), scalar_type).unwrap();
+        let derived = cube.with_jvp_from_primal();
+        assert_eq!(
+            differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| derived.call(x)),
+            Ok((Array::scalar(8.0).unwrap(), Array::scalar(12.0).unwrap())),
+        );
+        assert_eq!(program.interpret(Array::scalar(2.0).unwrap()), Ok(Array::scalar(8.0).unwrap()));
+    }
+
+    #[test]
     fn test_composite_with_non_differentiated_count() {
         // The leading `scale` leaf is plumbing, so the JVP rule ignores its tangent. A stopped gradient states its zero
         // derivative, while an active tangent for it is rejected rather than silently dropped.
@@ -1793,6 +2618,307 @@ mod tests {
                 if message == "cannot apply forward mode differentiation to a `composite` call of `sine` that \
                                has only reverse mode rules; it supports only reverse mode differentiation (e.g., \
                                `vjp`, `value_and_gradient`, or `jacobian_reverse`)",
+        ));
+    }
+
+    #[test]
+    fn test_composite_with_rule_axes() {
+        // A function declares no rule axes until it is configured to, an empty declaration differs from no declaration,
+        // and the declaration survives later configurations, including the configuration of rules.
+        let function = composite(|x: ArrayTracer| Ok(x.sin()?));
+        assert_eq!(function.rule_axes(), None);
+        let function = function.with_rule_axes(Vec::<String>::new());
+        assert_eq!(function.rule_axes(), Some(&[] as &[String]));
+        let function = function
+            .with_rule_axes(["x", "y"])
+            .with_jvp(|x: ArrayTracer, tangent: ArrayTracer| Ok((x.sin()?, x.cos()? * tangent)))
+            .with_name("sine");
+        assert_eq!(function.rule_axes(), Some(["x".to_string(), "y".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn test_composite_with_rule_axes_hidden_axes() {
+        // The declaration reaches the staged call through its definition, and so do the calls and carriers that
+        // transforms derive from it (i.e., a batched call, a reverse mode carrier, and a derived forward mode call).
+        // A call without retained rules has no hidden axes, with or without a declaration, and a call with retained
+        // rules but without a declaration may use any axis.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let hidden_axes = |instructions: &[Instruction<ArrayOperation<Array>>]| {
+            instructions.iter().map(|instruction| instruction.operation().hidden_axes()).collect::<Vec<_>>()
+        };
+        let named = HiddenAxes::Named(vec!["x".to_string()]);
+
+        let function = composite(|x: ArrayTracer| Ok(x.sin()?));
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
+        assert_eq!(hidden_axes(program.instructions()), vec![HiddenAxes::None]);
+        let function = function.with_rule_axes(["x"]);
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
+        assert_eq!(hidden_axes(program.instructions()), vec![HiddenAxes::None]);
+
+        let jvp = |x: ArrayTracer, tangent: ArrayTracer| -> Result<(ArrayTracer, ArrayTracer), ProgramError> {
+            Ok((x.sin()?, x.cos()? * tangent))
+        };
+        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_jvp(jvp);
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
+        assert_eq!(hidden_axes(program.instructions()), vec![HiddenAxes::Unknown]);
+        let function = function.with_rule_axes(["x"]);
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
+        assert_eq!(hidden_axes(program.instructions()), vec![named.clone()]);
+        let batched = program
+            .into_flat_program()
+            .batched(3, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(hidden_axes(batched.instructions()), vec![named.clone()]);
+
+        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+            .with_vjp(|x| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
+            .with_rule_axes(["x"]);
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
+        let linearization = program
+            .into_flat_program()
+            .entry_region_ref()
+            .linearize_shared_for_rule(&[0], DifferentiationRule::JvpForTranspose, None)
+            .unwrap();
+        assert_eq!(hidden_axes(linearization.tangent().instructions()), vec![named.clone()]);
+
+        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+            .with_batching(|x: ArrayTracer, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer>| Ok((x.sin()?, axis)))
+            .with_rule_axes(["x"]);
+        let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type).unwrap();
+        assert_eq!(hidden_axes(program.into_flat_program().jvp().unwrap().instructions()), vec![named]);
+    }
+
+    #[test]
+    fn test_composite_with_rule_axes_validates_jvp_rules() {
+        // The forward mode rule is validated against the declaration when a derivative traces it, in the scope of the
+        // call, which binds the manual mesh axes `x` and `y` and the batch axis `b`. A rule may communicate along the
+        // declared mesh axes and along batch axes, but not along another mesh axis, it must have no effect that runs
+        // once per device anywhere in its region closure, and it must not call a function whose rule axes are not
+        // declared.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let named_axes = vec![
+            ("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true }),
+            ("y".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: true }),
+            ("b".to_string(), NamedAxis::Batched { size: Some(2) }),
+        ];
+        let scalar_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let jvp = |function: &JvpComposite<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer>| {
+            let (_, program) = DomainTracingContext::<ArrayContext>::trace_with_named_axes(
+                |x| function.call(x),
+                scalar_type.clone(),
+                named_axes.clone(),
+            )
+            .unwrap();
+            program.into_flat_program().jvp().map(|_| ())
+        };
+        let reducing = |axis_name: &'static str| {
+            composite(|x: ArrayTracer| Ok(x)).with_jvp(move |x: ArrayTracer, tangent: ArrayTracer| {
+                Ok((x, tangent.parallel_reduce(ReductionKind::Sum, axis_name)?))
+            })
+        };
+        let rejected = |reason: &str| {
+            format!(
+                "`{COMPOSITE_OPERATION_NAME}` JVP rule {reason}, which the rule axes declared with `with_rule_axes` \
+                 do not allow",
+            )
+        };
+
+        // Collectives over declared mesh axes and over batch axes are accepted.
+        assert_eq!(jvp(&reducing("x").with_rule_axes(["x"])), Ok(()));
+        assert_eq!(jvp(&reducing("b").with_rule_axes(Vec::<String>::new())), Ok(()));
+
+        // A collective over a mesh axis that is not declared is rejected.
+        assert!(matches!(
+            jvp(&reducing("y").with_rule_axes(["x"])),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == rejected("communicates along mesh axis `y`"),
+        ));
+
+        // An I/O effect is rejected even when the rule communicates along no axis.
+        let printing = composite(|x: ArrayTracer| Ok(x))
+            .with_jvp(|x: ArrayTracer, tangent: ArrayTracer| {
+                Ok((x, tangent.print_with_effect_class("tangent", EffectClass::DeviceOrderedIo)?))
+            })
+            .with_rule_axes(Vec::<String>::new());
+        assert!(matches!(
+            jvp(&printing),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == rejected("has the `DeviceOrderedIo` effect"),
+        ));
+
+        // So is an effect that runs once per device in the dormant rule region of a call that the rule stages (here,
+        // an attached forward mode rule that prints), which a later transform of the rule may run, and opaque state.
+        let identity = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(scalar_type.clone());
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let printing_jvp = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(scalar_type.clone());
+            let tangent = builder.add_input(scalar_type.clone());
+            let print = PrintOperation::<ArrayType>::new("tangent").with_effect_class(EffectClass::DeviceOrderedIo);
+            let tangent = builder.add_instruction(print, Vec::new(), vec![tangent], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![input, tangent], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let attached = composite(|x: ArrayTracer| Ok(x))
+            .with_jvp(move |x: ArrayTracer, tangent: ArrayTracer| {
+                let call = CompositeOperation::<Array, ArrayOperation<Array>>::from_rule_regions(
+                    CompositeJvpRule::Explicit,
+                    false,
+                );
+                let regions = vec![identity.clone(), printing_jvp.clone()];
+                let tangent = tangent.domain().bind(ArrayOperation::Composite(call), regions, &[tangent])?.remove(0);
+                Ok((x, tangent))
+            })
+            .with_rule_axes(Vec::<String>::new());
+        assert!(matches!(
+            jvp(&attached),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == rejected("has the `DeviceOrderedIo` effect"),
+        ));
+        let state_type = scalar_type.clone();
+        let stateful = composite(|x: ArrayTracer| Ok(x))
+            .with_jvp(move |x: ArrayTracer, tangent: ArrayTracer| {
+                let call = CustomCallOperation::new("increment", vec![state_type.clone()])
+                    .with_effect_class(EffectClass::OrderedState);
+                let tangent =
+                    tangent.domain().bind(ArrayOperation::CustomCall(call), Vec::new(), &[tangent])?.remove(0);
+                Ok((x, tangent))
+            })
+            .with_rule_axes(Vec::<String>::new());
+        assert!(matches!(
+            jvp(&stateful),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == rejected("has the `OrderedState` effect"),
+        ));
+
+        // A call of a function whose rule axes are not declared may communicate along any axis, so it is rejected.
+        let inner = composite(|x: ArrayTracer| Ok(x)).with_jvp(|x: ArrayTracer, tangent: ArrayTracer| Ok((x, tangent)));
+        let nested = composite(|x: ArrayTracer| Ok(x))
+            .with_jvp(move |x: ArrayTracer, tangent: ArrayTracer| Ok((x, inner.call(tangent)?)))
+            .with_rule_axes(Vec::<String>::new());
+        assert!(matches!(
+            jvp(&nested),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == rejected(&format!(
+                    "calls `{COMPOSITE_OPERATION_NAME}`, whose rules may communicate along any axis",
+                )),
+        ));
+    }
+
+    #[test]
+    fn test_composite_with_rule_axes_validates_vjp_rules() {
+        // The reverse mode forward and backward rules are validated against the declaration when a pullback traces
+        // them, in the scope of the call, which binds the manual mesh axes `x` and `y`.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let named_axes = vec![
+            ("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true }),
+            ("y".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: true }),
+        ];
+        let scalar_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let pullback =
+            |function: &VjpComposite<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer, ArrayTracer>| {
+                DomainTracingContext::<ArrayContext>::trace_with_named_axes(
+                    |(x, seed): (ArrayTracer, ArrayTracer)| {
+                        let (y, pullback) = differentiate_at(x).vjp(|x| function.call(x))?;
+                        Ok((y, pullback.apply_materialized(seed)?))
+                    },
+                    (scalar_type.clone(), scalar_type.clone()),
+                    named_axes.clone(),
+                )
+                .map(|_| ())
+            };
+        let reducing_backward = |axis_name: &'static str| {
+            composite(|x: ArrayTracer| Ok(x)).with_vjp(
+                |x: ArrayTracer| Ok((x.clone(), x)),
+                move |_: ArrayTracer, cotangent: ArrayTracer| cotangent.parallel_reduce(ReductionKind::Sum, axis_name),
+            )
+        };
+        let rejected = |rule: &str, reason: &str| {
+            format!(
+                "`{COMPOSITE_OPERATION_NAME}` {rule} rule {reason}, which the rule axes declared with `with_rule_axes` \
+                 do not allow",
+            )
+        };
+        assert_eq!(pullback(&reducing_backward("x").with_rule_axes(["x"])), Ok(()));
+        assert!(matches!(
+            pullback(&reducing_backward("y").with_rule_axes(["x"])),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == rejected("backward", "communicates along mesh axis `y`"),
+        ));
+        let printing_forward = composite(|x: ArrayTracer| Ok(x))
+            .with_vjp(
+                |x: ArrayTracer| Ok((x.clone().print_with_effect_class("x", EffectClass::OrderedIo)?, x)),
+                |_: ArrayTracer, cotangent: ArrayTracer| Ok(cotangent),
+            )
+            .with_rule_axes(["x", "y"]);
+        assert!(matches!(
+            pullback(&printing_forward),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == rejected("forward", "has the `OrderedIo` effect"),
+        ));
+    }
+
+    #[test]
+    fn test_composite_with_rule_axes_validates_batching_rules() {
+        // The custom batching rule is validated against the declaration when batching traces it, in the scope of the
+        // call, which binds the manual mesh axes `x` and `y`.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let named_axes = vec![
+            ("x".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true }),
+            ("y".to_string(), NamedAxis::Mesh { mesh: mesh.clone(), axis: 1, size: 2, checks_manual_variation: true }),
+        ];
+        let scalar_type = ArrayType::scalar(DataType::F64).with_sharding(Sharding::replicated(mesh, 0)).unwrap();
+        let batched = |function: &BatchedComposite<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer>| {
+            let (_, program) = DomainTracingContext::<ArrayContext>::trace_with_named_axes(
+                |x| function.call(x),
+                scalar_type.clone(),
+                named_axes.clone(),
+            )
+            .unwrap();
+            program
+                .into_flat_program()
+                .batched(
+                    2,
+                    ShardingDimension::Replicated,
+                    &[BatchAxis::new(0)],
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )
+                .map(|_| ())
+        };
+        let reducing = |axis_name: &'static str| {
+            composite(|x: ArrayTracer| Ok(x)).with_batching(
+                move |x: ArrayTracer, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer>| {
+                    Ok((x.parallel_reduce(ReductionKind::Sum, axis_name)?, axis))
+                },
+            )
+        };
+        assert_eq!(batched(&reducing("x").with_rule_axes(["x"])), Ok(()));
+        assert!(matches!(
+            batched(&reducing("y").with_rule_axes(["x"])),
+            Err(BatchingError::Program(ProgramError::UnsupportedOperation { message }))
+                if message
+                    == format!(
+                        "`{COMPOSITE_OPERATION_NAME}` batching rule communicates along mesh axis `y`, which the rule \
+                         axes declared with `with_rule_axes` do not allow",
+                    ),
         ));
     }
 
@@ -4865,23 +5991,22 @@ mod tests {
                         lambda %0:f64[3], %1:f64[], %2:f64[], %3:f64[3], %4:f64[3], %5:f64[] .
                         let %6:f64[3] = mul %0 %1
                             %7:f64[] = mul %1 %2
-                            %8:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %1
-                            %9:f64[3] = mul %8 %3
-                            %10:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
-                            %11:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %4
-                            %12:f64[3, 3] = mul %10 %11
-                            %13:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
-                            %14:f64[3] = gather [
+                            %8:f64[3] = mul %1 %3
+                            %9:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[1]] %0
+                            %10:f64[3, 3] = broadcast [output_type=f64[3, 3], output_axes=[0]] %4
+                            %11:f64[3, 3] = mul %9 %10
+                            %12:i64[3, 1] = iota [type=i64[3, 1], dimension=0]
+                            %13:f64[3] = gather [
                                 dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
                                 slice_sizes=[1, 1],
-                            ] %12 %13
-                            %15:f64[3] = add %9 %14
-                            %16:f64[] = mul %1 %5
-                            %17:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %16
-                            %18:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %2
-                            %19:f64[3] = mul %18 %4
-                            %20:f64[3] = add %17 %19
-                        in (%6, %7, %15, %20)
+                            ] %11 %12
+                            %14:f64[3] = add %8 %13
+                            %15:f64[] = mul %1 %5
+                            %16:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %15
+                            %17:f64[3] = broadcast [output_type=f64[3], output_axes=[]] %2
+                            %18:f64[3] = mul %17 %4
+                            %19:f64[3] = add %16 %18
+                        in (%6, %7, %14, %19)
                     },
                 ]
                 in (%6, %7, %8, %9)
@@ -5269,7 +6394,8 @@ mod tests {
         let invariant_indices = placed(DataType::I64, &[3, 1], false);
         let varying_indices = placed(DataType::I64, &[3, 1], true);
         let varying_matrix_sharding = varying_matrix.sharding().unwrap();
-        let named_axes = vec![("m".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2 })];
+        let named_axes =
+            vec![("m".to_string(), NamedAxis::Mesh { mesh, axis: 0, size: 2, checks_manual_variation: true })];
         let function = composite(|(x, y): (ArrayTracer, ArrayTracer)| Ok(x + y)).with_broadcast_sensitive_batching(
             |(x, y): (ArrayTracer, ArrayTracer),
              (x_axis, y_axis): (BatchAxis, BatchAxis),
@@ -5657,6 +6783,100 @@ mod tests {
             }),
             Ok((Array::scalar(4.0).unwrap(), Array::scalar(2.0).unwrap())),
         );
+    }
+
+    #[test]
+    fn test_composite_call_default_mesh() {
+        // The primal and the rules are traced in fresh traces that are seeded with the default mesh of the context
+        // where the function is called (refer to `MeshContext::default_mesh`), so they resolve the same mesh as the
+        // function would if it were inlined.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let record = {
+            let observed = observed.clone();
+            move |rule: &'static str, x: &ArrayTracer| observed.lock().unwrap().push((rule, x.context().default_mesh()))
+        };
+        let function = {
+            let (primal, forward, backward) = (record.clone(), record.clone(), record);
+            composite(move |x: ArrayTracer| {
+                primal("primal", &x);
+                x.sin()
+            })
+            .with_vjp(
+                move |x: ArrayTracer| {
+                    forward("forward", &x);
+                    Ok((x.sin()?, x.cos()?))
+                },
+                move |cosine: ArrayTracer, cotangent: ArrayTracer| {
+                    backward("backward", &cosine);
+                    Ok(cosine * cotangent)
+                },
+            )
+        };
+        let input_type = ArrayType::new_static(DataType::F64, [2]);
+        DomainTracingContext::<ArrayContext>::trace_in_scope(
+            |(x, seed): (ArrayTracer, ArrayTracer)| {
+                let (y, pullback) = differentiate_at(x).vjp(|x| function.call(x))?;
+                Ok((y, pullback.apply_materialized(seed)?))
+            },
+            (input_type.clone(), input_type),
+            TracingScope::new(Vec::new(), Some(mesh.clone())),
+        )
+        .unwrap();
+        let observed = observed.lock().unwrap().clone();
+        assert!(!observed.is_empty());
+        assert!(observed.iter().any(|(rule, _)| *rule == "forward"));
+        assert!(observed.iter().any(|(rule, _)| *rule == "backward"));
+        assert!(observed.iter().all(|(_, default_mesh)| default_mesh.as_ref() == Some(&mesh)), "{observed:?}");
+    }
+
+    #[test]
+    fn test_composite_call_manual_axes() {
+        // The primal and the rules are traced in fresh traces that are seeded with the manual axes of the context where
+        // the function is called (refer to `MeshContext::manual_axes`), including a manual axis whose binding a batch
+        // axis of the same name shadows, so that they never make an enclosing manual axis manual again.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let manual_axis = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        let manual_axes = vec![("x".to_string(), manual_axis)];
+        let scope = TracingScope::new(vec![("x".to_string(), NamedAxis::Batched { size: Some(2) })], Some(mesh))
+            .with_manual_axes(manual_axes.clone());
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let record = {
+            let observed = observed.clone();
+            move |rule: &'static str, x: &ArrayTracer| observed.lock().unwrap().push((rule, x.context().manual_axes()))
+        };
+        let function = {
+            let (primal, forward, backward) = (record.clone(), record.clone(), record);
+            composite(move |x: ArrayTracer| {
+                primal("primal", &x);
+                x.sin()
+            })
+            .with_vjp(
+                move |x: ArrayTracer| {
+                    forward("forward", &x);
+                    Ok((x.sin()?, x.cos()?))
+                },
+                move |cosine: ArrayTracer, cotangent: ArrayTracer| {
+                    backward("backward", &cosine);
+                    Ok(cosine * cotangent)
+                },
+            )
+        };
+        let input_type = ArrayType::new_static(DataType::F64, [2]);
+        DomainTracingContext::<ArrayContext>::trace_in_scope(
+            |(x, seed): (ArrayTracer, ArrayTracer)| {
+                let (y, pullback) = differentiate_at(x).vjp(|x| function.call(x))?;
+                Ok((y, pullback.apply_materialized(seed)?))
+            },
+            (input_type.clone(), input_type),
+            scope,
+        )
+        .unwrap();
+        let observed = observed.lock().unwrap().clone();
+        assert!(observed.iter().any(|(rule, _)| *rule == "primal"));
+        assert!(observed.iter().any(|(rule, _)| *rule == "forward"));
+        assert!(observed.iter().any(|(rule, _)| *rule == "backward"));
+        assert!(observed.iter().all(|(_, observed_axes)| observed_axes == &manual_axes), "{observed:?}");
     }
 
     #[test]

@@ -269,14 +269,17 @@ impl<A: Into<Axis>> From<A> for BatchAxis {
     }
 }
 
-/// Specification of a batch axis introduced by the batching transform that contains an optional explicit extent and
-/// an optional axis name that can be referenced by operations that support named axes. The extent is normally
-/// inferred from the inputs that are being batched. An explicit extent can be provided to either pin it or to drive
-/// a broadcasted batching transform whose extent would otherwise be unobservable. Its representation is selected by
-/// the active [`BatchingPolicy`] (e.g., homogeneous arrays use a host `usize`, while array IR programs use a
-/// first-class dimension value). The axis name makes the batch axis addressable by name from collective operations
-/// inside the batched function body. The default `usize` form converts from `None`, `Some(extent)`, and `extent`
-/// directly. For example:
+/// Specification of a batch axis introduced by the batching transform that contains an optional axis name that can be
+/// referenced by operations that support named axes, an optional explicit extent, and an optional placement of the
+/// batch dimension. The extent is normally inferred from the inputs that are being batched. An explicit extent can be
+/// provided to either pin it or to drive a broadcasted batching transform whose extent would otherwise be unobservable.
+/// Its representation is selected by the active [`BatchingPolicy`] (e.g., homogeneous arrays use a host `usize`, while
+/// array IR programs use a first-class dimension value). The axis name makes the batch axis addressable by name from
+/// collective operations inside the batched function body. The placement plays the role of JAX's
+/// `vmap(spmd_axis_name=...)`. It places the batch dimension when no mapped input determines a placement and must agree
+/// with the placement that the mapped inputs determine otherwise. The default `usize` form converts from `None`,
+/// `Some(extent)`, and `extent` directly. Use [`Self::named`] to name an axis and [`Self::with_extent`] and
+/// [`Self::with_sharding`] to configure it. An anonymous axis starts with [`Self::default`]. For example:
 ///
 /// ```ignore
 /// domain.batch(f, input, input_axes, output_axes, None)?;                                     // Inferred, anonymous.
@@ -285,43 +288,36 @@ impl<A: Into<Axis>> From<A> for BatchAxis {
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchAxisSpecification<E = usize> {
+    /// Name that operations (e.g., collectives) can use to refer to it, or `None` for an anonymous axis.
+    name: Option<String>,
+
     /// Explicit batch extent, or `None` to infer it from the inputs that are being batched.
     extent: Option<E>,
 
-    /// Name that operations (e.g., collectives) can use to refer to it, or `None` for an anonymous axis.
-    name: Option<String>,
-}
-
-impl<E> Default for BatchAxisSpecification<E> {
-    #[inline]
-    fn default() -> Self {
-        Self { extent: None, name: None }
-    }
+    /// Explicit placement of the batch dimension, or `None` to infer it from the inputs that are being batched.
+    sharding: Option<ShardingDimension>,
 }
 
 impl<E> BatchAxisSpecification<E> {
-    /// Creates a named [`BatchAxisSpecification`] with an explicit batch extent.
-    #[inline]
-    pub fn new<N: Into<String>>(extent: E, name: N) -> Self {
-        Self { extent: Some(extent), name: Some(name.into()) }
-    }
-
-    /// Creates an anonymous [`BatchAxisSpecification`] with an explicit batch extent.
-    #[inline]
-    pub fn with_extent(extent: E) -> Self {
-        Self { extent: Some(extent), name: None }
-    }
-
     /// Creates a named [`BatchAxisSpecification`] whose batch extent is inferred from the mapped inputs.
     #[inline]
     pub fn named<N: Into<String>>(name: N) -> Self {
-        Self { extent: None, name: Some(name.into()) }
+        Self { name: Some(name.into()), extent: None, sharding: None }
     }
 
-    /// Returns the explicit batch extent, or `None` when it is to be inferred from mapped inputs.
+    /// Returns this [`BatchAxisSpecification`] with an explicit batch extent, preserving its name and placement.
     #[inline]
-    pub fn extent(&self) -> Option<&E> {
-        self.extent.as_ref()
+    pub fn with_extent(mut self, extent: E) -> Self {
+        self.extent = Some(extent);
+        self
+    }
+
+    /// Returns this [`BatchAxisSpecification`] with an explicit placement of the batch dimension (e.g.,
+    /// `ShardingDimension::sharded(["data"])` to split batch items across the `data` mesh axis).
+    #[inline]
+    pub fn with_sharding(mut self, sharding: ShardingDimension) -> Self {
+        self.sharding = Some(sharding);
+        self
     }
 
     /// Returns the name of this [`BatchAxisSpecification`] that operations (e.g., collectives) can use to refer
@@ -330,19 +326,61 @@ impl<E> BatchAxisSpecification<E> {
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+
+    /// Returns the explicit batch extent, or `None` when it is to be inferred from mapped inputs.
+    #[inline]
+    pub fn extent(&self) -> Option<&E> {
+        self.extent.as_ref()
+    }
+
+    /// Returns the explicit placement of the batch dimension, or `None` when it is to be inferred from mapped inputs.
+    #[inline]
+    pub fn sharding(&self) -> Option<&ShardingDimension> {
+        self.sharding.as_ref()
+    }
+
+    /// Returns the placement of the batch dimension given the placement `inferred` from the mapped inputs, which uses
+    /// [`ShardingDimension::Replicated`] or [`ShardingDimension::Unconstrained`] when no mapped input determines one.
+    /// The explicit placement, if any, replaces such an undetermined placement and must otherwise equal `inferred`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BatchingError::MisalignedBatchAxes`] when the explicit placement conflicts with `inferred`.
+    pub(crate) fn reconcile_sharding(&self, inferred: ShardingDimension) -> Result<ShardingDimension, BatchingError> {
+        match &self.sharding {
+            None => Ok(inferred),
+            Some(explicit) if *explicit == inferred => Ok(inferred),
+            Some(explicit) if matches!(inferred, ShardingDimension::Replicated | ShardingDimension::Unconstrained) => {
+                Ok(explicit.clone())
+            }
+            Some(explicit) => Err(BatchingError::MisalignedBatchAxes {
+                message: format!(
+                    "the explicit batch axis sharding {explicit} conflicts with the batch axis sharding {inferred} of \
+                     the mapped inputs",
+                ),
+            }),
+        }
+    }
+}
+
+impl<E> Default for BatchAxisSpecification<E> {
+    #[inline]
+    fn default() -> Self {
+        Self { name: None, extent: None, sharding: None }
+    }
 }
 
 impl<E> From<Option<E>> for BatchAxisSpecification<E> {
     #[inline]
     fn from(extent: Option<E>) -> Self {
-        Self { extent, name: None }
+        Self { name: None, extent, sharding: None }
     }
 }
 
 impl From<usize> for BatchAxisSpecification {
     #[inline]
     fn from(extent: usize) -> Self {
-        Self::with_extent(extent)
+        Self::default().with_extent(extent)
     }
 }
 
@@ -1384,14 +1422,14 @@ impl<C: Context, O: InterpretableOperation<C>, P: BatchingPolicy<C>> Interpretab
 ///    │ Structured Inputs and Broadcast Axes   │
 ///    └────────────────────┬───────────────────┘
 ///                         ▼
-///    ┌────────────────────────────────────────┐   ┌────────────────────────────────────────┐
-///    │ Entrypoint Policy `pack_inputs`        │◀──┤ Extent and Optional Axis Name          │
-///    └────────────────────┬─────────────┬─────┘   └────────────────────────────────────────┘
+///    ┌────────────────────────────────────────┐   ┌─────────────────────────────────────────┐
+///    │ Entrypoint Policy `pack_inputs`        │◀──┤ Optional Extent, Axis Name, & Placement │
+///    └────────────────────┬─────────────┬─────┘   └─────────────────────────────────────────┘
 ///                         │             └──────────────────────────────┐
 ///                         ▼                                            ▼
-///    ┌────────────────────────────────────────┐   ┌────────────────────────────────────────┐
-///    │ `BatchingContext`                      │   │ Policy-Selected Batch Carriers         │
-///    └────────────────────┬───────────────────┘   └────────────────────┬───────────────────┘
+///    ┌────────────────────────────────────────┐   ┌─────────────────────────────────────────┐
+///    │ `BatchingContext`                      │   │ Policy-Selected Batch Carriers          │
+///    └────────────────────┬───────────────────┘   └────────────────────┬────────────────────┘
 ///                         ▼                                            │
 ///    ┌────────────────────────────────────────┐                        │
 ///    │ Batching Tracer Inputs                 │◀───────────────────────┘
@@ -1547,7 +1585,7 @@ impl<C: Context, P: BatchingEntrypointPolicy<C>> BatchingContext<C, P> {
     ///   - `parent`: Context owning the input values and their reference identities.
     ///   - `inputs`: Flat packed values before applying the new batching level.
     ///   - `input_batch_axes`: Mapped or replicated axis for each input, in the same order as `inputs`.
-    ///   - `batch_axis`: Optional extent and name of the new batch axis.
+    ///   - `batch_axis`: Optional extent, name, and placement of the new batch axis.
     pub fn prepare_inputs(
         parent: &C,
         inputs: Vec<C::Value>,
@@ -1953,34 +1991,30 @@ pub trait Batch: Context {
                 .into_parameters()
                 .collect::<Vec<_>>();
 
-            // Prepare a complete context from the flat inputs, including the reference boundary used to check captures.
-            let (context, inputs) =
-                BatchingContext::<C, C::Policy>::prepare_inputs(parent, inputs, input_batch_axes, batch_axis)?;
-            let inputs =
-                inputs.into_iter().map(|batch| BatchingTracer::new(context.clone(), batch)).collect::<Vec<_>>();
-            let input = I::To::<BatchingTracer<C, C::Policy>>::from_parameters(input_structure, inputs)?;
-            let output = function(input)?;
-
-            // Broadcast the caller's `output_batch_axes` into the output parameter structure, mirroring the
-            // `input_batch_axes` handling above. A single `BatchAxis` leaf applies to every output, and a matching
-            // structure gives one axis per leaf.
-            let output_structure = output.parameter_structure();
-            let output_batch_axis_values = output_batch_axes
-                .broadcast_to_parameter_structure::<O::To<BatchAxis>>(output_structure.clone())?
-                .into_parameters()
-                .collect::<Vec<_>>();
-
-            // The active policy materializes each requested output axis. Unwrapping to parent values preserves any
-            // enclosing batching level's metadata, so nested transforms require no side table.
-            let parent_outputs = output
-                .into_parameters()
-                .zip(output_batch_axis_values)
-                .map(|(output, output_batch_axis)| {
-                    C::Policy::materialize_output(&context, output.into_batch(), output_batch_axis)
-                })
-                .collect::<Result<Vec<_>, BatchingError>>()?;
-
-            Ok(O::To::<C::Value>::from_parameters(output_structure, parent_outputs)?)
+            // Broadcast the caller's `output_batch_axes` into the output parameter structure once the function has
+            // produced it, mirroring the `input_batch_axes` handling above. A single `BatchAxis` leaf applies to every
+            // output, and a matching structure gives one axis per leaf.
+            let mut output_structure = None;
+            let outputs = batch_erased_and_flattened(
+                parent,
+                &mut |inputs| {
+                    let output = function(I::To::<BatchingTracer<C, C::Policy>>::from_parameters(
+                        input_structure.clone(),
+                        inputs,
+                    )?)?;
+                    let structure = output.parameter_structure();
+                    let output_batch_axes = output_batch_axes
+                        .broadcast_to_parameter_structure::<O::To<BatchAxis>>(structure.clone())?
+                        .into_parameters()
+                        .collect::<Vec<_>>();
+                    output_structure = Some(structure);
+                    Ok((output.into_parameters().collect(), output_batch_axes))
+                },
+                inputs,
+                input_batch_axes,
+                batch_axis,
+            )?;
+            Ok(O::To::<C::Value>::from_parameters(output_structure.unwrap(), outputs)?)
         }
 
         let mut function = Some(function);
@@ -2030,7 +2064,8 @@ impl<C: Context<Type: BatchableType<Policy: BatchingEntrypointPolicy<C>>>> Batch
 /// When at least one input is mapped, the batch extent is inferred from those inputs. The `batch_axis` argument accepts
 /// the specification form selected by the execution context's [`Batch::Policy`]. It can supply an explicit extent
 /// (either to pin the inferred extent or to drive a fully-replicated transform whose extent would otherwise be
-/// unobservable) and an axis name that operations inside `function` like collectives can address.
+/// unobservable), an axis name that operations inside `function` like collectives can address, and a placement
+/// of the batch dimension.
 ///
 /// # Parameters
 ///
@@ -2038,8 +2073,8 @@ impl<C: Context<Type: BatchableType<Policy: BatchingEntrypointPolicy<C>>>> Batch
 ///   - `input`: Input (potentially structured) that should be batched/vectorized.
 ///   - `input_batch_axes`: [`BatchAxis`] selection for the input leaves, broadcast into the input's structure.
 ///   - `output_batch_axes`: [`BatchAxis`] selection for the output leaves, broadcast into the output's structure.
-///   - `batch_axis`: [`BatchAxisSpecification`] to use carrying an optional explicit batch extent and an optional
-///     batch axis name.
+///   - `batch_axis`: [`BatchAxisSpecification`] to use carrying an optional explicit batch extent, an optional batch
+///     axis name, and an optional placement of the batch dimension.
 #[inline]
 pub fn batch<
     V: Value<Domain: Batch>,
@@ -2067,6 +2102,123 @@ pub fn batch<
         return Err(BatchingError::EmptyBatch);
     };
     context.batch(function, input, input_batch_axes, output_batch_axes, batch_axis)
+}
+
+/// Batches `function` over `input` like [`batch`], for inputs whose leaves are projections of values of a richer parent
+/// context (i.e., leaves of a [`ProjectedContext`], such as the [`ArrayType`] views of array IR values), running the
+/// transform in that parent context rather than in the projected one. `function` still receives values of the projected
+/// [`Type`] (i.e., projections of the parent's [`BatchingTracer`]s), but every operation that it binds is batched by
+/// the rules of the parent's universe. That universe can contain operations that the projected one lacks, such as calls
+/// of compiled functions, which the projected context could otherwise not batch at all. The outputs are projected back.
+///
+/// The parent context is recovered from the first input leaf, and so inputs with no leaf values return
+/// [`BatchingError::EmptyBatch`]. `batch_axis` takes the specification form of the parent context's [`Batch::Policy`]
+/// (e.g., a first-class dimension extent for array IR contexts). Refer to [`batch`] for the semantics of the other
+/// arguments.
+pub fn batch_in_parent<
+    T: Type,
+    V: Value<Type = T, Domain = ProjectedContext<C, T>>,
+    C: Batch + ContextProjection<T>,
+    I: Parameterized<
+            V,
+            Family: ParameterizedFamily<BatchAxis>
+                        + ParameterizedFamily<<BatchingTracer<C, C::Policy> as ValueProjection<T>>::Projected>,
+        >,
+    O: Parameterized<
+            <BatchingTracer<C, C::Policy> as ValueProjection<T>>::Projected,
+            Family: ParameterizedFamily<BatchAxis> + ParameterizedFamily<V>,
+        >,
+    F: FnOnce(I::To<<BatchingTracer<C, C::Policy> as ValueProjection<T>>::Projected>) -> Result<O, ProgramError>,
+    InputBatchAxes: Parameterized<BatchAxis>,
+    OutputBatchAxes: Parameterized<BatchAxis>,
+    Specification: Into<BatchAxisSpecification<<C::Policy as BatchingPolicy<C>>::Extent>>,
+>(
+    function: F,
+    input: I,
+    input_batch_axes: InputBatchAxes,
+    output_batch_axes: OutputBatchAxes,
+    batch_axis: Specification,
+) -> Result<O::To<V>, BatchingError>
+where
+    C::Value: ValueProjection<T, Projected = V>,
+    BatchingTracer<C, C::Policy>: ValueProjection<T, Projected: Value<Type = T>>,
+{
+    let Some(context) = input.parameters().next().map(|leaf| leaf.domain().parent().clone()) else {
+        return Err(BatchingError::EmptyBatch);
+    };
+
+    // Batch the flat parent values so that the transform is instantiated once per parent context rather than once per
+    // structure. The batch axes are broadcast into the input and output structures like `Batch::batch` does.
+    let input_structure = input.parameter_structure();
+    let input_batch_axes = input_batch_axes
+        .broadcast_to_parameter_structure::<I::To<BatchAxis>>(input_structure.clone())?
+        .into_parameters()
+        .collect::<Vec<_>>();
+    let inputs = input.into_parameters().map(<C::Value as ValueProjection<T>>::from_projected).collect();
+    let mut function = Some(function);
+    let mut output_structure = None;
+    let outputs = batch_erased_and_flattened(
+        &context,
+        &mut |inputs| {
+            let inputs = inputs
+                .into_iter()
+                .map(|input| ValueProjection::<T>::into_projected(input).map_err(ProgramError::from))
+                .collect::<Result<Vec<_>, _>>()?;
+            let output = function.take().unwrap()(I::To::from_parameters(input_structure.clone(), inputs)?)?;
+            let structure = output.parameter_structure();
+            let output_batch_axes = output_batch_axes
+                .broadcast_to_parameter_structure::<O::To<BatchAxis>>(structure.clone())?
+                .into_parameters()
+                .collect::<Vec<_>>();
+            output_structure = Some(structure);
+            let outputs = output
+                .into_parameters()
+                .map(<BatchingTracer<C, C::Policy> as ValueProjection<T>>::from_projected)
+                .collect();
+            Ok((outputs, output_batch_axes))
+        },
+        inputs,
+        input_batch_axes,
+        batch_axis.into(),
+    )?;
+    let outputs = outputs
+        .into_iter()
+        .map(|output| ValueProjection::<T>::into_projected(output).map_err(BatchingError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(O::To::<V>::from_parameters(output_structure.unwrap(), outputs)?)
+}
+
+/// Batches the flat `inputs` of `parent` with `function`, which receives one [`BatchingTracer`] per input and returns
+/// its flat outputs together with the requested output [`BatchAxis`] of each, and returns the materialized outputs.
+/// This is the structure independent body of [`Batch::batch`] and [`batch_in_parent`], which broadcast the batch axes
+/// of their structured inputs and outputs. Borrowing the callback as a trait object keeps this body independent of
+/// its concrete closure and parameter structure types, limiting Rust monomorphization to the parent context and its
+/// policy. `function` is invoked exactly once.
+#[allow(clippy::type_complexity)]
+fn batch_erased_and_flattened<C: Batch>(
+    parent: &C,
+    function: &mut dyn FnMut(
+        Vec<BatchingTracer<C, C::Policy>>,
+    ) -> Result<(Vec<BatchingTracer<C, C::Policy>>, Vec<BatchAxis>), BatchingError>,
+    inputs: Vec<C::Value>,
+    input_batch_axes: Vec<BatchAxis>,
+    batch_axis: BatchAxisSpecification<<C::Policy as BatchingPolicy<C>>::Extent>,
+) -> Result<Vec<C::Value>, BatchingError> {
+    // Prepare a complete context from the flat inputs, including the reference boundary used to check captures.
+    let (context, inputs) =
+        BatchingContext::<C, C::Policy>::prepare_inputs(parent, inputs, input_batch_axes, batch_axis)?;
+    let inputs = inputs.into_iter().map(|batch| BatchingTracer::new(context.clone(), batch)).collect::<Vec<_>>();
+    let (outputs, output_batch_axes) = function(inputs)?;
+
+    // The active policy materializes each requested output axis. Unwrapping to parent values preserves any enclosing
+    // batching level's metadata, so nested transforms require no side table.
+    outputs
+        .into_iter()
+        .zip(output_batch_axes)
+        .map(|(output, output_batch_axis)| {
+            C::Policy::materialize_output(&context, output.into_batch(), output_batch_axis)
+        })
+        .collect()
 }
 
 // The following functions are the batching rules that operation family dispatchers (e.g., the ones generated by
@@ -2301,6 +2453,7 @@ where
 mod tests {
     use std::borrow::Cow;
 
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
@@ -2308,10 +2461,13 @@ mod tests {
         ArrayOperation, ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
         DimensionVariable, Shape, ShardingDimension,
     };
+    use crate::axes::{NamedAxes, NamedAxis};
     use crate::contexts::EagerContext;
-    use crate::operations::{AddOperation, Reduce, ReductionKind, composite};
+    use crate::operations::{
+        Add, AddOperation, AxisIndex, ConvertElementType, DimensionToScalar, Reduce, ReductionKind, composite,
+    };
     use crate::parameters::Placeholder;
-    use crate::programs::{ProgramBuilder, Typed};
+    use crate::programs::{ProgramBuilder, ProjectedValue, Typed};
     use crate::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
         ProjectedProgramType, ProjectedProgramValue, TestArrayContext,
@@ -2319,6 +2475,12 @@ mod tests {
     use crate::tracing::{DomainTracer, Trace};
 
     use super::*;
+
+    /// Array IR parent used by the projected-input batching entry point.
+    type ParentBatchContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    /// Array view of a batch in the full array IR parent universe.
+    type ParentArrayBatch = ProjectedValue<ArrayType, BatchingTracer<ParentBatchContext, ArrayIrBatchingPolicy>>;
 
     /// Batch carrier shared by the heterogeneous and projected-member batching fixtures.
     #[derive(Clone, Debug, PartialEq)]
@@ -2638,15 +2800,85 @@ mod tests {
     #[test]
     fn test_batch_axis_specification() {
         assert_eq!(BatchAxisSpecification::from(None::<usize>), BatchAxisSpecification::default());
-        assert_eq!(BatchAxisSpecification::from(Some(4)), BatchAxisSpecification::with_extent(4));
-        assert_eq!(BatchAxisSpecification::from(4), BatchAxisSpecification::with_extent(4));
-        assert_eq!(BatchAxisSpecification::new(4, "i"), BatchAxisSpecification::new(4, "i").clone());
-        assert_ne!(BatchAxisSpecification::with_extent(4), BatchAxisSpecification::with_extent(5));
-        assert_ne!(BatchAxisSpecification::<usize>::named("i"), BatchAxisSpecification::<usize>::named("j"),);
-        assert_ne!(BatchAxisSpecification::<usize>::named("i"), BatchAxisSpecification::default());
+        assert_eq!(BatchAxisSpecification::from(Some(4)), BatchAxisSpecification::default().with_extent(4));
+        assert_eq!(BatchAxisSpecification::from(4), BatchAxisSpecification::default().with_extent(4));
+    }
+
+    #[test]
+    fn test_batch_axis_specification_named() {
+        let specification = BatchAxisSpecification::<usize>::named("i");
+        assert_eq!(specification.name(), Some("i"));
+        assert_eq!(specification.extent(), None);
+        assert_eq!(specification.sharding(), None);
+        assert_eq!(specification, specification.clone());
+        assert_ne!(specification, BatchAxisSpecification::named("j"));
+        assert_ne!(specification, BatchAxisSpecification::default());
         assert_eq!(
-            format!("{:?}", BatchAxisSpecification::<usize>::named("i")),
-            "BatchAxisSpecification { extent: None, name: Some(\"i\") }",
+            format!("{specification:?}"),
+            "BatchAxisSpecification { name: Some(\"i\"), extent: None, sharding: None }",
+        );
+    }
+
+    #[test]
+    fn test_batch_axis_specification_with_extent() {
+        let sharding = ShardingDimension::sharded(["x"]);
+        let specification = BatchAxisSpecification::named("i").with_sharding(sharding.clone()).with_extent(4);
+        assert_eq!(specification.name(), Some("i"));
+        assert_eq!(specification.extent(), Some(&4));
+        assert_eq!(specification.sharding(), Some(&sharding));
+        assert_eq!(
+            specification.with_extent(5),
+            BatchAxisSpecification::named("i").with_extent(5).with_sharding(sharding),
+        );
+    }
+
+    #[test]
+    fn test_batch_axis_specification_with_sharding() {
+        let specification =
+            BatchAxisSpecification::named("i").with_extent(4).with_sharding(ShardingDimension::sharded(["x"]));
+        assert_eq!(specification.name(), Some("i"));
+        assert_eq!(specification.extent(), Some(&4));
+        assert_eq!(specification.sharding(), Some(&ShardingDimension::sharded(["x"])));
+        assert_ne!(specification, BatchAxisSpecification::named("i").with_extent(4));
+        assert_eq!(
+            format!("{:?}", BatchAxisSpecification::<usize>::default().with_sharding(ShardingDimension::Replicated)),
+            "BatchAxisSpecification { name: None, extent: None, sharding: Some(Replicated) }",
+        );
+    }
+
+    #[test]
+    fn test_batch_axis_specification_reconcile_sharding() {
+        let sharded = ShardingDimension::sharded(["x"]);
+        let unspecified = BatchAxisSpecification::<usize>::default();
+        let specified = BatchAxisSpecification::<usize>::default().with_sharding(sharded.clone());
+
+        // Without an explicit placement the inferred placement is used unchanged.
+        assert_eq!(unspecified.reconcile_sharding(ShardingDimension::Replicated), Ok(ShardingDimension::Replicated));
+        assert_eq!(unspecified.reconcile_sharding(sharded.clone()), Ok(sharded.clone()));
+
+        // An explicit placement replaces an undetermined placement and is accepted when it agrees with the inputs.
+        assert_eq!(specified.reconcile_sharding(ShardingDimension::Replicated), Ok(sharded.clone()));
+        assert_eq!(specified.reconcile_sharding(ShardingDimension::Unconstrained), Ok(sharded.clone()));
+        assert_eq!(specified.reconcile_sharding(sharded.clone()), Ok(sharded.clone()));
+
+        // A conflicting concrete placement is rejected.
+        assert_eq!(
+            specified.reconcile_sharding(ShardingDimension::sharded(["y"])),
+            Err(BatchingError::MisalignedBatchAxes {
+                message: "the explicit batch axis sharding {'x'} conflicts with the batch axis sharding {'y'} of the \
+                          mapped inputs"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(
+            BatchAxisSpecification::<usize>::default()
+                .with_sharding(ShardingDimension::Replicated)
+                .reconcile_sharding(sharded),
+            Err(BatchingError::MisalignedBatchAxes {
+                message: "the explicit batch axis sharding {} conflicts with the batch axis sharding {'x'} of the \
+                          mapped inputs"
+                    .to_string(),
+            }),
         );
     }
 
@@ -3112,6 +3344,329 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error, BatchingError::EmptyBatch);
+    }
+
+    #[test]
+    fn test_batch_in_parent() {
+        let (output_type, program) = ParentBatchContext::trace(
+            |input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = batch_in_parent(
+                    |row: ParentArrayBatch| row.add(&row),
+                    input,
+                    BatchAxis::new(0),
+                    BatchAxis::new(1),
+                    BatchAxisSpecification::default(),
+                )?;
+                Ok(output.into_value())
+            },
+            ArrayIrType::from(ArrayType::new_static(DataType::F32, [2, 3])),
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::from(ArrayType::new_static(DataType::F32, [3, 2])));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3] .
+                let %1:dimension<2> = constant [value=2]
+                    %2:f32[2, 3] = add %0 %0
+                    %3:f32[3, 2] = transpose [permutation=[1, 0]] %2
+                in (%3)"
+            },
+        );
+        assert_eq!(
+            program.interpret(ArrayIrValue::Array(Array::matrix(2, 3, vec![1f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap())),
+            Ok(ArrayIrValue::Array(Array::matrix(3, 2, vec![2f32, 8.0, 4.0, 10.0, 6.0, 12.0]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_batch_in_parent_structured_inputs_and_outputs() {
+        let (_, program) = ParentBatchContext::trace(
+            |(input, bias)| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let bias = ValueProjection::<ArrayType>::into_projected(bias)?;
+                let (output, bias) = batch_in_parent(
+                    |(column, bias): (ParentArrayBatch, ParentArrayBatch)| Ok((column.add(&bias)?, bias)),
+                    (input, bias),
+                    (BatchAxis::new(-1), BatchAxis::replicated()),
+                    (BatchAxis::new(0), BatchAxis::replicated()),
+                    BatchAxisSpecification::default(),
+                )?;
+                Ok((output.into_value(), bias.into_value()))
+            },
+            (
+                ArrayIrType::from(ArrayType::new_static(DataType::F32, [2, 2])),
+                ArrayIrType::from(ArrayType::scalar(DataType::F32)),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 2], %1:f32[] .
+                let %2:dimension<2> = constant [value=2]
+                    %3:dimension<2> = constant [value=2]
+                    %4:f32[2, 2] = broadcast [output_axes=[]] %1 %3 %2
+                    %5:f32[2, 2] = add %0 %4
+                    %6:f32[2, 2] = transpose [permutation=[1, 0]] %5
+                in (%6, %1)"
+            },
+        );
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![1f32, 2.0, 3.0, 4.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(5f32).unwrap()),
+            )),
+            Ok((
+                ArrayIrValue::Array(Array::matrix(2, 2, vec![6f32, 8.0, 7.0, 9.0]).unwrap()),
+                ArrayIrValue::Array(Array::scalar(5f32).unwrap()),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_batch_in_parent_replicated_input_with_explicit_extent() {
+        let (_, program) = ParentBatchContext::trace(
+            |input| {
+                let extent = input.domain().lift(ArrayIrValue::Dimension(DimensionValue::constant(3)?))?;
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = batch_in_parent(
+                    |value: ParentArrayBatch| Ok(value),
+                    input,
+                    BatchAxis::replicated(),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::default().with_extent(extent),
+                )?;
+                Ok(output.into_value())
+            },
+            ArrayIrType::from(ArrayType::scalar(DataType::F32)),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:dimension<3> = const 3
+                    %2:f32[3] = broadcast [output_axes=[]] %0 %1
+                in (%2)"
+            },
+        );
+        assert_eq!(
+            program.interpret(ArrayIrValue::Array(Array::scalar(7f32).unwrap())),
+            Ok(ArrayIrValue::Array(Array::vector(vec![7f32, 7.0, 7.0]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_batch_in_parent_symbolic_extent() {
+        let items = DimensionVariable::new("items", DimensionBounds::new(0, Some(5)).unwrap());
+        let dimension_type = DimensionType::from(items.clone());
+        let (output_type, program) = ParentBatchContext::trace(
+            |(extent, input)| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = batch_in_parent(
+                    |value: ParentArrayBatch| value.add(&value),
+                    input,
+                    BatchAxis::replicated(),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::default().with_extent(extent),
+                )?;
+                Ok(output.into_value())
+            },
+            (ArrayIrType::from(dimension_type.clone()), ArrayIrType::from(ArrayType::scalar(DataType::F32))),
+        )
+        .unwrap();
+        assert_eq!(
+            output_type,
+            ArrayIrType::from(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items)]))),
+        );
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<items ∈ [0, 5)>, %1:f32[] .
+                let %2:f32[] = add %1 %1
+                    %3:f32[items] = broadcast [output_axes=[]] %2 %0
+                in (%3)"
+            },
+        );
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Dimension(DimensionValue::new(dimension_type.clone(), 3).unwrap()),
+                ArrayIrValue::Array(Array::scalar(7f32).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::vector(vec![14f32, 14.0, 14.0]).unwrap())),
+        );
+        assert_eq!(
+            program.interpret((
+                ArrayIrValue::Dimension(DimensionValue::new(dimension_type, 0).unwrap()),
+                ArrayIrValue::Array(Array::scalar(7f32).unwrap()),
+            )),
+            Ok(ArrayIrValue::Array(Array::vector(Vec::<f32>::new()).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_batch_in_parent_parent_universe() {
+        // The bridge from dimensions to arrays is available only in the richer parent universe.
+        let (_, program) = ParentBatchContext::trace(
+            |input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = batch_in_parent(
+                    |value: ParentArrayBatch| {
+                        let parent = value.domain().parent().clone();
+                        let dimension = parent.lift(ArrayIrValue::Dimension(DimensionValue::constant(3)?))?;
+                        let scalar = ValueProjection::<ArrayType>::into_projected(dimension.to_scalar()?)?
+                            .convert_element_type(DataType::F32)?;
+                        value.add(&scalar)
+                    },
+                    input,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::default(),
+                )?;
+                Ok(output.into_value())
+            },
+            ArrayIrType::from(ArrayType::new_static(DataType::F32, [2])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:dimension<2> = constant [value=2]
+                    %2:dimension<3> = const 3
+                    %3:i64[] = dimension_to_scalar %2
+                    %4:f32[] = convert_element_type [data_type=f32] %3
+                    %5:f32[2] = broadcast [output_axes=[]] %4 %1
+                    %6:f32[2] = add %0 %5
+                in (%6)"
+            },
+        );
+        assert_eq!(
+            program.interpret(ArrayIrValue::Array(Array::vector(vec![1f32, 2.0]).unwrap())),
+            Ok(ArrayIrValue::Array(Array::vector(vec![4f32, 5.0]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_batch_in_parent_named_axis() {
+        let (_, program) = ParentBatchContext::trace(
+            |input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = batch_in_parent(
+                    |value: ParentArrayBatch| {
+                        let parent = value.domain().parent().clone();
+                        assert_eq!(parent.named_axis("rows"), Some(NamedAxis::Batched { size: Some(3) }));
+                        let index = value.domain().axis_index("rows")?.convert_element_type(DataType::F32)?;
+                        value.add(&index)
+                    },
+                    input,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("rows"),
+                )?;
+                Ok(output.into_value())
+            },
+            ArrayIrType::from(ArrayType::new_static(DataType::F32, [3])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[3] .
+                let %1:dimension<3> = constant [value=3]
+                    %2:u64[3] = iota [type=u64[3], dimension=0]
+                    %3:f32[3] = convert_element_type [data_type=f32] %2
+                    %4:f32[3] = add %0 %3
+                in (%4)"
+            },
+        );
+        assert_eq!(
+            program.interpret(ArrayIrValue::Array(Array::vector(vec![10f32, 20.0, 30.0]).unwrap())),
+            Ok(ArrayIrValue::Array(Array::vector(vec![10f32, 21.0, 32.0]).unwrap())),
+        );
+    }
+
+    #[test]
+    fn test_batch_in_parent_empty_inputs() {
+        let context = ParentBatchContext::new();
+        let extent = context.lift(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())).unwrap();
+        let result = batch_in_parent(
+            |_: Vec<ParentArrayBatch>| -> Result<Vec<ParentArrayBatch>, ProgramError> {
+                panic!("empty inputs must be rejected before invoking the function")
+            },
+            Vec::<ProjectedValue<ArrayType, Tracer<ParentBatchContext>>>::new(),
+            BatchAxis::replicated(),
+            BatchAxis::replicated(),
+            BatchAxisSpecification::default().with_extent(extent),
+        );
+        assert!(matches!(result, Err(BatchingError::EmptyBatch)));
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:dimension<2> = const 2
+                in ()"
+            },
+        );
+    }
+
+    #[test]
+    fn test_batch_in_parent_empty_outputs() {
+        let (_, program) = ParentBatchContext::trace(
+            |input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                batch_in_parent(
+                    |_: ParentArrayBatch| Ok(()),
+                    input,
+                    BatchAxis::new(0),
+                    (),
+                    BatchAxisSpecification::default(),
+                )
+                .map_err(ProgramError::from)
+            },
+            ArrayIrType::from(ArrayType::new_static(DataType::F32, [2])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:dimension<2> = constant [value=2]
+                in ()"
+            },
+        );
+        assert_eq!(program.interpret(ArrayIrValue::Array(Array::vector(vec![1f32, 2.0]).unwrap())), Ok(()));
+    }
+
+    #[test]
+    fn test_batch_in_parent_function_error() {
+        let result = ParentBatchContext::trace(
+            |input| {
+                let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                let output = batch_in_parent(
+                    |_: ParentArrayBatch| {
+                        Err::<ParentArrayBatch, _>(ProgramError::InvalidArgument {
+                            message: "parent batch failure".to_string(),
+                        })
+                    },
+                    input,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::default(),
+                )?;
+                Ok(output.into_value())
+            },
+            ArrayIrType::from(ArrayType::new_static(DataType::F32, [2])),
+        );
+        assert!(matches!(result, Err(ProgramError::InvalidArgument { message }) if message == "parent batch failure"));
     }
 
     #[test]
