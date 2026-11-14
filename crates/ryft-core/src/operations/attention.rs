@@ -864,8 +864,8 @@ pub struct AttentionResiduals<P: Parameter> {
 /// scores, so their batch, head, and query sequence placements reach the output as well. Dimensions that are contracted
 /// and sharded on both sides (e.g., the head dimensions of the query and of the key) have no unambiguous placement and
 /// are rejected, as are placements that cannot be combined (e.g., one mesh axis that shards two dimensions of the
-/// scores). Reverse mode returns each gradient with the sharding and the layout of its input, however the inputs are
-/// placed. Reduced and unreduced inputs are unsupported, because softmax and the log-sum-exp residual preserve neither
+/// scores). Reverse mode returns each gradient with the sharding of its input, however the inputs are placed.
+/// Reduced and unreduced inputs are unsupported, because softmax and the log-sum-exp residual preserve neither
 /// partial sums nor replicas that are filled with zeros. Calls align the manual variation of their inputs before
 /// staging the call.
 ///
@@ -1704,9 +1704,9 @@ fn attention_backward_output_types(
         )));
     }
 
-    // Each cotangent has the cotangent type of its input, including its sharding and its layout, which the body
-    // restores after its contractions (refer to `restore_cotangent_type`), because reverse mode accumulates every
-    // cotangent into the cotangent of its input.
+    // Each cotangent has the cotangent type of its input, including its sharding, which the body restores after its
+    // contractions (refer to `restore_cotangent_type`), because reverse mode accumulates every cotangent into the
+    // cotangent of its input.
     let mut output_types = vec![types.query.cotangent()?, types.key.cotangent()?, types.value.cotangent()?];
     if let Some(bias) = &types.bias {
         let bias_cotangent = bias.cotangent()?;
@@ -2360,14 +2360,13 @@ fn contract_cotangent<V: Value<Type: ArrayMemberType> + Dot + Reshard>(
     }
 }
 
-/// Returns `cotangent` with the sharding and the layout of `cotangent_type`, which is the cotangent type of the input
-/// that it belongs to and has its data type and shape. The contractions of the backward body place each cotangent
-/// according to the inputs that they contract (e.g., the head dimension of the query cotangent comes from the key) and
-/// return arrays without an explicit layout, while reverse mode accumulates each cotangent into the cotangent of its
-/// input and therefore requires that type. A cotangent that already has it is returned unchanged, so inputs that are
-/// placed alike and have no explicit layout stage nothing here. A sharding that the input has is restored with a
-/// reshard, while the layout of the input and the absence of a sharding (i.e., an input without one that attends
-/// together with placed inputs) are metadata that a broadcast to the shape of the cotangent records.
+/// Returns `cotangent` with the sharding of `cotangent_type`, which is the cotangent type of the input that it belongs
+/// to and has its data type and shape. The contractions of the backward body place each cotangent according to the
+/// inputs that they contract (e.g., the head dimension of the query cotangent comes from the key), while reverse mode
+/// accumulates each cotangent into the cotangent of its input and therefore requires that type. A cotangent that
+/// already has it is returned unchanged, so inputs that are placed alike stage nothing here. A sharding that the input
+/// has is restored with a reshard, while the absence of a sharding (i.e., an input without one that attends together
+/// with placed inputs) is metadata that a broadcast to the shape of the cotangent records.
 fn restore_cotangent_type<V: Value<Type: ArrayMemberType> + Broadcast + Reshard>(
     cotangent: V,
     cotangent_type: &ArrayType,
@@ -2377,9 +2376,7 @@ fn restore_cotangent_type<V: Value<Type: ArrayMemberType> + Broadcast + Reshard>
         Some(sharding) if r#type.sharding() != Some(sharding) => cotangent.reshard(sharding)?,
         _ => cotangent,
     };
-    let has_layout = cotangent_type.layout().is_none() || r#type.layout() == cotangent_type.layout();
-    let has_sharding = cotangent_type.sharding().is_some() || r#type.sharding().is_none();
-    if has_layout && has_sharding {
+    if cotangent_type.sharding().is_some() || r#type.sharding().is_none() {
         return Ok(cotangent);
     }
 
@@ -2817,8 +2814,7 @@ where
             )
         };
 
-        // Every cotangent returns to the cotangent data type, to the rank, and to the placement and layout of its
-        // input.
+        // Every cotangent returns to the cotangent data type, to the rank, and to the placement of its input.
         let mut cotangents = [query_cotangent, key_cotangent, value_cotangent]
             .into_iter()
             .zip(input_types[..3].iter().zip(input_ranks))
@@ -3171,8 +3167,8 @@ fn batch_attention<
 
     // Restore the mapped axis of every output and reduce bias cotangents over the axes that their biases broadcast.
     // The outputs of the forward definition return to the placement of the logical batch axis, and every cotangent
-    // returns to the cotangent type of its aligned input (i.e., to its placement and to its layout), which reverse
-    // mode requires in order to accumulate it.
+    // returns to the cotangent type of its aligned input (i.e., to its placement), which reverse mode requires in
+    // order to accumulate it.
     let outputs = outputs
         .into_iter()
         .zip(output_roles)
@@ -3876,10 +3872,8 @@ mod tests {
                                 %12:bool[1, 1, 1, 1] = compare [direction=LessThan] %8 %11
                                 %13:bool[1, 1, 1, 1] = and %10 %12
                                 %14:bool[1, 1, 1] = reduce [kind=any, axes=[3]] %13
-                                %15:bool[1, 1, 1, 1] = broadcast [
-                                    output_type=bool[1, 1, 1, 1],
-                                    output_axes=[0, 1, 2],
-                                ] %14
+                                %15:bool[1, 1, 1, 1] = \
+                                    broadcast [output_type=bool[1, 1, 1, 1], output_axes=[0, 1, 2]] %14
                                 %16:f32[] = constant [value=-inf]
                                 %17:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %16
                                 %18:f32[] = constant [value=-2.3819763e38]
@@ -4768,30 +4762,29 @@ mod tests {
         .unwrap();
         assert_eq!(output_types, (plain.clone(), ArrayType::new_static(DataType::F32, [2, 1])));
 
-        // Reverse mode accumulates each cotangent into the cotangent of its input, so the cotangents of the backward
-        // definition have the layouts of their inputs, which the backward body restores.
+        // A layout describes how one array is stored, which its cotangent does not have to share, so the cotangents
+        // of the backward definition and the gradients have no explicit layout either.
         let residual = ArrayType::new_static(DataType::F32, [2, 1]);
         assert_eq!(
             attention_backward_output_types(
                 DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
                 AttentionConfiguration::new(),
                 AttentionInputs::new(Placeholder, Placeholder, Placeholder),
-                &[r#type.clone(), r#type.clone(), r#type.clone(), plain.clone(), residual, plain],
+                &[r#type.clone(), r#type.clone(), r#type.clone(), plain.clone(), residual, plain.clone()],
             ),
-            Ok(vec![r#type.clone(), r#type.clone(), r#type.clone()]),
+            Ok(vec![plain.clone(), plain.clone(), plain.clone()]),
         );
         let function = differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
-        let types = AttentionInputs::new(r#type.clone(), r#type.clone(), r#type);
         let (gradient_types, _) = ArrayContext::trace(
             |inputs: AttentionInputs<_>| {
                 differentiate_at(inputs)
                     .gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2], ReductionKind::Sum))
                     .map_err(ProgramError::from)
             },
-            types.clone(),
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type),
         )
         .unwrap();
-        assert_eq!(gradient_types, types);
+        assert_eq!(gradient_types, AttentionInputs::new(plain.clone(), plain.clone(), plain));
     }
 
     #[test]
@@ -6687,10 +6680,10 @@ mod tests {
     #[test]
     fn test_differentiable_dot_product_attention_batching_layout() {
         // The rules of a call that is batched after it was staged are traced at the types of its batch items, which
-        // cannot describe how the packed inputs are stored, so the cotangents of packed inputs with an explicit layout
-        // return without it. Reverse mode accumulates them into the cotangents of those inputs anyway, because the
-        // layout does not change which array a type describes, and it sums them with the contributions of other
-        // operations whose cotangents do have that layout (e.g., the square of the query below).
+        // cannot describe how the packed inputs are stored. Cotangent types have no explicit layout, so the gradients
+        // of packed inputs with one are arrays of the same data type, shape, and placement, whichever operations
+        // contribute to them (e.g., the batched call alone, or together with the square of the query below), and
+        // they have the elements of the gradients over inputs without a layout.
         let plain_type = ArrayType::new_static(DataType::F32, [2, 2, 2, 1, 2]);
         let packed_type = plain_type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![32, 16, 8, 8, 4])));
         let inputs = |r#type: &ArrayType| {

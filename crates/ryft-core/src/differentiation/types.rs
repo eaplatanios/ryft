@@ -26,16 +26,18 @@ pub trait DifferentiableType: Type {
 
     /// Returns the [`Type`] that forward mode tangents of values of this [`Type`] carry. The returned type is used
     /// for forward mode inputs, outputs, structural zeros, and intermediate Jacobian-Vector Product (JVP) values. It
-    /// preserves primal placement metadata because a tangent follows the same forward data flow as its primal. Most
-    /// differentiable types use themselves, but specialized storage representations may use a wider differential
-    /// representation. For example, [`DataType::F8E8M0FNU`] uses [`DataType::F32`] because its unsigned power-of-two
-    /// representation cannot represent zero or negative linear contributions. Non-differentiable types return a
-    /// first-class zero-space type, such as [`DataType::Zero`]. Generated linear programs are compact with respect to
-    /// such types (i.e., where a program boundary would carry one tangent input or output per primal leaf, leaves whose
-    /// tangent type [`is_zero_space`](Self::is_zero_space) get no boundary input or output at all). Structured callable
-    /// transforms such as [`Pushforward`](crate::Pushforward) still expose the complete leaf-for-leaf public derivative
-    /// tree and restore each omitted leaf as a typed zero at their public boundaries. Types that cannot participate in
-    /// forward differentiation return an error instead of fabricating a zero-space representation.
+    /// preserves primal placement metadata because a tangent follows the same forward data flow as its primal, but
+    /// not metadata about how one primal value is stored (e.g., the explicit layout of an array), because a tangent
+    /// is another value that nothing requires to be stored in the same way. Most differentiable types use themselves,
+    /// but specialized storage representations may use a wider differential representation. For example,
+    /// [`DataType::F8E8M0FNU`] uses [`DataType::F32`] because its unsigned power-of-two representation cannot represent
+    /// zero or negative linear contributions. Non-differentiable types return a first-class zero-space type, such as
+    /// [`DataType::Zero`]. Generated linear programs are compact with respect to such types (i.e., where a program
+    /// boundary would carry one tangent input or output per primal leaf, leaves whose tangent type
+    /// [`is_zero_space`](Self::is_zero_space) get no boundary input or output at all). Structured callable transforms
+    /// such as [`Pushforward`](crate::Pushforward) still expose the complete leaf-for-leaf public derivative tree and
+    /// restore each omitted leaf as a typed zero at their public boundaries. Types that cannot participate in forward
+    /// differentiation return an error instead of fabricating a zero-space representation.
     fn tangent(&self) -> Result<Self, DifferentiationError>;
 
     /// Returns the [`Type`] that reverse mode cotangents of values of this [`Type`] carry. The returned type is the
@@ -43,7 +45,10 @@ pub trait DifferentiableType: Type {
     /// type itself, but it may instead be a distinct representation that supports the required linear operations. For
     /// example, [`DataType::F8E8M0FNU`] uses [`DataType::F32`] cotangents because its unsigned power-of-two storage
     /// format cannot represent zero or negative values, while [`ArrayType`] also swaps the unreduced and reduced axes
-    /// of its [`Sharding`]. Refer to [`Sharding::cotangent`] for more information. This mapping is not required to be
+    /// of its [`Sharding`]. Refer to [`Sharding::cotangent`] for more information. Like a tangent type, a cotangent
+    /// type keeps no metadata about how one primal value is stored (e.g., the explicit layout of an array), so a
+    /// consumer that needs a derivative in a specific layout requests it at its own boundary. This mapping is not
+    /// required to be
     /// an _involution_ (i.e., a specialized primal representation may map to a general-purpose cotangent representation
     /// that is itself a fixed point). Non-differentiable types return a first-class zero-space type. Reverse mode
     /// accumulates no live adjoint for values of those types, and generated linear programs are compact with respect
@@ -138,27 +143,24 @@ impl DifferentiableType for ArrayType {
 
     #[inline]
     fn tangent(&self) -> Result<Self, DifferentiationError> {
-        // Forward perturbations follow their primals' placement. An element-representation change clears explicit
-        // layout because byte-level layout metadata cannot in general survive a change in element width.
-        let data_type = self.data_type().tangent()?;
-        let layout = if data_type == self.data_type() { self.layout().cloned() } else { None };
-        Ok(self.clone().with_data_type(data_type).with_layout(layout))
+        // Forward perturbations follow their primals' placement. An explicit layout describes how one primal array
+        // is stored, which its tangent does not have to share, so the tangent type has none.
+        Ok(self.clone().with_data_type(self.data_type().tangent()?).with_layout(None))
     }
 
     #[inline]
     fn cotangent(&self) -> Result<Self, DifferentiationError> {
-        // Use the element cotangent representation, clear explicit layout when that representation changes element
-        // width, swap the unreduced and reduced sharding axes, and keep all other type metadata unchanged. A value
-        // that is unreduced with a kind other than a sum has no cotangent. Refer to `Sharding::cotangent` for more
-        // information.
+        // Use the element cotangent representation, clear the explicit layout (which describes how one primal array
+        // is stored and which its cotangent does not have to share), swap the unreduced and reduced sharding axes,
+        // and keep all other type metadata unchanged. A value that is unreduced with a kind other than a sum has no
+        // cotangent. Refer to `Sharding::cotangent` for more information.
         let data_type = self.data_type().cotangent()?;
-        let layout = if data_type == self.data_type() { self.layout().cloned() } else { None };
         let sharding = self
             .sharding()
             .map(Sharding::cotangent)
             .transpose()
             .map_err(|_| DifferentiationError::UndefinedCotangentType { primal_type: self.to_string() })?;
-        Ok(self.clone().with_data_type(data_type).with_layout(layout).with_sharding_unchecked(sharding))
+        Ok(self.clone().with_data_type(data_type).with_layout(None).with_sharding_unchecked(sharding))
     }
 }
 
@@ -1145,10 +1147,10 @@ mod tests {
         let tangent = primal.clone().with_data_type(F32).with_layout(None);
         assert_eq!(primal.tangent(), Ok(tangent));
 
-        // An unchanged element representation retains its explicit physical layout.
-        let laid_out = ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)]))
-            .with_layout(Layout::Strided(StridedLayout::new(vec![4])));
-        assert_eq!(laid_out.tangent(), Ok(laid_out));
+        // An explicit physical layout describes how the primal is stored, so the tangent type has none.
+        let plain = ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)]));
+        let laid_out = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        assert_eq!(laid_out.tangent(), Ok(plain));
     }
 
     #[test]
@@ -1200,10 +1202,10 @@ mod tests {
         let e8m0_cotangent = reduced.with_data_type(F32).with_layout(None).with_memory(Memory::Host { pinned: true });
         assert_eq!(e8m0.cotangent(), Ok(e8m0_cotangent));
 
-        // An unchanged element representation retains its explicit physical layout.
-        let laid_out = ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)]))
-            .with_layout(Layout::Strided(StridedLayout::new(vec![4])));
-        assert_eq!(laid_out.cotangent(), Ok(laid_out));
+        // An explicit physical layout describes how the primal is stored, so the cotangent type has none.
+        let plain = ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)]));
+        let laid_out = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        assert_eq!(laid_out.cotangent(), Ok(plain));
     }
 
     #[test]
