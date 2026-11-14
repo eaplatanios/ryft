@@ -4,8 +4,8 @@ use std::fmt::Display;
 use ryft_macros::capability;
 
 use crate::arrays::{
-    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DimensionType, DimensionValue,
-    DimensionVariable,
+    Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DimensionError, DimensionType,
+    DimensionValue, DimensionVariable,
 };
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -26,6 +26,23 @@ pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 
 /// Scalar-array-to-dimension operation used by [`DimensionFromScalar`].
 /// Refer to [`DimensionFromScalar`] for semantic details and an example.
+///
+/// # Device Invariance
+///
+/// A dimension is an extent, and every device of a Single Program Multiple Data (SPMD) program agrees on every extent,
+/// which is why dimension types record no sharding and no manual variation. Type inference therefore rejects an input
+/// whose sharding varies along a manual mesh axis with [`DimensionError::VaryingScalar`], and an input with unreduced
+/// axes (i.e., one whose devices hold partial values that are not yet combined) with
+/// [`DimensionError::UnreducedScalar`], whether or not the axes are manual, so the values must be combined first. An
+/// input with reduced axes is accepted, because every device holds the same data along a reduced axis. Without this
+/// rule, `dimension_to_scalar(dimension_from_scalar(x))` would type a per device value as the same on every device.
+/// This is the device counterpart of the batching rule, which rejects a scalar that is mapped over batch items for
+/// the same reason. A per device offset (e.g., one derived from `axis_index`) stays an array value, which
+/// [`DynamicSliceOperation`](crate::DynamicSliceOperation) accepts as a start index. The body of a `shard_map` that
+/// does not check manual variation types no value as varying, so there the rule relies on the caller's promise that
+/// the scalar is the same on every device, which compiled execution trusts. Reference execution rejects the first
+/// dimension that it produces itself on which the devices disagree, but not one that is created and consumed
+/// entirely inside a region operation that runs once per device.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DimensionFromScalarOperation {
     /// Output [`DimensionType`] of this [`Operation`].
@@ -47,14 +64,34 @@ impl DimensionFromScalarOperation {
         &self.output_type
     }
 
-    /// Validates the provided input [`ArrayType`].
-    fn validate_input_type(input_type: &ArrayType) -> Result<(), TypeError> {
+    /// Validates the provided input [`ArrayType`], which must be a rank-0 integer array that is the same on every
+    /// device (i.e., one without manual variation and without unreduced axes).
+    fn validate_input_type(&self, input_type: &ArrayType) -> Result<(), TypeError> {
         if input_type.rank() != 0 || !input_type.data_type().is_integer() {
             return Err(TypeError::invalid(format!(
                 "`{DIMENSION_FROM_SCALAR_OPERATION_NAME}` input must be a rank-0 integer array but has type \
                  `{input_type}`",
             )));
         }
+
+        if let Some(sharding) = input_type.sharding() {
+            if let Some(axis_name) = sharding.varying_manual_axes().iter().next() {
+                return Err(DimensionError::VaryingScalar {
+                    r#type: Box::new(self.output_type.clone()),
+                    axis_name: axis_name.clone(),
+                }
+                .into());
+            }
+
+            if let Some(axis_name) = sharding.unreduced_axes().iter().next() {
+                return Err(DimensionError::UnreducedScalar {
+                    r#type: Box::new(self.output_type.clone()),
+                    axis_name: axis_name.clone(),
+                }
+                .into());
+            }
+        }
+
         Ok(())
     }
 }
@@ -82,7 +119,7 @@ impl Operation for DimensionFromScalarOperation {
         check_count!("input", input_types, 1, TypeError);
         check_count!("region", region_interfaces, 0, TypeError);
         let input_type = <&ArrayType>::try_from(&input_types[0])?;
-        Self::validate_input_type(input_type)?;
+        self.validate_input_type(input_type)?;
         Ok(vec![self.output_type.clone().into()])
     }
 
@@ -165,7 +202,9 @@ impl_non_transposable_operation!(DimensionFromScalarOperation);
 /// out-of-bounds, host-unrepresentable, and backend-width-incompatible values before returning the dimension.
 ///
 /// The input may use any signed or unsigned integer element type. It must be rank zero. Under batching, a mapped
-/// scalar is rejected because array shapes must be shared by every batch item.
+/// scalar is rejected because array shapes must be shared by every batch item, and inside a manual region, a
+/// scalar that varies across devices or is unreduced is rejected because they must be shared by every device
+/// (refer to the `# Device Invariance` section of the documentation of [`DimensionFromScalarOperation`]).
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values (including the projected array members of array IR values) implement this capability for [`ArrayType`] and
@@ -235,7 +274,7 @@ impl<
 impl DimensionFromScalar<DimensionValue, ArrayType> for Array {
     fn to_dimension(&self, output: DimensionVariable) -> Result<DimensionValue, ProgramError> {
         let operation = DimensionFromScalarOperation::new(output.into());
-        DimensionFromScalarOperation::validate_input_type(self.r#type().as_ref())?;
+        operation.validate_input_type(self.r#type().as_ref())?;
         Ok(DimensionValue::new(operation.output_type().clone(), self.concretize()?)?)
     }
 }
@@ -273,7 +312,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionError,
-        DimensionValue, MAX_DIMENSION_EXTENT, Shape, i1, i2, i4, u1, u2, u4,
+        DimensionValue, LogicalMesh, MAX_DIMENSION_EXTENT, MeshAxis, MeshAxisType, Shape, Sharding, i1, i2, i4, u1, u2,
+        u4,
     };
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext, StagingContext};
@@ -421,6 +461,60 @@ mod tests {
                 &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
+        );
+    }
+
+    #[test]
+    fn test_dimension_from_scalar_type_inference_rejects_device_dependent_inputs() {
+        // A dimension is the same on every device, so a scalar placed on a manual mesh is accepted only when it neither
+        // varies along a manual axis nor is unreduced along a mesh axis.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(0, Some(9)).unwrap());
+        let operation = DimensionFromScalarOperation::new(variable.clone().into());
+        let scalar =
+            |sharding: Sharding| ArrayIrType::Array(ArrayType::scalar(DataType::I32).with_sharding(sharding).unwrap());
+        let replicated = Sharding::replicated(mesh, 0);
+        assert_eq!(
+            operation.infer_output_types(&[scalar(replicated.clone())], &[]),
+            Ok(vec![DimensionType::from(variable.clone()).into()]),
+        );
+
+        let varying =
+            operation.infer_output_types(&[scalar(replicated.clone().with_varying_manual_axes(["x"]).unwrap())], &[]);
+        assert_eq!(
+            varying,
+            Err(DimensionError::VaryingScalar {
+                r#type: Box::new(DimensionType::from(variable.clone())),
+                axis_name: "x".to_string(),
+            }
+            .into()),
+        );
+        assert_eq!(
+            varying.unwrap_err().to_string(),
+            "a dimension of type `dimension<extent ∈ [0, 9)>` cannot be created from a scalar that varies along manual \
+             mesh axis `x`, because a dimension must be the same on every device",
+        );
+
+        let unreduced =
+            operation.infer_output_types(&[scalar(replicated.clone().with_unreduced_axes(["x"]).unwrap())], &[]);
+        assert_eq!(
+            unreduced,
+            Err(DimensionError::UnreducedScalar {
+                r#type: Box::new(DimensionType::from(variable.clone())),
+                axis_name: "x".to_string(),
+            }
+            .into()),
+        );
+        assert_eq!(
+            unreduced.unwrap_err().to_string(),
+            "a dimension of type `dimension<extent ∈ [0, 9)>` cannot be created from a scalar that is unreduced along \
+             mesh axis `x`, because a dimension must be the same on every device",
+        );
+
+        // A reduced axis is indistinguishable from a replicated one, so every device holds the same scalar.
+        assert_eq!(
+            operation.infer_output_types(&[scalar(replicated.with_reduced_axes(["x"]).unwrap())], &[]),
+            Ok(vec![DimensionType::from(variable).into()]),
         );
     }
 
