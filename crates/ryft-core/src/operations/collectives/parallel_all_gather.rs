@@ -3761,6 +3761,34 @@ mod tests {
     }
 
     #[test]
+    fn test_parallel_all_gather_differentiation_array_ir_keeps_static_cotangents_of_nominal_singleton_extents() {
+        // The bounds of the nominal extent `n` admit only the extent 2, so the gathered output and its cotangent have
+        // static extents, and the selection of the invariant gather's pullback returns a static `f32[2]` cotangent.
+        // No value of the pullback carries `n`, but the linear call accepts that cotangent, whose type and the input
+        // cotangent type `f32[n]` refine each other, so it is returned without a cast.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let n = DimensionVariable::new("n", DimensionBounds::new(2, Some(3)).unwrap());
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(n)]))
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| {
+                input.parallel_all_gather_with_options(
+                    "x",
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Invariant,
+                )
+            },
+            ArrayIrType::Array(input_type),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
+        )
+        .unwrap();
+        let linearization = program.to_flat_program().linearize().unwrap();
+        assert_eq!(linearization.pullback().unwrap().into_program().to_string(), "");
+    }
+
+    #[test]
     fn test_parallel_all_gather_differentiation_array_ir_invariant_moves_offsets_into_cotangent_memory() {
         // The participant offset of the selected chunk is computed in device memory, so the pullback of an invariant
         // gather of an array in pinned host memory moves it into that memory before slicing the cotangent with it.

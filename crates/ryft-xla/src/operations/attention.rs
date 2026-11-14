@@ -41,8 +41,9 @@ const FMHA_DROPOUT_SEED: u64 = 42;
 /// are declined. [`AttentionImplementation::Portable`] always lowers the body, and so does a call with a dropout state,
 /// because the fused kernels cannot reproduce the mask of a caller-provided random state.
 /// [`AttentionImplementation::Automatic`] selects the fused kernels when [`fmha_eligibility`] accepts the boundary and
-/// the body otherwise. [`AttentionImplementation::Fused`] selects the fused kernels when they are eligible and an
-/// implementation that reports why they are not otherwise, so that it never silently changes the requested numerics.
+/// its head dimension is within [`fmha_portable_head_dimension_limit`], and the body otherwise.
+/// [`AttentionImplementation::Fused`] selects the fused kernels when they are eligible and an implementation that
+/// reports why they are not otherwise, so that it never silently changes the requested numerics.
 pub(crate) fn select_attention_implementation(
     key: &CompositeKey,
     input_types: &[ArrayIrType],
@@ -84,6 +85,21 @@ pub(crate) fn select_attention_implementation(
         return None;
     }
     match fmha_eligibility(configuration, input_structure, input_types.as_slice(), target_platform) {
+        // The largest head dimension that cuDNN supports depends on the GPU architecture, which lowering does not
+        // know, so the automatic implementation only selects the fused kernels within the limit that holds for
+        // every architecture. A request for the fused kernels is passed on, and cuDNN reports a head dimension that
+        // the GPU does not support.
+        Ok(FmhaEligibility::Eligible)
+            if implementation == AttentionImplementation::Automatic
+                && attention_dimensions(&input_types[0]).ok().and_then(|[_, _, _, head]| head.value()).is_none_or(
+                    |head_dimension| {
+                        let training = !matches!(key, AttentionKey::Forward { return_residual: false, .. });
+                        head_dimension > fmha_portable_head_dimension_limit(training)
+                    },
+                ) =>
+        {
+            None
+        }
         Ok(FmhaEligibility::Eligible) => Some(match key {
             AttentionKey::Forward { return_residual, .. } => {
                 NamedCompositeImplementation::Attention { configuration, input_structure, return_residual }
@@ -230,6 +246,26 @@ fn fmha_mask_type(causal: bool, has_sequence_lengths: bool) -> &'static str {
     }
 }
 
+/// Returns the largest head dimension that cuDNN supports on every GPU architecture, for the fused kernels of
+/// training when `training` is set (i.e., the forward kernel that returns the residual, and the backward kernel) and
+/// for the forward kernel of inference otherwise. Its
+/// [support matrix](https://docs.nvidia.com/cudnn/operations/Attention/#support-matrix) allows `256` for inference on
+/// every architecture, and `128` for training on every architecture other than Hopper, which allows `256`.
+fn fmha_portable_head_dimension_limit(training: bool) -> usize {
+    if training { 128 } else { 256 }
+}
+
+/// Returns the sliding window length of the cuDNN fMHA configuration, which is the left radius of the local window
+/// and the position itself, and zero without a window. A window whose length the 32-bit configuration cannot
+/// represent admits every position of every sequence, so it is no window either.
+fn fmha_sliding_window_length(configuration: AttentionConfiguration) -> usize {
+    configuration
+        .local_window()
+        .and_then(|(left, _)| left.checked_add(1))
+        .filter(|length| *length <= i32::MAX as usize)
+        .unwrap_or(0)
+}
+
 /// Result of checking one attention boundary against the complete cuDNN fMHA contract.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum FmhaEligibility {
@@ -355,9 +391,36 @@ fn prepare_fmha_bias<'b, 'c: 'b, 't: 'c>(
                 context,
                 location,
             )?;
-            if input_types[index].data_type() == score_type.data_type() {
+            let bias_data_type = input_types[index].data_type();
+            if bias_data_type == score_type.data_type() {
                 return Ok::<_, Error>(bias);
             }
+
+            // A finite bias beyond the range of the data type of the scores would become infinite there, where the
+            // portable body keeps it finite, and a row of such biases would turn its softmax into NaNs. Finite biases
+            // therefore saturate at the largest finite magnitude of that data type before they are converted, while
+            // infinite biases and NaNs convert as they are. The saturation runs in the data type of an `f64` bias
+            // and in `f32` for every other bias data type.
+            let working_data_type = if bias_data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
+            let working_tensor_type =
+                lower_tensor_type(&score_type.clone().with_data_type(working_data_type), context, location)?;
+            let bias = if bias_data_type == working_data_type {
+                bias
+            } else {
+                let widened = block.append_operation(stable_hlo::convert(bias, working_tensor_type, location)?)?;
+                widened.result(0).expect("stablehlo.convert should return one result").as_ref()
+            };
+            let limit = if score_type.data_type() == DataType::F16 { 65_504.0 } else { 3.389_531_389_251_535_5e38 };
+            let scalar_type = ArrayType::scalar(working_data_type);
+            let scalar_tensor_type = lower_tensor_type(&scalar_type, context, location)?;
+            let lower = lower_f64_constant_splat(-limit, &scalar_type, scalar_tensor_type, block, context, location)?;
+            let upper = lower_f64_constant_splat(limit, &scalar_type, scalar_tensor_type, block, context, location)?;
+            let saturated = block.append_operation(stable_hlo::clamp(lower, bias, upper, location)?)?;
+            let saturated = saturated.result(0).expect("stablehlo.clamp should return one result").as_ref();
+            let finite = block.append_operation(stable_hlo::is_finite(bias, location)?)?;
+            let finite = finite.result(0).expect("stablehlo.is_finite should return one result").as_ref();
+            let bias = block.append_operation(stable_hlo::select(finite, saturated, bias, location)?)?;
+            let bias = bias.result(0).expect("stablehlo.select should return one result").as_ref();
             let converted = block.append_operation(stable_hlo::convert(
                 bias,
                 lower_tensor_type(score_type, context, location)?,
@@ -542,7 +605,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
             fmha_mask_type(configuration.causal(), sequence_lengths.is_some()),
             FMHA_FORWARD_DOT_DIMENSION_NUMBERS,
             configuration.dropout(),
-            configuration.local_window().map_or(0, |(left, _)| left + 1),
+            fmha_sliding_window_length(configuration),
         );
         // The operand order matches the traced operand order exactly: the bias sits after the value and the
         // `i32[batch]` sequence lengths trail. The workspace result is declared at size zero (the compiler resizes
@@ -754,7 +817,7 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
             fmha_mask_type(configuration.causal(), sequence_lengths.is_some()),
             FMHA_BACKWARD_DOT_DIMENSION_NUMBERS,
             configuration.dropout(),
-            configuration.local_window().map_or(0, |(left, _)| left + 1),
+            fmha_sliding_window_length(configuration),
         );
         let residual_input = if input_types[0].rank() == 3 {
             let reshaped = block.append_operation(stable_hlo::reshape(
@@ -1241,14 +1304,32 @@ mod tests {
         assert!(module.contains("tensor<2x2x4x4xbf16>"));
 
         // A bias with another data type is broadcast at its own data type, because a broadcast keeps the element type
-        // of its input, and it is then converted to the data type of the scores.
+        // of its input, and it is then converted to the data type of the scores. Its finite elements saturate at the
+        // largest finite magnitude of that data type first, so that they stay finite like in the portable body.
         let (input_structure, mut input_types) = extended_input_types(DataType::BF16, 2, 2, true, false);
         input_types[3] = attention_array_type(DataType::F32, &[1, 2, 4, 4]);
         let module =
             lower(&forward_program(configuration, input_structure, false, input_types, 1), Some("cuda")).unwrap();
         assert!(module.contains("(tensor<1x2x4x4xf32>) -> tensor<2x2x4x4xf32>"));
+        assert!(module.contains("stablehlo.constant dense<3.38953139E+38> : tensor<f32>"), "{module}");
+        assert!(module.contains("stablehlo.clamp"));
+        assert!(module.contains("stablehlo.is_finite"));
         assert!(module.contains("(tensor<2x2x4x4xf32>) -> tensor<2x2x4x4xbf16>"));
         assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaScaleBiasSoftmax("));
+
+        // An integer bias saturates in `f32`, and an `f16` bias of `bf16` attention too.
+        for (bias_data_type, query_data_type, limit) in [
+            (DataType::I32, DataType::F16, "6.550400e+04"),
+            (DataType::F64, DataType::F16, "6.550400e+04"),
+            (DataType::F16, DataType::BF16, "3.38953139E+38"),
+        ] {
+            let (input_structure, mut input_types) = extended_input_types(query_data_type, 2, 2, true, false);
+            input_types[3] = attention_array_type(bias_data_type, &[1, 2, 4, 4]);
+            let module =
+                lower(&forward_program(configuration, input_structure, false, input_types, 1), Some("cuda")).unwrap();
+            assert!(module.contains(format!("stablehlo.constant dense<{limit}>").as_str()), "{module}");
+            assert!(module.contains("stablehlo.clamp"));
+        }
 
         // Residual attention carries both length vectors and returns the `f32` kernel residual in its `BTN` form
         // without rounding it to the query data type.
@@ -1269,6 +1350,44 @@ mod tests {
         let module = lower(&forward_program(dropout, input_structure, false, input_types, 1), Some("cuda")).unwrap();
         assert!(module.contains("stablehlo.custom_call @__cudnn$fmhaSoftmaxDropout("));
         assert!(module.contains("\\22dropout_rate\\22:0.5,\\22seed\\22:42,\\22sliding_window_length\\22:2"));
+
+        // A left radius whose window length is not representable admits every position, so it records no window.
+        let (input_structure, input_types) = extended_input_types(DataType::BF16, 2, 2, false, false);
+        let unbounded = configuration.with_local_window((usize::MAX, 0));
+        let module = lower(&forward_program(unbounded, input_structure, false, input_types.clone(), 1), Some("cuda"));
+        assert!(module.unwrap().contains("\\22sliding_window_length\\22:0"));
+        let unbounded = unbounded.with_implementation(AttentionImplementation::Fused);
+        let module = lower(&training_program(unbounded, input_structure, input_types), Some("cuda")).unwrap();
+        assert!(module.contains("\\22sliding_window_length\\22:0"));
+        assert!(!module.contains("\\22sliding_window_length\\22:1"));
+    }
+
+    #[test]
+    fn test_fused_attention_head_dimension_limits() {
+        // cuDNN supports head dimensions up to a limit that depends on the GPU architecture, which lowering does not
+        // know. The automatic implementation therefore selects the fused kernels up to the limit of every
+        // architecture, which is `256` for inference and `128` for the kernels of training, and the portable body
+        // beyond it. A request for the fused kernels is passed on to cuDNN for every head dimension.
+        let automatic = AttentionConfiguration::new().with_scale(0.125);
+        let fused = automatic.with_implementation(AttentionImplementation::Fused);
+        let input_structure = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
+        let is_fused = |configuration: AttentionConfiguration, head_dimension: usize, return_residual: bool| {
+            let input_types = vec![attention_array_type(DataType::BF16, &[1, 4, 2, head_dimension]); 3];
+            let program = forward_program(configuration, input_structure, return_residual, input_types, 1);
+            lower(&program, Some("cuda")).unwrap().contains("stablehlo.custom_call @__cudnn$fmha")
+        };
+        for (head_dimension, return_residual, selected) in [
+            (128, false, true),
+            (256, false, true),
+            (264, false, false),
+            (1024, false, false),
+            (128, true, true),
+            (136, true, false),
+            (256, true, false),
+        ] {
+            assert_eq!(is_fused(automatic, head_dimension, return_residual), selected, "{head_dimension}");
+            assert!(is_fused(fused, head_dimension, return_residual), "{head_dimension}");
+        }
     }
 
     #[test]
@@ -1721,6 +1840,51 @@ mod tests {
                     "element {index} is {actual} but the reference is {expected}",
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_fused_attention_saturates_wide_bias_on_cuda() {
+        // An `f32` bias of `1e6` is finite but beyond the range of `f16`, where it would be infinite and turn the
+        // softmax of its row into NaNs. The fused kernels receive it saturated at the largest finite `f16` instead,
+        // which still attends only to the first key/value position, like the portable body does with the bias itself.
+        let client = load_cuda_13_plugin()
+            .unwrap()
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let halves = |dimensions: &[usize], values: &[f32]| {
+            let values = values.iter().copied().map(half::f16::from_f32).collect::<Vec<_>>();
+            replicated_array(&domain, &mesh, DataType::F16, dimensions, values_to_bytes(values.as_slice()).as_slice())
+        };
+        let values = (0..16).map(|index| if index < 8 { 1.0 } else { 2.0 }).collect::<Vec<_>>();
+        for implementation in [AttentionImplementation::Fused, AttentionImplementation::Portable] {
+            let function = dot_product_attention::<ArrayContext<'_>>(
+                AttentionConfiguration::new().with_implementation(implementation),
+            );
+            let inputs = AttentionInputs {
+                bias: Some(replicated_array(
+                    &domain,
+                    &mesh,
+                    DataType::F32,
+                    &[1, 1, 1, 2],
+                    values_to_bytes(&[1e6f32, 0.0]).as_slice(),
+                )),
+                ..AttentionInputs::new(
+                    halves(&[1, 1, 1, 8], &[0.0; 8]),
+                    halves(&[1, 2, 1, 8], &[0.0; 16]),
+                    halves(&[1, 2, 1, 8], values.as_slice()),
+                )
+            };
+            let output = function.call(inputs).unwrap().copy_to_host().unwrap();
+            let output = values_from_bytes::<half::f16>(&output).into_iter().map(half::f16::to_f32).collect::<Vec<_>>();
+            assert_eq!(output, vec![1.0; 8], "{implementation}");
         }
     }
 

@@ -800,6 +800,51 @@ mod tests {
     }
 
     #[test]
+    fn test_to_mlir_module_for_program_lowers_collectives_over_nested_meshes_that_retype_free_axes() {
+        // An outer map over `x` contains an inner map over `y` whose mesh types the free axis `z` as explicit instead of
+        // auto, as `explicit_axes` does for the maps inside it. A collective over both manual axes communicates across
+        // both regions. Their meshes share their topology, which is all that its replica groups depend on, so the
+        // groups are those of either mesh.
+        let mesh = |free_axis_type| {
+            LogicalMesh::new(vec![
+                MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+                MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+                MeshAxis::new("z", 1, free_axis_type).unwrap(),
+            ])
+            .unwrap()
+        };
+        let outer_mesh = mesh(MeshAxisType::Auto);
+        let inner_mesh = mesh(MeshAxisType::Explicit);
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
+            {
+                let inner_mesh = inner_mesh.clone();
+                move |_, x: ArrayTracer| {
+                    let nested: ArrayTracer = shard_map(
+                        |y: ArrayTracer| {
+                            Ok(y.parallel_all_gather(["x", "y"], 0)?
+                                .parallel_reduce(ReductionKind::Sum, "x")?
+                                .parallel_reduce(ReductionKind::Sum, "y")?)
+                        },
+                        x,
+                        inner_mesh.clone(),
+                        Sharding::replicated(inner_mesh.clone(), 0),
+                        Sharding::replicated(inner_mesh.clone(), 1),
+                        ShardMapOptions::new().with_manual_axes(["y"]),
+                    )?;
+                    Ok(nested)
+                }
+            },
+            ArrayType::scalar(DataType::F32),
+            outer_mesh.clone(),
+            Sharding::replicated(outer_mesh.clone(), 0),
+            Sharding::replicated(outer_mesh, 1),
+            ShardMapOptions::new().with_manual_axes(["x"]),
+        )
+        .unwrap();
+        assert_eq!(module, "");
+    }
+
+    #[test]
     fn test_to_mlir_module_for_program_rejects_nested_manual_computations_over_already_manual_axes() {
         // A nested map built from its boundary (e.g., as a transformation could) bypasses the checks of the frontend
         // and makes the axis `x` of the enclosing manual region manual again. The nested input is invariant along `x`,

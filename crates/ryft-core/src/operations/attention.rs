@@ -136,7 +136,9 @@ use std::sync::{Arc, Weak};
 
 use ryft_macros::Parameterized;
 
-use crate::arrays::{ArrayMemberType, ArrayType, DataType, Dimension, Shape};
+use crate::arrays::{
+    ArrayMemberType, ArrayType, Broadcastable, DataType, Dimension, Shape, Sharding, ShardingDimension,
+};
 use crate::batching::{BatchAxis, BatchableType};
 use crate::contexts::{Domain, StagingContext};
 use crate::differentiation::DifferentiableType;
@@ -156,15 +158,16 @@ use crate::operations::constants::iota_like::IotaLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::dimensions::dimension_size::DimensionSize;
-use crate::operations::dot::{Dot, DotDimensionNumbers};
+use crate::operations::dot::{Dot, DotDimensionNumbers, infer_dot_output_type};
 use crate::operations::exponential::{Exp, Log};
 use crate::operations::logical::And;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastLike, DynamicBroadcast};
 use crate::operations::manipulation::conversions::ConvertElementType;
-use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape};
+use crate::operations::manipulation::reshaping::{DynamicReshape, Reshape, infer_reshape_output_type};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::random::{Dropout, RandomAlgorithm};
 use crate::operations::reductions::{Reduce, ReductionKind};
+use crate::operations::sharding::reshard::Reshard;
 use crate::parameters::{Parameter, ParameterError, Parameterized, Placeholder};
 use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
 use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
@@ -173,14 +176,17 @@ use crate::tracing::{DomainTracer, DomainTracingContext, TracingContext};
 /// [`dot_product_attention`]) state one bound. Those functions create the portable bodies and the batching rule of the
 /// named definitions, so they need every capability that either of them uses, while each helper of the bodies bounds
 /// only what it calls. The last three members are the extent capabilities with which the batching rule folds batched
-/// calls (refer to the [module documentation](self#batching)). This bundle is implemented automatically for every
-/// value that implements all of its members, and so it must never be implemented manually.
+/// calls (refer to the [module documentation](self#batching)). [`Reshard`] places the scores according to the bias,
+/// the mask, and the sequence lengths, and returns each cotangent with the sharding of its input, and it is the member
+/// that requires [`Parameter`]. This bundle is implemented automatically for every value that implements all of its
+/// members, and so it must never be implemented manually.
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor and is passed to every member,
 /// so that tracers of homogeneous array programs implement this bundle for [`ArrayType`] and array IR values implement
 /// it for [`ArrayIrType`](crate::ArrayIrType).
 pub trait AttentionOperations<T = <Self as Capability>::Universe>:
     Capability
+    + Parameter
     + FillLike<T>
     + IotaLike<T>
     + Add<T>
@@ -201,6 +207,7 @@ pub trait AttentionOperations<T = <Self as Capability>::Universe>:
     + ConvertElementType<T>
     + StopGradient<T>
     + Dropout<T>
+    + Reshard<Self, T>
     + DimensionSize<T, Extent: Clone + Mul>
     + DynamicReshape<<Self as DimensionSize<T>>::Extent, T>
     + DynamicBroadcast<<Self as DimensionSize<T>>::Extent, T>
@@ -209,7 +216,8 @@ pub trait AttentionOperations<T = <Self as Capability>::Universe>:
 
 impl<
     T,
-    V: FillLike<T>
+    V: Parameter
+        + FillLike<T>
         + IotaLike<T>
         + Add<T>
         + Sub<T>
@@ -229,6 +237,7 @@ impl<
         + ConvertElementType<T>
         + StopGradient<T>
         + Dropout<T>
+        + Reshard<V, T>
         + DimensionSize<T, Extent: Clone + Mul>
         + DynamicReshape<<V as DimensionSize<T>>::Extent, T>
         + DynamicBroadcast<<V as DimensionSize<T>>::Extent, T>,
@@ -513,9 +522,9 @@ impl AttentionKey {
                 .collect(),
             Self::Backward { input_structure, .. } => {
                 let mut roles = vec![
-                    AttentionBatchOutput::Tensor(0),
-                    AttentionBatchOutput::Tensor(1),
-                    AttentionBatchOutput::Tensor(2),
+                    AttentionBatchOutput::Cotangent(0),
+                    AttentionBatchOutput::Cotangent(1),
+                    AttentionBatchOutput::Cotangent(2),
                 ];
                 if input_structure.bias.is_some() && output_count == 4 {
                     roles.push(AttentionBatchOutput::Score(3));
@@ -531,7 +540,12 @@ impl AttentionKey {
 pub enum AttentionImplementation {
     /// Uses a fused implementation when the active backend supports the complete configuration and otherwise uses
     /// the portable semantic composition. [`differentiable_dot_product_attention`] selects the portable composition
-    /// for this choice so that training uses its stabilized backward rule.
+    /// for this choice so that training uses its stabilized backward rule. A fused implementation evaluates attention
+    /// in the query data type, which bounds what it can represent. It rounds a bias of a wider data type to that
+    /// data type (saturating finite biases at its largest finite magnitude), and it may apply a Boolean mask as a
+    /// large finite penalty of that data type rather than by replacing the masked scores, so a masked score that
+    /// exceeds the visible scores of its row by more than that penalty is not hidden. [`Self::Portable`] evaluates
+    /// the scores in at least `f32` and hides every masked score.
     #[default]
     Automatic,
 
@@ -558,7 +572,7 @@ impl Display for AttentionImplementation {
 /// that backends receive (e.g., `-0.0` and `+0.0` scales are distinct).
 #[derive(Copy, Clone, Debug, Default)]
 pub struct AttentionConfiguration {
-    /// Explicit score scale, or [`None`] to use `1 / sqrt(head_dimension)`.
+    /// Explicit score scale, or [`None`] to use `1 / sqrt(head_dimension)` (or one for an empty head dimension).
     scale: Option<f64>,
 
     /// Whether query position `i` may attend only to key/value positions `j <= i`.
@@ -582,7 +596,8 @@ impl AttentionConfiguration {
         Self::default()
     }
 
-    /// Sets an explicit score scale. Passing [`None`] restores `1 / sqrt(head_dimension)`.
+    /// Sets an explicit score scale. Passing [`None`] restores `1 / sqrt(head_dimension)`, or one for an empty head
+    /// dimension, whose scores are zero for every scale.
     #[inline]
     pub fn with_scale<S: Into<Option<f64>>>(mut self, scale: S) -> Self {
         self.scale = scale.into();
@@ -633,6 +648,16 @@ impl AttentionConfiguration {
     #[inline]
     pub fn scale(&self) -> Option<f64> {
         self.scale
+    }
+
+    /// Returns the score scale that this configuration selects for inputs with the provided head dimension, which
+    /// is its explicit scale or, without one, `1 / sqrt(head_dimension)`. An empty head dimension has the scale
+    /// one instead, because its scores are empty contractions, which are zero for every scale, and the infinite
+    /// `1 / sqrt(0)` would turn them into NaNs. The portable bodies and backend implementations of the attention
+    /// definitions (e.g., the fused kernels of the XLA backend) use this function, so that they agree on the scale.
+    #[inline]
+    pub fn scale_for(&self, head_dimension: usize) -> f64 {
+        self.scale.unwrap_or(1.0 / (head_dimension.max(1) as f64).sqrt())
     }
 
     /// Returns whether causal masking is enabled.
@@ -724,7 +749,9 @@ pub struct AttentionInputs<P: Parameter> {
     pub value: P,
 
     /// Optional additive bias of the attention scores, of rank at most 4, which is broadcast to the score shape
-    /// `[B, N, T, S]` by aligning its axes with the trailing score axes.
+    /// `[B, N, T, S]` by aligning its axes with the trailing score axes. Its data type is real numeric (i.e., an
+    /// integer or floating-point type) or Boolean, and it is converted to the data type of the scores. Complex biases
+    /// are rejected, because that conversion would silently discard their imaginary parts.
     pub bias: Option<P>,
 
     /// Optional Boolean visibility mask of the attention scores, of rank at most 4, which is broadcast to the score
@@ -829,21 +856,35 @@ pub struct AttentionResiduals<P: Parameter> {
 /// The query has `TNH` or `BTNH` form, and the key and value have `SKH` or `BSKH` form, where `T` and `S` are the query
 /// and key/value sequence lengths, `N` is the number of query heads, `K` is the number of key/value heads, and `H` is
 /// the head dimension. `K` must divide `N`, where `K == N` is multi-head attention, `K == 1` is multi-query attention,
-/// and the remaining cases are grouped-query attention. The attended output has the query type. Reduced and unreduced
-/// inputs are unsupported, because softmax and the log-sum-exp residual preserve neither partial sums nor replicas
-/// that are filled with zeros. Calls align the manual variation of their inputs before staging the call.
+/// and the remaining cases are grouped-query attention. The attended output has the data type, shape, and memory space
+/// of the query, without its layout, and the sharding that the operations of attention infer. Its batch and head
+/// placements come from the query, key, and value, its sequence placement from the query, and its head dimension
+/// placement from the value, so the output has the sharding of the query whenever the key and the value are placed
+/// like it. The bias, the mask, and the sequence lengths take part like the inputs of an elementwise operation on the
+/// scores, so their batch, head, and query sequence placements reach the output as well. Dimensions that are contracted
+/// and sharded on both sides (e.g., the head dimensions of the query and of the key) have no unambiguous placement and
+/// are rejected, as are placements that cannot be combined (e.g., one mesh axis that shards two dimensions of the
+/// scores). Reverse mode returns each gradient with the sharding and the layout of its input, however the inputs are
+/// placed. Reduced and unreduced inputs are unsupported, because softmax and the log-sum-exp residual preserve neither
+/// partial sums nor replicas that are filled with zeros. Calls align the manual variation of their inputs before
+/// staging the call.
 ///
 /// [`AttentionInputs`] defines the complete input boundary, consisting of the query, key, and value, followed by an
 /// optional broadcastable additive bias, Boolean visibility mask, query and key/value sequence lengths of every batch
-/// item, and dropout state. Dot products, scaling, bias addition, and masking use the query type promoted to at least
-/// `f32`, and the masked logits are then converted to `f32` for the numerically stable softmax. Visibility is the
-/// conjunction of the explicit mask, causal ordering, the inclusive `(left, right)` local window, and both sequence
-/// length predicates. Invisible scores use a finite large negative value in the logits type, and query rows beyond
-/// their lengths are exact zeros. Without a configured scale, attention uses `1 / sqrt(H)`. Every batch item uses
-/// the same rectangular storage shape, and sequence lengths control visibility within that storage.
+/// item, and dropout state. The scores (i.e., the contraction of the query with the key, its scaling, the bias
+/// addition, and the masking) use the query data type promoted to at least `f32`, so that data types that are narrower
+/// than `f32` neither round nor overflow them. The masked logits are then converted to `f32` for the numerically
+/// stable softmax, and the attention weights return to the query data type before they are contracted with the value.
+/// Visibility is the conjunction of the explicit mask, causal ordering, the inclusive `(left, right)` local window,
+/// and both sequence length predicates. Invisible scores use a large negative value that is finite in `f32`, so a row
+/// without any visible position attends uniformly to every key/value position and receives no score cotangents, and
+/// query rows beyond their lengths are exact zeros. Without a configured scale, attention uses `1 / sqrt(H)`, or one
+/// when `H` is zero, because the scores of an empty head dimension are zero for every scale. Every batch item uses the
+/// same rectangular storage shape, and sequence lengths control visibility within that storage.
 ///
 /// [`DotProductAttention::call_with_residual`] also returns the log-sum-exp residual (i.e., the natural
-/// logarithm of the sum of the exponentiated logits), which has the `TN` or `BTN` form and the query data type. With
+/// logarithm of the sum of the exponentiated logits), which has the `TN` or `BTN` form and the `f32` data type
+/// of the softmax for every query data type, so that it is never rounded or overflowed by a narrower one. With
 /// [`AttentionConfiguration::with_dropout`], the attention weights are dropped and rescaled by [`Dropout`] with the
 /// dropout state of the inputs, which determines the mask (refer to [`AttentionInputs::dropout_state`]). Dropout
 /// supports sharding only along the broadcast axes of its input, so attention with dropout over sharded inputs runs
@@ -1213,11 +1254,13 @@ struct AttentionDimensions {
 }
 
 impl AttentionDimensions {
-    /// Returns the score scale of `configuration` for these dimensions, which is its explicit scale or, without one,
-    /// `1 / sqrt(head_dimension)`.
+    /// Returns the data type of the attention scores, which is the query data type promoted to at least `f32` (i.e.,
+    /// `f64` remains `f64` and every other data type becomes `f32`). The bodies evaluate everything other than the
+    /// softmax operation in this data type, so that data types that are narrower than `f32` neither round nor
+    /// overflow their scores and `f64` keeps its range.
     #[inline]
-    fn scale(&self, configuration: AttentionConfiguration) -> f64 {
-        configuration.scale().unwrap_or(1.0 / (self.head_dimension as f64).sqrt())
+    fn score_data_type(&self) -> DataType {
+        if self.data_type == DataType::F64 { DataType::F64 } else { DataType::F32 }
     }
 }
 
@@ -1355,6 +1398,10 @@ struct PreparedAttention<V> {
 
     /// Masked logits converted to [`SOFTMAX_DATA_TYPE`].
     logits: V,
+
+    /// Combined Boolean visibility mask in the `BNTS` score form, or [`None`] when no masking is configured.
+    /// The logits of masked scores are constants, so the backward body uses it to zero their cotangents.
+    mask: Option<V>,
 }
 
 /// Semantic role of one attention batching input.
@@ -1379,10 +1426,13 @@ enum AttentionBatchOutput {
     /// Tensor whose logical rank follows the input at this index.
     Tensor(usize),
 
+    /// Cotangent of the tensor input at this index, which has the cotangent type of that input.
+    Cotangent(usize),
+
     /// Log-sum-exp residual whose logical rank follows the query rank.
     Residual,
 
-    /// Bias cotangent restored to the logical bias shape of the input at this index.
+    /// Bias cotangent restored to the logical bias shape and to the cotangent type of the input at this index.
     Score(usize),
 }
 
@@ -1417,8 +1467,8 @@ fn attention_composite_key(
 }
 
 /// Validates one forward attention boundary (i.e., the [`AttentionInputs`] of `input_structure` in canonical order)
-/// and returns the types of its outputs. The first output is the attended output, which has the query type and
-/// therefore propagates the query's metadata (e.g., its sharding), and it is followed by the log-sum-exp residual when
+/// and returns the types of its outputs. The first output is the attended output, which has the query type without
+/// its layout and with the sharding that the body infers, and it is followed by the log-sum-exp residual when
 /// `return_residual` is set. Every input must have matching manual variation, and reduced and unreduced inputs are
 /// rejected, because softmax and the log-sum-exp residual preserve neither partial sums nor replicas that are filled
 /// with zeros.
@@ -1441,13 +1491,162 @@ fn attention_forward_output_types(
     let types = AttentionInputs::from_parameters(input_structure, input_types.iter().cloned())
         .map_err(|error| TypeError::invalid(error.to_string()))?;
     let dimensions = validate_attention_boundary(operation_name, configuration, &types, input_types)?;
-    let mut output_types = vec![types.query.clone()];
+
+    // The output takes its batch and head placements from the query, key, and value, its sequence placement from
+    // the query, and its head dimension placement from the value. The residual takes the score placements, including
+    // the bias, mask, and sequence lengths as `attention_score_sharding` describes. Inputs without sharding or fully
+    // replicated over one mesh keep the query's placements without inferring the contractions.
+    let placed_types = [
+        Some(&types.query),
+        Some(&types.key),
+        Some(&types.value),
+        types.bias.as_ref(),
+        types.mask.as_ref(),
+        types.query_sequence_lengths.as_ref(),
+        types.key_value_sequence_lengths.as_ref(),
+    ];
+    let (output_sharding, residual_sharding) = match types.query.sharding() {
+        None if placed_types.iter().flatten().all(|r#type| r#type.sharding().is_none()) => (None, None),
+        Some(query_sharding)
+            if placed_types.iter().flatten().all(|r#type| {
+                r#type.sharding().is_some_and(|sharding| {
+                    sharding.mesh() == query_sharding.mesh()
+                        && sharding
+                            .dimensions()
+                            .iter()
+                            .all(|dimension| matches!(dimension, ShardingDimension::Replicated))
+                })
+            }) =>
+        {
+            let residual_sharding = query_sharding
+                .with_dimensions(query_sharding.dimensions()[..types.query.rank() - 1].to_vec())
+                .map_err(|error| TypeError::invalid(error.to_string()))?;
+            (Some(query_sharding.clone()), Some(residual_sharding))
+        }
+        _ => attention_inferred_output_shardings(operation_name, &dimensions, &types)?,
+    };
+
+    // The body computes its outputs with contractions, which return arrays without an explicit layout and with the
+    // sharding that those contractions infer, so the attended output has every other property of the query type.
+    let output_type = types
+        .query
+        .clone()
+        .with_layout(None)
+        .with_sharding(output_sharding)
+        .map_err(|error| TypeError::invalid(error.to_string()))?;
+    let mut output_types = vec![output_type];
 
     if return_residual {
-        output_types.push(attention_residual_type(&dimensions, &types.query)?);
+        output_types.push(attention_residual_type(&dimensions, &types.query, residual_sharding)?);
     }
 
     Ok(output_types)
+}
+
+/// Infers the shardings of the output types that [`attention_forward_output_types`] returns by applying the type
+/// inference of the operations of the forward body that determine them (i.e., the reshapes that normalize rank-3
+/// inputs and that expand grouped key/value heads, the two contractions, and the placement of the scores between
+/// them) to the types of the inputs.
+fn attention_inferred_output_shardings(
+    operation_name: &str,
+    dimensions: &AttentionDimensions,
+    types: &AttentionInputs<ArrayType>,
+) -> Result<(Option<Sharding>, Option<Sharding>), TypeError> {
+    let normalize = |r#type: &ArrayType| -> Result<ArrayType, TypeError> {
+        if r#type.rank() == 4 {
+            return Ok(r#type.clone());
+        }
+        let normalized_dimensions =
+            std::iter::once(Dimension::Static(1)).chain(r#type.shape().dimensions().iter().cloned()).collect();
+        infer_reshape_output_type(r#type, Shape::new(normalized_dimensions), None)
+    };
+    let expand = |r#type: ArrayType| -> Result<ArrayType, TypeError> {
+        match key_value_group_types(&r#type, dimensions)? {
+            None => Ok(r#type),
+            Some((grouped_type, expanded_shape)) => infer_reshape_output_type(&grouped_type, expanded_shape, None),
+        }
+    };
+    let query = normalize(&types.query)?;
+    let key = expand(normalize(&types.key)?)?;
+    let value = expand(normalize(&types.value)?)?;
+    let scores = infer_dot_output_type(
+        operation_name,
+        &query,
+        &key,
+        &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]),
+        None,
+        None,
+    )?;
+    let score_sharding = attention_score_sharding(
+        operation_name,
+        &scores,
+        [types.bias.as_ref(), types.mask.as_ref()],
+        [types.query_sequence_lengths.as_ref(), types.key_value_sequence_lengths.as_ref()],
+    )?;
+    let scores = scores.with_sharding(score_sharding).map_err(|error| TypeError::invalid(error.to_string()))?;
+    let attended = infer_dot_output_type(
+        operation_name,
+        &scores,
+        &value,
+        &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]),
+        None,
+        None,
+    )?;
+
+    // The scores have the `BNTS` form and the attended values have the `BNTH` form, which the body transposes to the
+    // `BTN` form of the residual and to the `BTNH` form of the output, without the batch dimension for rank-3 queries.
+    let select = |sharding: Option<&Sharding>, axes: &[usize]| -> Result<Option<Sharding>, TypeError> {
+        sharding
+            .map(|sharding| {
+                sharding.with_dimensions(axes.iter().map(|axis| sharding.dimensions()[*axis].clone()).collect())
+            })
+            .transpose()
+            .map_err(|error| TypeError::invalid(error.to_string()))
+    };
+    let (output_axes, residual_axes): (&[usize], &[usize]) =
+        if types.query.rank() == 4 { (&[0, 2, 1, 3], &[0, 2, 1]) } else { (&[2, 1, 3], &[2, 1]) };
+    Ok((select(attended.sharding(), output_axes)?, select(scores.sharding(), residual_axes)?))
+}
+
+/// Returns the sharding of the `BNTS` scores of `scores_type` after the inputs that are applied to them elementwise
+/// take part in their placement. `score_inputs` are the bias and the mask, which are aligned with the trailing score
+/// dimensions, and `sequence_lengths` are the query and the key/value sequence lengths, which are aligned with the
+/// batch dimension. The placements combine like those of the inputs of an elementwise operation (i.e., a replicated
+/// dimension yields to a sharded one, and two dimensions that are sharded differently are rejected), so a bias that is
+/// sharded along a dimension that the scores replicate keeps the scores sharded along it, rather than being gathered.
+/// The type rule of the forward boundary and the bodies both use this function, so that they agree on the result.
+fn attention_score_sharding(
+    operation_name: &str,
+    scores_type: &ArrayType,
+    score_inputs: [Option<&ArrayType>; 2],
+    sequence_lengths: [Option<&ArrayType>; 2],
+) -> Result<Option<Sharding>, TypeError> {
+    let rank = scores_type.rank();
+    let template = scores_type.clone().with_layout(None);
+    let aligned_inputs = score_inputs
+        .into_iter()
+        .flatten()
+        .map(|r#type| (r#type, rank - r#type.rank()))
+        .chain(sequence_lengths.into_iter().flatten().map(|r#type| (r#type, 0)));
+    let mut placed = template.clone();
+    for (r#type, offset) in aligned_inputs {
+        let Some(sharding) = r#type.sharding() else {
+            continue;
+        };
+        let mut dimensions = vec![ShardingDimension::Replicated; rank];
+        dimensions[offset..offset + r#type.rank()].clone_from_slice(sharding.dimensions());
+        let aligned = sharding
+            .with_dimensions(dimensions)
+            .and_then(|sharding| template.clone().with_sharding(sharding))
+            .map_err(|error| TypeError::invalid(error.to_string()))?;
+        placed = Broadcastable::broadcast(&placed, &aligned).map_err(|_| {
+            TypeError::invalid(format!(
+                "`{operation_name}` input type `{type}` has a sharding that cannot be combined with that of the \
+                 attention scores `{placed}`",
+            ))
+        })?;
+    }
+    Ok(placed.sharding().cloned())
 }
 
 /// Validates one backward attention boundary (i.e., the [`AttentionInputs`] of `input_structure` in canonical order,
@@ -1496,7 +1695,8 @@ fn attention_backward_output_types(
         )));
     }
 
-    let expected_residual_type = attention_residual_type(&dimensions, &types.query)?;
+    // The residual is compared by data type and shape only, so its expected type needs no sharding.
+    let expected_residual_type = attention_residual_type(&dimensions, &types.query, None)?;
     if !matches_expected(&residual, &expected_residual_type) {
         return Err(TypeError::invalid(format!(
             "`{}` residual type {} does not match the expected residual type {}",
@@ -1504,6 +1704,9 @@ fn attention_backward_output_types(
         )));
     }
 
+    // Each cotangent has the cotangent type of its input, including its sharding and its layout, which the body
+    // restores after its contractions (refer to `restore_cotangent_type`), because reverse mode accumulates every
+    // cotangent into the cotangent of its input.
     let mut output_types = vec![types.query.cotangent()?, types.key.cotangent()?, types.value.cotangent()?];
     if let Some(bias) = &types.bias {
         let bias_cotangent = bias.cotangent()?;
@@ -1730,9 +1933,10 @@ fn validate_attention_inputs(
                     score_type.data_type(),
                 )));
             }
-        } else if !score_type.data_type().is_numeric() && !score_type.data_type().is_boolean() {
+        } else if !score_type.data_type().is_real() && !score_type.data_type().is_boolean() {
+            // The bias is converted to the real data type of the scores, which would discard an imaginary part.
             return Err(TypeError::invalid(format!(
-                "`{}` bias must have a numeric or Boolean data type but got `{}`",
+                "`{}` bias must have a real numeric or Boolean data type but got `{}`",
                 operation_name,
                 score_type.data_type(),
             )));
@@ -1799,23 +2003,25 @@ fn infer_attention_dimensions(
     }
 }
 
-/// Returns the `[batch, query_sequence, heads]` or `[query_sequence, heads]` type of the log-sum-exp residual, which
-/// has the query data type and inherits the query's sharding with only the trailing head dimension removed.
-fn attention_residual_type(dimensions: &AttentionDimensions, query_type: &ArrayType) -> Result<ArrayType, TypeError> {
+/// Returns the `[batch, query_sequence, heads]` or `[query_sequence, heads]` type of the log-sum-exp residual,
+/// which has the [`SOFTMAX_DATA_TYPE`], the memory space of the query, and the provided sharding (refer to
+/// [`attention_forward_output_types`]). The residual keeps the data type in which the softmax computes it for
+/// every query data type, because the backward definition of a backend may consume it (e.g., cuDNN's fused kernels,
+/// which return and consume it in `f32`), and rounding it to a narrower query data type would lose the normalization
+/// that it carries and could overflow it.
+fn attention_residual_type(
+    dimensions: &AttentionDimensions,
+    query_type: &ArrayType,
+    sharding: Option<Sharding>,
+) -> Result<ArrayType, TypeError> {
     let dimensions = if query_type.rank() == 3 {
         vec![dimensions.query_sequence.clone(), Dimension::Static(dimensions.query_heads)]
     } else {
         vec![dimensions.batch.clone(), dimensions.query_sequence.clone(), Dimension::Static(dimensions.query_heads)]
     };
-
-    let residual_type = ArrayType::new(query_type.data_type(), Shape::new(dimensions));
-    let Some(query_sharding) = query_type.sharding() else {
-        return Ok(residual_type);
-    };
-
-    query_sharding
-        .with_dimensions(query_sharding.dimensions()[..query_type.rank() - 1].to_vec())
-        .and_then(|sharding| residual_type.with_sharding(sharding))
+    ArrayType::new(SOFTMAX_DATA_TYPE, Shape::new(dimensions))
+        .with_memory(query_type.memory())
+        .with_sharding(sharding)
         .map_err(|error| TypeError::invalid(error.to_string()))
 }
 
@@ -1834,8 +2040,10 @@ fn prepare_attention<
         + Reshape
         + Broadcast
         + BroadcastLike
-        + ConvertElementType,
+        + ConvertElementType
+        + Reshard,
 >(
+    operation_name: &str,
     inputs: &AttentionInputs<V>,
     configuration: AttentionConfiguration,
     dimensions: &AttentionDimensions,
@@ -1860,16 +2068,43 @@ fn prepare_attention<
     let expanded_value = expand_key_value_heads(value_input, dimensions)?;
     let data_type = dimensions.data_type;
 
-    // Dot products, scaling, bias, and masking promote low precision inputs to `f32`, while `f64` remains `f64`.
-    // The stable softmax itself always runs in `f32`, matching the public attention contract.
-    let logits_type = if data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
+    // The score contraction, scaling, bias, and masking promote low precision inputs to `f32`, while `f64` remains
+    // `f64`. The stable softmax itself always runs in `f32`, matching the public attention contract.
+    let logits_type = dimensions.score_data_type();
 
     // The scores contract the head dimension of the query and of the expanded key for every batch item and head,
-    // which gives the `BNTS` score form.
-    let scores = query.dot(&expanded_key, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?;
-    let scores = if data_type == logits_type { scores } else { scores.convert_element_type(logits_type)? };
-    let scale_value = scores.fill_like(dimensions.scale(configuration))?;
-    let mut scores = scores.mul(&scale_value)?;
+    // which gives the `BNTS` score form. Low precision inputs accumulate the contraction in the promoted data type
+    // and return it there, because a contraction that returns the narrow data type rounds every score and overflows
+    // the scores that the narrow data type cannot represent before they could be promoted.
+    let score_dimensions = DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]);
+    let scores = if data_type == logits_type {
+        query.dot(&expanded_key, &score_dimensions)?
+    } else {
+        query.dot_with_accumulation_type(&expanded_key, &score_dimensions, logits_type)?
+    };
+    let scale_value = scores.fill_like(configuration.scale_for(dimensions.head_dimension))?;
+    let scores = scores.mul(&scale_value)?;
+
+    // The bias, the mask, and the sequence lengths are broadcast to the scores below, and a broadcast takes the
+    // placement of its exemplar. The scores are therefore first placed according to all of them, so that an input
+    // that is sharded along a dimension which the scores replicate keeps its shards instead of being gathered.
+    let scores_type = scores.r#type().as_array_type()?.clone();
+    let array_type = |input: &Option<V>| -> Result<Option<ArrayType>, ProgramError> {
+        input.as_ref().map(|input| Ok(input.r#type().as_array_type()?.clone())).transpose()
+    };
+    let (bias_type, mask_type) = (array_type(&inputs.bias)?, array_type(&inputs.mask)?);
+    let (query_lengths_type, key_value_lengths_type) =
+        (array_type(&inputs.query_sequence_lengths)?, array_type(&inputs.key_value_sequence_lengths)?);
+    let score_sharding = attention_score_sharding(
+        operation_name,
+        &scores_type,
+        [bias_type.as_ref(), mask_type.as_ref()],
+        [query_lengths_type.as_ref(), key_value_lengths_type.as_ref()],
+    )?;
+    let mut scores = match &score_sharding {
+        Some(sharding) if scores_type.sharding() != Some(sharding) => scores.reshard(sharding)?,
+        _ => scores,
+    };
 
     // A bias is right-aligned to `BNTS`, converted to the data type of the scores, and broadcast to their shape.
     // Every axis of the normalized bias either has the extent of the corresponding score axis or is a unit axis.
@@ -1886,18 +2121,18 @@ fn prepare_attention<
 
     // Visibility is the conjunction of the explicit mask, causal ordering, the local window, and both sequence
     // length predicates. Attention without any of them keeps its scores as they are.
-    let logits = if inputs.mask.is_none()
+    let (logits, mask) = if inputs.mask.is_none()
         && !configuration.causal()
         && configuration.local_window().is_none()
         && inputs.query_sequence_lengths.is_none()
         && inputs.key_value_sequence_lengths.is_none()
     {
-        scores
+        (scores, None)
     } else {
         // The row and column coordinates of the scores are integer constants that cannot carry tangents. They take the
         // runtime shape of the scores, and so do the broadcasts of the mask and of the sequence lengths below.
         let columns = scores.iota_like(3, DataType::I32)?;
-        let mut visible = match &inputs.mask {
+        let mut mask = match &inputs.mask {
             None => None,
             Some(mask) => {
                 let mask = normalize_attention_score_input(mask.clone())?;
@@ -1909,25 +2144,26 @@ fn prepare_attention<
         if configuration.causal() {
             let rows = scores.iota_like(2, DataType::I32)?;
             let causal = columns.compare(&rows, ComparisonDirection::LessThanOrEqual)?;
-            visible = Some(match visible {
+            mask = Some(match mask {
                 None => causal,
-                Some(visible) => visible.and(&causal)?,
+                Some(mask) => mask.and(&causal)?,
             });
         }
 
-        // The local window keeps the key/value positions `j` with `i - left <= j <= i + right`.
+        // The local window keeps the key/value positions `j` with `i - left <= j <= i + right`, which is evaluated as
+        // `-left <= j - i <= right`. The offsets `j - i` of two `i32` coordinates cannot overflow, unlike `i + right`
+        // for a large radius, and a radius beyond the `i32` range admits every offset, so it is clamped to that range.
         if let Some((left, right)) = configuration.local_window() {
             let rows = scores.iota_like(2, DataType::I32)?;
-            let left = rows.fill_like(left as f64)?;
-            let right = rows.fill_like(right as f64)?;
-            let lower = rows.sub(&left)?;
-            let upper = rows.add(&right)?;
-            let in_window = columns
+            let offsets = columns.sub(&rows)?;
+            let lower = offsets.fill_like(-(left.min(i32::MAX as usize) as f64))?;
+            let upper = offsets.fill_like(right.min(i32::MAX as usize) as f64)?;
+            let in_window = offsets
                 .compare(&lower, ComparisonDirection::GreaterThanOrEqual)?
-                .and(&columns.compare(&upper, ComparisonDirection::LessThanOrEqual)?)?;
-            visible = Some(match visible {
+                .and(&offsets.compare(&upper, ComparisonDirection::LessThanOrEqual)?)?;
+            mask = Some(match mask {
                 None => in_window,
-                Some(visible) => visible.and(&in_window)?,
+                Some(mask) => mask.and(&in_window)?,
             });
         }
 
@@ -1936,9 +2172,9 @@ fn prepare_attention<
             let rows = scores.iota_like(2, DataType::I32)?;
             let bounds = lengths.broadcast_like(&rows, &[0])?;
             let in_range = rows.compare(&bounds, ComparisonDirection::LessThan)?;
-            visible = Some(match visible {
+            mask = Some(match mask {
                 None => in_range,
-                Some(visible) => visible.and(&in_range)?,
+                Some(mask) => mask.and(&in_range)?,
             });
         }
 
@@ -1946,29 +2182,26 @@ fn prepare_attention<
         if let Some(lengths) = &inputs.key_value_sequence_lengths {
             let bounds = lengths.broadcast_like(&columns, &[0])?;
             let in_range = columns.compare(&bounds, ComparisonDirection::LessThan)?;
-            visible = Some(match visible {
+            mask = Some(match mask {
                 None => in_range,
-                Some(visible) => visible.and(&in_range)?,
+                Some(mask) => mask.and(&in_range)?,
             });
         }
 
         // Invisible scores use a finite large negative value rather than negative infinity, so that a row without
-        // any visible position still has a finite maximum and a finite log-sum-exp residual. At least one of the
-        // masks above is present on this path, so the visibility is known.
-        let large_negative = if scores.r#type().as_array_type()?.data_type() == DataType::F64 {
-            -0.7 * f64::MAX
-        } else {
-            -0.7 * f32::MAX as f64
-        };
-
-        let masked = scores.fill_like(large_negative)?;
-        visible.unwrap().select(&scores, &masked)?
+        // any visible position still has a finite maximum and a finite log-sum-exp residual. The value is finite
+        // in the softmax data type for every data type of the scores, because a value that is only finite in `f64`
+        // would become negative infinity when the logits are converted for the softmax. At least one of the masks
+        // above is present on this path, so the visibility is known.
+        let masked = scores.fill_like(-0.7 * f32::MAX as f64)?;
+        let mask = mask.unwrap();
+        (mask.select(&scores, &masked)?, Some(mask))
     };
 
     let logits =
         if logits_type == SOFTMAX_DATA_TYPE { logits } else { logits.convert_element_type(SOFTMAX_DATA_TYPE)? };
 
-    Ok(PreparedAttention { query, expanded_key, expanded_value, logits })
+    Ok(PreparedAttention { query, expanded_key, expanded_value, logits, mask })
 }
 
 /// Adds the implicit batch axis used to evaluate one unbatched `TNH` attention input (i.e., a query, key, value,
@@ -1980,34 +2213,33 @@ fn normalize_attention_input<V: Value<Type: ArrayMemberType> + Reshape>(input: V
     input.expand_dimensions(0)
 }
 
-/// Expands grouped key/value heads to the query heads. The `BSKH` input is replicated along a new group axis, which
-/// gives the `BSKGH` form, and its key/value head and group axes are then merged into the query head axis of the
-/// `BSNH` form. Both steps keep the batch and sequence dimensions, so they support dynamic extents along them.
-fn expand_key_value_heads<V: Value<Type: ArrayMemberType> + Reshape + Broadcast>(
-    key_or_value: V,
+/// Axes of the `BSKGH` form to which [`expand_key_value_heads`] maps the axes of its `BSKH` input.
+const KEY_VALUE_GROUP_AXES: [usize; 4] = [0, 1, 2, 4];
+
+/// Returns the types of the two steps of [`expand_key_value_heads`] for a normalized `BSKH` key or value type (i.e.,
+/// the `BSKGH` type that replicates the input along a new group axis, and the `BSNH` shape that merges the key/value
+/// head and group axes into the query head axis), or [`None`] when the key/value heads are the query heads.
+fn key_value_group_types(
+    r#type: &ArrayType,
     dimensions: &AttentionDimensions,
-) -> Result<V, ProgramError> {
+) -> Result<Option<(ArrayType, Shape)>, TypeError> {
     if dimensions.key_value_heads == dimensions.query_heads {
-        return Ok(key_or_value);
+        return Ok(None);
     }
 
     let group = dimensions.query_heads / dimensions.key_value_heads;
-    let r#type = key_or_value.r#type();
-    let r#type = r#type.as_array_type()?;
     let [batch, length, _, head_dimension] = r#type.shape().dimensions() else {
         return Err(TypeError::invalid(format!(
             "attention key or value type `{}` does not have the normalized rank 4",
             r#type,
-        ))
-        .into());
+        )));
     };
 
-    // The output keeps the memory space and the placement of the input along the mapped axes, and its group axis is
-    // replicated, because a broadcast cannot change manual variation.
-    let axes = [0, 1, 2, 4];
+    // The grouped type keeps the memory space and the placement of the input along the mapped axes, and its group
+    // axis is replicated, because a broadcast cannot change manual variation.
     let sharding = r#type
         .sharding()
-        .map(|sharding| sharding.with_broadcasted_dimensions(5, &axes))
+        .map(|sharding| sharding.with_broadcasted_dimensions(5, &KEY_VALUE_GROUP_AXES))
         .transpose()
         .map_err(|error| TypeError::invalid(error.to_string()))?;
     let grouped_dimensions =
@@ -2018,7 +2250,23 @@ fn expand_key_value_heads<V: Value<Type: ArrayMemberType> + Reshape + Broadcast>
         .map_err(|error| TypeError::invalid(error.to_string()))?;
     let expanded_dimensions =
         vec![batch.clone(), length.clone(), dimensions.query_heads.into(), head_dimension.clone()];
-    key_or_value.broadcast(grouped_type, &axes)?.reshape(Shape::new(expanded_dimensions))
+    Ok(Some((grouped_type, Shape::new(expanded_dimensions))))
+}
+
+/// Expands grouped key/value heads to the query heads. The `BSKH` input is replicated along a new group axis, which
+/// gives the `BSKGH` form, and its key/value head and group axes are then merged into the query head axis of the
+/// `BSNH` form. Both steps keep the batch and sequence dimensions, so they support dynamic extents along them.
+fn expand_key_value_heads<V: Value<Type: ArrayMemberType> + Reshape + Broadcast>(
+    key_or_value: V,
+    dimensions: &AttentionDimensions,
+) -> Result<V, ProgramError> {
+    let group_types = key_value_group_types(key_or_value.r#type().as_array_type()?, dimensions)?;
+    match group_types {
+        None => Ok(key_or_value),
+        Some((grouped_type, expanded_shape)) => {
+            key_or_value.broadcast(grouped_type, &KEY_VALUE_GROUP_AXES)?.reshape(expanded_shape)
+        }
+    }
 }
 
 /// Zeros query rows outside each batch item's logical sequence length.
@@ -2046,6 +2294,92 @@ fn apply_dropout<V: Value + Dropout>(
         return Ok(probabilities);
     };
     Ok(probabilities.dropout(rate, inputs.dropout_state.as_ref())?.0)
+}
+
+/// Returns `value` replicated along those of its dimensions `axes` that explicit mesh axes shard, and `value` itself
+/// when no such axis shards any of them.
+fn replicate_dimensions<V: Value<Type: ArrayMemberType> + Reshard>(
+    value: V,
+    axes: &[usize],
+) -> Result<V, ProgramError> {
+    let r#type = value.r#type().as_array_type()?.clone();
+    let Some(sharding) = r#type.sharding() else {
+        return Ok(value);
+    };
+    let mut dimensions = sharding.dimensions().to_vec();
+    for axis in axes {
+        if dimensions[*axis].has_explicit_axis(sharding.mesh()) {
+            dimensions[*axis] = ShardingDimension::Replicated;
+        }
+    }
+    if dimensions == sharding.dimensions() {
+        return Ok(value);
+    }
+    let replicated = sharding.with_dimensions(dimensions).map_err(|error| TypeError::invalid(error.to_string()))?;
+    value.reshard(&replicated)
+}
+
+/// Contracts `lhs` with `rhs` in the backward body, where one of them is a cotangent and the other one is a value of
+/// the forward body, and returns the result with the provided sharding, or with the one that the contraction infers
+/// when there is none. The placements that the forward body infers can give the two inputs placements that no
+/// contraction of them has, even though every contraction of the forward body has one (e.g., an output cotangent and
+/// a value whose contracted head dimensions are both sharded, or a cotangent whose query sequence and a value whose
+/// key/value sequence use one mesh axis, which the result cannot use twice). The cotangent is then replicated before
+/// the contraction, so that the values of the forward body keep their placements. The result of a contraction that
+/// feeds elementwise operations of the backward body takes the sharding of the values that it meets there.
+fn contract_cotangent<V: Value<Type: ArrayMemberType> + Dot + Reshard>(
+    operation_name: &str,
+    lhs: &V,
+    rhs: &V,
+    dimensions: &DotDimensionNumbers,
+    cotangent_is_lhs: bool,
+    sharding: Option<&Sharding>,
+) -> Result<V, ProgramError> {
+    let lhs_type = lhs.r#type().as_array_type()?.clone();
+    let rhs_type = rhs.r#type().as_array_type()?.clone();
+    let contraction = if infer_dot_output_type(operation_name, &lhs_type, &rhs_type, dimensions, None, None).is_ok() {
+        lhs.dot(rhs, dimensions)?
+    } else if cotangent_is_lhs {
+        let axes = (0..lhs_type.rank()).collect::<Vec<_>>();
+        replicate_dimensions(lhs.clone(), axes.as_slice())?.dot(rhs, dimensions)?
+    } else {
+        let axes = (0..rhs_type.rank()).collect::<Vec<_>>();
+        lhs.dot(&replicate_dimensions(rhs.clone(), axes.as_slice())?, dimensions)?
+    };
+    match sharding {
+        Some(sharding) if contraction.r#type().as_array_type()?.sharding() != Some(sharding) => {
+            contraction.reshard(sharding)
+        }
+        _ => Ok(contraction),
+    }
+}
+
+/// Returns `cotangent` with the sharding and the layout of `cotangent_type`, which is the cotangent type of the input
+/// that it belongs to and has its data type and shape. The contractions of the backward body place each cotangent
+/// according to the inputs that they contract (e.g., the head dimension of the query cotangent comes from the key) and
+/// return arrays without an explicit layout, while reverse mode accumulates each cotangent into the cotangent of its
+/// input and therefore requires that type. A cotangent that already has it is returned unchanged, so inputs that are
+/// placed alike and have no explicit layout stage nothing here. A sharding that the input has is restored with a
+/// reshard, while the layout of the input and the absence of a sharding (i.e., an input without one that attends
+/// together with placed inputs) are metadata that a broadcast to the shape of the cotangent records.
+fn restore_cotangent_type<V: Value<Type: ArrayMemberType> + Broadcast + Reshard>(
+    cotangent: V,
+    cotangent_type: &ArrayType,
+) -> Result<V, ProgramError> {
+    let r#type = cotangent.r#type().as_array_type()?.clone();
+    let cotangent = match cotangent_type.sharding() {
+        Some(sharding) if r#type.sharding() != Some(sharding) => cotangent.reshard(sharding)?,
+        _ => cotangent,
+    };
+    let has_layout = cotangent_type.layout().is_none() || r#type.layout() == cotangent_type.layout();
+    let has_sharding = cotangent_type.sharding().is_some() || r#type.sharding().is_none();
+    if has_layout && has_sharding {
+        return Ok(cotangent);
+    }
+
+    // A broadcast to the shape that the cotangent already has only records the metadata of its output type.
+    let axes = (0..cotangent_type.rank()).collect::<Vec<_>>();
+    cotangent.broadcast(cotangent_type.clone(), axes.as_slice())
 }
 
 /// Returns the named composite of the forward definition with the provided configuration and residual request,
@@ -2090,7 +2424,8 @@ where
 
             // The softmax over the key/value axis subtracts the maximum of every row before exponentiating,
             // so that the exponentials cannot overflow and the largest one is exactly one.
-            let prepared = prepare_attention(&inputs, configuration, &dimensions)?;
+            let prepared =
+                prepare_attention(DOT_PRODUCT_ATTENTION_COMPOSITE_NAME, &inputs, configuration, &dimensions)?;
             let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
             let maxima_broadcast = maxima.broadcast_like(&prepared.logits, &[0, 1, 2])?;
             let shifted = prepared.logits.sub(&maxima_broadcast)?;
@@ -2124,14 +2459,9 @@ where
 
             // The residual is the logarithm of the sum of the exponentiated logits of every row, which is the row
             // maximum plus the logarithm of the sum of the shifted exponentials. It is a statistic of the forward
-            // pass rather than a differentiable output, so it stops gradients.
+            // pass rather than a differentiable output, so it stops gradients, and it keeps the softmax data type.
             let residual = if return_residual {
                 let residual = maxima.add(&sums.log()?)?;
-                let residual = if SOFTMAX_DATA_TYPE == dimensions.data_type {
-                    residual
-                } else {
-                    residual.convert_element_type(dimensions.data_type)?
-                };
                 let residual = residual.transpose([0, 2, 1])?;
                 let residual = if query_rank == 4 { residual } else { residual.squeeze(0)? };
                 Some(residual.stop_gradient()?)
@@ -2241,24 +2571,31 @@ where
 /// a bias whose cotangent space is zero-dimensional have no cotangent outputs.
 ///
 /// The body recomputes the normalized probabilities `P` from the masked logits in `f32`, which avoids the precision
-/// that rounding the output or the residual to a narrower query data type loses, and so the output and the residual
-/// are validated inputs for backend implementations whose numerical values this body does not use. It computes:
+/// that rounding the output to a narrower query data type loses, and so the output and the residual are validated
+/// inputs for backend implementations whose numerical values this body does not use. Everything other than that
+/// softmax runs in the query data type promoted to at least `f32`, like the scores of the forward body, so `f64`
+/// inputs keep their range. It computes:
 ///
 /// ```text
-/// dV = transpose(P) * dO
+/// dV = transpose(round(P)) * dO
 /// dW = dO * transpose(V)
 /// C = dW - dW[pivot]
-/// dS = P * (C - sum(P * C))
+/// dS = mask * P * (C - sum(P * C))
 /// dQ = scale * dS * K
 /// dK = scale * transpose(dS) * Q,
 /// ```
 ///
 /// where the pivot is the first maximum logit of each row, whose `dS` entry is replaced by the negative sum of all
-/// other entries, which preserves the dominant derivative when its probability rounds to one. Grouped query heads are
-/// reduced back to each key/value head, a broadcast bias cotangent is reduced to the shape of its bias, and padded
-/// query rows are zeroed. With dropout, `P` is the dropped probabilities in `dV`, and the cotangent of the dropped
-/// probabilities is mapped back through the same dropout mask, which the same random state and probability shape
-/// reproduce.
+/// other entries, which preserves the dominant derivative when its probability rounds to one. `round` rounds the
+/// probabilities to the query data type, which is how the forward body contracts them with the values, and `mask`
+/// zeroes the cotangents of the invisible scores, whose logits are constants. That only changes rows without any
+/// visible position, because the probabilities of invisible scores are zero in every other row. `C` is evaluated on
+/// halved weight cotangents and multiplied by doubled probabilities, so that the difference of two finite cotangents
+/// cannot overflow and a tiny probability cannot underflow its product before the factor of two returns. Grouped query
+/// heads are reduced back to each key/value head, a broadcast bias cotangent is reduced to the shape of its bias, and
+/// padded query rows are zeroed. With dropout, `P` is the dropped probabilities in `dV`, and the cotangent of the
+/// dropped probabilities is mapped back through the same dropout mask, which the same random state and probability
+/// shape reproduce.
 fn backward_definition<V: Value, O: Operation<Type = V::Type>>(
     configuration: AttentionConfiguration,
 ) -> AttentionFunction<
@@ -2282,12 +2619,14 @@ where
     /// Sums the `BSNH` key or value cotangent of grouped query heads back to the `BSKH` form of the key/value heads
     /// that those query heads share, by splitting its query head axis into the key/value head and group axes of the
     /// `BSKGH` form and summing over the group axis. Like [`expand_key_value_heads`], it keeps the batch and sequence
-    /// dimensions.
-    fn sum_key_value_head_groups<V: Value<Type: ArrayMemberType> + Reduce + Reshape>(
+    /// dimensions. A query head axis that is sharded (i.e., like the query heads) is replicated first, because a
+    /// mesh axis that shards the query heads cannot shard either of the two axes that they split into.
+    fn sum_key_value_head_groups<V: Value<Type: ArrayMemberType> + Reduce + Reshape + Reshard>(
         cotangent: V,
         dimensions: &AttentionDimensions,
     ) -> Result<V, ProgramError> {
         let group = dimensions.query_heads / dimensions.key_value_heads;
+        let cotangent = replicate_dimensions(cotangent, &[2])?;
         let r#type = cotangent.r#type();
         let r#type = r#type.as_array_type()?;
         let grouped_dimensions = vec![
@@ -2321,11 +2660,12 @@ where
             inputs.bias.as_ref().map(|_| &input_types[3]),
             inputs.mask.as_ref().map(|_| &input_types[3 + usize::from(inputs.bias.is_some())]),
         )?;
-        let prepared = prepare_attention(inputs, configuration, &dimensions)?;
+        let prepared =
+            prepare_attention(DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME, inputs, configuration, &dimensions)?;
         let output_cotangent = normalize_attention_input(output_cotangent.clone())?;
 
-        // The public residual and output have the query data type, which can lose the normalization correction in
-        // narrow formats. Recompute probabilities in the softmax type instead of recovering them from those values.
+        // The output has the query data type, which can lose the normalization correction in narrow formats.
+        // Recompute probabilities in the softmax type instead of recovering them from the output and the residual.
         let maxima = prepared.logits.reduce(&[3], ReductionKind::Max)?;
         let maxima = maxima.broadcast_like(&prepared.logits, &[0, 1, 2])?;
         let exponentials = prepared.logits.sub(&maxima)?.exp()?;
@@ -2351,64 +2691,114 @@ where
             Some(query_lengths) => zero_query_rows(output_cotangent, query_lengths, 1)?,
         };
 
-        // The backward mathematics runs in the softmax data type, like the recomputed probabilities.
-        let convert = |array: CustomRuleTracer<V, O>| -> Result<CustomRuleTracer<V, O>, ProgramError> {
-            if dimensions.data_type == SOFTMAX_DATA_TYPE {
-                Ok(array)
-            } else {
-                Ok(array.convert_element_type(SOFTMAX_DATA_TYPE)?)
-            }
-        };
-        let softmax_query = convert(prepared.query)?;
-        let softmax_key = convert(prepared.expanded_key)?;
-        let softmax_value = convert(prepared.expanded_value)?;
-        let softmax_output_cotangent = convert(output_cotangent)?;
+        // The backward mathematics outside the softmax runs in the data type of the scores (i.e., the query data type
+        // promoted to at least `f32`), like the forward body, so that it keeps the range and precision of `f64` inputs.
+        let score_data_type = dimensions.score_data_type();
+        let convert =
+            |array: CustomRuleTracer<V, O>, data_type: DataType| -> Result<CustomRuleTracer<V, O>, ProgramError> {
+                if array.r#type().as_array_type()?.data_type() == data_type {
+                    Ok(array)
+                } else {
+                    Ok(array.convert_element_type(data_type)?)
+                }
+            };
+        let query = convert(prepared.query, score_data_type)?;
+        let key = convert(prepared.expanded_key, score_data_type)?;
+        let value = convert(prepared.expanded_value, score_data_type)?;
+        let output_cotangent = convert(output_cotangent, score_data_type)?;
 
         // With dropout, the output uses the dropped probabilities `D = dropout(P)`, so the value cotangent uses `D`
-        // and the cotangent of `P` is the cotangent of `D` through the same mask.
+        // and the cotangent of `P` is the cotangent of `D` through the same mask. The forward body rounds `D` to the
+        // query data type before it contracts it with the values, and the value cotangent uses the same rounded
+        // weights, because the output is linear in the values through exactly those weights.
         let dropped_weights = apply_dropout(weights.clone(), inputs, configuration)?;
+        let value_weights = convert(convert(dropped_weights, dimensions.data_type)?, score_data_type)?;
+        let weights = convert(weights, score_data_type)?;
+        let score_sharding = prepared.logits.r#type().as_array_type()?.sharding().cloned();
         let weight_cotangents = apply_dropout(
-            softmax_output_cotangent
-                .dot(&softmax_value, &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]))?,
+            contract_cotangent(
+                DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+                &output_cotangent,
+                &value,
+                &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]),
+                true,
+                score_sharding.as_ref(),
+            )?,
             inputs,
             configuration,
         )?;
-        let zero = prepared.logits.fill_like(0.0)?;
-        let pivot_cotangent = is_pivot.select(&weight_cotangents, &zero)?.reduce(&[3], ReductionKind::Sum)?;
-        let pivot_cotangent = pivot_cotangent.broadcast_like(&prepared.logits, &[0, 1, 2])?;
+
+        // The softmax derivative below subtracts weight cotangents from each other, and the difference of two finite
+        // cotangents with opposite signs can overflow even when the logit cotangents are representable. It therefore
+        // uses halved weight cotangents, whose differences are always finite, and the factor of two returns with the
+        // probabilities that multiply those differences. Doubling a probability is exact and cannot overflow, so
+        // each product is rounded once to the logit cotangent itself. Returning the factor only afterwards would let
+        // the product of a tiny probability with a halved difference underflow first, and folding it into the score
+        // scale would let a large scale overflow.
+        let zero = weights.fill_like(0.0)?;
+        let halved_weight_cotangents = weight_cotangents.mul(&weights.fill_like(0.5)?)?;
+        let pivot_cotangent = is_pivot.select(&halved_weight_cotangents, &zero)?.reduce(&[3], ReductionKind::Sum)?;
+        let pivot_cotangent = pivot_cotangent.broadcast_like(&weights, &[0, 1, 2])?;
 
         // Center the incoming weight cotangents before their weighted sum. This preserves a tiny dominant derivative
         // and gives exact zero when every weight cotangent is equal, even if the rounded probabilities do not sum to
         // one.
-        let centered = weight_cotangents.sub(&pivot_cotangent)?;
+        let centered = halved_weight_cotangents.sub(&pivot_cotangent)?;
         let delta = weights.mul(&centered)?.reduce(&[3], ReductionKind::Sum)?;
-        let delta = delta.broadcast_like(&prepared.logits, &[0, 1, 2])?;
-        let logit_cotangents = weights.mul(&centered.sub(&delta)?)?;
+        let delta = delta.broadcast_like(&weights, &[0, 1, 2])?;
+        let logit_cotangents = weights.add(&weights)?.mul(&centered.sub(&delta)?)?;
 
         // The logit cotangents of every row sum to zero, so the pivot's entry is replaced by the negative sum of the
         // other entries. That keeps the dominant derivative when the probability of the pivot rounds to one.
         let other_cotangents = is_pivot.select(&zero, &logit_cotangents)?;
         let pivot_cotangent = other_cotangents.reduce(&[3], ReductionKind::Sum)?;
-        let pivot_cotangent = pivot_cotangent.broadcast_like(&prepared.logits, &[0, 1, 2])?;
+        let pivot_cotangent = pivot_cotangent.broadcast_like(&weights, &[0, 1, 2])?;
         let logit_cotangents = is_pivot.select(&zero.sub(&pivot_cotangent)?, &other_cotangents)?;
+
+        // The logits of invisible scores are constants, so their cotangents contribute nothing to the scores. Rows
+        // with a visible position already have zero probabilities there, while a row without any visible position
+        // has uniform probabilities and would otherwise leak cotangents to its query, to the keys, and to the bias.
+        let logit_cotangents = match &prepared.mask {
+            Some(mask) => mask.select(&logit_cotangents, &zero)?,
+            None => logit_cotangents,
+        };
 
         // The scores are `scale * Q * transpose(K)`, so the query and key cotangents contract the scaled logit
         // cotangents with the keys and the queries, and the value cotangent contracts the dropped probabilities with
-        // the output cotangent. Every result is transposed from `BNTH` or `BNSH` to the form of its input.
-        let scale_value = logit_cotangents.fill_like(dimensions.scale(configuration))?;
+        // the output cotangent. Every result is transposed from `BNTH` or `BNSH` to the form of its input. The scale
+        // is the coefficient of the forward body, so both bodies round it in the same way.
+        let scale_value = logit_cotangents.fill_like(configuration.scale_for(dimensions.head_dimension))?;
         let scaled_logit_cotangents = logit_cotangents.mul(&scale_value)?;
-        let mut query_cotangent = scaled_logit_cotangents
-            .dot(&softmax_key, &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]))?
-            .transpose([0, 2, 1, 3])?;
+        let mut query_cotangent = contract_cotangent(
+            DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+            &scaled_logit_cotangents,
+            &key,
+            &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]),
+            true,
+            None,
+        )?
+        .transpose([0, 2, 1, 3])?;
         if let Some(query_lengths) = &inputs.query_sequence_lengths {
             query_cotangent = zero_query_rows(query_cotangent, query_lengths, 1)?;
         }
-        let key_cotangent = scaled_logit_cotangents
-            .dot(&softmax_query, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))?
-            .transpose([0, 2, 1, 3])?;
-        let value_cotangent = dropped_weights
-            .dot(&softmax_output_cotangent, &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]))?
-            .transpose([0, 2, 1, 3])?;
+        let key_cotangent = contract_cotangent(
+            DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+            &scaled_logit_cotangents,
+            &query,
+            &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]),
+            true,
+            None,
+        )?
+        .transpose([0, 2, 1, 3])?;
+        let value_cotangent = contract_cotangent(
+            DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+            &value_weights,
+            &output_cotangent,
+            &DotDimensionNumbers::new(vec![2], vec![1], vec![0, 1], vec![0, 2]),
+            false,
+            None,
+        )?
+        .transpose([0, 2, 1, 3])?;
 
         // Grouped query heads share one key/value head, so the key and value cotangents of every group are summed
         // back to that head.
@@ -2421,18 +2811,20 @@ where
             )
         };
 
-        // Every cotangent returns to the cotangent data type and to the rank of its input.
+        // Every cotangent returns to the cotangent data type, to the rank, and to the placement and layout of its
+        // input.
         let mut cotangents = [query_cotangent, key_cotangent, value_cotangent]
             .into_iter()
             .zip(input_types[..3].iter().zip(input_ranks))
             .map(|(cotangent, (input_type, rank))| {
-                let cotangent_data_type = input_type.cotangent()?.data_type();
-                let cotangent = if cotangent.r#type().as_array_type()?.data_type() == cotangent_data_type {
+                let cotangent_type = input_type.cotangent()?;
+                let cotangent = if cotangent.r#type().as_array_type()?.data_type() == cotangent_type.data_type() {
                     cotangent
                 } else {
-                    cotangent.convert_element_type(cotangent_data_type)?
+                    cotangent.convert_element_type(cotangent_type.data_type())?
                 };
-                if rank == 4 { Ok(cotangent) } else { cotangent.squeeze(0) }
+                let cotangent = if rank == 4 { cotangent } else { cotangent.squeeze(0)? };
+                restore_cotangent_type(cotangent, &cotangent_type)
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
 
@@ -2466,12 +2858,8 @@ where
             // The reduced cotangent keeps the axes along which the bias is not broadcast, which are the axes of the
             // bias other than its unit axes, so restoring the shape of the bias only inserts or removes unit axes.
             let bias_cotangent = bias_cotangent.reshape(bias_type.shape().clone())?;
-            let bias_cotangent = if bias_cotangent_type.data_type() == SOFTMAX_DATA_TYPE {
-                bias_cotangent
-            } else {
-                bias_cotangent.convert_element_type(bias_cotangent_type.data_type())?
-            };
-            cotangents.push(bias_cotangent);
+            let bias_cotangent = convert(bias_cotangent, bias_cotangent_type.data_type())?;
+            cotangents.push(restore_cotangent_type(bias_cotangent, &bias_cotangent_type)?);
         }
 
         Ok(cotangents)
@@ -2583,6 +2971,8 @@ fn batch_attention<
         + Reduce
         + Transpose
         + Reshape
+        + Broadcast
+        + Reshard
         + DimensionSize<Extent: Clone + Mul>
         + DynamicReshape<<V as DimensionSize>::Extent>
         + DynamicBroadcast<<V as DimensionSize>::Extent>,
@@ -2678,6 +3068,42 @@ fn batch_attention<
         None
     };
 
+    // A mesh axis that shards the logical batch axis cannot shard the folded batch axis, whose shards would interleave
+    // the batch items of the mapped axis, so the inputs are replicated along the logical batch axis before they are
+    // folded. The outputs return to that placement below. The logical batch axis follows the mapped axis in every
+    // aligned input that has one, and the placements of those inputs along it agree wherever they are not replicated,
+    // as they do for every batch item of the call.
+    let batch_placement = aligned
+        .iter()
+        .zip(input_roles)
+        .filter(|(_, role)| !matches!(role, AttentionBatchInput::Score))
+        .map(|(value, _)| -> Result<Option<ShardingDimension>, ProgramError> {
+            let r#type = value.r#type().as_array_type()?.clone();
+            Ok(r#type
+                .sharding()
+                .filter(|_| batch_extent.is_some() && r#type.rank() > 1)
+                .map(|sharding| (&sharding.dimensions()[1], sharding.mesh()))
+                .filter(|(dimension, mesh)| dimension.has_explicit_axis(mesh))
+                .map(|(dimension, _)| dimension.clone()))
+        })
+        .collect::<Result<Vec<_>, ProgramError>>()?
+        .into_iter()
+        .flatten()
+        .next();
+    let place_batch_axis = |output: V| -> Result<V, ProgramError> {
+        let r#type = output.r#type().as_array_type()?.clone();
+        match (&batch_placement, r#type.sharding()) {
+            (Some(placement), Some(sharding)) if &sharding.dimensions()[1] != placement => {
+                let mut dimensions = sharding.dimensions().to_vec();
+                dimensions[1] = placement.clone();
+                let placed =
+                    sharding.with_dimensions(dimensions).map_err(|error| TypeError::invalid(error.to_string()))?;
+                output.reshard(&placed)
+            }
+            _ => Ok(output),
+        }
+    };
+
     // Fold the mapped axis into attention's batch axis and stage the definition at the folded boundary.
     let folded = aligned
         .iter()
@@ -2686,9 +3112,11 @@ fn batch_attention<
             let rank = rank(value)?;
             match role {
                 AttentionBatchInput::Tensor if rank == 5 => {
-                    let batch_extent = mapped_extent.mul(&value.dimension_size(1)?)?;
-                    let folded_extents = std::iter::once(batch_extent).chain(extents(value, 2)?).collect::<Vec<_>>();
-                    value.dynamic_reshape(folded_extents.as_slice())
+                    // Every folded input uses the one folded batch extent, because a product that is computed again
+                    // is another dimension to the validation of the folded call, even when it has the same value.
+                    let folded_extents =
+                        std::iter::once(folded_batch_extent.clone()).chain(extents(value, 2)?).collect::<Vec<_>>();
+                    replicate_dimensions(value.clone(), &[1])?.dynamic_reshape(folded_extents.as_slice())
                 }
                 AttentionBatchInput::Tensor => Ok(value.clone()),
                 AttentionBatchInput::Score => {
@@ -2705,15 +3133,19 @@ fn batch_attention<
                     let output_axes = std::iter::once(0).chain(offset..normalized_extents.len()).collect::<Vec<_>>();
                     let normalized = value.dynamic_broadcast(normalized_extents.as_slice(), output_axes.as_slice())?;
                     match folded_extents {
-                        Some(folded_extents) => normalized.dynamic_reshape(folded_extents.as_slice()),
+                        Some(folded_extents) => {
+                            replicate_dimensions(normalized, &[1])?.dynamic_reshape(folded_extents.as_slice())
+                        }
                         None => Ok(normalized),
                     }
                 }
+                AttentionBatchInput::Length if rank == 2 => replicate_dimensions(value.clone(), &[1])?
+                    .dynamic_reshape(std::slice::from_ref(&folded_batch_extent)),
                 AttentionBatchInput::Length => value.dynamic_reshape(std::slice::from_ref(&folded_batch_extent)),
                 AttentionBatchInput::Residual if rank == 4 => {
                     let folded_extents =
                         std::iter::once(folded_batch_extent.clone()).chain(extents(value, 2)?).collect::<Vec<_>>();
-                    value.dynamic_reshape(folded_extents.as_slice())
+                    replicate_dimensions(value.clone(), &[1])?.dynamic_reshape(folded_extents.as_slice())
                 }
                 AttentionBatchInput::Residual => Ok(value.clone()),
             }
@@ -2725,25 +3157,39 @@ fn batch_attention<
     check_count!("output", output_roles, outputs.len(), ProgramError);
 
     // Restore the mapped axis of every output and reduce bias cotangents over the axes that their biases broadcast.
+    // The outputs of the forward definition return to the placement of the logical batch axis, and every cotangent
+    // returns to the cotangent type of its aligned input (i.e., to its placement and to its layout), which reverse
+    // mode requires in order to accumulate it.
     let outputs = outputs
         .into_iter()
         .zip(output_roles)
         .map(|(output, role)| match role {
-            AttentionBatchOutput::Tensor(input_index) if rank(&aligned[input_index])? == 5 => {
-                let unfolded_extents = [mapped_extent.clone(), aligned[input_index].dimension_size(1)?]
-                    .into_iter()
-                    .chain(extents(&output, 1)?)
-                    .collect::<Vec<_>>();
-                output.dynamic_reshape(unfolded_extents.as_slice())
+            AttentionBatchOutput::Tensor(input_index) | AttentionBatchOutput::Cotangent(input_index) => {
+                let output = if rank(&aligned[input_index])? == 5 {
+                    let unfolded_extents = [mapped_extent.clone(), aligned[input_index].dimension_size(1)?]
+                        .into_iter()
+                        .chain(extents(&output, 1)?)
+                        .collect::<Vec<_>>();
+                    output.dynamic_reshape(unfolded_extents.as_slice())?
+                } else {
+                    output
+                };
+                match role {
+                    AttentionBatchOutput::Cotangent(_) => {
+                        let cotangent_type = aligned[input_index].r#type().as_array_type()?.cotangent()?;
+                        restore_cotangent_type(output, &cotangent_type)
+                    }
+                    _ if rank(&aligned[input_index])? == 5 => place_batch_axis(output),
+                    _ => Ok(output),
+                }
             }
-            AttentionBatchOutput::Tensor(_) => Ok(output),
             AttentionBatchOutput::Residual => match &batch_extent {
                 Some(batch_extent) => {
                     let unfolded_extents = [mapped_extent.clone(), batch_extent.clone()]
                         .into_iter()
                         .chain(extents(&output, 1)?)
                         .collect::<Vec<_>>();
-                    output.dynamic_reshape(unfolded_extents.as_slice())
+                    place_batch_axis(output.dynamic_reshape(unfolded_extents.as_slice())?)
                 }
                 None => Ok(output),
             },
@@ -2772,7 +3218,8 @@ fn batch_attention<
                     .map(|axis| axis + 1)
                     .collect::<Vec<_>>();
                 let reduced = normalized.reduce(reduction_axes.as_slice(), ReductionKind::Sum)?;
-                reduced.dynamic_reshape(extents(bias, 0)?.as_slice())
+                let cotangent = reduced.dynamic_reshape(extents(bias, 0)?.as_slice())?;
+                restore_cotangent_type(cotangent, &bias_type.cotangent()?)
             }
         })
         .collect::<Result<Vec<_>, ProgramError>>()?;
@@ -2785,13 +3232,13 @@ mod tests {
     use std::collections::HashMap;
 
     use approx::assert_abs_diff_eq;
-    use half::bf16;
+    use half::{bf16, f16};
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Sharding,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionVariable, Layout,
+        LogicalMesh, Memory, MeshAxis, MeshAxisType, StridedLayout,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchingError, batch};
@@ -2817,6 +3264,23 @@ mod tests {
     /// Returns an `f32` array with the provided dimensions and elements.
     fn f32_array(dimensions: &[usize], elements: &[f32]) -> Array {
         Array::from_elements(ArrayType::new_static(DataType::F32, dimensions.to_vec()), elements).unwrap()
+    }
+
+    /// Returns an `f16` array with the provided dimensions and elements.
+    fn f16_array(dimensions: &[usize], elements: &[f32]) -> Array {
+        let elements = elements.iter().copied().map(f16::from_f32).collect::<Vec<_>>();
+        Array::from_elements(ArrayType::new_static(DataType::F16, dimensions.to_vec()), elements.as_slice()).unwrap()
+    }
+
+    /// Returns a `bf16` array with the provided dimensions and elements.
+    fn bf16_array(dimensions: &[usize], elements: &[f32]) -> Array {
+        let elements = elements.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
+        Array::from_elements(ArrayType::new_static(DataType::BF16, dimensions.to_vec()), elements.as_slice()).unwrap()
+    }
+
+    /// Returns an `f64` array with the provided dimensions and elements.
+    fn f64_array(dimensions: &[usize], elements: &[f64]) -> Array {
+        Array::from_elements(ArrayType::new_static(DataType::F64, dimensions.to_vec()), elements).unwrap()
     }
 
     /// Returns the rendering of the sharding of an array with the provided rank that is replicated over a mesh with one
@@ -3068,6 +3532,19 @@ mod tests {
         assert_eq!(configuration.with_causal(false).with_symmetric_local_window(3).local_window(), Some((3, 3)));
         assert_eq!(configuration.with_symmetric_local_window(None).local_window(), None);
         assert_eq!(configuration.with_dropout(None).dropout(), None);
+    }
+
+    #[test]
+    fn test_attention_configuration_scale_for() {
+        // An explicit scale applies to every head dimension, and the inferred scale is `1 / sqrt(head_dimension)`.
+        assert_eq!(AttentionConfiguration::new().with_scale(0.25).scale_for(16), 0.25);
+        assert_eq!(AttentionConfiguration::new().with_scale(0.25).scale_for(0), 0.25);
+        assert_eq!(AttentionConfiguration::new().scale_for(16), 0.25);
+        assert_eq!(AttentionConfiguration::new().scale_for(1), 1.0);
+
+        // The scores of an empty head dimension are zero for every scale, so its inferred scale is one instead of
+        // the infinite `1 / sqrt(0)`.
+        assert_eq!(AttentionConfiguration::new().scale_for(0), 1.0);
     }
 
     #[test]
@@ -3604,6 +4081,22 @@ mod tests {
             Ok(vec![query.clone()]),
         );
 
+        // The residual has the `f32` data type of the softmax for every query data type.
+        for data_type in [DataType::F16, DataType::BF16, DataType::F64] {
+            let query = ArrayType::new_static(data_type, [2, 2, 2]);
+            let key_value = ArrayType::new_static(data_type, [3, 1, 2]);
+            assert_eq!(
+                attention_forward_output_types(
+                    DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                    AttentionConfiguration::new(),
+                    AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                    true,
+                    &[query.clone(), key_value.clone(), key_value],
+                ),
+                Ok(vec![query, ArrayType::new_static(DataType::F32, [2, 2])]),
+            );
+        }
+
         // The number of input types must match the input structure.
         assert!(matches!(
             attention_forward_output_types(
@@ -3735,7 +4228,18 @@ mod tests {
                     ArrayType::new_static(DataType::Zero, [3]),
                     mask.clone(),
                 ],
-                "bias must have a numeric or Boolean data type but got `zero`",
+                "bias must have a real numeric or Boolean data type but got `zero`",
+            ),
+            (
+                scored,
+                vec![
+                    query.clone(),
+                    key_value.clone(),
+                    key_value.clone(),
+                    ArrayType::new_static(DataType::C64, [3]),
+                    mask.clone(),
+                ],
+                "bias must have a real numeric or Boolean data type but got `c64`",
             ),
             (
                 scored,
@@ -3968,6 +4472,286 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_product_attention_type_inference_memory() {
+        // The attended output and the residual reside in the memory space of the query.
+        let r#type = ArrayType::new_static(DataType::F32, [2, 1, 2]).with_memory(Memory::Host { pinned: true });
+        let residual_type = ArrayType::new_static(DataType::F32, [2, 1]).with_memory(Memory::Host { pinned: true });
+        assert_eq!(
+            attention_forward_output_types(
+                DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                AttentionConfiguration::new(),
+                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                true,
+                &[r#type.clone(), r#type.clone(), r#type.clone()],
+            ),
+            Ok(vec![r#type.clone(), residual_type.clone()]),
+        );
+
+        // The bodies of the definitions agree with those boundaries, so staging attention over host memory succeeds
+        // for the forward definition and for the backward definition that reverse mode stages.
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let (output_types, _) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type.clone()),
+        )
+        .unwrap();
+        assert_eq!(output_types, (r#type.clone(), residual_type));
+        let function = differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let (gradient_types, _) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| {
+                differentiate_at(inputs)
+                    .gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2], ReductionKind::Sum))
+                    .map_err(ProgramError::from)
+            },
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type.clone()),
+        )
+        .unwrap();
+        assert_eq!(gradient_types, AttentionInputs::new(r#type.clone(), r#type.clone(), r#type));
+    }
+
+    #[test]
+    fn test_dot_product_attention_type_inference_sharding() {
+        // The outputs have the shardings that the contractions of the body infer. The output takes its batch
+        // placement from all three inputs and its head dimension placement from the value, and the residual takes
+        // the placements of the scores. Each staged call agrees with its boundary.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded = |dimensions: [usize; 4], axis: Option<usize>| {
+            let mut placements = vec![ShardingDimension::Replicated; 4];
+            if let Some(axis) = axis {
+                placements[axis] = ShardingDimension::sharded(["x"]);
+            }
+            ArrayType::new_static(DataType::F32, dimensions)
+                .with_sharding(Sharding::new(mesh.clone(), placements).unwrap())
+                .unwrap()
+        };
+        let residual = |axis: Option<usize>| {
+            let mut placements = vec![ShardingDimension::Replicated; 3];
+            if let Some(axis) = axis {
+                placements[axis] = ShardingDimension::sharded(["x"]);
+            }
+            ArrayType::new_static(DataType::F32, [2, 2, 1])
+                .with_sharding(Sharding::new(mesh.clone(), placements).unwrap())
+                .unwrap()
+        };
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        for (query_axis, key_axis, value_axis, output_axis, residual_axis) in [
+            // A head dimension placement of the value reaches the output, and one of the query does not.
+            (None, None, Some(3), Some(3), None),
+            (Some(3), None, None, None, None),
+            // A batch placement of any input reaches the output and the residual.
+            (None, Some(0), None, Some(0), Some(0)),
+            (None, None, Some(0), Some(0), None),
+            (Some(0), Some(0), Some(0), Some(0), Some(0)),
+            // A sequence placement of the query reaches both, and one of the key or of the value reaches neither,
+            // because the contractions over the key/value sequence drop a placement that only one side has.
+            (Some(1), None, None, Some(1), Some(1)),
+            (None, Some(1), None, None, None),
+            (None, None, Some(1), None, None),
+        ] {
+            let query = sharded([2, 2, 1, 2], query_axis);
+            let key = sharded([2, 2, 1, 2], key_axis);
+            let value = sharded([2, 2, 1, 2], value_axis);
+            let expected = (sharded([2, 2, 1, 2], output_axis), residual(residual_axis));
+            assert_eq!(
+                attention_forward_output_types(
+                    DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                    AttentionConfiguration::new(),
+                    AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                    true,
+                    &[query.clone(), key.clone(), value.clone()],
+                ),
+                Ok(vec![expected.0.clone(), expected.1.clone()]),
+            );
+            let (output_types, _) = ArrayContext::trace(
+                |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
+                AttentionInputs::new(query, key, value),
+            )
+            .unwrap();
+            assert_eq!(output_types, expected);
+        }
+
+        // Rank-3 inputs and grouped key/value heads go through the reshapes that normalize and expand them, and the
+        // sequence placement of the query still reaches both outputs.
+        let mesh_sharding = |placements: Vec<ShardingDimension>| Sharding::new(mesh.clone(), placements).unwrap();
+        let x = ShardingDimension::sharded(["x"]);
+        let replicated = ShardingDimension::Replicated;
+        let query = ArrayType::new_static(DataType::F32, [2, 2, 2])
+            .with_sharding(mesh_sharding(vec![x.clone(), replicated.clone(), replicated.clone()]))
+            .unwrap();
+        let key_value = ArrayType::new_static(DataType::F32, [2, 1, 2])
+            .with_sharding(mesh_sharding(vec![replicated.clone(), replicated.clone(), replicated.clone()]))
+            .unwrap();
+        let (output_types, _) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
+            AttentionInputs::new(query.clone(), key_value.clone(), key_value),
+        )
+        .unwrap();
+        assert_eq!(
+            output_types,
+            (
+                query,
+                ArrayType::new_static(DataType::F32, [2, 2])
+                    .with_sharding(mesh_sharding(vec![x, replicated]))
+                    .unwrap(),
+            ),
+        );
+
+        // The bias, the mask, and the sequence lengths take part in the placement of the `BNTS` scores like the inputs
+        // of an elementwise operation. Their batch and query sequence placements reach the output and the residual,
+        // and their key/value sequence placement is contracted away with the value.
+        let placed = |data_type: DataType, dimensions: &[usize], axis: Option<usize>| {
+            let mut placements = vec![ShardingDimension::Replicated; dimensions.len()];
+            if let Some(axis) = axis {
+                placements[axis] = ShardingDimension::sharded(["x"]);
+            }
+            ArrayType::new_static(data_type, dimensions.to_vec())
+                .with_sharding(Sharding::new(mesh.clone(), placements).unwrap())
+                .unwrap()
+        };
+        let input_structure = AttentionInputs {
+            bias: Some(Placeholder),
+            mask: Some(Placeholder),
+            query_sequence_lengths: Some(Placeholder),
+            ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+        };
+        for (bias_axis, mask_axis, lengths_axis, output_axis, residual_axis) in [
+            (Some(0), None, None, Some(0), Some(0)),
+            (Some(2), None, None, Some(1), Some(1)),
+            (Some(3), None, None, None, None),
+            (None, Some(0), None, Some(0), Some(0)),
+            (None, Some(2), None, Some(1), Some(1)),
+            (None, Some(3), None, None, None),
+            (None, None, Some(0), Some(0), Some(0)),
+            (Some(0), Some(0), Some(0), Some(0), Some(0)),
+        ] {
+            let types = AttentionInputs {
+                bias: Some(placed(DataType::F32, &[2, 1, 2, 2], bias_axis)),
+                mask: Some(placed(DataType::Boolean, &[2, 1, 2, 2], mask_axis)),
+                query_sequence_lengths: Some(placed(DataType::I32, &[2], lengths_axis)),
+                ..AttentionInputs::new(
+                    sharded([2, 2, 1, 2], None),
+                    sharded([2, 2, 1, 2], None),
+                    sharded([2, 2, 1, 2], None),
+                )
+            };
+            let expected = (sharded([2, 2, 1, 2], output_axis), residual(residual_axis));
+            assert_eq!(
+                attention_forward_output_types(
+                    DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                    AttentionConfiguration::new(),
+                    input_structure.clone(),
+                    true,
+                    types.parameters().cloned().collect::<Vec<_>>().as_slice(),
+                ),
+                Ok(vec![expected.0.clone(), expected.1.clone()]),
+            );
+            let (output_types, _) =
+                ArrayContext::trace(|inputs: AttentionInputs<_>| function.call_with_residual(inputs), types).unwrap();
+            assert_eq!(output_types, expected);
+        }
+
+        // A placement that cannot be combined with that of the scores is rejected (e.g., a bias that is sharded along
+        // the query sequence over the mesh axis that already shards the batch dimension of the scores).
+        let bias = placed(DataType::F32, &[2, 1, 2, 2], Some(2));
+        assert_eq!(
+            attention_forward_output_types(
+                DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                AttentionConfiguration::new(),
+                AttentionInputs {
+                    bias: Some(Placeholder),
+                    ..AttentionInputs::new(Placeholder, Placeholder, Placeholder)
+                },
+                false,
+                &[
+                    sharded([2, 2, 1, 2], Some(0)),
+                    sharded([2, 2, 1, 2], None),
+                    sharded([2, 2, 1, 2], None),
+                    bias.clone()
+                ],
+            ),
+            Err(TypeError::invalid(format!(
+                "`{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` input type `{bias}` has a sharding that cannot be combined \
+                 with that of the attention scores `{}`",
+                sharded([2, 1, 2, 2], Some(0)),
+            ))),
+        );
+
+        // Contracted dimensions that are sharded on both sides make the placement of the result ambiguous (e.g., the
+        // head dimensions of the query and of the key, or the sequence dimensions of the key and of the value), which
+        // the boundary reports in the name of the definition.
+        for (query_axis, key_axis, value_axis) in [(Some(3), Some(3), Some(3)), (None, Some(1), Some(1))] {
+            assert_eq!(
+                attention_forward_output_types(
+                    DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                    AttentionConfiguration::new(),
+                    AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                    false,
+                    &[
+                        sharded([2, 2, 1, 2], query_axis),
+                        sharded([2, 2, 1, 2], key_axis),
+                        sharded([2, 2, 1, 2], value_axis),
+                    ],
+                ),
+                Err(TypeError::invalid(format!(
+                    "`{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` contracting dimensions are sharded, making the output \
+                     sharding ambiguous; request an explicit output sharding (e.g., one with unreduced axes) to \
+                     resolve it",
+                ))),
+            );
+        }
+    }
+
+    #[test]
+    fn test_dot_product_attention_type_inference_layout() {
+        // The forward body returns arrays without an explicit layout, so the outputs of the forward definition do not
+        // promise the layouts of their inputs, and staging it over inputs with an explicit layout succeeds.
+        let plain = ArrayType::new_static(DataType::F32, [2, 1, 2]);
+        let r#type = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8, 8, 4])));
+        assert_eq!(
+            attention_forward_output_types(
+                DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+                AttentionConfiguration::new(),
+                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                true,
+                &[r#type.clone(), r#type.clone(), r#type.clone()],
+            ),
+            Ok(vec![plain.clone(), ArrayType::new_static(DataType::F32, [2, 1])]),
+        );
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let (output_types, _) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
+            AttentionInputs::new(r#type.clone(), r#type.clone(), r#type.clone()),
+        )
+        .unwrap();
+        assert_eq!(output_types, (plain.clone(), ArrayType::new_static(DataType::F32, [2, 1])));
+
+        // Reverse mode accumulates each cotangent into the cotangent of its input, so the cotangents of the backward
+        // definition have the layouts of their inputs, which the backward body restores.
+        let residual = ArrayType::new_static(DataType::F32, [2, 1]);
+        assert_eq!(
+            attention_backward_output_types(
+                DOT_PRODUCT_ATTENTION_BACKWARD_COMPOSITE_NAME,
+                AttentionConfiguration::new(),
+                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                &[r#type.clone(), r#type.clone(), r#type.clone(), plain.clone(), residual, plain],
+            ),
+            Ok(vec![r#type.clone(), r#type.clone(), r#type.clone()]),
+        );
+        let function = differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let types = AttentionInputs::new(r#type.clone(), r#type.clone(), r#type);
+        let (gradient_types, _) = ArrayContext::trace(
+            |inputs: AttentionInputs<_>| {
+                differentiate_at(inputs)
+                    .gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2], ReductionKind::Sum))
+                    .map_err(ProgramError::from)
+            },
+            types.clone(),
+        )
+        .unwrap();
+        assert_eq!(gradient_types, types);
+    }
+
+    #[test]
     fn test_dot_product_attention_backward_type_inference() {
         let query = ArrayType::new_static(DataType::F32, [2, 2, 2]);
         let key_value = ArrayType::new_static(DataType::F32, [3, 1, 2]);
@@ -4061,6 +4845,18 @@ mod tests {
                     ArrayType::new_static(DataType::F32, [2, 2, 1]),
                 ],
                 "output cotangent type f32[2, 2, 1] does not match the expected cotangent type f32[2, 2, 2]",
+            ),
+            // The residual keeps the `f32` data type of the softmax, so one in a narrower query data type is rejected.
+            (
+                vec![
+                    ArrayType::new_static(DataType::BF16, [2, 2, 2]),
+                    ArrayType::new_static(DataType::BF16, [3, 1, 2]),
+                    ArrayType::new_static(DataType::BF16, [3, 1, 2]),
+                    ArrayType::new_static(DataType::BF16, [2, 2, 2]),
+                    ArrayType::new_static(DataType::BF16, [2, 2]),
+                    ArrayType::new_static(DataType::BF16, [2, 2, 2]),
+                ],
+                "residual type bf16[2, 2] does not match the expected residual type f32[2, 2]",
             ),
         ] {
             assert_eq!(
@@ -4197,6 +4993,120 @@ mod tests {
             )),
             Ok((ArrayIrValue::Array(output), ArrayIrValue::Array(residual))),
         );
+    }
+
+    #[test]
+    fn test_dot_product_attention_interpretation_low_precision() {
+        // Data types that are narrower than `f32` contract their scores in `f32`. The first score is `65536`, which
+        // `f16` cannot represent, so a contraction that returned `f16` scores would make it infinite and the softmax
+        // would return NaN, while the promoted scores select the first value.
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_scale(1.0));
+        let inputs = AttentionInputs::new(
+            f16_array(&[1, 1, 1, 1], &[256.0]),
+            f16_array(&[1, 2, 1, 1], &[256.0, 255.0]),
+            f16_array(&[1, 2, 1, 1], &[1.0, 2.0]),
+        );
+        assert_eq!(function.call(inputs), Ok(f16_array(&[1, 1, 1, 1], &[1.0])));
+
+        // The residual keeps the `f32` data type of the softmax. Both `bf16` scores are `1000`, so the residual is
+        // `1000 + log(2)`, which `bf16` would round to `1000` and thereby lose the normalization of the two keys.
+        let inputs = AttentionInputs::new(
+            bf16_array(&[1, 1, 1, 1], &[1.0]),
+            bf16_array(&[1, 2, 1, 1], &[1000.0, 1000.0]),
+            bf16_array(&[1, 2, 1, 1], &[1.0, 0.0]),
+        );
+        assert_eq!(
+            function.call_with_residual(inputs),
+            Ok((bf16_array(&[1, 1, 1, 1], &[0.5]), f32_array(&[1, 1, 1], &[1000.0 + std::f32::consts::LN_2]))),
+        );
+
+        // The residual of the `f16` call above is `65536`, which is finite in `f32` and would overflow `f16`.
+        let inputs = AttentionInputs::new(
+            f16_array(&[1, 1, 1, 1], &[256.0]),
+            f16_array(&[1, 2, 1, 1], &[256.0, 255.0]),
+            f16_array(&[1, 2, 1, 1], &[1.0, 2.0]),
+        );
+        assert_eq!(
+            function.call_with_residual(inputs),
+            Ok((f16_array(&[1, 1, 1, 1], &[1.0]), f32_array(&[1, 1, 1], &[65536.0]))),
+        );
+    }
+
+    #[test]
+    fn test_dot_product_attention_interpretation_invisible_rows() {
+        // The mask hides every key/value position from the second query row, which therefore attends uniformly to
+        // all four positions, including the ones with the largest scores, and whose residual is the finite logit of
+        // the invisible scores. The first query row attends to its two visible positions with equal scores.
+        let mask = Array::from_elements(
+            ArrayType::new_static(DataType::Boolean, [2, 4]),
+            &[true, true, false, false, false, false, false, false],
+        )
+        .unwrap();
+        let invisible = (-0.7 * f64::from(f32::MAX)) as f32;
+        let configuration = AttentionConfiguration::new().with_scale(1.0);
+        let (output, residual) = attend(
+            AttentionInputs {
+                mask: Some(mask.clone()),
+                ..AttentionInputs::new(
+                    f32_array(&[2, 1, 1], &[1.0, 1.0]),
+                    f32_array(&[4, 1, 1], &[0.0, 0.0, 5.0, 5.0]),
+                    f32_array(&[4, 1, 1], &[1.0, 3.0, 8.0, 4.0]),
+                )
+            },
+            configuration,
+        );
+        assert_eq!(output, f32_array(&[2, 1, 1], &[2.0, 4.0]));
+        assert_eq!(residual, f32_array(&[2, 1], &[std::f32::consts::LN_2, invisible]));
+
+        // The logits of `f64` inputs are converted to the `f32` softmax data type, in which the logit of the
+        // invisible scores remains finite, so such rows behave in the same way.
+        let (output, residual) = attend(
+            AttentionInputs {
+                mask: Some(mask),
+                ..AttentionInputs::new(
+                    f64_array(&[2, 1, 1], &[1.0, 1.0]),
+                    f64_array(&[4, 1, 1], &[0.0, 0.0, 5.0, 5.0]),
+                    f64_array(&[4, 1, 1], &[1.0, 3.0, 8.0, 4.0]),
+                )
+            },
+            configuration,
+        );
+        assert_eq!(output, f64_array(&[2, 1, 1], &[2.0, 4.0]));
+        assert_eq!(residual, f32_array(&[2, 1], &[std::f32::consts::LN_2, invisible]));
+    }
+
+    #[test]
+    fn test_dot_product_attention_interpretation_local_window() {
+        // A radius beyond the `i32` range of the position coordinates admits every offset on its side. The scores
+        // of all positions are equal, so every row averages the values that its window admits.
+        let inputs = AttentionInputs::new(
+            f32_array(&[2, 1, 1], &[1.0, 1.0]),
+            f32_array(&[2, 1, 1], &[1.0, 1.0]),
+            f32_array(&[2, 1, 1], &[1.0, 3.0]),
+        );
+        let (output, _) = attend(inputs.clone(), AttentionConfiguration::new().with_local_window((0, usize::MAX)));
+        assert_eq!(output, f32_array(&[2, 1, 1], &[2.0, 3.0]));
+        let (output, _) = attend(inputs.clone(), AttentionConfiguration::new().with_local_window((usize::MAX, 0)));
+        assert_eq!(output, f32_array(&[2, 1, 1], &[1.0, 2.0]));
+        let (output, _) = attend(inputs, AttentionConfiguration::new().with_symmetric_local_window(usize::MAX));
+        assert_eq!(output, f32_array(&[2, 1, 1], &[2.0, 2.0]));
+    }
+
+    #[test]
+    fn test_dot_product_attention_interpretation_empty_head_dimension() {
+        // The scores of an empty head dimension are empty contractions, which are zero, so every query row attends
+        // uniformly to the three key/value positions and its residual is `log(3)`. The default scale is one for such
+        // inputs, because the infinite `1 / sqrt(0)` would turn the zero scores into NaNs.
+        let (output, residual) = attend(
+            AttentionInputs::new(
+                f32_array(&[1, 2, 1, 0], &[]),
+                f32_array(&[1, 3, 1, 0], &[]),
+                f32_array(&[1, 3, 1, 0], &[]),
+            ),
+            AttentionConfiguration::new(),
+        );
+        assert_eq!(output, f32_array(&[1, 2, 1, 0], &[]));
+        assert_eq!(residual, f32_array(&[1, 2, 1], &[3f32.ln(), 3f32.ln()]));
     }
 
     #[test]
@@ -4790,24 +5700,21 @@ mod tests {
                                 %6:dimension<1> = constant [value=1]
                                 %7:dimension<1> = constant [value=1]
                                 %8:dimension<1> = constant [value=1]
-                                %9:dimension<1> = constant [value=1]
-                                %10:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %1 %4 %7 %8 %9
+                                %9:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %1 %4 %6 %7 %8
+                                %10:dimension<1> = constant [value=1]
                                 %11:dimension<1> = constant [value=1]
                                 %12:dimension<1> = constant [value=1]
-                                %13:dimension<1> = constant [value=1]
+                                %13:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %2 %4 %10 %11 %12
                                 %14:dimension<1> = constant [value=1]
-                                %15:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %2 %4 %12 %13 %14
+                                %15:dimension<1> = constant [value=1]
                                 %16:dimension<1> = constant [value=1]
-                                %17:dimension<1> = constant [value=1]
-                                %18:dimension<1> = constant [value=1]
-                                %19:dimension<1> = constant [value=1]
-                                %20:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %3 %4 %17 %18 %19
-                                %21:f32[batch, 1, 1, 1] = composite [
+                                %17:f32[batch, 1, 1, 1] = reshape [requires_runtime_assertion=false] %3 %4 %14 %15 %16
+                                %18:f32[batch, 1, 1, 1] = composite [
                                     key=\"ryft.dot_product_attention.v1 {scale = none, causal = false, \
                                         local_window = none, implementation = 0, dropout_rate = none, \
                                         residual = false, bias = false, mask = false, query_sequence_lengths = false, \
                                         key_value_sequence_lengths = false, dropout_state = false}\",
-                                ] %10 %15 %20 [
+                                ] %9 %13 %17 [
                                     primal={
                                         lambda %0:f32[batch, 1, 1, 1], %1:f32[batch, 1, 1, 1], %2:f32[batch, 1, 1, 1] .
                                         let %3:f32[batch, 1, 1, 1] = dot [
@@ -4833,18 +5740,70 @@ mod tests {
                                         in (%14)
                                     },
                                 ]
+                                %19:dimension<1> = constant [value=1]
+                                %20:dimension<1> = constant [value=1]
+                                %21:dimension<1> = constant [value=1]
                                 %22:dimension<1> = constant [value=1]
-                                %23:dimension<1> = constant [value=1]
-                                %24:dimension<1> = constant [value=1]
-                                %25:dimension<1> = constant [value=1]
-                                %26:f32[batch, 1, 1, 1, 1] = \
-                                    reshape [requires_runtime_assertion=false] %21 %4 %22 %23 %24 %25
-                            in (%26)
+                                %23:f32[batch, 1, 1, 1, 1] = \
+                                    reshape [requires_runtime_assertion=false] %18 %4 %19 %20 %21 %22
+                            in (%23)
                         },
                     ]
                 in (%8)
             "}
             .trim_end(),
+        );
+
+        // A dynamic mapped extent and a dynamic batch extent fold into their product, which is one dimension that
+        // every folded input shares, so the folded call validates and the staged program computes the unbatched
+        // attention of every batch item.
+        let mapped_variable = DimensionVariable::new("mapped", DimensionBounds::new(1, Some(4)).unwrap());
+        let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4)).unwrap());
+        let r#type = |length: usize| -> ArrayIrType {
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![
+                    Dimension::Dynamic(mapped_variable.clone()),
+                    Dimension::Dynamic(batch_variable.clone()),
+                    Dimension::Static(length),
+                    Dimension::Static(1),
+                    Dimension::Static(1),
+                ]),
+            )
+            .into()
+        };
+        let axes = AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0));
+        let (_, program) = ArrayIrContext::trace(
+            |inputs: AttentionInputs<_>| {
+                batch(|inputs: AttentionInputs<_>| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                    .map_err(ProgramError::from)
+            },
+            AttentionInputs::new(r#type(1), r#type(2), r#type(2)),
+        )
+        .unwrap();
+        let query = [1.0, -1.0, 0.5, 2.0, -0.5, 1.5];
+        let key = [0.25, -0.5, 1.5, 1.0, -1.0, 0.75, 2.0, 0.5, -0.25, 1.25, 0.0, -1.5];
+        let value = [3.0, 5.0, 7.0, 11.0, 13.0, 17.0, 19.0, 23.0, 29.0, 31.0, 37.0, 41.0];
+        let expected = (0..3)
+            .flat_map(|item| {
+                let (output, _) = attend(
+                    AttentionInputs::new(
+                        f32_array(&[2, 1, 1, 1], &query[2 * item..2 * item + 2]),
+                        f32_array(&[2, 2, 1, 1], &key[4 * item..4 * item + 4]),
+                        f32_array(&[2, 2, 1, 1], &value[4 * item..4 * item + 4]),
+                    ),
+                    AttentionConfiguration::new(),
+                );
+                output.elements::<f32>().unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            program.interpret(AttentionInputs::new(
+                ArrayIrValue::Array(f32_array(&[3, 2, 1, 1, 1], &query)),
+                ArrayIrValue::Array(f32_array(&[3, 2, 2, 1, 1], &key)),
+                ArrayIrValue::Array(f32_array(&[3, 2, 2, 1, 1], &value)),
+            )),
+            Ok(ArrayIrValue::Array(f32_array(&[3, 2, 1, 1, 1], expected.as_slice()))),
         );
     }
 
@@ -5131,39 +6090,43 @@ mod tests {
                                 ] %5 %2
                                 %26:f32[] = constant [value=0.0]
                                 %27:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %26
-                                %28:f32[1, 1, 1, 1] = select %24 %25 %27
-                                %29:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %28
-                                %30:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %29
-                                %31:f32[1, 1, 1, 1] = sub %25 %30
-                                %32:f32[1, 1, 1, 1] = mul %16 %31
-                                %33:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %32
-                                %34:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %33
-                                %35:f32[1, 1, 1, 1] = sub %31 %34
-                                %36:f32[1, 1, 1, 1] = mul %16 %35
-                                %37:f32[1, 1, 1, 1] = select %24 %27 %36
-                                %38:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %37
-                                %39:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %38
-                                %40:f32[1, 1, 1, 1] = sub %27 %39
-                                %41:f32[1, 1, 1, 1] = select %24 %40 %37
-                                %42:f32[] = constant [value=0.5]
-                                %43:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %42
-                                %44:f32[1, 1, 1, 1] = mul %41 %43
-                                %45:f32[1, 1, 1, 1] = dot [
+                                %28:f32[] = constant [value=0.5]
+                                %29:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %28
+                                %30:f32[1, 1, 1, 1] = mul %25 %29
+                                %31:f32[1, 1, 1, 1] = select %24 %30 %27
+                                %32:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %31
+                                %33:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %32
+                                %34:f32[1, 1, 1, 1] = sub %30 %33
+                                %35:f32[1, 1, 1, 1] = mul %16 %34
+                                %36:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %35
+                                %37:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %36
+                                %38:f32[1, 1, 1, 1] = add %16 %16
+                                %39:f32[1, 1, 1, 1] = sub %34 %37
+                                %40:f32[1, 1, 1, 1] = mul %38 %39
+                                %41:f32[1, 1, 1, 1] = select %24 %27 %40
+                                %42:f32[1, 1, 1] = reduce [kind=sum, axes=[3]] %41
+                                %43:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[0, 1, 2]] %42
+                                %44:f32[1, 1, 1, 1] = sub %27 %43
+                                %45:f32[1, 1, 1, 1] = select %24 %44 %41
+                                %46:f32[] = constant [value=0.5]
+                                %47:f32[1, 1, 1, 1] = broadcast [output_type=f32[1, 1, 1, 1], output_axes=[]] %46
+                                %48:f32[1, 1, 1, 1] = mul %45 %47
+                                %49:f32[1, 1, 1, 1] = dot [
                                     dimensions=(lhs_contracting=[3], rhs_contracting=[1], lhs_batching=[0, 1], \
                                         rhs_batching=[0, 2]),
-                                ] %44 %1
-                                %46:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %45
-                                %47:f32[1, 1, 1, 1] = dot [
+                                ] %48 %1
+                                %50:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %49
+                                %51:f32[1, 1, 1, 1] = dot [
                                     dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0, 1], \
                                         rhs_batching=[0, 2]),
-                                ] %44 %0
-                                %48:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %47
-                                %49:f32[1, 1, 1, 1] = dot [
+                                ] %48 %0
+                                %52:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %51
+                                %53:f32[1, 1, 1, 1] = dot [
                                     dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0, 1], \
                                         rhs_batching=[0, 2]),
                                 ] %16 %5
-                                %50:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %49
-                            in (%46, %48, %50)
+                                %54:f32[1, 1, 1, 1] = transpose [permutation=[0, 2, 1, 3]] %53
+                            in (%50, %52, %54)
                         },
                     ]
                 in (%8, %9, %10)
@@ -5562,6 +6525,70 @@ mod tests {
     }
 
     #[test]
+    fn test_differentiable_dot_product_attention_batching_sharding() {
+        // A mesh axis that shards the logical batch axis cannot shard the batch axis that the mapped axis is folded
+        // into, so the batching rule replicates the inputs along it for the folded call and returns the outputs and
+        // the cotangents to its placement. The placement only changes where the elements live, so the batched outputs
+        // and gradients have the elements of the ones over inputs without a sharding.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(
+            mesh,
+            vec![
+                ShardingDimension::Replicated,
+                ShardingDimension::sharded(["x"]),
+                ShardingDimension::Replicated,
+                ShardingDimension::Replicated,
+                ShardingDimension::Replicated,
+            ],
+        )
+        .unwrap();
+        let plain_type = ArrayType::new_static(DataType::F32, [2, 2, 2, 1, 2]);
+        let placed_type = plain_type.clone().with_sharding(sharding).unwrap();
+        let inputs = |r#type: &ArrayType| {
+            let array = |start: f32| {
+                let elements = (0..16).map(|index| start + 0.25 * index as f32).collect::<Vec<_>>();
+                Array::from_elements(r#type.clone(), elements.as_slice()).unwrap()
+            };
+            AttentionInputs::new(array(-1.0), array(0.5), array(-2.0))
+        };
+        let axes = AttentionInputs::new(BatchAxis::new(0), BatchAxis::new(0), BatchAxis::new(0));
+
+        let function = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let outputs = |r#type: &ArrayType| -> (Array, Array) {
+            batch(
+                |inputs: AttentionInputs<_>| function.call_with_residual(inputs),
+                inputs(r#type),
+                axes.clone(),
+                (BatchAxis::new(0), BatchAxis::new(0)),
+                None,
+            )
+            .unwrap()
+        };
+        let (output, residual) = outputs(&placed_type);
+        let (plain_output, plain_residual) = outputs(&plain_type);
+        assert_eq!(output.r#type().as_ref(), &placed_type);
+        assert_eq!(output.elements::<f32>().unwrap(), plain_output.elements::<f32>().unwrap());
+        assert_eq!(residual.r#type().sharding().unwrap().dimensions()[1], ShardingDimension::sharded(["x"]));
+        assert_eq!(residual.elements::<f32>().unwrap(), plain_residual.elements::<f32>().unwrap());
+
+        let function = differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let gradients = |r#type: &ArrayType| -> AttentionInputs<Array> {
+            differentiate_at(inputs(r#type))
+                .gradient(|inputs| {
+                    let outputs = batch(|inputs| function.call(inputs), inputs, axes.clone(), BatchAxis::new(0), None)
+                        .map_err(ProgramError::from)?;
+                    outputs.mul(&outputs)?.reduce(&[0, 1, 2, 3, 4], ReductionKind::Sum)
+                })
+                .unwrap()
+        };
+        let (gradients, plain_gradients) = (gradients(&placed_type), gradients(&plain_type));
+        for (gradient, plain_gradient) in gradients.parameters().zip(plain_gradients.parameters()) {
+            assert_eq!(gradient.r#type().as_ref(), &placed_type);
+            assert_eq!(gradient.elements::<f32>().unwrap(), plain_gradient.elements::<f32>().unwrap());
+        }
+    }
+
+    #[test]
     fn test_differentiable_dot_product_attention_batching_dropout() {
         // Definitions with dropout batch structurally, so every batch item applies the mask of its unbatched call in
         // the forward and in the backward definition, and the batched gradients equal the gradients of every item.
@@ -5718,15 +6745,11 @@ mod tests {
     }
 
     #[test]
-    fn test_differentiable_dot_product_attention_narrow_residual() {
-        // The `bf16` log-sum-exp residual rounds `1000 + log(2)` to `1000`. Reconstructing the probabilities from
-        // that residual would double the gradient, while recomputing the normalization retains the correct quarter
-        // gradients.
-        let bf16_array = |dimensions: &[usize], elements: &[f32]| {
-            let elements = elements.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
-            Array::from_elements(ArrayType::new_static(DataType::BF16, dimensions.to_vec()), elements.as_slice())
-                .unwrap()
-        };
+    fn test_differentiable_dot_product_attention_large_logits() {
+        // Both `bf16` scores are `1000`, so the log-sum-exp residual is `1000 + log(2)`, which `bf16` would round to
+        // `1000`. Probabilities that were reconstructed from such a rounded residual would double the gradient. The
+        // residual keeps the `f32` data type of the softmax, and the backward body recomputes the normalization, so
+        // the gradients are the correct quarters.
         let inputs = AttentionInputs::new(
             bf16_array(&[1, 1, 1, 1], &[1.0]),
             bf16_array(&[1, 2, 1, 1], &[1000.0, 1000.0]),
@@ -5736,6 +6759,327 @@ mod tests {
         assert_eq!(output.to_f64s(), vec![0.5]);
         assert_eq!(gradients.query.to_f64s(), vec![0.0]);
         assert_eq!(gradients.key.to_f64s(), vec![0.25, -0.25]);
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_low_precision() {
+        // The first `f16` score is `65536`, which only the promoted score contraction represents, so the first
+        // probability is one and the gradients are finite instead of NaN.
+        let inputs = AttentionInputs::new(
+            f16_array(&[1, 1, 1, 1], &[256.0]),
+            f16_array(&[1, 2, 1, 1], &[256.0, 255.0]),
+            f16_array(&[1, 2, 1, 1], &[1.0, 2.0]),
+        );
+        let (output, gradients) = attention_sum_gradient(inputs);
+        assert_eq!(output, f16_array(&[], &[1.0]));
+        assert_eq!(gradients.query, f16_array(&[1, 1, 1, 1], &[0.0]));
+        assert_eq!(gradients.key, f16_array(&[1, 2, 1, 1], &[0.0, 0.0]));
+        assert_eq!(gradients.value, f16_array(&[1, 2, 1, 1], &[1.0, 0.0]));
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_rounded_weights() {
+        // The probabilities of the two query rows differ in `f32` but round to the same `bf16` weights, with which
+        // the forward body contracts the values. The two output rows are therefore equal for every value, so the
+        // value gradient of their difference is an exact zero, which unrounded weights would not return.
+        let function =
+            differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_scale(1.0));
+        let inputs = AttentionInputs::new(
+            bf16_array(&[1, 2, 1, 1], &[1.0, 1.0078125]),
+            bf16_array(&[1, 2, 1, 1], &[0.0, 0.25]),
+            bf16_array(&[1, 2, 1, 1], &[1.0, 3.0]),
+        );
+        let (difference, gradients): (Array, AttentionInputs<Array>) = differentiate_at(inputs)
+            .value_and_gradient(|inputs| {
+                let output = function.call(inputs)?;
+                let difference = output.slice_axis(1, 0, 1, 1)?.sub(&output.slice_axis(1, 1, 2, 1)?)?;
+                difference.reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+            })
+            .unwrap();
+        assert_eq!(difference, bf16_array(&[], &[0.0]));
+        assert_eq!(gradients.value, bf16_array(&[1, 2, 1, 1], &[0.0, 0.0]));
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_sharding() {
+        // Reverse mode accumulates each cotangent into the cotangent of its input, so every gradient has the sharding
+        // of its input, however the query, key, value, bias, mask, and sequence lengths are placed. The contractions
+        // of the backward definition place their results according to the inputs that they contract, and two of their
+        // inputs can be sharded along a contracted dimension even though no forward contraction is (e.g., the output
+        // cotangent and a value that is sharded along its head dimension), so the cases cover each placement.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let placed = |data_type: DataType, dimensions: &[usize], axis: Option<usize>| {
+            let mut placements = vec![ShardingDimension::Replicated; dimensions.len()];
+            if let Some(axis) = axis {
+                placements[axis] = ShardingDimension::sharded(["x"]);
+            }
+            ArrayType::new_static(data_type, dimensions.to_vec())
+                .with_sharding(Sharding::new(mesh.clone(), placements).unwrap())
+                .unwrap()
+        };
+        let function = differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let gradient_types = |types: AttentionInputs<ArrayType>| {
+            ArrayContext::trace(
+                |inputs: AttentionInputs<_>| {
+                    differentiate_at(inputs)
+                        .gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum))
+                        .map_err(ProgramError::from)
+                },
+                types,
+            )
+            .map(|(gradient_types, _)| gradient_types)
+        };
+        for (query_axis, key_axis, value_axis) in [
+            (Some(0), None, None),
+            (None, Some(0), None),
+            (None, None, Some(0)),
+            (Some(0), Some(0), Some(0)),
+            (Some(1), None, None),
+            (None, Some(1), None),
+            (None, None, Some(1)),
+            (Some(3), None, None),
+            (None, Some(3), None),
+            (None, None, Some(3)),
+        ] {
+            let types = AttentionInputs::new(
+                placed(DataType::F32, &[2, 2, 1, 2], query_axis),
+                placed(DataType::F32, &[2, 2, 1, 2], key_axis),
+                placed(DataType::F32, &[2, 2, 1, 2], value_axis),
+            );
+            assert_eq!(gradient_types(types.clone()), Ok(types));
+        }
+        for (bias_axis, mask_axis, lengths_axis) in [
+            (Some(0), None, None),
+            (Some(2), None, None),
+            (Some(3), None, None),
+            (None, Some(0), None),
+            (None, Some(2), None),
+            (None, None, Some(0)),
+        ] {
+            let types = AttentionInputs {
+                bias: Some(placed(DataType::F32, &[2, 1, 2, 2], bias_axis)),
+                mask: Some(placed(DataType::Boolean, &[2, 1, 2, 2], mask_axis)),
+                query_sequence_lengths: Some(placed(DataType::I32, &[2], lengths_axis)),
+                ..AttentionInputs::new(
+                    placed(DataType::F32, &[2, 2, 1, 2], None),
+                    placed(DataType::F32, &[2, 2, 1, 2], None),
+                    placed(DataType::F32, &[2, 2, 1, 2], None),
+                )
+            };
+            let gradient_types = gradient_types(types.clone()).unwrap();
+            assert_eq!(
+                (gradient_types.query, gradient_types.key, gradient_types.value, gradient_types.bias),
+                (types.query, types.key, types.value, types.bias),
+            );
+        }
+
+        // The same holds for every placement of one mesh axis over the query, key, and value that the forward
+        // definition accepts, including the ones whose backward contractions have no placement of their own (e.g., a
+        // query that is sharded along its sequence and a value that is sharded along its own, which the weight
+        // cotangent cannot both keep on one mesh axis).
+        let forward = dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let axes = [None, Some(0), Some(1), Some(2), Some(3)];
+        let mut accepted = 0;
+        for (query_axis, key_axis, value_axis) in axes
+            .into_iter()
+            .flat_map(|query| axes.into_iter().flat_map(move |key| axes.map(|value| (query, key, value))))
+        {
+            let types = AttentionInputs::new(
+                placed(DataType::F32, &[2, 2, 2, 2], query_axis),
+                placed(DataType::F32, &[2, 2, 2, 2], key_axis),
+                placed(DataType::F32, &[2, 2, 2, 2], value_axis),
+            );
+            if ArrayContext::trace(|inputs: AttentionInputs<_>| forward.call(inputs), types.clone()).is_ok() {
+                accepted += 1;
+                assert_eq!(gradient_types(types.clone()), Ok(types), "{query_axis:?} {key_axis:?} {value_axis:?}");
+            }
+        }
+        assert_eq!(accepted, 57);
+
+        // Grouped query heads that a mesh axis shards return key and value cotangents that are summed over the groups
+        // of every key/value head, which neither axis of that split can keep sharded.
+        let wide_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let grouped = |dimensions: [usize; 4], head_axis: bool| {
+            let mut placements = vec![ShardingDimension::Replicated; 4];
+            if head_axis {
+                placements[2] = ShardingDimension::sharded(["x"]);
+            }
+            ArrayType::new_static(DataType::F32, dimensions)
+                .with_sharding(Sharding::new(wide_mesh.clone(), placements).unwrap())
+                .unwrap()
+        };
+        let types = AttentionInputs::new(
+            grouped([1, 1, 4, 1], true),
+            grouped([1, 1, 2, 1], false),
+            grouped([1, 1, 2, 1], false),
+        );
+        assert_eq!(gradient_types(types.clone()), Ok(types));
+
+        // An input without any sharding that attends together with placed inputs has a gradient without one.
+        let plain = ArrayType::new_static(DataType::F32, [2, 2, 1, 2]);
+        let replicated = placed(DataType::F32, &[2, 2, 1, 2], None);
+        for types in [
+            AttentionInputs::new(plain.clone(), placed(DataType::F32, &[2, 2, 1, 2], Some(0)), replicated.clone()),
+            AttentionInputs::new(placed(DataType::F32, &[2, 2, 1, 2], Some(0)), plain.clone(), replicated.clone()),
+            AttentionInputs::new(placed(DataType::F32, &[2, 2, 1, 2], Some(1)), replicated.clone(), plain.clone()),
+            AttentionInputs::new(plain.clone(), plain.clone(), placed(DataType::F32, &[2, 2, 1, 2], Some(3))),
+            AttentionInputs {
+                bias: Some(ArrayType::new_static(DataType::F32, [2, 2])),
+                ..AttentionInputs::new(
+                    placed(DataType::F32, &[2, 2, 1, 2], Some(0)),
+                    replicated.clone(),
+                    replicated.clone(),
+                )
+            },
+            AttentionInputs {
+                bias: Some(placed(DataType::F32, &[2, 1, 2, 2], Some(0))),
+                ..AttentionInputs::new(plain.clone(), plain.clone(), plain.clone())
+            },
+        ] {
+            assert_eq!(gradient_types(types.clone()), Ok(types));
+        }
+
+        // The placements only change where the elements live, so the gradients over placed inputs have the elements
+        // of the gradients over inputs without a sharding.
+        let elements =
+            |start: f32, count: usize| (0..count).map(|index| start + 0.25 * index as f32).collect::<Vec<_>>();
+        let gradients =
+            |query_axis: Option<usize>, value_axis: Option<usize>, bias_axis: Option<usize>, plain: bool| {
+                let array = |dimensions: &[usize], axis: Option<usize>, start: f32| {
+                    let r#type = if plain {
+                        ArrayType::new_static(DataType::F32, dimensions.to_vec())
+                    } else {
+                        placed(DataType::F32, dimensions, axis)
+                    };
+                    Array::from_elements(r#type, elements(start, dimensions.iter().product()).as_slice()).unwrap()
+                };
+                let inputs = AttentionInputs {
+                    bias: Some(array(&[2, 1, 2, 2], bias_axis, -0.5)),
+                    ..AttentionInputs::new(
+                        array(&[2, 2, 1, 2], query_axis, -1.0),
+                        array(&[2, 2, 1, 2], None, 0.5),
+                        array(&[2, 2, 1, 2], value_axis, -2.0),
+                    )
+                };
+                let gradients: AttentionInputs<Array> = differentiate_at(inputs)
+                    .gradient(|inputs| {
+                        let output = function.call(inputs)?;
+                        output.mul(&output)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+                    })
+                    .unwrap();
+                [gradients.query, gradients.key, gradients.value, gradients.bias.unwrap()]
+                    .map(|gradient| gradient.elements::<f32>().unwrap())
+            };
+        let expected = gradients(None, None, None, true);
+        for (query_axis, value_axis, bias_axis) in [
+            (None, None, None),
+            (Some(1), None, None),
+            (None, Some(3), None),
+            (None, None, Some(0)),
+            (Some(1), Some(1), None),
+            (Some(3), Some(0), None),
+        ] {
+            assert_eq!(gradients(query_axis, value_axis, bias_axis, false), expected);
+        }
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_invisible_rows() {
+        // The mask hides every key/value position from the second query row, whose output is the mean of the values
+        // whatever its scores are. The backward definition zeroes the cotangents of the invisible scores, so the
+        // query, key, and bias gradients agree with central finite differences of the forward definition. The `f64`
+        // inputs also cover the logit of the invisible scores, which is finite in the `f32` softmax data type.
+        let function = differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new());
+        let mask = Array::from_elements(
+            ArrayType::new_static(DataType::Boolean, [2, 3]),
+            &[true, true, false, false, false, false],
+        )
+        .unwrap();
+        check_gradient!(
+            |input, mask| {
+                // The input packs the `[1, 2, 1, 2]` query, the `[1, 3, 1, 2]` key, the `[1, 3, 1, 2]` value, and
+                // the `[2, 3]` bias.
+                let inputs = AttentionInputs {
+                    bias: Some(input.slice_axis(0, 16, 22, 1)?.reshape([2, 3])?),
+                    mask: Some(mask),
+                    ..AttentionInputs::new(
+                        input.slice_axis(0, 0, 4, 1)?.reshape([1, 2, 1, 2])?,
+                        input.slice_axis(0, 4, 10, 1)?.reshape([1, 3, 1, 2])?,
+                        input.slice_axis(0, 10, 16, 1)?.reshape([1, 3, 1, 2])?,
+                    )
+                };
+                function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum)
+            },
+            at = Array::vector(vec![
+                0.5f64, -1.0, 2.0, 0.25, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 5.0, -1.0, 4.0, 0.1, -0.2, 0.3,
+                0.4, 0.5, -0.6,
+            ])
+            .unwrap(),
+            with = mask,
+            step = 5e-3,
+            tolerance = 5e-3,
+        );
+    }
+
+    #[test]
+    fn test_differentiable_dot_product_attention_wide_range() {
+        // The backward body keeps `f64` inputs in `f64` outside the softmax. The query is beyond the `f32` range, so
+        // narrowing it would make the exactly zero key gradient the NaN product of zero and infinity.
+        let inputs = AttentionInputs::new(
+            f64_array(&[1, 1, 1, 1], &[1.0e40]),
+            f64_array(&[1, 1, 1, 1], &[0.0]),
+            f64_array(&[1, 1, 1, 1], &[1.0]),
+        );
+        let (output, gradients) = attention_sum_gradient(inputs);
+        assert_eq!(output, f64_array(&[], &[1.0]));
+        assert_eq!(gradients.query, f64_array(&[1, 1, 1, 1], &[0.0]));
+        assert_eq!(gradients.key, f64_array(&[1, 1, 1, 1], &[0.0]));
+        assert_eq!(gradients.value, f64_array(&[1, 1, 1, 1], &[1.0]));
+
+        // The weight cotangents of the two keys are the values, whose difference overflows `f32` although the logit
+        // cotangents are representable, so the backward body centers halved weight cotangents.
+        let inputs = AttentionInputs::new(
+            f32_array(&[1, 1, 1, 1], &[1.0]),
+            f32_array(&[1, 2, 1, 1], &[0.0, 0.0]),
+            f32_array(&[1, 2, 1, 1], &[3.0e38, -3.0e38]),
+        );
+        let (output, gradients) = attention_sum_gradient(inputs);
+        assert_eq!(output, f32_array(&[], &[0.0]));
+        assert_eq!(gradients.query, f32_array(&[1, 1, 1, 1], &[0.0]));
+        assert_eq!(gradients.key, f32_array(&[1, 2, 1, 1], &[1.5e38, -1.5e38]));
+        assert_eq!(gradients.value, f32_array(&[1, 2, 1, 1], &[0.5, 0.5]));
+
+        // The backward body multiplies by the score scale of the forward body rather than by its double, which a
+        // scale in the upper half of the `f32` range would overflow into the NaN product of zero and infinity.
+        let function =
+            differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_scale(2.0e38));
+        let inputs = AttentionInputs::new(
+            f32_array(&[1, 1, 1, 1], &[0.0]),
+            f32_array(&[1, 1, 1, 1], &[0.0]),
+            f32_array(&[1, 1, 1, 1], &[1.0]),
+        );
+        let (output, gradients): (Array, AttentionInputs<Array>) = differentiate_at(inputs)
+            .value_and_gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum))
+            .unwrap();
+        assert_eq!(output, f32_array(&[], &[1.0]));
+        assert_eq!(gradients.query, f32_array(&[1, 1, 1, 1], &[0.0]));
+        assert_eq!(gradients.key, f32_array(&[1, 1, 1, 1], &[0.0]));
+
+        // The probability of the second key is the smallest positive `f32`. Its logit cotangent is that probability
+        // times the difference of the weight cotangents, which is representable, while half of it is not, so the
+        // factor of two returns with the probability instead of after the product.
+        let function =
+            differentiable_dot_product_attention::<ArrayContext>(AttentionConfiguration::new().with_scale(1.0e38));
+        let inputs = AttentionInputs::new(
+            f32_array(&[1, 1, 1, 1], &[1.0]),
+            f32_array(&[1, 2, 1, 1], &[0.0, -103.0e-38]),
+            f32_array(&[1, 2, 1, 1], &[1.0, 0.0]),
+        );
+        let (_, gradients): (Array, AttentionInputs<Array>) = differentiate_at(inputs)
+            .value_and_gradient(|inputs| function.call(inputs)?.reduce(&[0, 1, 2, 3], ReductionKind::Sum))
+            .unwrap();
+        let tail = f32::from_bits(1) * 1.0e38;
+        assert_eq!(gradients.key, f32_array(&[1, 2, 1, 1], &[tail, -tail]));
     }
 
     #[test]

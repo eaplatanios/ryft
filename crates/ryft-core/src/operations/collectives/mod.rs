@@ -150,8 +150,9 @@ use std::fmt::{Debug, Display};
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy,
-    ArrayIrType, ArrayType, Dimension, DimensionType, DimensionValue, DynamicArrayExtentBatchingPolicy,
-    LinearResiduals, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension, StaticArrayExtentBatchingPolicy,
+    ArrayIrType, ArrayIrTypeRefinements, ArrayType, Dimension, DimensionType, DimensionValue,
+    DynamicArrayExtentBatchingPolicy, LinearResiduals, LogicalMesh, MeshAxisType, Shape, Sharding, ShardingDimension,
+    StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchingContext, BatchingError, BatchingPolicy, BatchingTracer};
@@ -180,7 +181,8 @@ use crate::operations::reductions::{Reduce, ReductionKind};
 use crate::operations::sharding::reshard::Reshard;
 use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, Operation, OperationProjection, ProgramError, RegionInterface, TypeError, Typed, Value, ValueProjection,
+    MaybeZero, Operation, OperationProjection, ProgramError, RegionInterface, TypeError, TypeRefinements, Typed, Value,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -990,8 +992,21 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
                         adjoint_inputs.extend(input_dimensions);
                         let mut outputs = transpose_context.bind(adjoint, Vec::new(), adjoint_inputs.as_slice())?;
                         check_count!("output", outputs, 1, ProgramError);
-                        let target = transpose_target_type.into();
-                        Ok(vec![with_cotangent_type(&transpose_context, outputs.remove(0), target)?])
+
+                        // The transpose region of a linear call may return a type that refines its expected type in
+                        // both directions (e.g., the static extent of a nominal dimension whose bounds admit only that
+                        // extent, for which no value in this region carries the nominal identity), so only a cotangent
+                        // whose type does not is cast.
+                        let output = outputs.remove(0);
+                        let output_type = output.r#type().into_owned();
+                        let target = ArrayIrType::from(transpose_target_type);
+                        if ArrayIrTypeRefinements::new([&target], [&output_type]).is_ok()
+                            && ArrayIrTypeRefinements::new([&output_type], [&target]).is_ok()
+                        {
+                            return Ok(vec![output]);
+                        }
+
+                        Ok(vec![with_cotangent_type(&transpose_context, output, target)?])
                     },
                 )?
                 .remove(0);
@@ -1786,12 +1801,11 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
     if axis == 0 { Ok(routed) } else { Ok(routed.move_axis(0, axis)?) }
 }
 
-/// Returns the input cotangent `cotangent` of a collective's transposition at exactly its required type `target`,
-/// which the transpose region of a linear call and the cotangent accumulator of transposition both require. The
-/// adjoint collectives and reshapes that produce the cotangent restore its shape, placement, and memory kind but
-/// not its layout (e.g., resizing an axis clears it), so when only the layout differs, an unchecked cast, whose
-/// relationship holds for that reason, requests the target type. A cotangent that already has the target type is
-/// returned unchanged, so nothing is staged for it.
+/// Returns the input cotangent `cotangent` of a collective's transposition at exactly the type `target`, which the
+/// cotangent accumulator of transposition requires. The adjoint collectives and reshapes that produce the cotangent
+/// restore its shape, placement, and memory kind but not its layout (e.g., resizing an axis clears it), so when only
+/// the layout differs, an unchecked cast, whose relationship holds for that reason, requests the target type.
+/// A cotangent that already has the target type is returned unchanged, so nothing is staged for it.
 fn with_cotangent_type<C: Context<Type: CastType>>(
     context: &C,
     cotangent: C::Value,

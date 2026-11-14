@@ -1042,21 +1042,42 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, OnceLock};
+
     use half::{bf16, f16};
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
-
     use ryft_core::{
-        Array as CoreArray, ConvertElementType, DimensionBounds, DimensionType, GuardOperation,
-        Operation as CoreOperation, Placeholder, ReducePrecision, TypeError, Typed,
+        Add, AddOperation, Array as CoreArray, AssertOperation, BatchAxis, BatchedProgram, Cast, ConditionOperation,
+        ConvertElementType, CustomCallOperation, DimensionBounds, DimensionFromScalar, DimensionToScalar,
+        DimensionType, DomainTracingContext, GuardOperation, Layout, LogicalMesh, MeshAxis, MeshAxisType,
+        Operation as CoreOperation, Placeholder, PrintOperation, ProgramBatchingOutputAxesPolicy, ProgramError,
+        ProjectedValue, ReducePrecision, ScanOperation, Shape, ShardMap, ShardMapOptions, Sharding, ShardingDimension,
+        ShardingError, StridedLayout, Tile, TileDimension, TiledLayout, Tracer as CoreTracer, TracingContext,
+        TypeError, Typed, ValueProjection, WhileOperation,
+    };
+    use ryft_mlir::{Location, OperationResultRef};
+    use ryft_pjrt::extensions::ffi::{
+        FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId,
+        XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
+    };
+    use ryft_pjrt::{
+        BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
+        load_cpu_plugin,
     };
 
+    use crate::domains::Tracer;
     use crate::domains::tests::domain_mesh;
-    use crate::experimental::lowering::tests::{ProgramBuilder, dynamic_dimension};
+    use crate::experimental::lowering::tests::{
+        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module,
+        test_spmd_compilation_options,
+    };
     use crate::experimental::lowering::to_mlir_module_for_plain_program;
     use crate::experimental::ops::{ArrayConstant, Constant, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::experimental::tracing::ArrayTracer;
+    use crate::operations::jit_call::JitCallOperation;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Session, to_mlir_module_for_program};
+    use crate::{Domain, Session, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1069,16 +1090,6 @@ mod tests {
         shards: &[Vec<f64>],
         dimensions: &[u64],
     ) -> Result<Vec<(Vec<f64>, ryft_pjrt::Layout)>, ryft_pjrt::Error> {
-        use std::sync::Arc;
-
-        use ryft_pjrt::{
-            BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
-            load_cpu_plugin,
-        };
-
-        use crate::experimental::lowering::tests::test_spmd_compilation_options;
-        use crate::tests::{values_from_bytes, values_to_bytes};
-
         let plugin = load_cpu_plugin()?;
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(shards.len()), ..Default::default() }))?;
@@ -1597,11 +1608,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast() {
-        use ryft_core::{Add, Cast, Shape, Tracer as CoreTracer, TracingContext};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         // A checked cast asserts its relationship before converting: narrowing `f64[n]` to `f64[2]` requires the
         // runtime extent 2, and widening `f64[2]` to `f64[n]` next to a witness of type `f64[n]` requires that the
         // witness has extent 2. An unchecked narrowing assumes the extent instead.
@@ -1654,9 +1660,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_dimension() {
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let mut builder = ArrayIrProgramBuilder::new();
         let value = builder.add_input(n.clone().into());
@@ -1686,11 +1689,6 @@ mod tests {
 
     #[test]
     fn test_lower_unchecked_cast_with_witness() {
-        use ryft_core::{Cast, Shape, TracingContext};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
@@ -1712,9 +1710,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_check_dependencies() {
-        use ryft_core::{PrintOperation, Shape};
-        use ryft_mlir::{Location, OperationResultRef};
-
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let exact = ArrayType::new_static(DataType::F32, [2]);
@@ -1771,8 +1766,6 @@ mod tests {
 
     #[test]
     fn test_lower_checked_cast_token_ordering() {
-        use ryft_core::{AssertOperation, Layout, TiledLayout};
-
         // Binding normalizes a proven cast to an unchecked one, so a checked cast whose relationship the actual types
         // prove only arises when staged directly through a program builder. It emits no check of its own but is still
         // ordered after preceding assertions: its dependency barrier consumes the token of the preceding assertion,
@@ -1839,12 +1832,6 @@ mod tests {
 
     #[test]
     fn test_lower_checked_cast_region_checks() {
-        use ryft_core::{ConditionOperation, ScanOperation, Shape, WhileOperation};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::operations::jit_call::JitCallOperation;
-        use crate::tests::execution_client;
-
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let body = |index, checked| {
@@ -1979,17 +1966,6 @@ mod tests {
 
     #[test]
     fn test_lower_checked_cast_in_shard_map() {
-        use ryft_core::{
-            Cast, ConvertElementType, DimensionFromScalar, DimensionToScalar, DomainTracingContext, LogicalMesh,
-            MeshAxis, MeshAxisType, ProgramError, ProjectedValue, ShardMap, ShardMapOptions, Sharding, ValueProjection,
-        };
-
-        use crate::Domain;
-        use crate::domains::Tracer;
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::experimental::tracing::ArrayTracer;
-        use crate::tests::execution_client;
-
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh.clone(), 0);
         let scalar = ArrayType::scalar(DataType::F64);
@@ -2033,11 +2009,6 @@ mod tests {
 
     #[test]
     fn test_lower_checked_cast_refined_representation() {
-        use ryft_core::{LogicalMesh, MeshAxis, Sharding, ShardingDimension};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let declared = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -2118,11 +2089,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_converts_bounded_dynamic_values() {
-        use ryft_core::{AddOperation, Shape};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         // An entry guard returns its inputs narrowed behind its check, so that computations consume static values.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
@@ -2210,13 +2176,6 @@ mod tests {
 
     #[test]
     fn test_lower_guarded_cast() {
-        use ryft_core::{
-            BatchAxis, BatchedProgram, Layout, ProgramBatchingOutputAxesPolicy, Shape, ShardingDimension, TiledLayout,
-        };
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
         let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
         // A declared physical layout disappears when batching inserts an axis. The guard and cast must validate
@@ -2324,11 +2283,6 @@ mod tests {
 
     #[test]
     fn test_lower_guarded_cast_discarded_output() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
         let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
@@ -2360,8 +2314,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_omits_proven_relationship_checks() {
-        use ryft_core::{Layout, Shape, TiledLayout};
-
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input_type =
@@ -2560,8 +2512,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_omits_proven_witness_checks() {
-        use ryft_core::Shape;
-
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input_type =
@@ -2630,11 +2580,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_repeated_static_check() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(); 2]));
         let output_type = ArrayType::new_static(DataType::F64, [2, 2]);
@@ -2702,11 +2647,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_dimension_witness_checks() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b, c] = ["a", "b", "c"].map(|name| DimensionType::new(name, bounds));
         let input_type =
@@ -2867,11 +2807,6 @@ mod tests {
 
     #[test]
     fn test_lower_checked_cast_ambient_identities() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
@@ -2950,11 +2885,6 @@ mod tests {
 
     #[test]
     fn test_lower_checked_cast_mixed_dimensions() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input_type =
@@ -3008,11 +2938,6 @@ mod tests {
 
     #[test]
     fn test_lower_checked_cast_static_witnesses() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         // A static witness establishes ambient b = 3 before type inference compares the source and target dimensions.
         // The symbolic input still needs its runtime check, before conversion slices its physical bound to 3.
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
@@ -3090,8 +3015,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_output_layout_dynamic() {
-        use ryft_core::{Layout, TiledLayout};
-
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("n", Some(5)), 3.into()]));
         let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
@@ -3148,11 +3071,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_widening_with_output_layout() {
-        use ryft_core::{Layout, Shape, TiledLayout};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         // Widening a static axis to a bounded dynamic one pads the physical buffer to the bound, and the requested
         // layout constrains that whole physical buffer before the runtime extent is restored on the constrained value.
         // A second cast drops the layout again so that the executable boundary stays row-major.
@@ -3250,17 +3168,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_layout_after_bound_change() {
-        use std::sync::OnceLock;
-
-        use ryft_core::{CustomCallOperation, Layout, TiledLayout};
-        use ryft_pjrt::extensions::ffi::{
-            FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput, FfiTypeId,
-            XLA_FFI_CallFrame, XLA_FFI_Error, XLA_FFI_Handler,
-        };
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         const TARGET: &str = "ryft.test.physical_f64_copy";
         static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
 
@@ -3291,7 +3198,12 @@ mod tests {
         // inputs and outputs). The custom call explicitly requests the column-major layout to observe this storage.
         // XLA rejects bounded dynamic custom-call operands and non-row-major bounded dynamic executable outputs, so only
         // a static result of such a cast can be observed, and its consumer still receives the declared column-major storage.
-        let client = execution_client();
+        // The copying handler reads and writes its buffers through host pointers, so this test always runs on the CPU
+        // client rather than on the configured execution platform, whose buffers may live in device memory.
+        let client = load_cpu_plugin()
+            .unwrap()
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         REGISTRATION
             .get_or_init(|| {
                 client.register_ffi_handler(
@@ -3383,8 +3295,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_output_layout_unsupported() {
-        use ryft_core::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
-
         let input_type = ArrayType::new_static(DataType::F64, [2]);
         for (layout, kind) in [
             (Layout::Strided(StridedLayout::new(vec![8])), "strided"),
@@ -3429,13 +3339,6 @@ mod tests {
 
     #[test]
     fn test_lower_checked_cast_layout_and_sharding() {
-        use ryft_core::{
-            Layout, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout, TiledLayout, Typed,
-        };
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let contiguous = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
@@ -3494,8 +3397,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_output_placement() {
-        use ryft_core::{Layout, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TiledLayout};
-
         let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_type = input_type
@@ -3563,8 +3464,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_preserved_placement() {
-        use ryft_core::{Layout, LogicalMesh, MeshAxis, Sharding, ShardingDimension, ShardingError, TiledLayout};
-
         // Carrying an existing sharding forward requests no redistribution: a cast that only changes the layout emits
         // no constraint, whereas a changed explicit placement emits the complete output sharding like `reshard`, with
         // its dimensions open over the auto axis `a`. Types record no placement over auto mesh axes, so neither type
@@ -3677,10 +3576,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_preserved_placement_executes() {
-        use ryft_core::{Layout, LogicalMesh, MeshAxis, Sharding, ShardingDimension, TiledLayout};
-
-        use crate::ToPjrt;
-
         // Carrying the auto and explicit placement forward emits no constraint, so every device keeps its own shard
         // and only the physical layout of the result changes. Types record no placement over the auto axis `a`, so the
         // placement over it is only an argument and result sharding of the lowered module.
@@ -3746,10 +3641,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_explicit_sharding_multiple_devices() {
-        use ryft_core::{Cast, LogicalMesh, MeshAxis, ShardMapOptions, Sharding, ShardingDimension, Typed};
-
-        use crate::experimental::lowering::tests::shard_map_module;
-
         // A cast whose output moves the placement over an explicit axis emits its complete output sharding as a
         // constraint, which the partitioner realizes by gathering the shards: every device returns the whole array.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -3860,12 +3751,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_dynamic_output_explicit_sharding() {
-        use ryft_core::{LogicalMesh, MeshAxis, Shape, Sharding, ShardingDimension};
-        use ryft_pjrt::{ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program, test_spmd_compilation_options};
-        use crate::tests::execution_client;
-
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
         let program_and_types = |mesh: LogicalMesh| {
@@ -3957,10 +3842,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_rejects_bound_manual_output_placement() {
-        use ryft_core::{Cast, LogicalMesh, MeshAxis, ShardMapOptions, Sharding, ShardingDimension, Typed};
-
-        use crate::experimental::lowering::tests::shard_map_module;
-
         // A body value that does not vary along the bound manual axis `x` preserves no definition of it, so a cast may
         // name a mesh that redefines `x` as explicit. Sharding a local dimension over `x` would request a placement
         // that only the region boundary owns, and lowering rejects it instead of stripping `x` from the constraint.
@@ -3996,8 +3877,6 @@ mod tests {
 
     #[test]
     fn test_cast_changes_explicit_placement() {
-        use ryft_core::{LogicalMesh, MeshAxis, ShardingDimension};
-
         let explicit_mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
@@ -4066,11 +3945,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_different_bounds() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
@@ -4125,11 +3999,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_different_bounds_narrowing_bound() {
-        use ryft_core::Shape;
-
-        use crate::experimental::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::tests::execution_client;
-
         // Moving a dynamic axis to an identity with a smaller physical bound slices the physical buffer from the
         // source bound to the target bound and restores the runtime extent, which the witness shares. Only the checked
         // cast verifies that the extents agree.
@@ -4227,9 +4096,6 @@ mod tests {
 
     #[test]
     fn test_lower_cast_unbounded_shape() {
-        use ryft_core::Shape;
-        use ryft_mlir::Location;
-
         // Converting any axis materializes the static physical buffer of the whole value, so it is rejected when the
         // converted axis or another axis that the conversion leaves unchanged has an unbounded dimension. A cast that
         // converts no axis returns its input unchanged, even when the input has unbounded dimensions.
