@@ -1583,17 +1583,33 @@ impl DynamicSliceOperation<ArrayIrType> {
             let start = match dimension_start {
                 Some(start) => to_array(start)?,
                 None => {
-                    let start = ValueProjection::<ArrayType>::into_projected(starts[axis].clone())?
-                        .convert_element_type(DataType::I64)?
-                        .transfer_to_memory(cotangent_type.memory())?;
+                    let start = ValueProjection::<ArrayType>::into_projected(starts[axis].clone())?;
+                    let is_unsigned = start.r#type().data_type().is_unsigned();
+                    let to_coordinate = |start: <V as ValueProjection<ArrayType>>::Projected| {
+                        start.convert_element_type(DataType::I64)?.transfer_to_memory(cotangent_type.memory())
+                    };
                     match maximum_start {
+                        // An unsigned start can exceed the `i64` range, where converting it first would wrap it to
+                        // a negative value that clamps to zero instead of to the maximum start. It is therefore
+                        // clamped as a `u64` value, which holds every unsigned start and every maximum start.
+                        Some(maximum_start) if is_unsigned => {
+                            let maximum_start =
+                                to_array(ValueProjection::<DimensionType>::from_projected(maximum_start))?
+                                    .convert_element_type(DataType::U64)?;
+                            let start = start
+                                .convert_element_type(DataType::U64)?
+                                .transfer_to_memory(cotangent_type.memory())?;
+                            let zero = to_array(context.dimension_constant(0)?)?.convert_element_type(DataType::U64)?;
+                            start.clamp(&zero, &maximum_start)?.convert_element_type(DataType::I64)?
+                        }
                         Some(maximum_start) => {
+                            let start = to_coordinate(start)?;
                             let zero = to_array(context.dimension_constant(0)?)?;
                             let maximum_start =
                                 to_array(ValueProjection::<DimensionType>::from_projected(maximum_start))?;
                             start.clamp(&zero, &maximum_start)?
                         }
-                        None => start,
+                        None => to_coordinate(start)?,
                     }
                 }
             };
@@ -8890,6 +8906,86 @@ mod tests {
             pullback_values(&clamped, -1),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0, 0.0, 0.0]).unwrap())]),
         );
+    }
+
+    #[test]
+    fn test_dynamic_slice_array_ir_transposition_clamps_unsigned_array_starts() {
+        // An unsigned array start can exceed the `i64` range of the coordinates that the adjoint scatters into. Under
+        // clamped bounds, the adjoint clamps such a start as a `u64` value before converting it, so the cotangent
+        // lands on the last window, which the forward slice selects, instead of on the first one.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(6)).unwrap());
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input =
+            builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)])).into());
+        let start = builder.add_input(ArrayType::scalar(DataType::U64).into());
+        let size = builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let operation = DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_bounds(DynamicSliceBounds::Clamp);
+        let output = builder.add_instruction(operation, Vec::new(), vec![input, start, size], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(
+            linearization.pullback().unwrap().into_program().to_string(),
+            indoc! {"
+                lambda %0:f64[2], %1:u64[], %2:dimension<extent ∈ [2, 6)> .
+                let %3:dimension<2> = const 2
+                    %4:f64[extent] = linear_call [residual_count=3] %1 %3 %2 %0 [
+                        forward={
+                            lambda %0:u64[], %1:dimension<2>, %2:dimension<extent ∈ [2, 6)>, %3:f64[2] .
+                            let %4:f64[extent] = zero [type=f64[extent]] %2
+                                %5:i64[2, 1] = iota [type=i64[2, 1], dimension=0]
+                                %6:dimension<0> = constant [value=0]
+                                %7:i64[] = dimension_to_scalar %6
+                                %8:i64[] = transfer_to_memory [destination=Device] %7
+                                %9:u64[] = convert_element_type [data_type=u64] %8
+                                %10:u64[] = transfer_to_memory [destination=Device] %0
+                                %11:dimension<extent ∈ [2, 6)> = dimension_size [axis=0] %4
+                                %12:dimension<1> = constant [value=1]
+                                %13:dimension<1> = saturating_sub %1 %12
+                                %14:dimension<2> = dimension_add %13 %12
+                                %15:dimension<max(0, extent - 2) ∈ [0, 4)> = saturating_sub %11 %14
+                                %16:i64[] = dimension_to_scalar %15
+                                %17:i64[] = transfer_to_memory [destination=Device] %16
+                                %18:u64[] = convert_element_type [data_type=u64] %17
+                                %19:u64[] = clamp %9 %10 %18
+                                %20:i64[] = convert_element_type [data_type=i64] %19
+                                %21:i64[2, 1] = add %5 %20
+                                %22:f64[extent] = scatter [
+                                    kind=add,
+                                    dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                operand_batching=[], scatter_indices_batching=[]),
+                                    unique_indices=true,
+                                ] %4 %21 %3
+                            in (%22)
+                        },
+                        transpose={
+                            lambda %0:u64[], %1:dimension<2>, %2:dimension<extent ∈ [2, 6)>, %3:f64[extent] .
+                            let %4:f64[2] = dynamic_slice [strides=[1], bounds=clamp, \
+                requires_runtime_assertion=true] %3 %0 %1
+                            in (%4)
+                        },
+                    ]
+                in (%4)"},
+        );
+
+        let input = ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap());
+        let cotangent = ArrayIrValue::Array(Array::vector(vec![10.0_f64, 20.0]).unwrap());
+        let pullback_values = |start: u64| {
+            let start = ArrayIrValue::Array(Array::scalar(start).unwrap());
+            let mut residuals = linearization.primal().interpret(vec![input.clone(), start]).unwrap();
+            let output = residuals.remove(0);
+            let mut inputs = vec![cotangent.clone()];
+            inputs.extend(residuals);
+            (output, linearization.pullback().unwrap().into_program().interpret(inputs))
+        };
+        let vector = |values: Vec<f64>| ArrayIrValue::Array(Array::vector(values).unwrap());
+        assert_eq!(pullback_values(1), (vector(vec![2.0, 3.0]), Ok(vec![vector(vec![0.0, 10.0, 20.0, 0.0])])));
+        assert_eq!(pullback_values(u64::MAX), (vector(vec![3.0, 4.0]), Ok(vec![vector(vec![0.0, 0.0, 10.0, 20.0])])));
     }
 
     #[test]
