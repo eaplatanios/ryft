@@ -1,7 +1,9 @@
 //! Generalized and grouped tensor contractions through [`Dot`] and [`RaggedDot`]. [`DotOperation`] pairs batching
 //! dimensions, sums over contracting dimensions, and preserves each input's remaining dimensions. Its output axes are
 //! ordered as batching dimensions, left result dimensions, then right result dimensions. Inputs have identical numeric
-//! element types, while an optional accumulation type selects the result representation.
+//! element types, except for the pairs of distinct 8-bit floating-point types that backends contract natively. An
+//! optional accumulation type selects the result representation, and a [`DotPrecision`] requests a precision for each
+//! input or a specific algorithm (e.g., a [`DotAlgorithmPreset`]).
 //!
 //! [`RaggedDotOperation`] additionally consumes integer group sizes that partition one left input dimension into
 //! consecutive intervals. Depending on that dimension's role, groups select right input slices, produce a leading group
@@ -166,20 +168,44 @@ impl DotDimensionNumbers {
             .collect()
     }
 
-    /// Lifts these dimension numbers through one batching level. Batch axis positions refer to the physical inputs,
-    /// while these dimension numbers describe each logical item. A missing position denotes a replicated input.
-    /// When both inputs are mapped, their inserted axes become the first batching pair and every existing axis at or
-    /// after its insertion position shifts by one. The output's mapped axis is then zero. Two replicated inputs keep
-    /// the original dimensions and have a replicated output. A mixed pair returns [`None`], so callers must first
-    /// materialize the mapped axis on the replicated input. This function does not validate ranks or mapped extents.
+    /// Lifts these dimension numbers through one batching level and returns them together with the position of the
+    /// mapped axis in the output, which is [`None`] for a replicated output. Batch axis positions refer to the physical
+    /// inputs, while these dimension numbers and the provided ranks describe each logical item. A missing position
+    /// denotes a replicated input. Every existing axis at or after the mapped axis of its input shifts by one.
+    ///
+    ///   - When both inputs are mapped, their mapped axes become the first batching pair, so the mapped axis of the
+    ///     output is zero.
+    ///   - When only one input is mapped, its mapped axis becomes one more of its result dimensions, so the replicated
+    ///     input needs no mapped axis of its own. The mapped axis of the output then follows the batching dimensions
+    ///     and the result dimensions that precede it, which include every left-hand side result dimension when the
+    ///     right-hand side is the mapped input.
+    ///   - Two replicated inputs keep the original dimensions and have a replicated output.
+    ///
+    /// This function does not validate these dimension numbers against the ranks, nor the mapped extents.
+    ///
+    /// # Parameters
+    ///
+    ///   - `lhs_rank`: Rank of each logical left-hand side item.
+    ///   - `rhs_rank`: Rank of each logical right-hand side item.
+    ///   - `lhs_batch_axis`: Position of the mapped axis in the physical left-hand side input, if it is mapped.
+    ///   - `rhs_batch_axis`: Position of the mapped axis in the physical right-hand side input, if it is mapped.
     pub fn batched(
         &self,
+        lhs_rank: usize,
+        rhs_rank: usize,
         lhs_batch_axis: Option<usize>,
         rhs_batch_axis: Option<usize>,
-    ) -> Option<(Self, Option<usize>)> {
+    ) -> (Self, Option<usize>) {
         let shift = |axes: &[usize], batch_axis: usize| -> Vec<usize> {
             axes.iter().map(|axis| if *axis >= batch_axis { *axis + 1 } else { *axis }).collect()
         };
+
+        // A logical result dimension precedes the mapped axis in the physical input exactly when its index is smaller
+        // than the position of that axis, because the axes before that position are not shifted.
+        let preceding = |result_dimensions: Vec<usize>, batch_axis: usize| {
+            result_dimensions.into_iter().filter(|axis| *axis < batch_axis).count()
+        };
+
         match (lhs_batch_axis, rhs_batch_axis) {
             (Some(lhs_axis), Some(rhs_axis)) => {
                 let mut lhs_batching_dimensions = vec![lhs_axis];
@@ -192,10 +218,33 @@ impl DotDimensionNumbers {
                     lhs_batching_dimensions,
                     rhs_batching_dimensions,
                 );
-                Some((dimensions, Some(0)))
+                (dimensions, Some(0))
             }
-            (None, None) => Some((self.clone(), None)),
-            _ => None,
+            (Some(lhs_axis), None) => {
+                let output_axis =
+                    self.lhs_batching_dimensions.len() + preceding(self.lhs_result_dimensions(lhs_rank), lhs_axis);
+                let dimensions = Self::new(
+                    shift(&self.lhs_contracting_dimensions, lhs_axis),
+                    self.rhs_contracting_dimensions.clone(),
+                    shift(&self.lhs_batching_dimensions, lhs_axis),
+                    self.rhs_batching_dimensions.clone(),
+                );
+                (dimensions, Some(output_axis))
+            }
+            (None, Some(rhs_axis)) => {
+                let output_axis = self.lhs_batching_dimensions.len()
+                    + self.lhs_result_dimensions(lhs_rank).len()
+                    + preceding(self.rhs_result_dimensions(rhs_rank), rhs_axis);
+                let dimensions = Self::new(
+                    self.lhs_contracting_dimensions.clone(),
+                    shift(&self.rhs_contracting_dimensions, rhs_axis),
+                    self.lhs_batching_dimensions.clone(),
+                    shift(&self.rhs_batching_dimensions, rhs_axis),
+                );
+                (dimensions, Some(output_axis))
+            }
+
+            (None, None) => (self.clone(), None),
         }
     }
 
@@ -266,40 +315,583 @@ impl Display for DotDimensionNumbers {
     }
 }
 
+/// Precision requested for one input of a [`DotOperation`], mirroring the entries of the `precision_config`
+/// attribute of StableHLO's [`dot_general`](https://openxla.org/stablehlo/spec#dot_general) and JAX's
+/// [`jax.lax.Precision`](https://docs.jax.dev/en/latest/jax.lax.html#jax.lax.Precision). The precision trades speed
+/// for accuracy on accelerator backends and only affects `f32` computations. It never changes the operation's types
+/// or its mathematical definition, and backends without alternative implementations, including CPU backends and the
+/// eager reference [`Array`] kernel, evaluate their only implementation for every precision.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DotInputPrecision {
+    /// Fastest and least accurate mode. GPUs use TensorFloat-32 where it is available.
+    #[default]
+    Default,
+
+    /// Slower and more accurate mode.
+    High,
+
+    /// Slowest and most accurate mode, which computes at full `f32` precision.
+    Highest,
+}
+
+impl Display for DotInputPrecision {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Default => "default",
+            Self::High => "high",
+            Self::Highest => "highest",
+        })
+    }
+}
+
+/// Explicit algorithm for computing a [`DotOperation`], mirroring the `algorithm` attribute
+/// of StableHLO's [`dot_general`](https://openxla.org/stablehlo/spec#dot_general) and JAX's
+/// [`jax.lax.DotAlgorithm`](https://docs.jax.dev/en/latest/jax.lax.html#jax.lax.DotAlgorithm). The inputs are rounded
+/// to the two precision types, the contraction accumulates at the accumulation type, and the result is then converted
+/// to the output element type of the operation. The component counts and the primitive operation count describe
+/// algorithms that decompose their inputs into several components and run several primitive operations on them,
+/// usually to emulate a higher precision. An algorithm without such a decomposition uses one for all three. Imprecise
+/// accumulation permits some accumulation steps to run at a lower precision (e.g., the fast accumulation mode of
+/// cuBLASLt).
+///
+/// Support for an algorithm depends on the platform, and a backend reports an error at compilation when it does not
+/// support the requested one. [`DotAlgorithmPreset`] names the algorithms that are known to be supported on at least
+/// one platform. All three types must be floating-point types and all three counts must be positive, which
+/// [`DotOperation`] validates during type inference.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DotAlgorithm {
+    /// Element type that the left-hand side input is rounded to.
+    lhs_precision_type: DataType,
+
+    /// Element type that the right-hand side input is rounded to.
+    rhs_precision_type: DataType,
+
+    /// Element type at which the contraction accumulates.
+    accumulation_type: DataType,
+
+    /// Number of components that the left-hand side input is decomposed into.
+    lhs_component_count: usize,
+
+    /// Number of components that the right-hand side input is decomposed into.
+    rhs_component_count: usize,
+
+    /// Number of primitive operations that the algorithm runs on the components.
+    primitive_operation_count: usize,
+
+    /// Whether some accumulation steps may run at a lower precision.
+    allow_imprecise_accumulation: bool,
+}
+
+impl DotAlgorithm {
+    /// Creates a new [`DotAlgorithm`] that rounds its inputs to the provided precision types and accumulates
+    /// at `accumulation_type`, without any decomposition and with precise accumulation.
+    #[inline]
+    pub fn new(lhs_precision_type: DataType, rhs_precision_type: DataType, accumulation_type: DataType) -> Self {
+        Self {
+            lhs_precision_type,
+            rhs_precision_type,
+            accumulation_type,
+            lhs_component_count: 1,
+            rhs_component_count: 1,
+            primitive_operation_count: 1,
+            allow_imprecise_accumulation: false,
+        }
+    }
+
+    /// Returns this [`DotAlgorithm`] with the provided numbers of components for its two inputs.
+    #[inline]
+    pub fn with_component_counts(mut self, lhs_component_count: usize, rhs_component_count: usize) -> Self {
+        self.lhs_component_count = lhs_component_count;
+        self.rhs_component_count = rhs_component_count;
+        self
+    }
+
+    /// Returns this [`DotAlgorithm`] with the provided number of primitive operations.
+    #[inline]
+    pub fn with_primitive_operation_count(mut self, primitive_operation_count: usize) -> Self {
+        self.primitive_operation_count = primitive_operation_count;
+        self
+    }
+
+    /// Returns this [`DotAlgorithm`] with imprecise accumulation allowed or disallowed.
+    #[inline]
+    pub fn with_imprecise_accumulation(mut self, allow_imprecise_accumulation: bool) -> Self {
+        self.allow_imprecise_accumulation = allow_imprecise_accumulation;
+        self
+    }
+
+    /// Returns the element type that the left-hand side input is rounded to.
+    #[inline]
+    pub fn lhs_precision_type(&self) -> DataType {
+        self.lhs_precision_type
+    }
+
+    /// Returns the element type that the right-hand side input is rounded to.
+    #[inline]
+    pub fn rhs_precision_type(&self) -> DataType {
+        self.rhs_precision_type
+    }
+
+    /// Returns the element type at which the contraction accumulates.
+    #[inline]
+    pub fn accumulation_type(&self) -> DataType {
+        self.accumulation_type
+    }
+
+    /// Returns the number of components that the left-hand side input is decomposed into.
+    #[inline]
+    pub fn lhs_component_count(&self) -> usize {
+        self.lhs_component_count
+    }
+
+    /// Returns the number of components that the right-hand side input is decomposed into.
+    #[inline]
+    pub fn rhs_component_count(&self) -> usize {
+        self.rhs_component_count
+    }
+
+    /// Returns the number of primitive operations that the algorithm runs on the components.
+    #[inline]
+    pub fn primitive_operation_count(&self) -> usize {
+        self.primitive_operation_count
+    }
+
+    /// Returns `true` if some accumulation steps may run at a lower precision.
+    #[inline]
+    pub fn allow_imprecise_accumulation(&self) -> bool {
+        self.allow_imprecise_accumulation
+    }
+}
+
+impl Display for DotAlgorithm {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "(lhs_precision_type={}, rhs_precision_type={}, accumulation_type={}, lhs_component_count={}, \
+             rhs_component_count={}, primitive_operation_count={}, allow_imprecise_accumulation={})",
+            self.lhs_precision_type,
+            self.rhs_precision_type,
+            self.accumulation_type,
+            self.lhs_component_count,
+            self.rhs_component_count,
+            self.primitive_operation_count,
+            self.allow_imprecise_accumulation,
+        )
+    }
+}
+
+/// Named algorithms for computing a [`DotOperation`] that are known to be supported on at least one platform, mirroring
+/// JAX's [`jax.lax.DotAlgorithmPreset`](https://docs.jax.dev/en/latest/jax.lax.html#jax.lax.DotAlgorithmPreset). The
+/// names have the form `LHS_RHS_ACCUMULATION`, where `LHS` and `RHS` are the element types that the two inputs are
+/// rounded to and `ACCUMULATION` is the element type at which the contraction accumulates. JAX's `DEFAULT` preset
+/// has no variant here, because the default [`DotPrecision`] already selects the platform's default algorithm.
+///
+/// A preset does not constrain the input types of its operation, except that the `Any_F8` presets require 8-bit
+/// floating-point inputs. Inputs that the preset does not compute with are converted to its first input type,
+/// and an output type that it does not produce is converted from its accumulation type. [`Self::input_types`] and
+/// [`Self::output_types`] list the types that need no conversion, and [`DotPrecision::computation_types`] resolves
+/// them for one operation. Support is platform dependent, and a backend reports an error at compilation when it does
+/// not support the requested preset.
+#[allow(non_camel_case_types)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DotAlgorithmPreset {
+    /// Accepts any 8-bit floating-point input types and accumulates at `f32`. It produces `f32`, `f16`, `bf16`,
+    /// `f8e4m3fn`, `f8e5m2`, `f8e5m2fnuz`, `f8e4m3fnuz`, and `f8e4m3b11fnuz` outputs.
+    Any_F8_Any_F8_F32,
+
+    /// Like [`Self::Any_F8_Any_F8_F32`], but with faster and less accurate accumulation.
+    Any_F8_Any_F8_F32_Fast_Accumulation,
+
+    /// Like [`Self::Any_F8_Any_F8_F32`], but producing the output element type of the operation directly, whatever
+    /// that type is.
+    Any_F8_Any_F8_Any,
+
+    /// Like [`Self::Any_F8_Any_F8_Any`], but with faster and less accurate accumulation. JAX's preset of this name
+    /// requests precise accumulation, which makes it identical to its precise counterpart.
+    Any_F8_Any_F8_Any_Fast_Accumulation,
+
+    /// Rounds the inputs to `f16` and accumulates at `f16`.
+    F16_F16_F16,
+
+    /// Rounds the inputs to `f16` and accumulates at `f32`. It produces `f32` and `f16` outputs.
+    F16_F16_F32,
+
+    /// Rounds the inputs to `bf16` and accumulates at `bf16`. Inputs may be stored as `bf16` or `f32`.
+    BF16_BF16_BF16,
+
+    /// Rounds the inputs to `bf16` and accumulates at `f32`. Inputs may be stored as `bf16` or `f32`. It produces
+    /// `f32` outputs, and also `bf16` outputs when both inputs are stored as `bf16`.
+    BF16_BF16_F32,
+
+    /// Like [`Self::BF16_BF16_F32`], but running three primitive operations on `f32` inputs to emulate a higher
+    /// precision.
+    BF16_BF16_F32_X3,
+
+    /// Like [`Self::BF16_BF16_F32_X3`], but running six primitive operations.
+    BF16_BF16_F32_X6,
+
+    /// Like [`Self::BF16_BF16_F32_X3`], but running nine primitive operations.
+    BF16_BF16_F32_X9,
+
+    /// Rounds `f32` inputs to TensorFloat-32 and accumulates at `f32`.
+    TF32_TF32_F32,
+
+    /// Like [`Self::TF32_TF32_F32`], but running three primitive operations to emulate a higher precision.
+    TF32_TF32_F32_X3,
+
+    /// Computes with `f32` inputs and accumulates at `f32`.
+    F32_F32_F32,
+
+    /// Computes with `f64` inputs and accumulates at `f64`.
+    F64_F64_F64,
+}
+
+impl DotAlgorithmPreset {
+    /// Returns the input element types that this preset computes with, or [`None`] if it computes with the input
+    /// types of its operation unchanged. An input of any other type is converted to the first listed type.
+    #[inline]
+    pub fn input_types(self) -> Option<&'static [DataType]> {
+        match self {
+            Self::Any_F8_Any_F8_F32
+            | Self::Any_F8_Any_F8_F32_Fast_Accumulation
+            | Self::Any_F8_Any_F8_Any
+            | Self::Any_F8_Any_F8_Any_Fast_Accumulation => None,
+            Self::F16_F16_F16 | Self::F16_F16_F32 => Some(&[DataType::F16]),
+            Self::BF16_BF16_BF16 | Self::BF16_BF16_F32 => Some(&[DataType::BF16, DataType::F32]),
+            Self::BF16_BF16_F32_X3
+            | Self::BF16_BF16_F32_X6
+            | Self::BF16_BF16_F32_X9
+            | Self::TF32_TF32_F32
+            | Self::TF32_TF32_F32_X3
+            | Self::F32_F32_F32 => Some(&[DataType::F32]),
+            Self::F64_F64_F64 => Some(&[DataType::F64]),
+        }
+    }
+
+    /// Returns the element type at which this preset accumulates, or [`None`] if the accumulation is determined by
+    /// the output element type of its operation.
+    #[inline]
+    pub fn accumulation_type(self) -> Option<DataType> {
+        match self {
+            Self::Any_F8_Any_F8_Any | Self::Any_F8_Any_F8_Any_Fast_Accumulation => None,
+            Self::F16_F16_F16 => Some(DataType::F16),
+            Self::BF16_BF16_BF16 => Some(DataType::BF16),
+            Self::F64_F64_F64 => Some(DataType::F64),
+            Self::Any_F8_Any_F8_F32
+            | Self::Any_F8_Any_F8_F32_Fast_Accumulation
+            | Self::F16_F16_F32
+            | Self::BF16_BF16_F32
+            | Self::BF16_BF16_F32_X3
+            | Self::BF16_BF16_F32_X6
+            | Self::BF16_BF16_F32_X9
+            | Self::TF32_TF32_F32
+            | Self::TF32_TF32_F32_X3
+            | Self::F32_F32_F32 => Some(DataType::F32),
+        }
+    }
+
+    /// Returns the output element types that this preset produces directly for inputs that it computes with at the
+    /// element types `lhs` and `rhs`, or [`None`] if it produces the output element type of its operation whatever
+    /// that type is. An output of any other type is converted from the first listed type, which is the accumulation
+    /// type of this preset.
+    #[inline]
+    pub fn output_types(self, lhs: DataType, rhs: DataType) -> Option<&'static [DataType]> {
+        match self {
+            Self::Any_F8_Any_F8_F32 | Self::Any_F8_Any_F8_F32_Fast_Accumulation => Some(&[
+                DataType::F32,
+                DataType::F16,
+                DataType::BF16,
+                DataType::F8E4M3FN,
+                DataType::F8E5M2,
+                DataType::F8E5M2FNUZ,
+                DataType::F8E4M3FNUZ,
+                DataType::F8E4M3B11FNUZ,
+            ]),
+            Self::Any_F8_Any_F8_Any | Self::Any_F8_Any_F8_Any_Fast_Accumulation => None,
+            Self::F16_F16_F16 => Some(&[DataType::F16]),
+            Self::F16_F16_F32 if lhs == DataType::F16 && rhs == DataType::F16 => Some(&[DataType::F32, DataType::F16]),
+            Self::BF16_BF16_BF16 => Some(&[DataType::BF16]),
+            Self::BF16_BF16_F32 if lhs == DataType::BF16 && rhs == DataType::BF16 => {
+                Some(&[DataType::F32, DataType::BF16])
+            }
+            Self::F16_F16_F32
+            | Self::BF16_BF16_F32
+            | Self::BF16_BF16_F32_X3
+            | Self::BF16_BF16_F32_X6
+            | Self::BF16_BF16_F32_X9
+            | Self::TF32_TF32_F32
+            | Self::TF32_TF32_F32_X3
+            | Self::F32_F32_F32 => Some(&[DataType::F32]),
+            Self::F64_F64_F64 => Some(&[DataType::F64]),
+        }
+    }
+}
+
+impl Display for DotAlgorithmPreset {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Any_F8_Any_F8_F32 => "any_f8_any_f8_f32",
+            Self::Any_F8_Any_F8_F32_Fast_Accumulation => "any_f8_any_f8_f32_fast_accumulation",
+            Self::Any_F8_Any_F8_Any => "any_f8_any_f8_any",
+            Self::Any_F8_Any_F8_Any_Fast_Accumulation => "any_f8_any_f8_any_fast_accumulation",
+            Self::F16_F16_F16 => "f16_f16_f16",
+            Self::F16_F16_F32 => "f16_f16_f32",
+            Self::BF16_BF16_BF16 => "bf16_bf16_bf16",
+            Self::BF16_BF16_F32 => "bf16_bf16_f32",
+            Self::BF16_BF16_F32_X3 => "bf16_bf16_f32_x3",
+            Self::BF16_BF16_F32_X6 => "bf16_bf16_f32_x6",
+            Self::BF16_BF16_F32_X9 => "bf16_bf16_f32_x9",
+            Self::TF32_TF32_F32 => "tf32_tf32_f32",
+            Self::TF32_TF32_F32_X3 => "tf32_tf32_f32_x3",
+            Self::F32_F32_F32 => "f32_f32_f32",
+            Self::F64_F64_F64 => "f64_f64_f64",
+        })
+    }
+}
+
+/// Precision configuration of a [`DotOperation`], which controls the numerics of the contraction
+/// and gives access to hardware-specific algorithms. It mirrors the `precision` argument of JAX's
+/// [`jax.lax.dot_general`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.dot_general.html). The default
+/// requests [`DotInputPrecision::Default`] for both inputs and no algorithm, which lets each backend select
+/// its default algorithm.
+///
+/// The per-input precisions are hints that never change the types that the contraction computes with. An algorithm
+/// or a preset additionally fixes those types (refer to [`Self::computation_types`]), requires floating-point inputs,
+/// and requests [`DotInputPrecision::Default`] for both inputs. [`From`] conversions build a configuration from one
+/// [`DotInputPrecision`] for both inputs, from a pair of them, from a [`DotAlgorithm`], and from a
+/// [`DotAlgorithmPreset`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DotPrecision {
+    /// Precision requested for each input, without constraining the algorithm.
+    Inputs {
+        /// Precision requested for the left-hand side input.
+        lhs: DotInputPrecision,
+
+        /// Precision requested for the right-hand side input.
+        rhs: DotInputPrecision,
+    },
+
+    /// Explicit algorithm that the contraction must use.
+    Algorithm(DotAlgorithm),
+
+    /// Named algorithm that the contraction must use.
+    Preset(DotAlgorithmPreset),
+}
+
+impl DotPrecision {
+    /// Returns `true` if this is the default [`DotPrecision`], which requests [`DotInputPrecision::Default`] for both
+    /// inputs and no algorithm.
+    #[inline]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Returns the precisions requested for the left-hand side and right-hand side inputs. An algorithm or a preset
+    /// requests [`DotInputPrecision::Default`] for both.
+    #[inline]
+    pub fn input_precisions(&self) -> (DotInputPrecision, DotInputPrecision) {
+        match self {
+            Self::Inputs { lhs, rhs } => (*lhs, *rhs),
+            Self::Algorithm(_) | Self::Preset(_) => (DotInputPrecision::Default, DotInputPrecision::Default),
+        }
+    }
+
+    /// Returns the element types that a contraction with this [`DotPrecision`] computes with, as the types that its
+    /// left-hand side and right-hand side inputs are converted to and the type that it produces before converting to
+    /// `output`. Per-input precisions compute with `lhs`, `rhs`, and `output` unchanged. A [`DotAlgorithm`] computes
+    /// with its two precision types and its accumulation type. A [`DotAlgorithmPreset`] keeps every type that it
+    /// supports and replaces every other type with the first type that it supports in that position.
+    ///
+    /// # Parameters
+    ///
+    ///   - `lhs`: Element type of the left-hand side input.
+    ///   - `rhs`: Element type of the right-hand side input.
+    ///   - `output`: Output element type of the operation.
+    pub fn computation_types(&self, lhs: DataType, rhs: DataType, output: DataType) -> (DataType, DataType, DataType) {
+        let supported = |data_type: DataType, supported_types: Option<&[DataType]>| match supported_types {
+            Some(supported_types) if !supported_types.contains(&data_type) => supported_types[0],
+            _ => data_type,
+        };
+        match self {
+            Self::Inputs { .. } => (lhs, rhs, output),
+            Self::Algorithm(algorithm) => {
+                (algorithm.lhs_precision_type, algorithm.rhs_precision_type, algorithm.accumulation_type)
+            }
+            Self::Preset(preset) => {
+                let lhs = supported(lhs, preset.input_types());
+                let rhs = supported(rhs, preset.input_types());
+                (lhs, rhs, supported(output, preset.output_types(lhs, rhs)))
+            }
+        }
+    }
+
+    /// Validates this [`DotPrecision`] against the input element types `lhs` and `rhs` of the operation
+    /// named `operation_name`. Per-input precisions support every input type. An algorithm or a preset requires
+    /// floating-point inputs, a [`DotAlgorithm`] additionally requires floating-point types and positive counts of its
+    /// own, and the `Any_F8` presets additionally require 8-bit floating-point inputs. JAX converts inputs of other
+    /// types to the input types of the algorithm instead, which callers do explicitly here.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`TypeError`] that names `operation_name` if this [`DotPrecision`] does not support the input types
+    /// or is itself invalid.
+    pub fn validate(&self, operation_name: &str, lhs: DataType, rhs: DataType) -> Result<(), TypeError> {
+        let validate_floating_point_inputs = || {
+            if lhs.is_floating_point() && rhs.is_floating_point() {
+                Ok(())
+            } else {
+                Err(TypeError::invalid(format!(
+                    "`{operation_name}` algorithms require floating-point inputs but got `{lhs}` and `{rhs}`",
+                )))
+            }
+        };
+        match self {
+            Self::Inputs { .. } => {}
+            Self::Algorithm(algorithm) => {
+                validate_floating_point_inputs()?;
+                let algorithm_types =
+                    [algorithm.lhs_precision_type, algorithm.rhs_precision_type, algorithm.accumulation_type];
+                if let Some(data_type) = algorithm_types.into_iter().find(|data_type| !data_type.is_floating_point()) {
+                    return Err(TypeError::invalid(format!(
+                        "`{operation_name}` algorithm types must be floating-point types but got `{data_type}`",
+                    )));
+                }
+                if algorithm.lhs_component_count == 0
+                    || algorithm.rhs_component_count == 0
+                    || algorithm.primitive_operation_count == 0
+                {
+                    return Err(TypeError::invalid(format!(
+                        "`{operation_name}` algorithm component and primitive operation counts must be positive",
+                    )));
+                }
+            }
+            Self::Preset(preset) => {
+                validate_floating_point_inputs()?;
+                let requires_f8_inputs = matches!(
+                    preset,
+                    DotAlgorithmPreset::Any_F8_Any_F8_F32
+                        | DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation
+                        | DotAlgorithmPreset::Any_F8_Any_F8_Any
+                        | DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation,
+                );
+                if requires_f8_inputs && !(is_f8_data_type(lhs) && is_f8_data_type(rhs)) {
+                    return Err(TypeError::invalid(format!(
+                        "`{operation_name}` algorithm preset `{preset}` requires 8-bit floating-point inputs \
+                         but got `{lhs}` and `{rhs}`",
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for DotPrecision {
+    #[inline]
+    fn default() -> Self {
+        Self::Inputs { lhs: DotInputPrecision::Default, rhs: DotInputPrecision::Default }
+    }
+}
+
+impl Display for DotPrecision {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inputs { lhs, rhs } => write!(formatter, "(lhs={lhs}, rhs={rhs})"),
+            Self::Algorithm(algorithm) => write!(formatter, "{algorithm}"),
+            Self::Preset(preset) => write!(formatter, "{preset}"),
+        }
+    }
+}
+
+impl From<DotInputPrecision> for DotPrecision {
+    #[inline]
+    fn from(precision: DotInputPrecision) -> Self {
+        Self::Inputs { lhs: precision, rhs: precision }
+    }
+}
+
+impl From<(DotInputPrecision, DotInputPrecision)> for DotPrecision {
+    #[inline]
+    fn from((lhs, rhs): (DotInputPrecision, DotInputPrecision)) -> Self {
+        Self::Inputs { lhs, rhs }
+    }
+}
+
+impl From<DotAlgorithm> for DotPrecision {
+    #[inline]
+    fn from(algorithm: DotAlgorithm) -> Self {
+        Self::Algorithm(algorithm)
+    }
+}
+
+impl From<DotAlgorithmPreset> for DotPrecision {
+    #[inline]
+    fn from(preset: DotAlgorithmPreset) -> Self {
+        Self::Preset(preset)
+    }
+}
+
 /// Canonical operation name for [`DotOperation`].
 pub const DOT_OPERATION_NAME: &str = "dot";
 
-/// Primitive representing a generalized dot operation (i.e., a tensor contraction) of two identically typed numeric
-/// inputs. Boolean, token, and structural zero element types are rejected. [`DotOperation`] is the unified primitive
-/// for matrix multiplication, batched matrix multiplication, vector inner products, and arbitrary tensor contractions.
-/// The XLA backend lowers it to StableHLO's [`dot_general`](https://openxla.org/stablehlo/spec#dot_general)
-/// instruction.
+/// Primitive representing a generalized dot operation (i.e., a tensor contraction) of two numeric inputs. The inputs
+/// have identical element types, except that two distinct 8-bit floating-point types other than `f8e4m3b11fnuz` are
+/// accepted together with an accumulation type, because XLA backends contract such pairs natively. JAX converts every
+/// other pair of distinct types to the output type itself, which callers do explicitly here. Boolean, token, and
+/// structural zero element types are rejected. [`DotOperation`] is the unified primitive for matrix multiplication,
+/// batched matrix multiplication, vector inner products, and arbitrary tensor contractions. The XLA backend lowers
+/// it to StableHLO's [`dot_general`](https://openxla.org/stablehlo/spec#dot_general) instruction.
 ///
 /// Without an accumulation type, the output keeps the input element type. The eager [`Array`] kernel accumulates
-/// floating-point inputs narrower than `f32` at `f32` and rounds each result once, which is how the XLA backend
-/// evaluates such dot operations. Integer products and sums wrap at the declared element width, and every other
-/// element type accumulates at itself.
+/// floating-point contractions at `f64` when an input or the output is `f64` and at `f32` otherwise, and it rounds
+/// each result once to the output element type. This matches how the XLA backend evaluates floating-point dots whose
+/// inputs or output are narrower than `f32`. Integer products and sums wrap at the declared element width, and every
+/// other element type accumulates at itself.
+///
+/// A [`DotPrecision`] controls the numerics of the contraction (refer to [`Self::with_precision`]). Its per-input
+/// precisions are backend hints. A [`DotAlgorithm`] or a [`DotAlgorithmPreset`] additionally fixes the element types
+/// that the contraction computes with, so the inputs are rounded to the algorithm's input types and each result is
+/// rounded to its accumulation type before it is converted to the output element type. The eager [`Array`] kernel
+/// applies both roundings but still accumulates at `f32` or `f64`, whereas a backend may round intermediate sums at
+/// the accumulation type, decompose the inputs, or use TensorFloat-32. A backend also rounds inputs that a preset
+/// computes with at a wider storage type (e.g., `f32` inputs of the `bf16` presets), which the eager kernel keeps
+/// at that storage type.
 ///
 /// A dot is bilinear, so for `y = dot(a, b)`, forward mode differentiation computes `ẏ = dot(ȧ, b) + dot(a, ḃ)`.
 /// Transposition accepts exactly one linear input and contracts the output cotangent `ȳ` with the other, known input
 /// using the corresponding adjoint dimension numbers. For a matrix multiplication `y = a · b`, for example, it computes
 /// `ā = ȳ · bᵀ` when `a` is linear and `b̄ = aᵀ · ȳ` when `b` is linear. Dots with an accumulation type perform those
-/// contractions at the widened cotangent type before converting the result back to the linear input's cotangent
+/// contractions at the cotangent type of the output before converting the result back to the linear input's cotangent
 /// representation.
 ///
 /// Each forward mode tangent term is staged as an ordinary dot that preserves the primal dimension numbers,
 /// accumulation type, and requested output sharding without introducing captures. The adjoint contraction emits the
 /// linear input's axes in dot order, so transposition requests the cotangent dual of the linear input's sharding in
 /// that order and then restores the original axis order and placement with the inverse permutation. A structural zero
-/// output cotangent remains structural zero.
+/// output cotangent remains structural zero. Tangent terms and adjoint contractions keep the primal [`DotPrecision`]
+/// whenever it supports their input element types, and they otherwise use the default precision. An algorithm stops
+/// applying only when a derivative contraction computes with other types than the primal (e.g., an `Any_F8` preset
+/// whose adjoint contracts an `f32` cotangent), whereas JAX passes the algorithm on unchanged and fails to compile
+/// such derivatives.
 ///
-/// Batching aligns the inputs onto a common mapped axis and lifts the dimension numbers past it. Materializing an axis
-/// on a replicated input preserves a dynamic mapped extent as a first-class value. Two mapped inputs must describe the
-/// same mapped extent. For dynamic extents, they must share the same [`DimensionVariable`](crate::DimensionVariable).
+/// Batching lifts the dimension numbers past the mapped axes and stages one contraction over the inputs as they are.
+/// The mapped axes of two mapped inputs become a new leading batching pair. When only one input is mapped, its mapped
+/// axis becomes one more of its result dimensions, so the replicated input is contracted without being broadcast across
+/// the mapped extent (e.g., mapping `x · W` over `x` remains one matrix multiplication against `W`). The mapped axis of
+/// the output is then not necessarily its first axis (refer to [`DotDimensionNumbers::batched`]). Two mapped inputs
+/// must describe the same mapped extent. For dynamic extents, they must share the same
+/// [`DimensionVariable`](crate::DimensionVariable).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DotOperation {
     /// Contracting and batching dimension specification.
     dimensions: DotDimensionNumbers,
+
+    /// Precision configuration. Refer to the documentation of [`Self::with_precision`].
+    precision: DotPrecision,
 
     /// Optional accumulation data type. Refer to the documentation of [`Self::with_accumulation_type`].
     accumulation_type: Option<DataType>,
@@ -312,7 +904,7 @@ impl DotOperation {
     /// Creates a new [`DotOperation`] with the provided dimension numbers.
     #[inline]
     pub fn new(dimensions: DotDimensionNumbers) -> Self {
-        Self { dimensions, accumulation_type: None, output_sharding: None }
+        Self { dimensions, precision: DotPrecision::default(), accumulation_type: None, output_sharding: None }
     }
 
     /// Returns a [`DotOperation`] configured for rank-two matrix multiplication.
@@ -321,14 +913,26 @@ impl DotOperation {
         Self::new(DotDimensionNumbers::matmul())
     }
 
-    /// Returns this [`DotOperation`] with the provided accumulation data type. The input element types must still
-    /// match each other and must support the accumulation type, which becomes the output element type. The eager
-    /// kernel upcasts the inputs and accumulates the contraction at the wider type. This is the
-    /// `preferred_element_type` contract of XLA, which its low precision matrix units implement natively (e.g.,
-    /// `f8 × f8 → f32` and `bf16 × bf16 → f32`). Dots with an accumulation type differentiate like ordinary dots,
-    /// with tangents and cotangents carried at the accumulation type (refer to the forward mode and transposition
-    /// documentation of this operation), and they can also request an output sharding (refer to
-    /// [`Self::with_output_sharding`]).
+    /// Returns this [`DotOperation`] with the provided [`DotPrecision`], which is built from a [`DotInputPrecision`]
+    /// for both inputs, a pair of them, a [`DotAlgorithm`], or a [`DotAlgorithmPreset`]. The precision never changes
+    /// the output type, which the input types and the accumulation type determine. Type inference validates it against
+    /// the input element types (refer to [`DotPrecision::validate`]). This is the `precision` argument of JAX's
+    /// `dot_general`.
+    #[inline]
+    pub fn with_precision<P: Into<DotPrecision>>(mut self, precision: P) -> Self {
+        self.precision = precision.into();
+        self
+    }
+
+    /// Returns this [`DotOperation`] with the provided accumulation data type, which becomes the output element type.
+    /// Floating-point inputs support every floating-point accumulation type, including narrower ones, and integer
+    /// inputs support integer accumulation types with the same signedness that are at least as wide. The input element
+    /// types must still match each other, unless they are two distinct 8-bit floating-point types that backends
+    /// contract natively (i.e., every such type except `f8e4m3b11fnuz`). This is the `preferred_element_type` contract
+    /// of XLA, which its low precision matrix units implement natively (e.g., `f8 × f8 → f32` and `bf16 × bf16 → f32`).
+    /// Dots with an accumulation type differentiate like ordinary dots, with tangents and cotangents carried at the
+    /// accumulation type (refer to the forward mode and transposition documentation of this operation), and they
+    /// can also request an output sharding (refer to [`Self::with_output_sharding`]).
     #[inline]
     pub fn with_accumulation_type<D: Into<Option<DataType>>>(mut self, accumulation_type: D) -> Self {
         self.accumulation_type = accumulation_type.into();
@@ -352,6 +956,13 @@ impl DotOperation {
         &self.dimensions
     }
 
+    /// Returns the [`DotPrecision`] of this [`DotOperation`]. Refer to the documentation of [`Self::with_precision`]
+    /// for more information.
+    #[inline]
+    pub fn precision(&self) -> DotPrecision {
+        self.precision
+    }
+
     /// Returns the optional accumulation data type of this [`DotOperation`]. Refer to the documentation of
     /// [`Self::with_accumulation_type`] for more information on what the accumulation data type is and how it is used.
     #[inline]
@@ -365,10 +976,30 @@ impl DotOperation {
         self.output_sharding.as_ref()
     }
 
-    /// Applies this operation to `lhs` and `rhs` through the [`Dot`] capability, forwarding the accumulation type and
-    /// the requested output sharding, so that interpretation and differentiation over staging values preserve them.
+    /// Applies this operation to `lhs` and `rhs` through the [`Dot`] capability, forwarding the precision, the
+    /// accumulation type, and the requested output sharding, so that interpretation and differentiation over staging
+    /// values preserve them.
     fn apply<V: Dot>(&self, lhs: &V, rhs: &V) -> Result<V, ProgramError> {
-        lhs.dot_with_configuration(rhs, &self.dimensions, self.accumulation_type, self.output_sharding.as_ref())
+        lhs.dot_with_configuration(
+            rhs,
+            &self.dimensions,
+            self.precision,
+            self.accumulation_type,
+            self.output_sharding.as_ref(),
+        )
+    }
+
+    /// Returns the [`DotPrecision`] of a derivative contraction of this operation (i.e., a forward mode tangent term or
+    /// an adjoint contraction) whose input element types are `lhs` and `rhs`. Derivative contractions keep the primal
+    /// precision whenever it supports their input types. They may compute with other types than the primal (e.g., with
+    /// a widened tangent or with a cotangent at the accumulation type), which an algorithm for the primal types need
+    /// not support, and they then use the default precision.
+    fn derivative_precision(&self, lhs: DataType, rhs: DataType) -> DotPrecision {
+        if self.precision.validate(DOT_OPERATION_NAME, lhs, rhs).is_ok() {
+            self.precision
+        } else {
+            DotPrecision::default()
+        }
     }
 }
 
@@ -393,19 +1024,25 @@ impl Operation for DotOperation {
         _region_interfaces: &[RegionInterface<ArrayType>],
     ) -> Result<Vec<ArrayType>, TypeError> {
         check_count!("input", input_types, 2, TypeError);
-        Ok(vec![infer_dot_output_type(
+        let output_type = infer_dot_output_type(
             DOT_OPERATION_NAME,
             &input_types[0],
             &input_types[1],
             &self.dimensions,
             self.accumulation_type,
             self.output_sharding.as_ref(),
-        )?])
+        )?;
+        self.precision
+            .validate(DOT_OPERATION_NAME, input_types[0].data_type(), input_types[1].data_type())?;
+        Ok(vec![output_type])
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?.bracketed(|operation| {
             operation.field("dimensions", &self.dimensions)?;
+            if !self.precision.is_default() {
+                operation.field("precision", self.precision)?;
+            }
             if let Some(accumulation_type) = self.accumulation_type {
                 operation.field("accumulation_type", &accumulation_type)?;
             }
@@ -427,8 +1064,9 @@ where
         _driver: &D,
         inputs: &[C::Value],
     ) -> Result<Vec<C::Value>, ProgramError> {
-        // Concrete values record the requested sharding and upcast for the accumulation type, while staging values
-        // (e.g., during program batching) stage an operation that preserves both.
+        // Concrete values record the requested sharding and compute at the element types that the precision and the
+        // accumulation type select, while staging values (e.g., during program batching) stage an operation that
+        // preserves all three.
         check_count!("input", inputs, 2, ProgramError);
         Ok(vec![self.apply(&inputs[0], &inputs[1])?])
     }
@@ -450,37 +1088,25 @@ where
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        // Alignment delegates mapped axis materialization to `ArrayExtentBatchingPolicy::match_axis`, so a dynamic
-        // mapped extent remains a first-class value. The lifted contraction keeps each item independent across the
-        // inserted axis.
+        // Every input is contracted as it is, with its mapped axis in place. The mapped axes of two mapped inputs
+        // become a new leading batching pair. The mapped axis of a single mapped input becomes one more of its result
+        // dimensions, so the replicated input needs no mapped axis and is never broadcast across the mapped extent,
+        // which also means that a dynamic mapped extent needs no extent value here. The lifted contraction keeps each
+        // item independent across the mapped axis in both cases.
         check_count!("input", inputs, 2, ProgramError);
-        self.dimensions.validate(
-            DOT_OPERATION_NAME,
-            inputs[0].unbatched_type().rank(),
-            inputs[1].unbatched_type().rank(),
-        )?;
+        let lhs_rank = inputs[0].unbatched_type().rank();
+        let rhs_rank = inputs[1].unbatched_type().rank();
+        self.dimensions.validate(DOT_OPERATION_NAME, lhs_rank, rhs_rank)?;
         validate_common_mapped_dimension(DOT_OPERATION_NAME, inputs)?;
+        let (lifted_dimensions, output_axis) = self.dimensions.batched(
+            lhs_rank,
+            rhs_rank,
+            inputs[0].batch_axis_position(),
+            inputs[1].batch_axis_position(),
+        );
 
-        // A mixed pair needs a physical batch axis on its replicated input before the logical dimension numbers can be
-        // lifted. Insert that axis at position zero through the active policy, so a dynamic mapped extent remains an
-        // extent value grounding the broadcast instead of requiring a statically known host size.
-        let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
-        let aligned_inputs: Vec<ArrayBatch<C::Value>> = match (batch_axes[0], batch_axes[1]) {
-            (Some(_), Some(_)) | (None, None) => inputs.to_vec(),
-            (Some(_), None) => vec![inputs[0].clone(), P::match_axis(context, &inputs[1], Axis::from(0))?],
-            (None, Some(_)) => vec![P::match_axis(context, &inputs[0], Axis::from(0))?, inputs[1].clone()],
-        };
-        let (lifted_dimensions, output_axis) = self
-            .dimensions
-            .batched(aligned_inputs[0].batch_axis_position(), aligned_inputs[1].batch_axis_position())
-            .ok_or_else(|| BatchingError::MisalignedBatchAxes {
-                message: format!(
-                    "`{DOT_OPERATION_NAME}` batching failed to lift its dimension numbers for the aligned batch axes",
-                ),
-            })?;
-
-        // The output batch axis carries the sharding of the inputs' mapped axes, including in a requested output
-        // sharding.
+        // The output batch axis carries the sharding of the inputs' mapped axes. The contraction infers it from the
+        // mapped inputs, and a requested output sharding gains it at the position of the output batch axis.
         let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
         let output_sharding = match (self.output_sharding(), output_axis) {
             (Some(output_sharding), Some(axis)) => {
@@ -490,10 +1116,11 @@ where
             (None, _) => None,
         };
         let lifted_operation = DotOperation::new(lifted_dimensions)
+            .with_precision(self.precision)
             .with_accumulation_type(self.accumulation_type)
             .with_output_sharding(output_sharding);
         let output_batch_axes = [BatchAxis::from_optional_position(output_axis)];
-        lifted_operation.interpret_with_batch_axes(context, &aligned_inputs, &output_batch_axes)
+        lifted_operation.interpret_with_batch_axes(context, inputs, &output_batch_axes)
     }
 }
 
@@ -508,12 +1135,24 @@ impl_differentiable_operation! {
         |operation, context, _driver, inputs| {
             // Forward mode differentiation applies the product rule. Each term holds the corresponding primal input
             // fixed on its original contracting side and stages an ordinary dot with the primal operation's dimensions,
-            // accumulation type, and requested output sharding.
+            // accumulation type, and requested output sharding. A term whose factors were converted to the tangent
+            // type keeps the primal precision only when it supports that type.
             check_count!("input", inputs, 2, ProgramError);
             let left = &inputs[0];
             let right = &inputs[1];
             let primal = operation.apply(left.primal(), right.primal())?;
-            Ok(vec![bilinear_array_jvp(context, primal, left, right, |left, right| Ok(operation.apply(left, right)?))?])
+            let apply = |left: &C::Value, right: &C::Value| {
+                let precision =
+                    operation.derivative_precision(left.r#type().data_type(), right.r#type().data_type());
+                Ok(left.dot_with_configuration(
+                    right,
+                    operation.dimensions(),
+                    precision,
+                    operation.accumulation_type(),
+                    operation.output_sharding(),
+                )?)
+            };
+            Ok(vec![bilinear_array_jvp(context, primal, left, right, apply)?])
         }
     },
     transpose<V, O>
@@ -635,12 +1274,22 @@ impl_differentiable_operation! {
                 .sharding()
                 .map(|sharding| sharding.transpose(output_axes.clone()))
                 .transpose()?;
-            let adjoint = DotOperation::new(dimensions).with_output_sharding(adjoint_output_sharding);
             let adjoint_inputs = if linear_index == 0 {
                 [output_cotangent.clone(), known_value]
             } else {
                 [known_value, output_cotangent.clone()]
             };
+
+            // The output cotangent takes the place of the linear input, so the known input keeps its side and its
+            // requested precision. Both adjoint inputs have the cotangent element type of the output, which an
+            // algorithm for the primal input types need not support.
+            let adjoint_precision = operation.derivative_precision(
+                adjoint_inputs[0].r#type().data_type(),
+                adjoint_inputs[1].r#type().data_type(),
+            );
+            let adjoint = DotOperation::new(dimensions)
+                .with_precision(adjoint_precision)
+                .with_output_sharding(adjoint_output_sharding);
             let mut adjoint_outputs = context.stage_operation(adjoint, Vec::new(), &adjoint_inputs)?;
             check_count!("output", adjoint_outputs, 1, ProgramError);
             let adjoint_value = adjoint_outputs.remove(0).transpose(Permutation::from(output_axes).inverse()?)?;
@@ -669,12 +1318,26 @@ pub trait Dot<T = <Self as Capability>::Universe>: Capability + Sized {
     /// the inputs are incompatible with `dimensions` or the contraction cannot be recorded in the value's context.
     #[inline]
     fn dot(&self, rhs: &Self, dimensions: &DotDimensionNumbers) -> Result<Self, ProgramError> {
-        self.dot_with_configuration(rhs, dimensions, None, None)
+        self.dot_with_configuration(rhs, dimensions, DotPrecision::default(), None, None)
     }
 
-    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, upcasting the inputs to
-    /// `accumulation_type` and accumulating the contraction there, so the result carries the accumulation type.
-    /// Refer to the documentation of [`DotOperation::with_accumulation_type`] for the exact contract.
+    /// Computes the generalized dot product of `self` and `rhs` using `dimensions` and the provided [`DotPrecision`],
+    /// which requests a precision for each input or an algorithm for the contraction (e.g.,
+    /// `DotAlgorithmPreset::BF16_BF16_F32.into()`). Refer to the documentation of [`DotOperation::with_precision`]
+    /// for the exact contract.
+    #[inline]
+    fn dot_with_precision(
+        &self,
+        rhs: &Self,
+        dimensions: &DotDimensionNumbers,
+        precision: DotPrecision,
+    ) -> Result<Self, ProgramError> {
+        self.dot_with_configuration(rhs, dimensions, precision, None, None)
+    }
+
+    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, accumulating the contraction at
+    /// `accumulation_type`, so the result carries the accumulation type. Refer to the documentation of
+    /// [`DotOperation::with_accumulation_type`] for the exact contract.
     #[inline]
     fn dot_with_accumulation_type(
         &self,
@@ -682,7 +1345,7 @@ pub trait Dot<T = <Self as Capability>::Universe>: Capability + Sized {
         dimensions: &DotDimensionNumbers,
         accumulation_type: DataType,
     ) -> Result<Self, ProgramError> {
-        self.dot_with_configuration(rhs, dimensions, Some(accumulation_type), None)
+        self.dot_with_configuration(rhs, dimensions, DotPrecision::default(), Some(accumulation_type), None)
     }
 
     /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, requesting `output_sharding` for
@@ -697,19 +1360,21 @@ pub trait Dot<T = <Self as Capability>::Universe>: Capability + Sized {
         dimensions: &DotDimensionNumbers,
         output_sharding: &Sharding,
     ) -> Result<Self, ProgramError> {
-        self.dot_with_configuration(rhs, dimensions, None, Some(output_sharding))
+        self.dot_with_configuration(rhs, dimensions, DotPrecision::default(), None, Some(output_sharding))
     }
 
-    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, accumulating the contraction at
-    /// `accumulation_type` when one is provided (refer to [`Self::dot_with_accumulation_type`]) and requesting
-    /// `output_sharding` for the result when one is provided (refer to [`Self::dot_with_output_sharding`]). The two
-    /// options are independent, because the accumulation type determines the element type of the result while the
-    /// requested sharding determines its placement. This is the most general function of this capability, and the
-    /// other functions are implemented using it.
+    /// Computes the generalized dot product of `self` and `rhs` using `dimensions`, with the provided
+    /// [`DotPrecision`] (refer to [`Self::dot_with_precision`]), accumulating the contraction at `accumulation_type`
+    /// when one is provided (refer to [`Self::dot_with_accumulation_type`]), and requesting `output_sharding` for the
+    /// result when one is provided (refer to [`Self::dot_with_output_sharding`]). The three options are independent,
+    /// because the precision selects how the contraction is computed, the accumulation type determines the element
+    /// type of the result, and the requested sharding determines its placement. This is the most general function of
+    /// this capability, and the other functions are implemented using it.
     fn dot_with_configuration(
         &self,
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
+        precision: DotPrecision,
         accumulation_type: Option<DataType>,
         output_sharding: Option<&Sharding>,
     ) -> Result<Self, ProgramError>;
@@ -720,33 +1385,49 @@ impl Dot for Array {
         &self,
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
+        precision: DotPrecision,
         accumulation_type: Option<DataType>,
         output_sharding: Option<&Sharding>,
     ) -> Result<Self, ProgramError> {
-        // The kernel accumulates at the input element type, so an accumulation type upcasts the inputs first, after the
-        // `DotOperation` type inference rule validated it against the original input types, which the upcast inputs no
-        // longer carry.
-        if let Some(accumulation_type) = accumulation_type {
-            DotOperation::new(dimensions.clone())
-                .with_accumulation_type(accumulation_type)
-                .with_output_sharding(output_sharding.cloned())
-                .infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?;
-            let lhs = self.convert_element_type(accumulation_type)?;
-            let rhs = rhs.convert_element_type(accumulation_type)?;
-            return lhs.dot_with_configuration(&rhs, dimensions, None, output_sharding);
-        }
+        // The `DotOperation` type inference rule validates the complete configuration against the original input
+        // types, which the converted inputs below no longer carry, and it determines the output element type.
+        let lhs_type = self.r#type().data_type();
+        let rhs_type = rhs.r#type().data_type();
+        let output_type = DotOperation::new(dimensions.clone())
+            .with_precision(precision)
+            .with_accumulation_type(accumulation_type)
+            .with_output_sharding(output_sharding.cloned())
+            .infer_output_types(&[self.r#type().into_owned(), rhs.r#type().into_owned()], &[])?
+            .remove(0)
+            .data_type();
+
+        // The precision selects the element types that the inputs are rounded to and the type that each result is
+        // rounded to before it is converted to the output type. Floating-point contractions accumulate at `f64` when
+        // one of those types is `f64` and at `f32` otherwise, and every narrower type is exactly representable there,
+        // so each result is rounded once. This matches how XLA backends evaluate dots of narrow floating-point types
+        // when no algorithm is requested. Every other element type accumulates at the output type.
+        let (lhs_type, rhs_type, result_type) = precision.computation_types(lhs_type, rhs_type, output_type);
+        let kernel_type = if !output_type.is_floating_point() {
+            output_type
+        } else if [lhs_type, rhs_type, result_type].contains(&DataType::F64) {
+            DataType::F64
+        } else {
+            DataType::F32
+        };
+        let lhs = self.convert_element_type(lhs_type)?.convert_element_type(kernel_type)?;
+        let rhs = rhs.convert_element_type(rhs_type)?.convert_element_type(kernel_type)?;
 
         // An `Array` is a concrete value on a single device whose payload is always its logical (i.e., fully reduced)
         // value, so a requested sharding only describes the placement of its result, exactly as for `Reshard`. That
         // holds for unreduced axes as well, which describe partial sums whose total is that payload. The `DotOperation`
         // type inference rule validates the request exactly as it does for staged programs and determines the result
         // type.
-        let data_type = self.r#type().data_type();
-        validate_dot_data_type(DOT_OPERATION_NAME, data_type)?;
         dispatch_on_array_element_type!(
-            @numeric data_type,
-            |Element| self.dot_elements::<Element>(rhs, dimensions, output_sharding),
-        )
+            @numeric kernel_type,
+            |Element| lhs.dot_elements::<Element>(&rhs, dimensions, output_sharding),
+        )?
+        .convert_element_type(result_type)?
+        .convert_element_type(output_type)
     }
 }
 
@@ -760,6 +1441,7 @@ where
         &self,
         rhs: &Self,
         dimensions: &DotDimensionNumbers,
+        precision: DotPrecision,
         accumulation_type: Option<DataType>,
         output_sharding: Option<&Sharding>,
     ) -> Result<Self, ProgramError> {
@@ -768,6 +1450,7 @@ where
         let inputs = [self.clone(), rhs.clone()];
         let inputs = ManualVariationAlignment::align_manual_variation(&inputs)?;
         let operation = DotOperation::new(dimensions.clone())
+            .with_precision(precision)
             .with_accumulation_type(accumulation_type)
             .with_output_sharding(output_sharding.cloned());
         let mut outputs = self.domain().bind(operation, Vec::new(), &inputs)?;
@@ -1326,7 +2009,12 @@ where
         // so a replicated data input is materialized across the mapped extent and a mapped one moves its axis there.
         let lhs = P::match_axis(context, &inputs[0], Axis::from(0))?;
         let rhs = P::match_axis(context, &inputs[1], Axis::from(0))?;
-        let (dot_dimensions, _) = self.dimensions.dot_dimensions().batched(Some(0), Some(0)).unwrap();
+        let (dot_dimensions, _) = self.dimensions.dot_dimensions().batched(
+            inputs[0].unbatched_type().rank(),
+            inputs[1].unbatched_type().rank(),
+            Some(0),
+            Some(0),
+        );
         let dimensions = RaggedDotDimensionNumbers::new(
             dot_dimensions,
             self.dimensions.lhs_ragged_dimension() + 1,
@@ -1950,11 +2638,15 @@ pub(crate) fn validate_common_mapped_dimension<V: Value<Type = ArrayType>>(
 /// Infers the output type of one generalized dot product operation, naming `operation_name` in diagnostics. The result
 /// shape is `[batching..., lhs_result..., rhs_result...]`, where the result dimensions are the input axes that are
 /// neither batching nor contracting, in their original order. The output element type is the requested compatible
-/// accumulation type when one is provided, or otherwise the common input element type.
+/// accumulation type when one is provided, or otherwise the common input element type. The input element types must
+/// match, except that two distinct 8-bit floating-point types other than `f8e4m3b11fnuz` are accepted together with
+/// an accumulation type, which XLA backends contract natively without converting either input. These are the pairs
+/// that JAX leaves unconverted when it lowers a dot.
 ///
 /// Floating-point compatibility deliberately does not use the standard elementwise promotion lattice. Backend dot
-/// instructions expose an independent preferred accumulator type, so even sub-byte and 8-bit inputs may accumulate
-/// at `f32` or `f64`. Integer accumulation preserves signedness and may only widen the input type.
+/// instructions expose an independent preferred accumulator type, so floating-point inputs may accumulate at every
+/// floating-point type, including narrower ones (e.g., 8-bit inputs at `bf16`, or `f32` inputs at `f16`). Integer
+/// accumulation preserves signedness and may only widen the input type. This is XLA's `preferred_element_type` rule.
 ///
 /// The output [`Sharding`] follows the `dot_general` sharding rule of JAX (i.e., `_dot_general_sharding_rule`
 /// in the [JAX implementation](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/lax.py)). The StableHLO
@@ -1986,7 +2678,14 @@ pub(crate) fn infer_dot_output_type(
     output_sharding: Option<&Sharding>,
 ) -> Result<ArrayType, TypeError> {
     ArrayType::check_matching_manual_variation(operation_name, &[lhs, rhs])?;
-    if lhs.data_type() != rhs.data_type() {
+
+    // Backends contract two distinct 8-bit floating-point types natively, except for `f8e4m3b11fnuz`, which JAX also
+    // converts first. Such a pair has no common input type to default the output to, so it needs an accumulation type.
+    // Every other pair of distinct types must be converted explicitly by the caller.
+    let is_native_f8_pair = [lhs.data_type(), rhs.data_type()]
+        .into_iter()
+        .all(|data_type| is_f8_data_type(data_type) && data_type != DataType::F8E4M3B11FNUZ);
+    if lhs.data_type() != rhs.data_type() && !(accumulation_type.is_some() && is_native_f8_pair) {
         return Err(TypeError::invalid(format!("`{operation_name}` input element types are incompatible")));
     }
 
@@ -2003,11 +2702,12 @@ pub(crate) fn infer_dot_output_type(
     }
 
     if let Some(accumulation_type) = accumulation_type {
-        // An identical type is valid. Floating-point inputs may accumulate at `f32` or `f64`, and integer inputs may
-        // accumulate at an integer type with the same signedness that is at least as wide.
+        // An identical type is valid. Floating-point inputs may accumulate at every floating-point type, and integer
+        // inputs may accumulate at an integer type with the same signedness that is at least as wide. Two distinct
+        // 8-bit floating-point inputs are both floating-point, so checking the left-hand side covers them.
         let input_type = lhs.data_type();
         let compatible = input_type == accumulation_type
-            || (input_type.is_floating_point() && matches!(accumulation_type, DataType::F32 | DataType::F64))
+            || (input_type.is_floating_point() && accumulation_type.is_floating_point())
             || (input_type.is_integer()
                 && accumulation_type.is_integer()
                 && input_type.is_signed() == accumulation_type.is_signed()
@@ -2307,10 +3007,18 @@ fn validate_dot_data_type(operation_name: &str, data_type: DataType) -> Result<(
     }
 }
 
+// TODO(eaplatanios): Inline this function.
+/// Returns `true` if `data_type` is an 8-bit floating-point type (e.g., [`DataType::F8E4M3FN`]). These are the types
+/// that the `Any_F8` [`DotAlgorithmPreset`]s require.
+fn is_f8_data_type(data_type: DataType) -> bool {
+    data_type.is_floating_point() && data_type.bit_width() == 8
+}
+
 /// Applies the product rule `ẏ = f(ȧ, b) + f(a, ḃ)` of a bilinear dot operation `y = f(a, b)`, where `apply` evaluates
 /// `f`. Structural zero tangents drop their term, so `ẏ` is a structural zero only when both `ȧ` and `ḃ` are. Dense
-/// and ragged dot operations share this rule. When one factor of a tangent term uses the widened tangent
-/// representation, both factors are converted to the output tangent element type before applying the operation.
+/// and ragged dot operations share this rule. A tangent term whose factors have the element types of the primal inputs
+/// applies the operation to them directly. When a tangent uses a widened representation instead, both factors of its
+/// term are converted to the output tangent element type before applying the operation.
 fn bilinear_array_jvp<C, V, ApplyFn, P: DifferentiationPolicy<C>>(
     context: &DifferentiationContext<C, P>,
     primal: V,
@@ -2333,8 +3041,12 @@ where
         }
     };
 
+    // The factors of a term are one tangent and the other primal. They have the primal input element types unless
+    // the tangent is widened, which also covers primal inputs with two distinct element types.
+    let lhs_type = lhs.primal().r#type().data_type();
+    let rhs_type = rhs.primal().r#type().data_type();
     let apply_tangent = |lhs: &V, rhs: &V| {
-        if lhs.r#type().data_type() == rhs.r#type().data_type() {
+        if lhs.r#type().data_type() == lhs_type && rhs.r#type().data_type() == rhs_type {
             apply_fn(lhs, rhs)
         } else {
             apply_fn(&convert_to_tangent_type(lhs)?, &convert_to_tangent_type(rhs)?)
@@ -2373,7 +3085,7 @@ mod tests {
         Array, ArrayBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
         ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh,
         Memory, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError, StridedLayout, f8e4m3fn,
-        f8e8m0fnu, i4,
+        f8e5m2, f8e8m0fnu, i4,
     };
     use crate::batching::{
         BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, BatchingTracer,
@@ -2464,17 +3176,77 @@ mod tests {
     fn test_dot_dimension_numbers_batched() {
         let dimensions = DotDimensionNumbers::matmul();
         assert_eq!(
-            dimensions.batched(Some(1), Some(2)),
-            Some((DotDimensionNumbers::new(vec![2], vec![0], vec![1], vec![2]), Some(0))),
+            dimensions.batched(2, 2, Some(1), Some(2)),
+            (DotDimensionNumbers::new(vec![2], vec![0], vec![1], vec![2]), Some(0)),
         );
-        assert_eq!(dimensions.batched(None, None), Some((dimensions.clone(), None)));
-        assert_eq!(dimensions.batched(Some(0), None), None);
-        assert_eq!(dimensions.batched(None, Some(0)), None);
+        assert_eq!(dimensions.batched(2, 2, None, None), (dimensions.clone(), None));
 
-        // The inserted axes lead the batching pairs, and existing axes at or after an insertion position shift by one.
+        // The mapped axes lead the batching pairs, and existing axes at or after a mapped axis shift by one.
+        let batched_matmul = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
         assert_eq!(
-            DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]).batched(Some(1), Some(0)),
-            Some((DotDimensionNumbers::new(vec![3], vec![2], vec![1, 0], vec![0, 1]), Some(0))),
+            batched_matmul.batched(3, 3, Some(1), Some(0)),
+            (DotDimensionNumbers::new(vec![3], vec![2], vec![1, 0], vec![0, 1]), Some(0)),
+        );
+
+        // A single mapped left-hand side keeps the right-hand side dimensions. Its mapped axis becomes a result
+        // dimension, which follows the batching dimensions and the left-hand side result dimensions before it. For
+        // `[M, K] × [K, N]`, the physical left-hand sides `[B, M, K]`, `[M, B, K]`, and `[M, K, B]` produce
+        // `[B, M, N]`, `[M, B, N]`, and `[M, B, N]`.
+        assert_eq!(
+            dimensions.batched(2, 2, Some(0), None),
+            (DotDimensionNumbers::new(vec![2], vec![0], vec![], vec![]), Some(0)),
+        );
+        assert_eq!(
+            dimensions.batched(2, 2, Some(1), None),
+            (DotDimensionNumbers::new(vec![2], vec![0], vec![], vec![]), Some(1)),
+        );
+        assert_eq!(
+            dimensions.batched(2, 2, Some(2), None),
+            (DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]), Some(1)),
+        );
+
+        // A single mapped right-hand side keeps the left-hand side dimensions. Its mapped axis additionally follows
+        // every left-hand side result dimension. The physical right-hand sides `[B, K, N]`, `[K, B, N]`, and
+        // `[K, N, B]` produce `[M, B, N]`, `[M, B, N]`, and `[M, N, B]`.
+        assert_eq!(
+            dimensions.batched(2, 2, None, Some(0)),
+            (DotDimensionNumbers::new(vec![1], vec![1], vec![], vec![]), Some(1)),
+        );
+        assert_eq!(
+            dimensions.batched(2, 2, None, Some(1)),
+            (DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]), Some(1)),
+        );
+        assert_eq!(
+            dimensions.batched(2, 2, None, Some(2)),
+            (DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]), Some(2)),
+        );
+
+        // Existing batching dimensions precede the mapped axis of a single mapped input in the output, wherever that
+        // axis is in the input. The physical left-hand sides `[b, B, M, K]` and `[B, b, M, K]` of
+        // `[b, M, K] × [b, K, N]` both produce `[b, B, M, N]`, and the physical right-hand side `[b, K, N, B]`
+        // produces `[b, M, N, B]`.
+        assert_eq!(
+            batched_matmul.batched(3, 3, Some(1), None),
+            (DotDimensionNumbers::new(vec![3], vec![1], vec![0], vec![0]), Some(1)),
+        );
+        assert_eq!(
+            batched_matmul.batched(3, 3, Some(0), None),
+            (DotDimensionNumbers::new(vec![3], vec![1], vec![1], vec![0]), Some(1)),
+        );
+        assert_eq!(
+            batched_matmul.batched(3, 3, None, Some(3)),
+            (DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]), Some(3)),
+        );
+
+        // An input without result dimensions contributes none before the mapped axis of the other input.
+        let inner_product = DotDimensionNumbers::inner_product();
+        assert_eq!(
+            inner_product.batched(1, 1, Some(0), None),
+            (DotDimensionNumbers::new(vec![1], vec![0], vec![], vec![]), Some(0)),
+        );
+        assert_eq!(
+            inner_product.batched(1, 1, None, Some(1)),
+            (DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]), Some(0)),
         );
     }
 
@@ -2541,19 +3313,443 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_input_precision_display() {
+        assert_eq!(DotInputPrecision::default(), DotInputPrecision::Default);
+        assert_eq!(DotInputPrecision::Default.to_string(), "default");
+        assert_eq!(DotInputPrecision::High.to_string(), "high");
+        assert_eq!(DotInputPrecision::Highest.to_string(), "highest");
+    }
+
+    #[test]
+    fn test_dot_algorithm_new() {
+        let algorithm = DotAlgorithm::new(DataType::BF16, DataType::F16, DataType::F32);
+        assert_eq!(algorithm.lhs_precision_type(), DataType::BF16);
+        assert_eq!(algorithm.rhs_precision_type(), DataType::F16);
+        assert_eq!(algorithm.accumulation_type(), DataType::F32);
+        assert_eq!(algorithm.lhs_component_count(), 1);
+        assert_eq!(algorithm.rhs_component_count(), 1);
+        assert_eq!(algorithm.primitive_operation_count(), 1);
+        assert!(!algorithm.allow_imprecise_accumulation());
+        assert_eq!(
+            algorithm.to_string(),
+            "(lhs_precision_type=bf16, rhs_precision_type=f16, accumulation_type=f32, lhs_component_count=1, \
+             rhs_component_count=1, primitive_operation_count=1, allow_imprecise_accumulation=false)",
+        );
+        assert_eq!(
+            format!("{algorithm:?}"),
+            "DotAlgorithm { lhs_precision_type: BF16, rhs_precision_type: F16, accumulation_type: F32, \
+             lhs_component_count: 1, rhs_component_count: 1, primitive_operation_count: 1, \
+             allow_imprecise_accumulation: false }",
+        );
+    }
+
+    #[test]
+    fn test_dot_algorithm_with_component_counts() {
+        let algorithm = DotAlgorithm::new(DataType::F32, DataType::F32, DataType::F32).with_component_counts(2, 3);
+        assert_eq!(algorithm.lhs_component_count(), 2);
+        assert_eq!(algorithm.rhs_component_count(), 3);
+        assert_eq!(algorithm.primitive_operation_count(), 1);
+    }
+
+    #[test]
+    fn test_dot_algorithm_with_primitive_operation_count() {
+        let algorithm = DotAlgorithm::new(DataType::BF16, DataType::BF16, DataType::F32);
+        assert_eq!(algorithm.with_primitive_operation_count(6).primitive_operation_count(), 6);
+        assert_ne!(algorithm.with_primitive_operation_count(6), algorithm);
+    }
+
+    #[test]
+    fn test_dot_algorithm_with_imprecise_accumulation() {
+        let algorithm = DotAlgorithm::new(DataType::F8E4M3FN, DataType::F8E5M2, DataType::F32);
+        assert!(algorithm.with_imprecise_accumulation(true).allow_imprecise_accumulation());
+        assert_eq!(algorithm.with_imprecise_accumulation(true).with_imprecise_accumulation(false), algorithm);
+        assert_eq!(
+            algorithm.with_imprecise_accumulation(true).to_string(),
+            "(lhs_precision_type=f8e4m3fn, rhs_precision_type=f8e5m2, accumulation_type=f32, lhs_component_count=1, \
+             rhs_component_count=1, primitive_operation_count=1, allow_imprecise_accumulation=true)",
+        );
+    }
+
+    #[test]
+    fn test_dot_algorithm_preset_input_types() {
+        // The `Any_F8` presets compute with the input types of their operation, and every other preset lists the
+        // storage types that it computes with, starting with the type that other inputs are converted to.
+        let f8_presets = [
+            DotAlgorithmPreset::Any_F8_Any_F8_F32,
+            DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation,
+            DotAlgorithmPreset::Any_F8_Any_F8_Any,
+            DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation,
+        ];
+        for preset in f8_presets {
+            assert_eq!(preset.input_types(), None);
+        }
+        let cases: [(DotAlgorithmPreset, &[DataType]); 11] = [
+            (DotAlgorithmPreset::F16_F16_F16, &[DataType::F16]),
+            (DotAlgorithmPreset::F16_F16_F32, &[DataType::F16]),
+            (DotAlgorithmPreset::BF16_BF16_BF16, &[DataType::BF16, DataType::F32]),
+            (DotAlgorithmPreset::BF16_BF16_F32, &[DataType::BF16, DataType::F32]),
+            (DotAlgorithmPreset::BF16_BF16_F32_X3, &[DataType::F32]),
+            (DotAlgorithmPreset::BF16_BF16_F32_X6, &[DataType::F32]),
+            (DotAlgorithmPreset::BF16_BF16_F32_X9, &[DataType::F32]),
+            (DotAlgorithmPreset::TF32_TF32_F32, &[DataType::F32]),
+            (DotAlgorithmPreset::TF32_TF32_F32_X3, &[DataType::F32]),
+            (DotAlgorithmPreset::F32_F32_F32, &[DataType::F32]),
+            (DotAlgorithmPreset::F64_F64_F64, &[DataType::F64]),
+        ];
+        for (preset, input_types) in cases {
+            assert_eq!(preset.input_types(), Some(input_types));
+        }
+    }
+
+    #[test]
+    fn test_dot_algorithm_preset_accumulation_type() {
+        let cases = [
+            (DotAlgorithmPreset::Any_F8_Any_F8_F32, Some(DataType::F32)),
+            (DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation, Some(DataType::F32)),
+            (DotAlgorithmPreset::Any_F8_Any_F8_Any, None),
+            (DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation, None),
+            (DotAlgorithmPreset::F16_F16_F16, Some(DataType::F16)),
+            (DotAlgorithmPreset::F16_F16_F32, Some(DataType::F32)),
+            (DotAlgorithmPreset::BF16_BF16_BF16, Some(DataType::BF16)),
+            (DotAlgorithmPreset::BF16_BF16_F32, Some(DataType::F32)),
+            (DotAlgorithmPreset::BF16_BF16_F32_X3, Some(DataType::F32)),
+            (DotAlgorithmPreset::BF16_BF16_F32_X6, Some(DataType::F32)),
+            (DotAlgorithmPreset::BF16_BF16_F32_X9, Some(DataType::F32)),
+            (DotAlgorithmPreset::TF32_TF32_F32, Some(DataType::F32)),
+            (DotAlgorithmPreset::TF32_TF32_F32_X3, Some(DataType::F32)),
+            (DotAlgorithmPreset::F32_F32_F32, Some(DataType::F32)),
+            (DotAlgorithmPreset::F64_F64_F64, Some(DataType::F64)),
+        ];
+        for (preset, accumulation_type) in cases {
+            assert_eq!(preset.accumulation_type(), accumulation_type);
+        }
+    }
+
+    #[test]
+    fn test_dot_algorithm_preset_output_types() {
+        let f8_output_types: &[DataType] = &[
+            DataType::F32,
+            DataType::F16,
+            DataType::BF16,
+            DataType::F8E4M3FN,
+            DataType::F8E5M2,
+            DataType::F8E5M2FNUZ,
+            DataType::F8E4M3FNUZ,
+            DataType::F8E4M3B11FNUZ,
+        ];
+        let f8 = DataType::F8E4M3FN;
+        assert_eq!(DotAlgorithmPreset::Any_F8_Any_F8_F32.output_types(f8, f8), Some(f8_output_types));
+        assert_eq!(
+            DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation.output_types(f8, DataType::F8E5M2),
+            Some(f8_output_types),
+        );
+        assert_eq!(DotAlgorithmPreset::Any_F8_Any_F8_Any.output_types(f8, f8), None);
+        assert_eq!(DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation.output_types(f8, f8), None);
+
+        // The presets that accumulate at `f32` over narrower inputs also produce the input type directly, but only
+        // when both inputs are stored at it.
+        let f16: &[DataType] = &[DataType::F32, DataType::F16];
+        let bf16: &[DataType] = &[DataType::F32, DataType::BF16];
+        let f32: &[DataType] = &[DataType::F32];
+        assert_eq!(DotAlgorithmPreset::F16_F16_F32.output_types(DataType::F16, DataType::F16), Some(f16));
+        assert_eq!(DotAlgorithmPreset::F16_F16_F32.output_types(DataType::F16, DataType::F32), Some(f32));
+        assert_eq!(DotAlgorithmPreset::BF16_BF16_F32.output_types(DataType::BF16, DataType::BF16), Some(bf16));
+        assert_eq!(DotAlgorithmPreset::BF16_BF16_F32.output_types(DataType::F32, DataType::BF16), Some(f32));
+        assert_eq!(DotAlgorithmPreset::BF16_BF16_F32.output_types(DataType::F32, DataType::F32), Some(f32));
+
+        // Every other preset produces only its accumulation type.
+        let cases: [(DotAlgorithmPreset, DataType); 9] = [
+            (DotAlgorithmPreset::F16_F16_F16, DataType::F16),
+            (DotAlgorithmPreset::BF16_BF16_BF16, DataType::BF16),
+            (DotAlgorithmPreset::BF16_BF16_F32_X3, DataType::F32),
+            (DotAlgorithmPreset::BF16_BF16_F32_X6, DataType::F32),
+            (DotAlgorithmPreset::BF16_BF16_F32_X9, DataType::F32),
+            (DotAlgorithmPreset::TF32_TF32_F32, DataType::F32),
+            (DotAlgorithmPreset::TF32_TF32_F32_X3, DataType::F32),
+            (DotAlgorithmPreset::F32_F32_F32, DataType::F32),
+            (DotAlgorithmPreset::F64_F64_F64, DataType::F64),
+        ];
+        for (preset, output_type) in cases {
+            assert_eq!(preset.output_types(DataType::F32, DataType::F32), Some([output_type].as_slice()));
+            assert_eq!(preset.accumulation_type(), Some(output_type));
+        }
+    }
+
+    #[test]
+    fn test_dot_algorithm_preset_display() {
+        let cases = [
+            (DotAlgorithmPreset::Any_F8_Any_F8_F32, "any_f8_any_f8_f32"),
+            (DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation, "any_f8_any_f8_f32_fast_accumulation"),
+            (DotAlgorithmPreset::Any_F8_Any_F8_Any, "any_f8_any_f8_any"),
+            (DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation, "any_f8_any_f8_any_fast_accumulation"),
+            (DotAlgorithmPreset::F16_F16_F16, "f16_f16_f16"),
+            (DotAlgorithmPreset::F16_F16_F32, "f16_f16_f32"),
+            (DotAlgorithmPreset::BF16_BF16_BF16, "bf16_bf16_bf16"),
+            (DotAlgorithmPreset::BF16_BF16_F32, "bf16_bf16_f32"),
+            (DotAlgorithmPreset::BF16_BF16_F32_X3, "bf16_bf16_f32_x3"),
+            (DotAlgorithmPreset::BF16_BF16_F32_X6, "bf16_bf16_f32_x6"),
+            (DotAlgorithmPreset::BF16_BF16_F32_X9, "bf16_bf16_f32_x9"),
+            (DotAlgorithmPreset::TF32_TF32_F32, "tf32_tf32_f32"),
+            (DotAlgorithmPreset::TF32_TF32_F32_X3, "tf32_tf32_f32_x3"),
+            (DotAlgorithmPreset::F32_F32_F32, "f32_f32_f32"),
+            (DotAlgorithmPreset::F64_F64_F64, "f64_f64_f64"),
+        ];
+        for (preset, name) in cases {
+            assert_eq!(preset.to_string(), name);
+        }
+        assert_eq!(format!("{:?}", DotAlgorithmPreset::BF16_BF16_F32_X3), "BF16_BF16_F32_X3");
+    }
+
+    #[test]
+    fn test_dot_precision_is_default() {
+        assert!(DotPrecision::default().is_default());
+        assert!(DotPrecision::from(DotInputPrecision::Default).is_default());
+        assert!(!DotPrecision::from(DotInputPrecision::Highest).is_default());
+        assert!(!DotPrecision::from((DotInputPrecision::Default, DotInputPrecision::High)).is_default());
+        assert!(!DotPrecision::from(DotAlgorithmPreset::F32_F32_F32).is_default());
+        assert!(!DotPrecision::from(DotAlgorithm::new(DataType::F32, DataType::F32, DataType::F32)).is_default());
+    }
+
+    #[test]
+    fn test_dot_precision_input_precisions() {
+        assert_eq!(
+            DotPrecision::default().input_precisions(),
+            (DotInputPrecision::Default, DotInputPrecision::Default),
+        );
+        assert_eq!(
+            DotPrecision::from((DotInputPrecision::High, DotInputPrecision::Highest)).input_precisions(),
+            (DotInputPrecision::High, DotInputPrecision::Highest),
+        );
+
+        // An algorithm or a preset requests the default precision for both inputs.
+        assert_eq!(
+            DotPrecision::from(DotAlgorithmPreset::TF32_TF32_F32).input_precisions(),
+            (DotInputPrecision::Default, DotInputPrecision::Default),
+        );
+        assert_eq!(
+            DotPrecision::from(DotAlgorithm::new(DataType::F16, DataType::F16, DataType::F32)).input_precisions(),
+            (DotInputPrecision::Default, DotInputPrecision::Default),
+        );
+    }
+
+    #[test]
+    fn test_dot_precision_computation_types() {
+        // Per-input precisions compute with the types of the operation.
+        assert_eq!(
+            DotPrecision::from(DotInputPrecision::Highest).computation_types(
+                DataType::F8E4M3FN,
+                DataType::F8E5M2,
+                DataType::BF16,
+            ),
+            (DataType::F8E4M3FN, DataType::F8E5M2, DataType::BF16),
+        );
+        assert_eq!(
+            DotPrecision::default().computation_types(DataType::I8, DataType::I8, DataType::I32),
+            (DataType::I8, DataType::I8, DataType::I32),
+        );
+
+        // An explicit algorithm computes with its own types, whatever the types of the operation are.
+        assert_eq!(
+            DotPrecision::from(DotAlgorithm::new(DataType::BF16, DataType::F16, DataType::F32)).computation_types(
+                DataType::F64,
+                DataType::F64,
+                DataType::F64,
+            ),
+            (DataType::BF16, DataType::F16, DataType::F32),
+        );
+
+        // The `Any_F8` presets keep their inputs. The `F32` variants produce the types that they list and otherwise
+        // produce `f32`, while the `Any` variants produce every output type directly.
+        let preset = DotPrecision::from(DotAlgorithmPreset::Any_F8_Any_F8_F32);
+        assert_eq!(
+            preset.computation_types(DataType::F8E4M3FN, DataType::F8E5M2, DataType::BF16),
+            (DataType::F8E4M3FN, DataType::F8E5M2, DataType::BF16),
+        );
+        assert_eq!(
+            preset.computation_types(DataType::F8E3M4, DataType::F8E3M4, DataType::F8E3M4),
+            (DataType::F8E3M4, DataType::F8E3M4, DataType::F32),
+        );
+        assert_eq!(
+            DotPrecision::from(DotAlgorithmPreset::Any_F8_Any_F8_Any).computation_types(
+                DataType::F8E3M4,
+                DataType::F8E3M4,
+                DataType::F64,
+            ),
+            (DataType::F8E3M4, DataType::F8E3M4, DataType::F64),
+        );
+
+        // Inputs that a preset does not compute with are converted to its first input type, and an output that it
+        // does not produce is converted from its accumulation type.
+        let preset = DotPrecision::from(DotAlgorithmPreset::BF16_BF16_F32);
+        assert_eq!(
+            preset.computation_types(DataType::BF16, DataType::BF16, DataType::BF16),
+            (DataType::BF16, DataType::BF16, DataType::BF16),
+        );
+        assert_eq!(
+            preset.computation_types(DataType::F32, DataType::BF16, DataType::BF16),
+            (DataType::F32, DataType::BF16, DataType::F32),
+        );
+        assert_eq!(
+            preset.computation_types(DataType::F64, DataType::F16, DataType::F64),
+            (DataType::BF16, DataType::BF16, DataType::F32),
+        );
+        assert_eq!(
+            DotPrecision::from(DotAlgorithmPreset::F16_F16_F32).computation_types(
+                DataType::F32,
+                DataType::F32,
+                DataType::F16,
+            ),
+            (DataType::F16, DataType::F16, DataType::F16),
+        );
+        assert_eq!(
+            DotPrecision::from(DotAlgorithmPreset::F16_F16_F16).computation_types(
+                DataType::F32,
+                DataType::F16,
+                DataType::F32,
+            ),
+            (DataType::F16, DataType::F16, DataType::F16),
+        );
+        assert_eq!(
+            DotPrecision::from(DotAlgorithmPreset::TF32_TF32_F32_X3).computation_types(
+                DataType::F64,
+                DataType::F64,
+                DataType::F64,
+            ),
+            (DataType::F32, DataType::F32, DataType::F32),
+        );
+        assert_eq!(
+            DotPrecision::from(DotAlgorithmPreset::F64_F64_F64).computation_types(
+                DataType::F32,
+                DataType::F32,
+                DataType::F32,
+            ),
+            (DataType::F64, DataType::F64, DataType::F64),
+        );
+    }
+
+    #[test]
+    fn test_dot_precision_validate() {
+        // Per-input precisions support every input type, including types that the operation itself rejects.
+        let precision = DotPrecision::from(DotInputPrecision::Highest);
+        assert_eq!(precision.validate(DOT_OPERATION_NAME, DataType::I32, DataType::I32), Ok(()));
+        assert_eq!(precision.validate(DOT_OPERATION_NAME, DataType::Boolean, DataType::C64), Ok(()));
+
+        // An algorithm or a preset requires floating-point inputs.
+        let preset = DotPrecision::from(DotAlgorithmPreset::F32_F32_F32);
+        assert_eq!(preset.validate(DOT_OPERATION_NAME, DataType::F64, DataType::BF16), Ok(()));
+        assert_eq!(
+            preset.validate(DOT_OPERATION_NAME, DataType::I32, DataType::F32),
+            Err(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` algorithms require floating-point inputs but got `i32` and `f32`",
+            ))),
+        );
+        let algorithm = DotAlgorithm::new(DataType::F16, DataType::F16, DataType::F32);
+        assert_eq!(DotPrecision::from(algorithm).validate("other", DataType::F32, DataType::F32), Ok(()));
+        assert_eq!(
+            DotPrecision::from(algorithm).validate("other", DataType::F32, DataType::C64),
+            Err(TypeError::invalid("`other` algorithms require floating-point inputs but got `f32` and `c64`")),
+        );
+
+        // An explicit algorithm has floating-point types and positive counts of its own.
+        assert_eq!(
+            DotPrecision::from(DotAlgorithm::new(DataType::F16, DataType::I16, DataType::F32)).validate(
+                DOT_OPERATION_NAME,
+                DataType::F32,
+                DataType::F32,
+            ),
+            Err(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` algorithm types must be floating-point types but got `i16`",
+            ))),
+        );
+        for invalid in [
+            algorithm.with_component_counts(0, 1),
+            algorithm.with_component_counts(1, 0),
+            algorithm.with_primitive_operation_count(0),
+        ] {
+            assert_eq!(
+                DotPrecision::from(invalid).validate(DOT_OPERATION_NAME, DataType::F32, DataType::F32),
+                Err(TypeError::invalid(format!(
+                    "`{DOT_OPERATION_NAME}` algorithm component and primitive operation counts must be positive",
+                ))),
+            );
+        }
+
+        // The `Any_F8` presets require 8-bit floating-point inputs, which may be two distinct types.
+        for preset in [
+            DotAlgorithmPreset::Any_F8_Any_F8_F32,
+            DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation,
+            DotAlgorithmPreset::Any_F8_Any_F8_Any,
+            DotAlgorithmPreset::Any_F8_Any_F8_Any_Fast_Accumulation,
+        ] {
+            let precision = DotPrecision::from(preset);
+            assert_eq!(precision.validate(DOT_OPERATION_NAME, DataType::F8E4M3FN, DataType::F8E5M2), Ok(()));
+            assert_eq!(precision.validate(DOT_OPERATION_NAME, DataType::F8E8M0FNU, DataType::F8E8M0FNU), Ok(()));
+            assert_eq!(
+                precision.validate(DOT_OPERATION_NAME, DataType::F8E4M3FN, DataType::BF16),
+                Err(TypeError::invalid(format!(
+                    "`{DOT_OPERATION_NAME}` algorithm preset `{preset}` requires 8-bit floating-point inputs but got \
+                     `f8e4m3fn` and `bf16`",
+                ))),
+            );
+            assert_eq!(
+                precision.validate(DOT_OPERATION_NAME, DataType::F6E3M2FN, DataType::F6E3M2FN),
+                Err(TypeError::invalid(format!(
+                    "`{DOT_OPERATION_NAME}` algorithm preset `{preset}` requires 8-bit floating-point inputs but got \
+                     `f6e3m2fn` and `f6e3m2fn`",
+                ))),
+            );
+        }
+    }
+
+    #[test]
+    fn test_dot_precision_display() {
+        assert_eq!(DotPrecision::default().to_string(), "(lhs=default, rhs=default)");
+        assert_eq!(
+            DotPrecision::Inputs { lhs: DotInputPrecision::High, rhs: DotInputPrecision::Highest }.to_string(),
+            "(lhs=high, rhs=highest)",
+        );
+        assert_eq!(DotPrecision::Preset(DotAlgorithmPreset::BF16_BF16_F32_X6).to_string(), "bf16_bf16_f32_x6");
+        let algorithm = DotAlgorithm::new(DataType::BF16, DataType::BF16, DataType::F32);
+        assert_eq!(DotPrecision::Algorithm(algorithm).to_string(), algorithm.to_string());
+        assert_eq!(format!("{:?}", DotPrecision::default()), "Inputs { lhs: Default, rhs: Default }");
+    }
+
+    #[test]
+    fn test_dot_precision_conversions() {
+        assert_eq!(
+            DotPrecision::from(DotInputPrecision::High),
+            DotPrecision::Inputs { lhs: DotInputPrecision::High, rhs: DotInputPrecision::High },
+        );
+        assert_eq!(
+            DotPrecision::from((DotInputPrecision::Default, DotInputPrecision::Highest)),
+            DotPrecision::Inputs { lhs: DotInputPrecision::Default, rhs: DotInputPrecision::Highest },
+        );
+        let algorithm = DotAlgorithm::new(DataType::F16, DataType::F16, DataType::F16);
+        assert_eq!(DotPrecision::from(algorithm), DotPrecision::Algorithm(algorithm));
+        assert_eq!(
+            DotPrecision::from(DotAlgorithmPreset::F64_F64_F64),
+            DotPrecision::Preset(DotAlgorithmPreset::F64_F64_F64),
+        );
+    }
+
+    #[test]
     fn test_dot() {
         let mesh = test_mesh();
         let sharding =
             Sharding::new(mesh, vec![ShardingDimension::sharded(["m"]), ShardingDimension::Replicated]).unwrap();
-        let operation =
-            DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(sharding.clone());
+        let operation = DotOperation::matmul()
+            .with_precision(DotAlgorithmPreset::BF16_BF16_F32)
+            .with_accumulation_type(DataType::F32)
+            .with_output_sharding(sharding.clone());
 
         // Operation identity, accessors, and formatting. The rendering lists the optional fields after the dimension
-        // numbers.
+        // numbers and omits the default precision.
         assert_eq!(operation.name(), DOT_OPERATION_NAME);
         assert_eq!(operation.dimensions(), &DotDimensionNumbers::matmul());
+        assert_eq!(operation.precision(), DotPrecision::Preset(DotAlgorithmPreset::BF16_BF16_F32));
         assert_eq!(operation.accumulation_type(), Some(DataType::F32));
         assert_eq!(operation.output_sharding(), Some(&sharding));
+        assert_eq!(DotOperation::matmul().precision(), DotPrecision::default());
         assert_eq!(DotOperation::matmul().accumulation_type(), None);
         assert_eq!(DotOperation::matmul().output_sharding(), None);
         assert_eq!(
@@ -2561,8 +3757,21 @@ mod tests {
             formatdoc! {"
                 dot [
                     dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    precision=bf16_bf16_f32,
                     accumulation_type=f32,
                     output_sharding={sharding},
+                ]
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            DotOperation::matmul()
+                .with_precision((DotInputPrecision::Highest, DotInputPrecision::Default))
+                .to_string(),
+            indoc! {"
+                dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    precision=(lhs=highest, rhs=default),
                 ]
             "}
             .trim_end(),
@@ -2571,7 +3780,7 @@ mod tests {
             format!("{:?}", DotOperation::matmul()),
             "DotOperation { dimensions: DotDimensionNumbers { lhs_contracting_dimensions: [1], \
              rhs_contracting_dimensions: [0], lhs_batching_dimensions: [], rhs_batching_dimensions: [] }, \
-             accumulation_type: None, output_sharding: None }",
+             precision: Inputs { lhs: Default, rhs: Default }, accumulation_type: None, output_sharding: None }",
         );
 
         // Program rendering uses the canonical operation name and includes the dimension numbers.
@@ -2598,6 +3807,7 @@ mod tests {
                 left.dot_with_configuration(
                     &right,
                     &DotDimensionNumbers::matmul(),
+                    DotPrecision::default(),
                     Some(DataType::F32),
                     Some(&sharding),
                 )
@@ -2613,6 +3823,31 @@ mod tests {
                     dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
                     accumulation_type=f32,
                     output_sharding={sharding},
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // Staged dots carry a requested precision as well.
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(left, right): (Tracer<_>, Tracer<_>)| {
+                left.dot_with_precision(
+                    &right,
+                    &DotDimensionNumbers::matmul(),
+                    DotAlgorithmPreset::TF32_TF32_F32.into(),
+                )
+            },
+            (ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::F32, [3, 4])),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2, 3], %1:f32[3, 4] .
+                let %2:f32[2, 4] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    precision=tf32_tf32_f32,
                 ] %0 %1
                 in (%2)
             "}
@@ -2774,19 +4009,83 @@ mod tests {
         let bf16_input = ArrayType::new_static(DataType::BF16, [2, 2]);
         let output_type = ArrayType::new_static(DataType::F32, [2, 2]);
 
-        // Floating-point inputs may accumulate at `f32` or `f64`, so the output widens to the accumulation type.
+        // Floating-point inputs may accumulate at every floating-point type, which becomes the output type. Two
+        // distinct 8-bit floating-point inputs are accepted together with an accumulation type, while every other
+        // pair of distinct input types is rejected.
         check_operation_type_inference!(
             operation = DotOperation::matmul().with_accumulation_type(DataType::F32),
             cases = [
                 { input_types = [f8_input.clone(), f8_input.clone()], output_types = [output_type.clone()] },
-                { input_types = [bf16_input.clone(), bf16_input], output_types = [output_type] },
+                { input_types = [bf16_input.clone(), bf16_input.clone()], output_types = [output_type.clone()] },
+                {
+                    input_types = [f8_input.clone(), ArrayType::new_static(DataType::F8E5M2, [2, 2])],
+                    output_types = [output_type.clone()],
+                },
+                {
+                    input_types = [ArrayType::new_static(DataType::F8E8M0FNU, [2, 2]), f8_input.clone()],
+                    output_types = [output_type],
+                },
+                {
+                    input_types = [f8_input.clone(), bf16_input.clone()],
+                    error = format!("`{DOT_OPERATION_NAME}` input element types are incompatible"),
+                },
+                // Backends do not contract `f8e4m3b11fnuz` with another 8-bit type natively.
+                {
+                    input_types = [f8_input.clone(), ArrayType::new_static(DataType::F8E4M3B11FNUZ, [2, 2])],
+                    error = format!("`{DOT_OPERATION_NAME}` input element types are incompatible"),
+                },
+                {
+                    input_types = [
+                        ArrayType::new_static(DataType::F6E3M2FN, [2, 2]),
+                        ArrayType::new_static(DataType::F6E2M3FN, [2, 2]),
+                    ],
+                    error = format!("`{DOT_OPERATION_NAME}` input element types are incompatible"),
+                },
             ],
         );
         check_operation_type_inference!(
+            operation = DotOperation::matmul(),
+            cases = [{
+                input_types = [f8_input.clone(), ArrayType::new_static(DataType::F8E5M2, [2, 2])],
+                error = format!("`{DOT_OPERATION_NAME}` input element types are incompatible"),
+            }],
+        );
+
+        // The accumulation type may be narrower than the inputs or an 8-bit type itself.
+        check_operation_type_inference!(
             operation = DotOperation::matmul().with_accumulation_type(DataType::F16),
+            cases = [
+                {
+                    input_types = [plain_array(&[2, 2]), plain_array(&[2, 2])],
+                    output_types = [ArrayType::new_static(DataType::F16, [2, 2])],
+                },
+                {
+                    input_types = [f8_input.clone(), f8_input.clone()],
+                    output_types = [ArrayType::new_static(DataType::F16, [2, 2])],
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = DotOperation::matmul().with_accumulation_type(DataType::F8E5M2),
+            cases = [{
+                input_types = [f8_input.clone(), ArrayType::new_static(DataType::F8E4M3FNUZ, [2, 2])],
+                output_types = [ArrayType::new_static(DataType::F8E5M2, [2, 2])],
+            }],
+        );
+
+        // Floating-point inputs cannot accumulate at integer or complex types.
+        check_operation_type_inference!(
+            operation = DotOperation::matmul().with_accumulation_type(DataType::I32),
             cases = [{
                 input_types = [plain_array(&[2, 2]), plain_array(&[2, 2])],
-                error = format!("`{DOT_OPERATION_NAME}` input data type `f32` cannot accumulate at data type `f16`"),
+                error = format!("`{DOT_OPERATION_NAME}` input data type `f32` cannot accumulate at data type `i32`"),
+            }],
+        );
+        check_operation_type_inference!(
+            operation = DotOperation::matmul().with_accumulation_type(DataType::C64),
+            cases = [{
+                input_types = [bf16_input.clone(), bf16_input],
+                error = format!("`{DOT_OPERATION_NAME}` input data type `bf16` cannot accumulate at data type `c64`"),
             }],
         );
 
@@ -2822,6 +4121,108 @@ mod tests {
             cases = [{
                 input_types = [f8_input.clone(), f8_input],
                 output_types = [ArrayType::new_static(DataType::F32, [2, 2]).with_sharding(sharding).unwrap()],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_dot_type_inference_precision() {
+        let f8_input = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let i32_input = ArrayType::new_static(DataType::I32, [2, 2]);
+        let f64_input = ArrayType::new_static(DataType::F64, [2, 2]);
+
+        // Per-input precisions are hints that support every input type and never change the output type.
+        check_operation_type_inference!(
+            operation = DotOperation::matmul().with_precision(DotInputPrecision::Highest),
+            cases = [
+                { input_types = [plain_array(&[2, 2]), plain_array(&[2, 2])], output_types = [plain_array(&[2, 2])] },
+                { input_types = [i32_input.clone(), i32_input.clone()], output_types = [i32_input.clone()] },
+            ],
+        );
+
+        // A preset never changes the output type either, even when it computes with other types. It requires
+        // floating-point inputs.
+        check_operation_type_inference!(
+            operation = DotOperation::matmul().with_precision(DotAlgorithmPreset::BF16_BF16_F32),
+            cases = [
+                { input_types = [f64_input.clone(), f64_input.clone()], output_types = [f64_input.clone()] },
+                { input_types = [f8_input.clone(), f8_input.clone()], output_types = [f8_input.clone()] },
+                {
+                    input_types = [i32_input.clone(), i32_input.clone()],
+                    error = format!(
+                        "`{DOT_OPERATION_NAME}` algorithms require floating-point inputs but got `i32` and `i32`",
+                    ),
+                },
+                // The input types are validated first, so the precision never accepts an invalid pair.
+                {
+                    input_types = [f64_input.clone(), plain_array(&[2, 2])],
+                    error = format!("`{DOT_OPERATION_NAME}` input element types are incompatible"),
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = DotOperation::matmul()
+                .with_precision(DotAlgorithmPreset::F16_F16_F32)
+                .with_accumulation_type(DataType::BF16),
+            cases = [{
+                input_types = [f64_input.clone(), f64_input.clone()],
+                output_types = [ArrayType::new_static(DataType::BF16, [2, 2])],
+            }],
+        );
+
+        // The `Any_F8` presets require 8-bit floating-point inputs, which may be two distinct types when an
+        // accumulation type is provided.
+        check_operation_type_inference!(
+            operation = DotOperation::matmul()
+                .with_precision(DotAlgorithmPreset::Any_F8_Any_F8_F32_Fast_Accumulation)
+                .with_accumulation_type(DataType::F32),
+            cases = [
+                { input_types = [f8_input.clone(), f8_input.clone()], output_types = [plain_array(&[2, 2])] },
+                {
+                    input_types = [f8_input.clone(), ArrayType::new_static(DataType::F8E5M2, [2, 2])],
+                    output_types = [plain_array(&[2, 2])],
+                },
+                {
+                    input_types = [plain_array(&[2, 2]), plain_array(&[2, 2])],
+                    error = format!(
+                        "`{DOT_OPERATION_NAME}` algorithm preset `any_f8_any_f8_f32_fast_accumulation` requires 8-bit \
+                         floating-point inputs but got `f32` and `f32`",
+                    ),
+                },
+            ],
+        );
+
+        // An explicit algorithm is validated as well.
+        check_operation_type_inference!(
+            operation = DotOperation::matmul()
+                .with_precision(DotAlgorithm::new(DataType::BF16, DataType::BF16, DataType::F32)),
+            cases = [
+                { input_types = [f64_input.clone(), f64_input.clone()], output_types = [f64_input.clone()] },
+                {
+                    input_types = [i32_input.clone(), i32_input],
+                    error = format!(
+                        "`{DOT_OPERATION_NAME}` algorithms require floating-point inputs but got `i32` and `i32`",
+                    ),
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = DotOperation::matmul()
+                .with_precision(DotAlgorithm::new(DataType::I8, DataType::BF16, DataType::F32)),
+            cases = [{
+                input_types = [f64_input.clone(), f64_input.clone()],
+                error = format!("`{DOT_OPERATION_NAME}` algorithm types must be floating-point types but got `i8`"),
+            }],
+        );
+        check_operation_type_inference!(
+            operation = DotOperation::matmul().with_precision(
+                DotAlgorithm::new(DataType::F32, DataType::F32, DataType::F32).with_primitive_operation_count(0),
+            ),
+            cases = [{
+                input_types = [f64_input.clone(), f64_input],
+                error = format!(
+                    "`{DOT_OPERATION_NAME}` algorithm component and primitive operation counts must be positive",
+                ),
             }],
         );
     }
@@ -3374,6 +4775,60 @@ mod tests {
             lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F32),
             Ok(Array::matrix(2, 2, vec![1.0f32, 1.25, 2.5, 2.75]).unwrap()),
         );
+
+        // An 8-bit accumulation type rounds each `f32` sum once. The two mantissa bits of `f8e5m2` resolve halves in
+        // `[2, 4)`, so the exact result `2.75` lies halfway between `2.5` and `3.0` and rounds to the even `3.0`.
+        assert_eq!(
+            lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::matmul(), DataType::F8E5M2),
+            Ok(Array::from_elements::<f8e5m2>(
+                ArrayType::new_static(DataType::F8E5M2, [2, 2]),
+                &[1.0, 1.25, 2.5, 3.0].map(|value| f8e5m2::from_f64(value).unwrap()),
+            )
+            .unwrap()),
+        );
+
+        // Two distinct 8-bit floating-point inputs contract without a common input type. Here,
+        // `[0.5, 1.0] · [2.0, 4.0] = 5`.
+        let lhs = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let rhs = Array::from_elements::<f8e5m2>(
+            ArrayType::new_static(DataType::F8E5M2, [2]),
+            &[2.0, 4.0].map(|value| f8e5m2::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::inner_product(), DataType::F32),
+            Ok(Array::scalar(5.0f32).unwrap()),
+        );
+        assert_eq!(
+            lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::inner_product(), DataType::BF16),
+            Ok(Array::scalar(bf16::from_f32(5.0)).unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_dot_interpretation_accumulation_type_narrows_once() {
+        // A narrower accumulation type accumulates at the input type and rounds each result once. The three terms
+        // `2⁻¹²` sum to `3 · 2⁻¹²` at `f32`, which lies above the midpoint between `1` and the next `f16` value
+        // `1 + 2⁻¹⁰`, so the sum rounds up. Rounding after every addition at `f16` would keep the sum at `1`.
+        let lhs = Array::vector(vec![1.0f32, 0.000244140625, 0.000244140625, 0.000244140625]).unwrap();
+        let rhs = Array::vector(vec![1.0f32; 4]).unwrap();
+        assert_eq!(
+            lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::inner_product(), DataType::F16),
+            Ok(Array::scalar(f16::from_f32(1.0009765625)).unwrap()),
+        );
+
+        // Narrowing from `f64` accumulates at `f64` in the same way. The three terms `2⁻²⁵` sum to three quarters of
+        // the distance from `1` to the next `f32` value `1 + 2⁻²³`, so the sum rounds up.
+        let lhs = Array::vector(vec![1.0f64, 2.0f64.powi(-25), 2.0f64.powi(-25), 2.0f64.powi(-25)]).unwrap();
+        let rhs = Array::vector(vec![1.0f64; 4]).unwrap();
+        assert_eq!(
+            lhs.dot_with_accumulation_type(&rhs, &DotDimensionNumbers::inner_product(), DataType::F32),
+            Ok(Array::scalar(1.0f32 + f32::EPSILON).unwrap()),
+        );
     }
 
     #[test]
@@ -3387,9 +4842,113 @@ mod tests {
             )))),
         );
         assert_eq!(
-            left.dot_with_accumulation_type(&left, &DotDimensionNumbers::matmul(), DataType::F16),
+            left.dot_with_accumulation_type(&left, &DotDimensionNumbers::matmul(), DataType::I32),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` input data type `f32` cannot accumulate at data type `f16`",
+                "`{DOT_OPERATION_NAME}` input data type `f32` cannot accumulate at data type `i32`",
+            )))),
+        );
+    }
+
+    #[test]
+    fn test_dot_interpretation_precision() {
+        // Per-input precisions are backend hints, so the reference kernel computes the same result for all of them.
+        let lhs = Array::matrix(2, 3, vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let rhs = Array::matrix(3, 2, vec![7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0]).unwrap();
+        assert_eq!(
+            lhs.dot_with_precision(
+                &rhs,
+                &DotDimensionNumbers::matmul(),
+                (DotInputPrecision::Highest, DotInputPrecision::High).into(),
+            ),
+            Ok(Array::matrix(2, 2, vec![58.0f32, 64.0, 139.0, 154.0]).unwrap()),
+        );
+
+        // A preset rounds inputs that it does not compute with to its first input type. The `f64` input `1 + 2⁻¹⁰`
+        // rounds to `1` at `bf16`, whose significand has eight bits, and the `f32` result is converted to the `f64`
+        // output type.
+        let lhs = Array::vector(vec![1.0009765625f64]).unwrap();
+        let rhs = Array::vector(vec![1.0f64]).unwrap();
+        assert_eq!(lhs.dot(&rhs, &DotDimensionNumbers::inner_product()), Ok(Array::scalar(1.0009765625f64).unwrap()));
+        assert_eq!(
+            lhs.dot_with_precision(
+                &rhs,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::BF16_BF16_F32.into(),
+            ),
+            Ok(Array::scalar(1.0f64).unwrap()),
+        );
+
+        // The same preset computes with `f32` inputs as they are stored, because a backend rounds those itself.
+        let lhs = Array::vector(vec![1.0009765625f32]).unwrap();
+        let rhs = Array::vector(vec![1.0f32]).unwrap();
+        assert_eq!(
+            lhs.dot_with_precision(
+                &rhs,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::BF16_BF16_F32.into(),
+            ),
+            Ok(Array::scalar(1.0009765625f32).unwrap()),
+        );
+
+        // A preset rounds each result to its accumulation type before converting it to the output type. The sum
+        // `1 + 3 · 2⁻¹²` of the `f16` inputs rounds up to `1 + 2⁻¹⁰` at `f16`, which the `f32` output represents.
+        let lhs = Array::vector(vec![1.0f32, 0.000732421875]).unwrap();
+        let rhs = Array::vector(vec![1.0f32, 1.0]).unwrap();
+        assert_eq!(lhs.dot(&rhs, &DotDimensionNumbers::inner_product()), Ok(Array::scalar(1.000732421875f32).unwrap()));
+        assert_eq!(
+            lhs.dot_with_precision(
+                &rhs,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::F16_F16_F16.into(),
+            ),
+            Ok(Array::scalar(1.0009765625f32).unwrap()),
+        );
+
+        // An explicit algorithm rounds the inputs to its precision types and the result to its accumulation type. The
+        // `f32` input `1 + 2⁻¹²` rounds to `1` at `f16`.
+        let lhs = Array::vector(vec![1.000244140625f32]).unwrap();
+        let rhs = Array::vector(vec![1.0f32]).unwrap();
+        assert_eq!(
+            lhs.dot_with_precision(
+                &rhs,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithm::new(DataType::F16, DataType::F16, DataType::F32).into(),
+            ),
+            Ok(Array::scalar(1.0f32).unwrap()),
+        );
+
+        // The `Any_F8` presets keep two distinct 8-bit inputs and produce the accumulation type directly.
+        let lhs = Array::from_elements::<f8e4m3fn>(
+            ArrayType::new_static(DataType::F8E4M3FN, [2]),
+            &[0.5, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        let rhs = Array::from_elements::<f8e5m2>(
+            ArrayType::new_static(DataType::F8E5M2, [2]),
+            &[2.0, 4.0].map(|value| f8e5m2::from_f64(value).unwrap()),
+        )
+        .unwrap();
+        assert_eq!(
+            lhs.dot_with_configuration(
+                &rhs,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::Any_F8_Any_F8_F32.into(),
+                Some(DataType::F32),
+                None,
+            ),
+            Ok(Array::scalar(5.0f32).unwrap()),
+        );
+
+        // Invalid precisions are rejected exactly as they are for staged programs.
+        let integers = Array::vector(vec![1i32, 2]).unwrap();
+        assert_eq!(
+            integers.dot_with_precision(
+                &integers,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::F32_F32_F32.into(),
+            ),
+            Err(ProgramError::Type(TypeError::invalid(format!(
+                "`{DOT_OPERATION_NAME}` algorithms require floating-point inputs but got `i32` and `i32`",
             )))),
         );
     }
@@ -3478,7 +5037,13 @@ mod tests {
             .with_unreduced_axes(["k"])
             .unwrap();
         assert_eq!(
-            lhs.dot_with_configuration(&rhs, &DotDimensionNumbers::matmul(), Some(DataType::F32), Some(&unreduced)),
+            lhs.dot_with_configuration(
+                &rhs,
+                &DotDimensionNumbers::matmul(),
+                DotPrecision::default(),
+                Some(DataType::F32),
+                Some(&unreduced),
+            ),
             Ok(Array::from_elements(
                 plain_array(&[2, 2]).with_sharding(unreduced).unwrap(),
                 &[1.0f32, 1.25, 2.5, 2.75]
@@ -3532,6 +5097,114 @@ mod tests {
                     outputs = [(@replicated, Array::scalar(31.0).unwrap())],
                 },
             ],
+        );
+    }
+
+    #[test]
+    fn test_dot_batching_mixed_inputs() {
+        // A single mapped input keeps its mapped axis in place and the replicated input is contracted as it is, so
+        // the mapped axis of the output follows the result dimensions that precede it. The two batch items of the
+        // left-hand side below are `[[1, 2], [5, 6]]` and `[[3, 4], [7, 8]]`, and the two batch items of the
+        // right-hand side are `[[10], [100]]` and `[[20], [200]]`.
+        let lhs = Array::matrix(2, 2, vec![1.0, 2.0, 5.0, 6.0]).unwrap();
+        let rhs = Array::matrix(2, 1, vec![10.0, 100.0]).unwrap();
+        let mapped_type = |sizes: [usize; 3]| ArrayType::new_static(DataType::F64, sizes);
+        check_operation_batching!(
+            @exact,
+            operation = DotOperation::matmul(),
+            axis_size = 2,
+            cases = [
+                // The physical left-hand side `[M, B, K]` produces `[M, B, N]`.
+                {
+                    inputs = [
+                        (
+                            @mapped(axis = 1),
+                            Array::from_elements(mapped_type([2, 2, 2]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+                                .unwrap(),
+                        ),
+                        (@replicated, rhs.clone()),
+                    ],
+                    outputs = [(
+                        @mapped(axis = 1),
+                        Array::from_elements(mapped_type([2, 2, 1]), &[210.0, 430.0, 650.0, 870.0]).unwrap(),
+                    )],
+                },
+                // The physical left-hand side `[M, K, B]` produces `[M, B, N]` as well.
+                {
+                    inputs = [
+                        (
+                            @mapped(axis = 2),
+                            Array::from_elements(mapped_type([2, 2, 2]), &[1.0, 3.0, 2.0, 4.0, 5.0, 7.0, 6.0, 8.0])
+                                .unwrap(),
+                        ),
+                        (@replicated, rhs),
+                    ],
+                    outputs = [(
+                        @mapped(axis = 1),
+                        Array::from_elements(mapped_type([2, 2, 1]), &[210.0, 430.0, 650.0, 870.0]).unwrap(),
+                    )],
+                },
+                // The physical right-hand side `[B, K, N]` produces `[M, B, N]`.
+                {
+                    inputs = [
+                        (@replicated, lhs.clone()),
+                        (
+                            @mapped(axis = 0),
+                            Array::from_elements(mapped_type([2, 2, 1]), &[10.0, 100.0, 20.0, 200.0]).unwrap(),
+                        ),
+                    ],
+                    outputs = [(
+                        @mapped(axis = 1),
+                        Array::from_elements(mapped_type([2, 2, 1]), &[210.0, 420.0, 650.0, 1300.0]).unwrap(),
+                    )],
+                },
+                // The physical right-hand side `[K, N, B]` produces `[M, N, B]`.
+                {
+                    inputs = [
+                        (@replicated, lhs),
+                        (
+                            @mapped(axis = 2),
+                            Array::from_elements(mapped_type([2, 1, 2]), &[10.0, 20.0, 100.0, 200.0]).unwrap(),
+                        ),
+                    ],
+                    outputs = [(
+                        @mapped(axis = 2),
+                        Array::from_elements(mapped_type([2, 1, 2]), &[210.0, 420.0, 650.0, 1300.0]).unwrap(),
+                    )],
+                },
+            ],
+        );
+
+        // Existing batching dimensions precede the mapped axis in the output, including when the mapped axis leads
+        // the input. The physical left-hand side `[B, b, M, K]` of `[b, M, K] × [b, K, N]` produces `[b, B, M, N]`.
+        // Its two batch items are `[[[1, 2]], [[3, 4]]]` and `[[[5, 6]], [[7, 8]]]`, and the two existing batch
+        // entries of the right-hand side are `[[10], [100]]` and `[[1000], [10000]]`.
+        let mapped_type = |sizes: [usize; 4]| ArrayType::new_static(DataType::F64, sizes);
+        check_operation_batching!(
+            @exact,
+            operation = DotOperation::new(DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0])),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (
+                        @mapped(axis = 0),
+                        Array::from_elements(mapped_type([2, 2, 1, 2]), &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+                            .unwrap(),
+                    ),
+                    (
+                        @replicated,
+                        Array::from_elements(
+                            ArrayType::new_static(DataType::F64, [2, 2, 1]),
+                            &[10.0, 100.0, 1000.0, 10000.0],
+                        )
+                        .unwrap(),
+                    ),
+                ],
+                outputs = [(
+                    @mapped(axis = 1),
+                    Array::from_elements(mapped_type([2, 2, 1, 1]), &[210.0, 650.0, 43000.0, 87000.0]).unwrap(),
+                )],
+            }],
         );
     }
 
@@ -3610,6 +5283,74 @@ mod tests {
                 in (%2)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_dot_batching_precision() {
+        // Batching lifts the dimension numbers while carrying the precision, so every batch item is contracted with
+        // the requested algorithm.
+        let input_type = ArrayType::new_static(DataType::BF16, [2, 2]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let lhs_input = builder.add_input(input_type.clone());
+        let rhs_input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(
+                DotOperation::matmul()
+                    .with_precision(DotAlgorithmPreset::BF16_BF16_F32)
+                    .with_accumulation_type(DataType::F32),
+                vec![],
+                vec![lhs_input, rhs_input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lifted = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0), BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(
+            lifted.to_string(),
+            indoc! {"
+                lambda %0:bf16[2, 2, 2], %1:bf16[2, 2, 2] .
+                let %2:f32[2, 2, 2] = dot [
+                    dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                    precision=bf16_bf16_f32,
+                    accumulation_type=f32,
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
+        // Every value below is exactly representable in `bf16`, so the batched results equal the results of each item.
+        check_operation_batching!(
+            @exact,
+            operation = DotOperation::new(DotDimensionNumbers::inner_product())
+                .with_precision(DotAlgorithmPreset::BF16_BF16_F32)
+                .with_accumulation_type(DataType::F32),
+            axis_size = 2,
+            cases = [{
+                inputs = [
+                    (
+                        @mapped(axis = 0),
+                        Array::matrix(2, 2, [1.0f32, 2.0, 3.0, 4.0].map(bf16::from_f32).to_vec()).unwrap(),
+                    ),
+                    (
+                        @mapped(axis = 0),
+                        Array::matrix(2, 2, [5.0f32, 6.0, 7.0, 8.0].map(bf16::from_f32).to_vec()).unwrap(),
+                    ),
+                ],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![17.0f32, 53.0]).unwrap())],
+            }],
         );
     }
 
@@ -3728,7 +5469,7 @@ mod tests {
                 sharded_array(&mesh, &[2, 8, 16], batch_sharding.clone()),
             ),
         )?;
-        let left_sharding = Sharding::new(mesh, batch_sharding).unwrap();
+        let left_sharding = Sharding::new(mesh.clone(), batch_sharding.clone()).unwrap();
         assert_eq!(
             program.to_string(),
             formatdoc! {"
@@ -3741,12 +5482,50 @@ mod tests {
             "}
             .trim_end(),
         );
+
+        // A single mapped right-hand side produces its mapped axis after the left-hand side result dimension, where
+        // the requested output sharding gains the sharding of that mapped axis.
+        let lifted_sharding = Sharding::new(
+            mesh.clone(),
+            vec![
+                ShardingDimension::sharded(["m"]),
+                ShardingDimension::sharded(["b"]),
+                ShardingDimension::sharded(["n"]),
+            ],
+        )
+        .unwrap();
+        let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
+            |(left, right)| {
+                let context = BatchingContext::new(left.context().clone(), 2)
+                    .with_axis_sharding(ShardingDimension::sharded(["b"]));
+                let mut outputs = operation.batch(
+                    &context,
+                    &EmptyRegionDriver,
+                    &[ArrayBatch::replicated(left), ArrayBatch::new(right, BatchAxis::new(0))?],
+                )?;
+                Ok(outputs.remove(0).into_value())
+            },
+            (plain_array(&[4, 8]), sharded_array(&mesh, &[2, 8, 16], batch_sharding)),
+        )?;
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:f32[4, 8], %1:f32[2, 8, 16][sharding={left_sharding}] .
+                let %2:f32[4, 2, 16][sharding={lifted_sharding}] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]),
+                    output_sharding={lifted_sharding},
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
         Ok(())
     }
 
     #[test]
-    fn test_dot_batching_preserves_materialized_batch_placement() -> Result<(), ProgramError> {
-        // Materializing the mapped axis on the replicated right-hand side places it like the mapped left-hand side.
+    fn test_dot_batching_keeps_replicated_input_unbroadcast() -> Result<(), ProgramError> {
+        // The replicated right-hand side is contracted as it is, and the mapped axis of the left-hand side becomes a
+        // result dimension that keeps its placement.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let left_sharding = Sharding::new(
             mesh.clone(),
@@ -3774,14 +5553,10 @@ mod tests {
             program.to_string(),
             formatdoc! {"
                 lambda %0:f64[2, 2, 2][sharding={left_sharding}], %1:f64[2, 1][sharding={right_sharding}] .
-                let %2:f64[2, 2, 1][sharding={left_sharding}] = broadcast [
-                    output_type=f64[2, 2, 1][sharding={left_sharding}],
-                    output_axes=[1, 2],
-                ] %1
-                    %3:f64[2, 2, 1][sharding={left_sharding}] = dot [
-                        dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
-                    ] %0 %2
-                in (%3)
+                let %2:f64[2, 2, 1][sharding={left_sharding}] = dot [
+                    dimensions=(lhs_contracting=[2], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                ] %0 %1
+                in (%2)
             "}
             .trim_end(),
         );
@@ -3789,9 +5564,9 @@ mod tests {
     }
 
     #[test]
-    fn test_dot_batching_aligns_materialized_batch_placement_with_manual_variation() -> Result<(), ProgramError> {
-        // Materializing the mapped axis on the replicated right-hand side gives it the batch placement on `y`, which
-        // adds no variation, so `parallel_vary` aligns it with the left-hand side, which varies along `x`.
+    fn test_dot_batching_aligns_replicated_input_with_manual_variation() -> Result<(), ProgramError> {
+        // The replicated right-hand side is contracted as it is, so the [`Dot`] capability only aligns it with the
+        // left-hand side, which varies along `x`. The mapped axis keeps its batch placement on `y` in the output.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -3804,12 +5579,8 @@ mod tests {
         .unwrap()
         .with_varying_manual_axes(["x"])
         .unwrap();
-        let right_sharding = Sharding::replicated(mesh.clone(), 2);
-        let materialized_sharding = Sharding::new(
-            mesh,
-            vec![ShardingDimension::sharded(["y"]), ShardingDimension::Replicated, ShardingDimension::Replicated],
-        )
-        .unwrap();
+        let right_sharding = Sharding::replicated(mesh, 2);
+        let varying_right_sharding = right_sharding.clone().with_varying_manual_axes(["x"]).unwrap();
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(left, right)| {
                 let context = BatchingContext::new(left.context().clone(), 2)
@@ -3830,15 +5601,11 @@ mod tests {
             program.to_string(),
             formatdoc! {"
                 lambda %0:f64[2, 2, 2][sharding={left_sharding}], %1:f64[2, 1][sharding={right_sharding}] .
-                let %2:f64[2, 2, 1][sharding={materialized_sharding}] = broadcast [
-                    output_type=f64[2, 2, 1][sharding={materialized_sharding}],
-                    output_axes=[1, 2],
-                ] %1
-                    %3:f64[2, 2, 1][sharding={left_sharding}] = parallel_vary [axis_name=\"x\"] %2
-                    %4:f64[2, 2, 1][sharding={left_sharding}] = dot [
-                        dimensions=(lhs_contracting=[2], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
-                    ] %0 %3
-                in (%4)
+                let %2:f64[2, 1][sharding={varying_right_sharding}] = parallel_vary [axis_name=\"x\"] %1
+                    %3:f64[2, 2, 1][sharding={left_sharding}] = dot [
+                        dimensions=(lhs_contracting=[2], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %0 %2
+                in (%3)
             "}
             .trim_end(),
         );
@@ -3979,9 +5746,9 @@ mod tests {
     #[test]
     fn test_dot_batching_dynamic_mapped_extent() -> Result<(), ProgramError> {
         // A dense contraction is batched under a dynamic mapped extent as well. The mapped input keeps the dynamic
-        // batch dimension it already carries, and the replicated right-hand side vector gains one through the policy's
-        // dynamic broadcast, whose inserted axis is grounded by the transform's first-class extent value (read off the
-        // mapped input's own axis). The lifted dot then contracts the trailing axis under a dynamic batching dimension.
+        // batch dimension it already carries as a result dimension, and the replicated right-hand side vector is
+        // contracted as it is. The transform still reads its first-class extent value off the mapped input, which the
+        // lifted dot does not need.
         let trace = ArrayIrContext::new();
         let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5))?);
         let rows = trace.input(
@@ -4018,12 +5785,10 @@ mod tests {
             indoc! {"
                 lambda %0:f32[batch, 3], %1:f32[3] .
                 let %2:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %0
-                    %3:dimension<3> = constant [value=3]
-                    %4:f32[batch, 3] = broadcast [output_axes=[1]] %1 %2 %3
-                    %5:f32[batch] = dot [
-                        dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
-                    ] %0 %4
-                in (%5)
+                    %3:f32[batch] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    ] %0 %1
+                in (%3)
             "}
             .trim_end(),
         );
@@ -4301,6 +6066,130 @@ mod tests {
     }
 
     #[test]
+    fn test_dot_differentiation_precision() {
+        // Two distinct 8-bit inputs keep their own tangent types, so both tangent terms have the primal input types
+        // and keep the primal precision, accumulation type, and native 8-bit contraction.
+        let lhs_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        let rhs_type = ArrayType::new_static(DataType::F8E5M2, [2, 2]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let lhs_input = builder.add_input(lhs_type.clone());
+        let rhs_input = builder.add_input(rhs_type.clone());
+        let output = builder
+            .add_instruction(
+                DotOperation::matmul()
+                    .with_precision(DotAlgorithmPreset::Any_F8_Any_F8_F32)
+                    .with_accumulation_type(DataType::F32),
+                vec![],
+                vec![lhs_input, rhs_input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let jvp = program.jvp().unwrap();
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f8e4m3fn[2, 2], %1:f8e5m2[2, 2], %2:f8e4m3fn[2, 2], %3:f8e5m2[2, 2] .
+                let %4:f32[2, 2] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    precision=any_f8_any_f8_f32,
+                    accumulation_type=f32,
+                ] %0 %1
+                    %5:f32[2, 2] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        precision=any_f8_any_f8_f32,
+                        accumulation_type=f32,
+                    ] %2 %1
+                    %6:f32[2, 2] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        precision=any_f8_any_f8_f32,
+                        accumulation_type=f32,
+                    ] %0 %3
+                    %7:f32[2, 2] = add %5 %6
+                in (%4, %7)
+            "}
+            .trim_end(),
+        );
+
+        // The tangent is `d_lhs · rhs + lhs · d_rhs = [[1.5, 1.5], [1.5, 1.5]] + [[0.75, 0.75], [1.75, 1.75]]`.
+        assert_eq!(
+            jvp.interpret(vec![
+                Array::from_elements::<f8e4m3fn>(
+                    lhs_type.clone(),
+                    &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                )
+                .unwrap(),
+                Array::from_elements::<f8e5m2>(
+                    rhs_type.clone(),
+                    &[1.0, 0.5, 0.5, 1.0].map(|value| f8e5m2::from_f64(value).unwrap()),
+                )
+                .unwrap(),
+                Array::from_elements::<f8e4m3fn>(
+                    lhs_type,
+                    &[1.0, 1.0, 1.0, 1.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                )
+                .unwrap(),
+                Array::from_elements::<f8e5m2>(
+                    rhs_type,
+                    &[0.5, 0.5, 0.5, 0.5].map(|value| f8e5m2::from_f64(value).unwrap()),
+                )
+                .unwrap(),
+            ]),
+            Ok(vec![
+                Array::matrix(2, 2, vec![1.0f32, 1.25, 2.5, 2.75]).unwrap(),
+                Array::matrix(2, 2, vec![2.25f32, 2.25, 3.25, 3.25]).unwrap(),
+            ]),
+        );
+
+        // The tangents of `f8e8m0fnu` primals are widened to `f32`, so both factors of each tangent term are converted
+        // to `f32`, which the `Any_F8` preset does not support. Those terms use the default precision instead.
+        let lhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2]);
+        let rhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [2, 1]);
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let lhs_input = builder.add_input(lhs_type);
+        let rhs_input = builder.add_input(rhs_type);
+        let output = builder
+            .add_instruction(
+                DotOperation::matmul()
+                    .with_precision(DotAlgorithmPreset::Any_F8_Any_F8_F32)
+                    .with_accumulation_type(DataType::F32),
+                vec![],
+                vec![lhs_input, rhs_input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f8e8m0fnu[3, 2], %1:f8e8m0fnu[2, 1], %2:f32[3, 2], %3:f32[2, 1] .
+                let %4:f32[3, 1] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    precision=any_f8_any_f8_f32,
+                    accumulation_type=f32,
+                ] %0 %1
+                    %5:f32[2, 1] = convert_element_type [data_type=f32] %1
+                    %6:f32[3, 1] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                    ] %2 %5
+                    %7:f32[3, 2] = convert_element_type [data_type=f32] %0
+                    %8:f32[3, 1] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                    ] %7 %3
+                    %9:f32[3, 1] = add %6 %8
+                in (%4, %9)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_dot_differentiation_accumulation_type_and_output_sharding() {
         // Forward mode differentiation stages tangent dots with both the accumulation type and the requested output
         // sharding, so the output tangent has exactly the type of the primal output.
@@ -4399,6 +6288,97 @@ mod tests {
         check_operation_transposition!(
             @exact,
             operation = DotOperation::matmul().with_accumulation_type(DataType::F32),
+            cases = [{
+                inputs = [
+                    (@known, Array::from_elements::<f8e4m3fn>(
+                        input_type.clone(),
+                        &[0.5, 1.0, 1.5, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                    ).unwrap()),
+                    (@linear(type = input_type.clone())),
+                ],
+                output_cotangents = [Array::matrix(2, 2, vec![1.0f32, 0.0, 0.0, 1.0]).unwrap()],
+                input_cotangents = [Array::from_elements::<f8e4m3fn>(
+                    input_type,
+                    &[0.5, 1.5, 1.0, 2.0].map(|value| f8e4m3fn::from_f64(value).unwrap()),
+                ).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f32[2, 2], %1:f8e4m3fn[2, 2] .
+                    let %2:f32[2, 2] = convert_element_type [data_type=f32] %1
+                        %3:f32[2, 2] = dot [
+                            dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        ] %2 %0
+                        %4:f8e4m3fn[2, 2] = convert_element_type [data_type=f8e4m3fn] %3
+                    in (%4)
+                "},
+            }],
+        );
+    }
+
+    #[test]
+    fn test_dot_transposition_precision() {
+        // The output cotangent takes the place of the linear input, so the adjoint keeps the per-input precisions with
+        // the known left-hand side on its original side.
+        let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        check_operation_transposition!(
+            @exact,
+            operation = DotOperation::matmul().with_precision((DotInputPrecision::High, DotInputPrecision::Default)),
+            cases = [{
+                inputs = [
+                    (@known, left),
+                    (@linear(type = ArrayType::new_static(DataType::F64, [3, 2]))),
+                ],
+                output_cotangents = [Array::matrix(2, 2, vec![1.0, -2.0, 0.5, 3.0]).unwrap()],
+                input_cotangents = [Array::matrix(3, 2, vec![3.0, 10.0, 4.5, 11.0, 6.0, 12.0]).unwrap()],
+                pullback = indoc! {"
+                    lambda %0:f64[2, 2], %1:f64[2, 3] .
+                    let %2:f64[3, 2] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        precision=(lhs=high, rhs=default),
+                    ] %1 %0
+                    in (%2)
+                "},
+            }],
+        );
+
+        // A preset that supports the cotangent element type is kept as well. Both adjoint inputs are `f32` here, which
+        // the `bf16` preset computes with as they are stored. With an identity output cotangent, the adjoint of the
+        // linear right-hand side is exactly `lhsᵀ`.
+        let input_type = ArrayType::new_static(DataType::BF16, [2, 2]);
+        check_operation_transposition!(
+            @exact,
+            operation = DotOperation::matmul()
+                .with_precision(DotAlgorithmPreset::BF16_BF16_F32)
+                .with_accumulation_type(DataType::F32),
+            cases = [{
+                inputs = [
+                    (@known, Array::matrix(2, 2, [0.5f32, 1.0, 1.5, 2.0].map(bf16::from_f32).to_vec()).unwrap()),
+                    (@linear(type = input_type)),
+                ],
+                output_cotangents = [Array::matrix(2, 2, vec![1.0f32, 0.0, 0.0, 1.0]).unwrap()],
+                input_cotangents = [
+                    Array::matrix(2, 2, [0.5f32, 1.5, 1.0, 2.0].map(bf16::from_f32).to_vec()).unwrap(),
+                ],
+                pullback = indoc! {"
+                    lambda %0:f32[2, 2], %1:bf16[2, 2] .
+                    let %2:f32[2, 2] = convert_element_type [data_type=f32] %1
+                        %3:f32[2, 2] = dot [
+                            dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                            precision=bf16_bf16_f32,
+                        ] %2 %0
+                        %4:bf16[2, 2] = convert_element_type [data_type=bf16] %3
+                    in (%4)
+                "},
+            }],
+        );
+
+        // The adjoint of an `Any_F8` dot contracts the `f32` cotangent with the converted known input, which that
+        // preset does not support, so the adjoint uses the default precision.
+        let input_type = ArrayType::new_static(DataType::F8E4M3FN, [2, 2]);
+        check_operation_transposition!(
+            @exact,
+            operation = DotOperation::matmul()
+                .with_precision(DotAlgorithmPreset::Any_F8_Any_F8_F32)
+                .with_accumulation_type(DataType::F32),
             cases = [{
                 inputs = [
                     (@known, Array::from_elements::<f8e4m3fn>(
@@ -4784,11 +6764,48 @@ mod tests {
             .trim_end(),
         );
 
+        // The array member projection forwards the complete configuration to the staged instruction.
+        let vector_type = ArrayIrType::Array(ArrayType::new_static(DataType::BF16, [2]));
+        let (_, program) = ArrayIrContext::trace(
+            |inputs: Vec<Tracer<ArrayIrContext>>| {
+                inputs[0].dot_with_configuration(
+                    &inputs[1],
+                    &DotDimensionNumbers::inner_product(),
+                    DotAlgorithmPreset::BF16_BF16_F32.into(),
+                    Some(DataType::F32),
+                    None,
+                )
+            },
+            vec![vector_type.clone(), vector_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bf16[2], %1:bf16[2] .
+                let %2:f32[] = dot [
+                    dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    precision=bf16_bf16_f32,
+                    accumulation_type=f32,
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+
         // Concrete array IR values contract their array members, while first-class dimension members are rejected.
         let left = ArrayIrValue::Array(Array::vector(vec![1.0f32, 2.0]).unwrap());
         let right = ArrayIrValue::Array(Array::vector(vec![3.0f32, 4.0]).unwrap());
         assert_eq!(
             left.dot(&right, &DotDimensionNumbers::inner_product()),
+            Ok(ArrayIrValue::Array(Array::scalar(11.0f32).unwrap())),
+        );
+        assert_eq!(
+            left.dot_with_precision(
+                &right,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::F16_F16_F16.into(),
+            ),
             Ok(ArrayIrValue::Array(Array::scalar(11.0f32).unwrap())),
         );
         let singleton = ArrayIrValue::Array(Array::vector(vec![3.0f32]).unwrap());

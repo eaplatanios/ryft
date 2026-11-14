@@ -24,7 +24,7 @@ use ryft_macros::Parameter;
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::sharding::{Sharding, ShardingDimension, ShardingError};
-use crate::arrays::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, Shape};
+use crate::arrays::types::{ArrayIrType, ArrayType, Dimension, DimensionType, Shape};
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedProgram, BatchingContext,
@@ -37,10 +37,9 @@ use crate::contexts::{Context, ContextProjection, EagerContext, ProjectedContext
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count};
 use crate::operations::{
-    Assert, Broadcast, BroadcastOperation, Compare, ComparisonDirection, ConstantOperation, DimensionConstant,
-    DimensionSize, DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicIota,
-    ElementwiseOperation, Gather, GatherDimensionNumbers, GatherOptions, GuardOperation, Iota, Transpose,
-    TransposeOperation,
+    Assert, Broadcast, BroadcastOperation, Compare, ComparisonDirection, ConstantOperation, Diagonal,
+    DimensionConstant, DimensionSize, DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation,
+    ElementwiseOperation, GuardOperation, Transpose, TransposeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -1183,31 +1182,21 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType> + Iota<C::Value>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Value>>>
-    DiagonalBatchingPolicy<C> for ArrayBatchingPolicy<P>
+impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Value>>> DiagonalBatchingPolicy<C>
+    for ArrayBatchingPolicy<P>
 where
-    C::Value: Gather,
+    C::Value: Diagonal,
 {
     fn diagonal(
-        context: &C,
+        _context: &C,
         value: &C::Value,
         kept_axis: usize,
         removed_axis: usize,
     ) -> Result<C::Value, BatchingError> {
-        // Homogeneous array contexts construct indices from host extents only, so every extent must be static.
-        let r#type = value.r#type();
-        let (indices_type, iota_dimension, dimensions, slice_sizes) =
-            diagonal_gather_layout(r#type.as_ref(), kept_axis, removed_axis)?;
-        if indices_type.shape().dimensions().iter().any(|dimension| dimension.value().is_none()) {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "cannot take the diagonal of a value of type `{type}` with dynamic extents in a homogeneous array \
-                     context",
-                ),
-            });
-        }
-        let indices = context.iota(&indices_type, iota_dimension)?;
-        Ok(value.gather(&indices, &dimensions, &slice_sizes, &GatherOptions::new())?)
+        // The main diagonal of two axes that share one extent needs no slice, so this is one gather whose indices
+        // the `Diagonal` capability constructs from host extents, which must therefore all be static.
+        validate_diagonal_batch_axes(value.r#type().as_ref(), kept_axis, removed_axis)?;
+        Ok(value.diagonal(0, kept_axis, removed_axis)?)
     }
 }
 
@@ -1707,34 +1696,21 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayIrType> + DynamicIota<C::Value>> DiagonalBatchingPolicy<C> for ArrayIrBatchingPolicy
+impl<C: Context<Type = ArrayIrType>> DiagonalBatchingPolicy<C> for ArrayIrBatchingPolicy
 where
-    C::Value: DimensionSize<Extent = C::Value> + ValueProjection<ArrayType>,
-    <C::Value as ValueProjection<ArrayType>>::Projected: Gather,
+    C::Value: Diagonal,
 {
     fn diagonal(
-        context: &C,
+        _context: &C,
         value: &C::Value,
         kept_axis: usize,
         removed_axis: usize,
     ) -> Result<C::Value, BatchingError> {
-        // Dynamic extents are read from `value` itself, so the indices share their dimension identities
-        // with the paired input axes. Static extents consume no dimension values.
+        // The main diagonal of two axes that share one extent needs no slice, so this is one gather whose indices
+        // the `Diagonal` capability constructs from the dynamic extents that it reads from `value` itself.
         let r#type = value.r#type();
-        let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
-        let (indices_type, iota_dimension, dimensions, slice_sizes) =
-            diagonal_gather_layout(r#type, kept_axis, removed_axis)?;
-        let mut extents = Vec::new();
-        for axis in (0..r#type.rank()).filter(|axis| *axis != removed_axis) {
-            if r#type.dimension(axis).value().is_none() {
-                extents.push(value.dimension_size(axis)?);
-            }
-        }
-        let indices = context.dynamic_iota(&indices_type, iota_dimension, &extents)?;
-        let value = <C::Value as ValueProjection<ArrayType>>::into_projected(value.clone())?;
-        let indices = <C::Value as ValueProjection<ArrayType>>::into_projected(indices)?;
-        let diagonal = value.gather(&indices, &dimensions, &slice_sizes, &GatherOptions::new())?;
-        Ok(<C::Value as ValueProjection<ArrayType>>::from_projected(diagonal))
+        validate_diagonal_batch_axes(<&ArrayType>::try_from(r#type.as_ref())?, kept_axis, removed_axis)?;
+        Ok(value.diagonal(0, kept_axis, removed_axis)?)
     }
 }
 
@@ -2815,48 +2791,24 @@ fn batch_axis_sharding<T: std::borrow::Borrow<ArrayType>, I: IntoIterator<Item =
     Ok(dimension.unwrap_or(ShardingDimension::Replicated))
 }
 
-/// Returns the paired gather that takes the diagonal of an array of type `type` along `kept_axis` and `removed_axis`
-/// (refer to [`DiagonalBatchingPolicy::diagonal`]), as the type of its indices, the indices axis along which they
-/// count, its dimension numbers, and its window sizes. The indices enumerate every input coordinate except those of
-/// `removed_axis`, followed by a one-component index vector, and count along the coordinates of `kept_axis`. Pairing
-/// every enumerated axis with the input axis that it enumerates (i.e., as gather batching dimensions) then reads, for
-/// each input coordinate, the element whose `removed_axis` index equals its `kept_axis` index, with no window over a
-/// possibly dynamic extent.
-fn diagonal_gather_layout(
-    r#type: &ArrayType,
-    kept_axis: usize,
-    removed_axis: usize,
-) -> Result<(ArrayType, usize, GatherDimensionNumbers, Vec<usize>), BatchingError> {
+/// Validates that `kept_axis` and `removed_axis` are two distinct axes of an array of type `type` that share one
+/// extent, which is what [`DiagonalBatchingPolicy::diagonal`] requires of the two batch axes whose diagonal it takes.
+/// The [`Diagonal`] capability itself also accepts axes with different static extents.
+fn validate_diagonal_batch_axes(r#type: &ArrayType, kept_axis: usize, removed_axis: usize) -> Result<(), TypeError> {
     let rank = r#type.rank();
     if kept_axis >= rank || removed_axis >= rank || kept_axis == removed_axis {
         return Err(TypeError::invalid(format!(
             "cannot take the diagonal of a value of type `{type}` along axes {kept_axis} and {removed_axis}, \
              which must be two distinct axes of its rank {rank}",
-        ))
-        .into());
+        )));
     }
-
     if r#type.dimension(kept_axis) != r#type.dimension(removed_axis) {
         return Err(TypeError::invalid(format!(
             "cannot take the diagonal of a value of type `{type}` along axes {kept_axis} and {removed_axis}, \
              whose extents differ",
-        ))
-        .into());
+        )));
     }
-
-    let paired_axes = (0..rank).filter(|axis| *axis != removed_axis).collect::<Vec<_>>();
-    let mut indices_shape = paired_axes.iter().map(|axis| r#type.dimension(*axis)).collect::<Vec<_>>();
-    indices_shape.push(Dimension::Static(1));
-    let indices_type = ArrayType::new(DataType::I64, Shape::new(indices_shape));
-    let iota_dimension = if removed_axis < kept_axis { kept_axis - 1 } else { kept_axis };
-    let dimensions = GatherDimensionNumbers::new(Vec::new(), vec![removed_axis], vec![removed_axis])
-        .with_batching_dimensions(paired_axes.iter().enumerate().map(|(index, axis)| (*axis, index)).collect());
-
-    // Paired axes use a zero window when they may be empty, exactly as `DynamicGather::dynamic_gather_axis` does.
-    let slice_sizes = (0..rank)
-        .map(|axis| if axis == removed_axis { 1 } else { r#type.dimension(axis).bounds().lower().min(1) })
-        .collect();
-    Ok((indices_type, iota_dimension, dimensions, slice_sizes))
+    Ok(())
 }
 
 /// Returns the [`ArrayType`] required to place `position` on `axis_sharding`,
@@ -4185,11 +4137,11 @@ mod tests {
         );
         assert_eq!(
             result.map(|_| ()),
-            Err(ProgramError::from(BatchingError::UnsupportedOperation {
+            Err(ProgramError::UnsupportedOperation {
                 message: "cannot take the diagonal of a value of type `f64[n, n]` with dynamic extents in a \
                           homogeneous array context"
                     .to_string(),
-            })),
+            }),
         );
         Ok(())
     }
