@@ -32,9 +32,9 @@ use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceNewOpe
 use crate::parameters::Parameter;
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClass, MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceAccessOperation,
-    ReferenceDischargePolicy, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType,
-    ReferenceTransform, ReferenceType, Type, Typed, Value,
+    MaybeZero, Operation, OperationProvider, Program, ProgramError, ReferenceAccessOperation, ReferenceDischargePolicy,
+    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceMemberType, ReferenceTransform,
+    ReferenceType, Type, Typed, Value,
 };
 use crate::tracing::{TracingContext, TracingScope};
 
@@ -1502,21 +1502,23 @@ impl<V: Typed<Type: Eq + Hash> + Parameter, O> CustomRuleDefinition<V, O> {
     ///
     /// The declaration exists only to let batching release manual axes (e.g., the batching of an enclosing
     /// `shard_map`), so it promises everything that releasing another manual axis requires of the rules.
-    /// They communicate only along the declared mesh axes, and they have no I/O effect (i.e., no
-    /// [`EffectClass::OrderedIo`], [`EffectClass::DeviceOrderedIo`], or [`EffectClass::UnorderedIo`] effect),
-    /// because every device along a manual axis runs its own occurrence of such an effect, which releasing the axis
-    /// would eliminate. A body with per device I/O can never have an axis released, so a definition whose rules have
-    /// I/O gains nothing from a declaration and must leave its rule axes undeclared. Its axes then stay manual and its
-    /// effects keep running once per device.
+    /// They communicate only along the declared mesh axes, and they have no effect that runs once per device (i.e.,
+    /// any effect other than an [`EffectClass::OrderedAssertion`](crate::EffectClass::OrderedAssertion) or the
+    /// [`EffectClass::OrderedState`](crate::EffectClass::OrderedState) of structured reference effects, such as I/O or
+    /// opaque state) anywhere in their region closure, including the dormant rule regions of the operations that they
+    /// call, because every device along a manual axis runs its own occurrence of such an effect, which releasing the
+    /// axis would eliminate. A body with such an effect can never have an axis released, so a definition whose rules
+    /// have one gains nothing from a declaration and must leave its rule axes undeclared. Its axes then stay manual
+    /// and its effects keep running once per device.
     ///
     /// # Errors
     ///
-    /// The declaration is checked rather than trusted. Every rule program is validated when it is traced, before
-    /// it is cached or used, so the request that traces a rule (e.g., a derivative or batching request) fails with a
-    /// [`ProgramError::UnsupportedOperation`] when the rule has an I/O effect, communicates along a mesh axis of the
-    /// definition's scope (i.e., one of its manual axes or [`NamedAxis::Mesh`] bindings, whereas a batch axis is not
-    /// restricted) that is not declared, or calls an operation whose hidden axes are unknown or include an axis that
-    /// is not declared (e.g., another composite whose rule axes are not declared).
+    /// The declaration is checked rather than trusted. Every rule program is validated when it is traced, before it
+    /// is cached or used, so the request that traces a rule (e.g., a derivative or batching request) fails with a
+    /// [`ProgramError::UnsupportedOperation`] when the rule has an effect that runs once per device, communicates along
+    /// a mesh axis of the definition's scope (i.e., one of its manual axes or [`NamedAxis::Mesh`] bindings, whereas a
+    /// batch axis is not restricted) that is not declared, or calls an operation whose hidden axes are unknown or
+    /// include an axis that is not declared (e.g., another composite whose rule axes are not declared).
     #[inline]
     pub fn with_rule_axes<A: Into<String>, I: IntoIterator<Item = A>>(self, axis_names: I) -> Self
     where
@@ -1921,7 +1923,9 @@ where
 }
 
 /// Validates `program`, which was just traced from the `rule` rule of `definition`, against the rule axes that
-/// `definition` declares (refer to [`CustomRuleDefinition::with_rule_axes`]). The program must have no I/O effect,
+/// `definition` declares (refer to [`CustomRuleDefinition::with_rule_axes`]). No instruction in the region closure
+/// of the program, including dormant rule regions, may have an effect that runs once per device (refer to
+/// [`device_count_sensitive_effect_class`](crate::EffectsSummary::device_count_sensitive_effect_class)),
 /// every mesh axis that one of its instructions communicates along must be declared, and every hidden axis of its
 /// instructions must be known and declared. Mesh axes are those of the definition's [`TracingScope`] (i.e., its manual
 /// axes and its [`NamedAxis::Mesh`] bindings), while an axis that the scope binds only to a batching level, or does not
@@ -1945,10 +1949,12 @@ where
         ),
     };
 
-    let effect_classes = program.effects().classes();
-    if let Some(effect_class) = [EffectClass::OrderedIo, EffectClass::DeviceOrderedIo, EffectClass::UnorderedIo]
-        .into_iter()
-        .find(|effect_class| effect_classes.contains(*effect_class))
+    // Every device along a manual axis runs its own occurrence of such an effect, and a later transform may activate
+    // the dormant rule regions that `Program::effects` excludes, so the whole closure is scanned.
+    if let Some(effect_class) = program
+        .entry_region_ref()
+        .instructions_in_closure()
+        .find_map(|(_, instruction)| instruction.operation().effects().summary().device_count_sensitive_effect_class())
     {
         return Err(violation(format!("has the `{effect_class:?}` effect")));
     }

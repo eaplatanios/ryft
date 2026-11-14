@@ -576,23 +576,24 @@ where
     ///
     /// The declaration exists only to let batching release manual axes, so it promises everything that releasing
     /// another manual axis requires of the rules. They communicate only along the declared mesh axes, and they have
-    /// no I/O effect (i.e., no [`EffectClass::OrderedIo`](crate::EffectClass::OrderedIo),
-    /// [`EffectClass::DeviceOrderedIo`](crate::EffectClass::DeviceOrderedIo), or
-    /// [`EffectClass::UnorderedIo`](crate::EffectClass::UnorderedIo) effect), because every device along a manual axis
-    /// runs its own occurrence of such an effect, which releasing the axis would eliminate. A body with per device I/O
-    /// can never have an axis released, so a function whose rules have I/O (e.g., a backward rule that prints) gains
-    /// nothing from a declaration and must leave its rule axes undeclared. Its axes then stay manual and its effects
-    /// keep running once per device.
+    /// no effect that runs once per device (i.e., any effect other than an
+    /// [`EffectClass::OrderedAssertion`](crate::EffectClass::OrderedAssertion) or the
+    /// [`EffectClass::OrderedState`](crate::EffectClass::OrderedState) of structured reference effects, such as I/O or
+    /// opaque state), anywhere in their region closure, including the dormant rule regions of the operations that they
+    /// call, because every device along a manual axis runs its own occurrence of such an effect, which releasing the
+    /// axis would eliminate. A body with such an effect can never have an axis released, so a function whose rules
+    /// have one (e.g., a backward rule that prints) gains nothing from a declaration and must leave its rule axes
+    /// undeclared. Its axes then stay manual and its effects keep running once per device.
     ///
     /// # Errors
     ///
     /// The declaration is checked rather than trusted. Every rule is validated when it is traced, before its program
     /// is cached or used, so the request that traces a rule (e.g., a derivative or batching request) fails with a
-    /// [`ProgramError::UnsupportedOperation`] when the rule has an I/O effect, communicates along a mesh axis of the
-    /// scope of its call (i.e., an axis that an enclosing manual region made manual, whereas the axis of an enclosing
-    /// batching level is not restricted) that is not declared, or calls an operation whose hidden axes are unknown or
-    /// include an axis that is not declared (e.g., another function whose rule axes are not declared). Refer to
-    /// [`CustomRuleDefinition::with_rule_axes`] for more information.
+    /// [`ProgramError::UnsupportedOperation`] when the rule has an effect that runs once per device, communicates along
+    /// a mesh axis of the scope of its call (i.e., an axis that an enclosing manual region made manual, whereas the
+    /// axis of an enclosing batching level is not restricted) that is not declared, or calls an operation whose hidden
+    /// axes are unknown or include an axis that is not declared (e.g., another function whose rule axes are not
+    /// declared). Refer to [`CustomRuleDefinition::with_rule_axes`] for more information.
     ///
     /// # Parameters
     ///
@@ -2071,10 +2072,11 @@ mod tests {
     use crate::operations::collectives::axis_index::AxisIndex;
     use crate::operations::collectives::parallel_reduce::ParallelReduce;
     use crate::operations::collectives::{CollectiveOperation, HiddenAxes};
+    use crate::operations::composites::operations::CompositeJvpRule;
     use crate::operations::composites::rules::specializations::CustomRuleSource;
     use crate::operations::constants::zero::Zero;
     use crate::operations::custom_call::CustomCallBatching;
-    use crate::operations::debugging::Print;
+    use crate::operations::debugging::{Print, PrintOperation};
     use crate::operations::differentiation::stop_gradient::StopGradient;
     use crate::operations::dimensions::dimension_size::DimensionSize;
     use crate::operations::dot::{Dot, DotDimensionNumbers};
@@ -2088,7 +2090,9 @@ mod tests {
     };
     use crate::operations::trigonometric::{Cos, Sin};
     use crate::parameters::Placeholder;
-    use crate::programs::{EffectClass, FlatProgram, Instruction, MaybeZero, ReferenceType, ValueProjection};
+    use crate::programs::{
+        EffectClass, FlatProgram, Instruction, MaybeZero, ProgramBuilder, ReferenceType, ValueProjection,
+    };
     use crate::tracing::{DomainTracer, Trace};
 
     use super::*;
@@ -2690,8 +2694,9 @@ mod tests {
     fn test_composite_with_rule_axes_validates_jvp_rules() {
         // The forward mode rule is validated against the declaration when a derivative traces it, in the scope of the
         // call, which binds the manual mesh axes `x` and `y` and the batch axis `b`. A rule may communicate along the
-        // declared mesh axes and along batch axes, but not along another mesh axis, it must have no I/O effect, and it
-        // must not call a function whose rule axes are not declared.
+        // declared mesh axes and along batch axes, but not along another mesh axis, it must have no effect that runs
+        // once per device anywhere in its region closure, and it must not call a function whose rule axes are not
+        // declared.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
             MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
@@ -2745,6 +2750,55 @@ mod tests {
             jvp(&printing),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == rejected("has the `DeviceOrderedIo` effect"),
+        ));
+
+        // So is an effect that runs once per device in the dormant rule region of a call that the rule stages (here,
+        // an attached forward mode rule that prints), which a later transform of the rule may run, and opaque state.
+        let identity = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(scalar_type.clone());
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()
+        };
+        let printing_jvp = {
+            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            let input = builder.add_input(scalar_type.clone());
+            let tangent = builder.add_input(scalar_type.clone());
+            let print = PrintOperation::<ArrayType>::new("tangent").with_effect_class(EffectClass::DeviceOrderedIo);
+            let tangent = builder.add_instruction(print, Vec::new(), vec![tangent], None).unwrap()[0];
+            builder
+                .build::<Vec<Array>, Vec<Array>>(vec![input, tangent], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let attached = composite(|x: ArrayTracer| Ok(x))
+            .with_jvp(move |x: ArrayTracer, tangent: ArrayTracer| {
+                let call = CompositeOperation::<Array, ArrayOperation<Array>>::from_rule_regions(
+                    CompositeJvpRule::Explicit,
+                    false,
+                );
+                let regions = vec![identity.clone(), printing_jvp.clone()];
+                let tangent = tangent.domain().bind(ArrayOperation::Composite(call), regions, &[tangent])?.remove(0);
+                Ok((x, tangent))
+            })
+            .with_rule_axes(Vec::<String>::new());
+        assert!(matches!(
+            jvp(&attached),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == rejected("has the `DeviceOrderedIo` effect"),
+        ));
+        let state_type = scalar_type.clone();
+        let stateful = composite(|x: ArrayTracer| Ok(x))
+            .with_jvp(move |x: ArrayTracer, tangent: ArrayTracer| {
+                let call = CustomCallOperation::new("increment", vec![state_type.clone()])
+                    .with_effect_class(EffectClass::OrderedState);
+                let tangent =
+                    tangent.domain().bind(ArrayOperation::CustomCall(call), Vec::new(), &[tangent])?.remove(0);
+                Ok((x, tangent))
+            })
+            .with_rule_axes(Vec::<String>::new());
+        assert!(matches!(
+            jvp(&stateful),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == rejected("has the `OrderedState` effect"),
         ));
 
         // A call of a function whose rule axes are not declared may communicate along any axis, so it is rejected.
