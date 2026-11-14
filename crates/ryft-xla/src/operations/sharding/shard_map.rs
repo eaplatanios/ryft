@@ -396,17 +396,20 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
+
     use ryft_core::{
-        AxisIndexOperation, BatchAxis, BatchAxisSpecification, BroadcastOperation, Context, ConvertElementType,
-        ConvertElementTypeOperation, CotangentDestinationKind, CustomCallOperation, DataType, Device, DeviceMesh,
-        Dimension as CoreDimension, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass, Exp,
-        LogicalMesh, MeshAxis, MeshAxisType, PARALLEL_BROADCAST_OPERATION_NAME, ParallelAllGather, ParallelAllToAll,
+        AxisIndexOperation, BatchAxis, BatchAxisSpecification, BatchedProgram, BroadcastOperation, CompositeOperation,
+        Context, ConvertElementType, ConvertElementTypeOperation, CotangentDestinationKind, CustomCallOperation,
+        CustomRuleDefinition, CustomRuleRegistration, DataType, Device, DeviceMesh, Dimension as CoreDimension,
+        DimensionValue, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass, Exp, LogicalMesh,
+        MeshAxis, MeshAxisType, NamedAxis, PARALLEL_BROADCAST_OPERATION_NAME, ParallelAllGather, ParallelAllToAll,
         ParallelArgExtrema, ParallelBroadcast, ParallelCast, ParallelCastTarget, ParallelPermute, ParallelReduce,
-        ParallelSumScatter, Placeholder, ProjectedValue, ReductionKind, ReshapeOperation, Shape, ShardMapOptions,
-        Typed, UnreducedKind, Value as CoreValue, ValueProjection, batch, differentiate_at, explicit_axes, shard_map,
-        shard_map_along, shard_map_with_inferred_input_shardings,
+        ParallelSumScatter, Placeholder, ProgramBatchingOutputAxesPolicy, ProjectedValue, ReductionKind,
+        ReshapeOperation, Shape, ShardMapOptions, TracingScope, Typed, TypedProgram, UnreducedKind, Value as CoreValue,
+        ValueProjection, batch, differentiate_at, explicit_axes, shard_map, shard_map_along,
+        shard_map_with_inferred_input_shardings,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -418,7 +421,7 @@ mod tests {
         test_spmd_compilation_options, test_vector_type,
     };
     use crate::experimental::lowering::{lower_mlir_module_for_program, to_mlir_module_for_program};
-    use crate::experimental::ops::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::experimental::ops::{Operation as ArrayIrOperation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::experimental::tracing::{TracedProgram, trace_with_context};
     use crate::operations::assertions::ensure_assertion_handler_registered;
     use crate::operations::debugging::PRINT_CUSTOM_CALL_TARGET;
@@ -876,6 +879,190 @@ mod tests {
                       sdy.return %3 : tensor<4xf32>
                     } : (tensor<f32>) -> tensor<4xf32>
                     return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_to_mlir_module_for_program_lowers_derivatives_of_batched_maps_whose_retained_rules_use_manual_axes() {
+        // The body of a map over `x` calls an identity composite of this operation family, whose retained forward mode
+        // rule reduces its tangent over `x`. No instruction of the body names `x`, so only the hidden axes that the
+        // composite reports show that the rule uses it. Batching the map with the batch placed on `x` must therefore
+        // keep `x` manual and gather the batch along it. Otherwise, the map would have no manual axes, and
+        // differentiating it afterwards would trace the rule into a map that does not bind `x`, which cannot be lowered.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let replicated = Sharding::replicated(mesh.clone(), 0);
+        let global_type = ArrayType::scalar(DataType::F32);
+        let boundary = ShardMapBoundary::new(mesh.clone(), vec![replicated.clone()], vec![replicated], vec![]).unwrap();
+        let local_type = boundary.local_input_type(0, &global_type).unwrap();
+        let binding = NamedAxis::Mesh { mesh: mesh.clone(), axis: 0, size: 2, checks_manual_variation: true };
+        let scope = TracingScope::new(vec![("x".to_string(), binding.clone())], Some(mesh))
+            .with_manual_axes(vec![("x".to_string(), binding)]);
+        let rules = CustomRuleRegistration::new(
+            CustomRuleDefinition::<Constant, ArrayIrOperation>::new("jvp_over_x")
+                .with_jvp(|primals, tangents| {
+                    let tangent = ValueProjection::<ArrayType>::into_projected(tangents[0].clone())?;
+                    let tangent = tangent.parallel_reduce(ReductionKind::Sum, "x")?;
+                    Ok((primals.to_vec(), vec![tangent.into_value()]))
+                })
+                .with_scope(scope)
+                .with_batching_support(),
+        );
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(local_type.clone().into());
+        let primal = builder.build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder]);
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(local_type.into());
+        let primal = builder.import_program(primal.unwrap());
+        let call = CompositeOperation::<Constant, ArrayIrOperation>::new(rules.reference());
+        let outputs = builder.add_instruction(call, vec![primal], vec![input], None).unwrap().to_vec();
+        let body = builder
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let map =
+            ShardMapOperation::from_program(&body, vec![ArrayIrType::Array(global_type.clone())], boundary).unwrap();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(global_type.into());
+        let body = builder.import_program(body);
+        let outputs = builder.add_instruction(map, vec![body], vec![input], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::sharded(["x"]),
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        let replicated = "{mesh<['x'=2:manual]>, [{}]}";
+        let tiled = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let local = format!("f32[2][sharding={replicated}]");
+        let varying = "{mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}";
+        let matrix = "{mesh<['x'=2:manual]>, [{}, {}], varying_manual={'x'}}";
+        let scalar = "{mesh<['x'=2:manual]>, [], varying_manual={'x'}}";
+        assert_eq!(
+            batched.to_string(),
+            formatdoc! {"
+                lambda %0:dimension<2>, %1:f32[2] .
+                let %2:f32[2][sharding={tiled}] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{replicated}],
+                    output_shardings=[{tiled}],
+                    manual_axes=['x'],
+                    global_input_types=[{local}],
+                    global_output_types=[f32[2][sharding={tiled}]],
+                ] %1 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:dimension<2> = constant [value=2]
+                            %2:{local} = composite [
+                                name=\"jvp_over_x\",
+                                non_differentiated_count=1,
+                                batching=[(extent=dimension<2>, input_axes=[axis 0], output_axes=[axis 0])],
+                            ] %1 %0 [
+                                primal={{
+                                    lambda %0:dimension<2>, %1:{local} .
+                                    in (%1)
+                                }},
+                            ]
+                            %3:f32[2][sharding={varying}] = parallel_vary [axis_name=\"x\"] %2
+                            %4:f32[2, 1][sharding={matrix}] = reshape [
+                                shape=[2, 1],
+                                output_sharding={matrix},
+                            ] %3
+                            %5:u64[][sharding={scalar}] = axis_index [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %6:u64[][sharding={scalar}] = zero [type=u64[][sharding={scalar}]]
+                            %7:f32[1, 1][sharding={matrix}] = dynamic_slice [sizes=[1, 1]] %4 %5 %6
+                            %8:f32[1][sharding={varying}] = reshape [shape=[1], output_sharding={varying}] %7
+                        in (%8)
+                    }},
+                ]
+                in (%0, %2)"},
+        );
+
+        // First-class dimensions cross the boundary of a lowered function as `i64` scalars.
+        let derivative = batched.jvp().unwrap();
+        let boundary_type = |r#type: &ArrayIrType| match r#type {
+            ArrayIrType::Array(r#type) => r#type.clone(),
+            _ => ArrayType::scalar(DataType::I64),
+        };
+        let input_types = derivative.input_types().iter().map(boundary_type).collect::<Vec<_>>();
+        let output_types = derivative.output_types().iter().map(boundary_type).collect::<Vec<_>>();
+        assert_eq!(
+            to_mlir_module_for_program(&derivative, &[], &input_types, &output_types, "main", None, None).unwrap(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<i64>, %arg1: tensor<2xf32>, %arg2: tensor<2xf32>) -> (tensor<i64>, tensor<2xf32>, tensor<2xf32>) {
+                    %0:2 = sdy.manual_computation(%arg1, %arg2) in_shardings=[<@mesh, [{}], replicated={"x"}>, <@mesh, [{}], replicated={"x"}>] out_shardings=[<@mesh, [{"x"}]>, <@mesh, [{"x"}]>] manual_axes={"x"} (%arg3: tensor<2xf32>, %arg4: tensor<2xf32>) {
+                      %1 = stablehlo.reshape %arg3 : (tensor<2xf32>) -> tensor<2x1xf32>
+                      %2 = sdy.sharding_constraint %1 <@mesh, [{}, {}]> : tensor<2x1xf32>
+                      %3 = stablehlo.partition_id : tensor<ui32>
+                      %4 = stablehlo.convert %3 : (tensor<ui32>) -> tensor<ui64>
+                      %c = stablehlo.constant dense<0> : tensor<ui64>
+                      %5 = sdy.sharding_constraint %c <@mesh, []> : tensor<ui64>
+                      %6 = stablehlo.convert %4 : tensor<ui64>
+                      %7 = stablehlo.get_dimension_size %2, dim = 0 : (tensor<2x1xf32>) -> tensor<i32>
+                      %8 = stablehlo.convert %7 : (tensor<i32>) -> tensor<i64>
+                      %c_0 = stablehlo.constant dense<0> : tensor<ui64>
+                      %c_1 = stablehlo.constant dense<1> : tensor<i64>
+                      %9 = stablehlo.subtract %8, %c_1 : tensor<i64>
+                      %10 = stablehlo.convert %9 : (tensor<i64>) -> tensor<ui64>
+                      %11 = stablehlo.maximum %6, %c_0 : tensor<ui64>
+                      %12 = stablehlo.minimum %11, %10 : tensor<ui64>
+                      %13 = stablehlo.convert %12 : (tensor<ui64>) -> tensor<i64>
+                      %14 = stablehlo.convert %5 : tensor<ui64>
+                      %15 = stablehlo.get_dimension_size %2, dim = 1 : (tensor<2x1xf32>) -> tensor<i32>
+                      %16 = stablehlo.convert %15 : (tensor<i32>) -> tensor<i64>
+                      %c_2 = stablehlo.constant dense<0> : tensor<ui64>
+                      %c_3 = stablehlo.constant dense<1> : tensor<i64>
+                      %17 = stablehlo.subtract %16, %c_3 : tensor<i64>
+                      %18 = stablehlo.convert %17 : (tensor<i64>) -> tensor<ui64>
+                      %19 = stablehlo.maximum %14, %c_2 : tensor<ui64>
+                      %20 = stablehlo.minimum %19, %18 : tensor<ui64>
+                      %21 = stablehlo.convert %20 : (tensor<ui64>) -> tensor<i64>
+                      %22 = stablehlo.dynamic_slice %2, %13, %21, sizes = [1, 1] : (tensor<2x1xf32>, tensor<i64>, tensor<i64>) -> tensor<1x1xf32>
+                      %23 = stablehlo.reshape %22 : (tensor<1x1xf32>) -> tensor<1xf32>
+                      %24 = sdy.sharding_constraint %23 <@mesh, [{}]> : tensor<1xf32>
+                      %25 = "stablehlo.all_reduce"(%arg4) <{channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
+                      ^bb0(%arg5: tensor<f32>, %arg6: tensor<f32>):
+                        %47 = stablehlo.add %arg5, %arg6 : tensor<f32>
+                        stablehlo.return %47 : tensor<f32>
+                      }) : (tensor<2xf32>) -> tensor<2xf32>
+                      %26 = stablehlo.reshape %25 : (tensor<2xf32>) -> tensor<2x1xf32>
+                      %27 = sdy.sharding_constraint %26 <@mesh, [{}, {}]> : tensor<2x1xf32>
+                      %28 = stablehlo.convert %4 : tensor<ui64>
+                      %29 = stablehlo.get_dimension_size %27, dim = 0 : (tensor<2x1xf32>) -> tensor<i32>
+                      %30 = stablehlo.convert %29 : (tensor<i32>) -> tensor<i64>
+                      %c_4 = stablehlo.constant dense<0> : tensor<ui64>
+                      %c_5 = stablehlo.constant dense<1> : tensor<i64>
+                      %31 = stablehlo.subtract %30, %c_5 : tensor<i64>
+                      %32 = stablehlo.convert %31 : (tensor<i64>) -> tensor<ui64>
+                      %33 = stablehlo.maximum %28, %c_4 : tensor<ui64>
+                      %34 = stablehlo.minimum %33, %32 : tensor<ui64>
+                      %35 = stablehlo.convert %34 : (tensor<ui64>) -> tensor<i64>
+                      %36 = stablehlo.convert %5 : tensor<ui64>
+                      %37 = stablehlo.get_dimension_size %27, dim = 1 : (tensor<2x1xf32>) -> tensor<i32>
+                      %38 = stablehlo.convert %37 : (tensor<i32>) -> tensor<i64>
+                      %c_6 = stablehlo.constant dense<0> : tensor<ui64>
+                      %c_7 = stablehlo.constant dense<1> : tensor<i64>
+                      %39 = stablehlo.subtract %38, %c_7 : tensor<i64>
+                      %40 = stablehlo.convert %39 : (tensor<i64>) -> tensor<ui64>
+                      %41 = stablehlo.maximum %36, %c_6 : tensor<ui64>
+                      %42 = stablehlo.minimum %41, %40 : tensor<ui64>
+                      %43 = stablehlo.convert %42 : (tensor<ui64>) -> tensor<i64>
+                      %44 = stablehlo.dynamic_slice %27, %35, %43, sizes = [1, 1] : (tensor<2x1xf32>, tensor<i64>, tensor<i64>) -> tensor<1x1xf32>
+                      %45 = stablehlo.reshape %44 : (tensor<1x1xf32>) -> tensor<1xf32>
+                      %46 = sdy.sharding_constraint %45 <@mesh, [{}]> : tensor<1xf32>
+                      sdy.return %24, %46 : tensor<1xf32>, tensor<1xf32>
+                    } : (tensor<2xf32>, tensor<2xf32>) -> (tensor<2xf32>, tensor<2xf32>)
+                    return %arg0, %0#0, %0#1 : tensor<i64>, tensor<2xf32>, tensor<2xf32>
                   }
                 }
             "#},
