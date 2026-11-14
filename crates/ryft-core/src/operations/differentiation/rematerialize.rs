@@ -827,7 +827,7 @@ mod tests {
         DimensionBounds, DimensionType, DimensionValue, LogicalMesh, Memory, MeshAxis, MeshAxisType, Shape, Sharding,
         ShardingDimension,
     };
-    use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
+    use crate::batching::{BatchAxis, BatchingLevelExtent, ProgramBatchingOutputAxesPolicy};
     use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
@@ -846,7 +846,7 @@ mod tests {
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::{WHILE_OPERATION_NAME, WhileOperation};
-    use crate::operations::debugging::PrintOperation;
+    use crate::operations::debugging::{Print, PrintOperation};
     use crate::operations::differentiation::stop_gradient::StopGradientOperation;
     use crate::operations::dimensions::dimension_add::DimensionAddOperation;
     use crate::operations::dot::{Dot, DotDimensionNumbers, DotOperation};
@@ -862,8 +862,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::ResidualPolicy;
     use crate::programs::{
-        EffectClasses, ExternalReferenceBinding, Program, ProgramBuilder, ReferenceSource, ReferenceType, RegionDriver,
-        RegionRef, TypedProgram,
+        EffectClass, EffectClasses, ExternalReferenceBinding, Program, ProgramBuilder, ReferenceSource, ReferenceType,
+        RegionDriver, RegionRef, TypedProgram, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -3106,6 +3106,66 @@ mod tests {
         assert_eq!(
             outputs,
             Ok(vec![Array::scalar(2.0 * x * (x * x).cos()).unwrap(), Array::scalar(second_derivative).unwrap()]),
+        );
+    }
+
+    #[test]
+    fn test_rematerialize_batching_applies_custom_batching_rules_to_replicated_inputs() {
+        // The body calls an identity composite whose custom batching rule prints its input. A custom batching rule is
+        // applied whenever its call is batched, whatever its inputs, so batching the rematerialized call at an unnamed
+        // level with a replicated input batches its body as well, and the batched body prints.
+        type IrContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let function = composite(|x: Tracer<IrContext>| Ok(x)).with_batching(
+            |x: Tracer<IrContext>, axis: BatchAxis, _: BatchingLevelExtent<Tracer<IrContext>>| {
+                let x = ValueProjection::<ArrayType>::into_projected(x)?;
+                Ok((x.print_with_effect_class("batched", EffectClass::DeviceOrderedIo)?.into_value(), axis))
+            },
+        );
+        let (_, region) = IrContext::trace(
+            |inputs: Vec<Tracer<IrContext>>| Ok(vec![function.call(inputs[0].clone())?]),
+            vec![scalar_type.clone()],
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(scalar_type.clone());
+        let region = builder.import_program(region);
+        let operation = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(NothingSavable));
+        let outputs = builder.add_instruction(operation, vec![region], vec![input], None).unwrap().to_vec();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let batched = program
+            .batched_with_threaded_extent(
+                DimensionValue::constant(2).unwrap().r#type().into_owned(),
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap();
+        assert_eq!(batched.output_axes(), &[BatchAxis::replicated()]);
+        assert_eq!(
+            batched.into_parts().0.to_string(),
+            indoc! {r#"
+                lambda %0:dimension<2>, %1:f32[] .
+                let %2:f32[] = rematerialize %0 %1 [
+                    body={
+                        lambda %0:dimension<2>, %1:f32[] .
+                        let %2:f32[] = composite [
+                            name="composite",
+                            non_differentiated_count=1,
+                            batching=[(extent=dimension<2>, input_axes=[replicated], output_axes=[replicated])],
+                        ] %0 %1 [
+                            primal={
+                                lambda %0:dimension<2>, %1:f32[] .
+                                let %2:f32[] = print [label=batched, effect_class=device_ordered_io] %1
+                                in (%2)
+                            },
+                        ]
+                        in (%2)
+                    },
+                ]
+                in (%0, %2)"#},
         );
     }
 

@@ -24339,8 +24339,53 @@ mod tests {
             builder.add_instruction(rematerialize, vec![body], inputs.to_vec(), None).unwrap().to_vec()
         });
         let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.primal().to_string(), "");
-        assert_eq!(linearization.tangent().to_string(), "");
+        assert_eq!(
+            linearization.primal().to_string(),
+            formatdoc! {"
+                lambda %0:{global} .
+                let %1:{global} = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{tiled}],
+                    output_shardings=[{tiled}],
+                    manual_axes=['x'],
+                    global_input_types=[{global}],
+                    global_output_types=[{global}],
+                ] %0 [
+                    body={{
+                        lambda %0:{local} .
+                        in (%0)
+                    }},
+                ]
+                in (%1)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            formatdoc! {"
+                lambda %0:{global} .
+                let %1:{global} = rematerialize [differentiated=true] %0 [
+                    body={{
+                        lambda %0:{global} .
+                        let %1:{global} = shard_map [
+                            mesh=['x'=2:manual],
+                            input_shardings=[{tiled}],
+                            output_shardings=[{tiled}],
+                            manual_axes=['x'],
+                            global_input_types=[{global}],
+                            global_output_types=[{global}],
+                        ] %0 [
+                            body={{
+                                lambda %0:{local} .
+                                let %1:ref<{local}> = reference_new %0
+                                    () = reference_write %1 %0
+                                    %2:{local} = reference_read %1
+                                in (%2)
+                            }},
+                        ]
+                        in (%1)
+                    }},
+                ]
+                in (%1)"},
+        );
     }
 
     #[test]
