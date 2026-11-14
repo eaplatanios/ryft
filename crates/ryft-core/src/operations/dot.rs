@@ -349,11 +349,18 @@ impl Display for DotInputPrecision {
 /// of StableHLO's [`dot_general`](https://openxla.org/stablehlo/spec#dot_general) and JAX's
 /// [`jax.lax.DotAlgorithm`](https://docs.jax.dev/en/latest/jax.lax.html#jax.lax.DotAlgorithm). The inputs are rounded
 /// to the two precision types, the contraction accumulates at the accumulation type, and the result is then converted
-/// to the output element type of the operation. The component counts and the primitive operation count describe
-/// algorithms that decompose their inputs into several components and run several primitive operations on them,
-/// usually to emulate a higher precision. An algorithm without such a decomposition uses one for all three. Imprecise
-/// accumulation permits some accumulation steps to run at a lower precision (e.g., the fast accumulation mode of
-/// cuBLASLt).
+/// to the output element type of the operation. Imprecise accumulation permits some accumulation steps to run at a
+/// lower precision (e.g., the fast accumulation mode of cuBLASLt).
+///
+/// The component counts and the primitive operation count describe algorithms that emulate a higher precision than
+/// the precision types provide. Such an algorithm splits each input into several components at its precision type
+/// whose sum approximates the input (e.g., a high part `a₁` and a low part `a₂` with `a ≈ a₁ + a₂`), contracts pairs
+/// of components, and sums those partial contractions at the accumulation type. Each contraction of one left-hand
+/// side component with one right-hand side component is one primitive operation, and the primitive operation count
+/// is how many of them the algorithm runs. It is at most the product of the two component counts, because an algorithm
+/// may skip the pairs that contribute least. For example, [`DotAlgorithmPreset::BF16_BF16_F32_X3`] runs the three
+/// `bf16` contractions `a₁ · b₁ + a₁ · b₂ + a₂ · b₁` and skips `a₂ · b₂`. An algorithm without such a decomposition
+/// contracts its rounded inputs once, so it uses one for all three counts.
 ///
 /// Support for an algorithm depends on the platform, and a backend reports an error at compilation when it does not
 /// support the requested one. [`DotAlgorithmPreset`] names the algorithms that are known to be supported on at least
@@ -376,7 +383,8 @@ pub struct DotAlgorithm {
     /// Number of components that the right-hand side input is decomposed into.
     rhs_component_count: usize,
 
-    /// Number of primitive operations that the algorithm runs on the components.
+    /// Number of primitive operations that the algorithm runs, each of which contracts one left-hand side component
+    /// with one right-hand side component at the precision types.
     primitive_operation_count: usize,
 
     /// Whether some accumulation steps may run at a lower precision.
@@ -407,7 +415,9 @@ impl DotAlgorithm {
         self
     }
 
-    /// Returns this [`DotAlgorithm`] with the provided number of primitive operations.
+    /// Returns this [`DotAlgorithm`] with the provided number of primitive operations, each of which contracts one
+    /// left-hand side component with one right-hand side component at the precision types. Refer to the documentation
+    /// of [`DotAlgorithm`] for more information.
     #[inline]
     pub fn with_primitive_operation_count(mut self, primitive_operation_count: usize) -> Self {
         self.primitive_operation_count = primitive_operation_count;
@@ -451,7 +461,8 @@ impl DotAlgorithm {
         self.rhs_component_count
     }
 
-    /// Returns the number of primitive operations that the algorithm runs on the components.
+    /// Returns the number of primitive operations that the algorithm runs, each of which contracts one left-hand side
+    /// component with one right-hand side component at the precision types.
     #[inline]
     pub fn primitive_operation_count(&self) -> usize {
         self.primitive_operation_count
