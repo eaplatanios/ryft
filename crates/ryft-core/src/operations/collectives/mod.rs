@@ -992,21 +992,8 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
                         adjoint_inputs.extend(input_dimensions);
                         let mut outputs = transpose_context.bind(adjoint, Vec::new(), adjoint_inputs.as_slice())?;
                         check_count!("output", outputs, 1, ProgramError);
-
-                        // The transpose region of a linear call may return a type that refines its expected type in
-                        // both directions (e.g., the static extent of a nominal dimension whose bounds admit only that
-                        // extent, for which no value in this region carries the nominal identity), so only a cotangent
-                        // whose type does not is cast.
-                        let output = outputs.remove(0);
-                        let output_type = output.r#type().into_owned();
-                        let target = ArrayIrType::from(transpose_target_type);
-                        if ArrayIrTypeRefinements::new([&target], [&output_type]).is_ok()
-                            && ArrayIrTypeRefinements::new([&output_type], [&target]).is_ok()
-                        {
-                            return Ok(vec![output]);
-                        }
-
-                        Ok(vec![with_cotangent_type(&transpose_context, output, target)?])
+                        let target = transpose_target_type.into();
+                        Ok(vec![with_transpose_output_type(&transpose_context, outputs.remove(0), target)?])
                     },
                 )?
                 .remove(0);
@@ -1822,6 +1809,28 @@ where
     let mut outputs = context.bind(cast, Vec::new(), &[cotangent])?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
+}
+
+/// Returns the output `output` of the transpose region of a linear call that a collective's forward mode rule stages
+/// at a type that the linear call accepts for the input cotangent type `target`. The linear call accepts any type that
+/// refines `target` in both directions (e.g., the static extent of a nominal dimension whose bounds admit only that
+/// extent, for which no value of the region carries the nominal identity), so such an output is returned unchanged,
+/// and any other output is converted by [`with_cotangent_type`] (e.g., one whose layout differs).
+fn with_transpose_output_type<C: Context<Type = ArrayIrType>>(
+    context: &C,
+    output: C::Value,
+    target: ArrayIrType,
+) -> Result<C::Value, ProgramError>
+where
+    C::Operation: From<CastOperation<ArrayIrType>>,
+{
+    let output_type = output.r#type().into_owned();
+    if ArrayIrTypeRefinements::new([&target], [&output_type]).is_ok()
+        && ArrayIrTypeRefinements::new([&output_type], [&target]).is_ok()
+    {
+        return Ok(output);
+    }
+    with_cotangent_type(context, output, target)
 }
 
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingContext<C, ArrayBatchingPolicy<P>> {

@@ -31,7 +31,7 @@ use crate::operations::collectives::{
     LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
     ShapeChangingCollectiveValue, infer_array_ir_shape_changing_collective_output_type,
     infer_linear_collective_operation_output_type, resolve_collective_axes, validate_manual_mesh_axes_input,
-    validate_participant_types, with_cotangent_type,
+    validate_participant_types, with_cotangent_type, with_transpose_output_type,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
@@ -1266,7 +1266,7 @@ where
                         )?;
                         check_count!("output", outputs, 1, ProgramError);
                         let target = transpose_target_type.into();
-                        Ok(vec![with_cotangent_type(&transpose_context, outputs.remove(0), target)?])
+                        Ok(vec![with_transpose_output_type(&transpose_context, outputs.remove(0), target)?])
                     },
                 )?
                 .remove(0);
