@@ -2055,8 +2055,8 @@ mod tests {
 
     use ryft_core::{
         Array as CoreArray, ArrayType, AssertionValue, Concretizable, DataType, Device, DeviceMesh,
-        Dimension as CoreDimension, DimensionBounds, DimensionFromScalar, DimensionSize, DimensionVariable,
-        Error as CoreError, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Neg, ProgramError,
+        Dimension as CoreDimension, DimensionBounds, DimensionError, DimensionFromScalar, DimensionSize,
+        DimensionVariable, Error as CoreError, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Neg, ProgramError,
         Reference as CoreReference, Shape, Sharding, ShardingDimension, ShardingError, StaticShape, TiledLayout,
         TypeError, Typed, UnreducedKind, Value as CoreValue, WhilePredicate,
     };
@@ -3254,7 +3254,8 @@ mod tests {
 
     #[test]
     fn test_array_to_dimension_unreduced() {
-        // The extent read from a scalar that is unreduced along `x` is the sum of the summands `3` and `4`.
+        // The devices of a scalar that is unreduced along `x` hold the summands `3` and `4`, which are not the same on
+        // every device, so the scalar must be combined before it can become a dimension.
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
             .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
@@ -3263,7 +3264,13 @@ mod tests {
         let array =
             unreduced_scalar(&domain, DataType::I32, UnreducedKind::Sum, [&3i32.to_ne_bytes(), &4i32.to_ne_bytes()]);
         let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        assert_eq!(array.to_dimension(variable).unwrap().extent(), 7);
+        assert_eq!(
+            array.to_dimension(variable.clone()),
+            Err(ProgramError::Type(
+                DimensionError::UnreducedScalar { r#type: Box::new(variable.into()), axis_name: "x".to_string() }
+                    .into()
+            )),
+        );
     }
 
     #[test]

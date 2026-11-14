@@ -436,7 +436,7 @@ fn test_collect_nested_sharding_mesh() {
     to_mlir_module_for_program(&program, &[], &vec![input_type.clone()], &Vec::<ArrayType>::new(), "main", None, None)
         .unwrap();
     let mut builder = ProgramBuilder::new();
-    builder.add_input(input_type.clone().with_sharding(Sharding::replicated(mesh, 1)).unwrap());
+    builder.add_input(input_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap());
     let metadata_only = builder
         .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![])
         .unwrap()
@@ -446,8 +446,8 @@ fn test_collect_nested_sharding_mesh() {
     let incompatible = LogicalMesh::new(vec![MeshAxis::new("x", 3, MeshAxisType::Explicit).unwrap()]).unwrap();
     assert!(matches!(
         collect_nested_sharding_mesh(&program, Some(incompatible.clone())),
-        Err(Error::Lowering(LoweringError::ConflictingMeshAxisSize { axis_name, expected: 3, actual: 2 }))
-            if axis_name == "x",
+        Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
+            if expected == incompatible && actual == mesh,
     ));
     assert!(matches!(
         to_mlir_module_for_program(
@@ -456,11 +456,11 @@ fn test_collect_nested_sharding_mesh() {
             &vec![input_type],
             &Vec::<ArrayType>::new(),
             "main",
-            Some(&[Sharding::replicated(incompatible, 1)]),
+            Some(&[Sharding::replicated(incompatible.clone(), 1)]),
             None,
         ),
-        Err(Error::Lowering(LoweringError::ConflictingMeshAxisSize { axis_name, expected: 3, actual: 2 }))
-            if axis_name == "x",
+        Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
+            if expected == incompatible && actual == mesh,
     ));
 
     // Cast placement can be the module's only mesh use, including when its result is internal.
@@ -500,6 +500,91 @@ fn test_collect_nested_sharding_mesh() {
             "#},
         );
     }
+}
+
+#[test]
+fn test_collect_nested_sharding_mesh_requires_one_topology() {
+    let mesh_2x2 = |names: [&str; 2], r#type: MeshAxisType| {
+        LogicalMesh::new(names.map(|name| MeshAxis::new(name, 2, r#type).unwrap()).to_vec()).unwrap()
+    };
+    let mesh = mesh_2x2(["x", "y"], MeshAxisType::Explicit);
+    let input_type = test_vector_type(4);
+    let mut builder = ProgramBuilder::new();
+    let input = builder.add_input(input_type.clone());
+    builder
+        .add_instruction(
+            ReshapeOperation::new(vec![4], vec![2, 2]).with_output_sharding(Sharding::replicated(mesh.clone(), 2)),
+            Vec::new(),
+            vec![input],
+            None,
+        )
+        .unwrap();
+    let program = builder
+        .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![], vec![Placeholder], vec![])
+        .unwrap()
+        .into_unprojected::<Constant, Operation>()
+        .unwrap();
+
+    // Device ids follow the order of the axes of the module mesh, so a reordered mesh is another topology.
+    let reordered = mesh_2x2(["y", "x"], MeshAxisType::Explicit);
+    assert!(matches!(
+        collect_nested_sharding_mesh(&program, Some(reordered.clone())),
+        Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
+            if expected == reordered && actual == mesh,
+    ));
+    assert!(matches!(
+        to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![input_type.clone()],
+            &Vec::<ArrayType>::new(),
+            "main",
+            Some(&[Sharding::replicated(reordered.clone(), 1)]),
+            None,
+        ),
+        Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
+            if expected == reordered && actual == mesh,
+    ));
+    assert_eq!(
+        LoweringError::MismatchedMeshTopology { expected: reordered, actual: mesh.clone() }.to_string(),
+        "mesh `['x'=2:explicit, 'y'=2:explicit]` does not have the topology of the module mesh \
+         `['y'=2:explicit, 'x'=2:explicit]`",
+    );
+
+    // Meshes with other axes are not merged into a union.
+    let other_axes = mesh_2x2(["x", "z"], MeshAxisType::Explicit);
+    assert!(matches!(
+        collect_nested_sharding_mesh(&program, Some(other_axes.clone())),
+        Err(Error::Lowering(LoweringError::MismatchedMeshTopology { expected, actual }))
+            if expected == other_axes && actual == mesh,
+    ));
+
+    // Meshes that differ only in axis types share the module mesh, which keeps the axis types of its first mesh.
+    let manual = mesh_2x2(["x", "y"], MeshAxisType::Manual);
+    assert_eq!(collect_nested_sharding_mesh(&program, Some(manual.clone())).unwrap(), Some(manual.clone()));
+    assert_eq!(
+        to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![input_type],
+            &Vec::<ArrayType>::new(),
+            "main",
+            Some(&[Sharding::replicated(manual, 1)]),
+            None,
+        )
+        .unwrap(),
+        indoc! {"
+            module {
+              sdy.mesh @mesh = <[\"x\"=2, \"y\"=2]>
+              func.func @main(%arg0: tensor<4xf32> \
+                  {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={\"x\", \"y\"}>}) {
+                %0 = stablehlo.reshape %arg0 : (tensor<4xf32>) -> tensor<2x2xf32>
+                %1 = sdy.sharding_constraint %0 <@mesh, [{}, {}], replicated={\"x\", \"y\"}> : tensor<2x2xf32>
+                return
+              }
+            }
+        "},
+    );
 }
 
 #[test]

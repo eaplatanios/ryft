@@ -342,6 +342,45 @@ pub(crate) fn plan_dynamic_slice_axis(
     Ok(DynamicSliceAxisPlan { size, span, needs_runtime_assertion: !bounds_prove_runtime_in_bounds })
 }
 
+/// Converts a rank-0 integer array start of a first-class dynamic shape slice of type `start_type` to the signed `i64`
+/// carrier of dimension starts. Unsigned starts are widened to `u64` and saturate at the largest `i64` value, which
+/// keeps them out of bounds rather than wrapping them to negative values, and Boolean starts follow the predicate
+/// carrier convention of [`lower_slice_start_indices`].
+fn lower_array_start<'b, 'c: 'b, 't: 'c>(
+    start: ValueRef<'b, 'c, 't>,
+    start_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let signed_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
+    if !start_type.data_type().is_unsigned() {
+        let start = block
+            .append_operation(stable_hlo::convert(start, signed_type, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        if start_type.data_type() == DataType::I1 {
+            return Ok(block.append_operation(stable_hlo::negate(start, location)?)?.result(0).unwrap().as_ref());
+        }
+        return Ok(start);
+    }
+    let unsigned_scalar_type = ArrayType::scalar(DataType::U64);
+    let unsigned_type = lower_tensor_type(&unsigned_scalar_type, context, location)?;
+    let start = block
+        .append_operation(stable_hlo::convert(start, unsigned_type, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref();
+    let maximum = lower_unplaced_constant_output(&[unsigned_scalar_type], i64::MAX, block, context, location)?[0];
+    let start = block.append_operation(stable_hlo::minimum(start, maximum, location)?)?.result(0).unwrap().as_ref();
+    Ok(block
+        .append_operation(stable_hlo::convert(start, signed_type, location)?)?
+        .result(0)
+        .unwrap()
+        .as_ref())
+}
+
 impl LowerableOperation for SliceOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
@@ -480,7 +519,18 @@ impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
         let mut physical_sizes = Vec::with_capacity(rank);
         let mut physical_spans = Vec::with_capacity(rank);
         for axis in 0..rank {
-            let start_type = <&DimensionType>::try_from(&start_types[axis])?;
+            // An array start (e.g., one that differs across devices) is first converted to the signed `i64` carrier
+            // of dimension starts. Unsigned starts saturate at the largest `i64` value, which is out of bounds for
+            // every input, and a start whose value is unknown before it runs proves no window, so it is checked at
+            // runtime.
+            let unknown_start = DimensionType::new("start", DimensionBounds::unbounded());
+            let start_type = match &start_types[axis] {
+                ArrayIrType::Array(array_start_type) => {
+                    starts[axis] = lower_array_start(starts[axis], array_start_type, block, context, location)?;
+                    &unknown_start
+                }
+                start_type => <&DimensionType>::try_from(start_type)?,
+            };
             let size_type = <&DimensionType>::try_from(&size_types[axis])?;
             // Clamping is relative to the logical span, not the larger physical allocation window.
             // Normalize once and reuse the same origin for validation and extraction.
@@ -520,6 +570,14 @@ impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
                     .result(0)
                     .unwrap()
                     .as_ref();
+                if matches!(start_types[axis], ArrayIrType::Array(_)) {
+                    // Unlike dimension starts, array starts can be negative, which clamping raises to zero.
+                    starts[axis] = block
+                        .append_operation(stable_hlo::maximum(starts[axis], constants[0], location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                }
                 starts[axis] = block
                     .append_operation(stable_hlo::minimum(starts[axis], maximum_start, location)?)?
                     .result(0)
@@ -843,6 +901,103 @@ mod tests {
                     values_from_bytes::<i64>(&outputs[1].copy_to_host(None).unwrap().r#await().unwrap()),
                     vec![size],
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_dynamic_slice_runtime_windows_array_starts() {
+        // An array start (e.g., one that differs across devices) is converted to the `i64` carrier of dimension starts.
+        // Checked bounds reject a negative start and a window past the end at runtime, while clamped bounds move both
+        // into the input, including an unsigned start beyond the largest `i64` value.
+        let client = execution_client();
+        crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        let input_type = ArrayType::new_static(DataType::I64, [4]);
+        let size_type = ArrayType::scalar(DataType::I64);
+        let values = [10_i64, 20, 30, 40];
+        for (bounds, start_type, starts) in [
+            (DynamicSliceBounds::Checked, DataType::I64, vec![(1_u64, Some(1_usize)), (2, Some(2)), (3, None)]),
+            (DynamicSliceBounds::Checked, DataType::I64, vec![((-1_i64) as u64, None)]),
+            (DynamicSliceBounds::Clamp, DataType::I64, vec![((-1_i64) as u64, Some(0)), (3, Some(2))]),
+            (DynamicSliceBounds::Clamp, DataType::U64, vec![(u64::MAX, Some(2)), (1, Some(1))]),
+        ] {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(input_type.clone().into());
+            let start = builder.add_input(ArrayType::scalar(start_type).into());
+            let size = builder.add_input(size_type.clone().into());
+            let size = builder
+                .add_instruction(
+                    DimensionFromScalarOperation::new(
+                        DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap()).into(),
+                    ),
+                    Vec::new(),
+                    vec![size],
+                    None,
+                )
+                .unwrap()[0];
+            let result = builder
+                .add_instruction(
+                    DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_bounds(bounds),
+                    Vec::new(),
+                    vec![input, start, size],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap();
+            let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type.clone(), ArrayType::scalar(start_type), size_type.clone()],
+                &vec![output_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap().remove(0);
+            let start_buffer_type = if start_type == DataType::U64 { BufferType::U64 } else { BufferType::I64 };
+            for (start, expected_start) in starts {
+                let inputs = [
+                    (values_to_bytes(&values), BufferType::I64, vec![4]),
+                    (start.to_ne_bytes().to_vec(), start_buffer_type, vec![]),
+                    (values_to_bytes(&[2_i64]), BufferType::I64, vec![]),
+                ]
+                .into_iter()
+                .map(|(bytes, buffer_type, shape)| ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(bytes.as_slice(), buffer_type, shape.as_slice(), None, device.clone(), None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                })
+                .collect::<Vec<_>>();
+                let result = executable
+                    .execute(
+                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .and_then(|execution| execution.block_until_ready());
+                match expected_start {
+                    None => assert!(result.err().unwrap().to_string().contains("dynamic_slice")),
+                    Some(expected_start) => {
+                        let outputs = result.unwrap().remove(0).outputs;
+                        let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+                        assert_eq!(values_from_bytes::<i64>(&bytes[..16]), &values[expected_start..expected_start + 2]);
+                    }
+                }
             }
         }
     }

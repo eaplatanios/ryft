@@ -13,7 +13,7 @@ use crate::experimental::lowering::types::{
     lower_tensor_type, lower_unplaced_constant_output,
 };
 use crate::operations::complex::lower_select_principal_phase_to_mlir;
-use crate::operations::extrema::lower_extremum_to_mlir;
+use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
@@ -121,10 +121,12 @@ impl LowerableOperation for LogAddExpOperation<ArrayType> {
             lowerer.context,
             lowerer.location,
         )?;
+        let form = FloatExtremumForm::for_elementwise(lowerer.collective_state.target_platform());
         let value = lower_log_add_exp_to_mlir(
             left,
             right,
             &output_types[0],
+            form,
             &mut lowerer.block,
             lowerer.context,
             lowerer.location,
@@ -564,6 +566,7 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     left: ValueRef<'b, 'c, 't>,
     right: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
+    form: FloatExtremumForm,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -592,8 +595,8 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
         // Factor out the operand `p` with the larger real component, so that the output is `p + ln_1p(exp(q - p))`,
         // which keeps small corrections exact. The ratio `exp(q - p)` is formed as `exp(q - re(p)) · exp(-i im(p))`,
         // which rotates by `p`'s phase instead of subtracting the imaginary components from each other.
-        let larger = lower_extremum_to_mlir(true, data_type, left, right, block, location)?;
-        let smaller = lower_extremum_to_mlir(false, data_type, left, right, block, location)?;
+        let larger = lower_extremum_to_mlir(true, data_type, left, right, form, block, location)?;
+        let smaller = lower_extremum_to_mlir(false, data_type, left, right, form, block, location)?;
         let part_type =
             output_type
                 .clone()

@@ -567,6 +567,10 @@ impl<'c> Domain<'c> {
                 .and_then(|shardings| shardings.get(index).cloned())
                 .or_else(|| array_type.sharding().cloned())
         };
+        // An output without a placement is replicated. These placements are both the result annotations that lowering
+        // emits and the placements from which execution reconstructs the outputs, so that the two always agree. In
+        // particular, a result is never left without an annotation, which would let the compiler place it differently
+        // (e.g., as the output of a `shard_map` that it is derived from) than execution expects.
         let mut output_shardings = output_types
             .iter()
             .enumerate()
@@ -576,25 +580,14 @@ impl<'c> Domain<'c> {
                 })
             })
             .collect::<Vec<_>>();
-        let result_shardings = if reference_states.is_empty() {
-            output_types
-                .iter()
-                .enumerate()
-                .map(|(index, array_type)| output_placement(index, array_type))
-                .collect::<Option<Vec<_>>>()
-        } else {
-            let mut shardings = output_shardings.clone();
-            // Mutated bindings cover the hidden output suffix in order, as validated above. Derive both the hidden
-            // state type and its placement from the same input binding in one pass.
-            for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
-                if state.is_mutated() {
-                    output_types.push(effective_input_types[logical_input_index].clone());
-                    shardings.push(logical_argument_shardings[logical_input_index].clone());
-                    output_shardings.push(logical_argument_shardings[logical_input_index].clone());
-                }
+        // Mutated bindings cover the hidden output suffix in order, as validated above. Derive both the hidden state
+        // type and its placement from the same input binding in one pass.
+        for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
+            if state.is_mutated() {
+                output_types.push(effective_input_types[logical_input_index].clone());
+                output_shardings.push(logical_argument_shardings[logical_input_index].clone());
             }
-            Some(shardings)
-        };
+        }
         // Shardy rejects bounded-dynamic tensors anywhere in the module, not only at the computation boundary, so a
         // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
         // still has to take the replica path. This is why the whole region arena is inspected instead of just the
@@ -637,7 +630,7 @@ impl<'c> Domain<'c> {
         // Shardy currently rejects bounded-dynamic tensors. Fully replicated dynamic programs need no partitioning,
         // so lower them without Shardy metadata and execute one replica per mesh device instead.
         let lowered_argument_shardings = use_shardy_partitioner.then_some(logical_argument_shardings.as_slice());
-        let lowered_result_shardings = if use_shardy_partitioner { result_shardings.as_deref() } else { None };
+        let lowered_result_shardings = use_shardy_partitioner.then_some(output_shardings.as_slice());
         // Public outputs without an override leave their placement over auto mesh axes to the compiler, like JAX
         // outputs without `out_shardings`, and compilation reads that placement back from the executable. Axes of size
         // one admit only one placement, so meshes without larger auto axes keep every result closed. Outputs with
@@ -670,6 +663,17 @@ impl<'c> Domain<'c> {
             options.ragged_dot_lowering_strategy,
             &open_outputs,
         )?;
+        // The module mesh assigns the devices of the target mesh to mesh coordinates, so a program over another
+        // topology cannot be placed on it.
+        if let Some(mesh) = &lowered_module.mesh
+            && !mesh.has_same_topology(options.mesh.logical_mesh())
+        {
+            return Err(ryft_core::ShardingError::MeshMismatch {
+                expected: options.mesh.logical_mesh().clone(),
+                actual: mesh.clone(),
+            }
+            .into());
+        }
         let (stable_hlo, signature, requires_assertion_handler, runtime_requirements) = lowered_module.into_parts();
         for (mapping, donation) in
             signature.input_mapping()[lowered_capture_count..].iter().zip(donation_flags.iter_mut())

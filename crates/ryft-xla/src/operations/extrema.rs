@@ -23,18 +23,19 @@ impl LowerableOperation for MaxOperation<ArrayType> {
             lowerer.context,
             lowerer.location,
         )?;
-        if output_types[0].data_type().is_complex() {
-            return Ok(vec![lower_extremum_to_mlir(
-                true,
-                output_types[0].data_type(),
-                left,
-                right,
-                &mut lowerer.block,
-                lowerer.location,
-            )?]);
-        }
-        let result = lowerer.block.append_operation(stable_hlo::maximum(left, right, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.maximum should return one result").as_ref()])
+        // Floating-point values take the form of the target, because the native operation does not propagate NaNs
+        // or order the signed zeros on every backend (e.g., XLA's CPU backend returns its left-hand side input when
+        // the right-hand side one is a NaN and for a tie between the signed zeros).
+        let form = FloatExtremumForm::for_elementwise(lowerer.collective_state.target_platform());
+        Ok(vec![lower_extremum_to_mlir(
+            true,
+            output_types[0].data_type(),
+            left,
+            right,
+            form,
+            &mut lowerer.block,
+            lowerer.location,
+        )?])
     }
 }
 
@@ -53,18 +54,19 @@ impl LowerableOperation for MinOperation<ArrayType> {
             lowerer.context,
             lowerer.location,
         )?;
-        if output_types[0].data_type().is_complex() {
-            return Ok(vec![lower_extremum_to_mlir(
-                false,
-                output_types[0].data_type(),
-                left,
-                right,
-                &mut lowerer.block,
-                lowerer.location,
-            )?]);
-        }
-        let result = lowerer.block.append_operation(stable_hlo::minimum(left, right, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.minimum should return one result").as_ref()])
+        // Floating-point values take the form of the target, because the native operation does not propagate NaNs
+        // or order the signed zeros on every backend (e.g., XLA's CPU backend returns its left-hand side input when
+        // the right-hand side one is a NaN and for a tie between the signed zeros).
+        let form = FloatExtremumForm::for_elementwise(lowerer.collective_state.target_platform());
+        Ok(vec![lower_extremum_to_mlir(
+            false,
+            output_types[0].data_type(),
+            left,
+            right,
+            form,
+            &mut lowerer.block,
+            lowerer.location,
+        )?])
     }
 }
 
@@ -91,27 +93,21 @@ impl LowerableOperation for ClampOperation<ArrayType> {
             // Floating-point and complex values compose `min(max(x, lower), upper)` explicitly. XLA's native `clamp`
             // does not propagate NaN operands on every backend (e.g., the CPU backend returns the lower bound for a
             // NaN input), and StableHLO leaves the ordering of complex `clamp` unspecified, whereas the extremum
-            // lowerings below propagate NaNs and order complex values lexicographically like the reference backend.
+            // lowerings below propagate the NaNs of the input and of both bounds, order the signed zeros, and order
+            // complex values lexicographically like the reference backend.
             let [lower, upper] = [input_values[0], input_values[2]].map(|bound| {
                 normalize_elementwise_operand(bound, output_type, &mut lowerer.block, lowerer.context, lowerer.location)
             });
             let (lower, upper) = (lower?, upper?);
-            if data_type.is_floating_point() {
-                let clamped_below =
-                    lowerer.block.append_operation(stable_hlo::maximum(input, lower, lowerer.location)?)?;
-                let clamped_below =
-                    clamped_below.result(0).expect("stablehlo.maximum should return one result").as_ref();
-                let result =
-                    lowerer.block.append_operation(stable_hlo::minimum(clamped_below, upper, lowerer.location)?)?;
-                return Ok(vec![result.result(0).expect("stablehlo.minimum should return one result").as_ref()]);
-            }
+            let form = FloatExtremumForm::for_elementwise(lowerer.collective_state.target_platform());
             let clamped_below =
-                lower_extremum_to_mlir(true, data_type, input, lower, &mut lowerer.block, lowerer.location)?;
+                lower_extremum_to_mlir(true, data_type, input, lower, form, &mut lowerer.block, lowerer.location)?;
             return Ok(vec![lower_extremum_to_mlir(
                 false,
                 data_type,
                 clamped_below,
                 upper,
+                form,
                 &mut lowerer.block,
                 lowerer.location,
             )?]);
@@ -138,15 +134,65 @@ impl LowerableOperation for ClampOperation<ArrayType> {
     }
 }
 
+/// Form in which [`lower_extremum_to_mlir`] lowers a floating-point minimum or maximum. Every form propagates NaNs and
+/// orders negative zero below positive zero. They differ in which XLA backends evaluate them with those semantics and
+/// in which programs each backend can compile them.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum FloatExtremumForm {
+    /// Explicit `TOTALORDER` comparison and selection, which orders the signed zeros on every XLA backend. XLA's
+    /// dynamic padder rejects such comparisons over bounded dynamic arrays, and the Triton code generation of its GPU
+    /// compiler fails on them, so this is the form of scalar combiner bodies (e.g., of reductions) that are not
+    /// lowered for CUDA. XLA can only distribute a reduction whose combiner is a single operation, so
+    /// [`lower_reduce_to_mlir`](crate::operations::reductions::lower_reduce_to_mlir) lowers the extrema of this form
+    /// as reductions of integer keys that have the same order, for the floating-point types that have such keys.
+    TotalOrder,
+
+    /// Ordinary `FLOAT` comparison and selection, with a tie between two zeros resolved by arithmetic that orders the
+    /// signed zeros. It supports bounded dynamic arrays, so it is the form of elementwise operations that are not
+    /// lowered for CUDA. Its arithmetic is exact on backends that evaluate floating-point arithmetic strictly (e.g.,
+    /// XLA's CPU backend), but not under the simplifications of XLA's GPU compiler, which ignore the sign of zero.
+    Arithmetic,
+
+    /// Native `stablehlo.maximum` or `stablehlo.minimum`, which orders the signed zeros on CUDA but not on every
+    /// other XLA backend (e.g., XLA's CPU backend returns its left-hand side input for a tie between them). It is
+    /// the form of every lowering for CUDA.
+    Native,
+}
+
+impl FloatExtremumForm {
+    /// Returns the [`FloatExtremumForm`] of scalar combiner bodies (e.g., of reductions) that are lowered for the
+    /// PJRT platform named `target_platform`. CUDA uses [`FloatExtremumForm::Native`], because XLA's GPU compiler
+    /// fuses reductions and the elementwise operations around them into Triton kernels (e.g., a maximum reduction
+    /// that is followed by the rest of a softmax), and its Triton code generation fails on the total-order
+    /// comparisons of [`FloatExtremumForm::TotalOrder`], which makes every such program fail to compile. Every other
+    /// target, and the absence of a target, uses [`FloatExtremumForm::TotalOrder`]. The native form is not a combiner
+    /// that XLA can distribute, so the lowering of a reduction whose dimensions can be sharded prefers the integer
+    /// keys of [`FloatExtremumForm::TotalOrder`] for every target, which XLA's GPU compiler compiles as well.
+    #[inline]
+    pub(crate) fn for_combiner(target_platform: Option<&str>) -> Self {
+        if target_platform == Some("cuda") { Self::Native } else { Self::TotalOrder }
+    }
+
+    /// Returns the [`FloatExtremumForm`] of elementwise operations that are lowered for the PJRT platform named
+    /// `target_platform`. CUDA uses [`FloatExtremumForm::Native`] for the reason that [`Self::for_combiner`]
+    /// describes. Every other target, and the absence of a target, uses [`FloatExtremumForm::Arithmetic`], because
+    /// the inputs of elementwise operations may have bounded dynamic shapes.
+    #[inline]
+    pub(crate) fn for_elementwise(target_platform: Option<&str>) -> Self {
+        if target_platform == Some("cuda") { Self::Native } else { Self::Arithmetic }
+    }
+}
+
 /// Lowers one JAX-compatible minimum or maximum. Integer and Boolean values use the corresponding StableHLO
-/// operation. Floating-point values use explicit total-order comparisons and NaN propagation so every XLA backend
-/// preserves IEEE signed-zero and NaN semantics. Complex values use JAX's lexicographic `(real, imaginary)`
-/// compare/select sequence.
+/// operation. Floating-point values use the provided [`FloatExtremumForm`] and explicit NaN propagation, so that every
+/// XLA backend preserves IEEE signed-zero and NaN semantics. Complex values use JAX's lexicographic
+/// `(real, imaginary)` compare/select sequence.
 pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
     maximum: bool,
     element_type: DataType,
     left: ValueRef<'b, 'c, 't>,
     right: ValueRef<'b, 'c, 't>,
+    form: FloatExtremumForm,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
@@ -164,19 +210,66 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
         } else {
             stable_hlo::ComparisonDirection::LessThan
         };
-        let ordered = block.append_operation(stable_hlo::compare(
-            left,
-            right,
-            direction,
-            stable_hlo::ComparisonType::TotalOrder,
-            location,
-        )?)?;
-        let ordered = ordered.result(0).expect("stablehlo.compare should return one result").as_ref();
-        let result = block.append_operation(stable_hlo::select(ordered, left, right, location)?)?;
-        let result = result.result(0).expect("stablehlo.select should return one result").as_ref();
+        let result = match form {
+            FloatExtremumForm::TotalOrder | FloatExtremumForm::Arithmetic => {
+                let comparison_type = if form == FloatExtremumForm::TotalOrder {
+                    stable_hlo::ComparisonType::TotalOrder
+                } else {
+                    stable_hlo::ComparisonType::Float
+                };
+                let ordered =
+                    block.append_operation(stable_hlo::compare(left, right, direction, comparison_type, location)?)?;
+                let ordered = ordered.result(0).expect("stablehlo.compare should return one result").as_ref();
+                block.append_operation(stable_hlo::select(ordered, left, right, location)?)?
+            }
+            FloatExtremumForm::Native if maximum => {
+                block.append_operation(stable_hlo::maximum(left, right, location)?)?
+            }
+            FloatExtremumForm::Native => block.append_operation(stable_hlo::minimum(left, right, location)?)?,
+        };
+        let mut result = result.result(0).expect("stablehlo extremum should return one result").as_ref();
+
+        if form == FloatExtremumForm::Arithmetic {
+            // The ordinary comparison treats the signed zeros as equal, so a tie between two zeros is resolved by
+            // arithmetic that orders negative zero below positive zero. A value is a zero exactly when it equals its
+            // own negation, and two equal values of which one is a zero are both zeros. Their sum is negative zero
+            // only when both are, which is their maximum, and the negated difference `-((-left) - right)` is positive
+            // zero only when both are, which is their minimum.
+            let negated_left = block.append_operation(stable_hlo::negate(left, location)?)?;
+            let negated_left = negated_left.result(0).expect("stablehlo.negate should return one result").as_ref();
+            let equal = block.append_operation(stable_hlo::compare(
+                left,
+                right,
+                stable_hlo::ComparisonDirection::Equal,
+                stable_hlo::ComparisonType::Float,
+                location,
+            )?)?;
+            let equal = equal.result(0).expect("stablehlo.compare should return one result").as_ref();
+            let left_is_zero = block.append_operation(stable_hlo::compare(
+                left,
+                negated_left,
+                stable_hlo::ComparisonDirection::Equal,
+                stable_hlo::ComparisonType::Float,
+                location,
+            )?)?;
+            let left_is_zero = left_is_zero.result(0).expect("stablehlo.compare should return one result").as_ref();
+            let both_zero = block.append_operation(stable_hlo::and(equal, left_is_zero, location)?)?;
+            let both_zero = both_zero.result(0).expect("stablehlo.and should return one result").as_ref();
+            let zero = if maximum {
+                block.append_operation(stable_hlo::add(left, right, location)?)?
+            } else {
+                let difference = block.append_operation(stable_hlo::subtract(negated_left, right, location)?)?;
+                let difference = difference.result(0).expect("stablehlo.subtract should return one result").as_ref();
+                block.append_operation(stable_hlo::negate(difference, location)?)?
+            };
+            let zero = zero.result(0).expect("stablehlo arithmetic should return one result").as_ref();
+            let selected = block.append_operation(stable_hlo::select(both_zero, zero, result, location)?)?;
+            result = selected.result(0).expect("stablehlo.select should return one result").as_ref();
+        }
 
         // Some XLA backends implement native min/max using instructions that drop NaNs or do not distinguish signed
-        // zeros. StableHLO and JAX require IEEE maximum/minimum, so make both behaviors explicit and portable.
+        // zeros. StableHLO and JAX require IEEE maximum/minimum, so make both behaviors explicit. The form above
+        // orders the signed zeros, and the selections below propagate a NaN of either input in every form.
         let left_is_nan = block.append_operation(stable_hlo::compare(
             left,
             left,
@@ -278,6 +371,39 @@ mod tests {
         (left, right, left_array, right_array)
     }
 
+    /// Uploads `f32` operands whose order is decided by their values, by signed zeros that compare equal (in both
+    /// operand orders and with equal signs), by a NaN payload in the left operand, in the right operand, and in both,
+    /// and by equal infinities.
+    fn real_operands<'c>(domain: &Domain<'c>, mesh: &DeviceMesh) -> (Array<'c>, Array<'c>) {
+        let left = [
+            1f32,
+            3.0,
+            -0.0,
+            0.0,
+            -0.0,
+            0.0,
+            f32::from_bits(0x7fc0_1234),
+            2.0,
+            f32::from_bits(0x7fc0_1234),
+            f32::NEG_INFINITY,
+        ];
+        let right = [
+            2f32,
+            1.0,
+            0.0,
+            -0.0,
+            -0.0,
+            0.0,
+            7.0,
+            f32::from_bits(0x7fc0_5678),
+            f32::from_bits(0x7fc0_5678),
+            f32::NEG_INFINITY,
+        ];
+        let left = replicated_array(domain, mesh, DataType::F32, &[10], values_to_bytes(&left).as_slice());
+        let right = replicated_array(domain, mesh, DataType::F32, &[10], values_to_bytes(&right).as_slice());
+        (left, right)
+    }
+
     #[test]
     fn test_max_operation_lower() {
         let client = execution_client();
@@ -288,6 +414,26 @@ mod tests {
         let booleans = replicated_array(&domain, &mesh, DataType::Boolean, &[2], &[0, 1]);
         let truth = replicated_array(&domain, &mesh, DataType::Boolean, &[], &[1]);
         assert_eq!(booleans.max(&truth).unwrap().copy_to_host().unwrap(), values_to_bytes(&[true, true]));
+
+        // Floating-point maxima order negative zero below positive zero in both operand orders, keep the sign of
+        // equal zeros, and propagate a NaN of either operand with its payload, preferring the left one. Exact byte
+        // comparisons check the signs of the zeros and the payloads.
+        let (left, right) = real_operands(&domain, &mesh);
+        assert_eq!(
+            left.max(&right).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[
+                2f32,
+                3.0,
+                0.0,
+                0.0,
+                -0.0,
+                0.0,
+                f32::from_bits(0x7fc0_1234),
+                f32::from_bits(0x7fc0_5678),
+                f32::from_bits(0x7fc0_1234),
+                f32::NEG_INFINITY,
+            ]),
+        );
     }
 
     #[test]
@@ -333,6 +479,25 @@ mod tests {
         let booleans = replicated_array(&domain, &mesh, DataType::Boolean, &[2], &[0, 1]);
         let truth = replicated_array(&domain, &mesh, DataType::Boolean, &[], &[1]);
         assert_eq!(booleans.min(&truth).unwrap().copy_to_host().unwrap(), values_to_bytes(&[false, true]));
+
+        // Floating-point minima order negative zero below positive zero in both operand orders, keep the sign of
+        // equal zeros, and propagate a NaN of either operand with its payload, preferring the left one.
+        let (left, right) = real_operands(&domain, &mesh);
+        assert_eq!(
+            left.min(&right).unwrap().copy_to_host().unwrap(),
+            values_to_bytes(&[
+                1f32,
+                1.0,
+                -0.0,
+                -0.0,
+                -0.0,
+                0.0,
+                f32::from_bits(0x7fc0_1234),
+                f32::from_bits(0x7fc0_5678),
+                f32::from_bits(0x7fc0_1234),
+                f32::NEG_INFINITY,
+            ]),
+        );
     }
 
     #[test]
@@ -394,6 +559,14 @@ mod tests {
             values_to_bytes(&[-1f32, -1.0, -1.0, f32::NAN]),
         );
 
+        // A NaN bound propagates like a NaN input, and a zero bound of the other sign orders against a zero input.
+        let zeros = replicated_array(&domain, &mesh, DataType::F32, &[2], values_to_bytes(&[0.5f32, -0.0]).as_slice());
+        let nan = replicated_array(&domain, &mesh, DataType::F32, &[], values_to_bytes(&[f32::NAN]).as_slice());
+        let zero = replicated_array(&domain, &mesh, DataType::F32, &[], values_to_bytes(&[0f32]).as_slice());
+        assert_eq!(zeros.clamp(&nan, &upper).unwrap().copy_to_host().unwrap(), values_to_bytes(&[f32::NAN, f32::NAN]));
+        assert_eq!(zeros.clamp(&lower, &nan).unwrap().copy_to_host().unwrap(), values_to_bytes(&[f32::NAN, f32::NAN]));
+        assert_eq!(zeros.clamp(&zero, &upper).unwrap().copy_to_host().unwrap(), values_to_bytes(&[0.5f32, 0.0]));
+
         // Array bounds broadcast to the result.
         let bounds =
             replicated_array(&domain, &mesh, DataType::F32, &[4], values_to_bytes(&[0f32, 1.0, 2.0, 3.0]).as_slice());
@@ -451,6 +624,18 @@ mod tests {
             complex.clamp(&complex_lower, &complex_upper).unwrap().copy_to_host().unwrap(),
             values_to_bytes(&[Complex::new(1f32, 0.0), Complex::new(1.0, 1.0), Complex::new(1.0, 2.0)]),
         );
+    }
+
+    #[test]
+    fn test_float_extremum_form() {
+        // Only CUDA uses the native form. Elsewhere, and without a target, scalar combiner bodies use the total-order
+        // form and elementwise operations use the arithmetic one, which supports bounded dynamic shapes.
+        assert_eq!(FloatExtremumForm::for_combiner(Some("cuda")), FloatExtremumForm::Native);
+        assert_eq!(FloatExtremumForm::for_combiner(Some("cpu")), FloatExtremumForm::TotalOrder);
+        assert_eq!(FloatExtremumForm::for_combiner(None), FloatExtremumForm::TotalOrder);
+        assert_eq!(FloatExtremumForm::for_elementwise(Some("cuda")), FloatExtremumForm::Native);
+        assert_eq!(FloatExtremumForm::for_elementwise(Some("cpu")), FloatExtremumForm::Arithmetic);
+        assert_eq!(FloatExtremumForm::for_elementwise(None), FloatExtremumForm::Arithmetic);
     }
 
     #[test]

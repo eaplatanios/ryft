@@ -32,6 +32,7 @@ use crate::operations::control_flow::{
     lower_refined_region_input, lower_refined_region_outputs, lower_region_guard, lowered_effect_classes,
     set_threaded_effect_tokens, threaded_effect_token_values, validate_unthreaded_effect_tokens,
 };
+use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::lower_reduce_to_mlir;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
@@ -214,6 +215,7 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
                         predicate_dimensions.as_slice(),
                         carried_predicate,
                         &ArrayType::scalar(DataType::Boolean),
+                        FloatExtremumForm::TotalOrder,
                         &mut condition_block_ref,
                         context,
                         location,

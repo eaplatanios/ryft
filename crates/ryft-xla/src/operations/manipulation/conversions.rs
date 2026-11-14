@@ -17,6 +17,7 @@ use crate::experimental::lowering::types::{
 use crate::operations::assertions::{lower_dependency_barrier, lower_type_relationship_checks};
 use crate::operations::constants::lower_layout_constraint;
 use crate::operations::control_flow::{lower_refined_region_input, lower_refined_region_outputs};
+use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::lower_reduce_to_mlir;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
@@ -757,6 +758,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             &[input_type.rank() - 1],
             shifted.result(0).unwrap().as_ref(),
             &physical_output_type.clone().with_data_type(DataType::U8),
+            FloatExtremumForm::TotalOrder,
             block,
             context,
             location,
@@ -844,6 +846,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
             &[bit_axis],
             shifted.result(0).unwrap().as_ref(),
             &groups_type,
+            FloatExtremumForm::TotalOrder,
             block,
             context,
             location,

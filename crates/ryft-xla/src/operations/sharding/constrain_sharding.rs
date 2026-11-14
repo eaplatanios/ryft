@@ -19,14 +19,39 @@ pub(crate) fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    lower_constraint(input_values, sharding, bound_manual_axes, block, location, true)
+    lower_constraint(input_values, sharding, &[], bound_manual_axes, block, location, true)
+}
+
+/// Lowers a tensor placement constraint that replicates a value with the tracked placement `sharding` along `axes`
+/// and returns the constrained value. The constraint is that of [`lower_sharding_constraint`] for `sharding` with
+/// those dimensions replicated, except that the dimensions are closed, so that the compiler cannot shard them along
+/// auto axes either. Operations whose lowering XLA cannot distribute along a dimension (e.g., a reduction whose
+/// combiner is not a single operation) use it to have every device hold all of the elements along that dimension.
+pub(crate) fn lower_replication_constraint<'b, 'c: 'b, 't: 'c>(
+    input_value: ValueRef<'b, 'c, 't>,
+    sharding: &Sharding,
+    axes: &[usize],
+    bound_manual_axes: &[String],
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let mut dimensions = sharding.dimensions().to_vec();
+    for axis in axes {
+        dimensions[*axis] = ShardingDimension::Replicated;
+    }
+    let replicated = sharding
+        .with_dimensions(dimensions)
+        .map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+    Ok(lower_constraint(&[input_value], &replicated, axes, bound_manual_axes, block, location, true)?[0])
 }
 
 /// Lowers a tensor placement constraint after excluding mesh axes bound by enclosing manual regions, whose dimensions
-/// are open over auto axes when `open_over_auto_axes` is set (refer to [`ShardyTensorSharding`]).
+/// are open over auto axes when `open_over_auto_axes` is set, except for `closed_dimensions` (refer to
+/// [`ShardyTensorSharding`]).
 fn lower_constraint<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     sharding: &Sharding,
+    closed_dimensions: &[usize],
     bound_manual_axes: &[String],
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
@@ -77,7 +102,9 @@ fn lower_constraint<'b, 'c: 'b, 't: 'c>(
         local_sharding = projected().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
         &local_sharding
     };
-    let sharding_attribute = ShardyTensorSharding::new(sharding, open_over_auto_axes).to_mlir(location)?;
+    let sharding_attribute = ShardyTensorSharding::new(sharding, open_over_auto_axes)
+        .with_closed_dimensions(closed_dimensions)
+        .to_mlir(location)?;
     let operation =
         block.append_operation(shardy::sharding_constraint(input_values[0], sharding_attribute, location)?)?;
     Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
@@ -99,6 +126,7 @@ impl LowerableOperation for ConstrainShardingOperation {
         lower_constraint(
             input_values,
             &sharding,
+            &[],
             &lowerer.collective_state.bound_manual_axes,
             &mut lowerer.block,
             lowerer.location,

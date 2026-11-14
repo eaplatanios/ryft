@@ -14,6 +14,7 @@ use crate::experimental::lowering::types::{
 };
 use crate::operations::complex::lower_principal_phase_to_mlir;
 use crate::operations::exponential::lower_log_add_exp_to_mlir;
+use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::{
     build_reduce_body_region, build_reduction_identity_constant, lower_product_combiner_to_mlir,
 };
@@ -83,7 +84,13 @@ fn build_cumulative_body_region<'c, 't>(
     if let Some(reduction_kind) = reduction_kind
         && !matches!(element_type, DataType::I1 | DataType::U1)
     {
-        return build_reduce_body_region(reduction_kind, element_type, context, location);
+        return build_reduce_body_region(
+            reduction_kind,
+            element_type,
+            FloatExtremumForm::TotalOrder,
+            context,
+            location,
+        );
     }
 
     // Product, log-sum-exp, and one-bit integer combiners build their body over a pair of scalar block arguments.
@@ -114,7 +121,15 @@ fn build_cumulative_body_region<'c, 't>(
             // `-∞ + 0i` initial values that pad every window), because its lexicographic difference is then NaN, so
             // the body selects around it, just like the eager kernel does.
             let scalar_type = ArrayType::scalar(element_type);
-            let combined = lower_log_add_exp_to_mlir(left, right, &scalar_type, &mut block_ref, context, location)?;
+            let combined = lower_log_add_exp_to_mlir(
+                left,
+                right,
+                &scalar_type,
+                FloatExtremumForm::TotalOrder,
+                &mut block_ref,
+                context,
+                location,
+            )?;
             let part_type =
                 ArrayType::scalar(if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 });
             let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
@@ -152,9 +167,15 @@ fn build_cumulative_body_region<'c, 't>(
                 .unwrap()
                 .as_ref()
         }
-        CumulativeKind::LogSumExp => {
-            lower_log_add_exp_to_mlir(left, right, &ArrayType::scalar(element_type), &mut block_ref, context, location)?
-        }
+        CumulativeKind::LogSumExp => lower_log_add_exp_to_mlir(
+            left,
+            right,
+            &ArrayType::scalar(element_type),
+            FloatExtremumForm::TotalOrder,
+            &mut block_ref,
+            context,
+            location,
+        )?,
         _ => lower_product_combiner_to_mlir(left, right, element_type, &mut block_ref, context, location)?,
     };
     block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;

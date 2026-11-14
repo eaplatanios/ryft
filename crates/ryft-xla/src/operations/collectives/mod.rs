@@ -35,7 +35,9 @@ pub(crate) mod parallel_vary;
 /// the coordinate combinations of the other axes, and the group members are ordered by their positions along the
 /// combined axis, which linearizes the named axes in the given order with the first name major (refer to
 /// [`CollectiveAxes`]). Errors outside manual regions, for axes that no enclosing region binds as manual mesh axes,
-/// and for axes whose binding regions have different meshes.
+/// and for axes whose binding regions have meshes with different topologies. The groups depend only on the names and
+/// sizes of the mesh axes in order, so regions whose meshes differ only in axis types (e.g., a nested region inside
+/// `auto_axes` or `explicit_axes`, which retype a free axis) bind axes of one collective.
 pub(crate) fn mesh_axis_replica_groups<A: Into<CollectiveAxes>>(
     collective_state: &CollectiveLoweringState,
     axis_name: A,
@@ -66,10 +68,10 @@ pub(crate) fn mesh_axis_replica_groups<A: Into<CollectiveAxes>>(
         };
         match mesh {
             None => mesh = Some(axis_region.mesh()),
-            Some(mesh) if mesh == axis_region.mesh() => {}
+            Some(mesh) if mesh.has_same_topology(axis_region.mesh()) => {}
             Some(_) => {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "collective over axes `{axis_names}` spans manual regions with different meshes",
+                    "collective over axes `{axis_names}` spans manual regions whose meshes have different topologies",
                 ))
                 .into());
             }

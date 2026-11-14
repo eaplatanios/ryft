@@ -15,7 +15,7 @@ use crate::experimental::lowering::types::{
     physical_bound_type,
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
-use crate::operations::extrema::lower_extremum_to_mlir;
+use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::reductions::build_reduce_body_region;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
@@ -76,6 +76,7 @@ fn build_scatter_combiner_region<'c, 't>(
                 element_type,
                 lhs,
                 rhs,
+                FloatExtremumForm::TotalOrder,
                 &mut block_ref,
                 location,
             )?,
@@ -245,7 +246,13 @@ pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
             let initial =
                 lower_unplaced_constant_output(&[ArrayType::scalar(DataType::Boolean)], 1, block, context, location)?
                     [0];
-            let body = build_reduce_body_region(ReductionKind::All, DataType::Boolean, context, location)?;
+            let body = build_reduce_body_region(
+                ReductionKind::All,
+                DataType::Boolean,
+                FloatExtremumForm::TotalOrder,
+                context,
+                location,
+            )?;
             let mask = block
                 .append_operation(stable_hlo::reduce(&[mask], &[initial], &[index_vector_dimension], body, location)?)?
                 .result(0)

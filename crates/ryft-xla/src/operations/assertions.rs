@@ -1107,6 +1107,12 @@ fn validate_dynamic_slice_with_dimensions(
             .and_then(|span| span.checked_add(1))
             .ok_or_else(|| format!("`{DYNAMIC_SLICE_OPERATION_NAME}` span overflows usize on axis {axis}"))?
     };
+    // Dimension starts are never negative, but array starts can be.
+    if start < 0 {
+        return Err(format!(
+            "`{DYNAMIC_SLICE_OPERATION_NAME}` start {start} is out of bounds for input axis {axis} extent {input_size}",
+        ));
+    }
     let limit = start
         .checked_add(span)
         .ok_or_else(|| format!("`{DYNAMIC_SLICE_OPERATION_NAME}` limit overflows usize on axis {axis}"))?;
@@ -2577,6 +2583,12 @@ mod tests {
         assert_eq!(
             validate_dynamic_slice_with_dimensions(1, 1, i64::MAX, i64::MAX, 1),
             Err("`dynamic_slice` limit overflows usize on axis 1".to_string()),
+        );
+
+        // An array start can be negative, which no window admits.
+        assert_eq!(
+            validate_dynamic_slice_with_dimensions(1, 1, 8, -1, 2),
+            Err("`dynamic_slice` start -1 is out of bounds for input axis 1 extent 8".to_string()),
         );
     }
 }

@@ -399,13 +399,14 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AxisIndexOperation, BatchAxis, BatchAxisSpecification, Context, ConvertElementType,
+        AxisIndexOperation, BatchAxis, BatchAxisSpecification, BroadcastOperation, Context, ConvertElementType,
         ConvertElementTypeOperation, CotangentDestinationKind, CustomCallOperation, DataType, Device, DeviceMesh,
         Dimension as CoreDimension, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, EffectClass, Exp,
         LogicalMesh, MeshAxis, MeshAxisType, PARALLEL_BROADCAST_OPERATION_NAME, ParallelAllGather, ParallelAllToAll,
         ParallelArgExtrema, ParallelBroadcast, ParallelCast, ParallelCastTarget, ParallelPermute, ParallelReduce,
-        ParallelSumScatter, Placeholder, ProjectedValue, ReductionKind, Shape, ShardMapOptions, Typed, UnreducedKind,
-        ValueProjection, batch, differentiate_at, shard_map, shard_map_along, shard_map_with_inferred_input_shardings,
+        ParallelSumScatter, Placeholder, ProjectedValue, ReductionKind, ReshapeOperation, Shape, ShardMapOptions,
+        Typed, UnreducedKind, Value as CoreValue, ValueProjection, batch, differentiate_at, shard_map, shard_map_along,
+        shard_map_with_inferred_input_shardings,
     };
     use ryft_mlir::Block;
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
@@ -2882,6 +2883,160 @@ mod tests {
             let bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
             assert_eq!(values_from_bytes::<u64>(&bytes), vec![index as u64]);
         }
+    }
+
+    #[test]
+    fn test_shard_map_compilation_requires_one_mesh_topology_on_cpu() {
+        // Two inputless maps each read the coordinate of every device along `x` and tile it along `x`. The module
+        // declares one mesh, which assigns device ids to coordinates, while `axis_index` computes coordinates from the
+        // axis order of the mesh of its own map, so maps over meshes with other axis orders must not share a module.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = test_logical_mesh_2x2();
+        let reordered_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let device_mesh = |logical_mesh: &LogicalMesh| {
+            let devices = client.addressable_devices().unwrap();
+            DeviceMesh::new(
+                logical_mesh.clone(),
+                devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+            )
+            .unwrap()
+        };
+        let coordinate_map = |mesh: &LogicalMesh| {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let coordinate = builder
+                .add_instruction(AxisIndexOperation::new("x".into()).with_mesh(mesh.clone()), vec![], vec![], None)
+                .unwrap()[0];
+            let coordinate = builder
+                .add_instruction(
+                    ReshapeOperation::new(Shape::new(vec![]), Shape::new(vec![CoreDimension::Static(1)])),
+                    vec![],
+                    vec![coordinate],
+                    None,
+                )
+                .unwrap()[0];
+            let body =
+                builder.build::<Vec<Constant>, Vec<Constant>>(vec![coordinate], vec![], vec![Placeholder]).unwrap();
+            let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+            let boundary = ShardMapBoundary::new(mesh.clone(), vec![], vec![output_sharding], vec![]).unwrap();
+            (ShardMapOperation::from_program(&body, Vec::<ArrayIrType>::new(), boundary).unwrap(), body)
+        };
+        let input_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let output_type = ArrayType::new_static(DataType::U64, [2])
+            .with_sharding(Sharding::replicated(mesh.clone(), 1))
+            .unwrap();
+        let compile_maps = |second_mesh: &LogicalMesh, device_mesh: DeviceMesh| {
+            let (first, first_body) = coordinate_map(&mesh);
+            let (second, second_body) = coordinate_map(second_mesh);
+            let output_type = output_type.clone();
+            crate::compile::<_, ArrayType, (ArrayType, ArrayType)>(
+                move |input| {
+                    let context = input.into_value().domain();
+                    let replicate = |output| {
+                        let operation = BroadcastOperation::new(output_type.clone(), vec![0]);
+                        let output = context.bind(operation, vec![], &[output]).unwrap().remove(0);
+                        ValueProjection::<ArrayType>::into_projected(output).unwrap()
+                    };
+                    let first = context.bind(first, vec![first_body], &[]).unwrap().remove(0);
+                    let second = context.bind(second, vec![second_body], &[]).unwrap().remove(0);
+                    (replicate(first), replicate(second))
+                },
+                input_type.clone(),
+                &domain,
+                device_mesh,
+            )
+        };
+
+        // Maps over meshes with the same axis order agree on the coordinates of every device.
+        let compiled = compile_maps(&mesh, device_mesh(&mesh)).unwrap();
+        let input =
+            Array::from_host_buffer(&domain, input_type.clone(), device_mesh(&mesh), 0f32.to_ne_bytes()).unwrap();
+        let (first, second) = compiled.executable().execute(&domain, input).unwrap();
+        assert_eq!(values_from_bytes::<u64>(&first.copy_to_host().unwrap()), vec![0, 1]);
+        assert_eq!(values_from_bytes::<u64>(&second.copy_to_host().unwrap()), vec![0, 1]);
+
+        // A map over the reordered mesh is rejected instead of computing coordinates that do not match the device ids.
+        assert!(matches!(
+            compile_maps(&reordered_mesh, device_mesh(&mesh)),
+            Err(Error::Lowering(crate::LoweringError::MismatchedMeshTopology { expected, actual }))
+                if expected == mesh && actual == reordered_mesh,
+        ));
+
+        // A program whose module mesh is not the topology of the device mesh that it compiles for is rejected too.
+        assert!(matches!(
+            compile_maps(&mesh, device_mesh(&reordered_mesh)),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Sharding(ryft_core::ShardingError::MeshMismatch { expected, actual })
+                    if expected == &reordered_mesh && actual == &mesh,
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_shard_map_compilation_replicates_unplaced_outputs_on_cpu() {
+        // An inputless map reads the coordinate of every device along `x` and tiles it along `x`. Broadcasting its
+        // output to a type without a sharding leaves the program output without a placement, which execution treats as
+        // replicated, so lowering must annotate the result as replicated as well. Otherwise, the compiler keeps the
+        // result tiled like the output of the map, and every device returns one element instead of both. The first
+        // output has no placement and the second one is replicated explicitly.
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let device_mesh = || {
+            let devices = client.addressable_devices().unwrap();
+            DeviceMesh::new(mesh.clone(), devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let coordinate = builder
+            .add_instruction(AxisIndexOperation::new("x".into()).with_mesh(mesh.clone()), vec![], vec![], None)
+            .unwrap()[0];
+        let coordinate = builder
+            .add_instruction(
+                ReshapeOperation::new(Shape::new(vec![]), Shape::new(vec![CoreDimension::Static(1)])),
+                vec![],
+                vec![coordinate],
+                None,
+            )
+            .unwrap()[0];
+        let body = builder.build::<Vec<Constant>, Vec<Constant>>(vec![coordinate], vec![], vec![Placeholder]).unwrap();
+        let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let boundary = ShardMapBoundary::new(mesh.clone(), vec![], vec![output_sharding], vec![]).unwrap();
+        let map = ShardMapOperation::from_program(&body, Vec::<ArrayIrType>::new(), boundary).unwrap();
+        let input_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(mesh.clone(), 0)).unwrap();
+        let unplaced_type = ArrayType::new_static(DataType::U64, [2]);
+        let replicated_type = unplaced_type.clone().with_sharding(Sharding::replicated(mesh.clone(), 1)).unwrap();
+        let compiled = crate::compile::<_, ArrayType, (ArrayType, ArrayType)>(
+            move |input| {
+                let context = input.into_value().domain();
+                let coordinates = context.bind(map, vec![body], &[]).unwrap().remove(0);
+                let broadcast = |output_type| {
+                    let operation = BroadcastOperation::new(output_type, vec![0]);
+                    let output = context.bind(operation, vec![], std::slice::from_ref(&coordinates)).unwrap().remove(0);
+                    ValueProjection::<ArrayType>::into_projected(output).unwrap()
+                };
+                (broadcast(unplaced_type), broadcast(replicated_type))
+            },
+            input_type.clone(),
+            &domain,
+            device_mesh(),
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(&domain, input_type, device_mesh(), 0f32.to_ne_bytes()).unwrap();
+        let (unplaced, replicated) = compiled.executable().execute(&domain, input).unwrap();
+        assert_eq!(values_from_bytes::<u64>(&unplaced.copy_to_host().unwrap()), vec![0, 1]);
+        assert_eq!(values_from_bytes::<u64>(&replicated.copy_to_host().unwrap()), vec![0, 1]);
     }
 
     #[test]

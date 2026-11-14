@@ -17,6 +17,7 @@ use crate::experimental::lowering::types::{
 };
 use crate::operations::collectives::axis_index::lower_axis_index_to_coordinate;
 use crate::operations::collectives::collective_replica_groups;
+use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::lower_reduce_to_mlir;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation};
 
@@ -467,8 +468,16 @@ fn lower_unbatched_parallel_ragged_all_to_all<'b, 'c: 'b, 't: 'c>(
         lower_tensor_type(&input_types[1].clone().with_shape(Shape::new(lane_dimensions)), context, location)?;
     let lanes = block.append_operation(stable_hlo::reshape_with_output_type(expanded, lane_type, location)?)?;
     let lanes = lanes.result(0).expect("stablehlo.reshape should return one result").as_ref();
-    let contribution =
-        lower_reduce_to_mlir(ReductionKind::Sum, &[0], lanes, &input_types[1], block, context, location)?;
+    let contribution = lower_reduce_to_mlir(
+        ReductionKind::Sum,
+        &[0],
+        lanes,
+        &input_types[1],
+        FloatExtremumForm::TotalOrder,
+        block,
+        context,
+        location,
+    )?;
     let sum = block.append_operation(stable_hlo::add(input_values[1], contribution, location)?)?;
     Ok(vec![sum.result(0).expect("stablehlo.add should return one result").as_ref()])
 }

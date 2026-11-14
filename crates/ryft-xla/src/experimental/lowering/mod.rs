@@ -78,9 +78,14 @@ pub enum LoweringError {
     #[error("invalid XLA reference-state ABI: {message}")]
     InvalidReferenceStateAbi { message: String },
 
-    /// A shared mesh axis was declared with different sizes by programs lowered into one module.
-    #[error("mesh axis `{axis_name}` has size {actual}, but an earlier declaration requires {expected}")]
-    ConflictingMeshAxisSize { axis_name: String, expected: usize, actual: usize },
+    /// A sharding or `shard_map` boundary of the module refers to a mesh whose topology (i.e., axis names and sizes in
+    /// order, refer to [`LogicalMesh::has_same_topology`]) differs from the topology of the module mesh. A lowered
+    /// module declares one `sdy.mesh`, which assigns device ids to mesh coordinates, while collectives and
+    /// `axis_index` compute coordinates from the order of the axes of their own mesh. Meshes that differ in order or
+    /// in axes would therefore disagree about which device holds which coordinate, and a union of different meshes
+    /// cannot be placed on one device mesh. Meshes that differ only in axis types share the module mesh.
+    #[error("mesh `{actual}` does not have the topology of the module mesh `{expected}`")]
+    MismatchedMeshTopology { expected: LogicalMesh, actual: LogicalMesh },
 
     /// A valid operation requests behavior this backend cannot lower.
     #[error("cannot lower `{operation}`: {reason}")]
@@ -117,6 +122,10 @@ pub(crate) struct LoweredModule {
 
     /// Canonical runtime contracts required by emitted calls and synthesized checks.
     pub(crate) runtime_requirements: Arc<[RuntimeRequirement]>,
+
+    /// Module mesh that every sharding and `shard_map` boundary of the module refers to, or `None` when the module
+    /// declares no mesh. Compilation checks it against the topology of the device mesh that it targets.
+    pub(crate) mesh: Option<LogicalMesh>,
 }
 
 impl LoweredModule {
@@ -1525,7 +1534,7 @@ where
     let mut signature_mesh = None;
     for sharding in argument_shardings.iter().chain(result_shardings).flatten() {
         signature_mesh = Some(match signature_mesh.take() {
-            Some(existing_mesh) => merge_logical_meshes(&existing_mesh, sharding.mesh())?,
+            Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
             None => sharding.mesh().clone(),
         });
     }
@@ -1855,6 +1864,7 @@ where
         signature,
         requires_assertion_handler,
         runtime_requirements,
+        mesh,
     })
 }
 
@@ -2049,7 +2059,7 @@ pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy
                 continue;
             };
             mesh = Some(match mesh.take() {
-                Some(existing_mesh) => merge_logical_meshes(&existing_mesh, sharding.mesh())?,
+                Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
                 None => sharding.mesh().clone(),
             });
         }
@@ -2138,7 +2148,9 @@ pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy
     serialize_lowered_module(&module, &collective_state)
 }
 
-/// Collects meshes referenced by emitted sharding constraints and nested-computation boundaries.
+/// Collects the module mesh from the meshes referenced by emitted sharding constraints and nested-computation
+/// boundaries, starting from `existing`, and rejects every mesh whose topology differs from it with
+/// [`LoweringError::MismatchedMeshTopology`].
 pub(crate) fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
     existing: Option<LogicalMesh>,
@@ -2222,7 +2234,7 @@ where
             };
             if let Some(incoming) = incoming {
                 mesh = Some(match mesh.take() {
-                    Some(existing_mesh) => merge_logical_meshes(&existing_mesh, &incoming)?,
+                    Some(existing_mesh) => merge_logical_meshes(existing_mesh, &incoming)?,
                     None => incoming,
                 });
             }
@@ -2231,22 +2243,21 @@ where
     Ok(mesh)
 }
 
-fn merge_logical_meshes(existing: &LogicalMesh, incoming: &LogicalMesh) -> Result<LogicalMesh, Error> {
-    let mut merged_axes = existing.axes().to_vec();
-    for incoming_axis in incoming.axes() {
-        match existing.axis_size(incoming_axis.name()) {
-            Some(existing_size) if existing_size != incoming_axis.size() => {
-                return Err(Error::Lowering(LoweringError::ConflictingMeshAxisSize {
-                    axis_name: incoming_axis.name().to_string(),
-                    expected: existing_size,
-                    actual: incoming_axis.size(),
-                }));
-            }
-            Some(_) => {}
-            None => merged_axes.push(incoming_axis.clone()),
-        }
+/// Validates that `incoming` has the topology of the module mesh `existing`, which it returns. The module mesh keeps
+/// the axis types of the first mesh that declared it, because the emitted `sdy.mesh` records only axis names and sizes.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::MismatchedMeshTopology`] when the axis names or sizes of the two meshes differ, including
+/// in order.
+fn merge_logical_meshes(existing: LogicalMesh, incoming: &LogicalMesh) -> Result<LogicalMesh, Error> {
+    if !existing.has_same_topology(incoming) {
+        return Err(Error::Lowering(LoweringError::MismatchedMeshTopology {
+            expected: existing,
+            actual: incoming.clone(),
+        }));
     }
-    LogicalMesh::new(merged_axes).map_err(Error::from)
+    Ok(existing)
 }
 
 /// Removes every `stablehlo.constant` operation whose result has no uses from `module`, including those in nested

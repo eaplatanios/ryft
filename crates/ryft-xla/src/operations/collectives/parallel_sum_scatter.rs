@@ -13,6 +13,7 @@ use crate::experimental::lowering::types::lower_tensor_type;
 use crate::operations::collectives::{
     collapse_singleton_axis, collective_replica_groups, refine_collective_result_dimensions,
 };
+use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::build_reduce_body_region;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, MemberLowerableOperation};
 
@@ -34,7 +35,13 @@ pub(crate) fn lower_parallel_sum_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
         operation.options().axis_index_groups(),
     )?;
     let replica_groups: Vec<&[usize]> = replica_groups.iter().map(Vec::as_slice).collect();
-    let computation = build_reduce_body_region(ReductionKind::Sum, output_array_type.data_type(), context, location)?;
+    let computation = build_reduce_body_region(
+        ReductionKind::Sum,
+        output_array_type.data_type(),
+        FloatExtremumForm::TotalOrder,
+        context,
+        location,
+    )?;
     let native_output_type = match operation.options().mode() {
         CollectiveMode::Tiled => output_array_type.clone(),
         CollectiveMode::Untiled => output_array_type

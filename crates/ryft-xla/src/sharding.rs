@@ -263,7 +263,8 @@ impl OpShardingExtension for OpSharding {
 /// axes that the sharding governs but does not use are listed as replicated either way, so open dimensions can only
 /// gain auto axes. This is how JAX lowers the shardings of types over meshes with auto axes (i.e.,
 /// `NamedSharding._to_sdy_sharding` with `modify_wrt_axis_types=True`), whose placement along those
-/// axes the type does not describe and the compiler chooses.
+/// axes the type does not describe and the compiler chooses. Individual dimensions can be kept
+/// closed in a lowering that is open over auto axes (refer to [`Self::with_closed_dimensions`]).
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ShardyTensorSharding<'s> {
     /// [`Sharding`] that is being lowered.
@@ -271,6 +272,9 @@ pub(crate) struct ShardyTensorSharding<'s> {
 
     /// Whether the dimensions of the lowered attribute are open over the auto axes of the mesh of the sharding.
     open_over_auto_axes: bool,
+
+    /// Dimensions of the lowered attribute that are closed even when the lowering is open over auto axes.
+    closed_dimensions: &'s [usize],
 }
 
 impl<'s> ShardyTensorSharding<'s> {
@@ -278,7 +282,15 @@ impl<'s> ShardyTensorSharding<'s> {
     /// axes of its mesh if `open_over_auto_axes` is set.
     #[inline]
     pub(crate) fn new(sharding: &'s Sharding, open_over_auto_axes: bool) -> Self {
-        Self { sharding, open_over_auto_axes }
+        Self { sharding, open_over_auto_axes, closed_dimensions: &[] }
+    }
+
+    /// Returns this [`ShardyTensorSharding`] with `dimensions` closed, so that Shardy cannot shard them along any
+    /// further axis (including auto axes) even when the lowering is open over auto axes.
+    #[inline]
+    pub(crate) fn with_closed_dimensions(mut self, dimensions: &'s [usize]) -> Self {
+        self.closed_dimensions = dimensions;
+        self
     }
 }
 
@@ -289,7 +301,7 @@ impl ToMlir for ShardyTensorSharding<'_> {
         &self,
         location: L,
     ) -> Result<shardy::TensorShardingAttributeRef<'c, 't>, ryft_mlir::Error> {
-        let Self { sharding, open_over_auto_axes } = *self;
+        let Self { sharding, open_over_auto_axes, closed_dimensions } = *self;
         let context = location.context();
         let closed =
             !open_over_auto_axes || sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto);
@@ -297,17 +309,23 @@ impl ToMlir for ShardyTensorSharding<'_> {
         let dimensions = sharding
             .dimensions()
             .iter()
-            .map(|dimension| match dimension {
-                ShardingDimension::Replicated => context.shardy_dimension_sharding([], closed, None),
-                ShardingDimension::Sharded(axis_names) => context.shardy_dimension_sharding(
-                    axis_names
-                        .iter()
-                        .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    closed,
-                    None,
-                ),
-                ShardingDimension::Unconstrained => context.shardy_dimension_sharding([], false, None),
+            .enumerate()
+            .map(|(index, dimension)| {
+                let closed_dimension = closed_dimensions.contains(&index);
+                match dimension {
+                    ShardingDimension::Replicated => {
+                        context.shardy_dimension_sharding([], closed || closed_dimension, None)
+                    }
+                    ShardingDimension::Sharded(axis_names) => context.shardy_dimension_sharding(
+                        axis_names
+                            .iter()
+                            .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
+                            .collect::<Result<Vec<_>, _>>()?,
+                        closed || closed_dimension,
+                        None,
+                    ),
+                    ShardingDimension::Unconstrained => context.shardy_dimension_sharding([], closed_dimension, None),
+                }
             })
             .collect::<Result<Vec<_>, _>>()?;
         let replicated_axes = sharding
@@ -545,6 +563,16 @@ mod tests {
         assert_eq!(
             ShardyTensorSharding::new(&sharding, false).to_mlir(location).unwrap().to_string(),
             "#sdy.sharding<@mesh, [{}, {\"y\"}], replicated={\"z\"}>",
+        );
+
+        // An open lowering keeps the requested dimensions closed, which the compiler cannot shard along auto axes.
+        assert_eq!(
+            ShardyTensorSharding::new(&sharding, true)
+                .with_closed_dimensions(&[0])
+                .to_mlir(location)
+                .unwrap()
+                .to_string(),
+            "#sdy.sharding<@mesh, [{}, {\"y\", ?}], replicated={\"z\"}>",
         );
 
         // An open lowering over a mesh without auto axes closes every dimension too.
