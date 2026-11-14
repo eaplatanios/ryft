@@ -5,8 +5,8 @@ use ryft_macros::capability;
 
 use crate::arrays::{
     Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrContext, ArrayIrType,
-    ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
-    DimensionVariable, LinearResiduals, LogicalMesh, Shape, Sharding,
+    ArrayIrValue, ArrayType, DataType, Dimension, DimensionOperation, DimensionType, DimensionValue, DimensionVariable,
+    LinearResiduals, LogicalMesh, Shape, Sharding,
 };
 use crate::axes::{Axis, AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchableOperation, BatchingContext, BatchingDriver, BatchingError, MemberBatchableOperation};
@@ -19,7 +19,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::{check_count, check_types};
 use crate::operations::Capability;
-use crate::operations::arithmetic::{AddOperation, Div, Mul, Rem};
+use crate::operations::arithmetic::{AddOperation, Div, Mul, MulOperation, Rem};
 use crate::operations::assertions::Assert;
 use crate::operations::collectives::axis_index::AxisIndexOperation;
 use crate::operations::collectives::parallel_sum_scatter::ParallelSumScatterOperation;
@@ -31,17 +31,18 @@ use crate::operations::collectives::{
     LinearCollectiveOperation, ShapeChangingCollectiveBatching, ShapeChangingCollectiveOperation,
     ShapeChangingCollectiveValue, infer_array_ir_shape_changing_collective_output_type,
     infer_linear_collective_operation_output_type, resolve_collective_axes, validate_manual_mesh_axes_input,
-    validate_participant_types,
+    validate_participant_types, with_cotangent_type,
 };
 use crate::operations::comparisons::Compare;
 use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
-use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_max::DimensionMax;
-use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
+use crate::operations::dimensions::dimension_to_scalar::{DIMENSION_DATA_TYPE, DimensionToScalarOperation};
 use crate::operations::manipulation::broadcasting::{BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation};
+use crate::operations::manipulation::conversions::{CastOperation, ConvertElementTypeOperation};
+use crate::operations::manipulation::memory::TransferToMemoryOperation;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape, ReshapeOperation};
 use crate::operations::manipulation::slicing::DynamicSliceOperation;
 use crate::operations::manipulation::transposition::Transpose;
@@ -717,11 +718,13 @@ impl<
         + From<ZeroOperation<ArrayType>>
         + From<AddOperation<ArrayType>>
         + From<BroadcastOperation>
+        + From<CastOperation<ArrayType>>
         + From<ReshapeOperation>
         + From<DynamicSliceOperation>
         + From<AxisIndexOperation>
         + From<ParallelVaryOperation>
-        + From<ParallelSumScatterOperation>,
+        + From<ParallelSumScatterOperation>
+        + From<TransferToMemoryOperation>,
 > TransposableOperation<V, O> for ParallelAllGatherOperation
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -799,11 +802,13 @@ where
         }
 
         // The start indices must vary over the same manual mesh axes as the cotangent that they slice, which is the
-        // variation of the input cotangent. The participant index varies at most over the gathered manual mesh axis,
-        // so it is placed on the mesh of the cotangent if necessary and takes the remaining axes through staged
-        // `parallel_vary` transitions. The zero start indices are non-differentiable constants, so they are created
-        // directly with that variation. A degenerate axis selects row zero instead of reading its participant index,
-        // so that the pullback of a degenerate ordinary all-gather remains interpretable without an enclosing binder.
+        // variation of the input cotangent, and reside in its memory kind. The participant index varies at most over
+        // the gathered manual mesh axis, so it is placed on the mesh of the cotangent if necessary, takes the
+        // remaining axes through staged `parallel_vary` transitions, and is moved into the memory of the cotangent.
+        // The zero start indices are non-differentiable constants, so they are created directly with that variation
+        // and memory. A degenerate axis selects row zero instead of reading its participant index, so that the
+        // pullback of a degenerate ordinary all-gather remains interpretable without an enclosing binder.
+        let memory = cotangent.r#type().memory();
         let index_sharding = input_cotangent_type
             .sharding()
             .filter(|sharding| !sharding.varying_manual_axes().is_empty())
@@ -840,11 +845,18 @@ where
                     start = context.bind(O::from(operation), Vec::new(), &[start])?.remove(0);
                 }
             }
+            if start.r#type().memory() != memory {
+                let operation = TransferToMemoryOperation::new(memory);
+                start = context.bind(O::from(operation), Vec::new(), &[start])?.remove(0);
+            }
             Some(start)
         };
 
         let zero = ZeroOperation::new(
-            ArrayType::scalar(DataType::U64).with_sharding(index_sharding).map_err(TypeError::from)?,
+            ArrayType::scalar(DataType::U64)
+                .with_memory(memory)
+                .with_sharding(index_sharding)
+                .map_err(TypeError::from)?,
         );
 
         let zero = context.bind(O::from(zero), Vec::new(), &[])?.remove(0);
@@ -859,6 +871,7 @@ where
         let operation = ReshapeOperation::new(selected_shape, input_cotangent_type.shape().clone())
             .with_output_sharding(input_cotangent_type.sharding().cloned());
         let contribution = context.bind(O::from(operation), Vec::new(), &[selected])?.remove(0);
+        let contribution = with_cotangent_type(&**context, contribution, input_cotangent_type)?;
         accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
         Ok(())
     }
@@ -993,9 +1006,10 @@ where
 impl<
     C: Context<
             Type = ArrayIrType,
-            Operation: From<ConstantOperation<DimensionValue>>
-                           + From<DimensionFromScalarOperation>
+            Operation: From<CastOperation<ArrayIrType>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
+                           + From<DimensionToScalarOperation>
                            + From<DynamicReshapeOperation>
                            + From<DynamicSliceOperation<ArrayIrType>>
                            + From<LinearCallOperation<ArrayIrType>>
@@ -1003,7 +1017,12 @@ impl<
                            + From<ParallelSumScatterOperation>
                            + OperationProjection<
                 ArrayType,
-                Projected: From<AxisIndexOperation> + From<ParallelVaryOperation>,
+                Projected: From<AxisIndexOperation>
+                               + From<BroadcastOperation>
+                               + From<ConvertElementTypeOperation<ArrayType>>
+                               + From<MulOperation<ArrayType>>
+                               + From<ParallelVaryOperation>
+                               + From<TransferToMemoryOperation>,
             > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
         >,
 > MemberDifferentiableOperation<C> for ParallelAllGatherOperation
@@ -1057,7 +1076,8 @@ where
                 let input_shape = residuals.retain_shape(context, array.primal())?;
 
                 // Each region closure owns its copy of the operation and of the residual slots that it reads. The
-                // input cotangent type supplies the sharding that the transpose region restores on its result.
+                // input cotangent type supplies the sharding and layout that the transpose region restores on its
+                // result.
                 let forward_operation = self.clone();
                 let forward_output_extents = output_extents.clone();
                 let transpose_operation = self.clone();
@@ -1077,9 +1097,9 @@ where
                     move |residuals, output_cotangents| {
                         // The transpose region maps the output cotangent to the input cotangent by selecting the
                         // current participant's chunk of it along the concatenation axis, which needs no communication
-                        // because every participant holds the complete invariant output cotangent. All extents and
-                        // offsets are first-class dimension values, so that they remain exact for dynamically shaped
-                        // inputs.
+                        // because every participant holds the complete invariant output cotangent. All extents are
+                        // first-class dimension values, so that they remain exact for dynamically shaped inputs, while
+                        // the offset of the chunk differs across participants and is therefore an array value.
 
                         // Rebuild the exact input dimensions from the retained shape, staging static extents as
                         // dimension constants in the transpose context.
@@ -1110,55 +1130,6 @@ where
                                 .remove(0),
                         };
 
-                        // The chunk of participant `i` starts at offset `i * chunk_extent`. A degenerate axis has only
-                        // participant zero, so its offset is zero and needs no `axis_index`, which keeps the pullback
-                        // interpretable without an enclosing binder. Otherwise, the participant index is read through
-                        // `axis_index` (on the operation's mesh for a manual mesh axis) and converted into a dimension
-                        // whose variable is bounded by the axis size, so that the offset becomes a symbolic dimension
-                        // product (e.g., `x_index * 2`) with known bounds, which the dynamic slice below checks.
-                        let start = if transpose_operation.axis_size() == 1 {
-                            zero.clone()
-                        } else {
-                            let mut axis_index_operation =
-                                AxisIndexOperation::new(transpose_operation.invariant_axis_name()?.to_string());
-                            if let Some(mesh) = transpose_operation.mesh() {
-                                axis_index_operation = axis_index_operation.with_mesh(mesh.clone());
-                            }
-                            let axis_index = transpose_context.bind_array(axis_index_operation, &[])?;
-                            let axis_index_variable = DimensionVariable::new(
-                                format!("{}_index", transpose_operation.axes()),
-                                DimensionBounds::non_negative(Some(transpose_operation.axis_size()))?,
-                            );
-                            let axis_index = transpose_context
-                                .bind(
-                                    DimensionFromScalarOperation::new(axis_index_variable.into()),
-                                    Vec::new(),
-                                    std::slice::from_ref(&axis_index),
-                                )?
-                                .remove(0);
-                            let axis_index_type = <&DimensionType>::try_from(axis_index.r#type().as_ref())?.clone();
-                            let chunk_extent_type = <&DimensionType>::try_from(chunk_extent.r#type().as_ref())?.clone();
-                            transpose_context
-                                .bind(
-                                    DimensionOperation::Mul(DimensionMulOperation::new(
-                                        &axis_index_type,
-                                        &chunk_extent_type,
-                                    )?),
-                                    Vec::new(),
-                                    &[axis_index, chunk_extent.clone()],
-                                )?
-                                .remove(0)
-                        };
-
-                        // Every other axis starts at zero and spans its full input extent. An untiled output cotangent
-                        // also has the participant axis, along which the slice keeps one size-one row.
-                        let mut starts = vec![zero; output_rank];
-                        starts[transpose_operation.concatenation_axis()] = start;
-                        let mut slice_sizes = input_dimensions.clone();
-                        if transpose_operation.options().mode() == CollectiveMode::Untiled {
-                            slice_sizes.insert(transpose_operation.concatenation_axis(), chunk_extent);
-                        }
-
                         // Over a manual mesh axis, the output cotangent is invariant across the gathered axis, while
                         // every participant selects a different chunk of it, so the selected chunk varies over that
                         // axis. The cotangent can carry a tangent itself (e.g., under nested differentiation), and so
@@ -1179,6 +1150,94 @@ where
                             _ => output_cotangents[0].clone(),
                         };
 
+                        // The chunk of participant `i` starts at offset `i * chunk_extent`. A degenerate axis has only
+                        // participant zero, so its offset is zero and needs no `axis_index`, which keeps the pullback
+                        // interpretable without an enclosing binder. Otherwise, the participant index is read through
+                        // `axis_index` (on the operation's mesh for a manual mesh axis), and the offset is an array
+                        // value, as in JAX, because it differs across the participants and a dimension is the same on
+                        // every device. An untiled chunk has extent one, so its offset is the participant index itself,
+                        // while a tiled offset is computed in `i64` array arithmetic. The integer values that this rule
+                        // creates are not differentiable, and they are placed on the mesh of the cotangent, made
+                        // varying along its manual axes, and moved into its memory kind, because `dynamic_slice`
+                        // requires array starts that vary like the sliced value and reside in the same memory.
+                        let start = if transpose_operation.axis_size() == 1 {
+                            zero.clone()
+                        } else {
+                            let mut axis_index_operation =
+                                AxisIndexOperation::new(transpose_operation.invariant_axis_name()?.to_string());
+                            if let Some(mesh) = transpose_operation.mesh() {
+                                axis_index_operation = axis_index_operation.with_mesh(mesh.clone());
+                            }
+                            let axis_index = transpose_context.bind_array(axis_index_operation, &[])?;
+                            let factors = match transpose_operation.options().mode() {
+                                CollectiveMode::Tiled => vec![
+                                    transpose_context.bind_array(
+                                        ConvertElementTypeOperation::<ArrayType>::new(DIMENSION_DATA_TYPE, false),
+                                        &[axis_index],
+                                    )?,
+                                    transpose_context
+                                        .bind(
+                                            DimensionToScalarOperation,
+                                            Vec::new(),
+                                            std::slice::from_ref(&chunk_extent),
+                                        )?
+                                        .remove(0),
+                                ],
+                                CollectiveMode::Untiled => vec![axis_index],
+                            };
+                            let output_cotangent_type = output_cotangent.r#type();
+                            let output_cotangent_type = <&ArrayType>::try_from(output_cotangent_type.as_ref())?;
+                            let target = output_cotangent_type.sharding().cloned();
+                            let memory = output_cotangent_type.memory();
+                            let mut factors = factors
+                                .into_iter()
+                                .map(|mut value| {
+                                    let Some(target) = &target else {
+                                        return Ok(value);
+                                    };
+                                    let value_type = value.r#type();
+                                    let value_type = <&ArrayType>::try_from(value_type.as_ref())?.clone();
+                                    if value_type.sharding().is_none() {
+                                        let mesh_type = value_type
+                                            .with_sharding(Sharding::replicated(target.mesh().clone(), 0))
+                                            .map_err(|error| TypeError::invalid(error.to_string()))?;
+                                        let broadcast = BroadcastOperation::new(mesh_type, Vec::new());
+                                        value = transpose_context.bind_array(broadcast, &[value])?;
+                                    }
+                                    for axis_name in target.varying_manual_axes() {
+                                        let value_type = value.r#type();
+                                        let varies = <&ArrayType>::try_from(value_type.as_ref())?
+                                            .sharding()
+                                            .is_some_and(|sharding| sharding.varying_manual_axes().contains(axis_name));
+                                        if !varies {
+                                            let vary = ParallelVaryOperation::new(axis_name.clone());
+                                            value = transpose_context.bind_array(vary, &[value])?;
+                                        }
+                                    }
+                                    Ok(value)
+                                })
+                                .collect::<Result<Vec<_>, ProgramError>>()?;
+                            let start = if factors.len() == 1 {
+                                factors.remove(0)
+                            } else {
+                                transpose_context.bind_array(MulOperation::<ArrayType>::new(), &factors)?
+                            };
+                            if <&ArrayType>::try_from(start.r#type().as_ref())?.memory() == memory {
+                                start
+                            } else {
+                                transpose_context.bind_array(TransferToMemoryOperation::new(memory), &[start])?
+                            }
+                        };
+
+                        // Every other axis starts at zero and spans its full input extent. An untiled output cotangent
+                        // also has the participant axis, along which the slice keeps one size-one row.
+                        let mut starts = vec![zero; output_rank];
+                        starts[transpose_operation.concatenation_axis()] = start;
+                        let mut slice_sizes = input_dimensions.clone();
+                        if transpose_operation.options().mode() == CollectiveMode::Untiled {
+                            slice_sizes.insert(transpose_operation.concatenation_axis(), chunk_extent);
+                        }
+
                         // The array IR `dynamic_slice` consumes the sliced array followed by all start offsets and then
                         // all slice extents, with one of each per array axis.
                         let mut slice_inputs = Vec::with_capacity(1 + 2 * output_rank);
@@ -1195,16 +1254,19 @@ where
 
                         // Reshaping to the exact input dimensions removes the size-one participant axis of an untiled
                         // chunk and leaves a tiled chunk's shape unchanged, while assigning the input cotangent's
-                        // sharding to the result in both modes.
+                        // sharding to the result in both modes. The input cotangent's layout is restored last.
                         let mut reshape_inputs = Vec::with_capacity(1 + input_dimensions.len());
                         reshape_inputs.push(selected);
                         reshape_inputs.extend(input_dimensions);
-                        transpose_context.bind(
+                        let mut outputs = transpose_context.bind(
                             DynamicReshapeOperation::new()
                                 .with_output_sharding(transpose_target_type.sharding().cloned()),
                             Vec::new(),
                             reshape_inputs.as_slice(),
-                        )
+                        )?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        let target = transpose_target_type.into();
+                        Ok(vec![with_cotangent_type(&transpose_context, outputs.remove(0), target)?])
                     },
                 )?
                 .remove(0);
@@ -1552,7 +1614,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayOperation, Layout, Memory, MeshAxis, MeshAxisType, ShardingDimension, StridedLayout,
+        ArrayIrOperation, ArrayOperation, DimensionBounds, Layout, Memory, MeshAxis, MeshAxisType, ShardingDimension,
+        StridedLayout,
     };
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -3487,14 +3550,13 @@ mod tests {
                         forward={
                             lambda %0:dimension<2>, %1:dimension<3>, %2:f32[2, 3] .
                             let %3:u64[] = axis_index [axis_name=\"x\"]
-                                %4:dimension<x_index ∈ [0, 2)> = dimension_from_scalar [bounds=[0, 2)] %3
-                                %5:dimension<0> = constant [value=0]
-                                %6:dimension<1> = constant [value=1]
-                                %7:dimension<3> = constant [value=3]
-                                %8:f32[1, 3] = dynamic_slice [strides=[1, 1], bounds=checked, \
-                requires_runtime_assertion=true] %2 %4 %5 %6 %7
-                                %9:f32[3] = reshape %8 %7
-                            in (%9)
+                                %4:dimension<0> = constant [value=0]
+                                %5:dimension<1> = constant [value=1]
+                                %6:dimension<3> = constant [value=3]
+                                %7:f32[1, 3] = dynamic_slice [strides=[1, 1], bounds=checked, \
+                requires_runtime_assertion=true] %2 %3 %4 %5 %6
+                                %8:f32[3] = reshape %7 %6
+                            in (%8)
                         },
                         transpose={
                             lambda %0:dimension<2>, %1:dimension<3>, %2:f32[3] .
@@ -3517,8 +3579,9 @@ mod tests {
     fn test_parallel_all_gather_differentiation_array_ir_invariant_manual_mesh() {
         // Inside a manual region, the output cotangent of an invariant gather is invariant across the gathered axis,
         // while every participant selects a different chunk of it. The pullback therefore varies the cotangent over
-        // that axis with a real `parallel_vary` transition before slicing it at the checked participant index, so that
-        // the selected chunk has the input cotangent's variation.
+        // that axis with a real `parallel_vary` transition before slicing it, so that the selected chunk has the input
+        // cotangent's variation. The offset of the chunk differs across participants, so it is an `i64` array computed
+        // from `axis_index`, which is placed and varied like the cotangent, rather than a dimension.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let input_type = ArrayType::new_static(DataType::F32, [2])
             .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
@@ -3545,22 +3608,214 @@ mod tests {
                     [residual_count=1] %1 %0 [
                     forward={
                         lambda %0:dimension<4>, %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] .
-                        let %2:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = axis_index \
-                            [axis_name=\"x\", mesh=['x'=2:manual]]
-                            %3:dimension<x_index ∈ [0, 2)> = dimension_from_scalar [bounds=[0, 2)] %2
-                            %4:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary \
-                                [axis_name=\"x\"] %1
+                        let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary \
+                            [axis_name=\"x\"] %1
+                            %3:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = axis_index \
+                                [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %4:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = convert_element_type \
+                                [data_type=i64] %3
                             %5:dimension<2> = constant [value=2]
-                            %6:dimension<x_index * 2 ∈ [0, 3)> = dimension_mul %3 %5
-                            %7:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = dynamic_slice \
-                                [strides=[1], bounds=checked, requires_runtime_assertion=true] %4 %6 %5
-                            %8:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape \
-                                [output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %7 %5
-                        in (%8)
+                            %6:i64[] = dimension_to_scalar %5
+                            %7:i64[][sharding={mesh<['x'=2:manual]>, []}] = broadcast \
+                                [output_type=i64[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %6
+                            %8:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary \
+                                [axis_name=\"x\"] %7
+                            %9:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %4 %8
+                            %10:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = dynamic_slice \
+                                [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %9 %5
+                            %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape \
+                                [output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %10 %5
+                        in (%11)
                     },
                     transpose={
                         lambda %0:dimension<4>, %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
                         let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_all_gather [
+                            axes=\"x\",
+                            axis_size=2,
+                            concatenation_axis=0,
+                            options=Tiled,
+                            output_variance=Invariant,
+                            mesh=['x'=2:manual],
+                        ] %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_differentiation_array_ir_restores_input_cotangent_layouts() {
+        // Resizing the gathered axis clears the explicit layout of the input, so neither the selection of an invariant
+        // gather nor the adjoint sum-scatter of a varying gather restores it. Both pullbacks therefore cast their
+        // result to the exact input cotangent type, whose layout the linear call requires.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let pullback = |output_variance| {
+            let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+                |input| input.parallel_all_gather_with_options("x", 0, CollectiveOptions::tiled(), output_variance),
+                ArrayIrType::Array(input_type.clone()),
+                vec![(
+                    "x".to_string(),
+                    NamedAxis::Mesh { axis: 0, size: 2, mesh: mesh.clone(), checks_manual_variation: true },
+                )],
+            )
+            .unwrap();
+            program.to_flat_program().linearize().unwrap().pullback().unwrap().into_program().to_string()
+        };
+        assert_eq!(
+            pullback(ParallelAllGatherOutputVariance::Invariant),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}], %1:dimension<4> .
+                let %2:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    linear_call [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<4>, %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] .
+                        let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = parallel_vary \
+                            [axis_name=\"x\"] %1
+                            %3:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = axis_index \
+                                [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %4:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = convert_element_type \
+                                [data_type=i64] %3
+                            %5:dimension<2> = constant [value=2]
+                            %6:i64[] = dimension_to_scalar %5
+                            %7:i64[][sharding={mesh<['x'=2:manual]>, []}] = broadcast \
+                                [output_type=i64[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %6
+                            %8:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary \
+                                [axis_name=\"x\"] %7
+                            %9:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %4 %8
+                            %10:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = dynamic_slice \
+                                [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %9 %5
+                            %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = reshape \
+                                [output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %10 %5
+                            %12:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
+                                varying_manual={'x'}}] = cast [
+                                type=f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
+                                    varying_manual={'x'}}],
+                                inputs=[f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]],
+                            ] %11
+                        in (%12)
+                    },
+                    transpose={
+                        lambda %0:dimension<4>, %1:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
+                            varying_manual={'x'}}] .
+                        let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}] = parallel_all_gather [
+                            axes=\"x\",
+                            axis_size=2,
+                            concatenation_axis=0,
+                            options=Tiled,
+                            output_variance=Invariant,
+                            mesh=['x'=2:manual],
+                        ] %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            pullback(ParallelAllGatherOutputVariance::Varying),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}], %1:dimension<4> .
+                let %2:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                    linear_call [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<4>, %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] .
+                        let %2:dimension<2> = constant [value=2]
+                            %3:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                                parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=0, options=Tiled, \
+                                mesh=['x'=2:manual]] %1 %2
+                            %4:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
+                                varying_manual={'x'}}] = cast [
+                                type=f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
+                                    varying_manual={'x'}}],
+                                inputs=[f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]],
+                            ] %3
+                        in (%4)
+                    },
+                    transpose={
+                        lambda %0:dimension<4>, %1:f32[2][layout=strided{4}][sharding={mesh<['x'=2:manual]>, [{}], \
+                            varying_manual={'x'}}] .
+                        let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] = \
+                            parallel_all_gather [
+                            axes=\"x\",
+                            axis_size=2,
+                            concatenation_axis=0,
+                            options=Tiled,
+                            output_variance=Varying,
+                            mesh=['x'=2:manual],
+                        ] %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_parallel_all_gather_differentiation_array_ir_invariant_moves_offsets_into_cotangent_memory() {
+        // The participant offset of the selected chunk is computed in device memory, so the pullback of an invariant
+        // gather of an array in pinned host memory moves it into that memory before slicing the cotangent with it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap()]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [2])
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(Sharding::replicated(mesh.clone(), 1).with_varying_manual_axes(["x"]).unwrap())
+            .unwrap();
+        let (_, program) = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace_with_named_axes(
+            |input| {
+                input.parallel_all_gather_with_options(
+                    "x",
+                    0,
+                    CollectiveOptions::tiled(),
+                    ParallelAllGatherOutputVariance::Invariant,
+                )
+            },
+            ArrayIrType::Array(input_type),
+            vec![("x".to_string(), NamedAxis::Mesh { axis: 0, size: 2, mesh, checks_manual_variation: true })],
+        )
+        .unwrap();
+        let pullback = program.to_flat_program().linearize().unwrap().pullback().unwrap().into_program();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}]@Host[Pinned], %1:dimension<4> .
+                let %2:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]@Host[Pinned] = linear_call \
+                    [residual_count=1] %1 %0 [
+                    forward={
+                        lambda %0:dimension<4>, %1:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}]@Host[Pinned] .
+                        let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]@Host[Pinned] = \
+                            parallel_vary [axis_name=\"x\"] %1
+                            %3:u64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = axis_index \
+                                [axis_name=\"x\", mesh=['x'=2:manual]]
+                            %4:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = convert_element_type \
+                                [data_type=i64] %3
+                            %5:dimension<2> = constant [value=2]
+                            %6:i64[] = dimension_to_scalar %5
+                            %7:i64[][sharding={mesh<['x'=2:manual]>, []}] = broadcast \
+                                [output_type=i64[][sharding={mesh<['x'=2:manual]>, []}], output_axes=[]] %6
+                            %8:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = parallel_vary \
+                                [axis_name=\"x\"] %7
+                            %9:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}] = mul %4 %8
+                            %10:i64[][sharding={mesh<['x'=2:manual]>, [], varying_manual={'x'}}]@Host[Pinned] = \
+                                transfer_to_memory [destination=Host[Pinned]] %9
+                            %11:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]@Host[Pinned] = \
+                                dynamic_slice [strides=[1], bounds=checked, requires_runtime_assertion=true] %2 %10 %5
+                            %12:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]@Host[Pinned] = \
+                                reshape [output_sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}] %11 %5
+                        in (%12)
+                    },
+                    transpose={
+                        lambda %0:dimension<4>, \
+                            %1:f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]@Host[Pinned] .
+                        let %2:f32[4][sharding={mesh<['x'=2:manual]>, [{}]}]@Host[Pinned] = parallel_all_gather [
                             axes=\"x\",
                             axis_size=2,
                             concatenation_axis=0,
@@ -3981,6 +4236,75 @@ mod tests {
                     %5:f32[2][sharding={mesh<['x'=1:manual]>, [{}], varying_manual={'x'}}] = \
                     reshape [shape=[2], output_sharding={mesh<['x'=1:manual]>, [{}], varying_manual={'x'}}] %4
                 in (%5)"
+            },
+        );
+        assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
+    }
+
+    #[test]
+    fn test_parallel_all_gather_transposition_restores_input_cotangent_layouts() {
+        // Resizing the gathered axis clears the explicit layout of the input, so neither the selection of an invariant
+        // gather nor the adjoint sum-scatter of a varying gather restores it. Both transposes therefore cast their
+        // result to the exact input cotangent type, which the cotangent accumulator requires.
+        let input_type =
+            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let pullback = |output_variance| {
+            let operation =
+                ParallelAllGatherOperation::new("x".to_string(), 2, 0, CollectiveOptions::tiled(), output_variance);
+            collective_program(operation, input_type.clone()).transpose_with_respect_to(&[0], &[]).unwrap()
+        };
+        let invariant = pullback(ParallelAllGatherOutputVariance::Invariant);
+        assert_eq!(
+            invariant.to_string(),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[2, 2] = reshape [shape=[2, 2]] %0
+                    %2:u64[] = axis_index [axis_name=\"x\"]
+                    %3:u64[] = zero [type=u64[]]
+                    %4:f32[1, 2] = dynamic_slice [sizes=[1, 2]] %1 %2 %3
+                    %5:f32[2] = reshape [shape=[2]] %4
+                    %6:f32[2][layout=strided{4}] = cast [type=f32[2][layout=strided{4}], inputs=[f32[2]]] %5
+                in (%6)"
+            },
+        );
+        assert_eq!(invariant.output_types(), vec![input_type.cotangent().unwrap()]);
+        let varying = pullback(ParallelAllGatherOutputVariance::Varying);
+        assert_eq!(
+            varying.to_string(),
+            indoc! {"
+                lambda %0:f32[4] .
+                let %1:f32[2] = parallel_sum_scatter [axes=\"x\", axis_size=2, scatter_axis=0, options=Tiled] %0
+                    %2:f32[2][layout=strided{4}] = cast [type=f32[2][layout=strided{4}], inputs=[f32[2]]] %1
+                in (%2)"
+            },
+        );
+        assert_eq!(varying.output_types(), vec![input_type.cotangent().unwrap()]);
+    }
+
+    #[test]
+    fn test_parallel_all_gather_transposition_invariant_moves_offsets_into_cotangent_memory() {
+        // The start indices that select the chunk of an invariant gather are created in the memory of the cotangent
+        // that they slice, which here resides in pinned host memory.
+        let input_type = ArrayType::new_static(DataType::F32, [2]).with_memory(Memory::Host { pinned: true });
+        let operation = ParallelAllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+            ParallelAllGatherOutputVariance::Invariant,
+        );
+        let pullback = collective_program(operation, input_type.clone()).transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4]@Host[Pinned] .
+                let %1:f32[2, 2]@Host[Pinned] = reshape [shape=[2, 2]] %0
+                    %2:u64[] = axis_index [axis_name=\"x\"]
+                    %3:u64[]@Host[Pinned] = transfer_to_memory [destination=Host[Pinned]] %2
+                    %4:u64[]@Host[Pinned] = zero [type=u64[]@Host[Pinned]]
+                    %5:f32[1, 2]@Host[Pinned] = dynamic_slice [sizes=[1, 2]] %1 %3 %4
+                    %6:f32[2]@Host[Pinned] = reshape [shape=[2]] %5
+                in (%6)"
             },
         );
         assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);

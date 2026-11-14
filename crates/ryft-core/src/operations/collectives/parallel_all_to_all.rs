@@ -37,6 +37,7 @@ use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
+use crate::operations::manipulation::conversions::CastOperation;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::{LockstepDomain, LockstepOperation, LockstepValue};
@@ -749,7 +750,10 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelAllToAllOperation>>> D
 
 impl<
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelAllToAllOperation>,
+    O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
+        + From<CastOperation<ArrayType>>
+        + From<ParallelAllToAllOperation>,
 > TransposableOperation<V, O> for ParallelAllToAllOperation
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -913,7 +917,8 @@ where
 impl<
     C: Context<
             Type = ArrayIrType,
-            Operation: From<ConstantOperation<DimensionValue>>
+            Operation: From<CastOperation<ArrayIrType>>
+                           + From<ConstantOperation<DimensionValue>>
                            + From<ParallelAllToAllOperation>
                            + From<DimensionSizeOperation>
                            + From<LinearCallOperation<ArrayIrType>>
@@ -1373,7 +1378,7 @@ mod tests {
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::DifferentiationTracer;
+    use crate::differentiation::{DifferentiableType, DifferentiationTracer};
     use crate::macros::{
         check_gradient, check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference,
     };
@@ -1383,7 +1388,7 @@ mod tests {
     use crate::operations::reductions::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationOutput, PartialEvaluationValue};
-    use crate::programs::{EmptyRegionDriver, ProgramBuilder};
+    use crate::programs::{EmptyRegionDriver, ProgramBuilder, TypedProgram};
 
     use super::*;
 
@@ -3280,6 +3285,29 @@ mod tests {
             },
         );
         assert_eq!(transposed.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), program.to_string());
+    }
+
+    #[test]
+    fn test_parallel_all_to_all_transposition_restores_input_cotangent_layouts() {
+        // An exchange that splits one axis and concatenates along another resizes both, which clears the explicit
+        // layout of the input, so the transpose casts the result of the adjoint exchange to the exact input cotangent
+        // type, which the cotangent accumulator requires.
+        let input_type =
+            ArrayType::new_static(DataType::F32, [2, 4]).with_layout(Layout::Strided(StridedLayout::new(vec![16, 4])));
+        let operation = ParallelAllToAllOperation::new("x", 2, 1, 0, CollectiveOptions::tiled());
+        let pullback = collective_program(operation, input_type.clone()).transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[4, 2] .
+                let %1:f32[2, 4] = parallel_all_to_all [axes=\"x\", axis_size=2, split_axis=0, concatenation_axis=1, \
+                    options=Tiled] %0
+                    %2:f32[2, 4][layout=strided{16,4}] = \
+                    cast [type=f32[2, 4][layout=strided{16,4}], inputs=[f32[2, 4]]] %1
+                in (%2)"
+            },
+        );
+        assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
     }
 
     #[test]

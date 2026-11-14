@@ -40,6 +40,7 @@ use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
+use crate::operations::manipulation::conversions::CastOperation;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReductionKind};
@@ -671,7 +672,10 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelSumScatterOperation>>>
 
 impl<
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelAllGatherOperation>,
+    O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
+        + From<CastOperation<ArrayType>>
+        + From<ParallelAllGatherOperation>,
 > TransposableOperation<V, O> for ParallelSumScatterOperation
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
@@ -812,6 +816,7 @@ impl<
     C: Context<
             Type = ArrayIrType,
             Operation: From<ParallelAllGatherOperation>
+                           + From<CastOperation<ArrayIrType>>
                            + From<DimensionSizeOperation>
                            + From<LinearCallOperation<ArrayIrType>>
                            + From<ParallelSumScatterOperation>
@@ -2381,6 +2386,32 @@ mod tests {
             },
         );
         assert_eq!(transposed.transpose_with_respect_to(&[0], &[]).unwrap().to_string(), untiled.to_string());
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_transposition_restores_input_cotangent_layouts() {
+        // The adjoint all-gather resizes the scattered axis, which clears the explicit layout of the input, so the
+        // transpose casts its result to the exact input cotangent type, which the cotangent accumulator requires.
+        let input_type =
+            ArrayType::new_static(DataType::F32, [4]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let operation = ParallelSumScatterOperation::new("x", 2, 0, CollectiveOptions::tiled());
+        let pullback = collective_program(operation, input_type.clone()).transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2] .
+                let %1:f32[4] = parallel_all_gather [
+                    axes=\"x\",
+                    axis_size=2,
+                    concatenation_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                ] %0
+                    %2:f32[4][layout=strided{4}] = cast [type=f32[4][layout=strided{4}], inputs=[f32[4]]] %1
+                in (%2)"
+            },
+        );
+        assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
     }
 
     #[test]

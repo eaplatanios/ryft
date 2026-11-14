@@ -29,7 +29,7 @@ use crate::operations::collectives::parallel_vary::{
 };
 use crate::operations::collectives::{
     CollectiveArrayExtentBatchingPolicy, CollectiveAxes, CollectiveOperation, CollectiveOptions,
-    effective_collective_axis_size, resolve_named_axis_size, validate_manual_mesh_input,
+    effective_collective_axis_size, resolve_named_axis_size, validate_manual_mesh_input, with_cotangent_type,
 };
 use crate::operations::comparisons::{Compare, CompareOperation};
 use crate::operations::constants::one::{One, OneOperation};
@@ -38,7 +38,7 @@ use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::cumulative::{Cumulative, CumulativeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
-use crate::operations::manipulation::conversions::{ConvertElementType, ConvertElementTypeOperation};
+use crate::operations::manipulation::conversions::{CastOperation, ConvertElementType, ConvertElementTypeOperation};
 use crate::operations::manipulation::memory::{TransferToMemory, TransferToMemoryOperation};
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::scattering::{
@@ -1165,6 +1165,7 @@ impl_differentiable_operation! {
             + From<NegOperation<ArrayType>>
             + From<AddOperation<ArrayType>>
             + From<BroadcastOperation>
+            + From<CastOperation<ArrayType>>
             + From<ConcatenateOperation<ArrayType>>
             + From<CompareOperation<ArrayType>>
             + From<SelectOperation<ArrayType>>
@@ -1392,6 +1393,18 @@ impl_differentiable_operation! {
                                     received.broadcast(condition_type, &(0..=leading_axis).collect::<Vec<_>>())?;
                                 let zero = context.zero(&output_type)?;
                                 MaybeZero::Value(received.select(&zero, cotangent)?)
+                            };
+
+                            // The adjoint exchange has the type of its `output` input, which is a zero of the
+                            // exact cotangent type of `operand`, so the operand cotangent needs no conversion. The
+                            // mask restores the shape of the output cotangent but not its layout, so that one is
+                            // returned at the exact cotangent type of `output`.
+                            let output_cotangent = match output_cotangent {
+                                MaybeZero::Value(value) => {
+                                    let target = output.r#type().cotangent()?;
+                                    MaybeZero::Value(with_cotangent_type(&**context, value, target)?)
+                                }
+                                zero => zero,
                             };
                             accumulators[0].accumulate(context, operand_cotangent)?;
                             accumulators[1].accumulate(context, output_cotangent)
@@ -1809,8 +1822,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionType, MeshAxis, MeshAxisType,
-        Sharding,
+        ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionType, Layout, MeshAxis, MeshAxisType,
+        Sharding, StridedLayout,
     };
     use crate::batching::{BatchAxisSpecification, BatchingTracer, batch};
     use crate::contexts::{EagerContext, StagingContext};
@@ -4691,6 +4704,79 @@ mod tests {
                     Array::vector(vec![3.0f64, 5.0]).unwrap(),
                 ],
             }],
+        );
+    }
+
+    #[test]
+    fn test_parallel_ragged_all_to_all_transposition_restores_input_cotangent_layouts() {
+        // The cotangent accumulator requires the exact cotangent type of each data input. The adjoint exchange has
+        // the type of its `output` input, which is a zero of the operand cotangent type, so the operand cotangent keeps
+        // its explicit layout. The receive mask restores the shape of the output cotangent but not its layout, so the
+        // transpose casts that one. The values match the first case of `test_parallel_ragged_all_to_all_transposition`.
+        let data_type =
+            ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let program = constant_metadata_exchange_program(
+            ParallelRaggedAllToAllOperation::new("x".to_string(), 1),
+            data_type.clone(),
+            data_type.clone(),
+            [
+                Array::vector(vec![0i32, 0]).unwrap(),
+                Array::vector(vec![1i32, 1]).unwrap(),
+                Array::vector(vec![0i32, 1]).unwrap(),
+                Array::vector(vec![1i32, 1]).unwrap(),
+            ],
+        );
+        let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f32[2][layout=strided{4}] .
+                let %1:i32[2] = const [0, 0]
+                    %2:i32[2] = const [1, 1]
+                    %3:i32[2] = const [0, 1]
+                    %4:i32[2] = const [1, 1]
+                    %5:i32[2] = parallel_all_to_all [axes=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
+                    options=Tiled] %3
+                    %6:i32[2] = parallel_all_to_all [axes=\"x\", axis_size=1, split_axis=0, concatenation_axis=0, \
+                    options=Tiled] %1
+                    %7:f32[2][layout=strided{4}] = zero [type=f32[2][layout=strided{4}]]
+                    %8:f32[2][layout=strided{4}] = parallel_ragged_all_to_all [axis_name=\"x\", axis_size=1, \
+                    update_kind=Add] %0 %7 %5 %4 %6 %2
+                    %9:u64[2] = convert_element_type [data_type=u64] %5
+                    %10:u64[2] = convert_element_type [data_type=u64] %4
+                    %11:i64[3] = zero [type=i64[3]]
+                    %12:i64[2] = one [type=i64[2]]
+                    %13:i64[2] = neg %12
+                    %14:u64[2] = add %9 %10
+                    %15:u64[2, 1] = reshape [shape=[2, 1]] %9
+                    %16:u64[2, 1] = reshape [shape=[2, 1]] %14
+                    %17:i64[3] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %11 %15 %12
+                    %18:i64[3] = scatter [
+                        kind=add,
+                        dimensions=(update_window=[], inserted_window=[0], scatter_to_operand=[0], \
+                            operand_batching=[], scatter_indices_batching=[]),
+                    ] %17 %16 %13
+                    %19:i64[3] = cumulative [kind=sum, axis=0] %18
+                    %20:i64[2] = slice [start_indices=[0], limits=[2]] %19
+                    %21:i64[2] = zero [type=i64[2]]
+                    %22:bool[2] = compare [direction=NotEqual] %20 %21
+                    %23:f32[2][layout=strided{4}] = zero [type=f32[2][layout=strided{4}]]
+                    %24:f32[2] = select %22 %23 %0
+                    %25:f32[2][layout=strided{4}] = cast [type=f32[2][layout=strided{4}], inputs=[f32[2]]] %24
+                in (%8, %25)"
+            },
+        );
+        let seed = Array::from_elements(data_type.clone(), &[3.0f32, 5.0]).unwrap();
+        assert_eq!(
+            pullback.interpret(vec![seed]),
+            Ok(vec![
+                Array::from_elements(data_type.clone(), &[8.0f32, 0.0]).unwrap(),
+                Array::from_elements(data_type, &[0.0f32, 0.0]).unwrap(),
+            ]),
         );
     }
 

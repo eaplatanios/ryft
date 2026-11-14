@@ -80,6 +80,30 @@ pub enum DimensionError {
         /// Conflicting extent observed at this occurrence.
         actual: usize,
     },
+
+    #[error(
+        "a dimension of type `{type}` cannot be created from a scalar that varies along manual mesh axis \
+         `{axis_name}`, because a dimension must be the same on every device"
+    )]
+    VaryingScalar {
+        /// Type of the dimension that would be created.
+        r#type: Box<DimensionType>,
+
+        /// Name of the first manual mesh axis along which the scalar varies.
+        axis_name: String,
+    },
+
+    #[error(
+        "a dimension of type `{type}` cannot be created from a scalar that is unreduced along mesh axis \
+         `{axis_name}`, because a dimension must be the same on every device"
+    )]
+    UnreducedScalar {
+        /// Type of the dimension that would be created.
+        r#type: Box<DimensionType>,
+
+        /// Name of the first mesh axis along which the scalar is unreduced.
+        axis_name: String,
+    },
 }
 
 impl From<DimensionError> for TypeError {

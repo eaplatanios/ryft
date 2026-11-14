@@ -172,6 +172,7 @@ use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::concatenation::Concatenate;
+use crate::operations::manipulation::conversions::{CastOperation, CastType};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
@@ -578,12 +579,13 @@ pub enum HiddenAxes {
     None,
 
     /// The operation may communicate along the named axes, and along no other axis that its
-    /// [`CollectiveOperation::axes`] and regions do not reveal (e.g., a composite call whose retained rules
-    /// declare these axes, refer to [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)). The rules
-    /// that it hides also have no I/O effect (i.e., no [`EffectClass::OrderedIo`](crate::EffectClass::OrderedIo),
-    /// [`EffectClass::DeviceOrderedIo`](crate::EffectClass::DeviceOrderedIo), or
-    /// [`EffectClass::UnorderedIo`](crate::EffectClass::UnorderedIo) effect), so an analysis may release every other
-    /// axis as it would for an operation without hidden axes. An empty list is equivalent to [`HiddenAxes::None`].
+    /// [`CollectiveOperation::axes`] and regions do not reveal (e.g., a composite call whose retained rules declare
+    /// these axes, refer to [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)). The rules that it hides
+    /// also have no effect that runs once per device (i.e., any effect other than an
+    /// [`EffectClass::OrderedAssertion`](crate::EffectClass::OrderedAssertion) or the
+    /// [`EffectClass::OrderedState`](crate::EffectClass::OrderedState) of structured reference effects), so an analysis
+    /// may release every other axis as it would for an operation without hidden axes. An empty list is equivalent to
+    /// [`HiddenAxes::None`].
     Named(Vec<String>),
 
     /// The operation may communicate along any axis (e.g., a composite call whose retained rules have no declaration
@@ -627,13 +629,13 @@ pub trait CollectiveOperation {
     /// Analyses that must prove that an operation does not use an axis (e.g., the release of manual axes by the
     /// batching rule of [`ShardMapOperation`](crate::ShardMapOperation)) must treat the named axes of
     /// [`HiddenAxes::Named`] as used and every axis as used for [`HiddenAxes::Unknown`]. An operation that reports
-    /// [`HiddenAxes::Named`] also promises that the rules it hides have no I/O effect, because the effects of rules
-    /// that are traced later are not part of the operation's own effects and so no effect analysis can see them (e.g.,
-    /// a composite call checks this promise when it traces its rules, refer to
-    /// [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)). Operations whose transform rules are derived
-    /// from their payload and regions, or are attached to them as regions, have no hidden axes, which is what the
-    /// default implementation reports. This function does not affect how an operation executes or lowers, which
-    /// depends on [`axes`](Self::axes) and on its regions only.
+    /// [`HiddenAxes::Named`] also promises that the rules it hides have no effect that runs once per device (e.g.,
+    /// I/O or opaque state), because the effects of rules that are traced later are not part of the operation's own
+    /// effects and so no effect analysis can see them (e.g., a composite call checks this promise when it traces its
+    /// rules, refer to [`Composite::with_rule_axes`](crate::Composite::with_rule_axes)). Operations whose transform
+    /// rules are derived from their payload and regions, or are attached to them as regions, have no hidden axes, which
+    /// is what the default implementation reports. This function does not affect how an operation executes or lowers,
+    /// which depends on [`axes`](Self::axes) and on its regions only.
     #[inline]
     fn hidden_axes(&self) -> HiddenAxes {
         HiddenAxes::None
@@ -790,12 +792,16 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> + CollectiveOperati
     }
 
     /// Implements [`TransposableOperation::transpose`](crate::TransposableOperation::transpose) for this collective
-    /// by staging its [`adjoint`](Self::adjoint) on the output cotangent. A known input or a structural zero output
-    /// cotangent contributes nothing, which leaves the input cotangent a structural zero. An ignored input cotangent
-    /// also needs no adjoint instructions.
+    /// by staging its [`adjoint`](Self::adjoint) on the output cotangent and returning the result at the exact input
+    /// cotangent type, including its layout. A known input or a structural zero output cotangent contributes nothing,
+    /// which leaves the input cotangent a structural zero. An ignored input cotangent also needs no adjoint
+    /// instructions.
     fn linear_collective_transpose<
         V: Value<Type = ArrayType>,
-        O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<Self::Adjoint>,
+        O: Operation<Type = ArrayType>
+            + From<AddOperation<ArrayType>>
+            + From<CastOperation<ArrayType>>
+            + From<Self::Adjoint>,
     >(
         &self,
         context: &mut TranspositionContext<V, O>,
@@ -825,7 +831,8 @@ trait LinearCollectiveOperation: Operation<Type = ArrayType> + CollectiveOperati
 
         let mut contributions = context.bind(O::from(adjoint), Vec::new(), std::slice::from_ref(cotangent))?;
         check_count!("output", contributions, 1, ProgramError);
-        accumulators[0].accumulate(context, MaybeZero::Value(contributions.remove(0)))?;
+        let contribution = with_cotangent_type(&**context, contributions.remove(0), inputs[0].r#type().cotangent()?)?;
+        accumulators[0].accumulate(context, MaybeZero::Value(contribution))?;
         Ok(())
     }
 }
@@ -924,7 +931,8 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
 
     /// Implements [`jvp_in_parent`](crate::MemberDifferentiableOperation::jvp_in_parent) for this collective. The
     /// explicit output extents and the exact input shape become ordinary residuals of one linear call, whose transpose
-    /// applies the [`adjoint`](LinearCollectiveOperation::adjoint) of the primal array input to the output cotangent.
+    /// applies the [`adjoint`](LinearCollectiveOperation::adjoint) of the primal array input to the output cotangent
+    /// and returns the result at the exact input cotangent type, including its layout.
     fn shape_changing_collective_jvp_in_parent<
         C: Context<
                 Type = ArrayIrType,
@@ -932,6 +940,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
                                + From<Self::Adjoint>
                                + From<ConstantOperation<DimensionValue>>
                                + From<DimensionSizeOperation>
+                               + From<CastOperation<ArrayIrType>>
                                + From<LinearCallOperation<ArrayIrType>>,
             >,
         P: DifferentiationPolicy<C>,
@@ -962,6 +971,7 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
                 let input_shape = residuals.retain_shape(context, array.primal())?;
                 let forward_operation = self.clone();
                 let forward_output_extents = output_extents.clone();
+                let transpose_target_type = <&ArrayType>::try_from(array.primal().r#type().as_ref())?.cotangent()?;
                 let tangent = LinearCallOperation::stage(
                     context,
                     residuals.into_values(),
@@ -978,7 +988,10 @@ trait ShapeChangingCollectiveOperation: LinearCollectiveOperation {
                         let mut adjoint_inputs = Vec::with_capacity(1 + input_dimensions.len());
                         adjoint_inputs.push(output_cotangents[0].clone());
                         adjoint_inputs.extend(input_dimensions);
-                        transpose_context.bind(adjoint, Vec::new(), adjoint_inputs.as_slice())
+                        let mut outputs = transpose_context.bind(adjoint, Vec::new(), adjoint_inputs.as_slice())?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        let target = transpose_target_type.into();
+                        Ok(vec![with_cotangent_type(&transpose_context, outputs.remove(0), target)?])
                     },
                 )?
                 .remove(0);
@@ -1771,6 +1784,30 @@ fn route_axis_slices<V: Value<Type = ArrayType> + ZeroLike + Concatenate + Slice
     }
 
     if axis == 0 { Ok(routed) } else { Ok(routed.move_axis(0, axis)?) }
+}
+
+/// Returns the input cotangent `cotangent` of a collective's transposition at exactly its required type `target`,
+/// which the transpose region of a linear call and the cotangent accumulator of transposition both require. The
+/// adjoint collectives and reshapes that produce the cotangent restore its shape, placement, and memory kind but
+/// not its layout (e.g., resizing an axis clears it), so when only the layout differs, an unchecked cast, whose
+/// relationship holds for that reason, requests the target type. A cotangent that already has the target type is
+/// returned unchanged, so nothing is staged for it.
+fn with_cotangent_type<C: Context<Type: CastType>>(
+    context: &C,
+    cotangent: C::Value,
+    target: C::Type,
+) -> Result<C::Value, ProgramError>
+where
+    C::Operation: From<CastOperation<C::Type>>,
+{
+    let cotangent_type = cotangent.r#type().into_owned();
+    if cotangent_type == target {
+        return Ok(cotangent);
+    }
+    let cast = CastOperation::unchecked(target, vec![cotangent_type])?;
+    let mut outputs = context.bind(cast, Vec::new(), &[cotangent])?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
 }
 
 impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchingContext<C, ArrayBatchingPolicy<P>> {

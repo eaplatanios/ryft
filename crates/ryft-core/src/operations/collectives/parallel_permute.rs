@@ -27,6 +27,7 @@ use crate::operations::collectives::{
 use crate::operations::constants::zero::Zero;
 use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
+use crate::operations::manipulation::conversions::CastOperation;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::reshard::Reshard;
@@ -391,7 +392,10 @@ impl<C: Context<Type = ArrayType, Operation: From<ParallelPermuteOperation>>> Di
 
 impl<
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelPermuteOperation>,
+    O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
+        + From<CastOperation<ArrayType>>
+        + From<ParallelPermuteOperation>,
 > TransposableOperation<V, O> for ParallelPermuteOperation
 where
     TracingContext<V, O>: StagingContext<Type = V::Type, Constant = V, Operation = O>,
