@@ -687,6 +687,27 @@ impl EffectsSummary {
         self.has_observable_effects_when_unused || self.has_deferred_work
     }
 
+    /// Returns the first [`EffectClass`] of this summary that would behave observably differently if fewer devices
+    /// executed the application, or [`None`] when there is none. Every device that executes an application performs
+    /// its effects once (e.g., a `print` inside a `shard_map` over four devices prints four times), so a transform
+    /// that makes fewer devices execute it (e.g., batching a `shard_map` by releasing one of its manual axes) is sound
+    /// only when this function returns [`None`]. Every class is treated as observable, including any class added
+    /// later, except for the following two:
+    ///
+    ///   - [`EffectClass::OrderedAssertion`], because devices that replicate a computation check the same requirement
+    ///     on the same values and so reach the same verdict, however many of them check it.
+    ///   - [`EffectClass::OrderedState`] derived from structured [`ReferenceEffect`]s, because those devices hold
+    ///     replicated copies of the referent and write the same values to them. Directly declared (i.e., opaque) state
+    ///     (refer to [`Self::has_explicit_ordered_state`]) is observable, because reference analysis cannot show that
+    ///     its copies stay identical.
+    pub fn device_count_sensitive_effect_class(self) -> Option<EffectClass> {
+        self.classes.into_iter().find(|effect_class| match effect_class {
+            EffectClass::OrderedAssertion => false,
+            EffectClass::OrderedState => self.has_explicit_ordered_state,
+            _ => true,
+        })
+    }
+
     /// Returns the union of this [`EffectsSummary`] with `other`, combining [`EffectClasses`] and retaining each flag
     /// when either side sets it. An enclosing operation cannot suppress an observable nested effect, an explicit
     /// ordered-state declaration, or nested deferred work.
@@ -1207,6 +1228,39 @@ mod tests {
         assert!(io.summary().is_retained_when_unused());
         assert!(deferred.summary().is_retained_when_unused());
         assert!(allocation.summary().union(deferred.summary()).is_retained_when_unused());
+    }
+
+    #[test]
+    fn test_effects_summary_device_count_sensitive_effect_class() {
+        let assertion = Effects::explicit(EffectClasses::single(EffectClass::OrderedAssertion));
+        let read = Effects::new(
+            EffectClasses::NONE,
+            vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+        )
+        .unwrap();
+        let opaque_state = Effects::explicit(EffectClasses::single(EffectClass::OrderedState));
+        let device_ordered_io = Effects::explicit(EffectClasses::single(EffectClass::DeviceOrderedIo));
+        let unordered_io = Effects::explicit(EffectClasses::single(EffectClass::UnorderedIo));
+
+        // Assertions and structured reference state cannot observe how many devices run them, while I/O and opaque
+        // state can, alone or next to the classes that cannot.
+        assert_eq!(EffectsSummary::PURE.device_count_sensitive_effect_class(), None);
+        assert_eq!(assertion.summary().device_count_sensitive_effect_class(), None);
+        assert_eq!(read.summary().device_count_sensitive_effect_class(), None);
+        assert_eq!(assertion.summary().union(read.summary()).device_count_sensitive_effect_class(), None);
+        assert_eq!(opaque_state.summary().device_count_sensitive_effect_class(), Some(EffectClass::OrderedState));
+        assert_eq!(
+            read.summary().union(opaque_state.summary()).device_count_sensitive_effect_class(),
+            Some(EffectClass::OrderedState)
+        );
+        assert_eq!(
+            device_ordered_io.summary().device_count_sensitive_effect_class(),
+            Some(EffectClass::DeviceOrderedIo)
+        );
+        assert_eq!(
+            assertion.summary().union(unordered_io.summary()).device_count_sensitive_effect_class(),
+            Some(EffectClass::UnorderedIo),
+        );
     }
 
     #[test]
