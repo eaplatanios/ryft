@@ -328,7 +328,7 @@ use crate::partial::{
     PartiallyEvaluatableOperation, ResidualInputSource,
 };
 use crate::programs::{
-    AtomId, AttachedRegions, Concretizable, EffectClass, EffectClasses, EmptyRegionDriver, ErasedOperation,
+    AtomId, AttachedRegions, Concretizable, EffectClass, EffectClasses, Effects, EmptyRegionDriver, ErasedOperation,
     FlatProgram, InputRegionProvenance, Instruction, MaybeZero, Operation, OperationBoundaryPruning,
     OperationFormatter, OperationPayloadProjection, OperationProjection, OperationProvider, OutputRegionProvenance,
     Program, ProgramBuilder, ProgramError, ProjectedValue, ReferenceDischargeContext, ReferenceDischargeDriver,
@@ -3037,9 +3037,12 @@ impl Operation for ShardMapOperation {
                         )));
                     }
 
-                    // The output is the forwarded input itself, so its declared type must describe that input.
+                    // The output is the forwarded input itself, so its declared type must describe that input,
+                    // which may refine it with a layout as it may refine the declared input type (refer to
+                    // `boundary_input_type_matches`). The output has the type of the input, so the identity
+                    // of the reference and how it is stored are those of the caller's reference.
                     let forwarded_type = <&ReferenceType<ArrayType>>::try_from(&input_types[forwarded])?;
-                    if !boundary_types_match(forwarded_type.referent(), declared.referent()) {
+                    if !boundary_input_type_matches(forwarded_type.referent(), declared.referent()) {
                         return Err(TypeError::invalid(format!(
                             "`{name}` output #{index} has declared type `{declared}`, but it forwards reference \
                              input #{forwarded} of type `{forwarded_type}`",
@@ -3309,7 +3312,10 @@ where
         // output per mutated reference input follows them under that input's input sharding. The final state is typed
         // by the input it replaces (the allocation's current state) rather than by the declared global referent,
         // because the declared boundary type may omit sharding metadata that the allocation carries and the discharged
-        // state must match the allocation's referent type exactly.
+        // state must match the allocation's referent type exactly. Its layout is the exception. The rebuilt body
+        // produces the final state at the local type of its reference view, whose layout is that of the declared
+        // referent, while the allocation may be stored with a layout that the declaration leaves open, so the final
+        // state leaves the rebuilt map with the declared layout and is converted to the type of the allocation below.
         let boundary_inputs = inputs
             .iter()
             .zip(&allocations)
@@ -3331,7 +3337,10 @@ where
             .map(|&index| self.boundary.output_shardings()[index].clone())
             .collect::<Vec<_>>();
         for &index in &mutated_inputs {
-            output_types.push(boundary_inputs[index].r#type().into_owned());
+            let state_type = boundary_inputs[index].r#type();
+            let state_type = <&ArrayType>::try_from(state_type.as_ref())?.clone();
+            let declared_layout = boundary_array_type(&self.input_types[index])?.layout().cloned();
+            output_types.push(state_type.with_layout(declared_layout).into());
             output_shardings.push(self.boundary.input_shardings()[index].clone());
         }
         let boundary = ShardMapBoundary::from_validated_shardings(
@@ -3347,7 +3356,30 @@ where
         let mut outputs = context.parent().bind(operation, vec![program], &boundary_inputs)?;
         check_count!("output", outputs, value_output_indices.len() + mutated_inputs.len(), ProgramError);
         let final_states = outputs.split_off(value_output_indices.len());
-        for (index, final_state) in mutated_inputs.iter().zip(final_states) {
+        for (index, mut final_state) in mutated_inputs.iter().zip(final_states) {
+            // An unchecked cast, whose relationship holds because only the layout differs, requests the exact referent
+            // type of the allocation. Nothing is staged when the final state already has that type.
+            let state_type = boundary_inputs[*index].r#type().into_owned();
+            let final_type = final_state.r#type().into_owned();
+            if final_type != state_type {
+                let cast = CastOperation::<ArrayType>::unchecked(
+                    <&ArrayType>::try_from(&state_type)?.clone(),
+                    vec![<&ArrayType>::try_from(&final_type)?.clone()],
+                )?;
+                let cast = C::Operation::from_payload(ErasedOperation::new(cast)).map_err(|payload| {
+                    ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "discharging a `{}` whose mutated reference input is stored with a layout that its \
+                             declared type leaves open requires an operation family that holds `{}`",
+                            SHARD_MAP_OPERATION_NAME,
+                            payload.type_name(),
+                        ),
+                    }
+                })?;
+                let mut converted = context.parent().bind(cast, Vec::new(), &[final_state])?;
+                check_count!("output", converted, 1, ProgramError);
+                final_state = converted.remove(0);
+            }
             let allocation = allocations[*index].unwrap();
             context.set_discharged_state(allocation, final_state, true)?;
         }
@@ -6676,13 +6708,16 @@ where
         }
 
         // An operation whose application executes one computation region once, on its inputs and for its outputs,
-        // position by position, behaves like that region on every device, so the region is replayed in its place.
-        // The operation declares this through its region data flow and its region provenance (e.g., composite calls,
-        // linear calls, and rematerialized calls do), so no operation is named here.
+        // position by position, and that has no effects of its own, behaves like that region on every device, so the
+        // region is replayed in its place. The operation declares this through its region data flow, its region
+        // provenance, and its effects (e.g., composite calls, linear calls, and rematerialized calls do), so no
+        // operation is named here. An operation with effects of its own (i.e., ones that its regions do not perform)
+        // is not replaced, because replaying its region would skip them, so it needs a lockstep rule of its own.
         let mut computation_regions =
             operation.region_slots().iter().enumerate().filter(|(_, slot)| slot.role == RegionRole::Computation);
         if let (Some((region_index, _)), None) = (computation_regions.next(), computation_regions.next())
             && matches!(operation.region_data_flow(), RegionDataFlow::Provenance | RegionDataFlow::Atomic)
+            && operation.effects().as_ref() == Effects::empty()
         {
             let interface = regions[region_index].interface();
             let output_count = instruction.outputs().len();
@@ -7703,6 +7738,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
@@ -7772,6 +7808,79 @@ mod tests {
     type TestValue = ArrayIrValue<Array>;
     type TestOperation = ArrayIrOperation<Array>;
     type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
+
+    /// Region operation that runs its only computation region once on its inputs and counts its own applications. The
+    /// count stands for an effect that the operation performs itself, in addition to the effects of its region, which
+    /// it declares as [`EffectClass::DeviceOrderedIo`].
+    #[derive(Clone, Debug)]
+    struct CountedCallOperation(Arc<AtomicUsize>);
+
+    impl Operation for CountedCallOperation {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            "counted_call"
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            const { &[RegionSlot::computation("body")] }
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayIrType],
+            region_interfaces: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            check_count!("region", region_interfaces, 1, TypeError);
+            if input_types != region_interfaces[0].input_types() {
+                return Err(TypeError::invalid("`counted_call` inputs must have the input types of its region"));
+            }
+            Ok(region_interfaces[0].output_types().to_vec())
+        }
+
+        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> InputRegionProvenance {
+            InputRegionProvenance::Input { index: input_index }
+        }
+
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+            vec![OutputRegionProvenance { region_index: 0, output_index }]
+        }
+
+        fn region_data_flow(&self) -> RegionDataFlow<'_> {
+            RegionDataFlow::Provenance
+        }
+
+        fn effects(&self) -> Cow<'_, Effects> {
+            Cow::Owned(Effects::new(EffectClasses::single(EffectClass::DeviceOrderedIo), Vec::new()).unwrap())
+        }
+    }
+
+    impl<C: Domain<Type = ArrayIrType>> InterpretableOperation<C> for CountedCallOperation {
+        fn interpret<D: InterpretationDriver<C>>(
+            &self,
+            context: &C,
+            driver: &D,
+            inputs: &[C::Value],
+        ) -> Result<Vec<C::Value>, ProgramError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            driver.interpret_region(context, 0, inputs.to_vec())
+        }
+    }
+
+    impl<C: Context<Type = ArrayIrType, Operation: From<CountedCallOperation>>> PartiallyEvaluatableOperation<C>
+        for CountedCallOperation
+    {
+    }
+
+    /// Operation family that adds [`CountedCallOperation`] to the array operations and `shard_map`.
+    #[derive(Clone, Debug, ryft_macros::Operation)]
+    #[ryft(type(ArrayIrType), constant(TestValue), members(ArrayType))]
+    enum CountedOperation {
+        #[ryft(projected(ArrayType), collective, lockstep)]
+        Array(ArrayOperation<Array>),
+        Map(ShardMapOperation),
+        Counted(CountedCallOperation),
+    }
 
     /// Tracing context over the array IR test family, whose tracers are the values that `shard_map` is invoked on.
     type TestContext = TracingContext<TestValue, TestOperation>;
@@ -13674,12 +13783,37 @@ mod tests {
             let body = builder.import_program(body);
             builder.add_instruction(operation, vec![body], vec![refined], None).unwrap().to_vec()
         });
-        let state = Array::from_elements(strided_type, &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
+        let state = Array::from_elements(strided_type.clone(), &[1.0f32, 2.0, 3.0, 4.0]).unwrap();
         let reference = ArrayReference::new(state.clone());
         assert_eq!(
             program.interpret(vec![ArrayIrValue::Reference(reference.clone())]),
-            Ok(vec![f32_value(f32_type(&[4], Some(sharded)), &[1.0, 2.0, 3.0, 4.0])]),
+            Ok(vec![f32_value(f32_type(&[4], Some(sharded.clone())), &[1.0, 2.0, 3.0, 4.0])]),
         );
+        assert_eq!(reference.read(), Ok(state.clone()));
+
+        // A map that forwards the reference returns the reference that it received, with the type that it is stored
+        // with, although the output is declared without a layout as well.
+        let boundary = ShardMapBoundary::new(manual_mesh(), vec![sharded.clone()], vec![sharded], Vec::new()).unwrap();
+        let local_type = boundary.local_input_type(0, &declared_type).unwrap();
+        let body =
+            build_program(vec![ArrayIrType::Reference(ReferenceType::new(local_type))], |_, inputs| inputs.to_vec());
+        let operation =
+            ShardMapOperation::from_program(&body, vec![declared_reference_type.clone()], boundary).unwrap();
+        let strided_reference_type = ArrayIrType::Reference(ReferenceType::new(strided_type));
+        let program = build_program(vec![strided_reference_type.clone()], |builder, inputs| {
+            let predicate = builder.add_constant(ArrayIrValue::Array(Array::scalar(true).unwrap()));
+            let regions = vec![builder.import_program(forward()), builder.import_program(forward())];
+            let condition = ConditionOperation::<ArrayIrType>::new();
+            let refined = builder.add_instruction(condition, regions, vec![predicate, inputs[0]], None).unwrap()[0];
+            let body = builder.import_program(body);
+            builder.add_instruction(operation, vec![body], vec![refined], None).unwrap().to_vec()
+        });
+        let outputs = program.interpret(vec![ArrayIrValue::Reference(reference.clone())]).unwrap();
+        let [ArrayIrValue::Reference(output)] = outputs.as_slice() else {
+            panic!("expected one forwarded reference");
+        };
+        assert_eq!(output.id(), reference.id());
+        assert_eq!(outputs[0].r#type().as_ref(), &strided_reference_type);
         assert_eq!(reference.read(), Ok(state));
     }
 
@@ -13735,6 +13869,130 @@ mod tests {
             ]),
             Ok(vec![f32_value(f32_type(&[2], Some(sharded)), &[3.0, 4.0])]),
         );
+    }
+
+    #[test]
+    fn test_shard_map_reference_discharge_restores_the_layouts_of_mutated_references() {
+        // The map declares a referent without a layout and receives a reference that is stored with an explicit one.
+        // Its body writes the reference, so discharge publishes a final state. The rebuilt body produces that state
+        // without a layout, and discharge converts it to the exact referent type of the allocation.
+        let sharded = sharded_along_x();
+        let boundary =
+            ShardMapBoundary::new(manual_mesh(), vec![sharded.clone()], vec![sharded.clone()], Vec::new()).unwrap();
+        let declared_type = f32_type(&[4], None);
+        let strided_type = declared_type.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
+        let local_type = boundary.local_input_type(0, &declared_type).unwrap();
+        let body = build_program(vec![ArrayIrType::Reference(ReferenceType::new(local_type))], |builder, inputs| {
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![inputs[0]], None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![inputs[0], value], None)
+                .unwrap();
+            vec![value]
+        });
+        let declared_reference_type = ArrayIrType::Reference(ReferenceType::new(declared_type));
+        let operation = ShardMapOperation::from_program(&body, vec![declared_reference_type], boundary).unwrap();
+        let strided_reference_type = ArrayIrType::Reference(ReferenceType::new(strided_type.clone()));
+        let program = build_program(vec![strided_reference_type], |builder, inputs| {
+            let body = builder.import_program(body);
+            builder.add_instruction(operation, vec![body], inputs.to_vec(), None).unwrap().to_vec()
+        });
+        let discharged = program.discharge_references(0).unwrap();
+        let tiled = "{mesh<['x'=2:manual]>, [{'x'}]}";
+        let local = "f32[2][sharding={mesh<['x'=2:manual]>, [{}], varying_manual={'x'}}]";
+        assert_eq!(
+            discharged.program().to_string(),
+            formatdoc! {"
+                lambda %0:f32[4][layout=strided{{4}}] .
+                let %1:f32[4][sharding={tiled}], %2:f32[4] = shard_map [
+                    mesh=['x'=2:manual],
+                    input_shardings=[{tiled}],
+                    output_shardings=[{tiled}, {tiled}],
+                    manual_axes=['x'],
+                    global_input_types=[f32[4][sharding={tiled}]],
+                    global_output_types=[f32[4][sharding={tiled}], f32[4]],
+                ] %0 [
+                    body={{
+                        lambda %0:{local} .
+                        let %1:{local} = add %0 %0
+                        in (%0, %1)
+                    }},
+                ]
+                    %3:f32[4][layout=strided{{4}}] = cast [type=f32[4][layout=strided{{4}}], inputs=[f32[4]]] %2
+                in (%1, %3)"},
+        );
+        assert_eq!(
+            discharged.program().interpret(vec![f32_value(strided_type.clone(), &[1.0, 2.0, 3.0, 4.0])]),
+            Ok(vec![
+                f32_value(f32_type(&[4], Some(sharded)), &[1.0, 2.0, 3.0, 4.0]),
+                f32_value(strided_type, &[2.0, 4.0, 6.0, 8.0]),
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_shard_map_interpretation_does_not_replace_operations_with_effects_of_their_own_by_their_regions() {
+        // `counted_call` runs its region once and counts its own applications, which stands for an effect that the
+        // operation performs itself. Without a collective it is bound once per device, so it is applied twice. With a
+        // reduction over the manual axis in its region it needs lockstep execution, which the emulator cannot provide
+        // by replaying the region in place of the operation, because that would skip the effect, so the map is
+        // rejected instead of running without it.
+        let sharded = sharded_along_x();
+        let global_type = f32_type(&[2], None);
+        let program = |collective: bool, applications: Arc<AtomicUsize>| {
+            let boundary =
+                ShardMapBoundary::new(manual_mesh(), vec![sharded.clone()], vec![sharded.clone()], Vec::new())
+                    .unwrap()
+                    .with_check_manual_variation(false);
+            let local_type = ArrayIrType::Array(boundary.local_input_type(0, &global_type).unwrap());
+            let mut builder = ProgramBuilder::<TestValue, CountedOperation>::new();
+            let input = builder.add_input(local_type.clone());
+            let output = if collective {
+                let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string());
+                builder.add_instruction(ArrayOperation::ParallelReduce(sum), Vec::new(), vec![input], None).unwrap()[0]
+            } else {
+                input
+            };
+            let region =
+                builder.build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder]);
+            let mut builder = ProgramBuilder::<TestValue, CountedOperation>::new();
+            let input = builder.add_input(local_type);
+            let region = builder.import_program(region.unwrap());
+            let call = CountedCallOperation(applications);
+            let outputs = builder.add_instruction(call, vec![region], vec![input], None).unwrap().to_vec();
+            let body = builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let operation =
+                ShardMapOperation::from_program(&body, vec![ArrayIrType::Array(global_type.clone())], boundary)
+                    .unwrap();
+            let mut builder = ProgramBuilder::<TestValue, CountedOperation>::new();
+            let input = builder.add_input(ArrayIrType::Array(global_type.clone()));
+            let body = builder.import_program(body);
+            let outputs = builder.add_instruction(operation, vec![body], vec![input], None).unwrap().to_vec();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let input = || f32_value(global_type.clone(), &[2.0, 5.0]);
+
+        let applications = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            program(false, applications.clone()).interpret(vec![input()]),
+            Ok(vec![f32_value(f32_type(&[2], Some(sharded.clone())), &[2.0, 5.0])]),
+        );
+        assert_eq!(applications.load(Ordering::SeqCst), 2);
+
+        let applications = Arc::new(AtomicUsize::new(0));
+        assert_eq!(
+            program(true, applications.clone()).interpret(vec![input()]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`shard_map` interpretation cannot run `counted_call` in lockstep across devices, which its \
+                          attached regions require because they use collectives over the manual axes"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(applications.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -14405,9 +14663,9 @@ mod tests {
                 vec![
                     shard_map(
                         |inputs: Vec<TestTracer>| {
-                            Ok(inputs[0].parallel_ragged_all_to_all(
+                            inputs[0].parallel_ragged_all_to_all(
                                 "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
-                            )?)
+                            )
                         },
                         inputs,
                         mesh.clone(),
