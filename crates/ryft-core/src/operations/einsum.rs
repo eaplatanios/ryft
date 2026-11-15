@@ -881,14 +881,17 @@ impl EinsumPlan {
             + ZeroLike,
     {
         let precision = self.options.precision;
-        let contraction = |lhs: &V,
-                           rhs: &V,
-                           dimensions: &DotDimensionNumbers,
-                           accumulation_type: Option<DataType>,
-                           output_sharding: Option<&Sharding>| {
-            lhs.dot_with_configuration(rhs, dimensions, precision, accumulation_type, output_sharding)
+        let steps = ValueSteps {
+            contraction: RefCell::new(
+                |lhs: &V,
+                 rhs: &V,
+                 dimensions: &DotDimensionNumbers,
+                 accumulation_type: Option<DataType>,
+                 output_sharding: Option<&Sharding>| {
+                    lhs.dot_with_configuration(rhs, dimensions, precision, accumulation_type, output_sharding)
+                },
+            ),
         };
-        let steps = ValueSteps { contraction: RefCell::new(contraction) };
         self.run(inputs, self.options.accumulation_type, true, precision, &steps)
     }
 
@@ -937,8 +940,6 @@ impl EinsumPlan {
         self.run(inputs, None, false, DotPrecision::default(), &steps)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Infers the type of the output of [`Self::execute`] for the input types of this plan, together with the number
     /// of instructions that it stages, by running the steps of this plan over types.
     fn infer(&self) -> Result<(ArrayType, usize), ProgramError> {
@@ -969,6 +970,7 @@ impl EinsumPlan {
             ))
             .into());
         }
+
         let input_types = inputs.iter().map(|input| steps.array_type(input)).collect::<Vec<_>>();
         for (index, (input_type, names)) in input_types.iter().zip(&self.input_labels).enumerate() {
             let rank = input_type.rank();
@@ -1013,17 +1015,19 @@ impl EinsumPlan {
                         .collect::<Vec<_>>();
 
                     // A requested output sharding goes to the sum that ends the step, which is the sum of the last
-                    // repeated label or, without repeated labels, the sum of the labels that appear once. A step
-                    // that ends with no sum (i.e., one that only keeps diagonals or reorders axes) has no operation
-                    // that takes the request, so its result is resharded to it instead.
+                    // repeated label or, without repeated labels, the sum of the labels that appear once. A step that
+                    // ends with no sum (i.e., one that only keeps diagonals or reorders axes) has no operation that
+                    // takes the request, so its result is resharded to it instead.
                     let last_repeated = counts.iter().filter(|(_, count)| *count > 1).map(|(name, _)| name).next_back();
                     let ends_with_sum = match last_repeated {
                         Some(name) => !step.result_names.contains(name),
                         None => !uniques.is_empty(),
                     };
+
                     if !ends_with_sum {
                         reshard_sharding = output_sharding;
                     }
+
                     let output = output_sharding
                         .filter(|_| ends_with_sum)
                         .map(|output_sharding| (output_sharding, step.result_names.as_slice()));
@@ -1063,8 +1067,8 @@ impl EinsumPlan {
                         .collect();
                     let (rhs, rhs_names) = state.sum_uniques(rhs, rhs_names, rhs_uniques, None)?;
 
-                    // Labels that one input repeats are replaced by their diagonal, which is kept when the result or
-                    // the other input contains the label and summed otherwise.
+                    // Labels that one input repeats are replaced by their diagonal, which is kept when the result
+                    // or the other input contains the label and summed otherwise.
                     let keep_names = step.result_names.iter().chain(&rhs_names).copied().collect::<Vec<_>>();
                     let (lhs, lhs_names) = state.sum_repeats(lhs, lhs_names, &lhs_counts, &keep_names, None)?;
                     let keep_names = step.result_names.iter().chain(&lhs_names).copied().collect::<Vec<_>>();
@@ -1100,8 +1104,8 @@ impl EinsumPlan {
                     let remaining_rhs_names = remaining(&rhs_names);
                     let batch_names = batch_names.into_iter().copied().collect::<Vec<_>>();
 
-                    // Both orders of the two inputs are tried, in the hope that one of them needs no transpose. The
-                    // path search tends to contract from right to left, so the exchanged order is tried first.
+                    // Both orders of the two inputs are tried, in the hope that one of them needs no transpose.
+                    // The path search tends to contract from right to left, so the exchanged order is tried first.
                     let exchanged_names = [batch_names.as_slice(), &remaining_rhs_names, &remaining_lhs_names].concat();
                     if exchanged_names == step.result_names {
                         let dimensions =
@@ -1147,6 +1151,8 @@ impl EinsumPlan {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Value-level Einstein summation capability, which contracts any number of values according to subscripts such as
 /// `"ij,jk->ik"`. Every function plans the einsum for the types of its inputs and then executes or stages the
