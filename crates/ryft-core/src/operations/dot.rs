@@ -878,8 +878,10 @@ pub const DOT_OPERATION_NAME: &str = "dot";
 /// rounded to its accumulation type before it is converted to the output element type. The eager [`Array`] kernel
 /// applies both roundings but still accumulates at `f32` or `f64`, whereas a backend may round intermediate sums at
 /// the accumulation type, decompose the inputs, or use TensorFloat-32. The `BF16_BF16_BF16` and `BF16_BF16_F32`
-/// presets also round the inputs that are stored as `f32` to `bf16`, in the eager kernel and in XLA backends alike.
-/// The eager kernel keeps the `f32` inputs of the presets that decompose them or use TensorFloat-32 as they are.
+/// presets also round the inputs that are stored as `f32` to `bf16`, which the eager kernel does like XLA does on
+/// GPUs. XLA's CPU backend ignores the algorithm of every contraction over more than one pair of elements, so it
+/// keeps such inputs as they are stored. The eager kernel keeps the `f32` inputs of the presets that decompose them
+/// or use TensorFloat-32 as they are.
 ///
 /// A dot is bilinear, so for `y = dot(a, b)`, forward mode differentiation computes `ẏ = dot(ȧ, b) + dot(a, ḃ)`.
 /// Transposition accepts exactly one linear input and contracts the output cotangent `ȳ` with the other, known input
@@ -1450,8 +1452,8 @@ impl Dot for Array {
             DataType::F32
         };
 
-        // The plain `bf16` presets also compute with inputs that are stored as `f32`, which a backend rounds to `bf16`
-        // itself, so those inputs are rounded here as well.
+        // The plain `bf16` presets also compute with inputs that are stored as `f32`, which the algorithm rounds to
+        // `bf16` like every other input, as XLA does on GPUs.
         let rounds_to_bf16 = matches!(
             precision,
             DotPrecision::Preset(DotAlgorithmPreset::BF16_BF16_BF16 | DotAlgorithmPreset::BF16_BF16_F32),
@@ -5045,7 +5047,7 @@ mod tests {
             Ok(Array::scalar(1.0f64).unwrap()),
         );
 
-        // The same preset also rounds inputs that are stored as `f32`, like XLA backends do. The presets that
+        // The same preset also rounds inputs that are stored as `f32`, like XLA does on GPUs. The presets that
         // decompose such inputs to emulate a higher precision keep them as they are stored.
         let lhs = Array::vector(vec![1.0009765625f32]).unwrap();
         let rhs = Array::vector(vec![1.0f32]).unwrap();
