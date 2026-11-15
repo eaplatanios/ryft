@@ -130,7 +130,7 @@ pub use dot::{
 };
 pub use einsum::{
     EINSUM_COMPOSITE_NAME, EINSUM_COMPOSITE_VERSION, Einsum, EinsumComposite, EinsumLabel, EinsumOptions,
-    EinsumPathStrategy, EinsumPlan, EinsumSpecification, einsum, einsum_with_options,
+    EinsumPathStep, EinsumPathStrategy, EinsumPlan, EinsumSpecification, einsum, einsum_with_options,
 };
 pub use exponential::{
     EXP_M1_OPERATION_NAME, EXP_OPERATION_NAME, Exp, ExpM1, ExpM1Operation, ExpOperation, ExponentialOperations,

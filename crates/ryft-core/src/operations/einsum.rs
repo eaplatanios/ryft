@@ -1,7 +1,8 @@
 //! Einstein summation through [`Einsum`] and [`einsum`]. An einsum contracts any number of arrays according to
 //! subscripts such as `"ij,jk->ik"`, which name every axis of every input and of the output. Labels that are absent
 //! from the output are summed over, labels that are shared between inputs are aligned, and a label that is repeated
-//! within one input selects its diagonal.
+//! within one input selects its diagonal. Boolean inputs follow the logical reading of the same rules, in which sums
+//! are disjunctions and products are conjunctions.
 //!
 //! Einsum is not a primitive operation. Like `jax.numpy.einsum`, it is decomposed into the pairwise [`Dot`]
 //! contractions, [`Reduce`] sums, [`Diagonal`]s, and [`Transpose`]s of an [`EinsumPlan`], so every program transform
@@ -9,7 +10,7 @@
 //!
 //!   - **Specification:** [`EinsumSpecification`] holds parsed subscripts, including ellipses and an implicit output.
 //!   - **Plan:** [`EinsumSpecification::plan`] expands the subscripts for particular input types, selects the order
-//!     of the pairwise contractions with an [`EinsumPathStrategy`], and returns the [`EinsumPlan`] that
+//!     of the contractions with an [`EinsumPathStrategy`], and returns the [`EinsumPlan`] that
 //!     [`EinsumPlan::contract`] executes or stages. [`EinsumPlan::contract_with`] replaces the pairwise
 //!     contraction (e.g., with a quantized dot operation).
 //!   - **Frontends:** The [`Einsum`] value capability plans and contracts inline on every call, and the global
@@ -17,8 +18,8 @@
 //!     the contraction as one named composite.
 //!
 //! The path search is a port of [`opt_einsum`](https://github.com/dgasmith/opt_einsum) 3.4.0, which `jax.numpy.einsum`
-//! uses, so that [`EinsumPathStrategy::Auto`] selects the same path as JAX for the same inputs and the staged
-//! contractions match JAX's.
+//! uses, so that [`EinsumPathStrategy::Auto`] and the other deterministic strategies select the same paths as JAX
+//! for the same inputs and the staged contractions match JAX's.
 //!
 //! # Example
 //!
@@ -48,9 +49,13 @@ use crate::operations::Capability;
 use crate::operations::collectives::parallel_vary::{
     ManualVariationAlignment, ParallelVaryOperation, manual_variation_axes, vary_over_missing_manual_axes,
 };
+use crate::operations::comparisons::Compare;
 use crate::operations::composites::builders::{Composite, CompositeCallContext, composite};
 use crate::operations::composites::configurations::JvpFromPrimal;
 use crate::operations::composites::rules::definitions::{CompositeAttribute, CompositeKey};
+use crate::operations::constants::iota_like::IotaLike;
+use crate::operations::constants::zero_like::ZeroLike;
+use crate::operations::control_flow::select::Select;
 use crate::operations::dot::{
     Dot, DotDimensionNumbers, DotOperation, DotPrecision, is_dot_accumulation_type, is_native_f8_dot_type,
 };
@@ -202,7 +207,7 @@ impl EinsumSpecification {
     }
 
     /// Plans this einsum for inputs of the provided types. This expands the ellipses for the ranks of the inputs,
-    /// validates the subscripts against the input types, and selects the order of the pairwise contractions with the
+    /// validates the subscripts against the input types, and selects the [`EinsumPathStep`]s with the
     /// [`EinsumPathStrategy`] of `options`. This is the analogue of `jax.numpy.einsum_path`, and the returned
     /// [`EinsumPlan`] can be executed or staged any number of times.
     ///
@@ -655,6 +660,13 @@ pub struct EinsumOptions {
 
     /// Optional requested [`Sharding`] of the output.
     output_sharding: Option<Sharding>,
+    // TODO(eaplatanios): Revisit the `reduction_order` option of `jax.numpy.einsum` once JAX releases and stabilizes
+    // it. JAX added it on its `main` branch in November 2026, after version 0.12, and marks it as experimental (refer
+    // to `jax/_src/reduction_order.py` there). It pins down the order in which floating-point values are accumulated
+    // (e.g., strictly from left to right, or in tiles with an inner and an outer order), so that results are
+    // reproducible bit for bit. The option belongs to the primitives and not to einsum, which only forwards it to a
+    // single sum or contraction. Supporting it therefore means adding reduction orders to `ReduceOperation` and
+    // `DotOperation` first, including a lowering that keeps backends from reordering the accumulation.
 }
 
 impl EinsumOptions {
@@ -674,15 +686,26 @@ impl EinsumOptions {
 
     /// Returns these options with the provided accumulation type, which is the element type of the output. Every
     /// pairwise contraction accumulates at it (refer to [`DotOperation::with_accumulation_type`]), and the output is
-    /// converted to it last. Values are converted to it earlier where JAX converts them. A sum converts its input
-    /// first, unless the element type of the input is the type that the two promote to (e.g., `bf16` inputs are
-    /// summed at an `f16` accumulation type and `f32` inputs are summed at `f32`). The 8-bit floating-point types
-    /// promote to no other type and are converted as well, where JAX fails. A contraction converts its inputs first
-    /// when a `dot` cannot accumulate them at that type itself, which it can for floating-point inputs at every
-    /// floating-point type and for integers at wider integers of the same signedness. That covers integers at any
-    /// numeric type that is at least as wide (e.g., `u8` at `i32` and `i32` at `f32`) and every other element type
-    /// that promotes to the accumulation type. The remaining combinations are rejected (e.g., `i32` at `i8`). This is
-    /// the `preferred_element_type` argument of `jax.numpy.einsum`.
+    /// converted to it last. Where a contraction or a sum cannot do that itself, element types are converted like
+    /// JAX converts them:
+    ///
+    ///   - A sum converts its input first, unless the element type of the input is the type that the two promote to
+    ///     (e.g., `bf16` inputs are summed at an `f16` accumulation type and `f32` inputs are summed at `f32`). The
+    ///     8-bit floating-point types promote to no other type and are converted as well, where JAX fails.
+    ///   - A `dot` accumulates floating-point inputs at every floating-point type and integers at wider integers of
+    ///     the same signedness. Integer and Boolean inputs are converted first for every other numeric accumulation
+    ///     type that is at least as wide (e.g., `u8` at `i32`, `i32` at `f32`, and Boolean inputs at `i32`, which
+    ///     counts), and narrower types are rejected (e.g., `i32` at `i8`).
+    ///   - Floating-point inputs are converted first for a complex accumulation type. For an integer or Boolean one
+    ///     they are contracted at the type that the precision computes with (i.e., their own type, or the
+    ///     accumulation type of an algorithm), and the result is converted (e.g., a product of `8.5` becomes `8` at
+    ///     `i32`).
+    ///   - Complex inputs are converted first for a wider complex accumulation type. For a real or integer one that
+    ///     is at least as wide as their components they are contracted at their own type, and the result is
+    ///     converted, which discards its imaginary component.
+    ///   - A result at the accumulation type that meets an input of another type converts that input first.
+    ///
+    /// This is the `preferred_element_type` argument of `jax.numpy.einsum`.
     #[inline]
     pub fn with_accumulation_type<D: Into<Option<DataType>>>(mut self, accumulation_type: D) -> Self {
         self.accumulation_type = accumulation_type.into();
@@ -737,8 +760,7 @@ impl EinsumOptions {
 }
 
 /// Plan of an einsum for inputs of particular types, which [`EinsumSpecification::plan`] creates. It holds the labels
-/// of every input and output axis after expanding ellipses, the selected order of the pairwise contractions, and the
-/// steps that realize it.
+/// of every input and output axis after expanding ellipses, the selected path, and the steps that realize it.
 ///
 /// Every step consumes one or two of the remaining inputs and appends its result to them, following
 /// `jax.numpy.einsum` step for step, so that equal paths stage the same contractions:
@@ -746,11 +768,15 @@ impl EinsumOptions {
 ///   1. Axes of extent one whose label has a larger extent in the other input are squeezed away.
 ///   2. Labels that only one input contains once and that no later step needs are summed out of that input.
 ///   3. Labels that one input repeats are replaced by their [`Diagonal`], which reads only the elements of the
-///      diagonal, where JAX masks the whole input and sums it. A diagonal that no later step needs is summed.
+///      diagonal, where JAX masks the whole input and sums it. An input with a dynamic extent uses that masked sum
+///      as well, because it supports diagonals that may be empty. A diagonal that no later step needs is summed.
 ///   4. The two inputs are contracted with one [`Dot`], whose batching dimensions are the shared labels that are still
 ///      needed and whose contracting dimensions are the shared labels that are not, in the order of their characters.
 ///      The contraction is first tried with its inputs exchanged, which more often produces the needed order of axes.
 ///   5. The result is transposed when its axes are still not in the needed order.
+///
+/// An [`EinsumPathStep::Reduction`] applies items 2, 3, and 5 to its one input. The sums of Boolean values are
+/// disjunctions (i.e., [`ReductionKind::Any`]) and their contractions are disjunctions of conjunctions.
 ///
 /// A plan can be reused for other inputs with the same ranks and consistent label extents, although its path was
 /// selected for the extents of the types that it was created for.
@@ -804,8 +830,8 @@ impl EinsumPlan {
     }
 
     /// Returns the selected steps, which are one [`EinsumPathStep::Reduction`] for an einsum of one input and
-    /// [`EinsumPathStep::Contraction`]s for the strategies that search for an order of pairwise contractions. The
-    /// path can be passed to [`EinsumPathStrategy::Explicit`].
+    /// [`EinsumPathStep::Contraction`]s for most strategies. [`EinsumPathStrategy::DynamicProgramming`] may also
+    /// select reductions. The path can be passed to [`EinsumPathStrategy::Explicit`].
     #[inline]
     pub fn path(&self) -> &[EinsumPathStep] {
         &self.path
@@ -831,19 +857,17 @@ impl EinsumPlan {
     /// Returns a [`ProgramError`] if the number of inputs or their ranks do not match this plan, or if a step fails.
     pub fn contract<V>(&self, inputs: &[V]) -> Result<V, ProgramError>
     where
-        V: Value<Type = ArrayType> + ConvertElementType + Diagonal + Dot + Reduce + Reshape + Transpose,
-    {
-        self.contract_with_main_diagonal(inputs, |value: &V, kept_axis, removed_axis| {
-            value.diagonal(0, kept_axis, removed_axis)
-        })
-    }
-
-    /// Executes or stages this plan on `inputs` like [`Self::contract`], but with `main_diagonal` as the function
-    /// that takes the main diagonal of a value along a kept axis and a removed axis, in place of the kept axis.
-    fn contract_with_main_diagonal<V, F>(&self, inputs: &[V], main_diagonal: F) -> Result<V, ProgramError>
-    where
-        V: Value<Type = ArrayType> + ConvertElementType + Dot + Reduce + Reshape + Transpose,
-        F: FnMut(&V, usize, usize) -> Result<V, ProgramError>,
+        V: Value<Type = ArrayType>
+            + Compare
+            + ConvertElementType
+            + Diagonal
+            + Dot
+            + IotaLike
+            + Reduce
+            + Reshape
+            + Select
+            + Transpose
+            + ZeroLike,
     {
         let precision = self.options.precision;
         let mut steps = ValueSteps {
@@ -854,9 +878,8 @@ impl EinsumPlan {
                           output_sharding: Option<&Sharding>| {
                 lhs.dot_with_configuration(rhs, dimensions, precision, accumulation_type, output_sharding)
             },
-            main_diagonal,
         };
-        self.execute(inputs, self.options.accumulation_type, &mut steps)
+        self.execute(inputs, self.options.accumulation_type, precision, &mut steps)
     }
 
     /// Executes or stages this plan on `inputs` like [`Self::contract`], but with `contraction` as the pairwise
@@ -877,34 +900,44 @@ impl EinsumPlan {
     /// Returns a [`ProgramError`] if the number of inputs or their ranks do not match this plan, or if a step fails.
     pub fn contract_with<V, F>(&self, inputs: &[V], mut contraction: F) -> Result<V, ProgramError>
     where
-        V: Value<Type = ArrayType> + ConvertElementType + Diagonal + Reduce + Reshape + Transpose,
+        V: Value<Type = ArrayType>
+            + Compare
+            + ConvertElementType
+            + Diagonal
+            + IotaLike
+            + Reduce
+            + Reshape
+            + Select
+            + Transpose
+            + ZeroLike,
         F: FnMut(&V, &V, &DotDimensionNumbers, Option<&Sharding>) -> Result<V, ProgramError>,
     {
-        let main_diagonal = |value: &V, kept_axis, removed_axis| value.diagonal(0, kept_axis, removed_axis);
         let contraction =
             |lhs: &V,
              rhs: &V,
              dimensions: &DotDimensionNumbers,
              _: Option<DataType>,
              output_sharding: Option<&Sharding>| { contraction(lhs, rhs, dimensions, output_sharding) };
-        self.execute(inputs, None, &mut ValueSteps { contraction, main_diagonal })
+        self.execute(inputs, None, DotPrecision::default(), &mut ValueSteps { contraction })
     }
 
     /// Infers the type of the output of [`Self::contract`] for the input types of this plan, together with the number
     /// of instructions that it stages, by running the steps of this plan over types.
     fn infer(&self) -> Result<(ArrayType, usize), ProgramError> {
         let mut steps = TypeSteps { precision: self.options.precision, instruction_count: 0 };
-        let output_type = self.execute(&self.input_types, self.options.accumulation_type, &mut steps)?;
+        let options = &self.options;
+        let output_type = self.execute(&self.input_types, options.accumulation_type, options.precision, &mut steps)?;
         Ok((output_type, steps.instruction_count))
     }
 
     /// Runs the steps of this plan on `inputs` through `steps`, which either computes or stages every step on values
-    /// or infers its type. This is a port of the `_einsum` function of JAX, except for repeated labels, whose
-    /// diagonals are taken with [`Diagonal`].
+    /// or infers its type. This is a port of the `_einsum` function of JAX, except for repeated labels of inputs
+    /// with static extents, whose diagonals are taken with [`Diagonal`].
     fn execute<V: Clone, S: EinsumSteps<V>>(
         &self,
         inputs: &[V],
         accumulation_type: Option<DataType>,
+        precision: DotPrecision,
         steps: &mut S,
     ) -> Result<V, ProgramError> {
         if inputs.len() != self.input_labels.len() {
@@ -928,7 +961,7 @@ impl EinsumPlan {
             }
         }
 
-        let mut state = EinsumExecution { steps, accumulation_type };
+        let mut state = EinsumExecution { steps, accumulation_type, precision };
         let mut values = inputs.to_vec();
         for (index, step) in self.steps.iter().enumerate() {
             let is_last = index + 1 == self.steps.len();
@@ -1087,8 +1120,8 @@ impl EinsumPlan {
 ///
 /// The universe parameter `T` defaults to the [`Capability`] universe of the implementor, so that homogeneous array
 /// values implement this capability for [`ArrayType`] and array IR values implement it for [`ArrayIrType`]. Array IR
-/// values contract through their array views and take the diagonals of repeated labels themselves, so their dynamic
-/// extents are supported, including along a label that one input repeats when its axes share one extent.
+/// values contract through their array views, so their dynamic extents are supported, including along a label that
+/// one input repeats.
 ///
 /// # Example
 ///
@@ -1149,7 +1182,17 @@ pub trait Einsum<T = <Self as Capability>::Universe>: Capability + Sized {
 
 impl<V> Einsum<ArrayType> for V
 where
-    V: Value<Type = ArrayType, Domain: Context> + ConvertElementType + Diagonal + Dot + Reduce + Reshape + Transpose,
+    V: Value<Type = ArrayType, Domain: Context>
+        + Compare
+        + ConvertElementType
+        + Diagonal
+        + Dot
+        + IotaLike
+        + Reduce
+        + Reshape
+        + Select
+        + Transpose
+        + ZeroLike,
 {
     fn einsum_with_options<'i, I: IntoIterator<Item = &'i Self>>(
         specification: &EinsumSpecification,
@@ -1166,9 +1209,9 @@ where
     }
 }
 
-impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType> + Diagonal<ArrayIrType>> Einsum<ArrayIrType> for V
+impl<V: Value<Type = ArrayIrType> + ValueProjection<ArrayType>> Einsum<ArrayIrType> for V
 where
-    V::Projected: Value<Type = ArrayType, Domain: Context> + ConvertElementType + Dot + Reduce + Reshape + Transpose,
+    V::Projected: Clone + Einsum<ArrayType>,
 {
     fn einsum_with_options<'i, I: IntoIterator<Item = &'i Self>>(
         specification: &EinsumSpecification,
@@ -1179,21 +1222,12 @@ where
         Self: 'i,
     {
         // The einsum runs in the array universe over the array views of the inputs, which rejects first-class
-        // dimension members. Only the diagonals of repeated labels are taken on the array IR values themselves,
-        // whose `Diagonal` supports dynamic extents.
+        // dimension members.
         let inputs = inputs
             .into_iter()
             .map(|input| <V as ValueProjection<ArrayType>>::into_projected(input.clone()))
             .collect::<Result<Vec<_>, _>>()?;
-        let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let plan = specification.plan(&input_types, options)?;
-        let scope = ProvenanceScope::new(specification.to_string());
-        let output = invoke_in_scope(scope, &inputs, || {
-            plan.contract_with_main_diagonal(&inputs, |value: &V::Projected, kept_axis, removed_axis| {
-                let value = <V as ValueProjection<ArrayType>>::from_projected(value.clone());
-                Ok(<V as ValueProjection<ArrayType>>::into_projected(value.diagonal(0, kept_axis, removed_axis)?)?)
-            })
-        })?;
+        let output = <V::Projected as Einsum<ArrayType>>::einsum_with_options(specification, inputs.iter(), options)?;
         Ok(<V as ValueProjection<ArrayType>>::from_projected(output))
     }
 }
@@ -1283,12 +1317,16 @@ where
         C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
         V: Value<Type = ArrayType, Domain = C>
             + ManualVariationAlignment
+            + Compare
             + ConvertElementType
             + Diagonal
             + Dot
+            + IotaLike
             + Reduce
             + Reshape
-            + Transpose,
+            + Select
+            + Transpose
+            + ZeroLike,
     {
         let inputs = V::align_manual_variation(&inputs)?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -1330,7 +1368,8 @@ where
 pub fn einsum<D>(subscripts: &str) -> Result<EinsumComposite<D>, ProgramError>
 where
     D: Domain<Type = ArrayType, Constant: 'static, Operation: 'static>,
-    DomainTracer<D>: ConvertElementType + Diagonal + Dot + Reduce + Reshape + Transpose,
+    DomainTracer<D>:
+        Compare + ConvertElementType + Diagonal + Dot + IotaLike + Reduce + Reshape + Select + Transpose + ZeroLike,
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     einsum_with_options(subscripts.parse()?, EinsumOptions::default())
@@ -1354,7 +1393,8 @@ pub fn einsum_with_options<D>(
 ) -> Result<EinsumComposite<D>, ProgramError>
 where
     D: Domain<Type = ArrayType, Constant: 'static, Operation: 'static>,
-    DomainTracer<D>: ConvertElementType + Diagonal + Dot + Reduce + Reshape + Transpose,
+    DomainTracer<D>:
+        Compare + ConvertElementType + Diagonal + Dot + IotaLike + Reduce + Reshape + Select + Transpose + ZeroLike,
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     let key = einsum_composite_key(&specification, &options);
@@ -1501,21 +1541,25 @@ trait EinsumSteps<V> {
 }
 
 /// [`EinsumSteps`] that compute or stage every step on values through their capabilities, with `Contraction` as the
-/// pairwise contraction and `MainDiagonal` as the function that takes the main diagonal of two axes.
-struct ValueSteps<Contraction, MainDiagonal> {
+/// pairwise contraction.
+struct ValueSteps<Contraction> {
     /// Pairwise contraction.
     contraction: Contraction,
-
-    /// Function that returns the main diagonal of a value along a kept axis and a removed axis, in place of the kept
-    /// axis. Array IR values supply their own, which supports dynamic extents.
-    main_diagonal: MainDiagonal,
 }
 
-impl<V, Contraction, MainDiagonal> EinsumSteps<V> for ValueSteps<Contraction, MainDiagonal>
+impl<V, Contraction> EinsumSteps<V> for ValueSteps<Contraction>
 where
-    V: Value<Type = ArrayType> + ConvertElementType + Reduce + Reshape + Transpose,
+    V: Value<Type = ArrayType>
+        + Compare
+        + ConvertElementType
+        + Diagonal
+        + IotaLike
+        + Reduce
+        + Reshape
+        + Select
+        + Transpose
+        + ZeroLike,
     Contraction: FnMut(&V, &V, &DotDimensionNumbers, Option<DataType>, Option<&Sharding>) -> Result<V, ProgramError>,
-    MainDiagonal: FnMut(&V, usize, usize) -> Result<V, ProgramError>,
 {
     #[inline]
     fn array_type(&self, value: &V) -> ArrayType {
@@ -1534,7 +1578,7 @@ where
 
     #[inline]
     fn diagonal(&mut self, value: &V, kept_axis: usize, removed_axis: usize) -> Result<V, ProgramError> {
-        (self.main_diagonal)(value, kept_axis, removed_axis)
+        main_diagonal(value, kept_axis, removed_axis)
     }
 
     #[inline]
@@ -1599,9 +1643,17 @@ impl EinsumSteps<ArrayType> for TypeSteps {
         kept_axis: usize,
         removed_axis: usize,
     ) -> Result<ArrayType, ProgramError> {
-        // The main diagonal of two axes that share one extent is an iota and a gather.
-        self.instruction_count += 2;
-        value.diagonal(0, kept_axis, removed_axis)
+        // The main diagonal of two axes that share one extent is an iota and a gather for static extents. Otherwise
+        // it is the masked sum of `masked_diagonal`, which stages two index arrays, their comparison, the zeros, the
+        // selection, and the sum.
+        if is_static(value) {
+            self.instruction_count += 2;
+            value.diagonal(0, kept_axis, removed_axis)
+        } else {
+            self.instruction_count += 6;
+            let operation = ReduceOperation::new(vec![removed_axis], sum_kind(value.data_type()));
+            Ok(operation.infer_output_types(std::slice::from_ref(value), &[])?.remove(0))
+        }
     }
 
     fn contract(
@@ -1661,6 +1713,9 @@ struct EinsumExecution<'s, S> {
 
     /// Optional accumulation type that sums, mixed contractions, and the output are converted to.
     accumulation_type: Option<DataType>,
+
+    /// Precision of every pairwise contraction, which decides the type that a contraction computes with.
+    precision: DotPrecision,
 }
 
 impl<S> EinsumExecution<'_, S> {
@@ -1800,10 +1855,15 @@ impl<S> EinsumExecution<'_, S> {
     ///
     ///   - Inputs of different element types are both converted to the accumulation type first, which happens when
     ///     an earlier result at the accumulation type meets an input.
-    ///   - Floating-point inputs with any other kind of accumulation type are contracted at their own type and the
-    ///     result is converted, so a fractional product is truncated once.
+    ///   - Floating-point inputs are converted first for a complex accumulation type. For every other kind of
+    ///     accumulation type they are contracted at the floating-point type that the precision computes with (i.e.,
+    ///     their own type, or the accumulation type of an algorithm), and the result is converted, so a fractional
+    ///     product is truncated once.
+    ///   - Complex inputs are converted first for a wider complex accumulation type. For a real or integer
+    ///     accumulation type that is at least as wide as their components, they are contracted at their own type
+    ///     and the result is converted, which discards its imaginary component.
     ///   - Integer and Boolean inputs are converted first when the accumulation type is numeric and at least as
-    ///     wide, and so is every other element type that promotes to the accumulation type.
+    ///     wide.
     ///   - Every other combination is left for the `dot` to reject.
     fn contract<V: Clone>(
         &mut self,
@@ -1825,18 +1885,26 @@ impl<S> EinsumExecution<'_, S> {
         } else if is_dot_accumulation_type(lhs_type, accumulation_type) {
             (false, false)
         } else if lhs_type.is_floating_point() {
-            (false, true)
+            (accumulation_type.is_complex(), !accumulation_type.is_complex())
+        } else if lhs_type.is_complex() && accumulation_type.is_complex() {
+            (lhs_type.is_promotable_to(accumulation_type), false)
+        } else if lhs_type.is_complex() {
+            (false, accumulation_type.bit_width() >= lhs_type.bit_width() / 2)
         } else if lhs_type.is_integer() || lhs_type == DataType::Boolean {
             (accumulation_type.is_numeric() && accumulation_type.bit_width() >= lhs_type.bit_width(), false)
         } else {
-            (lhs_type.is_promotable_to(accumulation_type), false)
+            (false, false)
         };
         if converts_inputs {
             let lhs = self.convert(lhs.clone(), accumulation_type)?;
             let rhs = self.convert(rhs.clone(), accumulation_type)?;
             self.steps.contract(&lhs, &rhs, dimensions, Some(accumulation_type), output_sharding)
         } else if converts_output {
-            let output = self.steps.contract(lhs, rhs, dimensions, None, output_sharding)?;
+            // An algorithm computes at its own accumulation type, which the result keeps until it is converted.
+            let result_type = self.precision.computation_types(lhs_type, rhs_type, lhs_type).2;
+            let result_type = Some(result_type)
+                .filter(|result_type| *result_type != lhs_type && is_dot_accumulation_type(lhs_type, *result_type));
+            let output = self.steps.contract(lhs, rhs, dimensions, result_type, output_sharding)?;
             self.convert(output, accumulation_type)
         } else {
             self.steps.contract(lhs, rhs, dimensions, Some(accumulation_type), output_sharding)
@@ -2638,9 +2706,12 @@ impl ContractionTable {
 ///      size of the output labels of the group and grows until the whole group is contracted.
 ///   3. The results of the groups are combined from the smallest one up.
 ///
+/// The search deviates from `opt_einsum` in one way. It never gives up on a group, where `opt_einsum` fails for some
+/// einsums with an empty input (e.g., `a,b,b->` with an empty first input).
+///
 /// # Errors
 ///
-/// Returns a [`ProgramError`] if the einsum has more inputs than the search supports.
+/// Returns a [`ProgramError`] if a group of connected inputs has more inputs than the search supports.
 fn dynamic_programming_path(
     inputs: &[LabelSet],
     output: &LabelSet,
@@ -2650,9 +2721,8 @@ fn dynamic_programming_path(
     for label in inputs.iter().flatten().chain(output) {
         *counts.entry(*label).or_default() += 1;
     }
-    let naive_cost = counts.keys().fold(inputs.len() as u128, |cost, label| cost.saturating_mul(sizes[label]));
 
-    // Subsets are bitmaps of the positions of the inputs that take part in the search.
+    // Labels that only one input contains are summed first, and the inputs that keep a label take part in the search.
     let mut searched_inputs = Vec::<LabelSet>::new();
     let mut searched_trees = Vec::<ContractionTree>::new();
     let mut trees = Vec::<ContractionTree>::new();
@@ -2669,17 +2739,7 @@ fn dynamic_programming_path(
             searched_trees.push(tree);
         }
     }
-    if searched_inputs.len() > u128::BITS as usize {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{EINSUM_NAME}` dynamic programming path search supports at most {} inputs but got {}",
-                u128::BITS,
-                searched_inputs.len(),
-            ),
-        });
-    }
     let mut tree_sizes = vec![1u128; trees.len()];
-    let all_inputs = u128::MAX >> (u128::BITS as usize - searched_inputs.len().max(1));
 
     // Inputs are connected when they share a summed label. The groups are found in the order in which CPython
     // iterates the sets of the reference implementation, which decides the order of equally large results.
@@ -2706,11 +2766,25 @@ fn dynamic_programming_path(
     }
 
     for group in groups {
+        if group.len() > u128::BITS as usize {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{EINSUM_NAME}` dynamic programming path search supports at most {} connected inputs but got {}",
+                    u128::BITS,
+                    group.len(),
+                ),
+            });
+        }
+
+        // Subsets of the group are bitmaps over its inputs in the order of their positions, which orders the
+        // bitmaps like the reference implementation orders its bitmaps over all inputs.
+        let mut members = group.clone();
+        members.sort_unstable();
+        let subset_of = |input: &usize| 1u128 << members.partition_point(|member| member < input);
         let mut tables = (0..=group.len()).map(|_| ContractionTable::default()).collect::<Vec<_>>();
         for input in &group {
-            tables[1].insert(1 << input, searched_inputs[*input].clone(), 0, searched_trees[*input].clone());
+            tables[1].insert(subset_of(input), searched_inputs[*input].clone(), 0, searched_trees[*input].clone());
         }
-        let group_inputs = group.iter().fold(0u128, |subset, input| subset | (1 << input));
         let group_labels = group.iter().flat_map(|input| &searched_inputs[*input]).copied().collect::<LabelSet>();
         let mut cost_cap = size_of(&(&group_labels & output), sizes);
         let cost_increment = group_labels.iter().map(|label| sizes[label]).min().map_or(2, |size| size.max(2));
@@ -2744,9 +2818,11 @@ fn dynamic_programming_path(
                             }
 
                             // The result keeps the labels that the output or an input outside of the subset needs.
-                            let outside = (0..searched_inputs.len())
-                                .filter(|input| (group_inputs & (all_inputs ^ subset)) >> input & 1 == 1)
-                                .flat_map(|input| &searched_inputs[input])
+                            let outside = members
+                                .iter()
+                                .enumerate()
+                                .filter(|(member, _)| subset >> member & 1 == 0)
+                                .flat_map(|(_, input)| &searched_inputs[*input])
                                 .copied()
                                 .collect::<LabelSet>();
                             let labels = either
@@ -2761,12 +2837,15 @@ fn dynamic_programming_path(
                 }
                 tables[subset_size] = table;
             }
-            if tables[group.len()].entries.is_empty() && (cost_cap > naive_cost || cost_cap == u128::MAX) {
+            // A group always has a contraction without outer products, so the search ends once the cost cap reaches
+            // its cost. The reference implementation gives up when the cap exceeds a naive bound on that cost
+            // instead, which an unrelated empty input reduces to zero, so it fails for some valid einsums.
+            if tables[group.len()].entries.is_empty() && cost_cap == u128::MAX {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!("`{EINSUM_NAME}` dynamic programming path search found no path"),
                 });
             }
-            cost_cap = cost_cap.saturating_mul(cost_increment);
+            cost_cap = cost_cap.saturating_mul(cost_increment).max(1);
         }
         let (_, labels, _, tree) = &tables[group.len()].entries[0];
         tree_sizes.push(size_of(labels, sizes));
@@ -2836,6 +2915,40 @@ fn ssa_to_linear(ssa_path: &[(usize, usize)]) -> Vec<(usize, usize)> {
     path
 }
 
+/// Returns `true` if every extent of `type` is static.
+fn is_static(r#type: &ArrayType) -> bool {
+    r#type.shape().dimensions().iter().all(|dimension| dimension.value().is_some())
+}
+
+/// Returns the main diagonal of `value` along `kept_axis` and `removed_axis`, in place of `kept_axis`, which is what
+/// replaces a repeated label of an einsum. Values whose extents are all static read only the elements of the
+/// diagonal through [`Diagonal`]. A value with a dynamic extent uses the [`masked_diagonal`] instead, because
+/// [`Diagonal`] cannot build its indices for homogeneous array values and does not support diagonals that may be
+/// empty.
+fn main_diagonal<V>(value: &V, kept_axis: usize, removed_axis: usize) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Compare + Diagonal + IotaLike + Reduce + Select + ZeroLike,
+{
+    match is_static(value.r#type().as_ref()) {
+        true => value.diagonal(0, kept_axis, removed_axis),
+        false => masked_diagonal(value, kept_axis, removed_axis),
+    }
+}
+
+/// Returns the main diagonal of `value` along `kept_axis` and `removed_axis`, in place of `kept_axis`, as the sum
+/// along `removed_axis` of the elements whose indices along the two axes are equal. This is how JAX takes the
+/// diagonal of a repeated label. It reads every element of `value`, and it supports dynamic and empty extents. The
+/// sum turns a negative zero on the diagonal into a positive one.
+fn masked_diagonal<V>(value: &V, kept_axis: usize, removed_axis: usize) -> Result<V, ProgramError>
+where
+    V: Value<Type = ArrayType> + Compare + IotaLike + Reduce + Select + ZeroLike,
+{
+    let kept_indices = value.iota_like(kept_axis, DataType::I64)?;
+    let removed_indices = value.iota_like(removed_axis, DataType::I64)?;
+    let diagonal = kept_indices.equal(&removed_indices)?.select(value, &value.zero_like()?)?;
+    diagonal.reduce(&[removed_axis], sum_kind(value.r#type().data_type()))
+}
+
 /// Returns the reduction that sums values of the provided element type, which is their disjunction for Boolean
 /// values, like in JAX.
 fn sum_kind(data_type: DataType) -> ReductionKind {
@@ -2897,8 +3010,9 @@ fn einsum_symbol(index: usize) -> char {
 /// Returns the [`CompositeKey`] of the named composite of an einsum with the provided specification and options.
 /// The attributes encode everything that determines its computation for given input types. Labels are encoded by
 /// their code points and an ellipsis by `-1`, the path strategy by a fixed index followed by its parameters (i.e., a
-/// count, or the positions of every step of an explicit path), the precision by its kind followed by its fields, and a requested
-/// output sharding by the code points of its rendering, which distinguishes every pair of different shardings.
+/// count, or the positions of every step of an explicit path), the precision by its kind followed by its fields, and
+/// a requested output sharding by the code points of its rendering, which distinguishes every pair of different
+/// shardings.
 fn einsum_composite_key(specification: &EinsumSpecification, options: &EinsumOptions) -> CompositeKey {
     let integer = |value: usize| CompositeAttribute::Integer(value as i128);
     let subscript = |subscript: &[EinsumLabel]| {
@@ -2970,8 +3084,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DimensionBounds, DimensionValue, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Shape, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, Complex, DimensionBounds, DimensionValue,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, ShardingDimension,
     };
     use crate::axes::NamedAxis;
     use crate::batching::{BatchAxis, batch};
@@ -5498,6 +5612,28 @@ mod tests {
             );
         }
 
+        // The dynamic programming search does not give up on einsums with an empty input, where `opt_einsum` fails,
+        // and it searches every group of connected inputs on its own, so their total number is not limited.
+        let empty = [reference_input(0, &[0]), reference_input(1, &[2]), reference_input(2, &[2])];
+        for strategy in [EinsumPathStrategy::DynamicProgramming, EinsumPathStrategy::AutoHighQuality] {
+            let options = EinsumOptions::new().with_path(strategy.clone());
+            assert_eq!(
+                Array::einsum_with_options(&"a,b,b->".parse().unwrap(), empty.iter(), &options),
+                Ok(Array::scalar(0.0f64).unwrap()),
+                "{strategy:?}",
+            );
+        }
+        let scalars = vec![Array::scalar(1.0f64).unwrap(); 3];
+        let inputs = empty.iter().chain(&scalars).collect::<Vec<_>>();
+        let options = EinsumOptions::new().with_path(EinsumPathStrategy::AutoHighQuality);
+        assert_eq!(
+            Array::einsum_with_options(&"a,b,b,,,->".parse().unwrap(), inputs, &options),
+            Ok(Array::scalar(0.0f64).unwrap()),
+        );
+        let subscripts = format!("{}->", vec![""; 129].join(","));
+        let shapes = vec![&[][..]; 129];
+        assert_eq!(planned_path(&subscripts, &shapes, EinsumPathStrategy::DynamicProgramming).len(), 128);
+
         // More than sixteen inputs use the randomized search in the high quality strategy.
         let subscripts = (0..18).map(|index| format!("{}{}", (b'a' + index) as char, (b'b' + index) as char));
         let subscripts = format!("{}->as", subscripts.collect::<Vec<_>>().join(","));
@@ -5746,12 +5882,12 @@ mod tests {
 
         // Invalid steps are reported without executing them.
         let options = EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32);
-        let integers = [matrix(DataType::I32, 2, 3), matrix(DataType::I32, 3, 4)];
-        let plan = "ij,jk".parse::<EinsumSpecification>().unwrap().plan(&integers, &options).unwrap();
+        let complex = [matrix(DataType::C64, 2, 3), matrix(DataType::C64, 3, 4)];
+        let plan = "ij,jk".parse::<EinsumSpecification>().unwrap().plan(&complex, &options).unwrap();
         assert_eq!(
             plan.output_type(),
             Err(ProgramError::Type(TypeError::invalid(
-                "`dot` algorithms require floating-point inputs but got `i32` and `i32`",
+                "`dot` algorithms require real or Boolean inputs but got `c64` and `c64`",
             ))),
         );
     }
@@ -6504,13 +6640,86 @@ mod tests {
             ))),
         );
 
-        // A precision that the inputs do not support is rejected by the contraction.
-        let integers = Array::matrix(1, 1, vec![2i32]).unwrap();
+        // An accumulation type of another kind does not round a floating-point product twice. Inputs are converted
+        // first for a complex accumulation type, so `1.0078125²` keeps the `2⁻¹⁴` that `bf16` drops. For an integer
+        // accumulation type the contraction computes at the type of its precision, so `1.4140625² ≈ 1.9996` is
+        // rounded to `2` at `bf16` without an algorithm and is truncated to `1` with one that computes at `f32`.
+        let narrow = Array::vector(vec![bf16::from_f32(1.0078125)]).unwrap();
+        let options = EinsumOptions::new().with_accumulation_type(DataType::C64);
+        assert_eq!(
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&narrow, &narrow], &options),
+            Ok(Array::scalar(Complex::new(1.01568603515625f32, 0.0)).unwrap()),
+        );
+        let narrow = Array::vector(vec![bf16::from_f32(1.4140625)]).unwrap();
+        let options = EinsumOptions::new().with_accumulation_type(DataType::I32);
+        assert_eq!(
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&narrow, &narrow], &options),
+            Ok(Array::scalar(2i32).unwrap()),
+        );
+        let options = options.with_precision(DotAlgorithmPreset::F32_F32_F32);
+        assert_eq!(
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&narrow, &narrow], &options),
+            Ok(Array::scalar(1i32).unwrap()),
+        );
+        let single = Array::vector(vec![1.0000001f32]).unwrap();
+        let options = EinsumOptions::new().with_accumulation_type(DataType::C128);
+        assert_eq!(
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&single, &single], &options),
+            Ok(Array::scalar(Complex::new(1.0000002384185933f64, 0.0)).unwrap()),
+        );
+
+        // Complex inputs are contracted at their own type for a real or integer accumulation type that is at least
+        // as wide as their components, and the result keeps its real component. A wider complex type converts the
+        // inputs first, and a narrower type is rejected.
+        let complex = Array::vector(vec![Complex::new(1.5f32, 0.5), Complex::new(2.5f32, 0.25)]).unwrap();
+        let contract = |accumulation_type: DataType| {
+            let options = EinsumOptions::new().with_accumulation_type(accumulation_type);
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&complex, &complex], &options)
+        };
+        assert_eq!(contract(DataType::F32), Ok(Array::scalar(8.1875f32).unwrap()));
+        assert_eq!(contract(DataType::F64), Ok(Array::scalar(8.1875f64).unwrap()));
+        assert_eq!(contract(DataType::I32), Ok(Array::scalar(8i32).unwrap()));
+        assert_eq!(contract(DataType::C128), Ok(Array::scalar(Complex::new(8.1875f64, 2.75)).unwrap()));
+        assert_eq!(
+            contract(DataType::F16),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`dot` input data type `c64` cannot accumulate at data type `f16`",
+            ))),
+        );
+        let options = EinsumOptions::new().with_accumulation_type(DataType::F32);
+        assert_eq!(
+            Array::einsum_with_options(&"i->".parse().unwrap(), [&complex], &options),
+            Ok(Array::scalar(4.0f32).unwrap()),
+        );
+        assert_eq!(
+            Array::einsum_with_options(&"i,i,i->".parse().unwrap(), [&complex, &complex, &complex], &options),
+            Ok(Array::scalar(18.46875f32).unwrap()),
+        );
+
+        // An algorithm converts integer and Boolean inputs to the types that it computes with, like in JAX.
+        let integers = Array::vector(vec![1i32, 2]).unwrap();
         let options = EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32);
         assert_eq!(
-            Array::einsum_with_options(&"ij,jk".parse().unwrap(), [&integers, &integers], &options),
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&integers, &integers], &options),
+            Ok(Array::scalar(5i32).unwrap()),
+        );
+        let booleans = Array::vector(vec![true, true]).unwrap();
+        assert_eq!(
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&booleans, &booleans], &options),
+            Ok(Array::scalar(true).unwrap()),
+        );
+        let options = options.with_accumulation_type(DataType::F64);
+        assert_eq!(
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&integers, &integers], &options),
+            Ok(Array::scalar(5.0f64).unwrap()),
+        );
+
+        // A precision that the inputs do not support is rejected by the contraction.
+        let options = EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32);
+        assert_eq!(
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&complex, &complex], &options),
             Err(ProgramError::Type(TypeError::invalid(
-                "`dot` algorithms require floating-point inputs but got `i32` and `i32`",
+                "`dot` algorithms require real or Boolean inputs but got `c64` and `c64`",
             ))),
         );
     }
@@ -6830,8 +7039,8 @@ mod tests {
             Ok(ArrayIrValue::Array(Array::einsum("i,j->ij", [&reference_input(0, &[2]), &broadcast[1]]).unwrap())),
         );
 
-        // A repeated label takes the diagonal of the array IR value itself, so the other extents may be dynamic, and
-        // so may the extent of the repeated label when its axes share it.
+        // A repeated label of an input with a dynamic extent is the sum of the elements on its diagonal, like in JAX,
+        // which also covers a dynamic extent of the repeated label itself.
         let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
         let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), 2.into(), 2.into()]));
         let (_, program) = DomainTracingContext::<ArrayIrEagerContext>::trace(
@@ -6843,13 +7052,13 @@ mod tests {
             program.to_string(),
             indoc! {"
                 lambda %0:f64[n, 2, 2] .
-                let %1:dimension<n ∈ [1, 8)> = dimension_size [axis=0] %0
-                    %2:i64[n, 2, 1] = iota [type=i64[n, 2, 1], dimension=1] %1
-                    %3:f64[n, 2] = gather [
-                        dimensions=(offset=[], collapsed_slice=[1], start_index_map=[1], batching=[(0, 0), (2, 1)]),
-                        slice_sizes=[1, 1, 1],
-                    ] %0 %2
-                in (%3)
+                let %1:i64[n, 2, 2] = iota_like [dimension=2, data_type=i64] %0
+                    %2:i64[n, 2, 2] = iota_like [dimension=1, data_type=i64] %0
+                    %3:bool[n, 2, 2] = compare [direction=Equal] %1 %2
+                    %4:f64[n, 2, 2] = zero_like %0
+                    %5:f64[n, 2, 2] = select %3 %0 %4
+                    %6:f64[n, 2] = reduce [kind=sum, axes=[1]] %5
+                in (%6)
             "}
             .trim_end(),
         );
@@ -6858,36 +7067,74 @@ mod tests {
             program.interpret(vec![ArrayIrValue::Array(batched.clone())]),
             Ok(ArrayIrValue::Array(Array::einsum("bii->bi", [&batched]).unwrap())),
         );
-        let plan = "bii->bi".parse::<EinsumSpecification>().unwrap().plan(&[batched_type], &EinsumOptions::new());
-        assert_eq!(
-            plan.unwrap().output_type(),
-            Ok(ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), 2.into()]))),
-        );
+        let plan = "bii->bi"
+            .parse::<EinsumSpecification>()
+            .unwrap()
+            .plan(&[batched_type], &EinsumOptions::new())
+            .unwrap();
+        assert_eq!(plan.output_type(), Ok(ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), 2.into()]))));
+        assert_eq!(plan.infer().unwrap().1, program.instructions().len());
         let square_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), extent, 3.into()]));
         let (_, program) = DomainTracingContext::<ArrayIrEagerContext>::trace(
             |inputs: Vec<_>| Einsum::einsum("iij->j", inputs.iter()),
             vec![ArrayIrType::from(square_type)],
         )
         .unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f64[n, n, 3] .
-                let %1:dimension<n ∈ [1, 8)> = dimension_size [axis=1] %0
-                    %2:i64[n, 3, 1] = iota [type=i64[n, 3, 1], dimension=0] %1
-                    %3:f64[n, 3] = gather [
-                        dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0), (2, 1)]),
-                        slice_sizes=[1, 1, 1],
-                    ] %0 %2
-                    %4:f64[3] = reduce [kind=sum, axes=[0]] %3
-                in (%4)
-            "}
-            .trim_end(),
-        );
         let square = reference_input(0, &[2, 2, 3]);
         assert_eq!(
             program.interpret(vec![ArrayIrValue::Array(square.clone())]),
             Ok(ArrayIrValue::Array(Array::einsum("iij->j", [&square]).unwrap())),
+        );
+
+        // The sum also covers diagonals that are or may be empty, which a gather cannot read.
+        let extent = Dimension::Dynamic(DimensionVariable::new("m", DimensionBounds::new(0, Some(8)).unwrap()));
+        let empty_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), 0.into(), 0.into()]));
+        let (output_types, program) = DomainTracingContext::<ArrayIrEagerContext>::trace(
+            |inputs: Vec<_>| Einsum::einsum("bii->bi", inputs.iter()),
+            vec![ArrayIrType::from(empty_type)],
+        )
+        .unwrap();
+        assert_eq!(
+            output_types,
+            ArrayIrType::from(ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), 0.into()]))),
+        );
+        assert_eq!(
+            program.interpret(vec![ArrayIrValue::Array(reference_input(0, &[3, 0, 0]))]),
+            Ok(ArrayIrValue::Array(reference_input(0, &[3, 0]))),
+        );
+        let possibly_empty_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), extent]));
+        let (_, program) = DomainTracingContext::<ArrayIrEagerContext>::trace(
+            |inputs: Vec<_>| Einsum::einsum("ii->i", inputs.iter()),
+            vec![ArrayIrType::from(possibly_empty_type)],
+        )
+        .unwrap();
+        for extent in [0, 3] {
+            let square = reference_input(0, &[extent, extent]);
+            assert_eq!(
+                program.interpret(vec![ArrayIrValue::Array(square.clone())]),
+                Ok(ArrayIrValue::Array(Array::einsum("ii->i", [&square]).unwrap())),
+                "{extent}",
+            );
+        }
+
+        // Homogeneous array values with a dynamic extent stage the same sum, including through a composite.
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
+        let batched_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), 2.into(), 2.into()]));
+        let function = einsum::<ArrayContext>("bii,bi->b").unwrap();
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![extent, 2.into()]));
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<DomainTracer<ArrayContext>>| {
+                let diagonal = Einsum::einsum("bii->bi", [&inputs[0]])?;
+                function.call(vec![inputs[0].clone(), diagonal])
+            },
+            vec![batched_type, vector_type],
+        )
+        .unwrap();
+        let batched = reference_input(0, &[3, 2, 2]);
+        let diagonal = Array::einsum("bii->bi", [&batched]).unwrap();
+        assert_eq!(
+            program.interpret(vec![batched.clone(), reference_input(1, &[3, 2])]),
+            Array::einsum("bii,bi->b", [&batched, &diagonal]),
         );
 
         // Concrete array IR values contract their array members, while first-class dimension members are rejected.

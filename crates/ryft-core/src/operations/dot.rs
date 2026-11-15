@@ -739,30 +739,32 @@ impl DotPrecision {
         }
     }
 
-    /// Validates this [`DotPrecision`] against the input element types `lhs` and `rhs` of the operation
-    /// named `operation_name`. Per-input precisions support every input type. An algorithm or a preset requires
-    /// floating-point inputs, a [`DotAlgorithm`] additionally requires floating-point types and positive counts of its
-    /// own, and the `Any_F8` presets additionally require 8-bit floating-point inputs. JAX converts inputs of other
-    /// types to the input types of the algorithm instead, which callers do explicitly here.
+    /// Validates this [`DotPrecision`] against the input element types `lhs` and `rhs` of the operation named
+    /// `operation_name`. Per-input precisions support every input type. An algorithm or a preset supports real and
+    /// Boolean inputs, which are converted to the types that it computes with (refer to [`Self::computation_types`]),
+    /// like in JAX. Complex inputs are rejected, where JAX discards their imaginary components. A [`DotAlgorithm`]
+    /// additionally requires floating-point types and positive counts of its own, and the `Any_F8` presets
+    /// additionally require 8-bit floating-point inputs.
     ///
     /// # Errors
     ///
     /// Returns a [`TypeError`] that names `operation_name` if this [`DotPrecision`] does not support the input types
     /// or is itself invalid.
     pub fn validate(&self, operation_name: &str, lhs: DataType, rhs: DataType) -> Result<(), TypeError> {
-        let validate_floating_point_inputs = || {
-            if lhs.is_floating_point() && rhs.is_floating_point() {
+        let validate_inputs = || {
+            let is_supported = |data_type: DataType| data_type.is_real() || data_type == DataType::Boolean;
+            if is_supported(lhs) && is_supported(rhs) {
                 Ok(())
             } else {
                 Err(TypeError::invalid(format!(
-                    "`{operation_name}` algorithms require floating-point inputs but got `{lhs}` and `{rhs}`",
+                    "`{operation_name}` algorithms require real or Boolean inputs but got `{lhs}` and `{rhs}`",
                 )))
             }
         };
         match self {
             Self::Inputs { .. } => {}
             Self::Algorithm(algorithm) => {
-                validate_floating_point_inputs()?;
+                validate_inputs()?;
                 let algorithm_types =
                     [algorithm.lhs_precision_type, algorithm.rhs_precision_type, algorithm.accumulation_type];
                 if let Some(data_type) = algorithm_types.into_iter().find(|data_type| !data_type.is_floating_point()) {
@@ -780,7 +782,7 @@ impl DotPrecision {
                 }
             }
             Self::Preset(preset) => {
-                validate_floating_point_inputs()?;
+                validate_inputs()?;
                 let requires_f8_inputs = matches!(
                     preset,
                     DotAlgorithmPreset::Any_F8_Any_F8_F32
@@ -1432,9 +1434,10 @@ impl Dot for Array {
         // rounded to before it is converted to the output type. Floating-point contractions accumulate at `f64` when
         // one of those types is `f64` and at `f32` otherwise, and every narrower type is exactly representable there,
         // so each result is rounded once. This matches how XLA backends evaluate dots of narrow floating-point types
-        // when no algorithm is requested. Every other element type accumulates at the output type.
+        // when no algorithm is requested. Every other element type accumulates at the output type, unless an algorithm
+        // makes it compute at a floating-point type.
         let (lhs_type, rhs_type, result_type) = precision.computation_types(lhs_type, rhs_type, output_type);
-        let kernel_type = if !output_type.is_floating_point() {
+        let kernel_type = if !result_type.is_floating_point() {
             output_type
         } else if [lhs_type, rhs_type, result_type].contains(&DataType::F64) {
             DataType::F64
@@ -3668,20 +3671,23 @@ mod tests {
         assert_eq!(precision.validate(DOT_OPERATION_NAME, DataType::I32, DataType::I32), Ok(()));
         assert_eq!(precision.validate(DOT_OPERATION_NAME, DataType::Boolean, DataType::C64), Ok(()));
 
-        // An algorithm or a preset requires floating-point inputs.
+        // An algorithm or a preset supports real and Boolean inputs, which it converts, and rejects complex ones.
         let preset = DotPrecision::from(DotAlgorithmPreset::F32_F32_F32);
         assert_eq!(preset.validate(DOT_OPERATION_NAME, DataType::F64, DataType::BF16), Ok(()));
+        assert_eq!(preset.validate(DOT_OPERATION_NAME, DataType::I32, DataType::I32), Ok(()));
+        assert_eq!(preset.validate(DOT_OPERATION_NAME, DataType::Boolean, DataType::Boolean), Ok(()));
         assert_eq!(
-            preset.validate(DOT_OPERATION_NAME, DataType::I32, DataType::F32),
+            preset.validate(DOT_OPERATION_NAME, DataType::C64, DataType::C64),
             Err(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` algorithms require floating-point inputs but got `i32` and `f32`",
+                "`{DOT_OPERATION_NAME}` algorithms require real or Boolean inputs but got `c64` and `c64`",
             ))),
         );
         let algorithm = DotAlgorithm::new(DataType::F16, DataType::F16, DataType::F32);
         assert_eq!(DotPrecision::from(algorithm).validate("other", DataType::F32, DataType::F32), Ok(()));
+        assert_eq!(DotPrecision::from(algorithm).validate("other", DataType::U8, DataType::U8), Ok(()));
         assert_eq!(
             DotPrecision::from(algorithm).validate("other", DataType::F32, DataType::C64),
-            Err(TypeError::invalid("`other` algorithms require floating-point inputs but got `f32` and `c64`")),
+            Err(TypeError::invalid("`other` algorithms require real or Boolean inputs but got `f32` and `c64`")),
         );
 
         // An explicit algorithm has floating-point types and positive counts of its own.
@@ -4181,19 +4187,14 @@ mod tests {
             ],
         );
 
-        // A preset never changes the output type either, even when it computes with other types. It requires
-        // floating-point inputs.
+        // A preset never changes the output type either, even when it computes with other types, which includes
+        // integer inputs.
         check_operation_type_inference!(
             operation = DotOperation::matmul().with_precision(DotAlgorithmPreset::BF16_BF16_F32),
             cases = [
                 { input_types = [f64_input.clone(), f64_input.clone()], output_types = [f64_input.clone()] },
                 { input_types = [f8_input.clone(), f8_input.clone()], output_types = [f8_input.clone()] },
-                {
-                    input_types = [i32_input.clone(), i32_input.clone()],
-                    error = format!(
-                        "`{DOT_OPERATION_NAME}` algorithms require floating-point inputs but got `i32` and `i32`",
-                    ),
-                },
+                { input_types = [i32_input.clone(), i32_input.clone()], output_types = [i32_input.clone()] },
                 // The input types are validated first, so the precision never accepts an invalid pair.
                 {
                     input_types = [f64_input.clone(), plain_array(&[2, 2])],
@@ -4239,12 +4240,7 @@ mod tests {
                 .with_precision(DotAlgorithm::new(DataType::BF16, DataType::BF16, DataType::F32)),
             cases = [
                 { input_types = [f64_input.clone(), f64_input.clone()], output_types = [f64_input.clone()] },
-                {
-                    input_types = [i32_input.clone(), i32_input],
-                    error = format!(
-                        "`{DOT_OPERATION_NAME}` algorithms require floating-point inputs but got `i32` and `i32`",
-                    ),
-                },
+                { input_types = [i32_input.clone(), i32_input.clone()], output_types = [i32_input] },
             ],
         );
         check_operation_type_inference!(
@@ -4992,7 +4988,9 @@ mod tests {
             Ok(Array::scalar(5.0f32).unwrap()),
         );
 
-        // Invalid precisions are rejected exactly as they are for staged programs.
+        // An algorithm converts integer and Boolean inputs to the types that it computes with and converts its result
+        // to their type, like in JAX. The integers below are not representable at `bf16`, which rounds `300` to `300`
+        // and `601` to `600`, so the preset computes `300 · 300 + 600 · 600` at `f32`.
         let integers = Array::vector(vec![1i32, 2]).unwrap();
         assert_eq!(
             integers.dot_with_precision(
@@ -5000,8 +4998,37 @@ mod tests {
                 &DotDimensionNumbers::inner_product(),
                 DotAlgorithmPreset::F32_F32_F32.into(),
             ),
+            Ok(Array::scalar(5i32).unwrap()),
+        );
+        let integers = Array::vector(vec![300i32, 601]).unwrap();
+        assert_eq!(
+            integers.dot_with_precision(
+                &integers,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::BF16_BF16_F32.into(),
+            ),
+            Ok(Array::scalar(450_000i32).unwrap()),
+        );
+        let booleans = Array::vector(vec![true, false]).unwrap();
+        assert_eq!(
+            booleans.dot_with_precision(
+                &booleans,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::F32_F32_F32.into(),
+            ),
+            Ok(Array::scalar(true).unwrap()),
+        );
+
+        // Invalid precisions are rejected exactly as they are for staged programs.
+        let complex = Array::vector(vec![ComplexNumber::new(1.0f32, 1.0)]).unwrap();
+        assert_eq!(
+            complex.dot_with_precision(
+                &complex,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::F32_F32_F32.into(),
+            ),
             Err(ProgramError::Type(TypeError::invalid(format!(
-                "`{DOT_OPERATION_NAME}` algorithms require floating-point inputs but got `i32` and `i32`",
+                "`{DOT_OPERATION_NAME}` algorithms require real or Boolean inputs but got `c64` and `c64`",
             )))),
         );
     }
