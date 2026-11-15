@@ -2318,8 +2318,8 @@ enum ArrayShardStorage<'o> {
 }
 
 // Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
-#[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::pin::pin;

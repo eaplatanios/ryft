@@ -611,9 +611,9 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrType, ArrayOperation, Complex, Dimension as CoreDimension, Dot, DotAlgorithm,
-        DotDimensionNumbers, DotOperation, Einsum, EinsumOptions, EinsumPathStep, EinsumPathStrategy,
-        EinsumSpecification, Operation as CoreOperation, Placeholder, ProjectedContext, RaggedDot,
+        Array as CoreArray, ArrayIrType, ArrayOperation, Complex, Dimension as CoreDimension, DimensionBounds,
+        DimensionVariable, Dot, DotAlgorithm, DotDimensionNumbers, DotOperation, Einsum, EinsumOptions, EinsumPathStep,
+        EinsumPathStrategy, EinsumSpecification, Operation as CoreOperation, Placeholder, ProjectedContext, RaggedDot,
         RaggedDotDimensionNumbers, Sharding, Typed, bf16, differentiate_at, einsum, f8e4m3fn, f8e5m2, f16,
     };
     use ryft_pjrt::{BufferType, Error as PjrtError, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
@@ -803,6 +803,39 @@ mod tests {
                   func.func @main(%arg0: tensor<2x2xf8E4M3FN>, %arg1: tensor<2x2xf8E4M3FN>) -> tensor<2x2xf32> {
                     %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x2xf8E4M3FN>, tensor<2x2xf8E4M3FN>) -> tensor<2x2xf32>
                     return %0 : tensor<2x2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_dot_operation_lower_with_proven_dynamic_dimensions() {
+        // A dynamic dimension whose bounds admit one extent contracts with the static dimension of that extent.
+        let proven = DimensionVariable::new("proven", DimensionBounds::new(2, Some(3)).unwrap());
+        let left_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Dynamic(proven)]));
+        let right_type = ArrayType::new_static(DataType::F32, [2, 2]);
+        let mut builder = ProgramBuilder::new();
+        let left = builder.add_input(left_type.clone());
+        let right = builder.add_input(right_type.clone());
+        let operation = DotOperation::new(DotDimensionNumbers::matmul());
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        let input_types = vec![left_type, right_type.clone()];
+        let module =
+            to_mlir_module_for_program(&program, &[], &input_types, &[right_type], "main", None, None).unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x2xf32>, %arg1: tensor<2x2xf32>, %arg2: tensor<i32>) -> tensor<2x2xf32> {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 1 : (tensor<2x2xf32>, tensor<i32>) -> tensor<2x?xf32, #stablehlo.bounds<?, 2>>
+                    %1 = stablehlo.dot_general %0, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : (tensor<2x?xf32, #stablehlo.bounds<?, 2>>, tensor<2x2xf32>) -> tensor<2x2xf32>
+                    return %1 : tensor<2x2xf32>
                   }
                 }
             "#},
@@ -2042,8 +2075,8 @@ mod tests {
         assert_eq!(output.copy_to_host().unwrap(), reference_output.logical_bytes());
 
         // Boolean and complex inputs, accumulation types of another kind than the inputs, algorithms over integers,
-        // reductions in a path, and the dynamic programming search agree with the reference backend as well. Every result is exact and no contraction is
-        // an outer product of signed zeros, so bytes are compared.
+        // reductions in a path, and the dynamic programming search agree with the reference backend as well. Every
+        // result is exact and no contraction is an outer product of signed zeros, so bytes are compared.
         let booleans = CoreArray::matrix(2, 2, vec![false, true, true, true]).unwrap();
         let fractions = CoreArray::matrix(2, 2, vec![1.5f32, 2.5, 0.5, 0.5]).unwrap();
         let integers = CoreArray::matrix(2, 2, vec![1u8, 2, 3, 4]).unwrap();
@@ -2086,6 +2119,31 @@ mod tests {
         let reference_output = CoreArray::einsum("ij,jk->ik", [&integers, &fractions]).unwrap();
         assert_eq!(reference_output.r#type().data_type(), DataType::F32);
         assert_eq!(output.copy_to_host().unwrap(), reference_output.logical_bytes());
+
+        // An algorithm contracts its inputs as they are and converts its result to an accumulation type of any kind.
+        // The `i16` inputs below are exact at `f32`, while `2049` rounds to `2048` at `f16`, so converting them to
+        // the accumulation type first would produce zero. JAX computes one as well.
+        let wide = CoreArray::vector(vec![2049i16, -2048]).unwrap();
+        let ones = CoreArray::vector(vec![1i16, 1]).unwrap();
+        let lhs = replicated_array(&domain, &mesh, DataType::I16, &[2], &wide.logical_bytes());
+        let rhs = replicated_array(&domain, &mesh, DataType::I16, &[2], &ones.logical_bytes());
+        let specification = "i,i->".parse::<EinsumSpecification>().unwrap();
+        let expected = [
+            CoreArray::scalar(f16::from_f32(1.0)).unwrap(),
+            CoreArray::scalar(1i8).unwrap(),
+            CoreArray::scalar(Complex::new(1.0f32, 0.0)).unwrap(),
+            CoreArray::scalar(true).unwrap(),
+        ];
+        for expected in expected {
+            let accumulation_type = expected.r#type().data_type();
+            let options = EinsumOptions::new()
+                .with_precision(DotAlgorithmPreset::F32_F32_F32)
+                .with_accumulation_type(accumulation_type);
+            let output = Einsum::einsum_with_options(&specification, [&lhs, &rhs], &options).unwrap();
+            assert_eq!(output.r#type().data_type(), accumulation_type);
+            assert_eq!(output.copy_to_host().unwrap(), expected.logical_bytes(), "{accumulation_type}");
+            assert_eq!(CoreArray::einsum_with_options(&specification, [&wide, &ones], &options), Ok(expected));
+        }
 
         for (subscripts, reference, options) in cases {
             let input =

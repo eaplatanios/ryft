@@ -608,8 +608,8 @@ fn merge_dense_byte_segment(
 }
 
 // Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
-#[cfg(test)]
 #[allow(clippy::single_range_in_vec_init)]
+#[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};

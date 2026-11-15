@@ -1,7 +1,7 @@
 //! Placement of an [`Array`] on another sharding or device mesh, by copying exact shards, by a compiled reshard, or
 //! through host memory.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -11,7 +11,9 @@ use ryft_core::{
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
-use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError, ExecutionFence};
+use ryft_pjrt::{
+    Buffer, BufferType, Client, Device as PjrtDevice, DeviceId, Error as PjrtError, Event, ExecutionFence,
+};
 
 use crate::arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 use crate::{CompiledFunction, Domain, Error, Options, ToPjrt};
@@ -281,6 +283,8 @@ impl<'o> Array<'o> {
     /// sends, because a send completes only once its receiver issues the matching receive, and the receiver may be
     /// this same process further below or a process that is itself waiting for a send of its own. The caller retains
     /// the fence in the placed array so that [`Self::ready`] and [`Self::block_until_ready`] surface send failures.
+    /// Every process derives the same plan from global metadata, so each send has exactly one matching receive, and
+    /// [`issue_cross_host_transfers`] issues the transfers of all processes in one global order.
     fn exact_shard_buffers(
         &self,
         client: &'o Client<'_>,
@@ -307,37 +311,6 @@ impl<'o> Array<'o> {
         for device in addressable_devices {
             addressable_device_by_id.insert(device.id()?, device);
         }
-
-        let send_fence = if !plan.cross_host_sends().is_empty() {
-            let mut send_buffers = Vec::with_capacity(plan.cross_host_sends().len());
-            let mut destination_devices = Vec::with_capacity(plan.cross_host_sends().len());
-            let mut transfer_keys = Vec::with_capacity(plan.cross_host_sends().len());
-            for send_plan in plan.cross_host_sends() {
-                let source_buffer = self
-                    .addressable_device_shard(send_plan.source_device_id())
-                    .ok_or_else(|| {
-                        Error::from(ArrayError::MissingShardBuffer {
-                            shard_index: send_plan.source_shard_index(),
-                            device_id: send_plan.source_device_id(),
-                        })
-                    })?
-                    .buffer()
-                    .map(|buffer| buffer.as_ref())
-                    .unwrap();
-                send_buffers.push(source_buffer);
-                destination_devices.push(cross_host_global_device_id(send_plan.destination_device_id())?);
-                transfer_keys.push(send_plan.transfer_key());
-            }
-            let send_events = client.cross_host_send_buffers(
-                send_buffers.as_slice(),
-                destination_devices.as_slice(),
-                transfer_keys.as_slice(),
-                &[],
-            )?;
-            Some(ExecutionFence::new(send_events))
-        } else {
-            None
-        };
 
         let mut addressable_buffers = Vec::new();
         for local_copy_plan in plan.local_copies() {
@@ -367,42 +340,45 @@ impl<'o> Array<'o> {
             addressable_buffers.push(Arc::new(source_buffer.copy_to_device(destination_device.clone())?));
         }
 
-        let mut receive_plans_by_device = HashMap::<DeviceId, Vec<&CrossHostShardReceivePlan>>::new();
-        for receive_plan in plan.cross_host_receives() {
-            receive_plans_by_device.entry(receive_plan.destination_device_id()).or_default().push(receive_plan);
+        let mut transfers = Vec::with_capacity(plan.cross_host_sends().len() + plan.cross_host_receives().len());
+        for send_plan in plan.cross_host_sends() {
+            let buffer = self
+                .addressable_device_shard(send_plan.source_device_id())
+                .ok_or_else(|| {
+                    Error::from(ArrayError::MissingShardBuffer {
+                        shard_index: send_plan.source_shard_index(),
+                        device_id: send_plan.source_device_id(),
+                    })
+                })?
+                .buffer()
+                .map(|buffer| buffer.as_ref())
+                .unwrap();
+            transfers.push(CrossHostTransfer::Send {
+                source: send_plan.source_device_id(),
+                destination: send_plan.destination_device_id(),
+                transfer_key: send_plan.transfer_key(),
+                buffer,
+            });
         }
-        let mut receive_device_ids = receive_plans_by_device.keys().copied().collect::<Vec<_>>();
-        receive_device_ids.sort_unstable();
-        for receive_device_id in receive_device_ids {
-            let receive_plans = receive_plans_by_device.get(&receive_device_id).unwrap();
-            let destination_device = addressable_device_by_id.get(&receive_device_id).ok_or_else(|| {
+        for receive_plan in plan.cross_host_receives() {
+            let device = addressable_device_by_id.get(&receive_plan.destination_device_id()).ok_or_else(|| {
                 Error::from(ArrayError::NonAddressableDevice {
-                    device_id: receive_device_id,
+                    device_id: receive_plan.destination_device_id(),
                     process_index: client_process_index,
                 })
             })?;
-            let element_types = receive_plans.iter().map(|_| self.data_type().to_pjrt()).collect::<Vec<_>>();
-            let dimensions = receive_plans
-                .iter()
-                .map(|receive_plan| receive_plan.cross_host_shape())
-                .collect::<Result<Vec<_>, _>>()?;
-            let dimension_slices = dimensions.iter().map(Vec::as_slice).collect::<Vec<_>>();
-            let source_devices = receive_plans
-                .iter()
-                .map(|receive_plan| cross_host_global_device_id(receive_plan.source_device_id()))
-                .collect::<Result<Vec<_>, _>>()?;
-            let transfer_keys =
-                receive_plans.iter().map(|receive_plan| receive_plan.transfer_key()).collect::<Vec<_>>();
-            let received_buffers = client.cross_host_receive_buffers(
-                element_types.as_slice(),
-                dimension_slices.as_slice(),
-                destination_device,
-                source_devices.as_slice(),
-                transfer_keys.as_slice(),
-                &[],
-            )?;
-            addressable_buffers.extend(received_buffers.into_iter().map(Arc::new));
+            transfers.push(CrossHostTransfer::Receive {
+                source: receive_plan.source_device_id(),
+                destination: receive_plan.destination_device_id(),
+                transfer_key: receive_plan.transfer_key(),
+                device,
+                element_type: self.data_type().to_pjrt(),
+                dimensions: receive_plan.cross_host_shape()?,
+            });
         }
+        let (send_events, received_buffers) = issue_cross_host_transfers(client, transfers)?;
+        addressable_buffers.extend(received_buffers.into_iter().map(|(_, buffer)| Arc::new(buffer)));
+        let send_fence = (!send_events.is_empty()).then(|| ExecutionFence::new(send_events));
 
         Ok(Some((addressable_buffers, send_fence)))
     }
@@ -647,28 +623,30 @@ impl<'o> Array<'o> {
             self.mesh().devices().first().copied().ok_or_else(|| ryft_core::ProgramError::InvalidArgument {
                 message: "cannot reshard an array on an empty self device mesh".to_string(),
             })?;
-        let canonical_source_global_id = cross_host_global_device_id(canonical_source_device.id())?;
         let this_process_is_canonical_sender = canonical_source_device.process_index() == client_process_index;
         let local_source_buffer = self.addressable_shards().find_map(|shard| shard.buffer().cloned());
 
-        // Decide the transfer plan of each destination device. Local destinations are served by `copy_to_device` when
-        // this process owns a source buffer, or by `cross_host_receive_buffers` when the source is on another process.
-        // Remote destinations are served by `cross_host_send_buffers` from the process of the canonical sender and
-        // ignored elsewhere.
-        let mut local_buffers: HashMap<DeviceId, Buffer<'o>> = HashMap::new();
-        let mut send_buffers: Vec<&Buffer<'o>> = Vec::new();
-        let mut send_destination_devices: Vec<GlobalDeviceId> = Vec::new();
-        let mut send_transfer_keys: Vec<CrossHostTransferKey> = Vec::new();
-        // Receives must be grouped by destination device for the cross-host API.
-        let mut receive_plans_by_device: HashMap<DeviceId, Vec<(GlobalDeviceId, CrossHostTransferKey)>> =
-            HashMap::new();
+        // Every process must derive the same transfers from global metadata, because a send that no receive matches
+        // is still delivered over the communicator of its pair of devices (e.g., by NCCL on CUDA) and then corrupts
+        // the next transfer between those devices. A process that owns a device of the source mesh holds a replica of
+        // this array, which `Self::validate_compiled_reshard` guarantees, so it copies that replica to its destination
+        // devices, and only the other processes receive from the canonical sender.
+        let source_process_indices =
+            self.mesh().devices().iter().map(|device| device.process_index()).collect::<HashSet<_>>();
 
+        // Decide the transfer plan of each destination device. Local destinations are served by `copy_to_device` when
+        // this process owns a device of the source mesh, or by a cross-host receive otherwise. Remote destinations of
+        // processes that own no device of the source mesh are served by cross-host sends from the process of the
+        // canonical sender, and every other remote destination is ignored.
+        let mut local_buffers: HashMap<DeviceId, Buffer<'o>> = HashMap::new();
+        let mut transfers = Vec::new();
+        let element_type = self.data_type().to_pjrt();
+        let dimensions = self.shape().as_slice().iter().map(|&size| size as i64).collect::<Vec<_>>();
         let destination_count = destination_mesh.devices().len();
         for (destination_index, destination_device) in destination_mesh.devices().iter().enumerate() {
             let destination_device_id = destination_device.id();
             let destination_local = destination_device.process_index() == client_process_index;
             let transfer_key = exact_shard_transfer_key(0, destination_index, destination_count)?;
-            let destination_global_id = cross_host_global_device_id(destination_device_id)?;
 
             if destination_local {
                 let pjrt_device =
@@ -676,78 +654,55 @@ impl<'o> Array<'o> {
                         device_id: destination_device_id,
                         process_index: client_process_index,
                     })?;
-                if let Some(local_source) = local_source_buffer.as_ref() {
+                if source_process_indices.contains(&client_process_index) {
+                    let local_source = local_source_buffer.as_ref().ok_or_else(|| {
+                        Error::from(ArrayError::MissingShardBuffer {
+                            shard_index: 0,
+                            device_id: canonical_source_device.id(),
+                        })
+                    })?;
                     let buffer = local_source.copy_to_device(pjrt_device.clone())?;
                     local_buffers.insert(destination_device_id, buffer);
                 } else {
-                    receive_plans_by_device
-                        .entry(destination_device_id)
-                        .or_default()
-                        .push((canonical_source_global_id, transfer_key));
+                    transfers.push(CrossHostTransfer::Receive {
+                        source: canonical_source_device.id(),
+                        destination: destination_device_id,
+                        transfer_key,
+                        device: pjrt_device,
+                        element_type,
+                        dimensions: dimensions.clone(),
+                    });
                 }
-            } else if this_process_is_canonical_sender {
+            } else if this_process_is_canonical_sender
+                && !source_process_indices.contains(&destination_device.process_index())
+            {
                 let local_source = local_source_buffer.as_ref().ok_or_else(|| {
                     Error::from(ArrayError::MissingShardBuffer {
                         shard_index: 0,
                         device_id: canonical_source_device.id(),
                     })
                 })?;
-                send_buffers.push(local_source.as_ref());
-                send_destination_devices.push(destination_global_id);
-                send_transfer_keys.push(transfer_key);
+                transfers.push(CrossHostTransfer::Send {
+                    source: canonical_source_device.id(),
+                    destination: destination_device_id,
+                    transfer_key,
+                    buffer: local_source.as_ref(),
+                });
             }
             // Otherwise, another process serves this remote destination, and there is nothing to do here.
         }
 
         // A receiver may have only local destinations, so an unavailable extension cannot be attributed to a remote
         // destination device. Preserve the plugin's actual extension error before issuing any transfers.
-        if !send_buffers.is_empty() || !receive_plans_by_device.is_empty() {
+        if !transfers.is_empty() {
             client.cross_host_transfers_extension()?;
         }
 
-        // Issue cross-host sends, if any. Waiting for them here could deadlock, because a send completes only once its
-        // receiver issues the matching receive, so the returned array retains their completion fence instead.
-        let send_fence = if !send_buffers.is_empty() {
-            let send_events = client.cross_host_send_buffers(
-                send_buffers.as_slice(),
-                send_destination_devices.as_slice(),
-                send_transfer_keys.as_slice(),
-                &[],
-            )?;
-            Some(ExecutionFence::new(send_events))
-        } else {
-            None
-        };
-
-        // Issue cross-host receives, if any. Each call covers one destination device, matching the receives of
-        // `Self::exact_shard_buffers`.
-        let element_type_pjrt = self.data_type().to_pjrt();
-        let shape_i64 = self.shape().as_slice().iter().map(|&size| size as i64).collect::<Vec<_>>();
-        let mut receive_device_ids = receive_plans_by_device.keys().copied().collect::<Vec<_>>();
-        receive_device_ids.sort_unstable();
-        for destination_device_id in receive_device_ids {
-            let plans = receive_plans_by_device.get(&destination_device_id).unwrap();
-            let pjrt_device =
-                destination_device_by_id.get(&destination_device_id).ok_or(ArrayError::NonAddressableDevice {
-                    device_id: destination_device_id,
-                    process_index: client_process_index,
-                })?;
-            let element_types = plans.iter().map(|_| element_type_pjrt).collect::<Vec<_>>();
-            let dimensions = plans.iter().map(|_| shape_i64.as_slice()).collect::<Vec<_>>();
-            let source_devices = plans.iter().map(|(source_global_id, _)| *source_global_id).collect::<Vec<_>>();
-            let transfer_keys = plans.iter().map(|(_, key)| *key).collect::<Vec<_>>();
-            let received = client.cross_host_receive_buffers(
-                element_types.as_slice(),
-                dimensions.as_slice(),
-                pjrt_device,
-                source_devices.as_slice(),
-                transfer_keys.as_slice(),
-                &[],
-            )?;
-            for buffer in received {
-                local_buffers.insert(destination_device_id, buffer);
-            }
-        }
+        // Waiting for the sends here could deadlock, because a send completes only once its receiver issues the
+        // matching receive, so the returned array retains their completion fence instead.
+        let (send_events, received_buffers) = issue_cross_host_transfers(client, transfers)?;
+        local_buffers.extend(received_buffers);
+        let send_fence = (!send_events.is_empty()).then(|| ExecutionFence::new(send_events));
 
         // Assemble the buffers of the devices in the device order of `destination_mesh`. Only locally addressable
         // destinations contribute to the intermediate `Array`, and the owning processes handle the remote
@@ -1026,6 +981,58 @@ impl CrossHostShardReceivePlan {
     }
 }
 
+/// One PJRT cross-host transfer that the current process takes part in, which [`issue_cross_host_transfers`] issues.
+enum CrossHostTransfer<'b, 'o> {
+    /// Send of `buffer` from its device `source` of the current process to the device `destination` of another
+    /// process.
+    Send {
+        /// ID of the source device.
+        source: DeviceId,
+
+        /// ID of the destination device.
+        destination: DeviceId,
+
+        /// Transfer rendezvous key shared with the matching receive.
+        transfer_key: CrossHostTransferKey,
+
+        /// Buffer to send.
+        buffer: &'b Buffer<'o>,
+    },
+
+    /// Receive of a buffer of `element_type` and `dimensions` from the device `source` of another process onto
+    /// `device`, which is the device `destination` of the current process.
+    Receive {
+        /// ID of the source device.
+        source: DeviceId,
+
+        /// ID of the destination device.
+        destination: DeviceId,
+
+        /// Transfer rendezvous key shared with the matching send.
+        transfer_key: CrossHostTransferKey,
+
+        /// Destination device.
+        device: &'b PjrtDevice<'o>,
+
+        /// Element type of the received buffer.
+        element_type: BufferType,
+
+        /// Dimensions of the received buffer.
+        dimensions: Vec<i64>,
+    },
+}
+
+impl CrossHostTransfer<'_, '_> {
+    /// Returns the IDs of the source and destination devices of this transfer.
+    fn devices(&self) -> (DeviceId, DeviceId) {
+        match self {
+            Self::Send { source, destination, .. } | Self::Receive { source, destination, .. } => {
+                (*source, *destination)
+            }
+        }
+    }
+}
+
 /// Returns the deterministic cross-host transfer key for moving the source shard `source_shard_index` to the
 /// destination shard `destination_shard_index`, which is `source_shard_index * destination_shard_count +
 /// destination_shard_index`, so that every pair of source and destination shards gets a unique key.
@@ -1062,6 +1069,46 @@ fn cross_host_global_device_id(device_id: DeviceId) -> Result<GlobalDeviceId, Er
     i32::try_from(device_id).map_err(|_| Error::SizeLimitExceeded {
         message: format!("cross-host transfer device ID {device_id} exceeds the maximum allowed value of {}", i32::MAX),
     })
+}
+
+/// Issues `transfers`, which are the cross-host transfers that the current process takes part in for one placement,
+/// and returns the completion events of the sends and the received buffers with the IDs of their devices.
+///
+/// The transfers are issued one at a time in the order of their source and then destination device IDs, keeping the
+/// given order of the transfers between the same two devices. The CUDA plugin carries the transfers between two
+/// devices over a communicator of that pair and pairs them by the order in which both sides issue them, ignoring their
+/// transfer keys, and the first transfer between two devices blocks the calling thread until the peer process issues
+/// its matching transfer. Two processes that each send before they receive would therefore deadlock when they swap
+/// shards. Every process derives the same transfers from global metadata and issues its own in this one global order,
+/// so the first pair of devices with a pending transfer always has both of its processes waiting for it.
+fn issue_cross_host_transfers<'o>(
+    client: &'o Client<'_>,
+    mut transfers: Vec<CrossHostTransfer<'_, 'o>>,
+) -> Result<(Vec<Event<()>>, Vec<(DeviceId, Buffer<'o>)>), Error> {
+    transfers.sort_by_key(CrossHostTransfer::devices);
+    let mut send_events = Vec::new();
+    let mut received_buffers = Vec::new();
+    for transfer in transfers {
+        match transfer {
+            CrossHostTransfer::Send { destination, transfer_key, buffer, .. } => {
+                let destination = cross_host_global_device_id(destination)?;
+                send_events.extend(client.cross_host_send_buffers(&[buffer], &[destination], &[transfer_key], &[])?);
+            }
+            CrossHostTransfer::Receive { source, destination, transfer_key, device, element_type, dimensions } => {
+                let source = cross_host_global_device_id(source)?;
+                let buffers = client.cross_host_receive_buffers(
+                    &[element_type],
+                    &[dimensions.as_slice()],
+                    device,
+                    &[source],
+                    &[transfer_key],
+                    &[],
+                )?;
+                received_buffers.extend(buffers.into_iter().map(|buffer| (destination, buffer)));
+            }
+        }
+    }
+    Ok((send_events, received_buffers))
 }
 
 /// Returns the preferred source shard among the `source_shards` whose slices exactly match `destination_shard`.

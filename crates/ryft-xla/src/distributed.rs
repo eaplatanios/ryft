@@ -559,6 +559,8 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     #[cfg(feature = "cuda-13")]
+    use crate::arrays::DevicePutTarget;
+    #[cfg(feature = "cuda-13")]
     use crate::lowering::tests::test_spmd_compilation_options;
     use crate::operations::sharding::shard_map::tests::doubling_reduced_reference_program;
     use crate::tests::{values_from_bytes, values_to_bytes};
@@ -766,6 +768,95 @@ mod tests {
         assert_eq!(read_addressable_f32s(&reference.read().unwrap()), vec![vec![2.0, 4.0]; local_positions.len()]);
         let materialized = reference.read().unwrap().copy_to_host().unwrap();
         assert_eq!(values_from_bytes::<f32>(materialized.as_slice()), vec![2.0, 4.0]);
+    }
+
+    /// Places arrays of `[1, 2, 3, 4]` across the two processes of a CUDA job with `place`, which calls
+    /// [`Array::to_placement`] or [`Array::into_placement`], and prints a `probe:` line with whether the client exposes
+    /// the PJRT cross-host transfers extension and then one per placement with the elements of the shards that this
+    /// process addresses afterwards and the result of [`Array::block_until_ready`]. Every process of the job must call
+    /// this function, because each placement transfers shards between the processes or executes a compiled reshard
+    /// over the devices of both.
+    #[cfg(feature = "cuda-13")]
+    fn probe_cross_host_placements<'c>(
+        client: &'c Client<'c>,
+        place: impl Fn(Array<'c>, &Domain<'c>, DevicePutTarget) -> Result<Array<'c>, Error>,
+    ) {
+        let rank = client.process_index().unwrap();
+        match client.cross_host_transfers_extension() {
+            Ok(_) => println!("probe: rank {rank} cross_host_transfers_extension: available"),
+            Err(error) => println!("probe: rank {rank} cross_host_transfers_extension: {error}"),
+        }
+        let devices = client
+            .devices()
+            .unwrap()
+            .iter()
+            .map(|device| Device::from_pjrt(device).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(devices.iter().map(Device::process_index).collect::<Vec<_>>(), vec![0, 1]);
+        let domain = Session::new(client).domain();
+        let mesh = |devices: Vec<Device>| {
+            let axis = MeshAxis::new("x", devices.len(), MeshAxisType::Explicit).unwrap();
+            DeviceMesh::new(LogicalMesh::new(vec![axis]).unwrap(), devices).unwrap()
+        };
+        let replicated = |mesh: &DeviceMesh| Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sharded = |mesh: &DeviceMesh| {
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()
+        };
+        let array = |mesh: &DeviceMesh, sharding: Sharding, values: [f32; 4]| {
+            let r#type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+            Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(&values)).unwrap()
+        };
+        let process_0_mesh = mesh(vec![devices[0]]);
+        let forward_mesh = mesh(devices.clone());
+        let reversed_mesh = mesh(vec![devices[1], devices[0]]);
+
+        // A replicated array on the device of process 0 is copied whole to the device of process 1 when the
+        // destination is replicated, and a sharded destination is resharded after that copy. A sharded array on both
+        // devices swaps its shards between the processes for the reversed device order, and a replicated destination
+        // on that order is resharded after gathering the array on its source devices. Because CUDA pairs the
+        // cross-host sends and receives between two devices by their order rather than by their transfer keys, a
+        // final copy from process 0 to process 1 receives the values of an earlier send that no receive matched.
+        let placements = [
+            (
+                "sharded_to_reversed_sharded",
+                array(&forward_mesh, sharded(&forward_mesh), [9.0, 10.0, 11.0, 12.0]),
+                DevicePutTarget::placement(reversed_mesh.clone(), sharded(&reversed_mesh)).unwrap(),
+            ),
+            (
+                "replicated_to_replicated",
+                array(&process_0_mesh, replicated(&process_0_mesh), [1.0, 2.0, 3.0, 4.0]),
+                DevicePutTarget::placement(forward_mesh.clone(), replicated(&forward_mesh)).unwrap(),
+            ),
+            (
+                "replicated_to_sharded",
+                array(&process_0_mesh, replicated(&process_0_mesh), [5.0, 6.0, 7.0, 8.0]),
+                DevicePutTarget::placement(forward_mesh.clone(), sharded(&forward_mesh)).unwrap(),
+            ),
+            (
+                "sharded_to_reversed_replicated",
+                array(&forward_mesh, sharded(&forward_mesh), [13.0, 14.0, 15.0, 16.0]),
+                DevicePutTarget::placement(reversed_mesh.clone(), replicated(&reversed_mesh)).unwrap(),
+            ),
+            (
+                "replicated_to_replicated_again",
+                array(&process_0_mesh, replicated(&process_0_mesh), [17.0, 18.0, 19.0, 20.0]),
+                DevicePutTarget::placement(forward_mesh.clone(), replicated(&forward_mesh)).unwrap(),
+            ),
+        ];
+        for (name, source, target) in placements {
+            match place(source, &domain, target) {
+                Ok(placed) => {
+                    let ready = match placed.block_until_ready() {
+                        Ok(()) => "ready".to_string(),
+                        Err(error) => error.to_string().lines().next().unwrap_or("").to_string(),
+                    };
+                    println!("probe: rank {rank} {name}: {:?} {ready}", read_addressable_f32s(&placed));
+                }
+                Err(error) => {
+                    println!("probe: rank {rank} {name}: {}", error.to_string().lines().next().unwrap_or(""));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1656,6 +1747,99 @@ module @jit__lambda attributes {mhlo.num_partitions = 2 : i32, mhlo.num_replicas
             indoc! {"
                 rank 0 parallel_broadcast: [3.0, 4.0] []
                 rank 1 parallel_broadcast: [3.0, 4.0] []"},
+        );
+    }
+
+    // Worker of `test_array_to_placement_on_two_cuda_processes`, which returns immediately unless that test launched it
+    // as one of its two ranks. Each placement also checks that the source array keeps its shards.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_array_to_placement_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            probe_cross_host_placements(client, |source, domain, target| {
+                let source_shards = read_addressable_f32s(&source);
+                let placed = source.to_placement(domain, target)?;
+                assert_eq!(read_addressable_f32s(&source), source_shards);
+                Ok(placed)
+            })
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_to_placement_on_two_cuda_processes() {
+        let Some(outputs) = run_cuda_rank_pair("distributed::tests::test_array_to_placement_cuda_process_helper")
+        else {
+            return;
+        };
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {"
+                rank 0 cross_host_transfers_extension: available
+                rank 0 sharded_to_reversed_sharded: [[11.0, 12.0]] ready
+                rank 0 replicated_to_replicated: [[1.0, 2.0, 3.0, 4.0]] ready
+                rank 0 replicated_to_sharded: [[5.0, 6.0]] ready
+                rank 0 sharded_to_reversed_replicated: [[13.0, 14.0, 15.0, 16.0]] ready
+                rank 0 replicated_to_replicated_again: [[17.0, 18.0, 19.0, 20.0]] ready
+                rank 1 cross_host_transfers_extension: available
+                rank 1 sharded_to_reversed_sharded: [[9.0, 10.0]] ready
+                rank 1 replicated_to_replicated: [[1.0, 2.0, 3.0, 4.0]] ready
+                rank 1 replicated_to_sharded: [[7.0, 8.0]] ready
+                rank 1 sharded_to_reversed_replicated: [[13.0, 14.0, 15.0, 16.0]] ready
+                rank 1 replicated_to_replicated_again: [[17.0, 18.0, 19.0, 20.0]] ready"},
+        );
+    }
+
+    // Worker of `test_array_into_placement_on_two_cuda_processes`, which returns immediately unless that test launched
+    // it as one of its two ranks.
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_array_into_placement_cuda_process_helper() {
+        let Ok(role) = std::env::var(MULTI_HOST_TEST_ROLE) else {
+            return;
+        };
+        run_as_cuda_rank(role.parse().unwrap(), |client| {
+            probe_cross_host_placements(client, |source, domain, target| source.into_placement(domain, target))
+        });
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    #[ignore = "requires one CUDA GPU with NCCL multi-rank support and CUDA MPS"]
+    fn test_array_into_placement_on_two_cuda_processes() {
+        let Some(outputs) = run_cuda_rank_pair("distributed::tests::test_array_into_placement_cuda_process_helper")
+        else {
+            return;
+        };
+        let probes = outputs
+            .iter()
+            .flat_map(|output| output.lines().filter_map(|line| line.split_once("probe: ").map(|(_, probe)| probe)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            probes,
+            indoc! {"
+                rank 0 cross_host_transfers_extension: available
+                rank 0 sharded_to_reversed_sharded: [[11.0, 12.0]] ready
+                rank 0 replicated_to_replicated: [[1.0, 2.0, 3.0, 4.0]] ready
+                rank 0 replicated_to_sharded: [[5.0, 6.0]] ready
+                rank 0 sharded_to_reversed_replicated: [[13.0, 14.0, 15.0, 16.0]] ready
+                rank 0 replicated_to_replicated_again: [[17.0, 18.0, 19.0, 20.0]] ready
+                rank 1 cross_host_transfers_extension: available
+                rank 1 sharded_to_reversed_sharded: [[9.0, 10.0]] ready
+                rank 1 replicated_to_replicated: [[1.0, 2.0, 3.0, 4.0]] ready
+                rank 1 replicated_to_sharded: [[7.0, 8.0]] ready
+                rank 1 sharded_to_reversed_replicated: [[13.0, 14.0, 15.0, 16.0]] ready
+                rank 1 replicated_to_replicated_again: [[17.0, 18.0, 19.0, 20.0]] ready"},
         );
     }
 }
