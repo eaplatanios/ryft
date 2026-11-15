@@ -726,18 +726,15 @@ impl EinsumOptions {
         self
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns these options with a requested output [`Sharding`], which the last operation of the last step
-    /// receives, reordered to the order of its axes when a transpose follows it. That operation is the pairwise
-    /// contraction of an [`EinsumPathStep::Contraction`] (refer to [`DotOperation::with_output_sharding`]) and the
-    /// last sum of an [`EinsumPathStep::Reduction`] (refer to [`ReduceOperation::with_output_sharding`]), such as
-    /// the sum of an einsum of one input. After a last step that ends with neither (e.g., the einsums `ij->ji`,
-    /// `ij->ij`, and `ii->i`), the output is resharded to the request with a [`Reshard`], where JAX accepts the
-    /// request and ignores it for the first two. The sharding must cover every axis of the output, like every
-    /// [`Sharding`] of a type, and the results of the earlier steps infer their shardings from their inputs. This
-    /// is the `out_sharding` argument of `jax.numpy.einsum`, which additionally accepts a sharding of fewer axes
-    /// and stages its earlier steps with automatic sharding.
+    /// Returns these options with a requested output [`Sharding`], which the last operation of the last step receives,
+    /// reordered to the order of its axes when a transpose follows it. That operation is the pairwise contraction of
+    /// an [`EinsumPathStep::Contraction`] and the last sum of an [`EinsumPathStep::Reduction`], such as the sum of an
+    /// einsum of one input. After a last step that ends with neither (e.g., the einsums `ij->ji`, `ij->ij`, and
+    /// `ii->i`), the output is resharded to the request with a [`Reshard`], where JAX accepts the request and ignores
+    /// it for the first two. The sharding must cover every axis of the output, like every [`Sharding`] of a type, and
+    /// the results of the earlier steps infer their shardings from their inputs. This is the `out_sharding` argument
+    /// of `jax.numpy.einsum`, which additionally accepts a sharding of fewer axes and stages its earlier steps with
+    /// automatic sharding.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.output_sharding = output_sharding.into();
@@ -768,6 +765,8 @@ impl EinsumOptions {
         self.output_sharding.as_ref()
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Plan of an einsum for inputs of particular types, which [`EinsumSpecification::plan`] creates. It holds the labels
 /// of every input and output axis after expanding ellipses, the selected path, and the steps that realize it.
@@ -6591,7 +6590,8 @@ mod tests {
         // its result is resharded to it. That covers a transpose, an einsum that returns its input, and a diagonal
         // that is kept, for which JAX accepts the request as well.
         let replicated = sharding(vec![ShardingDimension::Replicated; 2]);
-        let input_type = ArrayType::new_static(DataType::F64, [4, 4]).with_sharding(replicated).unwrap();
+        let diagonal_sharding = sharding(vec![ShardingDimension::Replicated]);
+        let input_type = ArrayType::new_static(DataType::F64, [4, 4]).with_sharding(replicated.clone()).unwrap();
         let matrix_sharding = sharding(vec![ShardingDimension::sharded(["y"]), ShardingDimension::sharded(["x"])]);
         let vector_sharding = sharding(vec![ShardingDimension::sharded(["x"])]);
         let square = reference_input(0, &[4, 4]);
@@ -6617,9 +6617,33 @@ mod tests {
             );
             programs.push(program.to_flat_program().to_string());
         }
-        assert_eq!(programs[0], "TODO");
-        assert_eq!(programs[1], "TODO");
-        assert_eq!(programs[2], "TODO");
+        assert_eq!(
+            programs,
+            [
+                formatdoc! {"
+                    lambda %0:f64[4, 4][sharding={replicated}] .
+                    let %1:f64[4, 4][sharding={replicated}] = transpose [permutation=[1, 0]] %0
+                        %2:f64[4, 4][sharding={matrix_sharding}] = reshard [sharding={matrix_sharding}] %1
+                    in (%2)
+                "},
+                formatdoc! {"
+                    lambda %0:f64[4, 4][sharding={replicated}] .
+                    let %1:f64[4, 4][sharding={matrix_sharding}] = reshard [sharding={matrix_sharding}] %0
+                    in (%1)
+                "},
+                formatdoc! {"
+                    lambda %0:f64[4, 4][sharding={replicated}] .
+                    let %1:i64[4, 1] = iota [type=i64[4, 1], dimension=0]
+                        %2:f64[4][sharding={diagonal_sharding}] = gather [
+                            dimensions=(offset=[], collapsed_slice=[0], start_index_map=[0], batching=[(1, 0)]),
+                            slice_sizes=[1, 1],
+                        ] %0 %1
+                        %3:f64[4][sharding={vector_sharding}] = reshard [sharding={vector_sharding}] %2
+                    in (%3)
+                "},
+            ]
+            .map(|program| program.trim_end().to_string()),
+        );
     }
 
     #[test]
