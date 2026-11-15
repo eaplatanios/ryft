@@ -1001,11 +1001,12 @@ impl<'o> Array<'o> {
         buffer_count > 0
     }
 
-    /// Waits asynchronously for every addressable shard buffer to become ready, then checks the whole-execution
-    /// fence so errors not tied to an individual output buffer are surfaced as well. When the placement that produced
-    /// this array sent shards to other processes, this function finally waits for those sends and returns the first
-    /// error among them. That wait blocks the calling thread until every receiving process has issued its matching
-    /// receive. Calling this function does not copy data to the host.
+    /// Waits asynchronously for every addressable shard buffer to become ready, then for the whole-execution fence
+    /// so errors not tied to an individual output buffer are surfaced as well. When the placement that produced this
+    /// array sent shards to other processes, this function finally waits for those sends and returns the first error
+    /// among them. Those sends complete only once every receiving process has issued its matching receive. None of
+    /// these waits blocks the calling thread, so a task that awaits this function can share its thread with the task
+    /// that issues such a receive. Calling this function does not copy data to the host.
     pub async fn ready(&self) -> Result<(), Error> {
         for shard in self.addressable_shards() {
             if let Some(buffer) = shard.buffer() {
@@ -1013,12 +1014,12 @@ impl<'o> Array<'o> {
             }
         }
         if let Some(fence) = &self.execution_fence {
-            // Once all output buffers are ready, the launch completion event should also be immediately consumable, so
-            // checking it here preserves whole-execution errors without introducing a wait into device pipelines.
-            fence.block_until_ready()?;
+            // Once all output buffers are ready, the launch completion event is normally complete as well,
+            // so this preserves whole-execution errors without introducing a wait into device pipelines.
+            fence.ready().await?;
         }
         if let Some(fence) = &self.send_fence {
-            fence.block_until_ready()?;
+            fence.ready().await?;
         }
         Ok(())
     }
@@ -3180,11 +3181,14 @@ mod tests {
                 if message == "cross-host send failed",
         ));
 
-        // Successful sends leave every readiness function successful.
+        // Pending sends leave the asynchronous readiness functions pending without blocking the thread,
+        // and successful sends leave every readiness function successful.
         let (event, promise) = client.event(()).unwrap();
         let array = Array::from_host_buffer(&domain, r#type, mesh, values_to_bytes(&[1f32, 2.]))
             .unwrap()
             .with_send_fence(ExecutionFence::new(vec![event]));
+        assert!(matches!(pin!(array.ready()).poll(&mut context), Poll::Pending));
+        assert!(matches!(pin!(ready(&vec![array.clone()])).poll(&mut context), Poll::Pending));
         promise.set(None).unwrap();
         assert!(matches!(array.block_until_ready(), Ok(())));
         assert!(matches!(block_until_ready(&vec![array.clone()]), Ok(())));

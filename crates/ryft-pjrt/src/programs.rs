@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::future::poll_fn;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::task::{Poll, Waker};
 
 use prost::Message;
 
@@ -1522,6 +1524,39 @@ impl ExecutionFence {
             completion = state.ready.wait(completion).expect("execution fence completion mutex poisoned while waiting");
         }
         completion.result.clone().unwrap()
+    }
+
+    /// Waits asynchronously until every participating [`Event`] is completed and returns the first execution error, if
+    /// any. Unlike [`Self::block_until_ready`], this function never parks the calling thread: a pending fence suspends
+    /// the task and wakes it from the thread that completes the last participating event (refer to [`Self::on_ready`]).
+    /// Use it from asynchronous code, where a fence may stay pending for a long time (e.g., a fence over transfers that
+    /// complete only once another process receives them).
+    pub async fn ready(&self) -> Result<(), Error> {
+        // The completion callback wakes the most recent waker of the task, which each pending poll replaces.
+        let waker = Arc::new(Mutex::new(None::<Waker>));
+        let mut registered = false;
+        poll_fn(|context| match self.is_ready() {
+            Ok(true) => Poll::Ready(Ok(())),
+            Err(error) => Poll::Ready(Err(error)),
+            Ok(false) => {
+                *waker.lock().expect("execution fence waker mutex poisoned") = Some(context.waker().clone());
+                if !registered {
+                    registered = true;
+                    let waker = Arc::clone(&waker);
+
+                    // A fence that completed since the readiness check runs this callback inline, which wakes the
+                    // task so that it is polled again and observes the terminal result.
+                    self.on_ready(move |_| {
+                        if let Some(waker) = waker.lock().expect("execution fence waker mutex poisoned").take() {
+                            waker.wake();
+                        }
+                    });
+                }
+
+                Poll::Pending
+            }
+        })
+        .await
     }
 
     /// Registers `callback` to run exactly once with this fence's terminal result. If the fence is already terminal,
@@ -3149,9 +3184,12 @@ pub(crate) mod ffi {
 mod tests {
     use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::future::Future;
     use std::mem::ManuallyDrop;
+    use std::pin::pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
+    use std::task::{Context, Wake};
     use std::time::Duration;
 
     use indoc::indoc;
@@ -4538,6 +4576,48 @@ mod tests {
         promise.set(None).unwrap();
         waiter.join().unwrap().unwrap();
         assert_eq!(fence.is_ready(), Ok(true));
+    }
+
+    #[test]
+    fn test_execution_fence_ready() {
+        /// Waker that records whether it was woken.
+        struct RecordingWaker(AtomicBool);
+
+        impl Wake for RecordingWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let client = test_cpu_client();
+        let recorder = Arc::new(RecordingWaker(AtomicBool::new(false)));
+        let waker = Waker::from(Arc::clone(&recorder));
+        let mut context = Context::from_waker(&waker);
+
+        // A pending fence suspends the task instead of blocking it, and completion wakes the task.
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        let mut ready = pin!(fence.ready());
+        assert_eq!(ready.as_mut().poll(&mut context), Poll::Pending);
+        assert_eq!(ready.as_mut().poll(&mut context), Poll::Pending);
+        assert!(!recorder.0.load(Ordering::SeqCst));
+        promise.set(None).unwrap();
+        fence.block_until_ready().unwrap();
+        assert!(recorder.0.load(Ordering::SeqCst));
+        assert_eq!(ready.as_mut().poll(&mut context), Poll::Ready(Ok(())));
+
+        // A completed fence is ready within one poll, and a failed one returns its error.
+        assert_eq!(pin!(ExecutionFence::new(Vec::new()).ready()).poll(&mut context), Poll::Ready(Ok(())));
+        let expected = Error::aborted("asynchronous execution failed");
+        let (event, promise) = client.event(()).unwrap();
+        promise.set(Some(expected.clone())).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        fence.block_until_ready().unwrap_err();
+        let Poll::Ready(Err(error)) = pin!(fence.ready()).poll(&mut context) else {
+            panic!("expected the failed fence to be ready with its error");
+        };
+        assert_eq!(error.code(), expected.code());
+        assert_eq!(error.message(), expected.message());
     }
 
     #[test]

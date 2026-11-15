@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   per-device `done` event.
 - Added `ExecutionFence::on_ready` for notification with the joined execution result. Callbacks run inline when the
   fence is already complete, and registered callbacks survive dropping every public fence handle.
+- Added the asynchronous `ExecutionFence::ready` for awaiting the joined execution result without parking the calling
+  thread, in contrast to `ExecutionFence::block_until_ready`. A pending fence suspends the task and wakes it from
+  the thread that completes the last participating event.
 - Added support for the new `PJRT_Buffer_Bitcast` C API function.
 - Added support for the new `PJRT_Device_ClearMemoryStats` C API function.
 - Added support for the new `PJRT_Error_ForEachPayload` C API function and for providing payload-aware safe Rust
