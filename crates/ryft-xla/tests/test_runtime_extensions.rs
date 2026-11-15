@@ -106,8 +106,8 @@ impl<'c> RuntimeProvider<'c> for StateProvider {
 impl<'c> RuntimeExtension<'c> for State {
     fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
         self.statistics.prepared.fetch_add(1, Ordering::SeqCst);
-        // The session retains this stable runtime allocation through whole-execution completion, including when
-        // public outputs are dropped. The named native type belongs to this State representation.
+        // The session retains this stable runtime allocation until the whole execution completes, including when
+        // public outputs are dropped. The named native type belongs to this `State` representation.
         unsafe { resources.add_ffi_user_data(FfiUserData::new(self.type_id, (self as *const Self).cast_mut().cast())) }
     }
 }
@@ -124,7 +124,7 @@ fn add_states(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
         if data.is_null() {
             return Err(FfiError::invalid_argument("missing runtime state"));
         }
-        // State::prepare is the sole producer; its session retains the State allocation until completion.
+        // `State::prepare` is the sole producer, and its session retains the `State` allocation until completion.
         let state = unsafe { &*data.cast::<State>() };
         state.statistics.called.fetch_add(1, Ordering::SeqCst);
         increment += state.value;
@@ -136,9 +136,10 @@ fn add_states(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
         || !input.dimensions().is_empty()
         || !output.dimensions().is_empty()
     {
-        return Err(FfiError::invalid_argument("expected scalar i32 buffers"));
+        return Err(FfiError::invalid_argument("expected scalar `i32` buffers"));
     }
-    // The CPU handler receives one live, aligned i32 in each buffer; XLA owns readiness and exclusive output access.
+    // The CPU handler receives one live, aligned `i32` in each buffer, and XLA owns readiness and exclusive output
+    // access.
     unsafe {
         let input = input.data().cast::<i32>();
         let output = output.data().cast::<i32>();
@@ -259,18 +260,12 @@ fn test_runtime_extensions_compose_execute_and_reload() {
     assert_eq!(left.called.load(Ordering::SeqCst), 2);
     assert_eq!(right.called.load(Ordering::SeqCst), 2);
 
-    let bytes = domain
-        .serialize_program(compiled.compiled_program())
-        .unwrap()
-        .expect("the CPU plugin must support serialization of this typed FFI executable");
+    let bytes = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
     let second = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
     let restored_domain = second.domain();
     assert_eq!(left.initialized.load(Ordering::SeqCst), 1);
     assert_eq!(right.initialized.load(Ordering::SeqCst), 1);
-    let restored = restored_domain
-        .deserialize_program(&bytes)
-        .unwrap()
-        .expect("the serialized executable must be compatible");
+    let restored = restored_domain.deserialize_program(&bytes).unwrap().unwrap();
     assert_eq!(restored.runtime_requirements(), requirements());
     // Loading resolves the receiving session's providers before its first invocation.
     assert_eq!(left.initialized.load(Ordering::SeqCst), 2);
@@ -326,7 +321,7 @@ fn test_runtime_extensions_reject_duplicate_native_binding_before_submission() {
 
 #[test]
 fn test_runtime_extensions_preserve_custom_initializer_error() {
-    #[derive(Debug, thiserror::Error)]
+    #[derive(Debug, PartialEq, thiserror::Error)]
     #[error("downstream provider is unavailable")]
     struct ProviderFailure;
 
@@ -339,10 +334,11 @@ fn test_runtime_extensions_preserve_custom_initializer_error() {
 
         fn initialize(
             &self,
-            _client: &'c Client<'c>,
-            _target: &Target,
-            _requirement: &RuntimeRequirement,
+            client: &'c Client<'c>,
+            target: &Target,
+            requirement: &RuntimeRequirement,
         ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+            let _ = (client, target, requirement);
             Err(Error::custom(ProviderFailure))
         }
     }
@@ -353,7 +349,6 @@ fn test_runtime_extensions_preserve_custom_initializer_error() {
     let domain = session.domain();
     let requirement = RuntimeRequirement::new("ryft.test.runtime_extensions.failure", 1, Vec::new()).unwrap();
     let error = staged(mesh, vec![requirement]).lower(&domain).unwrap().compile(&domain).err().unwrap();
-    assert!(matches!(error, Error::Custom(_)));
-    assert!(error.downcast_custom::<ProviderFailure>().is_some());
+    assert_eq!(error.downcast_custom::<ProviderFailure>(), Some(&ProviderFailure));
     assert_eq!(error.to_string(), "downstream provider is unavailable");
 }

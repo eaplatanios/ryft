@@ -1,17 +1,16 @@
 //! Process-wide telemetry counters for `ryft-xla` runtime resources.
 //!
-//! Counters in this module are best-effort instrumentation that mirrors a small subset of JAX's
-//! `jax.live_buffers()` / `jax.live_arrays()` debug surface. They are intended for live
-//! monitoring (memory leak hunting, allocation hotspot detection) and not for correctness
-//! checks: the values are eventually consistent under concurrent writers and may be off by a
-//! small amount during rapid construction / destruction.
+//! Counters in this module are best-effort instrumentation that mirrors a small subset of JAX's `jax.live_buffers()`
+//! and `jax.live_arrays()` debug surface. They are intended for live monitoring (e.g., memory leak hunting and
+//! allocation hotspot detection) and not for correctness checks, because the values are eventually consistent under
+//! concurrent writers and may be off by a small amount during rapid construction and destruction.
 
 // TODO(eaplatanios): Review this module.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Cumulative count of [`Array`](crate::Array) constructions (including [`Clone::clone`]) over
-/// the lifetime of the process. Monotonically non-decreasing.
+/// Cumulative count of [`Array`](crate::Array) constructions, including [`Clone::clone`], over the lifetime of the
+/// process. Monotonically non-decreasing.
 static CONSTRUCTED_ARRAY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Cumulative count of [`Array`](crate::Array) drops over the lifetime of the process.
@@ -19,34 +18,31 @@ static CONSTRUCTED_ARRAY_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DROPPED_ARRAY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Returns the cumulative number of [`Array`](crate::Array) handles constructed by the process so
-/// far, including handles created via [`Clone::clone`]. This counter is monotonically
-/// non-decreasing, which makes it suitable for allocation hotspot detection: the difference
-/// between two reads bounds from below the number of constructions that happened between them.
+/// far, including handles created with [`Clone::clone`]. This counter is monotonically non-decreasing, which makes it
+/// suitable for allocation hotspot detection, because the difference between two reads bounds from below the number
+/// of constructions that happened between them.
 #[inline]
 pub fn constructed_array_count() -> usize {
     CONSTRUCTED_ARRAY_COUNT.load(Ordering::Relaxed)
 }
 
 /// Returns the cumulative number of [`Array`](crate::Array) handles dropped by the process so
-/// far. This counter is monotonically non-decreasing, which makes it suitable for deallocation
-/// tracking: the difference between two reads bounds from below the number of drops that
-/// happened between them.
+/// far. This counter is monotonically non-decreasing, which makes it suitable for deallocation tracking, because the
+/// difference between two reads bounds from below the number of drops that happened between them.
 #[inline]
 pub fn dropped_array_count() -> usize {
     DROPPED_ARRAY_COUNT.load(Ordering::Relaxed)
 }
 
 /// Returns the current number of live [`Array`](crate::Array) handles, computed as the number of
-/// handles constructed so far minus the number dropped so far. Mirrors a subset of
-/// `jax.live_arrays()`'s functionality (count rather than full descriptor list). Cloned `Array`s
-/// share their underlying device buffers via `Arc`, but each clone is its own handle and is
-/// counted separately — the count therefore tracks the number of live `Array` *handles*, not the
-/// number of distinct device buffers.
+/// handles constructed so far minus the number dropped so far. Mirrors the count, but not the full descriptor list, of
+/// `jax.live_arrays()`. Cloned `Array`s share their underlying device buffers through `Arc`, but each clone is its own
+/// handle and is counted separately. The count therefore tracks the number of live `Array` *handles*, not the number
+/// of distinct device buffers.
 ///
-/// This is best-effort telemetry: under concurrent construction and destruction the value is
-/// eventually consistent rather than a snapshot of any specific moment, and the subtraction
-/// saturates at zero if the two underlying counters are read on either side of a concurrent
-/// construction.
+/// This is best-effort telemetry. Under concurrent construction and destruction, the value is eventually consistent
+/// rather than a snapshot of any specific moment, and the subtraction saturates at zero if the two underlying counters
+/// are read on either side of a concurrent construction.
 #[inline]
 pub fn live_array_count() -> usize {
     constructed_array_count().saturating_sub(dropped_array_count())
@@ -68,51 +64,22 @@ pub(crate) fn array_dropped() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{Array, Session};
     use ryft_core::{
         ArrayType, DataType, Device, DeviceMesh, Dimension as CoreDimension, LogicalMesh, MeshAxis, MeshAxisType,
         Shape, Sharding,
     };
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    /// The telemetry hooks advance their respective cumulative counters. Because both counters
-    /// are monotonically non-decreasing, concurrent `Array` activity from other tests can only
-    /// push them further up, so the lower-bound assertions below are deterministic under
-    /// parallel test execution.
+    use crate::tests::execution_client;
+    use crate::{Array, Session};
+
+    use super::*;
+
+    // Constructing and cloning an `Array` must advance the cumulative constructed counter, and dropping the resulting
+    // handles must advance the cumulative dropped counter. The assertions are exact lower bounds on monotonic
+    // counters, so they hold no matter how many `Array`s other tests construct or drop concurrently.
     #[test]
-    fn test_array_constructed_and_dropped_advance_cumulative_counters() {
-        let constructed_baseline = constructed_array_count();
-        for _ in 0..1000 {
-            array_constructed();
-        }
-        let constructed_after = constructed_array_count();
-        assert!(
-            constructed_after >= constructed_baseline + 1000,
-            "1000 `array_constructed` calls should advance the constructed counter by at least 1000 \
-             (after={constructed_after}, baseline={constructed_baseline})",
-        );
-
-        let dropped_baseline = dropped_array_count();
-        for _ in 0..1000 {
-            array_dropped();
-        }
-        let dropped_after = dropped_array_count();
-        assert!(
-            dropped_after >= dropped_baseline + 1000,
-            "1000 `array_dropped` calls should advance the dropped counter by at least 1000 \
-             (after={dropped_after}, baseline={dropped_baseline})",
-        );
-    }
-
-    /// Constructing and cloning an `Array` must advance the cumulative constructed counter, and
-    /// dropping the resulting handles must advance the cumulative dropped counter. The
-    /// assertions are exact lower bounds on monotonic counters, so they hold no matter how many
-    /// `Array`s other tests construct or drop concurrently.
-    #[test]
-    fn test_live_array_count_tracks_array_construction_and_drop() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+    fn test_constructed_array_count_and_dropped_array_count() {
+        let client = execution_client();
         let domain = Session::new(&client).domain();
         let shape = Shape::new(vec![CoreDimension::Static(2)]);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -149,6 +116,38 @@ mod tests {
             after_drop >= dropped_baseline + 400,
             "dropping 400 `Array` handles should advance the dropped counter by at least 400 \
              (after={after_drop}, baseline={dropped_baseline})",
+        );
+    }
+
+    // The telemetry hooks advance their respective cumulative counters. Because both counters are monotonically
+    // non-decreasing, concurrent `Array` activity from other tests can only push them further up, so the lower bound
+    // assertions below are deterministic under parallel test execution.
+    #[test]
+    fn test_array_constructed() {
+        let constructed_baseline = constructed_array_count();
+        for _ in 0..1000 {
+            array_constructed();
+        }
+        let constructed_after = constructed_array_count();
+        assert!(
+            constructed_after >= constructed_baseline + 1000,
+            "1000 `array_constructed` calls should advance the constructed counter by at least 1000 \
+             (after={constructed_after}, baseline={constructed_baseline})",
+        );
+    }
+
+    // Like `test_array_constructed`, this asserts a lower bound on a monotonically non-decreasing counter.
+    #[test]
+    fn test_array_dropped() {
+        let dropped_baseline = dropped_array_count();
+        for _ in 0..1000 {
+            array_dropped();
+        }
+        let dropped_after = dropped_array_count();
+        assert!(
+            dropped_after >= dropped_baseline + 1000,
+            "1000 `array_dropped` calls should advance the dropped counter by at least 1000 \
+             (after={dropped_after}, baseline={dropped_baseline})",
         );
     }
 }

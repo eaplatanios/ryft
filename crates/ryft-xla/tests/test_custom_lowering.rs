@@ -28,8 +28,9 @@ impl CoreOperation for TwiceOperation {
     fn infer_output_types(
         &self,
         input_types: &[ArrayIrType],
-        _region_interfaces: &[RegionInterface<ArrayIrType>],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
     ) -> Result<Vec<ArrayIrType>, TypeError> {
+        let _ = region_interfaces;
         Ok(input_types.to_vec())
     }
 }
@@ -39,9 +40,10 @@ impl LowerableOperation for TwiceOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayIrType],
-        _output_types: &[ArrayIrType],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (input_types, output_types);
         let doubled =
             lowerer
                 .block()

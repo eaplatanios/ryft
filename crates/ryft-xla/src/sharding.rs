@@ -1,3 +1,9 @@
+//! Conversions between `ryft` sharding types and their XLA representations. This module lowers [`LogicalMesh`],
+//! [`DeviceMesh`], [`Sharding`], and [`UnreducedKind`] to Shardy MLIR through [`ToMlir`], with the crate-internal
+//! `ShardyTensorSharding` controlling which dimensions of a lowered tensor sharding the compiler may still shard along
+//! auto mesh axes. In the opposite direction, [`OpShardingExtension`] recovers the [`Sharding`] that an XLA
+//! [`OpSharding`] describes, e.g., for executable outputs whose placement the compiler chose.
+
 use ryft_core::{DeviceMesh, LogicalMesh, MeshAxisType, Sharding, ShardingDimension, UnreducedKind};
 use ryft_mlir::Location;
 use ryft_mlir::dialects::shardy;
@@ -57,8 +63,9 @@ impl ToMlir for UnreducedKind {
     #[inline]
     fn to_mlir<'c, 't: 'c, L: Location<'c, 't>>(
         &self,
-        _location: L,
+        location: L,
     ) -> Result<shardy::ReductionOperation, ryft_mlir::Error> {
+        let _ = location;
         Ok(match self {
             Self::Sum => shardy::ReductionOperation::Sum,
             Self::Max => shardy::ReductionOperation::Max,
@@ -262,33 +269,33 @@ impl OpShardingExtension for OpSharding {
 /// and the mesh of the sharding has an [`Auto`](MeshAxisType::Auto) axis, in which case every dimension is open. The
 /// axes that the sharding governs but does not use are listed as replicated either way, so open dimensions can only
 /// gain auto axes. This is how JAX lowers the shardings of types over meshes with auto axes (i.e.,
-/// `NamedSharding._to_sdy_sharding` with `modify_wrt_axis_types=True`), whose placement along those
-/// axes the type does not describe and the compiler chooses. Individual dimensions can be kept
-/// closed in a lowering that is open over auto axes (refer to [`Self::with_closed_dimensions`]).
+/// `NamedSharding._to_sdy_sharding` with `modify_wrt_axis_types=True`), whose placement along those axes the type
+/// does not describe and the compiler chooses. [`Self::with_closed_dimensions`] keeps individual dimensions closed
+/// in a lowering that is open over auto axes.
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct ShardyTensorSharding<'s> {
+pub(crate) struct ShardyTensorSharding<'o> {
     /// [`Sharding`] that is being lowered.
-    sharding: &'s Sharding,
+    sharding: &'o Sharding,
 
     /// Whether the dimensions of the lowered attribute are open over the auto axes of the mesh of the sharding.
     open_over_auto_axes: bool,
 
     /// Dimensions of the lowered attribute that are closed even when the lowering is open over auto axes.
-    closed_dimensions: &'s [usize],
+    closed_dimensions: &'o [usize],
 }
 
-impl<'s> ShardyTensorSharding<'s> {
+impl<'o> ShardyTensorSharding<'o> {
     /// Creates a new [`ShardyTensorSharding`] that lowers `sharding`, with dimensions that are open over the auto
     /// axes of its mesh if `open_over_auto_axes` is set.
     #[inline]
-    pub(crate) fn new(sharding: &'s Sharding, open_over_auto_axes: bool) -> Self {
+    pub(crate) fn new(sharding: &'o Sharding, open_over_auto_axes: bool) -> Self {
         Self { sharding, open_over_auto_axes, closed_dimensions: &[] }
     }
 
     /// Returns this [`ShardyTensorSharding`] with `dimensions` closed, so that Shardy cannot shard them along any
-    /// further axis (including auto axes) even when the lowering is open over auto axes.
+    /// further axis, including auto axes, even when the lowering is open over auto axes.
     #[inline]
-    pub(crate) fn with_closed_dimensions(mut self, dimensions: &'s [usize]) -> Self {
+    pub(crate) fn with_closed_dimensions(mut self, dimensions: &'o [usize]) -> Self {
         self.closed_dimensions = dimensions;
         self
     }
@@ -305,7 +312,7 @@ impl ToMlir for ShardyTensorSharding<'_> {
         let context = location.context();
         let closed =
             !open_over_auto_axes || sharding.mesh().axes().iter().all(|axis| axis.r#type() != MeshAxisType::Auto);
-        let mesh_symbol_ref = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
+        let mesh_symbol_reference = context.flat_symbol_ref_attribute(SHARDY_MESH_SYMBOL_NAME);
         let dimensions = sharding
             .dimensions()
             .iter()
@@ -339,7 +346,7 @@ impl ToMlir for ShardyTensorSharding<'_> {
             .map(|axis_name| context.shardy_axis_ref(axis_name.as_str(), None))
             .collect::<Result<Vec<_>, _>>()?;
         context.shardy_tensor_sharding(
-            mesh_symbol_ref,
+            mesh_symbol_reference,
             dimensions.as_slice(),
             replicated_axes.as_slice(),
             unreduced_axes.as_slice(),
