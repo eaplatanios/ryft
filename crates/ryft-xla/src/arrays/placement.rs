@@ -18,9 +18,9 @@ use crate::{CompiledFunction, Domain, Error, Options, ToPjrt};
 
 // TODO(eaplatanios): Review this module.
 
-/// Target leaf accepted by the higher-level [`device_put()`](crate::arrays::device_put()) API.
+/// Target leaf accepted by [`Domain::device_put`].
 ///
-/// This models the current `ryft` subset of JAX's `device` / `src` arguments:
+/// This models the current `ryft` subset of JAX's `device` and `src` arguments.
 /// - [`Self::Device`] commits one leaf to a single concrete device, represented internally as a
 ///   size-1 mesh with fully replicated sharding, and
 /// - [`Self::Placement`] commits one leaf to an explicit mesh/sharding pair.
@@ -211,6 +211,27 @@ impl<'o> Array<'o> {
             Ok(array) => Ok(array),
             Err(_) => Err(compiled_error),
         }
+    }
+
+    /// Returns an array with the type and the placement of this array whose addressable shards are copies of the
+    /// shards of this array on the same devices, so that the result shares no buffer with any other array.
+    pub(crate) fn with_copied_shard_buffers(&self, domain: &Domain<'o>) -> Result<Self, Error> {
+        let buffers = self
+            .addressable_shards()
+            .filter_map(ArrayShard::buffer)
+            .map(|buffer| Ok(Arc::new(buffer.copy_to_device(buffer.device()?)?)))
+            .collect::<Result<Vec<_>, Error>>()?;
+        let r#type = self.r#type().into_owned().with_sharding(None)?;
+        let output = if self.data_type().is_zero() {
+            Self::from_zero_space(domain, r#type, Some(self.sharding().clone()), self.mesh().clone())?
+        } else {
+            let (sharding, mesh) = (self.sharding().clone(), self.mesh().clone());
+            Self::from_shared_addressable_buffers(domain, r#type, sharding, mesh, buffers)?
+        };
+        Ok(match self.execution_fence() {
+            Some(fence) => output.with_execution_fence(fence.clone()),
+            None => output,
+        })
     }
 
     /// Places this array on `mesh` according to `sharding` without compiling a program, or returns `None` when that
@@ -1486,44 +1507,6 @@ mod tests {
             output.reshard_on_devices(&domain, &manual_mesh, &manual, false).unwrap_err().to_string(),
             "compiled reshard does not support `Manual` mesh axis x",
         );
-    }
-
-    #[test]
-    fn test_probe_donation() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .unwrap();
-        let domain = Session::new(&client).domain();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
-        let logical_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), devices.clone()).unwrap();
-        let by_x = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let by_y = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["y"])]).unwrap();
-        let pointers = |array: &Array<'_>| {
-            array.shards().iter().map(|shard| unsafe { shard.buffer().unwrap().unsafe_pointer() }.unwrap()).collect::<Vec<_>>()
-        };
-        for donate in [false, true] {
-            let r#type = ArrayType::new_static(DataType::F32, [4096]).with_sharding(by_x.clone()).unwrap();
-            let values = (0..4096).map(|value| value as f32).collect::<Vec<_>>();
-            let source = Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(&values)).unwrap();
-            source.block_until_ready().unwrap();
-            let before = pointers(&source);
-            let target = DevicePutTarget::placement(mesh.clone(), by_y.clone()).unwrap();
-            let output = if donate { source.into_placement(&domain, target).unwrap() } else { source.to_placement(&domain, target).unwrap() };
-            output.block_until_ready().unwrap();
-            let after = pointers(&output);
-            eprintln!("donate={donate} before={before:?} after={after:?}");
-        }
     }
 
     #[test]

@@ -6,14 +6,14 @@ use std::sync::Arc;
 use ryft_core::macros::check_count;
 use ryft_core::{
     ArrayIrType, ArrayIrValue, ArrayType, AttachedRegions, COMPOSITE_OPERATION_NAME, CastType, Compare, Concretizable,
-    Constant as CoreConstant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DimensionFromScalar,
+    Constant as CoreConstant, ConstantOperation, Context, DataType, Device, DeviceMesh, DimensionFromScalar,
     DimensionOperation, DimensionSize, DimensionType, DimensionValue, EagerContext, EffectClass, EmptyRegionDriver,
     InterpretableOperation, LogicalMesh, MeshAxis, MeshAxisType, ONE_OPERATION_NAME, Operation as CoreOperation,
-    OperationProvider, Placeholder, ProgramError, Provenance, ProvenanceScope, RegionDriver, RegionRef, Shape,
+    OperationProvider, Placeholder, ProgramError, Provenance, ProvenanceScope, RegionDriver, RegionRef,
     SpecializationCacheEntry, Type, TypeError, Typed, TypedProgram, ZERO_OPERATION_NAME, Zero, ZeroOperation,
 };
-use ryft_pjrt::Client;
 
+use crate::arrays::ConstantKind;
 use crate::compilation::CompiledProgram;
 use crate::compilation::keys::{EagerDispatchKey, EagerDispatchKeyView, EagerDispatchQuery};
 use crate::domains::Domain;
@@ -22,10 +22,7 @@ use crate::domains::sessions::SessionConstant;
 use crate::domains::targets::Target;
 use crate::operations::composites::NamedCompositeImplementation;
 use crate::operations::{FlatProgram, ProgramBuilder};
-use crate::{
-    Array, ArrayError, Constant, Dimension, Error, FromPjrt, Operation, Options, ShardDescriptor, ShardLayout, ToPjrt,
-    Value,
-};
+use crate::{Array, ArrayError, Constant, Dimension, Error, FromPjrt, Operation, Options, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -684,7 +681,6 @@ impl<'c> Domain<'c> {
 
     /// Materializes a concrete [`Array`] whose addressable shards are filled with a constant.
     fn constant(&self, array_type: &ArrayType, kind: ConstantKind) -> Result<Array<'c>, Error> {
-        let client = self.client();
         let mesh = self.mesh.as_ref().ok_or_else(|| Error::from(ArrayError::MissingMesh))?;
         array_type
             .static_shape()
@@ -693,161 +689,11 @@ impl<'c> Domain<'c> {
             Some(_) => array_type.clone(),
             None => array_type.replicated(mesh)?,
         };
-        if array_type.data_type().is_zero() {
-            return Ok(Array::from_zero_space(self, effective_type, None, mesh.clone())?);
-        }
-        let addressable_ids = addressable_device_ids(client, mesh)?;
-        let element_size_in_bytes = array_type.data_type().to_pjrt().element_size_in_bytes()?;
-
-        let mut addressable_buffers = Vec::with_capacity(addressable_ids.len());
-        for shard in shards_for_type(&effective_type, mesh)? {
-            let shard_device = shard.device();
-            let shard_device_id = shard_device.id();
-            if !addressable_ids.contains(&shard_device_id) {
-                continue;
-            }
-            let shard_shape = shard.shape();
-            let element_count = Shape::from(&shard_shape).element_count()?.expect("shard shapes are static");
-            let bytes = constant_bytes(array_type.data_type(), kind, element_count, element_size_in_bytes);
-            let dimensions = shard_shape.as_slice().iter().map(|&dimension| dimension as u64).collect::<Vec<_>>();
-            let device = client
-                .addressable_devices()?
-                .into_iter()
-                .find(|device| device.id().map(|id| id == shard_device_id).unwrap_or(false))
-                .ok_or_else(|| {
-                    Error::from(ArrayError::NonAddressableDevice {
-                        device_id: shard_device_id,
-                        process_index: shard_device.process_index(),
-                    })
-                })?;
-            let buffer = client.buffer(
-                bytes.as_slice(),
-                Array::physical_buffer_type(array_type.data_type()),
-                dimensions.as_slice(),
-                None,
-                device,
-                None,
-            )?;
-            addressable_buffers.push(buffer);
-        }
 
         // The constant belongs to this domain so that chained eager operations and transforms over it recover a
         // context that keeps the same session, effect scope, and compilation options.
-        Ok(Array::from_canonical_addressable_buffers(self, effective_type, None, mesh.clone(), addressable_buffers)?)
+        Array::from_constant(self, effective_type, mesh.clone(), kind)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Constant materialization
-// ---------------------------------------------------------------------------
-
-/// Kind of constant value materialized by [`Domain::constant`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ConstantKind {
-    /// Additive identity.
-    Zero,
-
-    /// Multiplicative identity.
-    One,
-}
-
-/// Returns a dense row-major host buffer encoding `element_count` copies of `kind` for
-/// `data_type`.
-///
-/// Booleans are encoded as one byte per element (`0` / `1`). Integers and floating-point numbers
-/// are encoded in native-endian byte order matching
-/// [`ryft_pjrt::Client::buffer`](ryft_pjrt::Client::buffer)'s expectations. Complex numbers are
-/// encoded as a `(real, imaginary)` pair of native-endian floats.
-fn constant_bytes(data_type: DataType, kind: ConstantKind, element_count: usize, element_size: usize) -> Vec<u8> {
-    match kind {
-        ConstantKind::Zero => vec![0u8; element_count * element_size],
-        ConstantKind::One => {
-            let pattern = one_pattern_bytes(data_type);
-            debug_assert_eq!(pattern.len(), element_size);
-            let mut bytes = Vec::with_capacity(element_count * element_size);
-            for _ in 0..element_count {
-                bytes.extend_from_slice(&pattern);
-            }
-            bytes
-        }
-    }
-}
-
-/// Returns the native-endian byte pattern for a single `1`-valued element of `data_type`.
-fn one_pattern_bytes(data_type: DataType) -> Vec<u8> {
-    match data_type {
-        DataType::Boolean => vec![1u8],
-        DataType::I8 => 1i8.to_ne_bytes().to_vec(),
-        DataType::U8 => 1u8.to_ne_bytes().to_vec(),
-        DataType::I16 => 1i16.to_ne_bytes().to_vec(),
-        DataType::U16 => 1u16.to_ne_bytes().to_vec(),
-        DataType::I32 => 1i32.to_ne_bytes().to_vec(),
-        DataType::U32 => 1u32.to_ne_bytes().to_vec(),
-        DataType::I64 => 1i64.to_ne_bytes().to_vec(),
-        DataType::U64 => 1u64.to_ne_bytes().to_vec(),
-        DataType::BF16 => half::bf16::ONE.to_bits().to_ne_bytes().to_vec(),
-        DataType::F16 => half::f16::ONE.to_bits().to_ne_bytes().to_vec(),
-        DataType::F32 => 1.0f32.to_ne_bytes().to_vec(),
-        DataType::F64 => 1.0f64.to_ne_bytes().to_vec(),
-        DataType::C64 => {
-            let mut bytes = Vec::with_capacity(8);
-            bytes.extend_from_slice(&1.0f32.to_ne_bytes());
-            bytes.extend_from_slice(&0.0f32.to_ne_bytes());
-            bytes
-        }
-        DataType::C128 => {
-            let mut bytes = Vec::with_capacity(16);
-            bytes.extend_from_slice(&1.0f64.to_ne_bytes());
-            bytes.extend_from_slice(&0.0f64.to_ne_bytes());
-            bytes
-        }
-        // Low-precision (4-, 6-, and 8-bit) floating-point types do not have a canonical Rust representation;
-        // encoding `1.0` as a raw byte pattern would depend on the exact variant.
-        DataType::F8E3M4
-        | DataType::F8E4M3
-        | DataType::F8E4M3FN
-        | DataType::F8E4M3FNUZ
-        | DataType::F8E4M3B11FNUZ
-        | DataType::F8E5M2
-        | DataType::F8E5M2FNUZ
-        | DataType::F8E8M0FNU
-        | DataType::Token
-        | DataType::Zero
-        | DataType::I1
-        | DataType::I2
-        | DataType::I4
-        | DataType::U1
-        | DataType::U2
-        | DataType::U4
-        | DataType::F4E2M1FN
-        | DataType::F6E2M3FN
-        | DataType::F6E3M2FN => {
-            panic!("Domain::one does not support element type {data_type}")
-        }
-    }
-}
-
-/// Returns the addressable device IDs for `client`, filtered to devices that are both addressable by the client and
-/// present in the mesh.
-pub(super) fn addressable_device_ids(client: &Client<'_>, mesh: &DeviceMesh) -> Result<Vec<DeviceId>, Error> {
-    let mut addressable = Vec::new();
-    for device in client.addressable_devices()? {
-        let device_id = device.id()?;
-        if mesh.devices().iter().any(|device| device.id() == device_id) {
-            addressable.push(device_id);
-        }
-    }
-    Ok(addressable)
-}
-
-/// Returns the shard descriptors implied by `array_type` and `mesh`.
-pub(super) fn shards_for_type(array_type: &ArrayType, mesh: &DeviceMesh) -> Result<Vec<ShardDescriptor>, Error> {
-    let sharding = array_type.sharding().ok_or_else(|| Error::from(ArrayError::MissingSharding))?;
-    let global_shape = array_type
-        .static_shape()
-        .ok_or_else(|| Error::from(ArrayError::DynamicShape { shape: array_type.shape().clone() }))?;
-    let (descriptors, _) = ShardLayout::new(&global_shape, mesh, sharding)?.into_parts();
-    Ok(descriptors)
 }
 
 /// Default capacity of the eager dispatch cache of a [`Session`](crate::Session).
@@ -864,9 +710,9 @@ mod tests {
         DimensionDivOperation, DimensionSizeOperation, DimensionToScalarOperation, DimensionVariable, DivOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, Fill,
         Memory, Mul, MulOperation, NegOperation, OneOperation, Reduce, ReductionKind, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceType, ScanOperation, SelectOperation, ShardMapBoundary, ShardMapOperation,
-        Sharding, ShardingDimension, StaticShape, SubOperation, Typed, Value as CoreValue, WhileOperation,
-        ZeroOperation, batch, differentiate_at,
+        ReferenceReadOperation, ReferenceType, ScanOperation, SelectOperation, Shape, ShardMapBoundary,
+        ShardMapOperation, Sharding, ShardingDimension, StaticShape, SubOperation, Typed, Value as CoreValue,
+        WhileOperation, ZeroOperation, batch, differentiate_at,
     };
     use ryft_pjrt::protos::CompilationOptions;
     use ryft_pjrt::{ClientOptions, CpuClientOptions, ExecutionFence, load_cpu_plugin};

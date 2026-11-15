@@ -21,7 +21,7 @@ use crate::axes::Axis;
 use crate::contexts::EagerContext;
 use crate::operations::collectives::PARALLEL_VARY_OPERATION_NAME;
 use crate::operations::manipulation::diagonal::diagonal_layout;
-use crate::operations::{Diagonal, Gather, GatherOptions, Reshape, Slice};
+use crate::operations::{Gather, GatherOptions, Reshape, Slice};
 use crate::parameters::Parameter;
 use crate::programs::types::type_signature_pairs;
 use crate::programs::{
@@ -227,10 +227,11 @@ impl ArrayType {
     }
 
     /// Returns the type of the diagonal of a value of this type along `axis_1` and `axis_2` with the provided `offset`
-    /// (refer to [`Diagonal::diagonal`] for the parameters), by inferring the types of the slice and the gather that
-    /// take it. This function takes precedence over the [`Diagonal`] capability that an [`ArrayType`] has as a value
-    /// of itself. Unlike the implementation of that capability for homogeneous array values, it accepts the dynamic
-    /// extents that array IR values support, so compositions can infer their types for both.
+    /// (refer to [`Diagonal::diagonal`](crate::Diagonal::diagonal) for the parameters), by inferring the types of the
+    /// slice and the gather that take it. This function takes precedence over the [`Diagonal`](crate::Diagonal)
+    /// capability that an [`ArrayType`] has as a value of itself. Unlike the implementation of that capability for
+    /// homogeneous array values, it accepts the dynamic extents that array IR values support, so compositions can
+    /// infer their types for both.
     ///
     /// # Errors
     ///

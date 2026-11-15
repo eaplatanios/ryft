@@ -319,6 +319,25 @@ impl EinsumSpecification {
             EinsumPathStrategy::Unoptimized => pairwise(vec![(0, 1); input_count - 1]),
             EinsumPathStrategy::Optimal => pairwise(ssa_to_linear(&optimal_ssa_path(&input_sets, &output_set, &sizes))),
             EinsumPathStrategy::Greedy => pairwise(ssa_to_linear(&greedy_ssa_path(&input_sets, &output_set, &sizes))),
+            EinsumPathStrategy::DynamicProgramming => dynamic_programming_path(&input_sets, &output_set, &sizes)?,
+            EinsumPathStrategy::Branch(Some(0)) | EinsumPathStrategy::RandomGreedy(0) => {
+                return Err(TypeError::invalid(format!(
+                    "`{EINSUM_NAME}` path strategy `{:?}` requires a positive count",
+                    options.path(),
+                ))
+                .into());
+            }
+            EinsumPathStrategy::Branch(branch_count) => {
+                pairwise(ssa_to_linear(&branch_ssa_path(&input_sets, &output_set, &sizes, *branch_count)))
+            }
+            EinsumPathStrategy::RandomGreedy(repetitions) => {
+                pairwise(ssa_to_linear(&random_greedy_ssa_path(&input_sets, &output_set, &sizes, *repetitions)))
+            }
+            EinsumPathStrategy::AutoHighQuality => match input_count {
+                ..=5 => pairwise(ssa_to_linear(&optimal_ssa_path(&input_sets, &output_set, &sizes))),
+                6..=16 => dynamic_programming_path(&input_sets, &output_set, &sizes)?,
+                _ => pairwise(ssa_to_linear(&random_greedy_ssa_path(&input_sets, &output_set, &sizes, 128))),
+            },
             EinsumPathStrategy::Auto => pairwise(ssa_to_linear(&match input_count {
                 ..=4 => optimal_ssa_path(&input_sets, &output_set, &sizes),
                 5..=6 => branch_ssa_path(&input_sets, &output_set, &sizes, None),
@@ -557,26 +576,50 @@ impl From<(usize, usize)> for EinsumPathStep {
     }
 }
 
-/// Strategy that selects the order of the pairwise contractions of an einsum with more than two inputs. The order
-/// does not change the result, up to floating-point rounding, but it determines the sizes of the intermediate results
-/// and so the cost of the einsum. The searches are ports of the path optimizers of
-/// [`opt_einsum`](https://dgasmith.github.io/opt_einsum/paths/introduction/) with the same names, and they select the
-/// same paths.
+/// Strategy that selects the path of an einsum with more than two inputs (i.e., the order in which its inputs are
+/// contracted). The path does not change the result, up to floating-point rounding, but it determines the sizes of the
+/// intermediate results and so the cost of the einsum. The searches are ports of the path optimizers of
+/// [`opt_einsum`](https://dgasmith.github.io/opt_einsum/paths/introduction/) that `jax.numpy.einsum` accepts by name,
+/// and they select the same paths, except for [`Self::RandomGreedy`], whose choices are random in `opt_einsum`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EinsumPathStrategy {
     /// Selects the search by the number of inputs, aiming to keep it fast. Up to four inputs use
-    /// [`Self::Optimal`], up to fourteen use branching searches that explore only the most promising contractions
-    /// (all of them up to six inputs, two up to eight, and one beyond), and more inputs use [`Self::Greedy`]. This is
-    /// the default and the `"auto"` strategy that `jax.numpy.einsum` uses by default.
+    /// [`Self::Optimal`], up to fourteen use [`Self::Branch`] (with all contractions up to six inputs, two up to
+    /// eight, and one beyond), and more inputs use [`Self::Greedy`]. This is the default and the `"auto"` strategy
+    /// that `jax.numpy.einsum` uses by default.
     #[default]
     Auto,
+
+    /// Selects the search by the number of inputs like [`Self::Auto`], but spends more time for better paths. Up to
+    /// five inputs use [`Self::Optimal`], up to sixteen use [`Self::DynamicProgramming`], and more inputs use
+    /// [`Self::RandomGreedy`] with 128 repetitions. This is the `"auto-hq"` strategy of `opt_einsum`.
+    AutoHighQuality,
 
     /// Explores the orders exhaustively like the `optimal` optimizer of `opt_einsum`, whose choice it reproduces,
     /// aiming for the fewest scalar operations. Its cost grows factorially with the number of inputs.
     Optimal,
 
+    /// Finds the pairwise contractions with the fewest scalar operations among the orders that take no outer product
+    /// of connected inputs, by combining the best contractions of ever larger subsets of the inputs. Inputs that
+    /// share no summed label are contracted separately and combined last, and labels that only one input contains
+    /// are summed first with an [`EinsumPathStep::Reduction`]. Its cost grows exponentially with the number of
+    /// connected inputs. This is the `"dp"` strategy of `opt_einsum`.
+    DynamicProgramming,
+
+    /// Explores the provided number of most promising contractions at every step, or all of them without a number,
+    /// and abandons orders that fall far behind the best one found so far. These are the `"branch-all"`,
+    /// `"branch-2"`, and `"branch-1"` strategies of `opt_einsum`.
+    Branch(Option<usize>),
+
     /// Repeatedly contracts the pair of inputs that reduces the total size of the remaining inputs the most.
     Greedy,
+
+    /// Runs [`Self::Greedy`] and then the provided number of repetitions less one of a randomized variant of it,
+    /// which perturbs the costs of the candidate contractions and chooses among the best ones at random, and keeps
+    /// the path with the fewest scalar operations. This is the `"random-greedy"` strategy of `opt_einsum` with 32
+    /// repetitions and its `"random-greedy-128"` strategy with 128. The paths are deterministic here, while the
+    /// choices of `opt_einsum` differ between processes, so they are not the paths that JAX selects.
+    RandomGreedy(usize),
 
     /// Repeatedly contracts the first two of the remaining inputs and appends their result to the remaining inputs,
     /// like `optimize=False` in JAX. Four inputs are therefore contracted as two pairs whose results are contracted
@@ -1805,8 +1848,9 @@ impl<S> EinsumExecution<'_, S> {
 /// such a set. The exhaustive path searches of `opt_einsum` enumerate the candidate pairs of the remaining inputs in
 /// that order, and the order decides both which of several equally good paths they return and which candidates
 /// their pruning discards. Reproducing it is therefore what makes [`EinsumPathStrategy::Auto`] select the paths that
-/// JAX selects. The model follows `Objects/setobject.c` for the three operations that the searches use (i.e.,
-/// construction from a sequence, difference, and union). A small integer is its own hash.
+/// JAX selects. The model follows `Objects/setobject.c` for the operations that the searches use (i.e., construction
+/// from a sequence, difference, union, removal of an arbitrary value, and removal of the values of another set). A
+/// small integer is its own hash.
 #[derive(Clone)]
 struct PythonIntegerSet {
     /// Open addressing table, whose length is a power of two.
@@ -1817,6 +1861,9 @@ struct PythonIntegerSet {
 
     /// Number of slots that hold a value.
     used: usize,
+
+    /// Slot at which the search for the value that [`Self::pop`] removes starts.
+    finger: usize,
 }
 
 /// One slot of the table of a [`PythonIntegerSet`].
@@ -1844,7 +1891,7 @@ impl PythonIntegerSet {
 
     /// Creates an empty set.
     fn new() -> Self {
-        Self { table: vec![PythonIntegerSetSlot::Empty; Self::MINIMUM_SIZE], fill: 0, used: 0 }
+        Self { table: vec![PythonIntegerSetSlot::Empty; Self::MINIMUM_SIZE], fill: 0, used: 0, finger: 0 }
     }
 
     /// Creates a set by adding `values` in order, like `set(values)` does for a sequence and like a set display does.
@@ -1909,6 +1956,35 @@ impl PythonIntegerSet {
         let mut result = self.copy();
         result.merge(other);
         result
+    }
+
+    /// Removes and returns the first value at or after the search finger of this set, which must not be empty, like
+    /// `set.pop` does.
+    fn pop(&mut self) -> usize {
+        let mut index = self.finger & (self.table.len() - 1);
+        loop {
+            if let PythonIntegerSetSlot::Active(value) = self.table[index] {
+                self.table[index] = PythonIntegerSetSlot::Dummy;
+                self.used -= 1;
+                self.finger = index + 1;
+                return value;
+            }
+            index = (index + 1) & (self.table.len() - 1);
+        }
+    }
+
+    /// Removes the values of `other` from this set, like `set.difference_update` does, which leaves dummies and
+    /// rebuilds the table once more than a quarter of its slots are dummies.
+    fn difference_update(&mut self, other: &Self) {
+        for value in other.values() {
+            if let Some(slot) = self.table.iter().position(|slot| *slot == PythonIntegerSetSlot::Active(value)) {
+                self.table[slot] = PythonIntegerSetSlot::Dummy;
+                self.used -= 1;
+            }
+        }
+        if self.fill - self.used > (self.table.len() - 1) / 4 {
+            self.resize(if self.used > 50000 { self.used * 2 } else { self.used * 4 });
+        }
     }
 
     /// Returns a copy of this set, like `set(self)` does.
@@ -2213,6 +2289,19 @@ fn branch_ssa_path(
 /// memory, and finally taking outer products from the smallest results up. This is a port of
 /// `opt_einsum.paths.ssa_greedy_optimize` with its default options.
 fn greedy_ssa_path(inputs: &[LabelSet], output: &LabelSet, sizes: &BTreeMap<char, u128>) -> Vec<(usize, usize)> {
+    noisy_greedy_ssa_path(inputs, output, sizes, None)
+}
+
+/// Returns the pairwise contractions of [`greedy_ssa_path`], optionally randomized with `noise`, like the trials of
+/// the `RandomGreedy` optimizer of `opt_einsum` are. With `noise`, the cost of every candidate is perturbed by a
+/// factor drawn from a normal distribution around one, every candidate is kept rather than the best one of each
+/// input, and each contraction is chosen among the eight best candidates with Boltzmann weights of their costs.
+fn noisy_greedy_ssa_path(
+    inputs: &[LabelSet],
+    output: &LabelSet,
+    sizes: &BTreeMap<char, u128>,
+    mut noise: Option<&mut RandomGenerator>,
+) -> Vec<(usize, usize)> {
     /// Candidate contraction of two remaining inputs, ordered by its cost and then by the identifiers of its inputs,
     /// which makes the order of the candidates total.
     type Candidate = (i128, usize, usize, LabelSet, LabelSet, LabelSet);
@@ -2254,15 +2343,15 @@ fn greedy_ssa_path(inputs: &[LabelSet], output: &LabelSet, sizes: &BTreeMap<char
     let mut footprints =
         remaining.keys().map(|input| (input.clone(), size_of(input, sizes))).collect::<HashMap<_, _>>();
 
-    // The best candidate of an input among `others` is the one that frees the most memory, where ties are broken by
-    // the identifiers of its inputs.
-    let best_candidate = |first: &LabelSet,
-                          others: &[LabelSet],
-                          remaining: &BTreeMap<LabelSet, usize>,
-                          footprints: &HashMap<LabelSet, u128>,
-                          shared_by_two: &LabelSet,
-                          shared_by_three: &LabelSet|
-     -> Candidate {
+    // The candidates of an input are its contractions with `others`, ordered by the memory that they free, where
+    // ties are broken by the identifiers of their inputs.
+    let candidates = |first: &LabelSet,
+                      others: &[LabelSet],
+                      remaining: &BTreeMap<LabelSet, usize>,
+                      footprints: &HashMap<LabelSet, u128>,
+                      shared_by_two: &LabelSet,
+                      shared_by_three: &LabelSet|
+     -> Vec<Candidate> {
         others
             .iter()
             .map(|second| {
@@ -2282,8 +2371,18 @@ fn greedy_ssa_path(inputs: &[LabelSet], output: &LabelSet, sizes: &BTreeMap<char
                     if remaining[first] > remaining[second] { (second, first) } else { (first, second) };
                 (cost, remaining[second], remaining[first], first.clone(), second.clone(), result)
             })
-            .min()
-            .unwrap()
+            .collect()
+    };
+
+    // Without noise only the best candidate of an input is kept. With noise all of them are, with perturbed costs.
+    let push = |queue: &mut BinaryHeap<Reverse<Candidate>>,
+                candidates: Vec<Candidate>,
+                noise: &mut Option<&mut RandomGenerator>| match noise {
+        None => queue.extend(candidates.into_iter().min().map(Reverse)),
+        Some(noise) => queue.extend(candidates.into_iter().map(|mut candidate| {
+            candidate.0 = (noise.normal(1.0, 0.01) * candidate.0 as f64).round() as i128;
+            Reverse(candidate)
+        })),
     };
 
     let mut queue = BinaryHeap::new();
@@ -2291,22 +2390,51 @@ fn greedy_ssa_path(inputs: &[LabelSet], output: &LabelSet, sizes: &BTreeMap<char
         let mut inputs = inputs.iter().cloned().collect::<Vec<_>>();
         inputs.sort_by_key(|input| remaining[input]);
         for index in 0..inputs.len().saturating_sub(1) {
-            queue.push(Reverse(best_candidate(
+            let candidates = candidates(
                 &inputs[index],
                 &inputs[index + 1..],
                 &remaining,
                 &footprints,
                 &shared_by_two,
                 &shared_by_three,
-            )));
+            );
+            push(&mut queue, candidates, &mut noise);
         }
     }
 
-    while let Some(Reverse((_, _, _, first, second, result))) = queue.pop() {
-        // A candidate is obsolete once one of its inputs was contracted.
-        if !remaining.contains_key(&first) || !remaining.contains_key(&second) {
-            continue;
-        }
+    loop {
+        // A candidate is obsolete once one of its inputs was contracted. Without noise the best remaining candidate
+        // is contracted. With noise one of the eight best ones is, where a candidate is the likelier the closer its
+        // cost is to the best one, relative to the magnitude of that cost.
+        let is_current =
+            |candidate: &Candidate| remaining.contains_key(&candidate.3) && remaining.contains_key(&candidate.4);
+        let (first, second, result) = match &mut noise {
+            None => match queue.pop() {
+                Some(Reverse(candidate)) if is_current(&candidate) => (candidate.3, candidate.4, candidate.5),
+                Some(_) => continue,
+                None => break,
+            },
+            Some(noise) => {
+                let mut choices = Vec::new();
+                while choices.len() < 8
+                    && let Some(Reverse(candidate)) = queue.pop()
+                {
+                    if is_current(&candidate) {
+                        choices.push(candidate);
+                    }
+                }
+                let Some(best) = choices.first() else { break };
+                let best_cost = best.0 as f64;
+                let temperature = best_cost.abs().max(1.0);
+                let weights = choices
+                    .iter()
+                    .map(|candidate| (-(candidate.0 as f64 - best_cost) / temperature).exp())
+                    .collect::<Vec<_>>();
+                let candidate = choices.remove(noise.choose(&weights));
+                queue.extend(choices.into_iter().map(Reverse));
+                (candidate.3, candidate.4, candidate.5)
+            }
+        };
         let first_identifier = remaining.remove(&first).unwrap();
         let second_identifier = remaining.remove(&second).unwrap();
         for input in [&first, &second] {
@@ -2351,14 +2479,8 @@ fn greedy_ssa_path(inputs: &[LabelSet], output: &LabelSet, sizes: &BTreeMap<char
             .into_iter()
             .collect::<Vec<_>>();
         if !others.is_empty() {
-            queue.push(Reverse(best_candidate(
-                &result,
-                &others,
-                &remaining,
-                &footprints,
-                &shared_by_two,
-                &shared_by_three,
-            )));
+            let candidates = candidates(&result, &others, &remaining, &footprints, &shared_by_two, &shared_by_three);
+            push(&mut queue, candidates, &mut noise);
         }
     }
 
@@ -2377,6 +2499,321 @@ fn greedy_ssa_path(inputs: &[LabelSet], output: &LabelSet, sizes: &BTreeMap<char
         Reverse((_, first_identifier, first)) = queue.pop().unwrap();
     }
     path
+}
+
+/// Returns the pairwise contractions with the fewest scalar operations among those of [`greedy_ssa_path`] and of
+/// `repetitions - 1` randomized variants of it (refer to [`noisy_greedy_ssa_path`]), preferring a smaller largest
+/// intermediate result among equally cheap ones. This follows the `RandomGreedy` optimizer of `opt_einsum`, whose
+/// own choices are not reproducible, because they depend on the hash seed of its process. The randomized variants
+/// here are seeded with their repetition number, so the result is deterministic.
+fn random_greedy_ssa_path(
+    inputs: &[LabelSet],
+    output: &LabelSet,
+    sizes: &BTreeMap<char, u128>,
+    repetitions: usize,
+) -> Vec<(usize, usize)> {
+    let mut best = None::<((u128, u128), Vec<(usize, usize)>)>;
+    for repetition in 0..repetitions {
+        let mut noise = RandomGenerator::new(repetition as u64);
+        let path = noisy_greedy_ssa_path(inputs, output, sizes, (repetition > 0).then_some(&mut noise));
+
+        // The cost of a path is its number of scalar operations and then the size of its largest result, which are
+        // computed like `ssa_path_compute_cost` computes them.
+        let mut labels = inputs.to_vec();
+        let mut remaining = (0..inputs.len()).collect::<BTreeSet<_>>();
+        let mut cost = (0u128, 0u128);
+        for (first, second) in &path {
+            remaining.remove(first);
+            remaining.remove(second);
+            let keep = remaining.iter().flat_map(|input| &labels[*input]).chain(output).copied().collect::<LabelSet>();
+            let either = &labels[*first] | &labels[*second];
+            let has_inner_product = labels[*first].intersection(&labels[*second]).any(|label| !keep.contains(label));
+            let result = &either & &keep;
+            cost.0 =
+                cost.0.saturating_add(size_of(&either, sizes).saturating_mul(if has_inner_product { 2 } else { 1 }));
+            cost.1 = cost.1.max(size_of(&result, sizes));
+            remaining.insert(labels.len());
+            labels.push(result);
+        }
+        if best.as_ref().is_none_or(|(best_cost, _)| cost < *best_cost) {
+            best = Some((cost, path));
+        }
+    }
+    best.map(|(_, path)| path).unwrap_or_default()
+}
+
+/// Small deterministic pseudorandom number generator (SplitMix64) for the randomized path searches, which need
+/// reproducible choices and no statistical guarantees beyond rough uniformity.
+struct RandomGenerator {
+    /// State of the generator.
+    state: u64,
+}
+
+impl RandomGenerator {
+    /// Creates a generator with the provided seed.
+    fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    /// Returns a number that is uniformly distributed in `[0, 1)`.
+    fn uniform(&mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        ((value ^ (value >> 31)) >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    /// Returns a number that is normally distributed with the provided mean and standard deviation, using the
+    /// Box-Muller transform.
+    fn normal(&mut self, mean: f64, standard_deviation: f64) -> f64 {
+        let radius = (-2.0 * (1.0 - self.uniform()).ln()).sqrt();
+        mean + standard_deviation * radius * (std::f64::consts::TAU * self.uniform()).cos()
+    }
+
+    /// Returns an index of `weights`, which must not be empty, with a probability proportional to its weight.
+    fn choose(&mut self, weights: &[f64]) -> usize {
+        let target = self.uniform() * weights.iter().sum::<f64>();
+        let mut cumulative = 0.0;
+        for (index, weight) in weights.iter().enumerate() {
+            cumulative += weight;
+            if target < cumulative {
+                return index;
+            }
+        }
+        weights.len() - 1
+    }
+}
+
+/// Contraction tree that [`dynamic_programming_path`] builds, which is an input of the einsum or the contraction of
+/// its children. A contraction of one child reduces it on its own.
+#[derive(Clone)]
+enum ContractionTree {
+    /// Input of the einsum with the provided position.
+    Input(usize),
+
+    /// Contraction of the provided trees.
+    Contraction(Vec<ContractionTree>),
+}
+
+/// Best contractions that [`dynamic_programming_path`] found for the subsets of some size of the inputs, in the order
+/// in which the subsets were first reached, which decides between equally cheap contractions. A subset is a bitmap
+/// of input positions, and it maps to the labels of its result, its scalar operation count, and its tree.
+#[derive(Default)]
+struct ContractionTable {
+    /// Entries in the order in which their subsets were first reached.
+    entries: Vec<(u128, LabelSet, u128, ContractionTree)>,
+
+    /// Position in [`Self::entries`] of every subset.
+    positions: HashMap<u128, usize>,
+}
+
+impl ContractionTable {
+    /// Returns the scalar operation count of the best contraction found for `subset`, if any.
+    fn cost(&self, subset: u128) -> Option<u128> {
+        self.positions.get(&subset).map(|position| self.entries[*position].2)
+    }
+
+    /// Records a contraction of `subset`, replacing an earlier one in place.
+    fn insert(&mut self, subset: u128, labels: LabelSet, cost: u128, tree: ContractionTree) {
+        match self.positions.get(&subset) {
+            Some(position) => self.entries[*position] = (subset, labels, cost, tree),
+            None => {
+                self.positions.insert(subset, self.entries.len());
+                self.entries.push((subset, labels, cost, tree));
+            }
+        }
+    }
+}
+
+/// Returns the path with the fewest scalar operations for the `inputs` and `output` of an einsum among the orders
+/// that take no outer product within a group of connected inputs. This is a port of the `DynamicProgramming`
+/// optimizer of `opt_einsum` with its default options and without a memory limit:
+///
+///   1. Labels that only one input contains are summed first. An input that keeps no label is finished by that, and
+///      every other input takes part in the search with its remaining labels.
+///   2. The remaining inputs are grouped by the summed labels that connect them. For each group, the best
+///      contraction of every subset of its inputs is built from the best contractions of two smaller disjoint
+///      subsets that share a summed label. The search only keeps contractions below a cost cap, which starts at the
+///      size of the output labels of the group and grows until the whole group is contracted.
+///   3. The results of the groups are combined from the smallest one up.
+///
+/// # Errors
+///
+/// Returns a [`ProgramError`] if the einsum has more inputs than the search supports.
+fn dynamic_programming_path(
+    inputs: &[LabelSet],
+    output: &LabelSet,
+    sizes: &BTreeMap<char, u128>,
+) -> Result<Vec<EinsumPathStep>, ProgramError> {
+    let mut counts = BTreeMap::<char, usize>::new();
+    for label in inputs.iter().flatten().chain(output) {
+        *counts.entry(*label).or_default() += 1;
+    }
+    let naive_cost = counts.keys().fold(inputs.len() as u128, |cost, label| cost.saturating_mul(sizes[label]));
+
+    // Subsets are bitmaps of the positions of the inputs that take part in the search.
+    let mut searched_inputs = Vec::<LabelSet>::new();
+    let mut searched_trees = Vec::<ContractionTree>::new();
+    let mut trees = Vec::<ContractionTree>::new();
+    for (position, input) in inputs.iter().enumerate() {
+        let reduced = input.iter().filter(|label| counts[label] != 1).copied().collect::<LabelSet>();
+        let tree = match reduced == *input {
+            true => ContractionTree::Input(position),
+            false => ContractionTree::Contraction(vec![ContractionTree::Input(position)]),
+        };
+        if reduced.is_empty() && !input.is_empty() {
+            trees.push(tree);
+        } else {
+            searched_inputs.push(reduced);
+            searched_trees.push(tree);
+        }
+    }
+    if searched_inputs.len() > u128::BITS as usize {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{EINSUM_NAME}` dynamic programming path search supports at most {} inputs but got {}",
+                u128::BITS,
+                searched_inputs.len(),
+            ),
+        });
+    }
+    let mut tree_sizes = vec![1u128; trees.len()];
+    let all_inputs = u128::MAX >> (u128::BITS as usize - searched_inputs.len().max(1));
+
+    // Inputs are connected when they share a summed label. The groups are found in the order in which CPython
+    // iterates the sets of the reference implementation, which decides the order of equally large results.
+    let summed = searched_inputs
+        .iter()
+        .flatten()
+        .filter(|label| !output.contains(label))
+        .copied()
+        .collect::<LabelSet>();
+    let mut unused = PythonIntegerSet::from_values(0..searched_inputs.len());
+    let mut groups = Vec::new();
+    while unused.len() > 0 {
+        let mut group = PythonIntegerSet::new();
+        let mut pending = vec![unused.pop()];
+        while let Some(input) = pending.pop() {
+            group.add(input);
+            let connected = PythonIntegerSet::from_values(unused.values().into_iter().filter(|other| {
+                searched_inputs[input].intersection(&searched_inputs[*other]).any(|label| summed.contains(label))
+            }));
+            pending.extend(connected.values());
+            unused.difference_update(&connected);
+        }
+        groups.push(group.copy().values());
+    }
+
+    for group in groups {
+        let mut tables = (0..=group.len()).map(|_| ContractionTable::default()).collect::<Vec<_>>();
+        for input in &group {
+            tables[1].insert(1 << input, searched_inputs[*input].clone(), 0, searched_trees[*input].clone());
+        }
+        let group_inputs = group.iter().fold(0u128, |subset, input| subset | (1 << input));
+        let group_labels = group.iter().flat_map(|input| &searched_inputs[*input]).copied().collect::<LabelSet>();
+        let mut cost_cap = size_of(&(&group_labels & output), sizes);
+        let cost_increment = group_labels.iter().map(|label| sizes[label]).min().map_or(2, |size| size.max(2));
+        while tables[group.len()].entries.is_empty() {
+            for subset_size in 2..=group.len() {
+                // The table of this size is taken out while the tables of the smaller sizes are read.
+                let mut table = std::mem::take(&mut tables[subset_size]);
+                for first_size in 1..=subset_size / 2 {
+                    let second_size = subset_size - first_size;
+                    for (first, first_labels, first_cost, first_tree) in &tables[first_size].entries {
+                        for (second, second_labels, second_cost, second_tree) in &tables[second_size].entries {
+                            // The two subsets are disjoint, and each pair of equally large ones is taken once.
+                            if first & second != 0 || (first_size == second_size && first >= second) {
+                                continue;
+                            }
+
+                            // Outer products are skipped, so the two results share a label that is summed.
+                            let shared = first_labels
+                                .intersection(second_labels)
+                                .filter(|label| !output.contains(label))
+                                .copied()
+                                .collect::<LabelSet>();
+                            if shared.is_empty() {
+                                continue;
+                            }
+                            let either = first_labels | second_labels;
+                            let cost = first_cost.saturating_add(*second_cost).saturating_add(size_of(&either, sizes));
+                            let subset = first | second;
+                            if cost > cost_cap || table.cost(subset).is_some_and(|best_cost| cost >= best_cost) {
+                                continue;
+                            }
+
+                            // The result keeps the labels that the output or an input outside of the subset needs.
+                            let outside = (0..searched_inputs.len())
+                                .filter(|input| (group_inputs & (all_inputs ^ subset)) >> input & 1 == 1)
+                                .flat_map(|input| &searched_inputs[input])
+                                .copied()
+                                .collect::<LabelSet>();
+                            let labels = either
+                                .iter()
+                                .filter(|label| !shared.contains(label) || outside.contains(label))
+                                .copied()
+                                .collect();
+                            let tree = ContractionTree::Contraction(vec![first_tree.clone(), second_tree.clone()]);
+                            table.insert(subset, labels, cost, tree);
+                        }
+                    }
+                }
+                tables[subset_size] = table;
+            }
+            if tables[group.len()].entries.is_empty() && (cost_cap > naive_cost || cost_cap == u128::MAX) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!("`{EINSUM_NAME}` dynamic programming path search found no path"),
+                });
+            }
+            cost_cap = cost_cap.saturating_mul(cost_increment);
+        }
+        let (_, labels, _, tree) = &tables[group.len()].entries[0];
+        tree_sizes.push(size_of(labels, sizes));
+        trees.push(tree.clone());
+    }
+
+    // The results are combined from the smallest one up, keeping the order of equally large ones.
+    let mut order = (0..trees.len()).collect::<Vec<_>>();
+    order.sort_by_key(|tree| tree_sizes[*tree]);
+    let tree = order
+        .into_iter()
+        .map(|tree| trees[tree].clone())
+        .reduce(|first, second| ContractionTree::Contraction(vec![first, second]))
+        .expect("an einsum should have at least one input");
+
+    // The tree is unrolled from its root into the steps of a path, like `_tree_to_sequence` does. Each contraction
+    // takes its inputs from the list of the remaining inputs, in which the results of the contractions that are
+    // still pending follow the inputs of the einsum that were placed so far.
+    let mut pending = vec![&tree];
+    let mut placed = Vec::<usize>::new();
+    let mut path = VecDeque::new();
+    while let Some(ContractionTree::Contraction(children)) = pending.pop() {
+        let mut positions = Vec::new();
+        let mut inputs = children
+            .iter()
+            .filter_map(|child| match child {
+                ContractionTree::Input(input) => Some(*input),
+                ContractionTree::Contraction(_) => None,
+            })
+            .collect::<Vec<_>>();
+        inputs.sort_unstable();
+        for input in inputs {
+            let position = placed.iter().filter(|other| **other < input).count();
+            positions.push(position);
+            placed.insert(position, input);
+        }
+        for child in children.iter().filter(|child| matches!(child, ContractionTree::Contraction(_))) {
+            positions.push(placed.len() + pending.len());
+            pending.push(child);
+        }
+        path.push_front(match positions.as_slice() {
+            [position] => EinsumPathStep::Reduction(*position),
+            [first, second] => EinsumPathStep::Contraction(*first, *second),
+            _ => unreachable!("every contraction of the search has one or two children"),
+        });
+    }
+    Ok(path.into())
 }
 
 /// Converts pairwise contractions in static single assignment form, whose identifiers are never reused, into the
@@ -2459,8 +2896,8 @@ fn einsum_symbol(index: usize) -> char {
 
 /// Returns the [`CompositeKey`] of the named composite of an einsum with the provided specification and options.
 /// The attributes encode everything that determines its computation for given input types. Labels are encoded by
-/// their code points and an ellipsis by `-1`, the path strategy by its position among the strategies followed by the
-/// positions of every step of an explicit path, the precision by its kind followed by its fields, and a requested
+/// their code points and an ellipsis by `-1`, the path strategy by a fixed index followed by its parameters (i.e., a
+/// count, or the positions of every step of an explicit path), the precision by its kind followed by its fields, and a requested
 /// output sharding by the code points of its rendering, which distinguishes every pair of different shardings.
 fn einsum_composite_key(specification: &EinsumSpecification, options: &EinsumOptions) -> CompositeKey {
     let integer = |value: usize| CompositeAttribute::Integer(value as i128);
@@ -2480,6 +2917,10 @@ fn einsum_composite_key(specification: &EinsumSpecification, options: &EinsumOpt
         EinsumPathStrategy::Optimal => vec![integer(1)],
         EinsumPathStrategy::Greedy => vec![integer(2)],
         EinsumPathStrategy::Unoptimized => vec![integer(3)],
+        EinsumPathStrategy::AutoHighQuality => vec![integer(5)],
+        EinsumPathStrategy::DynamicProgramming => vec![integer(6)],
+        EinsumPathStrategy::Branch(branch_count) => vec![integer(7), CompositeAttribute::from(*branch_count)],
+        EinsumPathStrategy::RandomGreedy(repetitions) => vec![integer(8), integer(*repetitions)],
         EinsumPathStrategy::Explicit(path) => std::iter::once(integer(4))
             .chain(path.iter().map(|step| match *step {
                 EinsumPathStep::Reduction(position) => CompositeAttribute::Sequence(vec![integer(position)]),
@@ -4458,6 +4899,635 @@ mod tests {
     }
 
     #[test]
+    fn test_einsum_path_strategy_matches_opt_einsum_searches() {
+        // These paths were recorded like the ones above for the remaining searches that `jax.numpy.einsum` accepts by
+        // name (i.e., `dp`, `branch-all`, `branch-2`, `branch-1`, and `auto-hq`). The paths of the dynamic programming
+        // search hold steps of one position, which sum the labels that only one input contains, and they cover inputs
+        // that share no summed label, which are contracted separately. The recorded paths do not depend on the hash
+        // seed of the Python process.
+        let dynamic_programming: &[(&str, &[&[usize]], &[&[usize]])] = &[
+            ("d,cb,badc->c", &[&[5], &[2, 3], &[3, 3, 5, 2]], &[&[2], &[0, 2], &[0, 1]]),
+            ("cd,bac,acdb->ac", &[&[9, 9], &[64, 9, 9], &[9, 9, 9, 64]], &[&[1, 2], &[0, 1]]),
+            ("a,abcd,b", &[&[8], &[8, 8, 8, 8], &[8]], &[&[1, 2], &[0, 1]]),
+            ("aicc,cfc,ifa->", &[&[7, 5, 5, 5], &[5, 11, 5], &[5, 11, 7]], &[&[0, 2], &[0, 1]]),
+            (
+                "bgad,cbgf,gad,e->",
+                &[&[5, 3, 3, 2], &[2, 5, 3, 3], &[3, 3, 2], &[2]],
+                &[&[3], &[1], &[0, 1], &[1, 2], &[0, 1]],
+            ),
+            (
+                "de,dae,edab,ae->d",
+                &[&[9, 9], &[9, 64, 9], &[9, 9, 64, 2], &[64, 9]],
+                &[&[2], &[2, 3], &[1, 2], &[0, 1]],
+            ),
+            ("afeb,egad,bdc,ab", &[&[8, 8, 8, 8], &[8, 8, 8, 8], &[8, 8, 8], &[8, 8]], &[&[0, 3], &[0, 2], &[0, 1]]),
+            (
+                "fbf,ha,hceb,faih->ca",
+                &[&[3, 5, 3], &[5, 300], &[5, 11, 3, 5], &[3, 300, 7, 5]],
+                &[&[2], &[0, 3], &[1], &[0, 2], &[0, 1]],
+            ),
+            (
+                "c,cba,ba,cba,acb->a",
+                &[&[2], &[2, 2, 4], &[2, 4], &[2, 2, 4], &[4, 2, 2]],
+                &[&[3, 4], &[2, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "b,ec,b,bd,eadb->dbe",
+                &[&[2], &[9, 2], &[2], &[2, 64], &[9, 2, 64, 2]],
+                &[&[0, 2], &[0], &[2, 3], &[0, 2], &[0], &[0, 1]],
+            ),
+            (
+                "hde,bcg,hg,gb,bea",
+                &[&[8, 8, 8], &[8, 8, 8], &[8, 8], &[8, 8], &[8, 8, 8]],
+                &[&[2, 3], &[1, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "cc,f,fe,ch,h->",
+                &[&[300, 300], &[300], &[300, 5], &[300, 2], &[2]],
+                &[&[0, 3], &[2, 3], &[1], &[0, 2], &[0, 1]],
+            ),
+            (
+                "gf,d,b,db,d,cf->f",
+                &[&[4, 2], &[2], &[3], &[2, 3], &[2], &[5, 2]],
+                &[&[2, 3], &[2, 4], &[1, 3], &[0], &[1, 2], &[0], &[0, 1]],
+            ),
+            (
+                "b,bca,bca,c,c,acb->cab",
+                &[&[2], &[2, 2, 9], &[2, 2, 9], &[2], &[2], &[9, 2, 2]],
+                &[&[0, 3], &[2, 4], &[0, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "dac,cdba,ac,bc,d,ac",
+                &[&[8, 8, 8], &[8, 8, 8, 8], &[8, 8], &[8, 8], &[8], &[8, 8]],
+                &[&[2, 5], &[2, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "ecga,bdaf,ge,bc,ca,ec->adg",
+                &[&[2, 5, 300, 2], &[300, 5, 2, 5], &[300, 2], &[300, 5], &[5, 2], &[2, 5]],
+                &[&[1], &[2, 5], &[2, 4], &[1, 2], &[0, 2], &[0, 1]],
+            ),
+            (
+                "abhg,fhge,bdh,ce,hd,hecd,a->f",
+                &[&[3, 3, 5, 3], &[4, 5, 3, 5], &[3, 3, 5], &[5, 5], &[5, 3], &[5, 5, 5, 3], &[3]],
+                &[&[3, 5], &[0, 4], &[1, 4], &[1, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "g,edf,ba,g,gaeh,hbg,be->g",
+                &[&[9], &[2, 2, 64], &[64, 2], &[9], &[9, 2, 2, 2], &[2, 64, 9], &[64, 2]],
+                &[&[1], &[1, 5], &[3, 5], &[2, 4], &[2, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "che,bcd,hc,ceai,icgf,d,fbia",
+                &[&[8, 8, 8], &[8, 8, 8], &[8, 8], &[8, 8, 8, 8], &[8, 8, 8, 8], &[8], &[8, 8, 8, 8]],
+                &[&[1, 5], &[0, 1], &[0, 4], &[2, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "dbadc,dcb,aa,abc,d,bacd,dbab->dba",
+                &[&[11, 2, 2, 11, 3], &[11, 3, 2], &[2, 2], &[2, 2, 3], &[11], &[2, 2, 3, 11], &[11, 2, 2, 2]],
+                &[&[2, 4], &[2, 3], &[1, 4], &[0, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "he,gfc,b,b,e,bfe,dahe,fbe->d",
+                &[&[5, 5], &[2, 2, 2], &[2], &[2], &[5], &[2, 2, 5], &[3, 4, 5, 5], &[2, 2, 5]],
+                &[&[6], &[0, 7], &[0], &[0, 1], &[2, 5], &[1, 4], &[2, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "ca,cba,c,bc,ab,cba,c,bc->",
+                &[&[64, 9], &[64, 2, 9], &[64], &[2, 64], &[9, 2], &[64, 2, 9], &[64], &[2, 64]],
+                &[&[2, 6], &[5, 6], &[2, 5], &[3, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "c,bac,c,cb,b,bac,bc,ab",
+                &[&[8], &[8, 8, 8], &[8], &[8, 8], &[8], &[8, 8, 8], &[8, 8], &[8, 8]],
+                &[&[5, 7], &[1, 6], &[4, 5], &[3, 4], &[2, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "ba,ab,bcad,bacd,b,dbe,adb,ee->",
+                &[&[2, 2], &[2, 2], &[2, 7, 2, 300], &[2, 2, 7, 300], &[2], &[300, 2, 2], &[2, 300, 2], &[2, 2]],
+                &[&[2, 3], &[3, 5], &[4, 5], &[3, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "cab,bac,c,a,cab,b,abc,bc,bca->a",
+                &[&[2, 4, 3], &[3, 4, 2], &[2], &[4], &[2, 4, 3], &[3], &[4, 3, 2], &[3, 2], &[3, 2, 4]],
+                &[&[5, 7], &[2, 7], &[5, 6], &[4, 5], &[3, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "gfd,dcfg,dfbc,begc,gb,bcfd,ac,abed,f->age",
+                &[
+                    &[2, 2, 9],
+                    &[9, 9, 2, 2],
+                    &[9, 2, 2, 9],
+                    &[2, 2, 2, 9],
+                    &[2, 2],
+                    &[2, 9, 2, 9],
+                    &[9, 9],
+                    &[9, 2, 2, 9],
+                    &[2],
+                ],
+                &[&[3, 4], &[2, 3], &[0, 4], &[0, 5], &[3, 4], &[2, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "c,d,a,bd,da,ad,adbc,cd,d",
+                &[&[8], &[8], &[8], &[8, 8], &[8, 8], &[8, 8], &[8, 8, 8, 8], &[8, 8], &[8]],
+                &[&[1, 8], &[4, 7], &[3, 6], &[1, 5], &[2, 4], &[1, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "bc,b,cba,cabc,ac,c,a,acb,b->cba",
+                &[&[11, 3], &[11], &[3, 11, 3], &[3, 3, 11, 3], &[3, 3], &[3], &[3], &[3, 3, 11], &[11]],
+                &[&[5, 6], &[4, 7], &[1, 6], &[4, 5], &[0, 4], &[0, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "ecd,g,dbeh,if,ei,dfie,gc,a,b,ci->ahd",
+                &[&[2, 3, 2], &[5], &[2, 2, 2, 5], &[2, 5], &[2, 2], &[2, 5, 2, 2], &[5, 3], &[4], &[2], &[3, 2]],
+                &[&[3, 5], &[1, 4], &[5, 7], &[0, 6], &[4, 5], &[1, 4], &[0, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "bca,bac,bc,ac,bc,a,ac,c,cb,bac->c",
+                &[&[9, 2, 2], &[9, 2, 2], &[9, 2], &[2, 2], &[9, 2], &[2], &[2, 2], &[2], &[2, 9], &[9, 2, 2]],
+                &[&[4, 8], &[2, 8], &[6, 7], &[1, 6], &[0, 5], &[2, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "dicf,cgei,gi,c,fb,bdia,afc,iea,cgda,fei",
+                &[
+                    &[8, 8, 8, 8],
+                    &[8, 8, 8, 8],
+                    &[8, 8],
+                    &[8],
+                    &[8, 8],
+                    &[8, 8, 8, 8],
+                    &[8, 8, 8],
+                    &[8, 8, 8],
+                    &[8, 8, 8, 8],
+                    &[8, 8, 8],
+                ],
+                &[&[7, 9], &[4, 5], &[4, 7], &[0, 6], &[4, 5], &[3, 4], &[0, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "d,bc,dc,ca,ad,acdba,bc,d,dba,cdba->ad",
+                &[&[5], &[7, 3], &[5, 3], &[3, 7], &[7, 5], &[7, 3, 5, 7, 7], &[7, 3], &[5], &[5, 7, 7], &[3, 5, 7, 7]],
+                &[&[0, 7], &[0, 5], &[5, 7], &[4, 6], &[3, 5], &[1, 4], &[0, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "ab,bc,cd,de,ef,fg->ag",
+                &[&[2, 3], &[3, 4], &[4, 5], &[5, 6], &[6, 7], &[7, 2]],
+                &[&[4, 5], &[3, 4], &[2, 3], &[1, 2], &[0, 1]],
+            ),
+            ("ab,bc,cd,da->", &[&[8, 9], &[9, 3], &[3, 5], &[5, 8]], &[&[0, 1], &[1, 2], &[0, 1]]),
+            (
+                "ab,bc,ca,de,ef,fd->",
+                &[&[2, 3], &[3, 4], &[4, 2], &[5, 6], &[6, 7], &[7, 5]],
+                &[&[1, 2], &[0, 4], &[1, 2], &[0, 2], &[0, 1]],
+            ),
+            ("ab,cd,ef->", &[&[2, 3], &[4, 5], &[6, 7]], &[&[0], &[0], &[1, 2], &[0], &[0, 1]]),
+            ("a,b,c,ab,bc->", &[&[2], &[3], &[4], &[2, 3], &[3, 4]], &[&[2, 4], &[1, 3], &[1, 2], &[0, 1]]),
+            (
+                "abc,bcd,cde,def,efg->ag",
+                &[&[2, 3, 4], &[3, 4, 5], &[4, 5, 2], &[5, 2, 3], &[2, 3, 4]],
+                &[&[0, 1], &[0, 3], &[0, 2], &[0, 1]],
+            ),
+        ];
+        let branch_all: &[(&str, &[&[usize]], &[&[usize]])] = &[
+            ("cfba,fade,ab->cd", &[&[2, 3, 3, 2], &[3, 2, 2, 4], &[2, 3]], &[&[0, 2], &[0, 1]]),
+            ("bc,b,bc->bc", &[&[64, 9], &[64], &[64, 9]], &[&[0, 2], &[0, 1]]),
+            (
+                "dba,bdc,dcba,adbc->a",
+                &[&[4, 3, 5], &[3, 4, 4], &[4, 4, 3, 5], &[5, 4, 3, 4]],
+                &[&[2, 3], &[0, 2], &[0, 1]],
+            ),
+            ("dac,bad,cd,cabd->", &[&[9, 2, 2], &[64, 2, 9], &[2, 9], &[2, 2, 64, 9]], &[&[0, 2], &[0, 1], &[0, 1]]),
+            (
+                "a,ab,dbca,dab,bd->a",
+                &[&[3], &[3, 4], &[4, 4, 2, 3], &[4, 3, 4], &[4, 4]],
+                &[&[3, 4], &[0, 1], &[0, 1], &[0, 1]],
+            ),
+            (
+                "a,d,fde,bdaf,ec->e",
+                &[&[9], &[9], &[64, 9, 2], &[64, 9, 9, 64], &[2, 9]],
+                &[&[0, 3], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "cb,bca,ac,cb,bac,c->",
+                &[&[5, 3], &[3, 5, 5], &[5, 5], &[5, 3], &[3, 5, 5], &[5]],
+                &[&[0, 3], &[0, 2], &[0, 3], &[0, 1], &[0, 1]],
+            ),
+            (
+                "b,acb,c,b,c,c->bc",
+                &[&[9], &[64, 9, 9], &[9], &[9], &[9], &[9]],
+                &[&[0, 3], &[0, 4], &[0, 1], &[0, 2], &[0, 1]],
+            ),
+            (
+                "cad,bdc,d,acb,bad,ad,bcda->b",
+                &[&[4, 3, 2], &[2, 2, 4], &[2], &[3, 4, 2], &[2, 3, 2], &[3, 2], &[2, 4, 2, 3]],
+                &[&[4, 5], &[0, 3], &[2, 4], &[0, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "aeb,bc,bade,ba,e,db,abc->d",
+                &[&[9, 2, 2], &[2, 2], &[2, 9, 64, 2], &[2, 9], &[2], &[64, 2], &[9, 2, 2]],
+                &[&[1, 6], &[2, 5], &[0, 4], &[1, 3], &[0, 1], &[0, 1]],
+            ),
+        ];
+        let branch_2: &[(&str, &[&[usize]], &[&[usize]])] = &[
+            ("bca,cb,ab->ca", &[&[5, 5, 2], &[5, 5], &[2, 5]], &[&[0, 1], &[0, 1]]),
+            ("d,e,gceh->h", &[&[9], &[9], &[2, 9, 9, 2]], &[&[1, 2], &[0, 1]]),
+            ("d,dfh,feh,hcf->cf", &[&[2], &[2, 4, 2], &[4, 2, 2], &[2, 5, 4]], &[&[1, 2], &[0, 2], &[0, 1]]),
+            ("cba,a,ca,cb->a", &[&[9, 64, 9], &[9], &[9, 9], &[9, 64]], &[&[0, 3], &[1, 2], &[0, 1]]),
+            (
+                "hc,b,dh,hb,cgbh->bhd",
+                &[&[3, 2], &[2], &[5, 3], &[3, 2], &[2, 4, 2, 3]],
+                &[&[1, 3], &[2, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "ab,cb,e,adce,d->d",
+                &[&[2, 9], &[64, 9], &[2], &[2, 2, 64, 2], &[2]],
+                &[&[0, 1], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "ef,gfea,b,c,acb,d->gb",
+                &[&[5, 2], &[5, 2, 5, 4], &[3], &[2], &[4, 2, 3], &[2]],
+                &[&[0, 1], &[1, 2], &[0, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "c,eg,cbfe,c,fhc,d->hf",
+                &[&[64], &[2, 64], &[64, 9, 9, 2], &[64], &[9, 9, 64], &[2]],
+                &[&[0, 3], &[2, 4], &[0, 2], &[0, 2], &[0, 1]],
+            ),
+            (
+                "ec,bea,b,dbc,ce,cf,decf->d",
+                &[&[4, 2], &[5, 4, 3], &[5], &[5, 5, 2], &[2, 4], &[2, 2], &[5, 4, 2, 2]],
+                &[&[0, 4], &[0, 1], &[1, 2], &[0, 2], &[1, 2], &[0, 1]],
+            ),
+            (
+                "fe,c,dg,cedh,hecd,c,e->ed",
+                &[&[9, 64], &[9], &[2, 9], &[9, 64, 2, 64], &[64, 64, 9, 2], &[9], &[64]],
+                &[&[0, 6], &[0, 4], &[1, 2], &[2, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "feca,ebd,d,fcad,be,a,da,fcea->f",
+                &[&[4, 4, 2, 3], &[4, 5, 2], &[2], &[4, 2, 3, 2], &[5, 4], &[3], &[2, 3], &[4, 2, 4, 3]],
+                &[&[0, 7], &[0, 3], &[4, 5], &[1, 4], &[1, 2], &[0, 2], &[0, 1]],
+            ),
+            (
+                "cda,b,cad,cd,b,dbac,c,bac->cba",
+                &[&[9, 64, 2], &[9], &[9, 2, 64], &[9, 64], &[9], &[64, 9, 2, 9], &[9], &[9, 2, 9]],
+                &[&[0, 2], &[1, 6], &[0, 1], &[0, 3], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "e,gdbe,bafe,fc,d,agbd,c,ae,eacb->b",
+                &[&[2], &[5, 2, 5, 2], &[5, 2, 2, 2], &[2, 4], &[2], &[2, 5, 5, 2], &[4], &[2, 2], &[2, 2, 4, 5]],
+                &[&[3, 6], &[0, 5], &[1, 6], &[0, 2], &[1, 2], &[1, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "cb,ac,a,db,dab,cd,dac,a,bad->a",
+                &[&[64, 64], &[64, 64], &[64], &[9, 64], &[9, 64, 64], &[64, 9], &[9, 64, 64], &[64], &[64, 64, 9]],
+                &[&[2, 7], &[1, 7], &[2, 5], &[3, 4], &[1, 3], &[0, 1], &[0, 2], &[0, 1]],
+            ),
+        ];
+        let branch_1: &[(&str, &[&[usize]], &[&[usize]])] = &[
+            ("b,bac,acb->", &[&[2], &[2, 5, 4], &[5, 4, 2]], &[&[1, 2], &[0, 1]]),
+            ("daef,dab,c->c", &[&[64, 9, 64, 64], &[64, 9, 9], &[2]], &[&[0, 1], &[0, 1]]),
+            ("ca,b,c,cba->abc", &[&[3, 2], &[2], &[3], &[3, 2, 2]], &[&[0, 3], &[1, 2], &[0, 1]]),
+            ("fihd,giah,d,h->g", &[&[2, 64, 9, 2], &[2, 64, 9, 9], &[2], &[9]], &[&[0, 1], &[1, 2], &[0, 1]]),
+            ("c,ce,e,fabc,e->fc", &[&[4], &[4, 2], &[2], &[4, 5, 3, 4], &[2]], &[&[0, 1], &[0, 2], &[0, 1], &[0, 1]]),
+            (
+                "i,dibg,hdif,fbd,gfd->hig",
+                &[&[64], &[9, 64, 9, 2], &[64, 9, 64, 64], &[64, 9, 9], &[2, 64, 9]],
+                &[&[0, 1], &[1, 2], &[0, 2], &[0, 1]],
+            ),
+            (
+                "dhg,ich,fb,gaf,f,da->g",
+                &[&[4, 3, 3], &[2, 5, 3], &[4, 5], &[3, 5, 4], &[4], &[4, 5]],
+                &[&[0, 1], &[1, 3], &[2, 3], &[0, 1], &[0, 1]],
+            ),
+            (
+                "eab,d,e,cde,d,d->b",
+                &[&[9, 2, 64], &[2], &[9], &[9, 2, 9], &[2], &[2]],
+                &[&[0, 2], &[0, 1], &[2, 3], &[0, 1], &[0, 1]],
+            ),
+            (
+                "fga,g,cbei,adcb,id,b,def->b",
+                &[&[5, 4, 3], &[4], &[3, 4, 3, 5], &[3, 3, 3, 4], &[5, 3], &[4], &[3, 3, 5]],
+                &[&[0, 1], &[0, 2], &[0, 4], &[1, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "d,badc,ad,b,dabc,b,acd->bc",
+                &[&[9], &[64, 64, 9, 2], &[64, 9], &[64], &[9, 64, 64, 2], &[64], &[64, 2, 9]],
+                &[&[2, 6], &[2, 4], &[0, 3], &[0, 1], &[1, 2], &[0, 1]],
+            ),
+            (
+                "ed,c,c,fec,gafc,fcdb,be,ab->g",
+                &[&[3, 2], &[2], &[2], &[3, 3, 2], &[3, 3, 3, 2], &[3, 2, 2, 4], &[4, 3], &[3, 4]],
+                &[&[1, 2], &[1, 6], &[0, 3], &[1, 4], &[2, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "d,bdce,cdea,bead,ba,da,c,e->dcb",
+                &[&[9], &[64, 9, 9, 2], &[9, 9, 2, 2], &[64, 2, 2, 9], &[64, 2], &[9, 2], &[9], &[2]],
+                &[&[0, 5], &[1, 6], &[1, 2], &[1, 3], &[1, 3], &[0, 1], &[0, 1]],
+            ),
+            (
+                "geh,bf,gf,hgcf,hab,cdh,b,e,c->",
+                &[&[2, 2, 3], &[2, 2], &[2, 2], &[3, 2, 2, 2], &[3, 4, 2], &[2, 5, 3], &[2], &[2], &[2]],
+                &[&[0, 4], &[2, 3], &[5, 6], &[1, 5], &[0, 4], &[0, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "ce,f,gbde,f,c,bafc,f,hbef,gcfd->ach",
+                &[&[2, 64], &[9], &[64, 2, 9, 64], &[9], &[2], &[2, 9, 9, 2], &[9], &[9, 2, 64, 9], &[64, 2, 9, 9]],
+                &[&[1, 3], &[4, 7], &[3, 6], &[0, 2], &[0, 2], &[2, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "ac,cb,abc,acb,ab,b,ca,cba,abc,ab->abc",
+                &[&[2, 4], &[4, 2], &[2, 2, 4], &[2, 4, 2], &[2, 2], &[2], &[4, 2], &[4, 2, 2], &[2, 2, 4], &[2, 2]],
+                &[&[2, 3], &[5, 6], &[6, 7], &[0, 4], &[0, 4], &[3, 4], &[0, 2], &[1, 2], &[0, 1]],
+            ),
+            (
+                "b,cab,ca,cb,ac,c,cb,cb,acb,bca->cba",
+                &[&[9], &[64, 9, 9], &[64, 9], &[64, 9], &[9, 64], &[64], &[64, 9], &[64, 9], &[9, 64, 9], &[9, 64, 9]],
+                &[&[2, 4], &[2, 4], &[1, 4], &[3, 6], &[2, 4], &[2, 3], &[2, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "c,bac,bc,b,cb,abc,c,bc,cba,bc,a->bac",
+                &[&[3], &[3, 3, 3], &[3, 3], &[3], &[3, 3], &[3, 3, 3], &[3], &[3, 3], &[3, 3, 3], &[3, 3], &[3]],
+                &[&[2, 4], &[1, 3], &[4, 8], &[3, 4], &[4, 6], &[4, 5], &[0, 2], &[0, 2], &[0, 2], &[0, 1]],
+            ),
+            (
+                "e,d,c,cbe,a,baec,aedb,a,cabe,aec,cdab->b",
+                &[
+                    &[2],
+                    &[2],
+                    &[2],
+                    &[2, 64, 2],
+                    &[64],
+                    &[64, 64, 2, 2],
+                    &[64, 2, 2, 64],
+                    &[64],
+                    &[2, 64, 64, 2],
+                    &[64, 2, 2],
+                    &[2, 2, 64, 64],
+                ],
+                &[&[4, 7], &[7, 9], &[0, 3], &[1, 6], &[1, 3], &[3, 5], &[3, 4], &[0, 1], &[0, 2], &[0, 1]],
+            ),
+            (
+                "bca,ac,ba,c,acb,cb,ac,bc,abc,c,a,a->",
+                &[
+                    &[2, 3, 5],
+                    &[5, 3],
+                    &[2, 5],
+                    &[3],
+                    &[5, 3, 2],
+                    &[3, 2],
+                    &[5, 3],
+                    &[2, 3],
+                    &[5, 2, 3],
+                    &[3],
+                    &[5],
+                    &[5],
+                ],
+                &[&[0, 4], &[6, 10], &[0, 4], &[7, 8], &[0, 7], &[1, 2], &[4, 5], &[2, 3], &[2, 3], &[0, 1], &[0, 1]],
+            ),
+            (
+                "dc,cdb,abcd,acbd,ba,bc,bcd,bcda,b,bdac,ac,bca->",
+                &[
+                    &[64, 2],
+                    &[2, 64, 9],
+                    &[2, 9, 2, 64],
+                    &[2, 2, 9, 64],
+                    &[9, 2],
+                    &[9, 2],
+                    &[9, 2, 64],
+                    &[9, 2, 64, 2],
+                    &[9],
+                    &[9, 64, 2, 2],
+                    &[2, 2],
+                    &[9, 2, 2],
+                ],
+                &[&[0, 1], &[0, 1], &[3, 5], &[7, 8], &[2, 6], &[5, 6], &[4, 5], &[0, 4], &[0, 3], &[0, 2], &[0, 1]],
+            ),
+        ];
+        let auto_high_quality: &[(&str, &[&[usize]], &[&[usize]])] = &[
+            ("a,cab,c->b", &[&[4], &[4, 4, 3], &[4]], &[&[0, 2], &[0, 1]]),
+            ("abc,c,b->cba", &[&[64, 9, 2], &[2], &[9]], &[&[1, 2], &[0, 1]]),
+            (
+                "bdag,dgc,edb,ecf->bc",
+                &[&[2, 5, 3, 3], &[5, 3, 2], &[4, 5, 2], &[4, 2, 5]],
+                &[&[0, 1], &[0, 2], &[0, 1]],
+            ),
+            ("c,eb,ea,abed->eac", &[&[2], &[64, 9], &[64, 64], &[64, 9, 64, 64]], &[&[2, 3], &[1, 2], &[0, 1]]),
+            (
+                "gc,bdfe,afd,gf,df->",
+                &[&[2, 5], &[4, 3, 5, 2], &[4, 5, 3], &[2, 5], &[3, 5]],
+                &[&[0, 3], &[0, 2], &[0, 2], &[0, 1]],
+            ),
+            (
+                "bec,ebca,ca,bd,ecda->",
+                &[&[9, 9, 9], &[9, 9, 9, 64], &[9, 64], &[9, 64], &[9, 9, 64, 64]],
+                &[&[0, 2], &[0, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "gad,deb,a,cdbf,ae,agbd->dc",
+                &[&[2, 5, 2], &[2, 4, 4], &[5], &[2, 2, 4, 2], &[5, 4], &[5, 2, 4, 2]],
+                &[&[3], &[0, 2], &[2, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "afbc,e,ead,ed,cfd,d->cf",
+                &[&[2, 64, 9, 2], &[9], &[9, 2, 64], &[9, 64], &[2, 64, 64], &[64]],
+                &[&[0], &[0, 2], &[0, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "hfcg,bch,acfg,c,gbce,gad,f->a",
+                &[&[2, 4, 4, 2], &[3, 4, 2], &[5, 4, 4, 2], &[4], &[2, 3, 4, 3], &[2, 5, 5], &[4]],
+                &[&[5], &[4], &[1, 6], &[2, 5], &[0, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "a,bca,ab,bca,ca,ab,b->bc",
+                &[&[2], &[64, 64, 2], &[2, 64], &[64, 64, 2], &[64, 2], &[2, 64], &[64]],
+                &[&[2, 5], &[0, 5], &[2, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "da,cba,cab,ba,ca,dbac,bd,da->cda",
+                &[&[2, 2], &[2, 3, 2], &[2, 2, 3], &[3, 2], &[2, 2], &[2, 3, 2, 2], &[3, 2], &[2, 2]],
+                &[&[0, 4], &[5, 6], &[1, 2], &[0, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "f,ce,ce,d,adce,ceba,d,c->",
+                &[&[64], &[9, 9], &[9, 9], &[2], &[9, 2, 9, 9], &[9, 9, 64, 9], &[2], &[9]],
+                &[&[0], &[0, 1], &[2], &[1, 6], &[4, 5], &[2, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "c,bg,dea,edbg,be,fae,fabe,ecfa,a->",
+                &[&[3], &[2, 2], &[3, 3, 3], &[3, 3, 2, 2], &[2, 3], &[2, 3, 3], &[2, 3, 2, 3], &[3, 3, 2, 3], &[3]],
+                &[&[1, 4], &[2, 7], &[1, 6], &[2, 5], &[1, 4], &[1, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "g,h,dbag,a,d,adc,efh,eghc,g->bd",
+                &[&[9], &[64], &[64, 2, 2, 9], &[2], &[64], &[2, 64, 9], &[64, 2, 64], &[64, 9, 64, 9], &[9]],
+                &[&[0, 8], &[5], &[0, 7], &[4, 6], &[4, 5], &[3, 4], &[0, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "ge,ac,abfe,iab,hg,fdgi,fa,i,hid,igdc->",
+                &[
+                    &[4, 4],
+                    &[5, 2],
+                    &[5, 4, 2, 4],
+                    &[3, 5, 4],
+                    &[2, 4],
+                    &[2, 5, 4, 3],
+                    &[2, 5],
+                    &[3],
+                    &[2, 3, 5],
+                    &[3, 4, 5, 2],
+                ],
+                &[&[2, 3], &[1, 4], &[6, 7], &[0, 6], &[4, 5], &[1, 4], &[2, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "bc,cba,a,a,cb,ca,b,a,ac,abc->cab",
+                &[&[9, 64], &[64, 9, 2], &[2], &[2], &[64, 9], &[64, 2], &[9], &[2], &[2, 64], &[2, 9, 64]],
+                &[&[2, 3], &[5, 8], &[4, 7], &[3, 6], &[3, 5], &[0, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "dgb,af,bef,ce,adfc,dc,ag,c,fag,ad,g->",
+                &[
+                    &[3, 5, 3],
+                    &[3, 2],
+                    &[3, 2, 2],
+                    &[5, 2],
+                    &[3, 3, 2, 5],
+                    &[3, 5],
+                    &[3, 5],
+                    &[5],
+                    &[2, 3, 5],
+                    &[3, 3],
+                    &[5],
+                ],
+                &[&[1, 9], &[0, 1], &[3, 6], &[4, 7], &[5, 6], &[4, 5], &[1, 4], &[1, 3], &[0, 2], &[0, 1]],
+            ),
+            (
+                "b,b,c,b,b,a,acb,cb,bca,bca,a->cb",
+                &[&[9], &[9], &[64], &[9], &[9], &[2], &[2, 64, 9], &[64, 9], &[9, 64, 2], &[9, 64, 2], &[2]],
+                &[&[0, 1], &[1, 9], &[1, 8], &[0, 7], &[0, 5], &[3, 5], &[2, 4], &[0, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "abcd,ad,d,bad,cabd,c,ba,dc,bd,dac,d,a->",
+                &[
+                    &[2, 5, 2, 5],
+                    &[2, 5],
+                    &[5],
+                    &[5, 2, 5],
+                    &[2, 2, 5, 5],
+                    &[2],
+                    &[5, 2],
+                    &[5, 2],
+                    &[5, 5],
+                    &[5, 2, 2],
+                    &[5],
+                    &[2],
+                ],
+                &[&[2, 10], &[1, 10], &[4, 8], &[5, 8], &[1, 7], &[1, 6], &[0, 5], &[3, 4], &[2, 3], &[1, 2], &[0, 1]],
+            ),
+            (
+                "e,ch,ge,dahf,gicf,i,af,ai,d,gi,dhf,a->e",
+                &[
+                    &[9],
+                    &[9, 2],
+                    &[2, 9],
+                    &[9, 64, 2, 64],
+                    &[2, 9, 9, 64],
+                    &[9],
+                    &[64, 64],
+                    &[64, 9],
+                    &[9],
+                    &[2, 9],
+                    &[9, 2, 64],
+                    &[64],
+                ],
+                &[&[7, 11], &[7, 9], &[3, 9], &[5, 8], &[6, 7], &[1, 6], &[2, 5], &[3, 4], &[2, 3], &[1, 2], &[0, 1]],
+            ),
+        ];
+        let recorded = |path: &[&[usize]]| {
+            path.iter()
+                .map(|step| match step {
+                    [position] => EinsumPathStep::Reduction(*position),
+                    [first, second] => EinsumPathStep::Contraction(*first, *second),
+                    _ => unreachable!("recorded steps have one or two positions"),
+                })
+                .collect::<Vec<_>>()
+        };
+        for (strategy, paths) in [
+            (EinsumPathStrategy::DynamicProgramming, dynamic_programming),
+            (EinsumPathStrategy::Branch(None), branch_all),
+            (EinsumPathStrategy::Branch(Some(2)), branch_2),
+            (EinsumPathStrategy::Branch(Some(1)), branch_1),
+            (EinsumPathStrategy::AutoHighQuality, auto_high_quality),
+        ] {
+            for (subscripts, shapes, path) in paths {
+                assert_eq!(
+                    planned_path(subscripts, shapes, strategy.clone()),
+                    recorded(path),
+                    "{strategy:?} {subscripts}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_einsum_path_strategy_random_greedy() {
+        // The randomized search is deterministic, never worse than the greedy search that it starts from, and its
+        // paths compute the einsum.
+        let subscripts = "ab,bc,cd,de,ef,fa,ace,bdf->";
+        let shapes: &[&[usize]] = &[&[2, 3], &[3, 4], &[4, 5], &[5, 2], &[2, 3], &[3, 2], &[2, 4, 2], &[3, 5, 3]];
+        let random = planned_path(subscripts, shapes, EinsumPathStrategy::RandomGreedy(32));
+        assert_eq!(random, planned_path(subscripts, shapes, EinsumPathStrategy::RandomGreedy(32)));
+        assert_eq!(
+            planned_path(subscripts, shapes, EinsumPathStrategy::RandomGreedy(1)),
+            planned_path(subscripts, shapes, EinsumPathStrategy::Greedy),
+        );
+        let inputs = shapes.iter().enumerate().map(|(index, shape)| reference_input(index, shape)).collect::<Vec<_>>();
+        let specification = subscripts.parse::<EinsumSpecification>().unwrap();
+        let expected = Array::einsum(subscripts, inputs.iter()).unwrap();
+        for strategy in [
+            EinsumPathStrategy::RandomGreedy(32),
+            EinsumPathStrategy::RandomGreedy(128),
+            EinsumPathStrategy::DynamicProgramming,
+            EinsumPathStrategy::AutoHighQuality,
+            EinsumPathStrategy::Branch(None),
+            EinsumPathStrategy::Branch(Some(2)),
+        ] {
+            let options = EinsumOptions::new().with_path(strategy.clone());
+            assert_eq!(
+                Array::einsum_with_options(&specification, inputs.iter(), &options),
+                Ok(expected.clone()),
+                "{strategy:?}",
+            );
+        }
+
+        // More than sixteen inputs use the randomized search in the high quality strategy.
+        let subscripts = (0..18).map(|index| format!("{}{}", (b'a' + index) as char, (b'b' + index) as char));
+        let subscripts = format!("{}->as", subscripts.collect::<Vec<_>>().join(","));
+        let shapes = vec![&[2usize, 2][..]; 18];
+        assert_eq!(
+            planned_path(&subscripts, &shapes, EinsumPathStrategy::AutoHighQuality),
+            planned_path(&subscripts, &shapes, EinsumPathStrategy::RandomGreedy(128)),
+        );
+
+        // Counts must be positive.
+        let types = vec![ArrayType::new_static(DataType::F64, [2, 2]); 3];
+        let plan = |strategy: EinsumPathStrategy| {
+            let specification = "ab,bc,cd".parse::<EinsumSpecification>().unwrap();
+            specification.plan(&types, &EinsumOptions::new().with_path(strategy)).map(|_| ())
+        };
+        assert_eq!(
+            plan(EinsumPathStrategy::Branch(Some(0))),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`einsum` path strategy `Branch(Some(0))` requires a positive count",
+            ))),
+        );
+        assert_eq!(
+            plan(EinsumPathStrategy::RandomGreedy(0)),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`einsum` path strategy `RandomGreedy(0)` requires a positive count",
+            ))),
+        );
+    }
+
+    #[test]
     fn test_python_integer_set() {
         // Each case starts from `set(range(count))` and repeatedly replaces two values by a new one, like the path
         // searches do, recording `list(remaining)` after every replacement in CPython 3.13.
@@ -5545,7 +6615,19 @@ mod tests {
             vec![ArrayType::new_static(DataType::Boolean, [2, 2]), ArrayType::new_static(DataType::Boolean, [3])],
         )
         .unwrap();
-        assert_eq!(program.to_string(), "");
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:bool[2, 2], %1:bool[3] .
+                let %2:bool[] = reduce [kind=any, axes=[0]] %1
+                    %3:bool[2] = reduce [kind=any, axes=[1]] %0
+                    %4:bool[2] = dot [
+                        dimensions=(lhs_contracting=[], rhs_contracting=[], lhs_batching=[], rhs_batching=[]),
+                    ] %3 %2
+                in (%4)
+            "}
+            .trim_end(),
+        );
         assert_eq!(
             program.interpret(vec![lhs.clone(), Array::vector(vec![true, false, false]).unwrap()]),
             Ok(Array::vector(vec![true, false]).unwrap()),
@@ -6248,6 +7330,13 @@ mod tests {
             key("ij,jk->ik", EinsumOptions::new().with_output_sharding(sharding(ShardingDimension::sharded(["x"])))),
             key("ij,jk->ik", EinsumOptions::new().with_output_sharding(sharding(ShardingDimension::Replicated))),
             key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::explicit([(1, 0)]))),
+            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::explicit([1, 0]))),
+            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::AutoHighQuality)),
+            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::DynamicProgramming)),
+            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Branch(None))),
+            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Branch(Some(2)))),
+            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::RandomGreedy(32))),
+            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::RandomGreedy(128))),
         ];
         for (index, first) in keys.iter().enumerate() {
             for second in &keys[index + 1..] {

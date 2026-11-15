@@ -197,8 +197,7 @@ impl<'o> Array<'o> {
                 completion: Some(match completion {
                     Some(completion) => completion,
                     None => ExecutionFence::new(
-                        self
-                            .addressable_shards()
+                        self.addressable_shards()
                             .filter_map(|shard| shard.buffer())
                             .map(|buffer| buffer.ready())
                             .collect::<Result<Vec<_>, _>>()?,
