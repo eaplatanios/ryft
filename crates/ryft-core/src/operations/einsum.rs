@@ -1152,10 +1152,8 @@ impl EinsumPlan {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Value-level Einstein summation capability, which contracts any number of values according to subscripts such as
-/// `"ij,jk->ik"`. Every function plans the einsum for the types of its inputs and then executes or stages the
+/// Value-level Einstein summation capability, which contracts any number of values according to subscripts such
+/// as `"ij,jk->ik"`. Every function plans the einsum for the types of its inputs and then executes or stages the
 /// [`EinsumPlan`] inline, like `jax.numpy.einsum` does on every call. Refer to [`EinsumSpecification`] for the
 /// subscripts, to [`EinsumSpecification::plan`] for the requirements on the inputs, and to [`EinsumPlan`] for the
 /// decomposition. Use the global [`einsum`] function instead to plan once and call the contraction as one unit.
@@ -1180,8 +1178,8 @@ impl EinsumPlan {
 /// ```
 #[capability]
 pub trait Einsum<T = <Self as Capability>::Universe>: Capability + Sized {
-    /// Contracts `inputs` according to `subscripts`, which are parsed into an [`EinsumSpecification`], with the
-    /// default [`EinsumOptions`].
+    /// Contracts `inputs` according to `subscripts`, which are parsed into an [`EinsumSpecification`],
+    /// with the default [`EinsumOptions`].
     ///
     /// # Errors
     ///
@@ -1206,8 +1204,8 @@ pub trait Einsum<T = <Self as Capability>::Universe>: Capability + Sized {
     }
 
     /// Contracts `inputs` according to `specification` with the provided [`EinsumOptions`], which select the order of
-    /// the pairwise contractions, their precision, the accumulation type, and a requested output sharding. This is
-    /// the most general function of this capability, and the other functions are implemented using it.
+    /// the pairwise contractions, their precision, the accumulation type, and a requested output sharding. This is the
+    /// most general function of this capability, and the other functions are implemented using it.
     ///
     /// # Errors
     ///
@@ -1283,9 +1281,9 @@ pub const EINSUM_COMPOSITE_NAME: &str = "ryft.einsum";
 pub const EINSUM_COMPOSITE_VERSION: u32 = 1;
 
 /// Einstein summation function created by [`einsum`] and [`einsum_with_options`], which calls the contraction as one
-/// named composite. The function plans its einsum once for each input type signature and keeps the
-/// [`EinsumPlan`]s, where the [`Einsum`] capability plans on every call, and each of its calls is one unit whose body
-/// is the decomposition of the plan:
+/// named composite. The function plans its einsum once for each input type signature and keeps the [`EinsumPlan`]s,
+/// where the [`Einsum`] capability plans on every call, and each of its calls is one unit whose body is the
+/// decomposition of the plan:
 ///
 ///   - A staged program holds one `composite` instruction for each call, and the calls with equal input types share
 ///     one body. A backend lowers the body, sharing one function between repeated calls.
@@ -1294,16 +1292,16 @@ pub const EINSUM_COMPOSITE_VERSION: u32 = 1;
 ///   - Differentiation and batching are derived from the body, so no rule is written by hand. Forward and reverse
 ///     mode differentiate the body in the caller, and batching batches the body structurally.
 ///
-/// A plan that stages at most one instruction (e.g., a matrix product) gains nothing from the composite, so such
-/// calls contract inline. Create the function once and reuse it, because a new function plans and traces its body
-/// again and shares no compiled unit with another one. Use [`EinsumPlan::execute_with`] instead for a custom
-/// pairwise contraction, which the key of a named composite cannot describe.
+/// A plan that stages at most one instruction (e.g., a matrix product) gains nothing from the composite, so such calls
+/// contract inline. Create the function once and reuse it, because a new function plans and traces its body again and
+/// shares no compiled unit with another one. Use [`EinsumPlan::execute_with`] instead for a custom pairwise
+/// contraction, which the key of a named composite cannot describe.
 ///
 /// # Performance
 ///
-/// The function pays off where dispatch dominates the contractions. The table shows warm times for each call on
-/// eager XLA, measured on 2026-11-14 on one CPU device for `f32` matrices of extent 8 (in batches of 4 for the
-/// `b` label), with the outputs of 20,000 calls awaited together.
+/// The function pays off where dispatch dominates the contractions. The following table shows warm times for each call
+/// using the eager XLA backend, measured on 2026-11-14 on one CPU device for `f32` matrices of extent 8 (in batches of
+/// 4 for the `b` label), with the outputs of 20,000 calls awaited together:
 ///
 ///   | Subscripts        | Instructions | [`Einsum`] capability | [`EinsumComposite`] |
 ///   |-------------------|--------------|-----------------------|---------------------|
@@ -1312,11 +1310,11 @@ pub const EINSUM_COMPOSITE_VERSION: u32 = 1;
 ///   | `ij,jk,kl->il`    | 2            | 14.8 µs               | 6.3 µs              |
 ///   | `ij,jk,kl,lm->im` | 3            | 26.0 µs               | 6.9 µs              |
 ///
-/// The capability parses and plans on every call and dispatches every instruction, where a call of the function is
-/// one dispatch after a lookup of its plan. The two forms take the same time once the contractions dominate (at
-/// extent 256 in the same setup). Awaiting every output before the next call adds several microseconds to each call
-/// of either form, and it made the capability the faster one for `bij,bjk->ikb` (12 µs against 17 µs), so measure
-/// when the latency of single calls matters.
+/// The capability parses and plans on every call and dispatches every instruction, where a call of the function is one
+/// dispatch after a lookup of its plan. The two forms take the same time once the contractions dominate (at extent 256
+/// in the same setup). Awaiting every output before the next call adds several microseconds to each call of either
+/// form, and it made the capability the faster one for `bij,bjk->ikb` (12 µs against 17 µs), so measure when the
+/// latency of single calls matters.
 pub struct EinsumComposite<D: Domain<Type = ArrayType>>
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
@@ -1332,19 +1330,19 @@ impl<D: Domain<Type = ArrayType, Constant: 'static, Operation: 'static>> EinsumC
 where
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
-    /// Returns the [`EinsumSpecification`] of this function.
+    /// Returns the [`EinsumSpecification`] of this [`EinsumComposite`].
     #[inline]
     pub fn specification(&self) -> &EinsumSpecification {
         &self.plans.specification
     }
 
-    /// Returns the [`EinsumOptions`] of this function.
+    /// Returns the [`EinsumOptions`] of this [`EinsumComposite`].
     #[inline]
     pub fn options(&self) -> &EinsumOptions {
         &self.plans.options
     }
 
-    /// Contracts `inputs` according to the specification and the options of this function. Refer to
+    /// Contracts `inputs` according to the specification and the options of this [`EinsumComposite`]. Refer to
     /// [`EinsumSpecification::plan`] for the requirements on the inputs. Manual variation is aligned before the
     /// composite boundary, so its transpose sums the contributions of replicated inputs once.
     ///
@@ -1355,9 +1353,8 @@ where
     ///
     /// Returns a [`ProgramError`] if the specification does not match `inputs`, or if a step of the einsum cannot be
     /// executed or staged.
-    pub fn call<C, V>(&self, inputs: Vec<V>) -> Result<V, ProgramError>
+    pub fn call<V, C>(&self, inputs: Vec<V>) -> Result<V, ProgramError>
     where
-        C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
         V: Value<Type = ArrayType, Domain = C>
             + ManualVariationAlignment
             + Compare
@@ -1371,6 +1368,7 @@ where
             + Select
             + Transpose
             + ZeroLike,
+        C: CompositeCallContext<Type = ArrayType, Value = V, Constant = D::Constant, Operation = D::Operation>,
     {
         let inputs = V::align_manual_variation(&inputs)?;
         let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
@@ -1382,6 +1380,8 @@ where
         self.composite.call(inputs)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Creates an Einstein summation function for `subscripts` with the default [`EinsumOptions`]. Refer to
 /// [`einsum_with_options`] for more information.
