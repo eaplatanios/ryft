@@ -89,7 +89,10 @@ impl EinsumLabel {
     /// labels. Indices map to `A` through `Z` and then `a` through `z`, like in the label lists of NumPy, and then to
     /// the alphabetic Unicode characters from `À` on in the order of their code points. Every returned label is valid
     /// in an [`EinsumSpecification`], and labels are ordered like their indices, so an implicit output orders its
-    /// labels by their indices, like `jax.numpy.einsum` does for integer labels.
+    /// labels by their indices, like `numpy.einsum` does for integer labels. `jax.numpy.einsum` does the same for
+    /// up to 26 distinct labels. With more, it orders the labels with the 27th smallest index and above before
+    /// the others, because `opt_einsum` renames the labels by their rank to `a` through `z` and then `A` through
+    /// `Z` before it orders them.
     pub fn from_index(index: usize) -> Option<Self> {
         const LETTERS: &[u8; 52] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         let label = match LETTERS.get(index) {
@@ -218,7 +221,8 @@ impl EinsumSpecification {
     /// that promote to no common type (e.g., the 8-bit floating-point types with any other type) need a requested
     /// accumulation type. Each label must have one extent across all inputs that contain it, except that inputs may
     /// have extent one where others have another extent (static or dynamic), in which case they are broadcast. The
-    /// axes of a label that one input repeats must have equal extents. Dynamic extents take part in the path search
+    /// axes of a label that one input repeats must have equal extents. Extents are equal when they provably are
+    /// (refer to [`Dimension::has_equal_extents`]), and a dynamic extent is one when its bounds admit nothing else. Dynamic extents take part in the path search
     /// as extent 8, like in JAX.
     ///
     /// # Errors
@@ -673,6 +677,12 @@ impl EinsumOptions {
     ///     converted, which discards its imaginary component.
     ///   - A result at the accumulation type that meets an input of another type converts that input first.
     ///
+    /// An algorithm or a preset of the [`DotPrecision`] replaces the last four rules. It converts the inputs of a
+    /// contraction to the types that it computes with and accumulates at its own type, so the inputs are not
+    /// converted first and every accumulation type is supported (e.g., `i16` inputs are contracted at `f32` by the
+    /// `F32_F32_F32` preset and the result is converted to an `f16` accumulation type). Two inputs of different
+    /// element types are converted to the type that they promote to.
+    ///
     /// This is the `preferred_element_type` argument of `jax.numpy.einsum`.
     #[inline]
     pub fn with_accumulation_type<D: Into<Option<DataType>>>(mut self, accumulation_type: D) -> Self {
@@ -733,7 +743,8 @@ impl EinsumOptions {
 /// Every step consumes one or two of the remaining inputs and appends its result to them, following
 /// `jax.numpy.einsum` step for step, so that equal paths stage the same contractions:
 ///
-///   1. Axes of extent one whose label has a larger extent in the other input are squeezed away.
+///   1. Axes of extent one whose label has another extent in the other input are squeezed away. A dynamic axis
+///      whose bounds admit only extent one is summed away instead, because a reshape cannot remove it.
 ///   2. Labels that only one input contains once and that no later step needs are summed out of that input.
 ///   3. Labels that one input repeats are replaced by their [`Diagonal`], which reads only the elements of the
 ///      diagonal, where JAX masks the whole input and sums it. An input with a dynamic extent uses that masked sum
@@ -1823,8 +1834,10 @@ impl<S> EinsumExecution<'_, S> {
         Ok((value, names))
     }
 
-    /// Squeezes away every axis of `value` that has extent one while the other input of its step has another extent
-    /// for its label, which broadcasts `value` along that label. Only static extents are compared.
+    /// Removes every axis of `value` that provably has extent one while the other input of its step has another
+    /// extent for its label, which broadcasts `value` along that label. Static axes are squeezed away. A dynamic
+    /// axis whose bounds admit only extent one cannot be removed by a reshape, so the axes are then summed away,
+    /// which keeps their single elements.
     fn filter_singleton_axes<V>(
         &mut self,
         value: V,
@@ -1838,17 +1851,21 @@ impl<S> EinsumExecution<'_, S> {
         let value_type = self.steps.array_type(&value);
         let squeezed_axes = (0..names.len())
             .filter(|axis| {
-                value_type.dimension(*axis) == Dimension::Static(1)
+                is_singleton(&value_type.dimension(*axis))
                     && other_names
                         .iter()
                         .position(|name| *name == names[*axis])
-                        .is_some_and(|other_axis| other_type.dimension(other_axis) != Dimension::Static(1))
+                        .is_some_and(|other_axis| !is_singleton(&other_type.dimension(other_axis)))
             })
             .collect::<Vec<_>>();
         if squeezed_axes.is_empty() {
             return Ok((value, names));
         }
-        let value = self.steps.squeeze(&value, squeezed_axes.clone())?;
+        let value = if squeezed_axes.iter().all(|axis| value_type.dimension(*axis) == Dimension::Static(1)) {
+            self.steps.squeeze(&value, squeezed_axes.clone())?
+        } else {
+            self.steps.reduce_sum(&value, &squeezed_axes, None)?
+        };
         for axis in squeezed_axes.into_iter().rev() {
             names.remove(axis);
         }
@@ -1863,8 +1880,7 @@ impl<S> EinsumExecution<'_, S> {
     ///   - Inputs of different element types are both converted to the accumulation type first, which happens when
     ///     an earlier result at the accumulation type meets an input.
     ///   - Floating-point inputs are converted first for a complex accumulation type. For every other kind of
-    ///     accumulation type they are contracted at the floating-point type that the precision computes with (i.e.,
-    ///     their own type, or the accumulation type of an algorithm), and the result is converted, so a fractional
+    ///     accumulation type they are contracted at their own type, and the result is converted, so a fractional
     ///     product is truncated once.
     ///   - Complex inputs are converted first for a wider complex accumulation type. For a real or integer
     ///     accumulation type that is at least as wide as their components, they are contracted at their own type
@@ -1872,6 +1888,13 @@ impl<S> EinsumExecution<'_, S> {
     ///   - Integer and Boolean inputs are converted first when the accumulation type is numeric and at least as
     ///     wide.
     ///   - Every other combination is left for the `dot` to reject.
+    ///
+    /// An algorithm converts its inputs to the element types that it computes with and accumulates at its own type,
+    /// so its inputs are contracted as they are, like in JAX. Converting them to the accumulation type first would
+    /// round them before the algorithm does (e.g., `i16` inputs at an `f16` accumulation type, which the
+    /// `F32_F32_F32` preset contracts at `f32`). Only inputs of different element types are converted, to the type
+    /// that they promote to. A floating-point accumulation type is then produced by the `dot` itself. Every other
+    /// one is converted from the type that the algorithm accumulates at, which keeps the `dot` differentiable.
     fn contract<V: Clone>(
         &mut self,
         lhs: &V,
@@ -1887,8 +1910,25 @@ impl<S> EinsumExecution<'_, S> {
         };
         let lhs_type = self.steps.array_type(lhs).data_type();
         let rhs_type = self.steps.array_type(rhs).data_type();
+        let is_native_f8_pair = is_native_f8_dot_type(lhs_type) && is_native_f8_dot_type(rhs_type);
+        if !matches!(self.precision, DotPrecision::Inputs { .. }) {
+            let (lhs, rhs, lhs_type, rhs_type) = if lhs_type == rhs_type || is_native_f8_pair {
+                (lhs.clone(), rhs.clone(), lhs_type, rhs_type)
+            } else {
+                let common_type = DataType::promoted(&[lhs_type, rhs_type]).unwrap_or(accumulation_type);
+                let lhs = self.convert(lhs.clone(), common_type)?;
+                let rhs = self.convert(rhs.clone(), common_type)?;
+                (lhs, rhs, common_type, common_type)
+            };
+            if accumulation_type.is_floating_point() {
+                return self.steps.contract(&lhs, &rhs, dimensions, Some(accumulation_type), output_sharding);
+            }
+            let result_type = self.precision.computation_types(lhs_type, rhs_type, accumulation_type).2;
+            let output = self.steps.contract(&lhs, &rhs, dimensions, Some(result_type), output_sharding)?;
+            return self.convert(output, accumulation_type);
+        }
         let (converts_inputs, converts_output) = if lhs_type != rhs_type {
-            (!(is_native_f8_dot_type(lhs_type) && is_native_f8_dot_type(rhs_type)), false)
+            (!is_native_f8_pair, false)
         } else if is_dot_accumulation_type(lhs_type, accumulation_type) {
             (false, false)
         } else if lhs_type.is_floating_point() {
@@ -1907,11 +1947,7 @@ impl<S> EinsumExecution<'_, S> {
             let rhs = self.convert(rhs.clone(), accumulation_type)?;
             self.steps.contract(&lhs, &rhs, dimensions, Some(accumulation_type), output_sharding)
         } else if converts_output {
-            // An algorithm computes at its own accumulation type, which the result keeps until it is converted.
-            let result_type = self.precision.computation_types(lhs_type, rhs_type, lhs_type).2;
-            let result_type = Some(result_type)
-                .filter(|result_type| *result_type != lhs_type && is_dot_accumulation_type(lhs_type, *result_type));
-            let output = self.steps.contract(lhs, rhs, dimensions, result_type, output_sharding)?;
+            let output = self.steps.contract(lhs, rhs, dimensions, None, output_sharding)?;
             self.convert(output, accumulation_type)
         } else {
             self.steps.contract(lhs, rhs, dimensions, Some(accumulation_type), output_sharding)
@@ -2945,10 +2981,10 @@ fn promoted_type(input_types: &[ArrayType]) -> Result<Option<DataType>, TypeErro
 }
 
 /// Returns the extent of every label of an einsum whose inputs have the provided labels and types, validating that
-/// each label has one extent across the inputs that contain it. An input may have extent one where another has a
-/// different extent, in which case its axis is squeezed away before the two are contracted, but the axes of a label
-/// that one input repeats must provably have equal extents, because their diagonal is taken. The extent of a label is
-/// the one of its axes that do not have extent one.
+/// each label provably has one extent across the inputs that contain it (refer to [`Dimension::has_equal_extents`]).
+/// An input may have extent one where another has a different extent, in which case its axis is removed before the
+/// two are contracted, but the axes of a label that one input repeats must provably have equal extents, because
+/// their diagonal is taken. The extent of a label is the one of its axes that do not have extent one.
 fn label_extents(input_names: &[Vec<char>], input_types: &[ArrayType]) -> Result<BTreeMap<char, Dimension>, TypeError> {
     let mut extents = BTreeMap::<char, Dimension>::new();
     for (index, (names, input_type)) in input_names.iter().zip(input_types).enumerate() {
@@ -2963,8 +2999,8 @@ fn label_extents(input_names: &[Vec<char>], input_types: &[ArrayType]) -> Result
             }
             input_extents.insert(*name, extent.clone());
             match extents.get(name) {
-                Some(other) if other.has_equal_extents(&extent) || extent == Dimension::Static(1) => {}
-                Some(other) if *other != Dimension::Static(1) => {
+                Some(other) if other.has_equal_extents(&extent) || is_singleton(&extent) => {}
+                Some(other) if !is_singleton(other) => {
                     return Err(TypeError::invalid(format!(
                         "`{EINSUM_NAME}` label `{name}` has extent `{extent}` in input {index} but extent `{other}` \
                          in an earlier input",
@@ -2977,6 +3013,12 @@ fn label_extents(input_names: &[Vec<char>], input_types: &[ArrayType]) -> Result
         }
     }
     Ok(extents)
+}
+
+/// Returns `true` if `dimension` provably has extent one, which a static dimension of size one does and a dynamic
+/// dimension whose bounds admit only that extent does as well.
+fn is_singleton(dimension: &Dimension) -> bool {
+    dimension.bounds().extent() == Some(1)
 }
 
 /// Returns `true` if every extent of `type` is static.

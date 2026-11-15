@@ -65,7 +65,9 @@ use crate::operations::constants::iota::Iota;
 use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_max::DimensionMax;
 use crate::operations::dimensions::dimension_size::DimensionSize;
-use crate::operations::dot::{Dot, DotDimensionNumbers, infer_dot_output_type, validate_common_mapped_dimension};
+use crate::operations::dot::{
+    Dot, DotDimensionNumbers, DotPrecision, infer_dot_output_type, validate_common_mapped_dimension,
+};
 use crate::operations::extrema::Clamp;
 use crate::operations::logical::And;
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast};
@@ -1276,6 +1278,7 @@ impl Operation for ScaledDotOperation {
             &lhs.clone().with_data_type(DataType::BF16),
             &rhs.clone().with_data_type(DataType::BF16),
             &self.dimensions,
+            DotPrecision::default(),
             Some(self.accumulation_type),
             None,
             false,
@@ -2650,6 +2653,7 @@ impl<'o> BlockScaledDotRules<'o> {
             &lhs_type.as_ref().clone().with_data_type(computation_type),
             &rhs_type.as_ref().clone().with_data_type(computation_type),
             dimensions,
+            DotPrecision::default(),
             None,
             None,
             false,

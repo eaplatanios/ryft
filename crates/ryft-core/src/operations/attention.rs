@@ -158,7 +158,7 @@ use crate::operations::constants::iota_like::IotaLike;
 use crate::operations::control_flow::select::Select;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::dimensions::dimension_size::DimensionSize;
-use crate::operations::dot::{Dot, DotDimensionNumbers, infer_dot_output_type};
+use crate::operations::dot::{Dot, DotDimensionNumbers, DotPrecision, infer_dot_output_type};
 use crate::operations::exponential::{Exp, Log};
 use crate::operations::logical::And;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastLike, DynamicBroadcast};
@@ -1574,6 +1574,7 @@ fn attention_inferred_output_shardings(
         &query,
         &key,
         &DotDimensionNumbers::new(vec![3], vec![3], vec![0, 2], vec![0, 2]),
+        DotPrecision::default(),
         None,
         None,
         false,
@@ -1590,6 +1591,7 @@ fn attention_inferred_output_shardings(
         &scores,
         &value,
         &DotDimensionNumbers::new(vec![3], vec![1], vec![0, 1], vec![0, 2]),
+        DotPrecision::default(),
         None,
         None,
         false,
@@ -2355,16 +2357,27 @@ fn contract_cotangent<V: Value<Type: ArrayMemberType> + Dot + Reshard>(
 ) -> Result<V, ProgramError> {
     let lhs_type = lhs.r#type().as_array_type()?.clone();
     let rhs_type = rhs.r#type().as_array_type()?.clone();
-    let contraction =
-        if infer_dot_output_type(operation_name, &lhs_type, &rhs_type, dimensions, None, None, false).is_ok() {
-            lhs.dot(rhs, dimensions)?
-        } else if cotangent_is_lhs {
-            let axes = (0..lhs_type.rank()).collect::<Vec<_>>();
-            replicate_dimensions(lhs.clone(), axes.as_slice())?.dot(rhs, dimensions)?
-        } else {
-            let axes = (0..rhs_type.rank()).collect::<Vec<_>>();
-            lhs.dot(&replicate_dimensions(rhs.clone(), axes.as_slice())?, dimensions)?
-        };
+    let precision = DotPrecision::default();
+    let contraction = if infer_dot_output_type(
+        operation_name,
+        &lhs_type,
+        &rhs_type,
+        dimensions,
+        precision,
+        None,
+        None,
+        false,
+    )
+    .is_ok()
+    {
+        lhs.dot(rhs, dimensions)?
+    } else if cotangent_is_lhs {
+        let axes = (0..lhs_type.rank()).collect::<Vec<_>>();
+        replicate_dimensions(lhs.clone(), axes.as_slice())?.dot(rhs, dimensions)?
+    } else {
+        let axes = (0..rhs_type.rank()).collect::<Vec<_>>();
+        lhs.dot(&replicate_dimensions(rhs.clone(), axes.as_slice())?, dimensions)?
+    };
     match sharding {
         Some(sharding) if contraction.r#type().as_array_type()?.sharding() != Some(sharding) => {
             contraction.reshard(sharding)

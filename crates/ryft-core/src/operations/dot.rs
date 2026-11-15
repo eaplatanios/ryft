@@ -670,7 +670,7 @@ impl Display for DotAlgorithmPreset {
 /// its default algorithm.
 ///
 /// The per-input precisions are hints that never change the types that the contraction computes with. An algorithm
-/// or a preset additionally fixes those types (refer to [`Self::computation_types`]), requires floating-point inputs,
+/// or a preset additionally fixes those types (refer to [`Self::computation_types`]), requires real or Boolean inputs,
 /// and requests [`DotInputPrecision::Default`] for both inputs. [`From`] conversions build a configuration from one
 /// [`DotInputPrecision`] for both inputs, from a pair of them, from a [`DotAlgorithm`], and from a
 /// [`DotAlgorithmPreset`].
@@ -950,9 +950,12 @@ impl DotOperation {
     /// types must still match each other, unless they are two distinct 8-bit floating-point types that backends
     /// contract natively (i.e., every such type except `f8e4m3b11fnuz`). This is the `preferred_element_type` contract
     /// of XLA, which its low precision matrix units implement natively (e.g., `f8 × f8 → f32` and `bf16 × bf16 → f32`).
-    /// Dots with an accumulation type differentiate like ordinary dots, with tangents and cotangents carried at the
-    /// accumulation type (refer to the forward mode and transposition documentation of this operation), and they
-    /// can also request an output sharding (refer to [`Self::with_output_sharding`]).
+    /// A [`DotAlgorithm`] or a [`DotAlgorithmPreset`] that accumulates at a type of its own converts its result to the
+    /// accumulation type, so it supports every accumulation type, like in JAX (e.g., `i16` inputs that the
+    /// `F32_F32_F32` preset contracts at `f32` and returns as `f16`). Dots with an accumulation type differentiate like
+    /// ordinary dots, with tangents and cotangents carried at the accumulation type (refer to the forward mode and
+    /// transposition documentation of this operation), and they can also request an output sharding (refer to
+    /// [`Self::with_output_sharding`]).
     #[inline]
     pub fn with_accumulation_type<D: Into<Option<DataType>>>(mut self, accumulation_type: D) -> Self {
         self.accumulation_type = accumulation_type.into();
@@ -1049,6 +1052,7 @@ impl Operation for DotOperation {
             &input_types[0],
             &input_types[1],
             &self.dimensions,
+            self.precision,
             self.accumulation_type,
             self.output_sharding.as_ref(),
             true,
@@ -1422,9 +1426,11 @@ impl Dot for Array {
             .remove(0)
             .data_type();
 
-        // Boolean inputs contract to the disjunction of the conjunctions of their paired elements, which holds
-        // exactly when the number of pairs of true elements is not zero.
-        if output_type == DataType::Boolean {
+        // Boolean inputs contract to the disjunction of the conjunctions of their paired elements, which holds exactly
+        // when the number of pairs of true elements is not zero. An algorithm computes Boolean inputs at its own
+        // floating-point types instead, like every other input.
+        let (lhs_type, rhs_type, result_type) = precision.computation_types(lhs_type, rhs_type, output_type);
+        if result_type == DataType::Boolean {
             let lhs = self.convert_element_type(DataType::U64)?;
             let rhs = rhs.convert_element_type(DataType::U64)?;
             return lhs.dot_elements::<u64>(&rhs, dimensions, output_sharding)?.convert_element_type(DataType::Boolean);
@@ -1436,7 +1442,6 @@ impl Dot for Array {
         // so each result is rounded once. This matches how XLA backends evaluate dots of narrow floating-point types
         // when no algorithm is requested. Every other element type accumulates at the output type, unless an algorithm
         // makes it compute at a floating-point type.
-        let (lhs_type, rhs_type, result_type) = precision.computation_types(lhs_type, rhs_type, output_type);
         let kernel_type = if !result_type.is_floating_point() {
             output_type
         } else if [lhs_type, rhs_type, result_type].contains(&DataType::F64) {
@@ -1934,8 +1939,16 @@ impl Operation for RaggedDotOperation {
         }
 
         let mode = dimensions.validate(lhs.rank(), rhs.rank())?;
-        let mut output =
-            infer_dot_output_type(RAGGED_DOT_OPERATION_NAME, lhs, rhs, dimensions.dot_dimensions(), None, None, false)?;
+        let mut output = infer_dot_output_type(
+            RAGGED_DOT_OPERATION_NAME,
+            lhs,
+            rhs,
+            dimensions.dot_dimensions(),
+            DotPrecision::default(),
+            None,
+            None,
+            false,
+        )?;
         let prefix_axes = dimensions.group_sizes_prefix_dimensions(lhs.rank())?;
         if group_sizes.rank() != 1 {
             let expected_prefix = Shape::new(prefix_axes.iter().map(|axis| lhs.dimension(*axis)).collect());
@@ -2698,6 +2711,14 @@ pub(crate) fn is_dot_accumulation_type(input_type: DataType, accumulation_type: 
 /// instructions expose an independent preferred accumulator type, so floating-point inputs may accumulate at every
 /// floating-point type, including narrower ones (e.g., 8-bit inputs at `bf16`, or `f32` inputs at `f16`). Integer
 /// accumulation preserves signedness and may only widen the input type. This is XLA's `preferred_element_type` rule.
+/// An algorithm or a preset of `precision` converts the inputs to the element types that it computes with and converts
+/// its result to the accumulation type (refer to [`DotPrecision::computation_types`]), so the rule applies to those
+/// computation types. An algorithm that accumulates at a type of its own therefore supports every accumulation type,
+/// like in JAX, which skips its width check for algorithms.
+///
+/// Each pair of batching dimensions and each pair of contracting dimensions must provably have equal extents (refer
+/// to [`Dimension::has_equal_extents`]), which includes a dynamic dimension whose bounds admit only the extent of
+/// its static counterpart. A batching dimension of the output is the one of the left-hand side input.
 ///
 /// The output [`Sharding`] follows the `dot_general` sharding rule of JAX (i.e., `_dot_general_sharding_rule`
 /// in the [JAX implementation](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/lax.py)). The StableHLO
@@ -2725,6 +2746,7 @@ pub(crate) fn infer_dot_output_type(
     lhs: &ArrayType,
     rhs: &ArrayType,
     dimensions: &DotDimensionNumbers,
+    precision: DotPrecision,
     accumulation_type: Option<DataType>,
     output_sharding: Option<&Sharding>,
     accepts_boolean_inputs: bool,
@@ -2754,9 +2776,13 @@ pub(crate) fn infer_dot_output_type(
     }
 
     if let Some(accumulation_type) = accumulation_type {
-        // Two distinct 8-bit floating-point inputs are both floating-point, so checking the left-hand side covers them.
+        // The contraction accumulates the element types that its precision computes with, and an algorithm converts
+        // its result to the accumulation type afterwards. Two distinct 8-bit floating-point inputs are both
+        // floating-point, so checking the left-hand side covers them.
         let input_type = lhs.data_type();
-        if !is_dot_accumulation_type(input_type, accumulation_type) {
+        let (computation_type, _, result_type) =
+            precision.computation_types(input_type, rhs.data_type(), accumulation_type);
+        if !is_dot_accumulation_type(computation_type, result_type) {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` input data type `{input_type}` cannot accumulate at data type \
                  `{accumulation_type}`",
@@ -2771,7 +2797,7 @@ pub(crate) fn infer_dot_output_type(
     dimensions.validate(operation_name, lhs.rank(), rhs.rank())?;
 
     for (lhs_axis, rhs_axis) in lhs_batching.iter().zip(rhs_batching) {
-        if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
+        if !lhs.dimension(*lhs_axis).has_equal_extents(&rhs.dimension(*rhs_axis)) {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` batching dimension sizes do not match (left-hand side axis {lhs_axis}, \
                  right-hand side axis {rhs_axis})",
@@ -2780,7 +2806,7 @@ pub(crate) fn infer_dot_output_type(
     }
 
     for (lhs_axis, rhs_axis) in lhs_contracting.iter().zip(rhs_contracting) {
-        if lhs.dimension(*lhs_axis) != rhs.dimension(*rhs_axis) {
+        if !lhs.dimension(*lhs_axis).has_equal_extents(&rhs.dimension(*rhs_axis)) {
             return Err(TypeError::invalid(format!(
                 "`{operation_name}` contracting dimension sizes do not match (left-hand side axis {lhs_axis}, \
                  right-hand side axis {rhs_axis})",
