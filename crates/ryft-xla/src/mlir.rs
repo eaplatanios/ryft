@@ -1,3 +1,6 @@
+//! Conversion of `ryft` types into MLIR. [`ToMlir`] is implemented by the types that `ryft-xla` lowers into MLIR
+//! attributes, types, or operations, such as the meshes and shardings in [`crate::sharding`].
+
 use ryft_mlir::Location;
 
 /// Represents types that can be converted to an MLIR representation (e.g., an MLIR [`Attribute`](ryft_mlir::Attribute),

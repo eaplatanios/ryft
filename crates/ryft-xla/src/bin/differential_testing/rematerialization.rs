@@ -1,8 +1,8 @@
 //! Emits the rematerialization (i.e., gradient checkpointing) cases of the differential harness, which compare Ryft's
 //! [`rematerialize`] with JAX's [`jax.checkpoint`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html).
 //!
-//! Every case differentiates one rematerialized function of `x: f32[2, 3]` and `w: f32[3, 2]` (and, for the scan cases,
-//! of stacked layers `f32[2, 2, 2]`) whose arithmetic is exact in `f32` (i.e., dot products, products, and sums of
+//! Every case differentiates one rematerialized function of `x: f32[2, 3]` and `w: f32[3, 2]`, and of stacked layers
+//! `f32[2, 2, 2]` for the scan cases, whose arithmetic is exact in `f32` (i.e., dot products, products, and sums of
 //! small integers), so that both frameworks must produce identical values. Each case records its output, its
 //! Jacobian-vector product, and its input gradients, which are computed eagerly on core [`CoreArray`]s, together with
 //! the values that reverse mode differentiation saves, which [`saved_residuals`] reports. The saved values are encoded
@@ -40,7 +40,7 @@ pub(super) const CASES: [(&str, fn() -> Result<DifferentialObservation, Box<dyn 
     ("rematerialization_nothing_saveable", emit_nothing_saveable),
     ("rematerialization_everything_saveable", emit_everything_saveable),
     ("rematerialization_dots_saveable", emit_dots_saveable),
-    ("rematerialization_dots_with_no_batch_dims_saveable", emit_dots_with_no_batch_dims_saveable),
+    ("rematerialization_dots_with_no_batch_dims_saveable", emit_dots_with_no_batch_dimensions_saveable),
     ("rematerialization_save_only_these_names", emit_save_only_these_names),
     ("rematerialization_save_any_names_but_these", emit_save_any_names_but_these),
     ("rematerialization_save_from_both_policies", emit_save_from_both_policies),
@@ -127,14 +127,14 @@ fn scan_step<V: Dot + Mul>(hidden: V, layer: V) -> Result<V, ProgramError> {
 /// Returns `broadcast(layer : layer)` of shape `[2, 2]`, which expands the compact sum of the squares of the entries
 /// of `layer` (i.e., the dot product that contracts both of its dimensions), the `true` branch of the condition in the
 /// condition-in-scan case.
-fn expanded_layer_norm<V: Broadcast + Dot + Typed<Type = ArrayType>>(layer: V) -> Result<V, ProgramError> {
+fn expanded_layer_norm<V: Typed<Type = ArrayType> + Broadcast + Dot>(layer: V) -> Result<V, ProgramError> {
     let dimensions = DotDimensionNumbers::new(vec![0, 1], vec![0, 1], vec![], vec![]);
     layer.dot(&layer, &dimensions)?.broadcast_to(StaticShape::new(vec![2, 2]))
 }
 
 /// Returns `e + e` for `e = broadcast(layer : layer)`, the `false` branch of the condition in the condition-in-scan
 /// case.
-fn doubled_expanded_layer_norm<V: Add + Broadcast + Dot + Typed<Type = ArrayType>>(
+fn doubled_expanded_layer_norm<V: Typed<Type = ArrayType> + Add + Broadcast + Dot>(
     layer: V,
 ) -> Result<V, ProgramError> {
     let e = expanded_layer_norm(layer)?;
@@ -148,35 +148,35 @@ fn condition_in_scan_step<V: Add + Mul>(hidden: V, e: V) -> Result<V, ProgramErr
 
 /// Returns `broadcast(c)` of shape `[3, 2, 2]`, which expands the compact value `c: f32[2, 2]` of the cases whose
 /// regions carry no gradients.
-fn expand<V: Broadcast + Typed<Type = ArrayType>>(c: V) -> Result<V, ProgramError> {
+fn expand<V: Typed<Type = ArrayType> + Broadcast>(c: V) -> Result<V, ProgramError> {
     c.broadcast_to(StaticShape::new(vec![3, 2, 2]))
 }
 
 /// Returns `broadcast(wᵀ · w)`, the `true` branch of the known condition case.
-fn known_condition_true_branch<V: Broadcast + Dot + Typed<Type = ArrayType>>(w: V) -> Result<V, ProgramError> {
+fn known_condition_true_branch<V: Typed<Type = ArrayType> + Broadcast + Dot>(w: V) -> Result<V, ProgramError> {
     expand(w.dot(&w, &DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![]))?)
 }
 
 /// Returns `e + e` for `e = broadcast(wᵀ · w)`, the `false` branch of the known condition case.
-fn known_condition_false_branch<V: Add + Broadcast + Dot + Typed<Type = ArrayType>>(w: V) -> Result<V, ProgramError> {
+fn known_condition_false_branch<V: Typed<Type = ArrayType> + Add + Broadcast + Dot>(w: V) -> Result<V, ProgramError> {
     let e = known_condition_true_branch(w)?;
     e.add(&e)
 }
 
 /// Returns `h + broadcast(layer · layer)`, one iteration of the known scan case.
-fn known_scan_step<V: Add + Broadcast + Dot + Typed<Type = ArrayType>>(hidden: V, layer: V) -> Result<V, ProgramError> {
+fn known_scan_step<V: Typed<Type = ArrayType> + Add + Broadcast + Dot>(hidden: V, layer: V) -> Result<V, ProgramError> {
     hidden.add(&expand(layer.dot(&layer, &matrix_multiplication())?)?)
 }
 
 /// Returns `broadcast(tag(layer : layer, "compact"))` of shape `[2, 3]`, expanding a scalar saved by the offloading
 /// policy of the storage scan cases.
-fn expanded_compact_norm<V: Broadcast + Dot + Tag + Typed<Type = ArrayType>>(layer: V) -> Result<V, ProgramError> {
+fn expanded_compact_norm<V: Typed<Type = ArrayType> + Broadcast + Dot + Tag>(layer: V) -> Result<V, ProgramError> {
     let dimensions = DotDimensionNumbers::new(vec![0, 1], vec![0, 1], vec![], vec![]);
     layer.dot(&layer, &dimensions)?.tag("compact")?.broadcast_to(StaticShape::new(vec![2, 3]))
 }
 
 /// Returns twice [`expanded_compact_norm`], the false branch of the carried storage scan case.
-fn doubled_expanded_compact_norm<V: Add + Broadcast + Dot + Tag + Typed<Type = ArrayType>>(
+fn doubled_expanded_compact_norm<V: Typed<Type = ArrayType> + Add + Broadcast + Dot + Tag>(
     layer: V,
 ) -> Result<V, ProgramError> {
     let e = expanded_compact_norm(layer)?;
@@ -234,10 +234,11 @@ fn record_residuals(
     Ok(())
 }
 
-/// Inserts into `$observations` the output (named `output`), Jacobian-vector product (named `jvp`), and input gradients
-/// (named after the inputs with a `_gradient` suffix) of the rematerialized function `$function` at the core arrays
-/// bound to the identifiers `$input`, for the tangents `$tangent` and the output cotangent `$seed`. Every name starts
-/// with `$prefix`. The function is called once per transform, because each transform traces a different tracer type.
+/// Inserts into `$observations` the output, the Jacobian-vector product, and the input gradients of the rematerialized
+/// function `$function` at the core arrays bound to the identifiers `$input`, for the tangents `$tangent` and the
+/// output cotangent `$seed`. They are named `output`, `jvp`, and the input names with a `_gradient` suffix, and every
+/// name starts with `$prefix`. The function is called once per transform, because each transform traces a different
+/// tracer type.
 macro_rules! observe {
     // Evaluates the function under each transform, binding the gradients to the input identifiers.
     (
@@ -341,7 +342,7 @@ fn emit_dots_saveable() -> Result<DifferentialObservation, Box<dyn Error>> {
 
 /// Emits [`policy_body`] rematerialized with [`DotsWithNoBatchDimensionsSavable`], which saves only the dot product
 /// without batching dimensions.
-fn emit_dots_with_no_batch_dims_saveable() -> Result<DifferentialObservation, Box<dyn Error>> {
+fn emit_dots_with_no_batch_dimensions_saveable() -> Result<DifferentialObservation, Box<dyn Error>> {
     emit_case!(
         "rematerialization_dots_with_no_batch_dims_saveable",
         rematerialize(|(x, w): (CoreTracer, CoreTracer)| policy_body(x, w))
@@ -601,11 +602,11 @@ fn emit_dots_saveable_nested_scan() -> Result<DifferentialObservation, Box<dyn E
 }
 
 /// Emits a rematerialized function with [`DotsSavable`] that scans [`condition_in_scan_step`] over two stacked
-/// `layers`, starting from `y = x · w`. On each iteration, a condition on `sum(h) > 0` (refer to
-/// [`condition_predicate`]) computes `e` from the layer without its gradient, as [`expanded_layer_norm`] or
-/// [`doubled_expanded_layer_norm`]. The carry chain splits the condition, so the policy saves the stacked compact dot
-/// products of the branches that run, rather than the expanded outputs of the condition, and the residual program
-/// recomputes the carries and the predicates, as JAX does. Both branches run at `-x`, whose values are recorded under names that start with
+/// `layers`, starting from `y = x · w`. On each iteration, a condition on `sum(h) > 0`, as in [`condition_predicate`],
+/// computes `e` from the layer without its gradient, as [`expanded_layer_norm`] or [`doubled_expanded_layer_norm`].
+/// The carry chain splits the condition, so the policy saves the stacked compact dot products of the branches that
+/// run, rather than the expanded outputs of the condition, and the residual program recomputes the carries and the
+/// predicates, as JAX does. Both branches run at `-x`, whose values are recorded under names that start with
 /// `false_branch_`.
 fn emit_dots_saveable_condition_in_scan() -> Result<DifferentialObservation, Box<dyn Error>> {
     let core = rematerialize(|(x, w, layers): (CoreTracer, CoreTracer, CoreTracer)| {
@@ -683,8 +684,8 @@ fn emit_dots_saveable_condition_in_scan() -> Result<DifferentialObservation, Box
 }
 
 /// Emits a rematerialized function with [`DotsSavable`] whose output [`known_region_output`] reads the output of a
-/// condition whose inputs carry no gradients. The condition expands the compact `wᵀ · w` of its branch into `f32[3, 2,
-/// 2]` (refer to [`known_condition_true_branch`] and [`known_condition_false_branch`]), so the policy saves that
+/// condition whose inputs carry no gradients. The condition expands the compact `wᵀ · w` of its branch into
+/// `f32[3, 2, 2]`, as [`known_condition_true_branch`] and [`known_condition_false_branch`] do, so the policy saves that
 /// compact value rather than the expansion, as JAX does. The predicate, `sum(x) > 0`, holds at `x` and fails at `-x`,
 /// whose values are recorded under names that start with `false_branch_`.
 fn emit_dots_saveable_known_condition() -> Result<DifferentialObservation, Box<dyn Error>> {
@@ -735,7 +736,7 @@ fn emit_dots_saveable_known_condition() -> Result<DifferentialObservation, Box<d
 
 /// Emits a rematerialized function with [`DotsSavable`] whose output [`known_region_output`] reads the final carry of a
 /// scan whose inputs carry no gradients. The scan adds the expansion of the compact `layer · layer` into
-/// `f32[3, 2, 2]` to its carry on each iteration (refer to [`known_scan_step`]), starting from the expansion of
+/// `f32[3, 2, 2]` to its carry on each iteration, as [`known_scan_step`] does, starting from the expansion of
 /// `Σ layers`, so the policy saves the stacked compact values and the layers from which the initial carry is
 /// recomputed, rather than the final carry, as JAX does.
 fn emit_dots_saveable_known_scan() -> Result<DifferentialObservation, Box<dyn Error>> {
@@ -784,8 +785,8 @@ fn emit_dots_saveable_known_scan() -> Result<DifferentialObservation, Box<dyn Er
 }
 
 /// Emits a rematerialized function with [`DotsSavable`] whose output [`known_region_output`] reads the output of a
-/// composite call whose input carries no gradient. The call expands the compact `wᵀ · w` into `f32[3, 2, 2]` (refer to
-/// [`known_condition_true_branch`]). The policy classifies the call itself, which is not a dot product, so it saves
+/// composite call whose input carries no gradient. The call expands the compact `wᵀ · w` into `f32[3, 2, 2]`, as
+/// [`known_condition_true_branch`] does. The policy classifies the call itself, which is not a dot product, so it saves
 /// neither the compact value nor the expansion, and the backward pass replays the whole call from `w`, as JAX does for
 /// `custom_jvp_call`.
 fn emit_dots_saveable_known_composite() -> Result<DifferentialObservation, Box<dyn Error>> {
@@ -936,6 +937,7 @@ fn emit_nested_policies() -> Result<DifferentialObservation, Box<dyn Error>> {
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use ryft_core::ResidualSource;
@@ -989,7 +991,40 @@ mod tests {
                 ("residual_bit_widths", vec![vec![32.0, 32.0, 32.0, 32.0]]),
             ]),
         );
-        assert!(stablehlo.contains("stablehlo.optimization_barrier"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.dot_general"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {"
+            module {
+              func.func @main(%arg0: tensor<2x3xf32>, %arg1: tensor<3x2xf32>, %arg2: tensor<2xf32>) -> \
+                  (tensor<2xf32>, tensor<2x3xf32>, tensor<3x2xf32>) {
+                %0 = stablehlo.dot_general %arg0, %arg1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] \
+                    : (tensor<2x3xf32>, tensor<3x2xf32>) -> tensor<2x2xf32>
+                %1 = stablehlo.multiply %0, %0 : tensor<2x2xf32>
+                %2 = stablehlo.dot_general %1, %0, batching_dims = [0] x [0], contracting_dims = [1] x [1], precision \
+                    = [DEFAULT, DEFAULT] : (tensor<2x2xf32>, tensor<2x2xf32>) -> tensor<2xf32>
+                %3 = stablehlo.multiply %2, %2 : tensor<2xf32>
+                %4:5 = stablehlo.optimization_barrier %arg2, %arg1, %arg0, %0, %2 : tensor<2xf32>, tensor<3x2xf32>, \
+                    tensor<2x3xf32>, tensor<2x2xf32>, tensor<2xf32>
+                %5 = stablehlo.multiply %4#3, %4#3 : tensor<2x2xf32>
+                %6 = stablehlo.multiply %4#4, %4#0 : tensor<2xf32>
+                %7 = stablehlo.multiply %4#4, %4#0 : tensor<2xf32>
+                %8 = stablehlo.add %6, %7 : tensor<2xf32>
+                %9 = stablehlo.dot_general %5, %8, batching_dims = [0] x [0], contracting_dims = [] x [], precision = \
+                    [DEFAULT, DEFAULT] : (tensor<2x2xf32>, tensor<2xf32>) -> tensor<2x2xf32>
+                %10 = stablehlo.dot_general %8, %4#3, batching_dims = [0] x [0], contracting_dims = [] x [], \
+                    precision = [DEFAULT, DEFAULT] : (tensor<2xf32>, tensor<2x2xf32>) -> tensor<2x2xf32>
+                %11 = stablehlo.multiply %4#3, %10 : tensor<2x2xf32>
+                %12 = stablehlo.add %9, %11 : tensor<2x2xf32>
+                %13 = stablehlo.multiply %4#3, %10 : tensor<2x2xf32>
+                %14 = stablehlo.add %12, %13 : tensor<2x2xf32>
+                %15 = stablehlo.dot_general %14, %4#1, contracting_dims = [1] x [1], precision = [DEFAULT, DEFAULT] : \
+                    (tensor<2x2xf32>, tensor<3x2xf32>) -> tensor<2x3xf32>
+                %16 = stablehlo.dot_general %4#2, %14, contracting_dims = [0] x [0], precision = [DEFAULT, DEFAULT] : \
+                    (tensor<2x3xf32>, tensor<2x2xf32>) -> tensor<3x2xf32>
+                return %3, %15, %16 : tensor<2xf32>, tensor<2x3xf32>, tensor<3x2xf32>
+              }
+            }
+            "},
+        );
     }
 }

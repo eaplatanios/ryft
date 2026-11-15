@@ -1,6 +1,6 @@
 //! Lowering of [`ConditionOperation`] to [StableHLO `if`](https://openxla.org/stablehlo/spec#if).
 //!
-//! A condition lowers only from the [`ArrayIrType`] operation family, which stores its two branch regions; the
+//! A condition lowers only from the [`ArrayIrType`] operation family, which stores its two branch regions. The
 //! homogeneous [`ArrayType`] payload carries no regions and is rejected. The predicate selects between two
 //! `stablehlo.if` regions that take no arguments and capture the lowered branch inputs implicitly. Each branch input is
 //! converted from its actual type to the shared declared type of its branch input, and an entry guard checks the input
@@ -23,11 +23,12 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 impl LowerableOperation for ConditionOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        _input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (lowerer, input_values, input_types, output_types);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
@@ -47,7 +48,7 @@ impl LowerableOperation for ConditionOperation<ArrayIrType> {
         output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         // A condition lowers to one `stablehlo.if` on its predicate, which is the first of its `1 + n` inputs, followed
-        // by the `n` inputs of both branches. The branch regions take no arguments: each one is inlined over the
+        // by the `n` inputs of both branches. The branch regions take no arguments. Each one is inlined over the
         // lowered branch inputs, which it captures implicitly, and returns the condition's `output_types` followed by
         // one trailing token for each ordered effect class that either branch threads. The lowering proceeds in order:
         //
@@ -61,8 +62,11 @@ impl LowerableOperation for ConditionOperation<ArrayIrType> {
         //
         // The program that attaches the condition validated its region and input counts, so a mismatch here is an
         // internal error, reported as the operation's own region contract and input count would report it.
-        self.validate_region_count(lowerer.regions.len())?;
-        let (true_branch, false_branch) = (&lowerer.regions[0], &lowerer.regions[1]);
+        self.validate_region_count(lowerer.regions().len())?;
+        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
+            lowerer.split_effect_tokens();
+        let (true_branch, false_branch) = (&regions[0], &regions[1]);
         let branch_input_types = true_branch.input_types();
         let expected = branch_input_types.len() + 1;
         for actual in [input_values.len(), input_types.len()] {
@@ -77,14 +81,7 @@ impl LowerableOperation for ConditionOperation<ArrayIrType> {
             .zip(&input_types[1..])
             .zip(branch_input_types.iter())
             .map(|((value, input_type), branch_input_type)| {
-                lower_refined_region_input(
-                    *value,
-                    input_type,
-                    branch_input_type,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
-                )
+                lower_refined_region_input(*value, input_type, branch_input_type, &mut block, context, location)
             })
             .collect::<Result<Vec<_>, _>>()?;
         // Both branches declare the same inputs, so guarding their shared entry before the conditional checks exactly
@@ -95,18 +92,18 @@ impl LowerableOperation for ConditionOperation<ArrayIrType> {
             &branch_input_types,
             &input_types[1..],
             &input_values[1..],
-            &mut lowerer.effect_tokens,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
+            effect_tokens,
+            &mut block,
+            context,
+            location,
         )?;
         // Each ordered class used by either branch is captured and returned independently. Both branches carry the
         // union so their result signatures agree, returning an entry token unchanged when that branch is pure for the
         // class.
         let threaded_effects = lowered_effect_classes(true_branch)?.union(lowered_effect_classes(false_branch)?);
-        let mut entry_effect_tokens = lowerer.effect_tokens;
+        let mut entry_effect_tokens = *effect_tokens;
         for effect in token_threaded_effects(threaded_effects) {
-            let token = current_or_new_token(effect, &mut lowerer.effect_tokens, &mut lowerer.block, lowerer.location)?;
+            let token = current_or_new_token(effect, effect_tokens, &mut block, location)?;
             entry_effect_tokens.set(effect, token);
         }
         // The declared branch outputs may differ (e.g., `f64[extent]` and `f64[3]`) while agreeing after input
@@ -116,32 +113,32 @@ impl LowerableOperation for ConditionOperation<ArrayIrType> {
                 branch,
                 &branch_inputs,
                 output_types,
-                lowerer.context,
-                lowerer.location,
-                &lowerer.captured_values,
-                lowerer.nested_functions.as_ref(),
-                &lowerer.collective_state,
+                context,
+                location,
+                captured_values,
+                nested_functions,
+                collective_state,
                 entry_effect_tokens,
                 threaded_effects,
             )
         });
-        let operation = lowerer.block.append_operation(stable_hlo::r#if(
+        let operation = block.append_operation(stable_hlo::r#if(
             input_values[0],
             true_branch_region?.into(),
             false_branch_region?.into(),
-            lowerer.location,
+            location,
         )?)?;
         let output_count = output_types.len();
-        set_threaded_effect_tokens(&mut lowerer.effect_tokens, threaded_effects, |offset| {
+        set_threaded_effect_tokens(effect_tokens, threaded_effects, |offset| {
             operation.result(output_count + offset).unwrap().as_ref()
         });
         let outputs = (0..output_count).map(|index| operation.result(index).unwrap().as_ref()).collect();
         lower_explicit_sharding_constraints(
             outputs,
             output_types,
-            &lowerer.collective_state.bound_manual_axes,
-            &mut lowerer.block,
-            lowerer.location,
+            collective_state.bound_manual_axes(),
+            &mut block,
+            location,
         )
     }
 }
@@ -153,17 +150,17 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, AddOperation, ArrayOperation, ArrayType, AssertOperation, BatchAxis, BatchedProgram, CompareOperation,
-        ComparisonDirection, CompositeTransposeOperation, Condition, ConditionOperation, DataType, Device, DeviceMesh,
-        Dimension as CoreDimension, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable,
-        DynamicBroadcastOperation, GuardOperation, LogicalMesh, MeshAxis, MeshAxisType, Mul, MulOperation,
-        NegOperation, OneLikeOperation, OneOperation, Placeholder, PrintOperation, ProgramBatchingOutputAxesPolicy,
-        ReduceOperation, ReductionKind, ScanOperation, Shape, Sharding, ShardingDimension, SubOperation,
-        TransposedProgramCotangent, TypedProgram, WhileOperation, ZeroOperation, batch,
+        Add, AddOperation, ArrayOperation, AssertOperation, BatchAxis, BatchedProgram, CompareOperation,
+        ComparisonDirection, CompositeTransposeOperation, Condition, DataType, Dimension as CoreDimension,
+        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation,
+        GuardOperation, MeshAxisType, Mul, MulOperation, NegOperation, OneLikeOperation, OneOperation, Placeholder,
+        PrintOperation, ProgramBatchingOutputAxesPolicy, ReduceOperation, ReductionKind, ScanOperation, Shape,
+        Sharding, ShardingDimension, SubOperation, TransposedProgramCotangent, WhileOperation, ZeroOperation, batch,
     };
     use ryft_mlir::{Context as MlirContext, Location};
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
+    use crate::domains::tests::{domain_mesh, program_array, read_f32s};
     use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, neg_branch,
         ragged_dot_cpu_compilation_options, unproject_plain_program,
@@ -174,13 +171,54 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, Constant, FromPjrt, Session, Value, to_mlir_module_for_program};
+    use crate::tests::{execution_client, replicated_array, values_to_bytes};
+    use crate::{Constant, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 
+    /// Compiles the StableHLO `module`, whose function returns no outputs, executes it once on `client` with one
+    /// scalar input per entry of `inputs`, given as its native-endian bytes and buffer type, and returns the lines that
+    /// its prints emit.
+    fn execute_module_without_outputs(
+        client: &ryft_pjrt::Client<'_>,
+        module: &str,
+        inputs: &[(&[u8], BufferType)],
+    ) -> Vec<String> {
+        ensure_print_handler_registered(client).unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.as_bytes().to_vec() }, &ragged_dot_cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        let inputs = inputs
+            .iter()
+            .map(|(bytes, buffer_type)| ExecutionInput {
+                buffer: Arc::new(client.buffer(*bytes, *buffer_type, &[], None, device.clone(), None).unwrap()),
+                donatable: false,
+            })
+            .collect::<Vec<_>>();
+        let (outputs, lines) = with_captured_prints(|| {
+            executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    Vec::new(),
+                    0,
+                    None,
+                    Some(file!()),
+                    None,
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .block_until_ready()
+                .unwrap()
+        });
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].outputs.len(), 0);
+        lines
+    }
+
     #[test]
-    fn test_condition_lowering() {
+    fn test_condition_operation_lower() {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
         let mut builder = ArrayIrProgramBuilder::new();
@@ -229,20 +267,20 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_threads_the_io_dependency_of_a_guard_out_of_its_branches() {
+    fn test_condition_operation_lower_threads_the_io_dependency_of_a_guard_out_of_its_branches() {
         // Each branch's only effect is an entry guard, which joins its assertion token into the ordered I/O chain so
         // that later I/O follows the check. The conditional must thread that chain out of its branches, so the print
         // after it consumes an I/O token that the conditional returns.
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
+        let declared_dimension = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let input_dimension = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new_static(DataType::F64, [2]);
         let branch = || {
             let mut builder = ArrayIrProgramBuilder::new();
-            let dimension = builder.add_input(m.clone().into());
+            let dimension = builder.add_input(input_dimension.clone().into());
             let array = builder.add_input(array_type.clone().into());
             let declared: Vec<ArrayIrType> = vec![
-                n.clone().into(),
-                ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into(),
+                declared_dimension.clone().into(),
+                ArrayType::new(DataType::F64, Shape::new(vec![declared_dimension.simplified_dimension()])).into(),
             ];
             builder
                 .add_instruction(GuardOperation::new("branch", declared), Vec::new(), vec![dimension, array], None)
@@ -255,7 +293,7 @@ mod tests {
         let true_region = builder.import_region(branch().entry_region_ref());
         let false_region = builder.import_region(branch().entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let dimension = builder.add_input(m.clone().into());
+        let dimension = builder.add_input(input_dimension.clone().into());
         let array = builder.add_input(array_type.clone().into());
         let selected = builder
             .add_instruction(
@@ -312,19 +350,20 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_threads_the_io_dependency_of_guards_that_lowering_synthesizes() {
+    fn test_condition_operation_lower_threads_the_io_dependency_of_guards_that_lowering_synthesizes() {
         // The outer branches are pure in the source program, but each contains an inner conditional whose mixed entry
-        // (a symbolic `dimension<m>` and an exact `f64[2]` entering `[dimension<n>, f64[n]]`) gains an entry guard
-        // during lowering. The outer conditional must thread that guard's I/O dependency out of its branches too, so
-        // the print after it consumes an I/O token that the outer conditional returns.
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
+        // (i.e., a symbolic `dimension<m>` and an exact `f64[2]` entering `[dimension<n>, f64[n]]`) gains an entry
+        // guard during lowering. The outer conditional must thread that guard's I/O dependency out of its branches too,
+        // so the print after it consumes an I/O token that the outer conditional returns.
+        let declared_dimension = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let input_dimension = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
         let array_type = ArrayType::new_static(DataType::F64, [2]);
         let inner_branch = || {
             let mut builder = ArrayIrProgramBuilder::new();
-            builder.add_input(n.clone().into());
-            let array =
-                builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into());
+            builder.add_input(declared_dimension.clone().into());
+            let array = builder.add_input(
+                ArrayType::new(DataType::F64, Shape::new(vec![declared_dimension.simplified_dimension()])).into(),
+            );
             builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![array], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
@@ -334,7 +373,7 @@ mod tests {
             let true_region = builder.import_region(inner_branch().entry_region_ref());
             let false_region = builder.import_region(inner_branch().entry_region_ref());
             let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-            let dimension = builder.add_input(m.clone().into());
+            let dimension = builder.add_input(input_dimension.clone().into());
             let array = builder.add_input(array_type.clone().into());
             let selected = builder
                 .add_instruction(
@@ -353,7 +392,7 @@ mod tests {
         let true_region = builder.import_region(outer_branch().entry_region_ref());
         let false_region = builder.import_region(outer_branch().entry_region_ref());
         let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let dimension = builder.add_input(m.clone().into());
+        let dimension = builder.add_input(input_dimension.clone().into());
         let array = builder.add_input(array_type.clone().into());
         let selected = builder
             .add_instruction(
@@ -438,9 +477,9 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_lowering_keeps_constant_predicates() {
-        // A condition whose predicate input is fed by a staged constant still lowers to `stablehlo.if`; folding the
-        // constant predicate away is the backend's job (StableHLO canonicalization and XLA's conditional
+    fn test_condition_operation_lower_keeps_constant_predicates() {
+        // A condition whose predicate input is fed by a staged constant still lowers to `stablehlo.if`. Folding the
+        // constant predicate away is the backend's job (i.e., StableHLO canonicalization and XLA's conditional
         // simplification), not ryft's.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F32);
@@ -484,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_lowering_forwards_dimension_extents() {
+    fn test_condition_operation_lower_forwards_dimension_extents() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
         let dynamic_vector_type =
@@ -585,9 +624,9 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_lowering_returns_branch_effect_tokens() {
+    fn test_condition_operation_lower_returns_branch_effect_tokens() {
         // A print inside one condition branch makes the lowered `stablehlo.if` return the branch's final effect
-        // token as one extra trailing result: both branches capture the entry token implicitly, the effectful branch
+        // token as one extra trailing result. Both branches capture the entry token implicitly, the effectful branch
         // returns its print custom call's token, and the pure branch returns the entry token unchanged.
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F64);
@@ -643,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_lowering_threads_the_union_of_branch_effect_classes() {
+    fn test_condition_operation_lower_threads_the_union_of_branch_effect_classes() {
         // Each branch uses a different ordered class. StableHLO requires identical branch result signatures, so both
         // branches return the union's two tokens while forwarding the untouched entry token for the unused class.
         let scalar_type = ArrayType::scalar(DataType::I64);
@@ -733,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_execution_transposed_without_cotangent_outputs_runs_backward_effects() {
+    fn test_condition_operation_lower_execution_transposed_without_cotangent_outputs_runs_backward_effects() {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let branch = |label| {
@@ -834,53 +873,21 @@ mod tests {
                 "#},
         );
         let client = execution_client();
-        ensure_print_handler_registered(&client).unwrap();
-        let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
-            .unwrap();
-        let device = executable.addressable_devices().unwrap().remove(0);
         for (predicate, expected) in [(true, "true backward: 7.0"), (false, "false backward: 7.0")] {
-            let inputs = vec![
-                ExecutionInput {
-                    buffer: Arc::new(
-                        client.buffer(&7f64.to_ne_bytes(), BufferType::F64, &[], None, device.clone(), None).unwrap(),
-                    ),
-                    donatable: false,
-                },
-                ExecutionInput {
-                    buffer: Arc::new(
-                        client
-                            .buffer(&[u8::from(predicate)], BufferType::Predicate, &[], None, device.clone(), None)
-                            .unwrap(),
-                    ),
-                    donatable: false,
-                },
-            ];
-            let (outputs, lines) = with_captured_prints(|| {
-                executable
-                    .execute(
-                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
-                        Vec::new(),
-                        0,
-                        None,
-                        Some(file!()),
-                        None,
-                        None,
-                        &[],
-                    )
-                    .unwrap()
-                    .block_until_ready()
-                    .unwrap()
-            });
-            assert_eq!(outputs.len(), 1);
-            assert_eq!(outputs[0].outputs.len(), 0);
-            assert_eq!(lines, vec![expected]);
+            assert_eq!(
+                execute_module_without_outputs(
+                    &client,
+                    &module,
+                    &[(&7f64.to_ne_bytes(), BufferType::F64), (&[u8::from(predicate)], BufferType::Predicate)],
+                ),
+                vec![expected],
+            );
         }
     }
 
     #[test]
-    fn test_condition_without_outputs_executes_selected_effects_in_order_on_cpu() {
-        // An empty data-flow boundary must retain the selected branch's effects and sequence later effects after it.
+    fn test_condition_operation_lower_without_outputs_executes_selected_effects_in_order_on_cpu() {
+        // An empty data flow boundary must retain the selected branch's effects and sequence later effects after it.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |label| {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -939,52 +946,20 @@ mod tests {
             "#},
         );
         let client = execution_client();
-        ensure_print_handler_registered(&client).unwrap();
-        let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
-            .unwrap();
-        let device = executable.addressable_devices().unwrap().remove(0);
         for (predicate, expected) in [(true, "true: 7.0"), (false, "false: 7.0")] {
-            let inputs = vec![
-                ExecutionInput {
-                    buffer: Arc::new(
-                        client
-                            .buffer(&[u8::from(predicate)], BufferType::Predicate, &[], None, device.clone(), None)
-                            .unwrap(),
-                    ),
-                    donatable: false,
-                },
-                ExecutionInput {
-                    buffer: Arc::new(
-                        client.buffer(&7f64.to_ne_bytes(), BufferType::F64, &[], None, device.clone(), None).unwrap(),
-                    ),
-                    donatable: false,
-                },
-            ];
-            let (outputs, lines) = with_captured_prints(|| {
-                executable
-                    .execute(
-                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
-                        Vec::new(),
-                        0,
-                        None,
-                        Some(file!()),
-                        None,
-                        None,
-                        &[],
-                    )
-                    .unwrap()
-                    .block_until_ready()
-                    .unwrap()
-            });
-            assert_eq!(outputs.len(), 1);
-            assert_eq!(outputs[0].outputs.len(), 0);
-            assert_eq!(lines, vec![expected, "after: 7.0"]);
+            assert_eq!(
+                execute_module_without_outputs(
+                    &client,
+                    &module,
+                    &[(&[u8::from(predicate)], BufferType::Predicate), (&7f64.to_ne_bytes(), BufferType::F64)],
+                ),
+                vec![expected, "after: 7.0"],
+            );
         }
     }
 
     #[test]
-    fn test_condition_converts_a_refined_static_branch_input_to_its_bounded_branch_input_type() {
+    fn test_condition_operation_lower_converts_a_refined_static_branch_input_to_its_bounded_branch_input_type() {
         // A branch input only needs to refine its branch input type, so a static `f64[3]` input feeds a branch input
         // with the bounded dynamic type `f64[rows]`. The output takes the static extent that the inputs establish for
         // `rows`, so the bounded branch result is sliced back to `f64[3]`. The taken branch computes `a + b`.
@@ -1039,7 +1014,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_normalizes_retained_branch_signatures_before_lowering_on_cpu() {
+    fn test_condition_operation_lower_normalizes_retained_branch_signatures_before_lowering_on_cpu() {
         let extent_type = DimensionType::new("extent", DimensionBounds::positive(Some(8)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
         let static_type = ArrayType::new_static(DataType::F64, [3]);
@@ -1063,7 +1038,7 @@ mod tests {
         for predicate_value in [false, true] {
             // The broad first-class dimension and static array share an extent relationship that structural
             // specialization cannot replace. Direct construction retains both declared branch programs, whose declared
-            // outputs (`f64[extent]` and `f64[3]`) agree only after input refinement.
+            // outputs (i.e., `f64[extent]` and `f64[3]`) agree only after input refinement.
             let mut builder = ArrayIrProgramBuilder::new();
             let regions = vec![
                 builder.import_region(true_branch.entry_region_ref()),
@@ -1110,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_lowering_rejects_malformed_instructions() {
+    fn test_condition_operation_lower_rejects_malformed_instructions() {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let block = context.block_with_no_arguments();
@@ -1154,9 +1129,9 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_execution_bounded_dynamic_and_zero_space_outputs() {
-        // Both branches return a bounded dynamic `f64[extent]` and a zero-space `f64[0]`. The dynamic result keeps its
-        // runtime extent at every extent that its bound admits, including zero and the largest one, and the zero-space
+    fn test_condition_operation_lower_execution_bounded_dynamic_and_zero_space_outputs() {
+        // Both branches return a bounded dynamic `f64[extent]` and an empty `f64[0]`. The dynamic result keeps its
+        // runtime extent at every extent that its bound admits, including zero and the largest one, and the empty
         // result stays empty whichever branch runs.
         let extent_type = DimensionType::new("extent", DimensionBounds::non_negative(Some(9)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -1282,7 +1257,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_execution_returns_equal_bounded_dynamic_results() {
+    fn test_condition_operation_lower_execution_returns_equal_bounded_dynamic_results() {
         // Each branch returns one bounded dynamic value twice, and the program returns both condition results. Each
         // result must keep its own runtime extent at the executable boundary.
         let extent_type = DimensionType::new("extent", DimensionBounds::non_negative(Some(9)).unwrap());
@@ -1397,7 +1372,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_execution_skips_assertions_of_the_untaken_branch() {
+    fn test_condition_operation_lower_execution_skips_assertions_of_the_untaken_branch() {
         // The `false` branch asserts that the selector is positive, which fails exactly when that branch is selected.
         // The assertion must not run when the `true` branch is selected.
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -1497,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_execution_nested_in_while() {
+    fn test_condition_operation_lower_execution_nested_in_while() {
         // A loop body selects one of two printing branches per iteration. The loop must thread the ordered I/O token
         // through the condition, so that the prints appear once per iteration and in iteration order.
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -1638,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_execution_nested_in_scan() {
+    fn test_condition_operation_lower_execution_nested_in_scan() {
         // A scan body adds positive items to its carry and subtracts the others, printing each item from the selected
         // branch. The scan must thread the ordered I/O token through the condition, so that the prints appear in item
         // order.
@@ -1775,7 +1750,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_execution_batched() {
+    fn test_condition_operation_lower_execution_batched() {
         // The condition negates its input when the selector is positive and doubles it otherwise.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let branch = |negate: bool| {
@@ -1901,27 +1876,19 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_execution_batched_under_eager_parent() {
+    fn test_condition_operation_lower_execution_batched_under_eager_parent() {
         // Batching over eager array IR values binds the batched condition through eager dispatch, which compiles it as
         // a standalone program whose results must all be arrays. Neither predicate kind may therefore return the batch
         // extent that array IR batching threads through the batched branches.
         let client = execution_client();
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain();
         let value = |data_type: DataType, dimensions: &[usize], bytes: &[u8]| {
-            let shape = Shape::new(dimensions.iter().map(|&dimension| CoreDimension::Static(dimension)).collect());
-            let r#type = ArrayType::new(data_type, shape)
-                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
-                .unwrap();
-            Value::Array(Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap())
+            Value::Array(replicated_array(&domain, &mesh, data_type, dimensions, bytes))
         };
         let read = |value: Value<'_>| {
-            let Value::Array(array) = value else { panic!("expected an array result") };
-            let shard = array.addressable_shards().next().unwrap();
-            let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
-            (array.shape().dimensions().to_vec(), values_from_bytes::<f32>(bytes.as_slice()))
+            let array = program_array(&value);
+            (array.shape().dimensions().to_vec(), read_f32s(&client, array))
         };
         let inputs = value(DataType::F32, &[3], values_to_bytes(&[1f32, 2.0, 3.0]).as_slice());
 
@@ -1952,14 +1919,14 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_execution_differentiated() {
+    fn test_condition_operation_lower_execution_differentiated() {
         // The `true` branch broadcasts the sum of `x` back to the extent of `x`, so its tangent needs that extent as a
         // residual `dimension<n>`, while the `false` branch squares `x`, so its tangent needs `x` as a residual. Each
-        // branch fills the residual slots of its peer with placeholders: the `false` branch captures the extent from
+        // branch fills the residual slots of its peer with placeholders. The `false` branch captures the extent from
         // its known input `x`, and the `true` branch builds a zero of the extent of `x`.
-        let n = DimensionType::new("n", DimensionBounds::non_negative(Some(5)).unwrap());
+        let extent_type = DimensionType::new("n", DimensionBounds::non_negative(Some(5)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
-        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![n.dimension().clone()]));
+        let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![extent_type.dimension().clone()]));
         let true_branch = {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(vector_type.clone().into());
@@ -2159,7 +2126,7 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_lowering_constrains_explicit_output_shardings() {
+    fn test_condition_operation_lower_constrains_explicit_output_shardings() {
         // The `true` branch negates a vector sharded over the explicit mesh axis `x`, and the `false` branch forwards
         // it. The result of the `stablehlo.if` is constrained to the placement that its type states.
         let (client, mesh) = two_device_mesh(MeshAxisType::Explicit);

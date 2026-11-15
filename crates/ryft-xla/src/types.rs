@@ -1,3 +1,8 @@
+//! Conversions between `ryft-core` data types and layouts and their PJRT representations. This module implements
+//! [`ToPjrt`] and [`FromPjrt`] for [`DataType`] (i.e., PJRT [`BufferType`]s) and for [`Layout`], [`TiledLayout`],
+//! [`StridedLayout`], [`Tile`], and [`TileDimension`]. Tiled and strided layout conversions are fallible because
+//! PJRT stores minor-to-major dimension indices as unsigned 64-bit integers and strides as signed 64-bit integers.
+
 use ryft_core::{DataType, DataTypeError, Layout, LayoutError, StridedLayout, Tile, TileDimension, TiledLayout};
 use ryft_pjrt::{
     BufferType, Layout as PjrtLayout, StridedLayout as PjrtStridedLayout, Tile as PjrtTile,
@@ -163,7 +168,7 @@ impl ToPjrt for DataType {
     fn to_pjrt(&self) -> BufferType {
         match self {
             DataType::Token => BufferType::Token,
-            // PJRT has no zero-information buffer type. The predicate buffer is a private physical carrier; logical
+            // PJRT has no zero-information buffer type. The predicate buffer is a private physical carrier, and logical
             // `Zero` metadata is retained by Ryft and therefore intentionally does not round-trip through `BufferType`.
             DataType::Zero => BufferType::Predicate,
             DataType::Boolean => BufferType::Predicate,
@@ -253,62 +258,11 @@ impl FromPjrt<BufferType> for DataType {
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use ryft_pjrt::{
-        BufferType, Layout as PjrtLayout, StridedLayout as PjrtStridedLayout, Tile as PjrtTile,
-        TileDimension as PjrtTileDimension, TiledLayout as PjrtTiledLayout,
-    };
-
-    use ryft_core::{DataType, DataTypeError, Layout, StridedLayout, Tile, TileDimension, TiledLayout};
-
     use super::*;
 
-    #[test]
-    fn test_layout_from_and_to_pjrt_layout() {
-        let tiled_layout = TiledLayout::new(
-            vec![1, 0],
-            vec![
-                Tile::new(vec![TileDimension::Sized(4), TileDimension::Combined]),
-                Tile::new(vec![TileDimension::Sized(2)]),
-            ],
-        );
-        let pjrt_tiled_layout = PjrtTiledLayout::new(
-            vec![1, 0],
-            vec![
-                PjrtTile { dimensions: vec![PjrtTileDimension::sized(4), PjrtTileDimension::combined()] },
-                PjrtTile { dimensions: vec![PjrtTileDimension::sized(2)] },
-            ],
-        );
-        assert_eq!(TiledLayout::from_pjrt(pjrt_tiled_layout.clone()), Ok(tiled_layout.clone()));
-        assert_eq!(tiled_layout.to_pjrt(), Ok(pjrt_tiled_layout.clone()));
-
-        let strided_layout = StridedLayout::new(vec![24, 8, -4]);
-        let pjrt_strided_layout = PjrtStridedLayout::new(vec![24, 8, -4]);
-        assert_eq!(StridedLayout::from_pjrt(pjrt_strided_layout.clone()), Ok(strided_layout.clone()));
-        assert_eq!(strided_layout.to_pjrt(), Ok(pjrt_strided_layout.clone()));
-
-        let tiled_layout = Layout::Tiled(tiled_layout);
-        let pjrt_tiled_layout = PjrtLayout::Tiled(pjrt_tiled_layout);
-        assert_eq!(Layout::from_pjrt(pjrt_tiled_layout.clone()), Ok(tiled_layout.clone()));
-        assert_eq!(tiled_layout.to_pjrt(), Ok(pjrt_tiled_layout));
-
-        let strided_layout = Layout::Strided(strided_layout);
-        let pjrt_strided_layout = PjrtLayout::Strided(pjrt_strided_layout);
-        assert_eq!(Layout::from_pjrt(pjrt_strided_layout.clone()), Ok(strided_layout.clone()));
-        assert_eq!(strided_layout.to_pjrt(), Ok(pjrt_strided_layout));
-    }
-
-    #[test]
-    fn test_data_type_from_and_to_pjrt_buffer_type() {
-        assert!(matches!(
-            DataType::from_pjrt(BufferType::Invalid),
-            Err(DataTypeError::InvalidDataType { message, .. }) if message == "invalid data type from PJRT: `invalid`",
-        ));
-
-        // Zero-space values have no PJRT type and use a predicate carrier. One-bit integer types retain their
-        // native PJRT representations independently of the carrier selected by an executable.
-        assert_eq!(DataType::Zero.to_pjrt(), BufferType::Predicate);
-        assert_eq!(DataType::from_pjrt(BufferType::Predicate), Ok(DataType::Boolean));
-        for &(data_type, buffer_type) in &[
+    /// Returns the PJRT [`BufferType`] of every [`DataType`] that has one, in [`DataType`] declaration order.
+    fn data_type_buffer_types() -> Vec<(DataType, BufferType)> {
+        vec![
             (DataType::Token, BufferType::Token),
             (DataType::Boolean, BufferType::Predicate),
             (DataType::I1, BufferType::I1),
@@ -342,9 +296,120 @@ mod tests {
             (DataType::F64, BufferType::F64),
             (DataType::C64, BufferType::C64),
             (DataType::C128, BufferType::C128),
-        ] {
-            assert_eq!(DataType::from_pjrt(buffer_type), Ok::<_, DataTypeError>(data_type));
+        ]
+    }
+
+    /// Returns a tiled layout with two tiles and its PJRT counterpart.
+    fn tiled_layouts() -> (TiledLayout, PjrtTiledLayout) {
+        (
+            TiledLayout::new(
+                vec![1, 0],
+                vec![
+                    Tile::new(vec![TileDimension::Sized(4), TileDimension::Combined]),
+                    Tile::new(vec![TileDimension::Sized(2)]),
+                ],
+            ),
+            PjrtTiledLayout::new(
+                vec![1, 0],
+                vec![
+                    PjrtTile { dimensions: vec![PjrtTileDimension::sized(4), PjrtTileDimension::combined()] },
+                    PjrtTile { dimensions: vec![PjrtTileDimension::sized(2)] },
+                ],
+            ),
+        )
+    }
+
+    #[test]
+    fn test_tile_dimension_to_pjrt() {
+        assert_eq!(TileDimension::Sized(4).to_pjrt(), PjrtTileDimension::sized(4));
+        assert_eq!(TileDimension::Combined.to_pjrt(), PjrtTileDimension::combined());
+    }
+
+    #[test]
+    fn test_tile_dimension_from_pjrt() {
+        assert_eq!(TileDimension::from_pjrt(PjrtTileDimension::sized(4)), TileDimension::Sized(4));
+        assert_eq!(TileDimension::from_pjrt(PjrtTileDimension::combined()), TileDimension::Combined);
+    }
+
+    #[test]
+    fn test_tile_to_pjrt() {
+        assert_eq!(
+            Tile::new(vec![TileDimension::Sized(4), TileDimension::Combined]).to_pjrt(),
+            PjrtTile { dimensions: vec![PjrtTileDimension::sized(4), PjrtTileDimension::combined()] },
+        );
+    }
+
+    #[test]
+    fn test_tile_from_pjrt() {
+        assert_eq!(
+            Tile::from_pjrt(PjrtTile { dimensions: vec![PjrtTileDimension::sized(4), PjrtTileDimension::combined()] }),
+            Tile::new(vec![TileDimension::Sized(4), TileDimension::Combined]),
+        );
+    }
+
+    #[test]
+    fn test_tiled_layout_to_pjrt() {
+        let (tiled_layout, pjrt_tiled_layout) = tiled_layouts();
+        assert_eq!(tiled_layout.to_pjrt(), Ok(pjrt_tiled_layout));
+    }
+
+    #[test]
+    fn test_tiled_layout_from_pjrt() {
+        let (tiled_layout, pjrt_tiled_layout) = tiled_layouts();
+        assert_eq!(TiledLayout::from_pjrt(pjrt_tiled_layout), Ok(tiled_layout));
+    }
+
+    #[test]
+    fn test_strided_layout_to_pjrt() {
+        assert_eq!(StridedLayout::new(vec![24, 8, -4]).to_pjrt(), Ok(PjrtStridedLayout::new(vec![24, 8, -4])));
+    }
+
+    #[test]
+    fn test_strided_layout_from_pjrt() {
+        assert_eq!(
+            StridedLayout::from_pjrt(PjrtStridedLayout::new(vec![24, 8, -4])),
+            Ok(StridedLayout::new(vec![24, 8, -4]))
+        );
+    }
+
+    #[test]
+    fn test_layout_to_pjrt() {
+        let (tiled_layout, pjrt_tiled_layout) = tiled_layouts();
+        assert_eq!(Layout::Tiled(tiled_layout).to_pjrt(), Ok(PjrtLayout::Tiled(pjrt_tiled_layout)));
+        assert_eq!(
+            Layout::Strided(StridedLayout::new(vec![24, 8, -4])).to_pjrt(),
+            Ok(PjrtLayout::Strided(PjrtStridedLayout::new(vec![24, 8, -4]))),
+        );
+    }
+
+    #[test]
+    fn test_layout_from_pjrt() {
+        let (tiled_layout, pjrt_tiled_layout) = tiled_layouts();
+        assert_eq!(Layout::from_pjrt(PjrtLayout::Tiled(pjrt_tiled_layout)), Ok(Layout::Tiled(tiled_layout)));
+        assert_eq!(
+            Layout::from_pjrt(PjrtLayout::Strided(PjrtStridedLayout::new(vec![24, 8, -4]))),
+            Ok(Layout::Strided(StridedLayout::new(vec![24, 8, -4]))),
+        );
+    }
+
+    #[test]
+    fn test_data_type_to_pjrt() {
+        // Zero-space values have no PJRT type and use a predicate carrier. One-bit integer types retain their
+        // native PJRT representations independently of the carrier selected by an executable.
+        assert_eq!(DataType::Zero.to_pjrt(), BufferType::Predicate);
+        for (data_type, buffer_type) in data_type_buffer_types() {
             assert_eq!(data_type.to_pjrt(), buffer_type);
         }
+    }
+
+    #[test]
+    fn test_data_type_from_pjrt() {
+        for (data_type, buffer_type) in data_type_buffer_types() {
+            assert_eq!(DataType::from_pjrt(buffer_type), Ok::<_, DataTypeError>(data_type));
+        }
+        assert!(matches!(
+            DataType::from_pjrt(BufferType::Invalid),
+            Err(DataTypeError::InvalidDataType { message, .. }) if message == "invalid data type from PJRT: `invalid`",
+        ));
     }
 }

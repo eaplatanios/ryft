@@ -36,45 +36,45 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
         let input_type = &input_types[0];
         let mut input_data_type = input_type.data_type();
         let output_data_type = output_types[0].data_type();
-        let output_type = lower_tensor_type(&output_types[0], lowerer.context, lowerer.location)?;
+        let output_type = lower_tensor_type(&output_types[0], lowerer.context(), lowerer.location())?;
         let mut input = input_values[0];
         if self.bitcast() {
             return Ok(vec![lower_bitcast_to_mlir(
                 input,
                 input_type,
                 &output_types[0],
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
+                &mut lowerer.block(),
+                lowerer.context(),
+                lowerer.location(),
             )?]);
         }
 
         // StableHLO's complex-to-predicate conversion discards the imaginary part. Ryft Boolean conversion tests
         // the entire value for nonzero, including purely imaginary values and NaNs in either component.
         if input_data_type.is_complex() && output_data_type == DataType::Boolean {
-            let real = lowerer.block.append_operation(stable_hlo::real(input, lowerer.location)?)?;
-            let imaginary = lowerer.block.append_operation(stable_hlo::imag(input, lowerer.location)?)?;
-            let real = lowerer.block.append_operation(stable_hlo::convert(
+            let real = lowerer.block().append_operation(stable_hlo::real(input, lowerer.location())?)?;
+            let imaginary = lowerer.block().append_operation(stable_hlo::imag(input, lowerer.location())?)?;
+            let real = lowerer.block().append_operation(stable_hlo::convert(
                 real.result(0).unwrap().as_ref(),
                 output_type,
-                lowerer.location,
+                lowerer.location(),
             )?)?;
-            let imaginary = lowerer.block.append_operation(stable_hlo::convert(
+            let imaginary = lowerer.block().append_operation(stable_hlo::convert(
                 imaginary.result(0).unwrap().as_ref(),
                 output_type,
-                lowerer.location,
+                lowerer.location(),
             )?)?;
-            let result = lowerer.block.append_operation(stable_hlo::or(
+            let result = lowerer.block().append_operation(stable_hlo::or(
                 real.result(0).unwrap().as_ref(),
                 imaginary.result(0).unwrap().as_ref(),
-                lowerer.location,
+                lowerer.location(),
             )?)?;
             return Ok(vec![result.result(0).unwrap().as_ref()]);
         }
 
         // Floating destinations use the real component, retaining its precision for the rounding adjustment below.
         if input_data_type.is_complex() && output_data_type.is_floating_point() {
-            let real = lowerer.block.append_operation(stable_hlo::real(input, lowerer.location)?)?;
+            let real = lowerer.block().append_operation(stable_hlo::real(input, lowerer.location())?)?;
             input = real.result(0).unwrap().as_ref();
             input_data_type = if input_data_type == DataType::C128 { DataType::F64 } else { DataType::F32 };
         }
@@ -87,13 +87,13 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
             return Ok(vec![input]);
         }
         if input_data_type == DataType::I1 {
-            input = lower_signed_one_bit_to_mlir(input, &mut lowerer.block, lowerer.context, lowerer.location)?;
+            input = lower_signed_one_bit_to_mlir(input, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
         }
         if matches!(
             output_data_type,
             DataType::I1 | DataType::I2 | DataType::I4 | DataType::U1 | DataType::U2 | DataType::U4
         ) {
-            // Integer narrowing retains low bits. Real inputs instead saturate to the logical integer range;
+            // Integer narrowing retains low bits. Real inputs instead saturate to the logical integer range, and
             // using a byte carrier first also gives NaNs the integer conversion's zero value. The final mask
             // preserves one-bit signed encodings rather than invoking predicate truthiness.
             let carrier_data_type = if matches!(output_data_type, DataType::I1 | DataType::I2 | DataType::I4) {
@@ -102,9 +102,12 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                 DataType::U8
             };
             let carrier_type = ArrayType::new(carrier_data_type, input_type.shape().clone());
-            let carrier_tensor_type = lower_tensor_type(&carrier_type, lowerer.context, lowerer.location)?;
-            let converted =
-                lowerer.block.append_operation(stable_hlo::convert(input, carrier_tensor_type, lowerer.location)?)?;
+            let carrier_tensor_type = lower_tensor_type(&carrier_type, lowerer.context(), lowerer.location())?;
+            let converted = lowerer.block().append_operation(stable_hlo::convert(
+                input,
+                carrier_tensor_type,
+                lowerer.location(),
+            )?)?;
             let mut converted = converted.result(0).unwrap().as_ref();
             if input_data_type.is_floating_point() || input_data_type.is_complex() {
                 let (minimum, maximum) = match output_data_type {
@@ -118,22 +121,22 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                 let minimum = lower_unplaced_constant_output(
                     &[carrier_type.clone()],
                     minimum,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
+                    &mut lowerer.block(),
+                    lowerer.context(),
+                    lowerer.location(),
                 )?[0];
                 let maximum = lower_unplaced_constant_output(
                     &[carrier_type.clone()],
                     maximum,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
+                    &mut lowerer.block(),
+                    lowerer.context(),
+                    lowerer.location(),
                 )?[0];
-                let clamped = lowerer.block.append_operation(stable_hlo::clamp(
+                let clamped = lowerer.block().append_operation(stable_hlo::clamp(
                     minimum,
                     converted,
                     maximum,
-                    lowerer.location,
+                    lowerer.location(),
                 )?)?;
                 converted = clamped.result(0).unwrap().as_ref();
             }
@@ -144,11 +147,11 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                     DataType::I2 | DataType::U2 => 3,
                     _ => 15,
                 },
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
+                &mut lowerer.block(),
+                lowerer.context(),
+                lowerer.location(),
             )?[0];
-            let masked = lowerer.block.append_operation(stable_hlo::and(converted, mask, lowerer.location)?)?;
+            let masked = lowerer.block().append_operation(stable_hlo::and(converted, mask, lowerer.location())?)?;
             input = masked.result(0).unwrap().as_ref();
         }
         if (matches!(input_data_type, DataType::I32 | DataType::U32 | DataType::I64 | DataType::U64)
@@ -160,18 +163,20 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
             input = lower_conversion_round_to_odd(
                 input,
                 &input_type.clone().with_data_type(input_data_type),
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
+                &mut lowerer.block(),
+                lowerer.context(),
+                lowerer.location(),
             )?;
         }
         if matches!(output_data_type, DataType::F4E2M1FN | DataType::F6E2M3FN | DataType::F6E3M2FN) {
             // These formats have no NaN or infinity encodings. Normalize exceptional values and clamp finite
             // overflow before native conversion, whose handling otherwise differs across CPU and GPU backends.
             let float_type = input_type.clone().with_data_type(DataType::F32);
-            let float_tensor_type = lower_tensor_type(&float_type, lowerer.context, lowerer.location)?;
+            let float_tensor_type = lower_tensor_type(&float_type, lowerer.context(), lowerer.location())?;
             let converted =
-                lowerer.block.append_operation(stable_hlo::convert(input, float_tensor_type, lowerer.location)?)?;
+                lowerer
+                    .block()
+                    .append_operation(stable_hlo::convert(input, float_tensor_type, lowerer.location())?)?;
             input = converted.result(0).unwrap().as_ref();
             let maximum = match output_data_type {
                 DataType::F4E2M1FN => 6.0,
@@ -182,37 +187,37 @@ impl LowerableOperation for ConvertElementTypeOperation<ArrayType> {
                 -maximum,
                 &float_type,
                 float_tensor_type,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
+                &mut lowerer.block(),
+                lowerer.context(),
+                lowerer.location(),
             )?;
             let maximum = lower_f64_constant_splat(
                 maximum,
                 &float_type,
                 float_tensor_type,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
+                &mut lowerer.block(),
+                lowerer.context(),
+                lowerer.location(),
             )?;
-            let is_nan = lowerer.block.append_operation(stable_hlo::compare(
+            let is_nan = lowerer.block().append_operation(stable_hlo::compare(
                 input,
                 input,
                 stable_hlo::ComparisonDirection::NotEqual,
                 stable_hlo::ComparisonType::Float,
-                lowerer.location,
+                lowerer.location(),
             )?)?;
             let clamped =
-                lowerer.block.append_operation(stable_hlo::clamp(minimum, input, maximum, lowerer.location)?)?;
-            let normalized = lowerer.block.append_operation(stable_hlo::select(
+                lowerer.block().append_operation(stable_hlo::clamp(minimum, input, maximum, lowerer.location())?)?;
+            let normalized = lowerer.block().append_operation(stable_hlo::select(
                 is_nan.result(0).unwrap().as_ref(),
                 maximum,
                 clamped.result(0).unwrap().as_ref(),
-                lowerer.location,
+                lowerer.location(),
             )?)?;
             input = normalized.result(0).unwrap().as_ref();
         }
-        let result = lowerer.block.append_operation(stable_hlo::convert(input, output_type, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.convert should return one result").as_ref()])
+        let result = lowerer.block().append_operation(stable_hlo::convert(input, output_type, lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -221,15 +226,16 @@ impl LowerableOperation for ReducePrecisionOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (input_types, output_types);
         check_count!("input", input_values, 1, ProgramError);
-        let result = lowerer.block.append_operation(stable_hlo::reduce_precision(
+        let result = lowerer.block().append_operation(stable_hlo::reduce_precision(
             input_values[0],
             self.exponent_bits(),
             self.mantissa_bits(),
-            lowerer.location,
+            lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
     }
@@ -259,127 +265,12 @@ impl LowerableOperation for CastOperation<ArrayIrType> {
     }
 }
 
-/// Lowers the same complete cast contract for native and array IR type families. Witness producers are explicit
-/// dependencies even for unchecked casts. A [checked](CastOperation::is_checked) cast is also ordered after preceding
-/// assertions: its dependency barrier consumes the current assertion token, without advancing it, whether or not the
-/// cast emits a check of its own (it emits none when the actual input types prove its relationship), whereas an
-/// unchecked cast never consumes that token.
-fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: LowerableOperationFamily>(
-    operation: &CastOperation<T>,
-    lowerer: &mut Lowerer<'b, 'c, 't, O>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[T],
-    output_types: &[T],
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("output", output_types, 1, ProgramError);
-    if input_values.is_empty() || input_types.is_empty() {
-        return Err(
-            ProgramError::InvalidInputCount { expected: 1, actual: input_values.len().min(input_types.len()) }.into()
-        );
-    }
-    // A checked cast is ordered after preceding assertions even when the actual types prove its relationship and no
-    // check is emitted (binding normalizes proven casts to unchecked ones, so this only affects casts staged directly
-    // through a program builder); the dependency barrier therefore follows the mode rather than the emitted check.
-    lower_cast_check(operation, input_values, input_types, lowerer)?;
-    let values = lower_dependency_barrier(
-        input_values,
-        if operation.is_checked() { lowerer.effect_tokens.ordered_assertion } else { None },
-        &mut lowerer.block,
-        lowerer.location,
-    )?;
-    Ok(vec![lower_cast(values[0], &input_types[0].clone().into(), &output_types[0].clone().into(), lowerer)?])
-}
-
-/// Lowers the runtime check of a [checked](CastOperation::is_checked) cast whose inputs (the value followed by the
-/// witnesses) are `input_values` of the `input_types`: the value at the cast's output type and the witnesses at their
-/// declared types must satisfy their shared identity relationships. The source and output declarations observe the
-/// same first input, preserving its original nominal bindings. Unchecked casts emit nothing.
-fn lower_cast_check<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: LowerableOperationFamily>(
-    operation: &CastOperation<T>,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[T],
-    lowerer: &mut Lowerer<'b, 'c, 't, O>,
-) -> Result<(), Error> {
-    if !operation.is_checked()
-        || T::infer_cast_output_type(operation, input_types).map_err(ProgramError::from)?.1.is_some()
-    {
-        return Ok(());
-    }
-    let declared_types = std::iter::once(operation.output_type())
-        .chain(operation.input_types())
-        .cloned()
-        .map(Into::into)
-        .collect::<Vec<_>>();
-    let values = std::iter::once(input_values[0]).chain(input_values.iter().copied()).collect::<Vec<_>>();
-    let actual_types = std::iter::once(input_types[0].clone())
-        .chain(input_types.iter().cloned())
-        .map(Into::into)
-        .collect::<Vec<_>>();
-    lower_type_relationship_checks(
-        CAST_OPERATION_NAME,
-        &format!("in `{CAST_OPERATION_NAME}`"),
-        &declared_types,
-        &values,
-        &actual_types,
-        &mut lowerer.effect_tokens,
-        &mut lowerer.block,
-        lowerer.context,
-        lowerer.location,
-    )
-    .map(|_| ())
-}
-
-/// Converts a cast's shape and enforces its requested physical layout and explicit sharding.
-fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    value: ValueRef<'b, 'c, 't>,
-    input_type: &ArrayIrType,
-    output_type: &ArrayIrType,
-    lowerer: &mut Lowerer<'b, 'c, 't, O>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let value =
-        lower_cast_shape(value, input_type, output_type, &mut lowerer.block, lowerer.context, lowerer.location)?;
-    let (ArrayIrType::Array(input_type), ArrayIrType::Array(output_type)) = (input_type, output_type) else {
-        return Ok(value);
-    };
-    let mut result = value;
-    if output_type.layout().is_some() && output_type.layout() != input_type.layout() {
-        // LayoutConstraint takes a static physical buffer. Preserve logical sizes on the converted value while the
-        // buffer is exposed, then restore them after constraining its allocation. No padding becomes logical data.
-        // An input that already declares the requested layout was constrained by its producer.
-        let physical_type = physical_bound_type(output_type)?;
-        let physical =
-            lower_physical_storage(value, output_type, &mut lowerer.block, lowerer.context, lowerer.location)?;
-        result = lower_layout_constraint(physical, &physical_type, &mut lowerer.block, lowerer.location)?;
-        let sources = (0..output_type.rank()).map(|axis| (value, axis)).collect::<Vec<_>>();
-        result = lower_restore_dynamic_dimensions(
-            result,
-            output_type,
-            &sources,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
-    }
-    if let Some(sharding) = output_type.sharding()
-        && cast_changes_explicit_placement(input_type, output_type)
-    {
-        result = lower_sharding_constraint(
-            &[result],
-            sharding,
-            &lowerer.collective_state.bound_manual_axes,
-            &mut lowerer.block,
-            lowerer.location,
-        )?[0];
-    }
-    Ok(result)
-}
-
 /// Returns whether a cast from `input_type` to `output_type` changes the placement that the type system tracks over
 /// explicit mesh axes and therefore emits a sharding constraint carrying its complete output sharding, like
 /// [`ReshardOperation`](ryft_core::ReshardOperation). Carrying an existing sharding forward requests no
 /// redistribution, and an output without a sharding is untracked rather than replicated. Type inference guarantees
-/// that the placement over auto and manual axes is unchanged (refer to [`CastOperation`]), so the emitted constraint
-/// never contradicts the type the program was checked against.
+/// that the placement over auto and manual axes is unchanged, as documented on [`CastOperation`], so the emitted
+/// constraint never contradicts the type the program was checked against.
 pub(crate) fn cast_changes_explicit_placement(input_type: &ArrayType, output_type: &ArrayType) -> bool {
     let Some(output_sharding) = output_type.sharding() else {
         return false;
@@ -395,17 +286,17 @@ pub(crate) fn cast_changes_explicit_placement(input_type: &ArrayType, output_typ
     }
 }
 
-/// Converts the shape of the lowered `value` of type `input_type` to that of the compatible `output_type` (refer to
-/// [`CastOperation`] and [`GuardOperation`](ryft_core::GuardOperation)). First-class dimensions lower to `i64` scalars
-/// whatever their type. The value is converted through the type whose axes are static wherever either type is static:
-/// narrowing a bounded dynamic axis to a static extent slices the physical buffer (refer to
-/// [`lower_refined_region_outputs`]), and then widening a static axis to a bounded dynamic one, or moving a dynamic
-/// axis to another identity with another physical bound, pads or slices it and restores its runtime size (refer to
-/// [`lower_refined_region_input`]). Neither conversion checks runtime extents. Checked casts and guards validate the
-/// relationship first; unchecked casts from transforms carry a proof of the relationship and dependencies on the values
-/// that justify it. Both conversions operate on the static physical buffer of the whole value, so a conversion of any
-/// axis is rejected when either type has an unbounded dynamic axis, whereas a value whose tensor type does not change
-/// is returned unchanged even when it has unbounded axes.
+/// Converts the shape of the lowered `value` of type `input_type` to that of the compatible `output_type`, following
+/// the compatibility rules of [`CastOperation`] and [`GuardOperation`](ryft_core::GuardOperation). First-class
+/// dimensions lower to `i64` scalars whatever their type. The value is converted through the type whose axes are static
+/// wherever either type is static. Narrowing a bounded dynamic axis to a static extent slices the physical buffer via
+/// [`lower_refined_region_outputs`]. Then, widening a static axis to a bounded dynamic one, or moving a dynamic axis to
+/// another identity with another physical bound, pads or slices it and restores its runtime size via
+/// [`lower_refined_region_input`]. Neither conversion checks runtime extents. Checked casts and guards validate the
+/// relationship first, and unchecked casts from transforms carry a proof of the relationship and dependencies on the
+/// values that justify it. Both conversions operate on the static physical buffer of the whole value, so a conversion
+/// of any axis is rejected when either type has an unbounded dynamic axis, whereas a value whose tensor type does not
+/// change is returned unchanged even when it has unbounded axes.
 pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     input_type: &ArrayIrType,
@@ -480,7 +371,123 @@ pub(crate) fn lower_cast_shape<'b, 'c: 'b, 't: 'c>(
     lower_refined_region_input(value, &intermediate_type, output_type, block, context, location)
 }
 
-/// Preserves rounding information in an intermediate `f32` before conversion to a lower-precision float.
+/// Lowers the same complete [`CastOperation`] contract for native and array IR type families. Witness producers are
+/// explicit dependencies even for unchecked casts. A [checked](CastOperation::is_checked) cast is also ordered after
+/// preceding assertions, because its dependency barrier consumes the current assertion token, without advancing it,
+/// whether or not the cast emits a check of its own. A checked cast emits no check when the actual input types prove
+/// its relationship. An unchecked cast never consumes the assertion token.
+fn lower_cast_operation<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: LowerableOperationFamily>(
+    operation: &CastOperation<T>,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[T],
+    output_types: &[T],
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    check_count!("output", output_types, 1, ProgramError);
+    if input_values.is_empty() || input_types.is_empty() {
+        return Err(
+            ProgramError::InvalidInputCount { expected: 1, actual: input_values.len().min(input_types.len()) }.into()
+        );
+    }
+    // A checked cast is ordered after preceding assertions even when the actual types prove its relationship and no
+    // check is emitted, so the dependency barrier follows the mode rather than the emitted check. Binding normalizes
+    // proven casts to unchecked ones, so this only affects casts staged directly through a program builder.
+    lower_cast_check(operation, input_values, input_types, lowerer)?;
+    let values = lower_dependency_barrier(
+        input_values,
+        if operation.is_checked() { lowerer.effect_tokens().ordered_assertion() } else { None },
+        &mut lowerer.block(),
+        lowerer.location(),
+    )?;
+    Ok(vec![lower_cast(values[0], &input_types[0].clone().into(), &output_types[0].clone().into(), lowerer)?])
+}
+
+/// Lowers the runtime check of a [checked](CastOperation::is_checked) cast whose inputs are `input_values` of the
+/// `input_types` (i.e., the value followed by the witnesses). The check requires that the value at the cast's output
+/// type and the witnesses at their declared types satisfy their shared identity relationships. The source and output
+/// declarations observe the same first input, preserving its original nominal bindings. Unchecked casts emit nothing.
+fn lower_cast_check<'b, 'c: 'b, 't: 'c, T: CastType + Into<ArrayIrType>, O: LowerableOperationFamily>(
+    operation: &CastOperation<T>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[T],
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
+) -> Result<(), Error> {
+    if !operation.is_checked()
+        || T::infer_cast_output_type(operation, input_types).map_err(ProgramError::from)?.1.is_some()
+    {
+        return Ok(());
+    }
+    let declared_types = std::iter::once(operation.output_type())
+        .chain(operation.input_types())
+        .cloned()
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    let values = std::iter::once(input_values[0]).chain(input_values.iter().copied()).collect::<Vec<_>>();
+    let actual_types = std::iter::once(input_types[0].clone())
+        .chain(input_types.iter().cloned())
+        .map(Into::into)
+        .collect::<Vec<_>>();
+    let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+    lower_type_relationship_checks(
+        CAST_OPERATION_NAME,
+        &format!("in `{CAST_OPERATION_NAME}`"),
+        &declared_types,
+        &values,
+        &actual_types,
+        lowerer.effect_tokens_mut(),
+        &mut block,
+        context,
+        location,
+    )
+    .map(|_| ())
+}
+
+/// Converts a cast's shape and enforces its requested physical layout and explicit sharding.
+fn lower_cast<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    value: ValueRef<'b, 'c, 't>,
+    input_type: &ArrayIrType,
+    output_type: &ArrayIrType,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let value =
+        lower_cast_shape(value, input_type, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+    let (ArrayIrType::Array(input_type), ArrayIrType::Array(output_type)) = (input_type, output_type) else {
+        return Ok(value);
+    };
+    let mut result = value;
+    if output_type.layout().is_some() && output_type.layout() != input_type.layout() {
+        // LayoutConstraint takes a static physical buffer. Preserve logical sizes on the converted value while the
+        // buffer is exposed, then restore them after constraining its allocation. No padding becomes logical data.
+        // An input that already declares the requested layout was constrained by its producer.
+        let physical_type = physical_bound_type(output_type)?;
+        let physical =
+            lower_physical_storage(value, output_type, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        result = lower_layout_constraint(physical, &physical_type, &mut lowerer.block(), lowerer.location())?;
+        let sources = (0..output_type.rank()).map(|axis| (value, axis)).collect::<Vec<_>>();
+        result = lower_restore_dynamic_dimensions(
+            result,
+            output_type,
+            &sources,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+    }
+    if let Some(sharding) = output_type.sharding()
+        && cast_changes_explicit_placement(input_type, output_type)
+    {
+        result = lower_sharding_constraint(
+            &[result],
+            sharding,
+            lowerer.collective_state().bound_manual_axes(),
+            &mut lowerer.block(),
+            lowerer.location(),
+        )?[0];
+    }
+    Ok(result)
+}
+
+/// Preserves rounding information in an intermediate `f32` before conversion to a lower precision float.
 /// An inexact intermediate is truncated toward zero and its low significand bit is set, preventing a second
 /// nearest-even rounding from mistaking a value adjacent to a destination midpoint for the midpoint itself.
 fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
@@ -493,8 +500,8 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
     let float_type = lower_tensor_type(&input_type.clone().with_data_type(DataType::F32), context, location)?;
     let float = block.append_operation(stable_hlo::convert(input, float_type, location)?)?;
     let float = float.result(0).unwrap().as_ref();
-    // The intermediate rounding is observable here. Prevent excess-precision optimizations from cancelling
-    // the narrowing/widening pair and incorrectly proving that the original conversion was exact.
+    // The intermediate rounding is observable here. Prevent excess precision optimizations from cancelling
+    // the narrowing and widening pair and incorrectly proving that the original conversion was exact.
     let float = block.append_operation(stable_hlo::optimization_barrier(&[float], location)?)?;
     let float = float.result(0).unwrap().as_ref();
     let recovered = block.append_operation(stable_hlo::convert(
@@ -582,13 +589,13 @@ fn lower_conversion_round_to_odd<'b, 'c: 'b, 't: 'c>(
             lower_unplaced_constant_output(&[wide_type.clone()], 897, block, context, location)?[0];
         let shift_offset = lower_unplaced_constant_output(&[wide_type.clone()], 926, block, context, location)?[0];
         let mantissa_mask =
-            lower_unplaced_constant_output(&[wide_type.clone()], (1_i64 << 52) - 1, block, context, location)?[0];
+            lower_unplaced_constant_output(&[wide_type.clone()], (1i64 << 52) - 1, block, context, location)?[0];
         let implicit_bit =
-            lower_unplaced_constant_output(&[wide_type.clone()], 1_i64 << 52, block, context, location)?[0];
+            lower_unplaced_constant_output(&[wide_type.clone()], 1i64 << 52, block, context, location)?[0];
         let wide_one = lower_unplaced_constant_output(&[wide_type.clone()], 1, block, context, location)?[0];
         let wide_zero = lower_unplaced_constant_output(&[wide_type.clone()], 0, block, context, location)?[0];
         let sign_shift = lower_unplaced_constant_output(&[wide_type.clone()], 32, block, context, location)?[0];
-        let sign_mask = lower_unplaced_constant_output(&[wide_type.clone()], 1_i64 << 31, block, context, location)?[0];
+        let sign_mask = lower_unplaced_constant_output(&[wide_type.clone()], 1i64 << 31, block, context, location)?[0];
         let magnitude = block.append_operation(stable_hlo::and(source_bits, magnitude_mask, location)?)?;
         let magnitude = magnitude.result(0).unwrap().as_ref();
         let exponent = block.append_operation(stable_hlo::shift_right_logical(magnitude, exponent_shift, location)?)?;
@@ -765,8 +772,9 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         )?;
         lower_bits_to_fp6(bits, &physical_output_type, block, context, location)?
     } else if output_one_bit {
-        // Split into two-bit groups first: every supported non-one-bit numeric encoding has an even width, including
-        // six-bit floats. Expanding each group to two predicates avoids treating each predicate as eight bits.
+        // Split into two-bit groups first, because every supported numeric encoding wider than one bit has an even
+        // width, including six-bit floats. Expanding each group to two predicates avoids treating each predicate as
+        // eight bits.
         let mut shape = static_dimensions(&physical_output_type)?;
         let width = shape.pop().unwrap();
         if width > 2 {
@@ -815,7 +823,7 @@ fn lower_bitcast_to_mlir<'b, 'c: 'b, 't: 'c>(
         )?)?;
         result.result(0).unwrap().as_ref()
     } else if input_one_bit {
-        // Pack neighboring predicates into two-bit groups with disjoint shifts; their sum is their bitwise union.
+        // Pack neighboring predicates into two-bit groups with disjoint shifts, so their sum is their bitwise union.
         let mut shape = static_dimensions(&physical_input_type)?;
         let width = shape.pop().unwrap();
         if width > 2 {
@@ -921,7 +929,7 @@ fn lower_fp6_to_bits<'b, 'c: 'b, 't: 'c>(
     let normal = block.append_operation(stable_hlo::or(biased, mantissa, location)?)?;
     let normal = normal.result(0).unwrap().as_ref();
     let scale = lower_f64_constant_splat(
-        2.0_f64.powi((bias + mantissa_bits - 1) as i32),
+        2.0f64.powi((bias + mantissa_bits - 1) as i32),
         &float_type,
         float_tensor_type,
         block,
@@ -1007,7 +1015,7 @@ fn lower_bits_to_fp6<'b, 'c: 'b, 't: 'c>(
     let normal = block.append_operation(stable_hlo::or(biased, normal_mantissa, location)?)?;
     let normal = normal.result(0).unwrap().as_ref();
     let scale = lower_f64_constant_splat(
-        2.0_f64.powi((1 - bias - mantissa_bits) as i32),
+        2.0f64.powi((1 - bias - mantissa_bits) as i32),
         &float_type,
         float_tensor_type,
         block,
@@ -1049,12 +1057,12 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Add, AddOperation, Array as CoreArray, AssertOperation, BatchAxis, BatchedProgram, Cast, ConditionOperation,
-        ConvertElementType, CustomCallOperation, DimensionBounds, DimensionFromScalar, DimensionToScalar,
-        DimensionType, DomainTracingContext, GuardOperation, Layout, LogicalMesh, MeshAxis, MeshAxisType,
-        Operation as CoreOperation, Placeholder, PrintOperation, ProgramBatchingOutputAxesPolicy, ProgramError,
-        ProjectedValue, ReducePrecision, ScanOperation, Shape, ShardMap, ShardMapOptions, Sharding, ShardingDimension,
-        ShardingError, StridedLayout, Tile, TileDimension, TiledLayout, Tracer as CoreTracer, TracingContext,
-        TypeError, Typed, ValueProjection, WhileOperation,
+        ConvertElementType, CustomCallOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalar,
+        DimensionToScalar, DimensionType, DimensionVariable, DomainTracingContext, EffectClass, GuardOperation, Layout,
+        LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, Placeholder, PrintOperation,
+        ProgramBatchingOutputAxesPolicy, ProgramError, ProjectedValue, ReducePrecision, ScanOperation, Shape, ShardMap,
+        ShardMapOptions, Sharding, ShardingDimension, ShardingError, StaticShape, StridedLayout, Tile, TileDimension,
+        TiledLayout, Tracer as CoreTracer, TracingContext, TypeError, Typed, ValueProjection, WhileOperation,
     };
     use ryft_mlir::{Location, OperationResultRef};
     use ryft_pjrt::extensions::ffi::{
@@ -1067,18 +1075,19 @@ mod tests {
     };
 
     use crate::domains::Tracer;
-    use crate::domains::tests::domain_mesh;
+    use crate::domains::tests::{domain_mesh, f32_vector, read_f32s, read_f64s};
     use crate::lowering::tests::{
-        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module,
+        MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, shard_map_module, test_manual_mesh,
         test_spmd_compilation_options,
     };
     use crate::lowering::to_mlir_module_for_plain_program;
+    use crate::operations::debugging::with_captured_prints;
     use crate::operations::jit_call::JitCallOperation;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::tracing::ArrayTracer;
     use crate::values::ArrayConstant;
-    use crate::{Constant, Domain, Session, ToPjrt, to_mlir_module_for_program};
+    use crate::{Array, Constant, Domain, FromPjrt, Options, Session, ToPjrt, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1142,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_convert_element_type() {
+    fn test_convert_element_type_operation_lower() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -1152,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_convert_element_type_integer_rounding() {
+    fn test_convert_element_type_operation_lower_integer_rounding() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -1180,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_convert_element_type_f64_rounding() {
+    fn test_convert_element_type_operation_lower_f64_rounding() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -1223,7 +1232,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_convert_element_type_finite_formats() {
+    fn test_convert_element_type_operation_lower_finite_formats() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -1254,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_convert_element_type_fp6_to_f32() {
+    fn test_convert_element_type_operation_lower_fp6_to_f32() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -1285,7 +1294,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_convert_element_type_complex_to_boolean() {
+    fn test_convert_element_type_operation_lower_complex_to_boolean() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -1297,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_convert_element_type_sub_byte_integers() {
+    fn test_convert_element_type_operation_lower_sub_byte_integers() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -1368,130 +1377,88 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_bitcast_to_mlir() {
+    fn test_convert_element_type_operation_lower_bitcast_preserves_dynamic_prefix_extents() {
         let client = execution_client();
-        let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, -0.0]));
-        let integers = input.bitcast_element_type(DataType::I32).unwrap();
-        assert_eq!(values_from_bytes::<i32>(&integers.copy_to_host().unwrap()), vec![0x3f800000, i32::MIN]);
-
-        // A narrower element type appends a trailing axis that splits each element's bits, starting from the least
-        // significant ones, and widening removes that axis and restores the original bits.
-        let halves = input.bitcast_element_type(DataType::U16).unwrap();
-        assert_eq!(halves.shape().dimensions(), &[2, 2]);
-        assert_eq!(values_from_bytes::<u16>(&halves.copy_to_host().unwrap()), vec![0x0000, 0x3f80, 0x0000, 0x8000]);
-        let restored = halves.bitcast_element_type(DataType::F32).unwrap();
-        assert_eq!(restored.shape().dimensions(), &[2]);
-        assert_eq!(restored.copy_to_host().unwrap(), values_to_bytes(&[1f32, -0.0]));
-    }
-
-    #[test]
-    fn test_lower_bitcast_to_mlir_one_bit() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        // One-bit targets split a byte into eight elements ordered from the least significant bit.
-        let input = replicated_array(&domain, &mesh, DataType::U8, &[], &[0xab]);
-        for data_type in [DataType::I1, DataType::U1] {
-            let bits = input.bitcast_element_type(data_type).unwrap();
-            assert_eq!(bits.shape().dimensions(), &[8]);
-            assert_eq!(bits.copy_to_host().unwrap(), vec![1, 1, 0, 1, 0, 1, 0, 1], "{data_type}");
-            let restored = bits.bitcast_element_type(DataType::U8).unwrap();
-            assert_eq!(restored.copy_to_host().unwrap(), vec![0xab], "{data_type}");
-        }
-        let pair = replicated_array(&domain, &mesh, DataType::U2, &[], &[3]);
-        let bits = pair.bitcast_element_type(DataType::U1).unwrap();
-        assert_eq!(bits.copy_to_host().unwrap(), vec![1, 1]);
-        let restored = bits.bitcast_element_type(DataType::U2).unwrap();
-        assert_eq!(restored.copy_to_host().unwrap(), vec![3]);
-    }
-
-    #[test]
-    fn test_lower_bitcast_to_mlir_fp6() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        let encodings = (0u8..64).collect::<Vec<_>>();
-        for (data_type, other_data_type) in
-            [(DataType::F6E2M3FN, DataType::F6E3M2FN), (DataType::F6E3M2FN, DataType::F6E2M3FN)]
-        {
-            let input = replicated_array(&domain, &mesh, data_type, &[64], &encodings);
-
-            // Same-width reinterpretation preserves the complete encoding, including both signed zeros.
-            let output = input.bitcast_element_type(other_data_type).unwrap();
-            assert_eq!(output.shape().dimensions(), &[64]);
-            assert_eq!(output.copy_to_host().unwrap(), encodings, "{data_type} to {other_data_type}");
-
-            // Packing uses six logical bits, not the eight-bit host carrier. Splitting appends exactly six one-bit
-            // or three two-bit elements, ordered from the least significant bits, and widening removes that axis.
-            for (pieces_type, bit_width) in [(DataType::U1, 1), (DataType::U2, 2)] {
-                let pieces = input.bitcast_element_type(pieces_type).unwrap();
-                let piece_count = 6 / bit_width;
-                let expected = encodings
-                    .iter()
-                    .flat_map(|&encoding| {
-                        (0..piece_count).map(move |piece| (encoding >> (piece * bit_width)) & ((1 << bit_width) - 1))
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(pieces.shape().dimensions(), &[64, piece_count]);
-                assert_eq!(pieces.copy_to_host().unwrap(), expected, "{data_type} to {pieces_type}");
-                let restored = pieces.bitcast_element_type(data_type).unwrap();
-                assert_eq!(restored.r#type().as_ref(), input.r#type().as_ref());
-                assert_eq!(restored.copy_to_host().unwrap(), encodings, "{data_type} from {pieces_type}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_lower_bitcast_to_mlir_unbounded_dimensions() {
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(input_type.clone());
-        let output = builder
-            .add_instruction(
-                ConvertElementTypeOperation::<ArrayType>::new(DataType::I32, true),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
-            indoc! {r#"
-            module {
-              func.func @main(%arg0: tensor<?xf32>) -> tensor<?xi32> {
-                %0 = stablehlo.bitcast_convert %arg0 : (tensor<?xf32>) -> tensor<?xi32>
-                return %0 : tensor<?xi32>
-              }
-            }
-        "#},
-        );
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(input_type);
-        let output = builder
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let declared_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
+                "count",
+                DimensionBounds::new(0, Some(5)).unwrap(),
+            ))]),
+        )
+        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+        .unwrap();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let values = builder.add_input(declared_type.into());
+        let halves = builder
             .add_instruction(
                 ConvertElementTypeOperation::<ArrayType>::new(DataType::U16, true),
                 Vec::new(),
-                vec![input],
+                vec![values],
+                None,
+            )
+            .unwrap()[0];
+        let restored = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true),
+                Vec::new(),
+                vec![halves],
+                None,
+            )
+            .unwrap()[0];
+        let bits = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::I1, true),
+                Vec::new(),
+                vec![values],
+                None,
+            )
+            .unwrap()[0];
+        let restored_bits = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true),
+                Vec::new(),
+                vec![bits],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![halves, restored, bits, restored_bits],
+                vec![Placeholder],
+                vec![Placeholder; 4],
+            )
             .unwrap();
-        assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
-                if op == "width-changing bitcast with an unbounded dynamic dimension",
-        ));
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        // Splitting and joining the static bit width axis preserves an independent dynamic prefix and its live bytes.
+        for count in [2usize, 4] {
+            let outputs =
+                domain.execute_program(&compiled, vec![f32_vector(&domain, &mesh, &vec![1.0; count])]).unwrap();
+            assert_eq!(outputs[0].shape(), StaticShape::new(vec![count, 2]));
+            assert_eq!(outputs[1].shape(), StaticShape::new(vec![count]));
+            assert_eq!(read_f32s(&client, &outputs[1]), vec![1.0; count]);
+            assert_eq!(outputs[2].shape(), StaticShape::new(vec![count, 32]));
+            assert_eq!(outputs[3].shape(), StaticShape::new(vec![count]));
+            assert_eq!(read_f32s(&client, &outputs[3]), vec![1.0; count]);
+            let bytes = outputs[0]
+                .addressable_shards()
+                .next()
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            assert_eq!(bytes, values_to_bytes(&vec![1.0f32; count]));
+        }
     }
 
     #[test]
-    fn test_lower_reduce_precision() {
+    fn test_reduce_precision_operation_lower() {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
         let output = builder
@@ -1514,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_reduce_precision_matches_reference_backend() {
+    fn test_reduce_precision_operation_lower_matches_reference_backend() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -1608,8 +1575,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast() {
-        // A checked cast asserts its relationship before converting: narrowing `f64[n]` to `f64[2]` requires the
+    fn test_cast_operation_lower() {
+        // A checked cast asserts its relationship before converting. Narrowing `f64[n]` to `f64[2]` requires the
         // runtime extent 2, and widening `f64[2]` to `f64[n]` next to a witness of type `f64[n]` requires that the
         // witness has extent 2. An unchecked narrowing assumes the extent instead.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
@@ -1636,9 +1603,13 @@ mod tests {
             let result = execute_mixed_program(&client, &program, std::slice::from_ref(&symbolic_input), &[3]);
             if checked {
                 let error = result.unwrap_err().to_string();
-                assert!(error.contains("input dimension `n` must have the declared extent in `cast`"), "{error}");
+                assert_eq!(
+                    error,
+                    "assertion failed: input dimension `n` must have the declared extent \
+                    in `cast`; expected=2, actual=3",
+                );
             } else {
-                assert!(result.is_ok(), "{result:?}");
+                assert_eq!(result.unwrap(), vec![MixedValue::Array(vec![1.0, 2.0], vec![2])]);
             }
         }
 
@@ -1656,11 +1627,11 @@ mod tests {
             vec![MixedValue::Array(vec![4.0, 6.0], vec![2]), MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
-        assert!(error.contains("input dimension `n` must have one extent in `cast`"), "{error}");
+        assert_eq!(error, "assertion failed: input dimension `n` must have one extent in `cast`; expected=2, actual=3");
     }
 
     #[test]
-    fn test_lower_cast_dimension() {
+    fn test_cast_operation_lower_dimension() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let mut builder = ArrayIrProgramBuilder::new();
         let value = builder.add_input(n.clone().into());
@@ -1685,11 +1656,14 @@ mod tests {
             vec![MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(3)], &[]).unwrap_err().to_string();
-        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `n` must have the declared extent in `cast`; expected=2, actual=3",
+        );
     }
 
     #[test]
-    fn test_lower_unchecked_cast_with_witness() {
+    fn test_cast_operation_lower_unchecked_with_witness() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let (_, program) = TracingContext::<Constant, Operation>::trace(
@@ -1710,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_check_dependencies() {
+    fn test_cast_operation_lower_check_dependencies() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
         let exact = ArrayType::new_static(DataType::F32, [2]);
@@ -1727,13 +1701,14 @@ mod tests {
             .unwrap()
             .lower(&mut lowerer, &[source], &[symbolic], &[exact.clone()])
             .unwrap()[0];
-        assert!(lowerer.effect_tokens.ordered_assertion.is_some());
+        assert!(lowerer.effect_tokens().ordered_assertion().is_some());
         let unchanged = CastOperation::unchecked(exact.clone(), vec![exact.clone()])
             .unwrap()
             .lower(&mut lowerer, &[unrelated], &[exact.clone()], &[exact.clone()])
             .unwrap();
         assert_eq!(unchanged, vec![unrelated]);
-        // Inspect actual operand edges: the narrowing must consume the barrier, not merely follow it in the block.
+        // Inspect actual operand edges, because the narrowing must consume the barrier, not merely follow it in the
+        // block.
         let mut pending = vec![guarded];
         let mut found = false;
         while let Some(value) = pending.pop() {
@@ -1743,7 +1718,7 @@ mod tests {
                     assert_eq!(operation.operand(0).unwrap().value().unwrap(), source);
                     assert_eq!(
                         operation.operand(1).unwrap().value().unwrap(),
-                        lowerer.effect_tokens.ordered_assertion.unwrap()
+                        lowerer.effect_tokens().ordered_assertion().unwrap()
                     );
                     found = true;
                     break;
@@ -1760,52 +1735,62 @@ mod tests {
             .lower(&mut lowerer, &[guarded], &[exact.clone()], &[exact])
             .unwrap();
         assert_eq!(printed, vec![guarded]);
-        let print =
-            lowerer.effect_tokens.ordered_io.unwrap().cast::<OperationResultRef>().unwrap().operation().unwrap();
+        let print = lowerer
+            .effect_tokens()
+            .ordered_io()
+            .unwrap()
+            .cast::<OperationResultRef>()
+            .unwrap()
+            .operation()
+            .unwrap();
         assert_eq!(print.operand(0).unwrap().value().unwrap(), guarded);
     }
 
     #[test]
-    fn test_lower_checked_cast_token_ordering() {
+    fn test_cast_operation_lower_checked_token_ordering() {
         // Binding normalizes a proven cast to an unchecked one, so a checked cast whose relationship the actual types
         // prove only arises when staged directly through a program builder. It emits no check of its own but is still
-        // ordered after preceding assertions: its dependency barrier consumes the token of the preceding assertion,
-        // without advancing it, whereas its unchecked twin converts the input directly and leaves the token chain
-        // alone.
+        // ordered after preceding assertions, because its dependency barrier consumes the token of the preceding
+        // assertion, without advancing it, whereas its unchecked twin converts the input directly and leaves the token
+        // chain alone.
         let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
-        let assertion = "%0 = stablehlo.after_all  : !stablehlo.token\n    \
-            %1 = stablehlo.custom_call @ryft.assert(%arg0, %0) {api_version = 4 : i32, \
-            backend_config = {actor = \"assert\", kind = \"generic\", label_count = \"0\", \
-            message = \"precondition\"}, has_side_effect = true} : (tensor<i1>, !stablehlo.token) -> !stablehlo.token";
         let cases = [
             (
                 CastOperation::checked as fn(ArrayType, Vec<ArrayType>) -> Result<CastOperation<ArrayType>, TypeError>,
-                formatdoc! {"
-                    module {{
-                      func.func @main(%arg0: tensor<i1>, %arg1: tensor<2x3xf32>) -> tensor<2x3xf32> {{
-                        {assertion}
+                indoc! {"
+                    module {
+                      func.func @main(%arg0: tensor<i1>, %arg1: tensor<2x3xf32>) -> tensor<2x3xf32> {
+                        %0 = stablehlo.after_all  : !stablehlo.token
+                        %1 = stablehlo.custom_call @ryft.assert(%arg0, %0) {api_version = 4 : i32, \
+                            backend_config = {actor = \"assert\", kind = \"generic\", label_count = \"0\", \
+                            message = \"precondition\"}, has_side_effect = true} : (tensor<i1>, !stablehlo.token) \
+                            -> !stablehlo.token
                         %2:2 = stablehlo.optimization_barrier %arg1, %1 : tensor<2x3xf32>, !stablehlo.token
-                        %3 = stablehlo.custom_call @LayoutConstraint(%2#0) {{\
+                        %3 = stablehlo.custom_call @LayoutConstraint(%2#0) {\
                             operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
-                            result_layouts = [dense<[0, 1]> : tensor<2xindex>]}} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                            result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
                         return %3 : tensor<2x3xf32>
-                      }}
-                    }}
+                      }
+                    }
                 "},
             ),
             (
                 CastOperation::unchecked,
-                formatdoc! {"
-                    module {{
-                      func.func @main(%arg0: tensor<i1>, %arg1: tensor<2x3xf32>) -> tensor<2x3xf32> {{
-                        {assertion}
-                        %2 = stablehlo.custom_call @LayoutConstraint(%arg1) {{\
+                indoc! {"
+                    module {
+                      func.func @main(%arg0: tensor<i1>, %arg1: tensor<2x3xf32>) -> tensor<2x3xf32> {
+                        %0 = stablehlo.after_all  : !stablehlo.token
+                        %1 = stablehlo.custom_call @ryft.assert(%arg0, %0) {api_version = 4 : i32, \
+                            backend_config = {actor = \"assert\", kind = \"generic\", label_count = \"0\", \
+                            message = \"precondition\"}, has_side_effect = true} : (tensor<i1>, !stablehlo.token) \
+                            -> !stablehlo.token
+                        %2 = stablehlo.custom_call @LayoutConstraint(%arg1) {\
                             operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
-                            result_layouts = [dense<[0, 1]> : tensor<2xindex>]}} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                            result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
                         return %2 : tensor<2x3xf32>
-                      }}
-                    }}
+                      }
+                    }
                 "},
             ),
         ];
@@ -1832,7 +1817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_checked_cast_region_checks() {
+    fn test_cast_operation_lower_checked_region_checks() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
         let body = |index, checked| {
@@ -1946,7 +1931,11 @@ mod tests {
                     );
                     if entered && extent == 3 {
                         let error = result.unwrap_err().to_string();
-                        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
+                        assert_eq!(
+                            error,
+                            "assertion failed: input dimension `n` must have the declared extent \
+                            in `cast`; expected=2, actual=3",
+                        );
                     } else {
                         assert_eq!(
                             result.unwrap(),
@@ -1966,7 +1955,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_checked_cast_in_shard_map() {
+    fn test_cast_operation_lower_checked_in_shard_map() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::replicated(mesh.clone(), 0);
         let scalar = ArrayType::scalar(DataType::F64);
@@ -2005,11 +1994,14 @@ mod tests {
         let error = execute_mixed_program(&client, &program, &[MixedValue::Array(vec![3.0], vec![])], &[])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `extent` must have the declared extent in `cast`; expected=2, actual=3",
+        );
     }
 
     #[test]
-    fn test_lower_checked_cast_refined_representation() {
+    fn test_cast_operation_lower_checked_refined_representation() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let declared = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
@@ -2060,9 +2052,9 @@ mod tests {
         );
         let wrong = MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4]);
         let error = execute_mixed_program(&client, &jvp, &[wrong.clone(), wrong], &[3, 3]).unwrap_err().to_string();
-        assert!(
-            error.contains("input dimension `n` must have the declared extent in `cast`; expected=2, actual=3"),
-            "{error}"
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `n` must have the declared extent in `cast`; expected=2, actual=3",
         );
 
         let pullback = program.linearize().unwrap().tangent().transpose_with_respect_to(&[0], &[]).unwrap();
@@ -2089,7 +2081,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_converts_bounded_dynamic_values() {
+    fn test_cast_operation_lower_bounded_dynamic_values() {
         // An entry guard returns its inputs narrowed behind its check, so that computations consume static values.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic: ArrayIrType = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()])).into();
@@ -2117,9 +2109,12 @@ mod tests {
             vec![MixedValue::Array(vec![4.0, 6.0], vec![2])],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
-        assert!(error.contains("input dimension `n` must have one extent at the entry of `region`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `n` must have one extent at the entry of `region`; expected=2, actual=3",
+        );
 
-        // The forward-mode derivative retains the guard on the primal inputs and converts each tangent to the type of
+        // The forward mode derivative retains the guard on the primal inputs and converts each tangent to the type of
         // its guarded primal with a `cast` that the guarded primal witnesses. The bounded dynamic tangent is narrowed
         // to the static extent, which slices its physical buffer, and its cast is also witnessed by the extent `n` read
         // from the primal input, which the pullback needs to restore that extent.
@@ -2176,7 +2171,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_guarded_cast() {
+    fn test_cast_operation_lower_guarded() {
         let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
         let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
         // A declared physical layout disappears when batching inserts an axis. The guard and cast must validate
@@ -2195,7 +2190,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        // Exercise the homogeneous-array rule inside the array IR program, including empty dense shapes.
+        // Exercise the homogeneous array rule inside the array IR program, including empty dense shapes.
         let output = builder
             .add_instruction(CastOperation::checked(array.clone(), vec![array]).unwrap(), Vec::new(), vec![input], None)
             .unwrap()[0];
@@ -2215,11 +2210,17 @@ mod tests {
         let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 3])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=2, actual=3",
+        );
         let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[0, 3])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=0, actual=3",
+        );
 
         // Differentiation retains the checked primal relation even when the tangent already has the type of the output
         // tangent, which has no explicit layout because a tangent does not have to be stored like its primal. Both
@@ -2248,7 +2249,10 @@ mod tests {
             ],
         );
         let error = execute_mixed_program(&client, &differentiated, &inputs, &[2, 3, 2, 3]).unwrap_err().to_string();
-        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=2, actual=3",
+        );
 
         // Batching adds a separate leading dimension to the guard and cast. The two item axes must still
         // agree, including when the mapped extent is zero and there are no elements to inspect.
@@ -2274,14 +2278,20 @@ mod tests {
             ],
         );
         let error = execute_mixed_program(&client, &batched, &inputs, &[2, 2, 3]).unwrap_err().to_string();
-        assert!(error.contains("must have one extent at the entry of `square`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=2, actual=3",
+        );
         let inputs = [MixedValue::Dimension(0), inputs[1].clone()];
         let error = execute_mixed_program(&client, &batched, &inputs, &[0, 2, 3]).unwrap_err().to_string();
-        assert!(error.contains("must have one extent at the entry of `square`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=2, actual=3",
+        );
     }
 
     #[test]
-    fn test_lower_guarded_cast_discarded_output() {
+    fn test_cast_operation_lower_guarded_discarded_output() {
         let bounds = DimensionBounds::non_negative(Some(5)).unwrap();
         let [a, b, p] = ["a", "b", "p"].map(|name| DimensionType::new(name, bounds));
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
@@ -2308,11 +2318,14 @@ mod tests {
             Vec::new(),
         );
         let error = execute_mixed_program(&client, &program, &[input], &[2, 3]).unwrap_err().to_string();
-        assert!(error.contains("input dimension `p` must have one extent at the entry of `square`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `p` must have one extent at the entry of `square`; expected=2, actual=3",
+        );
     }
 
     #[test]
-    fn test_lower_cast_omits_proven_relationship_checks() {
+    fn test_cast_operation_lower_omits_proven_relationship_checks() {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input_type =
@@ -2379,8 +2392,9 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        // The stored repeated-identity signature proves itself, but actual [a, 3] still needs a == 3. Source/output
-        // declarations repeat both observations; that one real comparison must not emit duplicate callbacks.
+        // The stored signature with a repeated identity proves itself, but actual [a, 3] still needs a == 3. The source
+        // and output declarations repeat both observations, and that one real comparison must not emit duplicate
+        // callbacks.
         assert_eq!(
             module,
             indoc! {"
@@ -2510,7 +2524,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_omits_proven_witness_checks() {
+    fn test_cast_operation_lower_omits_proven_witness_checks() {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input_type =
@@ -2578,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_repeated_static_check() {
+    fn test_cast_operation_lower_repeated_static_check() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension(); 2]));
         let output_type = ArrayType::new_static(DataType::F64, [2, 2]);
@@ -2641,11 +2655,14 @@ mod tests {
             vec![MixedValue::Array(vec![1f64; 4], vec![2, 2])],
         );
         let error = execute_mixed_program(&client, &program, &[input], &[3, 3]).unwrap_err().to_string();
-        assert!(error.contains("input dimension `n` must have the declared extent in `cast`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `n` must have the declared extent in `cast`; expected=2, actual=3",
+        );
     }
 
     #[test]
-    fn test_lower_cast_dimension_witness_checks() {
+    fn test_cast_operation_lower_dimension_witness_checks() {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b, c] = ["a", "b", "c"].map(|name| DimensionType::new(name, bounds));
         let input_type =
@@ -2799,13 +2816,16 @@ mod tests {
                 let error = execute_mixed_program(&client, &program, &[MixedValue::Dimension(3), input], &[2, 2])
                     .unwrap_err()
                     .to_string();
-                assert!(error.contains("input dimension `b` must have one extent in `cast`"), "{error}");
+                assert_eq!(
+                    error,
+                    "assertion failed: input dimension `b` must have one extent in `cast`; expected=2, actual=3",
+                );
             }
         }
     }
 
     #[test]
-    fn test_lower_checked_cast_ambient_identities() {
+    fn test_cast_operation_lower_checked_ambient_identities() {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let array = ArrayType::new(DataType::F64, Shape::new(vec![a.simplified_dimension(), b.simplified_dimension()]));
@@ -2833,7 +2853,7 @@ mod tests {
         let error = execute_mixed_program(&client, &program, std::slice::from_ref(&input), &[2, 3])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("must have one extent in `cast`"), "{error}");
+        assert_eq!(error, "assertion failed: input dimension `a` must have one extent in `cast`; expected=3, actual=2");
 
         // The primal of a differentiated cast retains that same source declaration. Tangent casts reverse neither
         // the ambient assignments nor their dependence on the checked primal output.
@@ -2860,7 +2880,7 @@ mod tests {
         let error = execute_mixed_program(&client, &differentiated, &[input.clone(), input.clone()], &[2, 3, 2, 3])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("must have one extent in `cast`"), "{error}");
+        assert_eq!(error, "assertion failed: input dimension `a` must have one extent in `cast`; expected=3, actual=2");
 
         // Keeping the original source and output types accepts rectangular shapes.
         let mut builder = ArrayIrProgramBuilder::new();
@@ -2883,7 +2903,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_checked_cast_mixed_dimensions() {
+    fn test_cast_operation_lower_checked_mixed_dimensions() {
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
         let [a, b] = ["a", "b"].map(|name| DimensionType::new(name, bounds));
         let input_type =
@@ -2913,9 +2933,12 @@ mod tests {
             vec![MixedValue::Array(vec![1f64; 9], vec![3, 3]), MixedValue::Dimension(3)],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[4, 3]).unwrap_err().to_string();
-        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `b` must have the declared extent in `cast`; expected=3, actual=4",
+        );
         let error = execute_mixed_program(&client, &program, &inputs, &[3, 2]).unwrap_err().to_string();
-        assert!(error.contains("must have one extent in `cast`"), "{error}");
+        assert_eq!(error, "assertion failed: input dimension `a` must have one extent in `cast`; expected=3, actual=2");
 
         // The tangent cast is witnessed by the extent of `b`, which its output type no longer carries, read from the
         // primal input, and by the extent of `a`, which it introduces, read from the checked primal output, so that
@@ -2936,7 +2959,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_checked_cast_static_witnesses() {
+    fn test_cast_operation_lower_checked_static_witnesses() {
         // A static witness establishes ambient b = 3 before type inference compares the source and target dimensions.
         // The symbolic input still needs its runtime check, before conversion slices its physical bound to 3.
         let bounds = DimensionBounds::positive(Some(5)).unwrap();
@@ -3009,11 +3032,14 @@ mod tests {
             vec![MixedValue::Array(vec![1f64; 9], vec![3, 3])],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[4]).unwrap_err().to_string();
-        assert!(error.contains("must have the declared extent in `cast`"), "{error}");
+        assert_eq!(
+            error,
+            "assertion failed: input dimension `b` must have the declared extent in `cast`; expected=3, actual=4",
+        );
     }
 
     #[test]
-    fn test_lower_cast_output_layout_dynamic() {
+    fn test_cast_operation_lower_output_layout_dynamic() {
         let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("n", Some(5)), 3.into()]));
         let output_type = input_type.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![0, 1], vec![])));
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
@@ -3053,7 +3079,7 @@ mod tests {
             );
             let program = program.into_unprojected::<Constant, Operation>().unwrap();
             assert!(matches!(
-                crate::to_mlir_module_for_program(
+                to_mlir_module_for_program(
                     &program,
                     &[],
                     &vec![input_type.clone()],
@@ -3062,14 +3088,14 @@ mod tests {
                     None,
                     None,
                 ),
-                Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
-                    if op == "non-row-major bounded-dynamic output layout `tiled{0,1}`",
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                    if reason == "non-row-major bounded-dynamic output layout `tiled{0,1}`",
             ));
         }
     }
 
     #[test]
-    fn test_lower_cast_widening_with_output_layout() {
+    fn test_cast_operation_lower_widening_with_output_layout() {
         // Widening a static axis to a bounded dynamic one pads the physical buffer to the bound, and the requested
         // layout constrains that whole physical buffer before the runtime extent is restored on the constrained value.
         // A second cast drops the layout again so that the executable boundary stays row-major.
@@ -3162,11 +3188,11 @@ mod tests {
             vec![MixedValue::Array((1..=6).map(f64::from).collect(), vec![2, 3]), MixedValue::Dimension(2)],
         );
         let error = execute_mixed_program(&client, &program, &inputs, &[3]).unwrap_err().to_string();
-        assert!(error.contains("input dimension `n` must have one extent in `cast`"), "{error}");
+        assert_eq!(error, "assertion failed: input dimension `n` must have one extent in `cast`; expected=2, actual=3");
     }
 
     #[test]
-    fn test_lower_cast_layout_after_bound_change() {
+    fn test_cast_operation_lower_layout_after_bound_change() {
         const TARGET: &str = "ryft.test.physical_f64_copy";
         static REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
 
@@ -3193,16 +3219,14 @@ mod tests {
 
         // The first cast constrains the physical buffer to its new column-major layout. The second cast keeps that
         // layout but narrows the bounded dynamic axis, which slices a new buffer that it does not constrain again.
-        // Layouts are only observable where a value crosses a boundary (executable inputs and outputs, and custom-call
-        // inputs and outputs). The custom call explicitly requests the column-major layout to observe this storage.
-        // XLA rejects bounded dynamic custom-call operands and non-row-major bounded dynamic executable outputs, so only
-        // a static result of such a cast can be observed, and its consumer still receives the declared column-major storage.
+        // Layouts are only observable where a value crosses a boundary (i.e., executable inputs and outputs, and custom
+        // call inputs and outputs). The custom call explicitly requests the column-major layout to observe this
+        // storage. XLA rejects bounded dynamic custom call operands and bounded dynamic executable outputs whose layout
+        // is not row-major, so only a static result of such a cast can be observed, and its consumer still receives
+        // the declared column-major storage.
         // The copying handler reads and writes its buffers through host pointers, so this test always runs on the CPU
         // client rather than on the configured execution platform, whose buffers may live in device memory.
-        let client = load_cpu_plugin()
-            .unwrap()
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+        let client = cpu_client(1);
         REGISTRATION
             .get_or_init(|| {
                 client.register_ffi_handler(
@@ -3293,7 +3317,294 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_output_layout_unsupported() {
+    #[allow(deprecated)] // Inspect physical result storage independently of the lowered IR.
+    fn test_cast_operation_lower_layouts_in_shard_map() {
+        let mesh = test_manual_mesh("x", 1);
+        let sharding = Sharding::replicated(mesh.clone(), 2);
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let input_type = ArrayType::new_static(DataType::F32, [2, 3]).with_layout(layout.clone());
+        let module = shard_map_module::<_, ArrayType, ArrayType>(
+            |_, input| {
+                let input = input.cast(input.r#type().into_owned().with_layout(None), &[])?;
+                input.cast(input.r#type().into_owned().with_layout(layout.clone()), &[])
+            },
+            input_type,
+            mesh,
+            sharding.clone(),
+            sharding,
+            ShardMapOptions::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=1]>
+                  func.func @main(%arg0: tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\", \
+                      sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={\"x\"}>}) \
+                      -> (tensor<2x3xf32> {mhlo.layout_mode = \"{0,1}\", \
+                      sdy.sharding = #sdy.sharding<@mesh, [{}, {}], replicated={\"x\"}>}) {
+                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{}, {}], replicated={\"x\"}>] \
+                        out_shardings=[<@mesh, [{}, {}], replicated={\"x\"}>] \
+                        manual_axes={\"x\"} (%arg1: tensor<2x3xf32>) {
+                      %1 = stablehlo.custom_call @LayoutConstraint(%arg1) {\
+                          operand_layouts = [dense<[0, 1]> : tensor<2xindex>], \
+                          result_layouts = [dense<[0, 1]> : tensor<2xindex>]} : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                      sdy.return %1 : tensor<2x3xf32>
+                    } : (tensor<2x3xf32>) -> tensor<2x3xf32>
+                    return %0 : tensor<2x3xf32>
+                  }
+                }
+            "},
+        );
+        let client = execution_client();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(1))
+            .unwrap();
+        let device = client.addressable_devices().unwrap().remove(0);
+        let values = vec![1f32, 2., 3., 4., 5., 6.];
+        let buffer = client
+            .buffer(
+                values_to_bytes(&values).as_slice(),
+                BufferType::F32,
+                [2, 3],
+                None,
+                device,
+                Some(layout.to_pjrt().unwrap()),
+            )
+            .unwrap();
+        let inputs = vec![ExecutionInput { buffer: Arc::new(buffer), donatable: false }];
+        let outputs = executable
+            .execute(
+                vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                vec![],
+                0,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+        let output = &outputs[0].outputs[0];
+        assert_eq!(output.layout().unwrap(), layout.to_pjrt().unwrap(),);
+        let bytes = output.copy_to_host(Some(ryft_pjrt::Layout::dense_major_to_minor(2))).unwrap().r#await().unwrap();
+        assert_eq!(values_from_bytes::<f32>(&bytes), values);
+    }
+
+    #[test]
+    #[allow(deprecated)] // Inspect the actual buffer, independently of the declared array type.
+    fn test_cast_operation_lower_preserves_layouts() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let actual_type = ArrayType::new_static(DataType::F64, [2, 3]);
+        let values = vec![1f64, 2., 3., 4., 5., 6.];
+        let input =
+            Array::from_host_buffer(&domain, actual_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
+        let target = input.r#type().into_owned().with_layout(layout.clone());
+        let consumer = crate::compile::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            input.r#type().into_owned(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        for output in [input.cast(target.clone(), &[]).unwrap(), input.cast_unchecked(target, &[]).unwrap()] {
+            assert_eq!(
+                output.addressable_shards().next().unwrap().buffer().unwrap().layout(),
+                Ok(layout.to_pjrt().unwrap())
+            );
+            // The next executable must consume the actual column-major buffer and return dense logical values.
+            let consumed = output.cast(input.r#type().into_owned(), &[]).unwrap();
+            assert_eq!(read_f64s(&client, &consumed), values);
+            assert_eq!(values_from_bytes::<f64>(&output.copy_to_host().unwrap()), values);
+            let destination_mesh = domain_mesh(&client, "destination", 1);
+            let moved = output
+                .to_placement(
+                    &domain,
+                    crate::arrays::DevicePutTarget::Placement {
+                        sharding: Sharding::replicated(destination_mesh.logical_mesh().clone(), 2),
+                        mesh: destination_mesh,
+                    },
+                )
+                .unwrap();
+            assert_eq!(moved.layout(), Some(&layout));
+            assert_eq!(values_from_bytes::<f64>(&moved.copy_to_host().unwrap()), values);
+            // A raw buffer may have a known physical layout even when its logical type leaves that field open.
+            let opaque = Array::from_addressable_buffers(
+                &domain,
+                output.r#type().into_owned().with_layout(None),
+                mesh.clone(),
+                vec![
+                    output
+                        .addressable_shards()
+                        .next()
+                        .unwrap()
+                        .buffer()
+                        .unwrap()
+                        .copy_to_device(client.addressable_devices().unwrap().remove(0))
+                        .unwrap(),
+                ],
+            )
+            .unwrap();
+            let doubled = consumer.executable().execute(&domain, opaque).unwrap();
+            assert_eq!(read_f64s(&client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
+            let doubled = consumer.executable().execute(&domain, output).unwrap();
+            assert_eq!(read_f64s(&client, &doubled), vec![2., 4., 6., 8., 10., 12.]);
+        }
+
+        // A tuple mixes an erased zero, a constrained result and an unconstrained result. The dynamic case also
+        // appends hidden extent results. Check the actual buffers rather than trusting their reconstructed types.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let zero_type = ArrayType::new_static(DataType::Zero, [2, 3]);
+        let zero = Array::from_host_buffer(&domain, zero_type.clone(), mesh.clone(), []).unwrap();
+        for source_type in [actual_type, ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]))] {
+            for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+                let mut builder = ArrayIrProgramBuilder::new();
+                let source = builder.add_input(source_type.clone().into());
+                let zero_input = builder.add_input(zero_type.clone().into());
+                let output = builder
+                    .add_instruction(
+                        constructor(
+                            input.r#type().into_owned().with_layout(layout.clone()).into(),
+                            vec![source_type.clone().into()],
+                        )
+                        .unwrap(),
+                        vec![],
+                        vec![source],
+                        None,
+                    )
+                    .unwrap()[0];
+                let program = builder
+                    .build::<Vec<Constant>, Vec<Constant>>(
+                        vec![zero_input, output, source],
+                        vec![Placeholder; 2],
+                        vec![Placeholder; 3],
+                    )
+                    .unwrap();
+                let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+                assert_eq!(lowered.signature().input_mapping(), &[Some(0), None]);
+                assert_eq!(lowered.signature().output_mapping(), &[None, Some(0), Some(1)]);
+                let compiled = domain.compile_program(&lowered).unwrap();
+                let outputs = domain.execute_program(&compiled, vec![input.clone(), zero.clone()]).unwrap();
+                assert_eq!(outputs[1].shape().as_slice(), &[2, 3]);
+                assert_eq!(outputs[1].layout(), Some(&layout));
+                assert_eq!(
+                    outputs[1].addressable_shards().next().unwrap().buffer().unwrap().layout(),
+                    Ok(layout.to_pjrt().unwrap())
+                );
+                assert_eq!(values_from_bytes::<f64>(&outputs[1].copy_to_host().unwrap()), values);
+                assert_eq!(read_f64s(&client, &outputs[2]), values);
+                assert!(outputs[0].addressable_shards().all(|shard| shard.buffer().is_none()));
+            }
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // Verify actual result storage alongside the hidden extent and effect-token ABI.
+    fn test_cast_operation_lower_preserves_dynamic_row_major_layout_with_ordered_io() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        let source_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.into(), 3.into()]));
+        let layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![]));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(source_type.clone().into());
+        let output = builder
+            .add_instruction(
+                CastOperation::<ArrayIrType>::checked(
+                    source_type.clone().with_layout(layout.clone()).into(),
+                    vec![source_type.into()],
+                )
+                .unwrap(),
+                vec![],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let scalar = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        builder
+            .add_instruction(PrintOperation::<ArrayType>::new("layout"), vec![], vec![scalar], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.signature().ordered_io_output_index(), Some(2));
+        let compiled = domain.compile_program(&lowered).unwrap();
+        for rows in [2, 0] {
+            let values = (1..=rows * 3).map(|value| value as f64).collect::<Vec<_>>();
+            let input = Array::from_host_buffer(
+                &domain,
+                ArrayType::new_static(DataType::F64, [rows, 3]),
+                mesh.clone(),
+                values_to_bytes(&values),
+            )
+            .unwrap();
+            let scalar = Array::from_host_buffer(
+                &domain,
+                ArrayType::scalar(DataType::F64),
+                mesh.clone(),
+                values_to_bytes(&[1f64]),
+            )
+            .unwrap();
+            let (outputs, prints) =
+                with_captured_prints(|| domain.execute_program(&compiled, vec![input, scalar]).unwrap());
+            assert_eq!(outputs[0].shape().as_slice(), &[rows, 3]);
+            assert_eq!(
+                outputs[0].addressable_shards().next().unwrap().buffer().unwrap().layout(),
+                Ok(layout.to_pjrt().unwrap()),
+            );
+            assert_eq!(values_from_bytes::<f64>(&outputs[0].copy_to_host().unwrap()), values);
+            assert_eq!(prints.len(), 1);
+        }
+    }
+
+    #[test]
+    #[allow(deprecated)] // Inspect per-device storage in addition to the global type.
+    fn test_cast_operation_lower_preserves_layouts_on_multiple_cpu_devices() {
+        let client = cpu_client(2);
+        // Types record placement over explicit mesh axes only, so the sharded cast type uses an explicit axis.
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            client
+                .addressable_devices()
+                .unwrap()
+                .into_iter()
+                .map(|device| Device::from_pjrt(device).unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = ArrayType::new_static(DataType::F64, [4, 3])
+            .with_sharding(
+                Sharding::new(
+                    mesh.logical_mesh().clone(),
+                    vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let values = (1..=12).map(|value| value as f64).collect::<Vec<_>>();
+        let input =
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
+        let layout = Layout::Tiled(TiledLayout::new(vec![0, 1], vec![]));
+        let target = input_type.with_layout(layout.clone());
+        let output = input.cast(target, &[]).unwrap();
+        for shard in output.addressable_shards() {
+            assert_eq!(shard.shape().as_slice(), &[2, 3]);
+            assert_eq!(shard.buffer().unwrap().layout(), Ok(layout.to_pjrt().unwrap()));
+        }
+        assert_eq!(values_from_bytes::<f64>(&output.copy_to_host().unwrap()), values);
+    }
+
+    #[test]
+    fn test_cast_operation_lower_output_layout_unsupported() {
         let input_type = ArrayType::new_static(DataType::F64, [2]);
         for (layout, kind) in [
             (Layout::Strided(StridedLayout::new(vec![8])), "strided"),
@@ -3317,7 +3628,7 @@ mod tests {
                     .unwrap();
                 assert!(matches!(
                     to_mlir_module_for_plain_program(&program, "main"),
-                    Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. })) if op == expected,
+                    Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })) if reason == expected,
                 ));
                 let program = program.into_unprojected::<Constant, Operation>().unwrap();
                 assert!(matches!(
@@ -3330,14 +3641,14 @@ mod tests {
                         None,
                         None,
                     ),
-                    Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. })) if op == expected,
+                    Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })) if reason == expected,
                 ));
             }
         }
     }
 
     #[test]
-    fn test_lower_checked_cast_layout_and_sharding() {
+    fn test_cast_operation_lower_checked_layout_and_sharding() {
         let plain = ArrayType::new_static(DataType::F32, [2]);
         let contiguous = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let strided = plain.clone().with_layout(Layout::Strided(StridedLayout::new(vec![8])));
@@ -3395,7 +3706,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_output_placement() {
+    fn test_cast_operation_lower_output_placement() {
         let input_type = ArrayType::new_static(DataType::F64, [2, 3]);
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let output_type = input_type
@@ -3462,11 +3773,11 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_preserved_placement() {
-        // Carrying an existing sharding forward requests no redistribution: a cast that only changes the layout emits
+    fn test_cast_operation_lower_preserved_placement() {
+        // Carrying an existing sharding forward requests no redistribution. A cast that only changes the layout emits
         // no constraint, whereas a changed explicit placement emits the complete output sharding like `reshard`, with
         // its dimensions open over the auto axis `a`. Types record no placement over auto mesh axes, so neither type
-        // places anything over `a`. The plain-program entry point declares the mesh of every sharded atom, so the mesh
+        // places anything over `a`. The plain program entry point declares the mesh of every sharded atom, so the mesh
         // declaration below does not depend on the cast.
         let mesh = LogicalMesh::new(vec![
             MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
@@ -3546,7 +3857,7 @@ mod tests {
                     .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
                     .unwrap();
                 assert_eq!(to_mlir_module_for_plain_program(&program, "main").unwrap(), expected);
-                // The executable entry point declares meshes only for casts that emit a constraint; the input's
+                // The executable entry point declares meshes only for casts that emit a constraint, and the input's
                 // own placement is declared through the executable signature instead.
                 let program = program.into_unprojected::<Constant, Operation>().unwrap();
                 assert_eq!(
@@ -3574,7 +3885,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_preserved_placement_executes() {
+    fn test_cast_operation_lower_preserved_placement_executes() {
         // Carrying the auto and explicit placement forward emits no constraint, so every device keeps its own shard
         // and only the physical layout of the result changes. Types record no placement over the auto axis `a`, so the
         // placement over it is only an argument and result sharding of the lowered module.
@@ -3639,9 +3950,9 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_explicit_sharding_multiple_devices() {
+    fn test_cast_operation_lower_explicit_sharding_multiple_devices() {
         // A cast whose output moves the placement over an explicit axis emits its complete output sharding as a
-        // constraint, which the partitioner realizes by gathering the shards: every device returns the whole array.
+        // constraint, which the partitioner realizes by gathering the shards, so every device returns the whole array.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharded =
             Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
@@ -3692,7 +4003,7 @@ mod tests {
         let outputs = execute_sharded_module(&module, &shards, &[2, 2]).unwrap();
         assert_eq!(outputs.iter().map(|(values, _)| values.clone()).collect::<Vec<_>>(), vec![values.clone(), values]);
 
-        // Inside a manual region, the constraint names only the axes that the region does not bind: the bound manual
+        // Inside a manual region, the constraint names only the axes that the region does not bind. The bound manual
         // axis `x` is projected out of the emitted constraint, which still refers to the module's full mesh symbol.
         // Replicating the body value over the explicit axis `z` gathers it on every device of the manual shard.
         let mesh = LogicalMesh::new(vec![
@@ -3749,7 +4060,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_dynamic_output_explicit_sharding() {
+    fn test_cast_operation_lower_dynamic_output_explicit_sharding() {
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
         let symbolic = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
         let program_and_types = |mesh: LogicalMesh| {
@@ -3777,9 +4088,9 @@ mod tests {
             (program, input_type, output_type, replicated, sharded)
         };
 
-        // The constraint lowers on the bounded-dynamic tensor (the executable boundary carries the physical buffer and
-        // its runtime extent separately), but Shardy propagation rejects the dynamic tensor that the constraint
-        // places, so the module cannot be compiled for a multi-device mesh.
+        // The constraint lowers on the bounded dynamic tensor, because the executable boundary carries the physical
+        // buffer and its runtime extent separately. However, Shardy propagation rejects the dynamic tensor that the
+        // constraint places, so the module cannot be compiled for a mesh with multiple devices.
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let (program, input_type, output_type, replicated, sharded) = program_and_types(mesh);
         let module = to_mlir_module_for_program(
@@ -3812,10 +4123,7 @@ mod tests {
                 }
             "},
         );
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
+        let client = cpu_client(2);
         let Err(error) =
             client.compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(2))
         else {
@@ -3840,7 +4148,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_rejects_bound_manual_output_placement() {
+    fn test_cast_operation_lower_rejects_bound_manual_output_placement() {
         // A body value that does not vary along the bound manual axis `x` preserves no definition of it, so a cast may
         // name a mesh that redefines `x` as explicit. Sharding a local dimension over `x` would request a placement
         // that only the region boundary owns, and lowering rejects it instead of stripping `x` from the constraint.
@@ -3874,6 +4182,200 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_cast_operation_lower_different_bounds() {
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
+        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
+        let client = execution_client();
+        for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(source.clone().into());
+            let witness = builder.add_input(target.clone().into());
+            let output = builder
+                .add_instruction(
+                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]).unwrap(),
+                    vec![],
+                    vec![input, witness],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            assert_eq!(
+                execute_mixed_program(
+                    &client,
+                    &program,
+                    &[MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7]),],
+                    &[2, 2]
+                )
+                .unwrap(),
+                vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)],
+            );
+            if program.instructions()[0].operation().effects().classes().contains(EffectClass::OrderedAssertion) {
+                let error = execute_mixed_program(
+                    &client,
+                    &program,
+                    &[MixedValue::Array(vec![1.0; 4], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7])],
+                    &[2, 3],
+                )
+                .unwrap_err()
+                .to_string();
+                assert_eq!(
+                    error,
+                    "assertion failed: input dimension `m` must have one extent in `cast`; expected=2, actual=3",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_operation_lower_different_bounds_narrowing_bound() {
+        // Moving a dynamic axis to an identity with a smaller physical bound slices the physical buffer from the
+        // source bound to the target bound and restores the runtime extent, which the witness shares. Only the checked
+        // cast verifies that the extents agree.
+        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
+        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
+        let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
+        let client = execution_client();
+        for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(source.clone().into());
+            let witness = builder.add_input(target.clone().into());
+            let output = builder
+                .add_instruction(
+                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]).unwrap(),
+                    vec![],
+                    vec![input, witness],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            let checked =
+                program.instructions()[0].operation().effects().classes().contains(EffectClass::OrderedAssertion);
+            if !checked {
+                assert_eq!(
+                    to_mlir_module_for_program(
+                        &program,
+                        &[],
+                        &[source.clone(), target.clone()],
+                        &[target.clone()],
+                        "main",
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                    // The witness is a dependency of the unchecked cast, so both inputs pass through one barrier. The
+                    // negative high padding slices the physical buffer from the source bound to the target bound.
+                    indoc! {"
+                        module {
+                          func.func @main(%arg0: tensor<7xf64>, %arg1: tensor<4xf64>, %arg2: tensor<i32>, \
+                              %arg3: tensor<i32>) -> (tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>) {
+                            %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : \
+                                (tensor<7xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<7>>
+                            %1 = stablehlo.set_dimension_size %arg1, %arg3, dim = 0 : \
+                                (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                            %2:2 = stablehlo.optimization_barrier %0, %1 : \
+                                tensor<?xf64, #stablehlo.bounds<7>>, tensor<?xf64, #stablehlo.bounds<4>>
+                            %3 = stablehlo.get_dimension_size %2#0, dim = 0 : \
+                                (tensor<?xf64, #stablehlo.bounds<7>>) -> tensor<i32>
+                            %c = stablehlo.constant dense<7> : tensor<i32>
+                            %4 = stablehlo.set_dimension_size %2#0, %c, dim = 0 : \
+                                (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
+                            %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                            %5 = stablehlo.pad %4, %cst, low = [0], high = [-3], interior = [0] : \
+                                (tensor<7xf64>, tensor<f64>) -> tensor<4xf64>
+                            %6 = stablehlo.set_dimension_size %5, %3, dim = 0 : \
+                                (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
+                            %7 = stablehlo.get_dimension_size %6, dim = 0 : \
+                                (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
+                            %8 = stablehlo.convert %7 : (tensor<i32>) -> tensor<i64>
+                            return %6, %8 : tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>
+                          }
+                        }
+                    "},
+                );
+            }
+            let inputs = [
+                MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0], vec![7]),
+                MixedValue::Array(vec![0.0; 4], vec![4]),
+            ];
+            assert_eq!(
+                execute_mixed_program(&client, &program, &inputs, &[3, 3]).unwrap(),
+                vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)],
+            );
+            let result = execute_mixed_program(&client, &program, &inputs, &[3, 2]);
+            if checked {
+                let error = result.unwrap_err().to_string();
+                assert_eq!(
+                    error,
+                    "assertion failed: input dimension `m` must have one extent in `cast`; expected=3, actual=2",
+                );
+            } else {
+                assert_eq!(
+                    result.unwrap(),
+                    vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_operation_lower_unbounded_shape() {
+        // Converting any axis materializes the static physical buffer of the whole value, so it is rejected when the
+        // converted axis or another axis that the conversion leaves unchanged has an unbounded dimension. A cast that
+        // converts no axis returns its input unchanged, even when the input has unbounded dimensions.
+        let n = DimensionType::new("n", DimensionBounds::positive(None).unwrap());
+        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
+        let unbounded = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let mixed = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), m.simplified_dimension()]));
+        let partially_exact =
+            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), CoreDimension::Static(2)]));
+        let cases = [
+            (
+                unbounded.clone(),
+                ArrayType::new_static(DataType::F32, [2]),
+                Some(
+                    "shape conversion along axis 0 requires a finite physical bound, but that axis has unbounded \
+                      dimension `n`",
+                ),
+            ),
+            (
+                mixed.clone(),
+                partially_exact,
+                Some(
+                    "shape conversion along axis 1 requires finite physical bounds for every axis, but axis 0 \
+                      has unbounded dimension `n`",
+                ),
+            ),
+            (mixed.clone(), mixed, None),
+        ];
+        for (input_type, output_type, expected) in cases {
+            let context = MlirContext::new();
+            let location = context.unknown_location();
+            let block = context.block(&[(lower_tensor_type(&input_type, &context, location).unwrap(), location)]);
+            let source = block.argument(0).unwrap().as_ref();
+            let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+            let result = CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap().lower(
+                &mut lowerer,
+                &[source],
+                &[input_type],
+                &[output_type],
+            );
+            match expected {
+                Some(expected) => assert!(matches!(
+                    result,
+                    Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })) if reason == expected,
+                )),
+                None => assert_eq!(result.unwrap(), vec![source]),
+            }
+        }
+    }
     #[test]
     fn test_cast_changes_explicit_placement() {
         let explicit_mesh = LogicalMesh::new(vec![
@@ -3943,205 +4445,145 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_cast_different_bounds() {
+    fn test_lower_cast_shape() {
+        // Widening a static axis to a bounded dynamic one pads the physical buffer to the bound and restores the
+        // runtime extent, whereas narrowing that axis back slices the physical buffer to the static extent.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(5)).unwrap());
-        let m = DimensionType::new("m", DimensionBounds::positive(Some(8)).unwrap());
-        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
+        let exact = ArrayType::new_static(DataType::F32, [2]);
+        let symbolic = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let block = context.block(&[(lower_tensor_type(&exact, &context, location).unwrap(), location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let (exact, symbolic) = (ArrayIrType::from(exact), ArrayIrType::from(symbolic));
+        let widened =
+            lower_cast_shape(input, &exact, &symbolic, &mut block.as_ref(), &context, location.as_ref()).unwrap();
+        let narrowed =
+            lower_cast_shape(widened, &symbolic, &exact, &mut block.as_ref(), &context, location.as_ref()).unwrap();
+        assert_eq!(widened.r#type().unwrap().to_string(), "tensor<?xf32, #stablehlo.bounds<4>>");
+        assert_eq!(narrowed.r#type().unwrap().to_string(), "tensor<2xf32>");
+    }
+
+    #[test]
+    fn test_lower_bitcast_to_mlir() {
         let client = execution_client();
-        for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let input = builder.add_input(source.clone().into());
-            let witness = builder.add_input(target.clone().into());
-            let output = builder
-                .add_instruction(
-                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]).unwrap(),
-                    vec![],
-                    vec![input, witness],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap();
-            assert_eq!(
-                execute_mixed_program(
-                    &client,
-                    &program,
-                    &[MixedValue::Array(vec![1.0, 2.0, 0.0, 0.0], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7]),],
-                    &[2, 2]
-                )
-                .unwrap(),
-                vec![MixedValue::Array(vec![1.0, 2.0], vec![2]), MixedValue::Dimension(2)],
-            );
-            if program.instructions()[0]
-                .operation()
-                .effects()
-                .classes()
-                .contains(ryft_core::EffectClass::OrderedAssertion)
-            {
-                let error = execute_mixed_program(
-                    &client,
-                    &program,
-                    &[MixedValue::Array(vec![1.0; 4], vec![4]), MixedValue::Array(vec![0.0; 7], vec![7])],
-                    &[2, 3],
-                )
-                .unwrap_err()
-                .to_string();
-                assert!(
-                    error.contains("input dimension `m` must have one extent in `cast`; expected=2, actual=3"),
-                    "{error}"
-                );
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[1f32, -0.0]));
+        let integers = input.bitcast_element_type(DataType::I32).unwrap();
+        assert_eq!(values_from_bytes::<i32>(&integers.copy_to_host().unwrap()), vec![0x3f800000, i32::MIN]);
+
+        // A narrower element type appends a trailing axis that splits each element's bits, starting from the least
+        // significant ones, and widening removes that axis and restores the original bits.
+        let halves = input.bitcast_element_type(DataType::U16).unwrap();
+        assert_eq!(halves.shape().dimensions(), &[2, 2]);
+        assert_eq!(values_from_bytes::<u16>(&halves.copy_to_host().unwrap()), vec![0x0000, 0x3f80, 0x0000, 0x8000]);
+        let restored = halves.bitcast_element_type(DataType::F32).unwrap();
+        assert_eq!(restored.shape().dimensions(), &[2]);
+        assert_eq!(restored.copy_to_host().unwrap(), values_to_bytes(&[1f32, -0.0]));
+    }
+
+    #[test]
+    fn test_lower_bitcast_to_mlir_one_bit() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        // One-bit targets split a byte into eight elements ordered from the least significant bit.
+        let input = replicated_array(&domain, &mesh, DataType::U8, &[], &[0xab]);
+        for data_type in [DataType::I1, DataType::U1] {
+            let bits = input.bitcast_element_type(data_type).unwrap();
+            assert_eq!(bits.shape().dimensions(), &[8]);
+            assert_eq!(bits.copy_to_host().unwrap(), vec![1, 1, 0, 1, 0, 1, 0, 1], "{data_type}");
+            let restored = bits.bitcast_element_type(DataType::U8).unwrap();
+            assert_eq!(restored.copy_to_host().unwrap(), vec![0xab], "{data_type}");
+        }
+        let pair = replicated_array(&domain, &mesh, DataType::U2, &[], &[3]);
+        let bits = pair.bitcast_element_type(DataType::U1).unwrap();
+        assert_eq!(bits.copy_to_host().unwrap(), vec![1, 1]);
+        let restored = bits.bitcast_element_type(DataType::U2).unwrap();
+        assert_eq!(restored.copy_to_host().unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn test_lower_bitcast_to_mlir_fp6() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let encodings = (0u8..64).collect::<Vec<_>>();
+        for (data_type, other_data_type) in
+            [(DataType::F6E2M3FN, DataType::F6E3M2FN), (DataType::F6E3M2FN, DataType::F6E2M3FN)]
+        {
+            let input = replicated_array(&domain, &mesh, data_type, &[64], &encodings);
+
+            // Same-width reinterpretation preserves the complete encoding, including both signed zeros.
+            let output = input.bitcast_element_type(other_data_type).unwrap();
+            assert_eq!(output.shape().dimensions(), &[64]);
+            assert_eq!(output.copy_to_host().unwrap(), encodings, "{data_type} to {other_data_type}");
+
+            // Packing uses six logical bits, not the eight-bit host carrier. Splitting appends exactly six one-bit
+            // or three two-bit elements, ordered from the least significant bits, and widening removes that axis.
+            for (pieces_type, bit_width) in [(DataType::U1, 1), (DataType::U2, 2)] {
+                let pieces = input.bitcast_element_type(pieces_type).unwrap();
+                let piece_count = 6 / bit_width;
+                let expected = encodings
+                    .iter()
+                    .flat_map(|&encoding| {
+                        (0..piece_count).map(move |piece| (encoding >> (piece * bit_width)) & ((1 << bit_width) - 1))
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(pieces.shape().dimensions(), &[64, piece_count]);
+                assert_eq!(pieces.copy_to_host().unwrap(), expected, "{data_type} to {pieces_type}");
+                let restored = pieces.bitcast_element_type(data_type).unwrap();
+                assert_eq!(restored.r#type().as_ref(), input.r#type().as_ref());
+                assert_eq!(restored.copy_to_host().unwrap(), encodings, "{data_type} from {pieces_type}");
             }
         }
     }
 
     #[test]
-    fn test_lower_cast_different_bounds_narrowing_bound() {
-        // Moving a dynamic axis to an identity with a smaller physical bound slices the physical buffer from the
-        // source bound to the target bound and restores the runtime extent, which the witness shares. Only the checked
-        // cast verifies that the extents agree.
-        let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
-        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
-        let source = ArrayType::new(DataType::F64, Shape::new(vec![n.simplified_dimension()]));
-        let target = ArrayType::new(DataType::F64, Shape::new(vec![m.simplified_dimension()]));
-        let client = execution_client();
-        for constructor in [CastOperation::<ArrayIrType>::checked, CastOperation::<ArrayIrType>::unchecked] {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let input = builder.add_input(source.clone().into());
-            let witness = builder.add_input(target.clone().into());
-            let output = builder
-                .add_instruction(
-                    constructor(target.clone().into(), vec![source.clone().into(), target.clone().into()]).unwrap(),
-                    vec![],
-                    vec![input, witness],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap();
-            let checked = program.instructions()[0]
-                .operation()
-                .effects()
-                .classes()
-                .contains(ryft_core::EffectClass::OrderedAssertion);
-            if !checked {
-                assert_eq!(
-                    to_mlir_module_for_program(
-                        &program,
-                        &[],
-                        &[source.clone(), target.clone()],
-                        &[target.clone()],
-                        "main",
-                        None,
-                        None,
-                    )
-                    .unwrap(),
-                    // The witness is a dependency of the unchecked cast, so both inputs pass through one barrier. The
-                    // negative high padding slices the physical buffer from the source bound to the target bound.
-                    indoc! {"
-                        module {
-                          func.func @main(%arg0: tensor<7xf64>, %arg1: tensor<4xf64>, %arg2: tensor<i32>, \
-                              %arg3: tensor<i32>) -> (tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>) {
-                            %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : \
-                                (tensor<7xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<7>>
-                            %1 = stablehlo.set_dimension_size %arg1, %arg3, dim = 0 : \
-                                (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
-                            %2:2 = stablehlo.optimization_barrier %0, %1 : \
-                                tensor<?xf64, #stablehlo.bounds<7>>, tensor<?xf64, #stablehlo.bounds<4>>
-                            %3 = stablehlo.get_dimension_size %2#0, dim = 0 : \
-                                (tensor<?xf64, #stablehlo.bounds<7>>) -> tensor<i32>
-                            %c = stablehlo.constant dense<7> : tensor<i32>
-                            %4 = stablehlo.set_dimension_size %2#0, %c, dim = 0 : \
-                                (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
-                            %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
-                            %5 = stablehlo.pad %4, %cst, low = [0], high = [-3], interior = [0] : \
-                                (tensor<7xf64>, tensor<f64>) -> tensor<4xf64>
-                            %6 = stablehlo.set_dimension_size %5, %3, dim = 0 : \
-                                (tensor<4xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<4>>
-                            %7 = stablehlo.get_dimension_size %6, dim = 0 : \
-                                (tensor<?xf64, #stablehlo.bounds<4>>) -> tensor<i32>
-                            %8 = stablehlo.convert %7 : (tensor<i32>) -> tensor<i64>
-                            return %6, %8 : tensor<?xf64, #stablehlo.bounds<4>>, tensor<i64>
-                          }
-                        }
-                    "},
-                );
+    fn test_lower_bitcast_to_mlir_unbounded_dimensions() {
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("size", None)]));
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        let output = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::I32, true),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<?xf32>) -> tensor<?xi32> {
+                %0 = stablehlo.bitcast_convert %arg0 : (tensor<?xf32>) -> tensor<?xi32>
+                return %0 : tensor<?xi32>
+              }
             }
-            let inputs = [
-                MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0], vec![7]),
-                MixedValue::Array(vec![0.0; 4], vec![4]),
-            ];
-            assert_eq!(
-                execute_mixed_program(&client, &program, &inputs, &[3, 3]).unwrap(),
-                vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)],
-            );
-            let result = execute_mixed_program(&client, &program, &inputs, &[3, 2]);
-            if checked {
-                let error = result.unwrap_err().to_string();
-                assert!(
-                    error.contains("input dimension `m` must have one extent in `cast`; expected=3, actual=2"),
-                    "{error}"
-                );
-            } else {
-                assert_eq!(
-                    result.unwrap(),
-                    vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)],
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_lower_cast_unbounded_shape() {
-        // Converting any axis materializes the static physical buffer of the whole value, so it is rejected when the
-        // converted axis or another axis that the conversion leaves unchanged has an unbounded dimension. A cast that
-        // converts no axis returns its input unchanged, even when the input has unbounded dimensions.
-        let n = DimensionType::new("n", DimensionBounds::positive(None).unwrap());
-        let m = DimensionType::new("m", DimensionBounds::positive(Some(5)).unwrap());
-        let unbounded = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()]));
-        let mixed = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), m.simplified_dimension()]));
-        let partially_exact =
-            ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension(), CoreDimension::Static(2)]));
-        let cases = [
-            (
-                unbounded.clone(),
-                ArrayType::new_static(DataType::F32, [2]),
-                Some(
-                    "shape conversion along axis 0 requires a finite physical bound, but that axis has unbounded \
-                      dimension `n`",
-                ),
-            ),
-            (
-                mixed.clone(),
-                partially_exact,
-                Some(
-                    "shape conversion along axis 1 requires finite physical bounds for every axis, but axis 0 \
-                      has unbounded dimension `n`",
-                ),
-            ),
-            (mixed.clone(), mixed, None),
-        ];
-        for (input_type, output_type, expected) in cases {
-            let context = MlirContext::new();
-            let location = context.unknown_location();
-            let block = context.block(&[(lower_tensor_type(&input_type, &context, location).unwrap(), location)]);
-            let source = block.argument(0).unwrap().as_ref();
-            let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
-            let result = CastOperation::unchecked(output_type.clone(), vec![input_type.clone()]).unwrap().lower(
-                &mut lowerer,
-                &[source],
-                &[input_type],
-                &[output_type],
-            );
-            match expected {
-                Some(expected) => assert!(matches!(
-                    result,
-                    Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })) if reason == expected,
-                )),
-                None => assert_eq!(result.unwrap(), vec![source]),
-            }
-        }
+        "#},
+        );
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::U16, true),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason == "width-changing bitcast with an unbounded dynamic dimension",
+        ));
     }
 }

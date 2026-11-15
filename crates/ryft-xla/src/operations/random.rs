@@ -13,47 +13,22 @@ use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::assertions::lower_output_extent_validation;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
-/// Lowers one traced random bit generation with `algorithm` to a `stablehlo.rng_bit_generator` that produces bits of
-/// type `bits_type`, mapping the algorithm to the corresponding StableHLO algorithm attribute. The two results are the
-/// advanced generator state and the bits. The bits type is the instruction's (possibly refined) output type rather
-/// than the operation's declared one, whose dynamic axes exact extent operands may have refined to static axes.
-pub(crate) fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
-    algorithm: RandomAlgorithm,
-    bits_type: &ArrayType,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("input", input_values, 1, ProgramError);
-    let algorithm = match algorithm {
-        RandomAlgorithm::ThreeFry => stable_hlo::RngAlgorithm::ThreeFry,
-        RandomAlgorithm::Philox => stable_hlo::RngAlgorithm::Philox,
-    };
-    let output_type = lower_tensor_type(bits_type, context, location)?;
-    let generated =
-        block.append_operation(stable_hlo::rng_bit_generator(input_values[0], algorithm, output_type, location)?)?;
-    Ok(vec![
-        generated.result(0).expect("stablehlo.rng_bit_generator should return a state result").as_ref(),
-        generated.result(1).expect("stablehlo.rng_bit_generator should return a bits result").as_ref(),
-    ])
-}
-
 impl LowerableOperation for RngBitGeneratorOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (input_types, output_types);
         lower_rng_bit_generator_to_mlir(
             self.algorithm(),
             self.output_type(),
             input_values,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
         )
     }
 }
@@ -66,9 +41,9 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayIrType> {
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context;
-        let location = lowerer.location;
-        let block = &mut lowerer.block;
+        let context = lowerer.context();
+        let location = lowerer.location();
+        let block = &mut lowerer.block();
         // Type inference refines the declared dynamic output axes whose extents are exact (e.g., those of eager
         // dimension values) to static axes, so only the refined bits type decides whether the generator can be
         // lowered. Their extent operands can be omitted after validating symbolic operands against the refined extents.
@@ -79,10 +54,11 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayIrType> {
         if bits_type.static_shape().is_none() {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: self.name().to_string(),
-                reason: "rng-bit-generator with dynamic output extents cannot lower by generating the physical \
-                     upper-bound shape because that would advance its functional state by the physical rather \
-                     than logical element count"
-                    .to_string(),
+                reason: format!(
+                    "`{RNG_BIT_GENERATOR_OPERATION_NAME}` with dynamic output extents cannot lower by generating the \
+                     physical upper-bound shape because that would advance its functional state by the physical \
+                     rather than logical element count",
+                ),
             }));
         }
         let expected_input_count = 1 + self
@@ -100,7 +76,7 @@ impl LowerableOperation for RngBitGeneratorOperation<ArrayIrType> {
             &input_values[1..],
             &input_types[1..],
             std::slice::from_ref(bits_type),
-            &mut lowerer.effect_tokens,
+            lowerer.effect_tokens_mut(),
             block,
             context,
             location,
@@ -126,7 +102,11 @@ impl LowerableOperation for DropoutOperation {
         check_count!("output", output_types, input_values.len(), ProgramError);
         let (input, input_type) = match (input_values, input_types) {
             ([input, ..], [input_type, ..]) if input_values.len() <= 2 => (*input, input_type),
-            _ => return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() }.into()),
+            // The operation takes its input and an optional state, so report the closest valid count.
+            _ => {
+                let expected = input_values.len().clamp(1, 2);
+                return Err(ProgramError::InvalidInputCount { expected, actual: input_values.len() }.into());
+            }
         };
         if input_type.static_shape().is_none() {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
@@ -134,9 +114,9 @@ impl LowerableOperation for DropoutOperation {
                 reason: format!("`{DROPOUT_OPERATION_NAME}` with dynamic input extents"),
             }));
         }
-        let context = lowerer.context;
-        let location = lowerer.location;
-        let block = &mut lowerer.block;
+        let context = lowerer.context();
+        let location = lowerer.location();
+        let block = &mut lowerer.block();
         let (algorithm, state) = match input_values.get(1) {
             Some(state) => (RandomAlgorithm::from_state_type(&input_types[1])?, *state),
             None => {
@@ -166,7 +146,7 @@ impl LowerableOperation for DropoutOperation {
                 location,
             )?)?
             .result(0)
-            .expect("stablehlo.compare should return one result")
+            .unwrap()
             .as_ref();
         let input_tensor_type = lower_tensor_type(input_type, context, location)?;
         let keep = if mask_type.shape() == input_type.shape() {
@@ -178,7 +158,7 @@ impl LowerableOperation for DropoutOperation {
             block
                 .append_operation(stable_hlo::broadcast(keep, keep_tensor_type, &dimensions, location)?)?
                 .result(0)
-                .expect("stablehlo.broadcast_in_dim should return one result")
+                .unwrap()
                 .as_ref()
         };
 
@@ -203,7 +183,7 @@ impl LowerableOperation for DropoutOperation {
                     Ok(block
                         .append_operation(stable_hlo::complex(real, part_zero, location)?)?
                         .result(0)
-                        .expect("stablehlo.complex should return one result")
+                        .unwrap()
                         .as_ref())
                 };
                 (complex(part_scale)?, complex(part_zero)?)
@@ -213,18 +193,37 @@ impl LowerableOperation for DropoutOperation {
         if self.drops_everything() {
             return Ok(std::iter::once(zero).chain(input_values.get(1).map(|_| generated[0])).collect());
         }
-        let scaled = block
-            .append_operation(stable_hlo::multiply(input, scale, location)?)?
-            .result(0)
-            .expect("stablehlo.multiply should return one result")
-            .as_ref();
+        let scaled = block.append_operation(stable_hlo::multiply(input, scale, location)?)?.result(0).unwrap().as_ref();
         let output = block
             .append_operation(stable_hlo::select(keep, scaled, zero, location)?)?
             .result(0)
-            .expect("stablehlo.select should return one result")
+            .unwrap()
             .as_ref();
         Ok(std::iter::once(output).chain(input_values.get(1).map(|_| generated[0])).collect())
     }
+}
+
+/// Lowers one random bit generation with `algorithm` to a `stablehlo.rng_bit_generator` that produces bits of type
+/// `bits_type`, mapping the algorithm to the corresponding StableHLO algorithm attribute. The two results are the
+/// advanced generator state and the bits. The bits type is the instruction's output type, which may be refined, rather
+/// than the operation's declared one, whose dynamic axes exact extent operands may have refined to static axes.
+fn lower_rng_bit_generator_to_mlir<'b, 'c: 'b, 't: 'c>(
+    algorithm: RandomAlgorithm,
+    bits_type: &ArrayType,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    check_count!("input", input_values, 1, ProgramError);
+    let algorithm = match algorithm {
+        RandomAlgorithm::ThreeFry => stable_hlo::RngAlgorithm::ThreeFry,
+        RandomAlgorithm::Philox => stable_hlo::RngAlgorithm::Philox,
+    };
+    let output_type = lower_tensor_type(bits_type, context, location)?;
+    let generated =
+        block.append_operation(stable_hlo::rng_bit_generator(input_values[0], algorithm, output_type, location)?)?;
+    Ok(vec![generated.result(0).unwrap().as_ref(), generated.result(1).unwrap().as_ref()])
 }
 
 #[cfg(test)]
@@ -232,20 +231,26 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayType, Axes, CategoricalSamplingMode, ConvertElementType, ConvertElementTypeOperation,
-        DataType, DeviceMesh, Dimension as CoreDimension, Dropout, DropoutOperation, Placeholder, Random,
-        RandomAlgorithm, RngBitGenerator, Shape, TypedProgram, ZeroOperation,
+        Array as CoreArray, ArrayIrType, ArrayType, Axes, CategoricalSamplingMode, ConvertElementType,
+        ConvertElementTypeOperation, DataType, DeviceMesh, Dimension as CoreDimension, DimensionBounds, DimensionType,
+        DimensionValue, DimensionVariable, Dropout, DropoutOperation, Placeholder, ProgramError, Random,
+        RandomAlgorithm, RngBitGenerator, RngBitGeneratorOperation, Shape, TypedProgram, ZeroOperation,
     };
+    use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
 
     use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{MixedValue, ProgramBuilder, execute_mixed_program, unproject_plain_program};
-    use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
+    use crate::lowering::types::lower_tensor_type;
+    use crate::operations::assertions::ensure_assertion_handler_registered;
+    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::values::ArrayConstant;
-    use crate::{Array, Constant, Domain, Session, to_mlir_module_for_program};
+    use crate::{
+        Array, Constant, Domain, Error, LowerableOperation, Lowerer, LoweringError, Session, to_mlir_module_for_program,
+    };
 
     // Uploads one generator state to the device and builds the same state on the reference backend.
-    fn rng_states<'c>(
+    fn generator_states<'c>(
         domain: &Domain<'c>,
         mesh: &DeviceMesh,
         algorithm: RandomAlgorithm,
@@ -257,9 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_rng_bit_generator() {
-        use ryft_core::{RandomAlgorithm, RngBitGeneratorOperation};
-
+    fn test_rng_bit_generator_operation_lower() {
         let state_type = ArrayType::new(DataType::U64, Shape::new(vec![CoreDimension::Static(2)]));
         let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![CoreDimension::Static(4)]));
         let mut builder = ProgramBuilder::new();
@@ -296,15 +299,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_rng_bit_generator_with_exact_output_extent() {
-        use ryft_core::{
-            ArrayIrType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, RandomAlgorithm,
-            RngBitGeneratorOperation,
-        };
-
-        use crate::Constant;
-        use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-
+    fn test_rng_bit_generator_operation_lower_with_exact_output_extent() {
         // An exact extent refines the declared dynamic bits axis to a static one, so the generator lowers at that
         // static shape and its redundant extent operand does not reach `stablehlo.rng_bit_generator`.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
@@ -346,18 +341,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_rng_bit_generator_mixed_repeated_extents() {
-        use ryft_core::{
-            ConvertElementTypeOperation, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
-            RandomAlgorithm, RngBitGeneratorOperation, ZeroOperation,
-        };
-
-        use crate::Constant;
-        use crate::lowering::tests::{MixedValue, execute_mixed_program};
-        use crate::operations::assertions::ensure_assertion_handler_registered;
-        use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-        use crate::tests::execution_client;
-
+    fn test_rng_bit_generator_operation_lower_mixed_repeated_extents() {
         // An exact operand makes both repeated bits axes static, but the symbolic peer must still equal that extent.
         // The two generators cover both operand orders and consume the same state, so they produce the same bits.
         let size = DimensionVariable::new("size", DimensionBounds::new(0, Some(9)).unwrap());
@@ -451,16 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_rng_bit_generator_rejects_missing_input_types() {
-        use ryft_core::{
-            ArrayIrType, DimensionBounds, DimensionVariable, ProgramError, RandomAlgorithm, RngBitGeneratorOperation,
-        };
-        use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
-
-        use crate::lowering::types::lower_tensor_type;
-        use crate::operations::Operation;
-        use crate::{Error, LowerableOperation, Lowerer};
-
+    fn test_rng_bit_generator_operation_lower_rejects_missing_input_types() {
         // Input types are validated before they are split into the state type and the extent operand types.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let operation = RngBitGeneratorOperation::<ArrayIrType>::new(
@@ -487,10 +462,39 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_rng_bit_generator_matches_reference_backend() {
+    fn test_rng_bit_generator_operation_lower_rejects_dynamic_output_extents() {
+        // Generating the physical upper-bound shape would advance the state by the physical element count, so bits
+        // whose refined type remains dynamic cannot be lowered.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let bits_type = ArrayType::new(DataType::U32, Shape::new(vec![extent.into()]));
+        let operation = RngBitGeneratorOperation::<ArrayIrType>::new(RandomAlgorithm::ThreeFry, bits_type.clone());
+        let state_type = RandomAlgorithm::ThreeFry.state_type();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let block = context.block(&[
+            (lower_tensor_type(&state_type, &context, location).unwrap(), location),
+            (lower_tensor_type(&ArrayType::scalar(DataType::I64), &context, location).unwrap(), location),
+        ]);
+        let inputs = vec![block.argument(0).unwrap().as_ref(), block.argument(1).unwrap().as_ref()];
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+        let input_types = vec![state_type.clone().into(), ArrayType::scalar(DataType::I64).into()];
+        let output_types = vec![state_type.into(), bits_type.into()];
+        assert!(matches!(
+            operation.lower(&mut lowerer, &inputs, &input_types, &output_types),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "rng_bit_generator"
+                    && reason
+                        == "`rng_bit_generator` with dynamic output extents cannot lower by generating the physical \
+                            upper-bound shape because that would advance its functional state by the physical rather \
+                            than logical element count",
+        ));
+    }
+
+    #[test]
+    fn test_rng_bit_generator_operation_lower_matches_reference_backend() {
         // Bits and advanced states are byte-identical on both backends. Five 32-bit words exercise the padded counter
         // blocks and the truncated word layout. For outputs narrower than 64 bits, XLA's ThreeFry expansion splits the
-        // first even-sized axis of the output (or else its first largest axis) and advances the counter by the size
+        // first even-sized axis of the output, or else its first largest axis, and advances the counter by the size
         // of the resulting half shape, which the last group covers at several shapes and every narrow width.
         let client = execution_client();
         let domain = Session::new(&client).domain();
@@ -513,7 +517,7 @@ mod tests {
                 ],
             ),
         ] {
-            let (state, reference_state) = rng_states(&domain, &mesh, algorithm, &state_values);
+            let (state, reference_state) = generator_states(&domain, &mesh, algorithm, &state_values);
             for (data_type, dimensions) in outputs {
                 let output_type = ArrayType::new_static(data_type, dimensions);
                 let (device_advanced_state, device_bits) = state.rng_bit_generator(algorithm, &output_type).unwrap();
@@ -534,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_rng_bit_generator_matches_reference_backend_at_counter_boundaries() {
+    fn test_rng_bit_generator_operation_lower_matches_reference_backend_at_counter_boundaries() {
         // Empty outputs preserve the state, and counter advancement wraps at the counter width of the algorithm while
         // the bits stay byte-identical with the reference backend for every output width.
         let client = execution_client();
@@ -545,7 +549,7 @@ mod tests {
             (RandomAlgorithm::Philox, vec![42u64, u64::MAX - 1, 7]),
             (RandomAlgorithm::Philox, vec![42u64, u64::MAX - 1, u64::MAX]),
         ] {
-            let (state, reference_state) = rng_states(&domain, &mesh, algorithm, &state_values);
+            let (state, reference_state) = generator_states(&domain, &mesh, algorithm, &state_values);
             for data_type in [DataType::U8, DataType::U16, DataType::U32, DataType::U64] {
                 for dimensions in [vec![2, 0, 3], vec![5]] {
                     // The empty shape runs no cipher invocations. Five elements run enough invocations to cross the
@@ -587,7 +591,7 @@ mod tests {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
-        let (state, reference_state) = rng_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        let (state, reference_state) = generator_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         let (device_advanced_state, device_keys) = state.split_rng_key(2).unwrap();
         let (reference_advanced_state, reference_keys) = reference_state.split_rng_key(2).unwrap();
         assert_eq!(device_advanced_state.copy_to_host().unwrap(), reference_advanced_state.logical_bytes());
@@ -604,7 +608,7 @@ mod tests {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
-        let (state, reference_state) = rng_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        let (state, reference_state) = generator_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         for data_type in [DataType::F32, DataType::BF16, DataType::F16] {
             let sample_type = ArrayType::new_static(data_type, [8]);
             let (device_advanced_state, device_samples) = state.random_uniform(&sample_type).unwrap();
@@ -626,7 +630,7 @@ mod tests {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
-        let (state, reference_state) = rng_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        let (state, reference_state) = generator_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         for (data_type, component_count, tolerance) in
             [(DataType::F32, 8, 1e-5f64), (DataType::C64, 16, 1e-5), (DataType::C128, 16, 1e-12)]
         {
@@ -668,7 +672,7 @@ mod tests {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
-        let (state, reference_state) = rng_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
+        let (state, reference_state) = generator_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[11u64, 3]);
         let logit_values = [0f32, 10.0, -3.0, 2.0];
         let logits = replicated_array(&domain, &mesh, DataType::F32, &[4], values_to_bytes(&logit_values).as_slice());
         let reference_logits =
@@ -691,7 +695,7 @@ mod tests {
         for (algorithm, state_values) in
             [(RandomAlgorithm::ThreeFry, vec![11u64, 3]), (RandomAlgorithm::Philox, vec![11u64, 3, 0])]
         {
-            let (state, reference_state) = rng_states(&domain, &mesh, algorithm, &state_values);
+            let (state, reference_state) = generator_states(&domain, &mesh, algorithm, &state_values);
             for data_type in [DataType::F32, DataType::F64] {
                 let reference_logits =
                     CoreArray::matrix(2, 3, vec![f64::NEG_INFINITY, 2000.0, 0.0, f64::NEG_INFINITY, 0.0, 2000.0])
@@ -719,7 +723,7 @@ mod tests {
         }
 
         // A zero first uniform exercises the rare tail where an ordinary `log(1 - x)` loses the distinction from zero.
-        let (state, _) = rng_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[0u64, 0x1badd8a64e5859ae]);
+        let (state, _) = generator_states(&domain, &mesh, RandomAlgorithm::ThreeFry, &[0u64, 0x1badd8a64e5859ae]);
         let logits = replicated_array(&domain, &mesh, DataType::F32, &[2], values_to_bytes(&[-16f32, 0.0]).as_slice());
         for (mode, expected) in
             [(CategoricalSamplingMode::LowPrecision, 1i32), (CategoricalSamplingMode::HighPrecision, 0)]
@@ -730,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_dropout() {
+    fn test_dropout_operation_lower() {
         // The mask is drawn at the input shape with the broadcast axes replaced by one, compared against the drop
         // threshold, and broadcast to the input shape before it selects between the scaled input and zero.
         let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
@@ -814,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_dropout_matches_eager_arrays() {
+    fn test_dropout_operation_lower_matches_reference_backend() {
         // Compiled dropout draws exactly the masks and advanced states of the eager `Array` implementation, with and
         // without a state, with broadcast axes, and for a mask shape without even extents, for which ThreeFry splits
         // its largest axis.

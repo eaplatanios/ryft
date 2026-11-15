@@ -1,16 +1,19 @@
 //! Per-call dispatch latency benchmark for small eager operations and retained JIT dispatch, for comparison with JAX.
 //!
-//! Every case applies one tiny operation (an `f32[8]` add, a `condition` over such adds, a first-class dimension add,
-//! or an `f32[8]` reference read) on a single CPU device, so the measured time is dispatch overhead rather than
+//! Every case applies one tiny operation (i.e., an `f32[8]` add, a `condition` over such adds, a first-class dimension
+//! add, or an `f32[8]` reference read) on a single CPU device, so the measured time is dispatch overhead rather than
 //! computation. The dimension and reference cases come in pairs that compare dispatch through the session-carrying
-//! [`Value`] members with the direct host implementations of the session-free `ArrayIrValue` members. Each case
-//! runs warm-up calls and then several timed rounds without per-call synchronization (the same methodology as
-//! `python/scripts/compare_dispatch_performance_with_jax.py`), and reports the per-call mean of every round.
+//! [`Value`] members with the direct host implementations of the session-free
+//! [`ArrayIrValue`](ryft_core::ArrayIrValue) members. Each case runs warm-up calls and then several timed rounds
+//! without per-call synchronization, which is the same methodology that
+//! `python/scripts/compare_dispatch_performance_with_jax.py` uses, and reports the per-call mean of every round.
 
 use std::collections::HashMap;
 use std::env;
 use std::sync::Arc;
 use std::time::Instant;
+
+use serde_json::json;
 
 use ryft_core::{
     Add, AddOperation, ArrayIrType, ArrayIrValue, ArrayType, ConditionOperation, Context, DataType, Device, DeviceMesh,
@@ -23,9 +26,16 @@ use ryft_xla::operations::ProgramBuilder;
 use ryft_xla::{
     Array, CompileTracer, CompiledFunctionDispatcher, Constant, Dimension, FromPjrt, Operation, Session, Value, jit,
 };
-use serde_json::json;
 
 // TODO(eaplatanios): Review this module.
+
+/// StableHLO module that adds its two `f32[8]` inputs, used to measure the raw PJRT execution floor.
+const ADD_MODULE: &str = "module {
+  func.func @main(%arg0: tensor<8xf32>, %arg1: tensor<8xf32>) -> tensor<8xf32> {
+    %0 = stablehlo.add %arg0, %arg1 : tensor<8xf32>
+    return %0 : tensor<8xf32>
+  }
+}";
 
 /// Command-line arguments of this benchmark.
 #[derive(Debug)]
@@ -111,14 +121,7 @@ fn measure(arguments: &Arguments, mut call: impl FnMut()) -> Vec<f64> {
         .collect()
 }
 
-/// StableHLO module that adds its two `f32[8]` inputs, used to measure the raw PJRT execution floor.
-const ADD_MODULE: &str = "module {
-  func.func @main(%arg0: tensor<8xf32>, %arg1: tensor<8xf32>) -> tensor<8xf32> {
-    %0 = stablehlo.add %arg0, %arg1 : tensor<8xf32>
-    return %0 : tensor<8xf32>
-  }
-}";
-
+/// Runs the selected benchmark cases and prints the per-round means, minimum, and median of each case as JSON.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(arguments) = parse_arguments().map_err(std::io::Error::other)? else {
         return Ok(());
@@ -139,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Eager `add` through the receiver-based capability, which dispatches through the array's domain.
     if arguments.selects("eager_add") {
-        results.insert("eager_add", measure(&arguments, || drop(Add::add(&input, &input).unwrap())));
+        results.insert("eager_add", measure(&arguments, || drop(input.add(&input).unwrap())));
     }
 
     // First-class dimension addition through a session-carrying `Dimension`, which binds the operation through its
@@ -147,10 +150,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let extent = DimensionValue::constant(8)?;
     let xla_extent = Dimension::new(extent.clone(), domain.clone());
     if arguments.selects("xla_dimension_add") {
-        results.insert("xla_dimension_add", measure(&arguments, || drop(Add::add(&xla_extent, &xla_extent).unwrap())));
+        results.insert("xla_dimension_add", measure(&arguments, || drop(xla_extent.add(&xla_extent).unwrap())));
     }
     if arguments.selects("host_dimension_add") {
-        results.insert("host_dimension_add", measure(&arguments, || drop(Add::add(&extent, &extent).unwrap())));
+        results.insert("host_dimension_add", measure(&arguments, || drop(extent.add(&extent).unwrap())));
     }
 
     // Reference reads through a session-carrying `Value`, which binds the read through its domain, and through a
@@ -193,12 +196,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Warm JIT dispatch of `x + x`.
     let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> =
-        jit(|_, value: CompileTracer<'_>| Ok(Add::add(&value, &value)?), &domain, mesh.clone());
+        jit(|_, value: CompileTracer<'_>| Ok(value.add(&value)?), &domain, mesh.clone());
     if arguments.selects("jit_add") {
         results.insert("jit_add", measure(&arguments, || drop(function.execute((), input.clone()).unwrap())));
     }
 
-    // Raw PJRT execution floor: a precompiled add executed directly through `ryft-pjrt`.
+    // Raw PJRT execution floor, which is a precompiled add executed directly through `ryft-pjrt`.
     let options = CompilationOptions {
         executable_build_options: Some(ExecutableCompilationOptions {
             device_ordinal: -1,

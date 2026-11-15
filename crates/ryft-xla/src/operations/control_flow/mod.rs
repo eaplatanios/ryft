@@ -9,8 +9,8 @@ use ryft_core::{
 };
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::{
-    Block, BlockRef, Context as MlirContext, LocationRef, Operation as MlirOperation, Region, Type, TypeRef,
-    Value as MlirValue, ValueRef,
+    Block, BlockRef, Context as MlirContext, DetachedRegion, LocationRef, Operation as MlirOperation, Region, Type,
+    TypeRef, Value as MlirValue, ValueRef,
 };
 
 use crate::lowering::regions::lower_nested_program_inline;
@@ -25,13 +25,9 @@ use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::operations::{FlatProgram, Program};
 use crate::{Constant, Error, LowerableOperationFamily};
 
-/// StableHLO lowering of `condition`.
 pub(crate) mod condition;
-/// StableHLO lowering of `scan`.
 pub(crate) mod scan;
-/// StableHLO lowering of `select`.
 pub(crate) mod select;
-/// StableHLO lowering of `while`.
 pub(crate) mod r#while;
 
 /// Lowers the input relationship guard of a region invoked with `values` of the `actual_types`, before any conversion
@@ -39,8 +35,8 @@ pub(crate) mod r#while;
 /// inputs that their actual types leave unproven (e.g., a `dimension<n>` input that must equal the extent of an exact
 /// `f32[3]` input entering `f32[n]`) is checked by a [`GuardOperation`] before the region runs, exactly as eager
 /// validation of region inputs would reject it. Static extents are checked as constants and dynamic ones are read from
-/// the values, so the guard needs no conversion and can precede every path that invokes the region (including paths
-/// that never run the region). Inputs whose actual types prove every relationship need no guard.
+/// the values, so the guard needs no conversion and can precede every path that invokes the region, including paths
+/// that never run the region. Inputs whose actual types prove every relationship need no guard.
 ///
 /// # Parameters
 ///
@@ -77,15 +73,16 @@ pub(crate) fn lower_region_guard<'b, 'c: 'b, 't: 'c>(
     )
 }
 
-/// Returns the [`EffectClasses`] whose tokens lowering `program` threads: its source effect classes, plus
+/// Returns the [`EffectClasses`] whose tokens lowering `program` threads, which are its source effect classes, plus
 /// [`EffectClass::OrderedAssertion`] when lowering synthesizes an assertion anywhere in it, at any depth. Lowering
 /// synthesizes the input relationship guard of a nested `condition`, `while`, or `scan` whose inputs leave
-/// relationships of its region inputs unproven (refer to [`lower_region_guard`]), and the validation of the extent
-/// inputs that a dynamic array constructor (`zero`, `one`, or `iota`), a random bit generator, or a custom call
-/// consumes for output axes that type inference refined to static extents (refer to `validates_output_extents`). A
-/// region that contains such an assertion must thread its tokens out (refer to `token_threaded_effects`) even when its
-/// source program is pure, so that later assertions and I/O follow it: a region input guard joins its assertion token
-/// into the ordered I/O chain, and every assertion advances the ordered-assertion chain.
+/// relationships of its region inputs unproven, which [`lower_region_guard`] emits. It also synthesizes the validation
+/// of the extent inputs that a dynamic array constructor (i.e., `zero`, `one`, or `iota`), a random bit generator, or a
+/// custom call consumes for output axes that type inference refined to static extents, which
+/// [`validates_output_extents`] detects. A region that contains such an assertion must thread its tokens out, in the
+/// order of [`token_threaded_effects`], even when its source program is pure, so that later assertions and I/O follow
+/// it. A region input guard joins its assertion token into the ordered I/O chain, and every assertion advances the
+/// ordered assertion chain.
 pub(crate) fn lowered_effect_classes<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> Result<EffectClasses, Error>
@@ -161,17 +158,17 @@ where
     Ok(classes)
 }
 
-/// Converts the lowered value of one control-flow input to the lowered type of the region input that it feeds, which
-/// the input type refines (refer to the `while`, `scan`, and `condition` type inference rules in `ryft-core`), or more
-/// generally to a type whose dynamic axes take either a static extent of the input or the runtime size of a dynamic
-/// axis of the input (e.g., the outputs of a region input guard or a `cast`). Regions receive every input at its
-/// declared type, and refinements that only add metadata (e.g., shardings or layouts) lower to the same tensor type, so
-/// those inputs are returned unchanged. A static extent that refines a bounded dynamic dimension, and a dynamic
-/// dimension whose physical bound differs from the declared one, lower to different tensor types. Such an input is
-/// exposed as its full physical buffer, padded up (or sliced down) to the physical bound of the declared type along
+/// Converts the lowered value of one control flow input to the lowered type of the region input that it feeds, which
+/// the input type refines according to the `while`, `scan`, and `condition` type inference rules in `ryft-core`, or
+/// more generally to a type whose dynamic axes take either a static extent of the input or the runtime size of a
+/// dynamic axis of the input (e.g., the outputs of a region input guard or a `cast`). Regions receive every input at
+/// its declared type, and refinements that only add metadata (e.g., shardings or layouts) lower to the same tensor
+/// type, so those inputs are returned unchanged. A static extent that refines a bounded dynamic dimension, and a
+/// dynamic dimension whose physical bound differs from the declared one, lower to different tensor types. Such an input
+/// is exposed as its full physical buffer, padded up or sliced down to the physical bound of the declared type along
 /// every such axis, and then given the runtime size of every dynamic dimension of the declared type with
-/// `stablehlo.set_dimension_size`: the static extent for a refined axis, and the input's own runtime size for an axis
-/// that stays dynamic.
+/// `stablehlo.set_dimension_size`. That size is the static extent for a refined axis and the input's own runtime size
+/// for an axis that stays dynamic.
 pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     input_type: &ArrayIrType,
@@ -257,13 +254,13 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     Ok(value)
 }
 
-/// Converts the lowered values of the results of one control-flow instruction from the `region_output_types` that its
-/// lowering produced them at to the instruction's `output_types`, which refine them (refer to
-/// `refine_control_flow_output_types` in `ryft-core`). This is the inverse of [`lower_refined_region_input`]:
-/// refinements only replace dynamic dimensions with static extents, so a result is exposed as its full physical buffer,
-/// sliced to the static extent of every refined axis, and then given back the runtime size of every axis that stays
-/// dynamic with `stablehlo.set_dimension_size`. Results whose types the instruction does not refine are returned
-/// unchanged.
+/// Converts the lowered values of the results of one control flow instruction from the `region_output_types` that its
+/// lowering produced them at to the instruction's `output_types`, which refine them as
+/// `refine_control_flow_output_types` in `ryft-core` computes them. This is the inverse of
+/// [`lower_refined_region_input`]. Refinements only replace dynamic dimensions with static extents, so a result is
+/// exposed as its full physical buffer, sliced to the static extent of every refined axis, and then given back the
+/// runtime size of every axis that stays dynamic with `stablehlo.set_dimension_size`. Results whose types the
+/// instruction does not refine are returned unchanged.
 pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
     values: Vec<ValueRef<'b, 'c, 't>>,
     region_output_types: &[ArrayIrType],
@@ -339,16 +336,16 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
     Ok(converted)
 }
 
-/// Lowers one nested control-flow branch program into a fresh single-block region.
+/// Lowers one nested control flow branch program into a fresh region with a single block.
 ///
-/// `entry_effect_tokens` are the enclosing scope's active per-class tokens, referenced inside the region through
-/// StableHLO's implicit region capture (the same mechanism that feeds `input_values` into `stablehlo.if` branches).
-/// Ordinary results are converted to `output_types` before the region returns one trailing token for each class in
-/// `threaded_effects`, in canonical effect order. A branch that is pure for one of those classes returns that class's
-/// incoming token unchanged. `threaded_effects` must cover every ordered class whose token the lowering of `program`
-/// advances (refer to [`lowered_effect_classes`]): the region cannot return the token of any other class, so an
-/// advanced token of such a class is reported as a [`ProgramError::MalformedProgram`] instead of being dropped, which
-/// would leave later effects of that class unordered with respect to the effects of the region.
+/// `entry_effect_tokens` are the active tokens of each effect class in the enclosing scope, which the region references
+/// through StableHLO's implicit region capture. This is the same mechanism that feeds `input_values` into
+/// `stablehlo.if` branches. Ordinary results are converted to `output_types` before the region returns one trailing
+/// token for each class in `threaded_effects`, in canonical effect order. A branch that is pure for one of those
+/// classes returns that class's incoming token unchanged. `threaded_effects` must cover every ordered class whose token
+/// the lowering of `program` advances, as [`lowered_effect_classes`] computes them. The region cannot return the token
+/// of any other class, so an advanced token of such a class is reported as a [`ProgramError::MalformedProgram`] instead
+/// of being dropped, which would leave later effects of that class unordered with respect to the effects of the region.
 pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     program: &FlatProgram<O>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -360,7 +357,7 @@ pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperatio
     collective_state: &CollectiveLoweringState,
     entry_effect_tokens: EffectTokens<'b, 'c, 't>,
     threaded_effects: EffectClasses,
-) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
+) -> Result<DetachedRegion<'c, 't>, Error> {
     let mut region = context.region();
     let block = context.block_with_no_arguments();
     {
@@ -396,10 +393,10 @@ pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperatio
     Ok(region)
 }
 
-/// Validates that lowering a control-flow region whose tokens were `entry_effect_tokens` when it started and are
+/// Validates that lowering a control flow region whose tokens were `entry_effect_tokens` when it started and are
 /// `region_effect_tokens` when it ends advanced no token of an ordered class outside `threaded_effects`. A region
-/// returns only the tokens of its threaded classes (refer to `token_threaded_effects`), so the advanced token of any
-/// other class would be dropped, leaving later effects of that class unordered with respect to the effects of the
+/// returns only the tokens of its threaded classes, which [`token_threaded_effects`] yields, so the advanced token of
+/// any other class would be dropped, leaving later effects of that class unordered with respect to the effects of the
 /// region. The threaded classes come from [`lowered_effect_classes`], which must predict every ordered class whose
 /// token lowering advances, so a violation is an internal error. A region that returns no token at all (e.g., the
 /// condition region of a `stablehlo.while`) validates with [`EffectClasses::NONE`].
@@ -425,8 +422,8 @@ pub(crate) fn validate_unthreaded_effect_tokens<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Appends the current token of each class in `threaded_effects` to the initial `state_values` of a
-/// `stablehlo.while` and one token type per class to its `state_types`, in canonical effect order (refer to
-/// `token_threaded_effects`). A class without a current token gets a fresh one. The loop carries these tokens as its
+/// `stablehlo.while` and one token type per class to its `state_types`, in the canonical effect order of
+/// [`token_threaded_effects`]. A class without a current token gets a fresh one. The loop carries these tokens as its
 /// trailing state elements, so its regions read them with [`set_threaded_effect_tokens`] and its results become the
 /// current tokens of the enclosing scope the same way.
 pub(crate) fn append_loop_effect_tokens<'b, 'c: 'b, 't: 'c>(
@@ -446,10 +443,10 @@ pub(crate) fn append_loop_effect_tokens<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Sets the token of each class in `threaded_effects` to `token(offset)`, where `offset` is the position of the class
-/// in canonical effect order (refer to `token_threaded_effects`), and keeps the tokens of all other classes.
-/// Control-flow regions and operations carry the tokens of their threaded classes as trailing block arguments or
-/// results in that order, so `token` reads them from the block arguments of a region that it enters, or from the
-/// results of the operation that it leaves.
+/// in the canonical effect order of [`token_threaded_effects`], and keeps the tokens of all other classes. Control flow
+/// regions and operations carry the tokens of their threaded classes as trailing block arguments or results in that
+/// order, so `token` reads them from the block arguments of a region that it enters, or from the results of the
+/// operation that it leaves.
 pub(crate) fn set_threaded_effect_tokens<'b, 'c: 'b, 't: 'c>(
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     threaded_effects: EffectClasses,
@@ -460,8 +457,8 @@ pub(crate) fn set_threaded_effect_tokens<'b, 'c: 'b, 't: 'c>(
     }
 }
 
-/// Returns the current token of each class in `threaded_effects`, in canonical effect order (refer to
-/// `token_threaded_effects`), which a control-flow region returns as its trailing results. Every threaded class has a
+/// Returns the current token of each class in `threaded_effects`, in the canonical effect order of
+/// [`token_threaded_effects`], which a control flow region returns as its trailing results. Every threaded class has a
 /// token in a region whose tokens entered through [`set_threaded_effect_tokens`] or that started from tokens returned
 /// by [`append_loop_effect_tokens`].
 pub(crate) fn threaded_effect_token_values<'b, 'c: 'b, 't: 'c>(
@@ -471,14 +468,14 @@ pub(crate) fn threaded_effect_token_values<'b, 'c: 'b, 't: 'c>(
     token_threaded_effects(threaded_effects).map(|effect| effect_tokens.get(effect).unwrap()).collect()
 }
 
-/// Constrains each of the lowered `outputs` of a control-flow operation whose array type in `output_types` carries a
+/// Constrains each of the lowered `outputs` of a control flow operation whose array type in `output_types` carries a
 /// sharding over a mesh with at least one `Explicit` axis to that sharding with `sdy.sharding_constraint`, and returns
 /// the constrained values. This includes results that such a sharding replicates or shards only over the `Auto` axes
 /// of that mesh. Nothing inside a region needs to pin the placement of a result over a mesh with explicit axes (e.g., a
 /// region may return a replicated constant), so propagation could otherwise assign the result a placement other than
 /// the one that its type states. Results without a sharding, results whose mesh has no explicit axis (e.g., only `Auto`
 /// or `Manual` axes), references, and first-class dimensions remain unconstrained. Mesh axes in `bound_manual_axes`,
-/// which enclosing manual regions bind, are excluded from the constraints (refer to `lower_sharding_constraint`).
+/// which enclosing manual regions bind, are excluded from the constraints that [`lower_sharding_constraint`] emits.
 pub(crate) fn lower_explicit_sharding_constraints<'b, 'c: 'b, 't: 'c>(
     outputs: Vec<ValueRef<'b, 'c, 't>>,
     output_types: &[ArrayIrType],
@@ -509,116 +506,24 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayOperation, AtomId, CompareOperation, ComparisonDirection, ConditionOperation, Device,
-        DeviceMesh, LogicalMesh, MeshAxis, Placeholder, PrintOperation, ScanOperation, Sharding, TypedProgram,
-        WhileOperation, ZeroLikeOperation,
+        AddOperation, ArrayOperation, AtomId, CompareOperation, ComparisonDirection, CompositeJvpRule,
+        CompositeOperation, Device, DeviceMesh, DimensionBounds, DimensionFromScalarOperation, DimensionValue,
+        DimensionVariable, LogicalMesh, MeshAxis, Placeholder, PrintOperation, Sharding, ZeroLikeOperation,
     };
     use ryft_mlir::Location;
-    use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, Program as PjrtProgram, load_cpu_plugin};
+    use ryft_pjrt::{Client, Program as PjrtProgram};
 
+    use crate::domains::runtimes::builtin_requirement;
     use crate::execution::ExecutionArguments;
     use crate::lowering::lower_mlir_module_for_program;
-    use crate::lowering::tests::{test_spmd_compilation_options, test_vector_type};
+    use crate::lowering::tests::{dynamic_dimension, test_spmd_compilation_options, test_vector_type};
+    use crate::lowering::types::lower_array_ir_type;
     use crate::operations::jit_call::JitCallOperation;
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::{Array, FromPjrt, Session, to_mlir_module_for_program};
 
     use super::*;
-
-    #[test]
-    fn test_synthesized_assertion_requirements_exclude_dormant_rule_regions() {
-        use ryft_core::{
-            CompositeJvpRule, CompositeOperation, DimensionBounds, DimensionFromScalarOperation, DimensionValue,
-            DimensionVariable,
-        };
-
-        let array_type = test_vector_type(4);
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(array_type.clone().into());
-        let primal = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(array_type.clone().into());
-        let tangent = builder.add_input(array_type.clone().into());
-        let scalar = builder
-            .add_instruction(
-                CustomCallOperation::new("ryft.test.runtime_extent", vec![ArrayType::scalar(DataType::I64)]),
-                Vec::new(),
-                Vec::new(),
-                None,
-            )
-            .unwrap()[0];
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-        let symbolic = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.clone().into()), Vec::new(), vec![scalar], None)
-            .unwrap()[0];
-        let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
-        builder
-            .add_instruction(
-                CustomCallOperation::new(
-                    "ryft.test.refined_extent",
-                    vec![ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into(), extent.into()]))],
-                ),
-                Vec::new(),
-                vec![symbolic, exact],
-                None,
-            )
-            .unwrap();
-        let jvp = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![input, tangent], vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-        assert_eq!(lowered_effect_classes(&jvp).unwrap(), EffectClasses::single(EffectClass::OrderedAssertion));
-        let active = lower_mlir_module_for_program(
-            &jvp,
-            &[],
-            &vec![array_type.clone(); 2],
-            &vec![array_type.clone(); 2],
-            "main",
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(active.requires_assertion_handler);
-        assert_eq!(
-            active.runtime_requirements.as_ref(),
-            &[crate::domains::runtimes::builtin_requirement("ryft.assert")]
-        );
-
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(array_type.clone().into());
-        let primal = builder.import_region(primal.entry_region_ref());
-        let jvp = builder.import_region(jvp.entry_region_ref());
-        let output = builder
-            .add_instruction(
-                Operation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
-                vec![primal, jvp],
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let dormant = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![array_type.clone()],
-            &vec![array_type],
-            "main",
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert!(lowered_effect_classes(&program).unwrap().is_empty());
-        assert!(!dormant.requires_assertion_handler);
-        assert!(dormant.runtime_requirements.is_empty());
-        assert!(!dormant.stable_hlo.contains("ryft.assert"));
-    }
 
     /// Returns the [`Operation`] that compares two arrays in `direction`.
     pub(super) fn compare(direction: ComparisonDirection) -> Operation {
@@ -652,10 +557,7 @@ mod tests {
 
     /// Returns a two-device CPU client and a device mesh over its devices with the single mesh axis `x` of `axis_type`.
     pub(super) fn two_device_mesh(axis_type: MeshAxisType) -> (Client<'static>, DeviceMesh) {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
+        let client = cpu_client(2);
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap(),
             client
@@ -670,7 +572,7 @@ mod tests {
     }
 
     /// Compiles the SPMD `module` for the devices of a [`two_device_mesh`], executes it on global `f32` inputs of the
-    /// given types, runtime placements (which default to those of the types), and values, and returns the `f32` shard
+    /// given types, runtime placements, which default to those of the types, and values, and returns the `f32` shard
     /// of each output on each device.
     pub(super) fn execute_on_two_devices(
         client: &Client<'static>,
@@ -720,6 +622,166 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn test_lowered_effect_classes_excludes_dormant_rule_regions() {
+        let array_type = test_vector_type(4);
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(array_type.clone().into());
+        let primal = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(array_type.clone().into());
+        let tangent = builder.add_input(array_type.clone().into());
+        let scalar = builder
+            .add_instruction(
+                CustomCallOperation::new("ryft.test.runtime_extent", vec![ArrayType::scalar(DataType::I64)]),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+        let symbolic = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.clone().into()), Vec::new(), vec![scalar], None)
+            .unwrap()[0];
+        let exact = builder.add_constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
+        builder
+            .add_instruction(
+                CustomCallOperation::new(
+                    "ryft.test.refined_extent",
+                    vec![ArrayType::new(DataType::F32, Shape::new(vec![extent.clone().into(), extent.into()]))],
+                ),
+                Vec::new(),
+                vec![symbolic, exact],
+                None,
+            )
+            .unwrap();
+        let jvp = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input, tangent], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(lowered_effect_classes(&jvp).unwrap(), EffectClasses::single(EffectClass::OrderedAssertion));
+        let active = lower_mlir_module_for_program(
+            &jvp,
+            &[],
+            &vec![array_type.clone(); 2],
+            &vec![array_type.clone(); 2],
+            "main",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(active.requires_assertion_handler());
+        assert_eq!(active.runtime_requirements().as_ref(), &[builtin_requirement("ryft.assert")],);
+
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(array_type.clone().into());
+        let primal = builder.import_region(primal.entry_region_ref());
+        let jvp = builder.import_region(jvp.entry_region_ref());
+        let output = builder
+            .add_instruction(
+                Operation::Composite(CompositeOperation::from_rule_regions(CompositeJvpRule::Explicit, false)),
+                vec![primal, jvp],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let dormant = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![array_type.clone()],
+            &vec![array_type],
+            "main",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(lowered_effect_classes(&program).unwrap().is_empty());
+        assert!(!dormant.requires_assertion_handler());
+        assert!(dormant.runtime_requirements().is_empty());
+        assert_eq!(
+            dormant.stable_hlo(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    return %arg0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_lower_refined_region_input() {
+        // A static `f64[3]` input that enters the bounded dynamic region input type `f64[rows]` is padded to the
+        // physical bound of `rows` and given its static extent as the runtime size of that axis. An input of the
+        // declared type lowers to the same tensor type and is returned unchanged.
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let input_type: ArrayIrType = ArrayType::new_static(DataType::F64, [3]).into();
+        let region_input_type: ArrayIrType =
+            ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))])).into();
+        let block = context.block(&[(lower_array_ir_type(&input_type, &context, location).unwrap(), location)]);
+        let input = block.as_ref().argument(0).unwrap().as_ref();
+        let unchanged =
+            lower_refined_region_input(input, &input_type, &input_type, &mut block.as_ref(), &context, location);
+        assert_eq!(unchanged.unwrap(), input);
+        let refined =
+            lower_refined_region_input(input, &input_type, &region_input_type, &mut block.as_ref(), &context, location)
+                .unwrap();
+        assert_ne!(refined, input);
+        assert_eq!(
+            block
+                .as_ref()
+                .operations()
+                .unwrap()
+                .map(|operation| operation.unwrap().name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["stablehlo.constant", "stablehlo.constant", "stablehlo.pad", "stablehlo.set_dimension_size",],
+        );
+    }
+
+    #[test]
+    fn test_lower_refined_region_outputs() {
+        // A result of the bounded dynamic region output type `f64[rows]` that the instruction refines to `f64[3]` is
+        // sliced to the static extent, while a result whose type the instruction does not refine is returned
+        // unchanged.
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let region_output_type: ArrayIrType =
+            ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))])).into();
+        let output_type: ArrayIrType = ArrayType::new_static(DataType::F64, [3]).into();
+        let lowered_type = lower_array_ir_type(&region_output_type, &context, location).unwrap();
+        let block = context.block(&[(lowered_type, location), (lowered_type, location)]);
+        let refined = block.as_ref().argument(0).unwrap().as_ref();
+        let unchanged = block.as_ref().argument(1).unwrap().as_ref();
+        let outputs = lower_refined_region_outputs(
+            vec![refined, unchanged],
+            &[region_output_type.clone(), region_output_type.clone()],
+            &[output_type, region_output_type],
+            &mut block.as_ref(),
+            &context,
+            location,
+        )
+        .unwrap();
+        assert_eq!(outputs[1], unchanged);
+        assert_eq!(
+            block
+                .as_ref()
+                .operations()
+                .unwrap()
+                .map(|operation| operation.unwrap().name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["stablehlo.constant", "stablehlo.set_dimension_size", "stablehlo.slice"],
+        );
     }
 
     #[test]
@@ -790,7 +852,16 @@ mod tests {
                 threaded_effects,
             )
         };
-        assert!(lower(EffectClasses::single(EffectClass::OrderedIo)).is_ok());
+        let region = lower(EffectClasses::single(EffectClass::OrderedIo)).unwrap();
+        assert_eq!(
+            region
+                .blocks()
+                .unwrap()
+                .flat_map(|block| block.unwrap().operations().unwrap())
+                .map(|operation| operation.unwrap().name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["stablehlo.after_all", "stablehlo.custom_call", "stablehlo.return"],
+        );
         let expected_message =
             "control-flow region lowering advanced the `ordered_io` token, which the region does not thread";
         assert!(matches!(
@@ -843,6 +914,92 @@ mod tests {
                     == "control-flow region lowering advanced the `ordered_assertion` token, which the region does \
                         not thread",
         ));
+    }
+
+    #[test]
+    fn test_append_loop_effect_tokens() {
+        // Threading assertions threads the I/O slot too, in the canonical order assertion and then I/O. The assertion
+        // class has no current token, so it gets a fresh one, while the current I/O token enters the loop as is.
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let token_type = context.stable_hlo_token_type().unwrap();
+        let block = context.block(&[(token_type, location)]);
+        let io_token = block.as_ref().argument(0).unwrap().as_ref();
+        let mut effect_tokens = EffectTokens::default();
+        effect_tokens.set(EffectClass::OrderedIo, io_token);
+        let mut state_values = Vec::new();
+        let mut state_types = Vec::new();
+        append_loop_effect_tokens(
+            EffectClasses::single(EffectClass::OrderedAssertion),
+            &mut effect_tokens,
+            &mut state_values,
+            &mut state_types,
+            &mut block.as_ref(),
+            &context,
+            location,
+        )
+        .unwrap();
+        let assertion_token = effect_tokens.get(EffectClass::OrderedAssertion).unwrap();
+        assert_eq!(state_values, vec![assertion_token, io_token]);
+        assert_eq!(state_types, vec![token_type.as_ref(); 2]);
+        assert_eq!(
+            block
+                .as_ref()
+                .operations()
+                .unwrap()
+                .map(|operation| operation.unwrap().name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["stablehlo.after_all"]
+        );
+    }
+
+    #[test]
+    fn test_set_threaded_effect_tokens() {
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let token_type = context.stable_hlo_token_type().unwrap();
+        let block = context.block(&[(token_type, location), (token_type, location), (token_type, location)]);
+        let [assertion_token, io_token, new_io_token] =
+            [0, 1, 2].map(|index| block.as_ref().argument(index).unwrap().as_ref());
+        let mut effect_tokens = EffectTokens::default();
+
+        // Threading assertions sets the assertion token and then the I/O token, at offsets 0 and 1.
+        let tokens = [assertion_token, io_token];
+        set_threaded_effect_tokens(
+            &mut effect_tokens,
+            EffectClasses::single(EffectClass::OrderedAssertion),
+            |offset| tokens[offset],
+        );
+        assert_eq!(effect_tokens.get(EffectClass::OrderedAssertion), Some(assertion_token));
+        assert_eq!(effect_tokens.get(EffectClass::OrderedIo), Some(io_token));
+
+        // Threading only I/O replaces the I/O token and keeps the assertion token.
+        set_threaded_effect_tokens(&mut effect_tokens, EffectClasses::single(EffectClass::OrderedIo), |offset| {
+            [new_io_token][offset]
+        });
+        assert_eq!(effect_tokens.get(EffectClass::OrderedAssertion), Some(assertion_token));
+        assert_eq!(effect_tokens.get(EffectClass::OrderedIo), Some(new_io_token));
+    }
+
+    #[test]
+    fn test_threaded_effect_token_values() {
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let token_type = context.stable_hlo_token_type().unwrap();
+        let block = context.block(&[(token_type, location), (token_type, location)]);
+        let [assertion_token, io_token] = [0, 1].map(|index| block.as_ref().argument(index).unwrap().as_ref());
+        let mut effect_tokens = EffectTokens::default();
+        effect_tokens.set(EffectClass::OrderedAssertion, assertion_token);
+        effect_tokens.set(EffectClass::OrderedIo, io_token);
+        assert_eq!(
+            threaded_effect_token_values(effect_tokens, EffectClasses::single(EffectClass::OrderedAssertion)),
+            vec![assertion_token, io_token],
+        );
+        assert_eq!(
+            threaded_effect_token_values(effect_tokens, EffectClasses::single(EffectClass::OrderedIo)),
+            vec![io_token]
+        );
+        assert_eq!(threaded_effect_token_values(effect_tokens, EffectClasses::NONE), Vec::<ValueRef>::new());
     }
 
     #[test]
@@ -932,7 +1089,7 @@ mod tests {
             )
             .unwrap();
 
-        // Keep the complete mixed control-flow program behind one compiled-call boundary. Linearization must preserve
+        // Keep the complete mixed control flow program behind one compiled call boundary. Linearization must preserve
         // that boundary while deriving its primal and pullback callees, and lowering must still reach the nested
         // condition and loop operations.
         let mut builder = ArrayIrProgramBuilder::new();

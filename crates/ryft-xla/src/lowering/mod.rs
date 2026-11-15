@@ -1,3 +1,28 @@
+//! Lowering of staged XLA programs to textual StableHLO/Shardy MLIR modules.
+//!
+//! [`to_mlir_module_for_program`] is the public entry point. It lowers a program of any [`LowerableOperationFamily`]
+//! into one module whose entry function takes the hidden capture arguments followed by the program inputs, and whose
+//! function signature optionally carries `sdy.sharding` attributes. The crate-internal entry points that the
+//! compilation path uses also return the `ExecutableSignature` that maps the logical program boundary to the
+//! physical executable boundary (e.g., erasing static zero-sized leaves and appending hidden extent scalars and effect
+//! tokens), together with the runtime requirements of the module. Programs must have their references and mutable
+//! state discharged before lowering, and failures that only lowering can detect are reported as [`LoweringError`]s
+//! wrapped in [`Error::Lowering`].
+//!
+//! Each operation lowers itself through [`LowerableOperation::lower`], which receives a [`Lowerer`] that exposes the
+//! block receiving the emitted operations, the MLIR context and location, the attached regions of the instruction, and
+//! the ordered effect token chains of the enclosing lowering scope. Operation families dispatch to the payloads of
+//! their variants through the [`lower_operation_variants`](crate::lower_operation_variants) macro, so downstream
+//! crates extend lowering by implementing [`LowerableOperation`] for their own operations and families. One
+//! crate-internal `CollectiveLoweringState` per module carries the state that nested regions share, such as the
+//! collective channel counter, the enclosing manual regions, the target platform, and the registry of named
+//! compositions.
+//!
+//! The crate-internal submodules own the parts of this pipeline. `admission` rejects data-dependent dynamic programs
+//! whose padding could become observable, `compositions` emits the shared private functions of named compositions,
+//! `regions` lowers nested programs and regions inline, `signature` defines the executable signature, and `types`
+//! lowers types, constants, and dynamic dimensions.
+
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -45,9 +70,10 @@ use crate::{CompilationError, Constant, Error, Operation, RaggedDotLoweringStrat
 // TODO(eaplatanios): Review this module.
 
 #[cfg(test)]
-use crate::lowering::regions::lower_plain_program_outputs;
-#[cfg(test)]
 use ryft_core::Program as CoreProgram;
+
+#[cfg(test)]
+use crate::lowering::regions::lower_plain_program_outputs;
 
 /// XLA-owned failures while admitting a program, constructing its StableHLO representation, or verifying it.
 ///
@@ -102,7 +128,6 @@ pub enum LoweringError {
     VerificationFailure,
 }
 
-/// Admission of data-dependent bounded-dynamic programs to lowering.
 pub(crate) mod admission;
 /// Named StableHLO compositions shared by composite operation lowerings (e.g., scaled dot).
 pub(crate) mod compositions;
@@ -116,23 +141,65 @@ pub(crate) mod types;
 /// Textual StableHLO module paired with the exact executable signature used to emit its entry function.
 pub(crate) struct LoweredModule {
     /// Textual StableHLO/Shardy module.
-    pub(crate) stable_hlo: String,
+    stable_hlo: String,
 
-    /// Logical-to-physical entry-function signature.
-    pub(crate) signature: ExecutableSignature,
+    /// Signature of the entry function, which maps its logical inputs and outputs to its physical arguments and
+    /// results.
+    signature: ExecutableSignature,
 
     /// Whether execution requires the host runtime assertion handler.
-    pub(crate) requires_assertion_handler: bool,
+    requires_assertion_handler: bool,
 
     /// Canonical runtime contracts required by emitted calls and synthesized checks.
-    pub(crate) runtime_requirements: Arc<[RuntimeRequirement]>,
+    runtime_requirements: Arc<[RuntimeRequirement]>,
 
     /// Module mesh that every sharding and `shard_map` boundary of the module refers to, or `None` when the module
     /// declares no mesh. Compilation checks it against the topology of the device mesh that it targets.
-    pub(crate) mesh: Option<LogicalMesh>,
+    mesh: Option<LogicalMesh>,
 }
 
 impl LoweredModule {
+    /// Returns the textual StableHLO/Shardy module.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn stable_hlo(&self) -> &str {
+        &self.stable_hlo
+    }
+
+    /// Returns the rendered StableHLO module of this lowering, consuming it.
+    #[inline]
+    pub(crate) fn into_stable_hlo(self) -> String {
+        self.stable_hlo
+    }
+
+    /// Returns the signature of the entry function, which maps its logical inputs and outputs to its physical arguments
+    /// and results.
+    #[inline]
+    pub(crate) fn signature(&self) -> &ExecutableSignature {
+        &self.signature
+    }
+
+    /// Returns whether execution requires the host runtime assertion handler.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn requires_assertion_handler(&self) -> bool {
+        self.requires_assertion_handler
+    }
+
+    /// Returns the canonical runtime contracts required by emitted calls and synthesized checks.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn runtime_requirements(&self) -> &[RuntimeRequirement] {
+        &self.runtime_requirements
+    }
+
+    /// Returns the module mesh that every sharding and `shard_map` boundary of the module refers to, or `None` when the
+    /// module declares no mesh. Compilation checks it against the topology of the device mesh that it targets.
+    #[inline]
+    pub(crate) fn mesh(&self) -> Option<&LogicalMesh> {
+        self.mesh.as_ref()
+    }
+
     /// Consumes the textual module, executable signature, assertion classification, and runtime requirements.
     #[inline]
     pub(crate) fn into_parts(self) -> (String, ExecutableSignature, bool, Arc<[RuntimeRequirement]>) {
@@ -144,21 +211,21 @@ impl LoweredModule {
 ///
 /// Ordered assertions and ordered I/O intentionally use independent chains. This preserves program order within
 /// each observable class without introducing an ordering relationship between unrelated classes. Unordered I/O has
-/// no token slot. Region input guards are the exception: input validation must precede every operation in the
-/// invoked region, so their lowering joins the assertion chain into the ordered-I/O chain (refer to
-/// `operations::assertions::lower_guard`).
+/// no token slot. Region input guards are the exception, because input validation must precede every operation in the
+/// invoked region, so their lowering joins the assertion chain into the ordered I/O chain (refer to
+/// [`lower_guard`](crate::operations::assertions::lower_guard)).
 #[derive(Copy, Clone, Default)]
 pub(crate) struct EffectTokens<'b, 'c: 'b, 't: 'c> {
-    /// Current ordered-assertion token, created lazily by the first runtime assertion in this scope.
-    pub(crate) ordered_assertion: Option<ValueRef<'b, 'c, 't>>,
+    /// Current ordered assertion token, created lazily by the first runtime assertion in this scope.
+    ordered_assertion: Option<ValueRef<'b, 'c, 't>>,
 
-    /// Current ordered-I/O token, created lazily by the first ordered I/O operation in this scope.
-    pub(crate) ordered_io: Option<ValueRef<'b, 'c, 't>>,
+    /// Current ordered I/O token, created lazily by the first ordered I/O operation in this scope.
+    ordered_io: Option<ValueRef<'b, 'c, 't>>,
 }
 
 impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
-    /// Returns the current token for `effect_class`. Both ordered I/O classes share the ordered-I/O slot: they form
-    /// one ordering domain on any given device and differ only in whether that order also spans devices.
+    /// Returns the current token for `effect_class`. Both ordered I/O classes share the ordered I/O slot, because they
+    /// form one ordering domain on any given device and differ only in whether that order also spans devices.
     pub(crate) fn get(&self, effect_class: EffectClass) -> Option<ValueRef<'b, 'c, 't>> {
         match effect_class {
             EffectClass::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
@@ -166,6 +233,19 @@ impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
             EffectClass::OrderedIo | EffectClass::DeviceOrderedIo => self.ordered_io,
             EffectClass::UnorderedIo => None,
         }
+    }
+
+    /// Returns the current ordered assertion token, created lazily by the first runtime assertion in this scope.
+    #[inline]
+    pub(crate) fn ordered_assertion(&self) -> Option<ValueRef<'b, 'c, 't>> {
+        self.ordered_assertion
+    }
+
+    /// Returns the current ordered I/O token, created lazily by the first ordered I/O operation in this scope.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn ordered_io(&self) -> Option<ValueRef<'b, 'c, 't>> {
+        self.ordered_io
     }
 
     /// Replaces the current token for one ordered effect class.
@@ -202,10 +282,10 @@ where
 /// Returns `true` if `program` contains a reference-typed atom or a [`CoreOperation`](ryft_core::Operation) whose
 /// [effects](ryft_core::Operation::effects) declare a [`ReferenceEffect`](ryft_core::ReferenceEffect) in any region.
 ///
-/// This check is independent from [`contains_unresolved_state`]: a pure reference pass-through or forwarded
-/// reference capture can carry reference values without executing a stateful instruction. Both predicates back
-/// the pre-compilation state checks and the two direct module-lowering entries; eager binding, dispatch, and staging
-/// enforce their corresponding boundary invariants separately.
+/// This check is independent from [`contains_unresolved_state`], because a pure reference pass-through or a forwarded
+/// reference capture can carry reference values without executing a stateful instruction. Both predicates back the
+/// state checks that precede compilation and the two direct module lowering entry points. Eager binding, dispatch, and
+/// staging enforce their corresponding boundary invariants separately.
 pub(crate) fn contains_unresolved_references<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
 ) -> bool
@@ -213,8 +293,8 @@ where
     ProgramInput: Parameterized<Constant>,
     ProgramOutput: Parameterized<Constant>,
 {
-    // The atom scan dominates for every well-formed program (reference operations always touch a reference-typed
-    // atom); the declaration scan is the independent-verifier arm that still catches a core discharge bug which
+    // The atom scan dominates for every well-formed program, because reference operations always touch an atom of a
+    // reference type. The declaration scan is an independent check that still catches a core discharge bug which
     // retyped the boundary atoms but left a reference operation behind.
     program.entry_region_ref().contains_atom_type_in_closure(RyftType::is_reference)
         || program.regions().iter().any(|region| {
@@ -225,15 +305,16 @@ where
         })
 }
 
-/// Returns the effect classes that have StableHLO token slots, in canonical token/result order.
+/// Returns the effect classes that have StableHLO token slots, in canonical token and result order.
 ///
 /// Token slots are an XLA/StableHLO representation decision, so the classification lives here rather than on the core
-/// [`EffectClass`] type — but the match is deliberately exhaustive so that adding a class forces an explicit token-slot
-/// decision in this backend instead of a silent omission. [`EffectClass::OrderedState`] has no slot: ordinary XLA
-/// lowering rejects unresolved state at its module entry boundaries, and no defensive path may accidentally turn state
-/// into an ordinary token-threaded effect.
+/// [`EffectClass`] type. The classification tests for each ordered class explicitly with [`EffectClasses::contains`],
+/// so a newly added [`EffectClass`] gets no token slot here until it is listed. Only [`EffectTokens::get`] and
+/// [`EffectTokens::set`] match exhaustively and force an explicit decision for a new class.
+/// [`EffectClass::OrderedState`] has no slot, because ordinary XLA lowering rejects unresolved state at its module
+/// entry boundaries, and no defensive path may accidentally turn state into an ordinary token-threaded effect.
 pub(crate) fn token_threaded_effects(effects: EffectClasses) -> impl Iterator<Item = EffectClass> {
-    // Each yielded class names one token slot of `EffectTokens`. Both ordered I/O classes share the ordered-I/O slot,
+    // Each yielded class names one token slot of `EffectTokens`. Both ordered I/O classes share the ordered I/O slot,
     // so a program mixing them still threads exactly one I/O token, keyed by `OrderedIo`. A scope that threads the
     // assertion token also threads the I/O slot, because an entry guard inside it joins its assertion token into the
     // I/O chain (refer to `lower_guard`), and that dependency must reach the I/O that follows the scope.
@@ -252,36 +333,36 @@ pub(crate) fn token_threaded_effects(effects: EffectClasses) -> impl Iterator<It
 ///
 /// A lowerer exposes the block that receives the emitted operations, together with the MLIR context and location that
 /// those operations use, the attached regions of the instruction being lowered, and the ordered effect chains of the
-/// enclosing lowering scope. The lowering entry points construct one lowerer per instruction: they copy the
-/// scope-level effect tokens in and read the updated tokens back out after the instruction lowers, so effectful
+/// enclosing lowering scope. The lowering entry points construct one lowerer per instruction. They copy the effect
+/// tokens of the scope in and read the updated tokens back out after the instruction lowers, so effectful
 /// operations thread their tokens through [`Self::effect_token`] and [`Self::set_effect_token`] without knowing the
 /// enclosing scope. The lifetimes are those of the MLIR block (`'b`), context (`'c`), and thread pool (`'t`).
 pub struct Lowerer<'b, 'c: 'b, 't: 'c, O = Operation> {
     /// Owning block receiving the lowered operations.
-    pub(crate) block: BlockRef<'b, 'c, 't>,
+    block: BlockRef<'b, 'c, 't>,
 
     /// MLIR context owning the block and created operations.
-    pub(crate) context: &'c MlirContext<'t>,
+    context: &'c MlirContext<'t>,
 
     /// Shared MLIR location used for emitted operations.
-    pub(crate) location: LocationRef<'c, 't>,
+    location: LocationRef<'c, 't>,
 
     /// Attached regions of the instruction currently being lowered, materialized as flat programs in region-slot order.
-    pub(crate) regions: Vec<FlatProgram<O>>,
+    regions: Vec<FlatProgram<O>>,
 
     /// Shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call` lowering sites.
     /// Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
-    pub(crate) nested_functions: Option<Rc<JitCallFunctionMap<O>>>,
+    nested_functions: Option<Rc<JitCallFunctionMap<O>>>,
 
     /// Hidden capture arguments of the function currently being lowered, in capture-table order.
-    pub(crate) captured_values: Vec<ValueRef<'b, 'c, 't>>,
+    captured_values: Vec<ValueRef<'b, 'c, 't>>,
 
     /// Current per-class effect tokens of the lowering scope this lowerer emits into.
-    pub(crate) effect_tokens: EffectTokens<'b, 'c, 't>,
+    effect_tokens: EffectTokens<'b, 'c, 't>,
 
     /// Collective lowering state of the lowering scope this lowerer emits into. Refer to the documentation of
     /// [`CollectiveLoweringState`] for more information.
-    pub(crate) collective_state: CollectiveLoweringState,
+    collective_state: CollectiveLoweringState,
 }
 
 impl<'b, 'c: 'b, 't: 'c, O> Lowerer<'b, 'c, 't, O> {
@@ -333,20 +414,53 @@ impl<'b, 'c: 'b, 't: 'c, O> Lowerer<'b, 'c, 't, O> {
         self
     }
 
-    /// Declares a runtime contract required by this emitted operation.
-    ///
-    /// Requirements are shared by every nested lowering scope and retained with the compiled artifact. Runtime
-    /// providers are resolved by the invoking session before compilation, loading, or execution.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when this declaration conflicts with an earlier requirement for the same identifier.
-    pub fn require_runtime(&mut self, requirement: RuntimeRequirement) -> Result<(), Error> {
-        let mut requirements = self.collective_state.runtime_requirements.borrow_mut();
-        let mut updated = requirements.clone();
-        updated.push(requirement);
-        *requirements = normalize_runtime_requirements(updated)?;
-        Ok(())
+    /// Returns the shared private functions emitted for deduplicated `jit_call` callees, consulted at `jit_call`
+    /// lowering sites. Shared via [`Rc`] so it threads through nested lowering scopes without lifetime entanglement.
+    #[inline]
+    pub(crate) fn nested_functions(&self) -> Option<&Rc<JitCallFunctionMap<O>>> {
+        self.nested_functions.as_ref()
+    }
+
+    /// Returns the current per-class effect tokens of the lowering scope this lowerer emits into.
+    #[inline]
+    pub(crate) fn effect_tokens(&self) -> &EffectTokens<'b, 'c, 't> {
+        &self.effect_tokens
+    }
+
+    /// Returns a mutable reference to the current per-class effect tokens of the lowering scope this lowerer emits into.
+    #[inline]
+    pub(crate) fn effect_tokens_mut(&mut self) -> &mut EffectTokens<'b, 'c, 't> {
+        &mut self.effect_tokens
+    }
+
+    /// Returns the collective lowering state of the lowering scope this lowerer emits into. Refer to the documentation
+    /// of [`CollectiveLoweringState`] for more information.
+    #[inline]
+    pub(crate) fn collective_state(&self) -> &CollectiveLoweringState {
+        &self.collective_state
+    }
+
+    /// Returns the effect tokens of the lowering scope mutably, together with the attached regions, the captured
+    /// values, the shared `jit_call` functions, and the collective lowering state of this lowerer, in that order.
+    /// Lowering helpers thread the tokens while they read the rest of that state, which the separate accessors cannot
+    /// provide, because the mutable borrow of [`Self::effect_tokens_mut`] covers the whole lowerer.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn split_effect_tokens(
+        &mut self,
+    ) -> (
+        &mut EffectTokens<'b, 'c, 't>,
+        &[FlatProgram<O>],
+        &[ValueRef<'b, 'c, 't>],
+        Option<&Rc<JitCallFunctionMap<O>>>,
+        &CollectiveLoweringState,
+    ) {
+        (
+            &mut self.effect_tokens,
+            &self.regions,
+            &self.captured_values,
+            self.nested_functions.as_ref(),
+            &self.collective_state,
+        )
     }
 
     /// Returns the block that receives the StableHLO operations of the instruction being lowered. [`BlockRef`] is a
@@ -370,6 +484,22 @@ impl<'b, 'c: 'b, 't: 'c, O> Lowerer<'b, 'c, 't, O> {
         &self.regions
     }
 
+    /// Declares a runtime contract required by this emitted operation.
+    ///
+    /// Requirements are shared by every nested lowering scope and retained with the compiled artifact. Runtime
+    /// providers are resolved by the invoking session before compilation, loading, or execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this declaration conflicts with an earlier requirement for the same identifier.
+    pub fn require_runtime(&mut self, requirement: RuntimeRequirement) -> Result<(), Error> {
+        let mut requirements = self.collective_state.runtime_requirements.borrow_mut();
+        let mut updated = requirements.clone();
+        updated.push(requirement);
+        *requirements = normalize_runtime_requirements(updated)?;
+        Ok(())
+    }
+
     /// Returns the StableHLO tensor type that represents values of `array_type`.
     ///
     /// # Errors
@@ -387,7 +517,7 @@ impl<'b, 'c: 'b, 't: 'c, O> Lowerer<'b, 'c, 't, O> {
     ///
     /// # Errors
     ///
-    /// Returns a [`Error`] when the `stablehlo.after_all` operation cannot be created.
+    /// Returns an [`Error`] when the `stablehlo.after_all` operation cannot be created.
     ///
     /// # Panics
     ///
@@ -450,9 +580,9 @@ impl<'b, 'c: 'b, 't: 'c, O> Lowerer<'b, 'c, 't, O> {
 /// Operations that can be lowered to StableHLO for XLA compilation.
 ///
 /// Each operation type implements this trait at the type universe of its [`CoreOperation`](ryft_core::Operation)
-/// contract: homogeneous array operations at [`ArrayType`], array IR operations at [`ArrayIrType`], and first-class
-/// dimension operations at [`DimensionType`]. Operation families (e.g., [`ArrayOperation`] and [`Operation`]) implement
-/// this trait by dispatching each variant to its payload through
+/// contract. Homogeneous array operations implement it at [`ArrayType`], array IR operations at [`ArrayIrType`], and
+/// first-class dimension operations at [`DimensionType`]. Operation families (e.g., [`ArrayOperation`] and
+/// [`Operation`]) implement this trait by dispatching each variant to its payload through
 /// [`lower_operation_variants`](crate::lower_operation_variants), which also handles payloads that a family stores as
 /// projected or mixed members. A family whose type universe is [`ArrayIrType`] and that implements
 /// [`OperationPayloadProjection`] is a [`LowerableOperationFamily`] whose programs [`to_mlir_module_for_program`]
@@ -537,7 +667,7 @@ pub fn lower_projected_operation<'b, 'c: 'b, 't: 'c, U, T, P, O: LowerableOperat
 where
     U: RyftType,
     P: LowerableOperation<Type = U>,
-    for<'a> &'a U: TryFrom<&'a T, Error: Into<ProgramError>>,
+    for<'o> &'o U: TryFrom<&'o T, Error: Into<ProgramError>>,
 {
     let project = |types: &[T]| {
         types
@@ -639,9 +769,9 @@ macro_rules! lower_operation_variants {
 /// zero-operand `stablehlo.after_all` when the lowering scope has not used it yet.
 ///
 /// Each ordered class has an independent chain that preserves program order within that class without imposing an
-/// artificial order across classes. The enclosing lowering helpers carry active chains through nested computations;
-/// the final tokens are intentionally omitted from the public function results because their custom calls are marked
-/// side-effecting and the tokens exist only to encode intra-execution ordering.
+/// artificial order across classes. The enclosing lowering helpers carry active chains through nested computations.
+/// The final tokens are intentionally omitted from the public function results, because their custom calls are marked
+/// as having side effects and the tokens exist only to encode the ordering within one execution.
 pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
     effect_class: EffectClass,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
@@ -652,7 +782,7 @@ pub(crate) fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
         return Ok(token);
     }
     let created = block.append_operation(stable_hlo::after_all::<ValueRef, _>(&[], location)?)?;
-    let created = created.result(0).expect("stablehlo.after_all should return one result").as_ref();
+    let created = created.result(0).unwrap().as_ref();
     effect_tokens.set(effect_class, created);
     Ok(created)
 }
@@ -773,35 +903,6 @@ impl LowerableOperation for Operation {
     }
 }
 
-/// Rejects array `output_types` of the operation named `operation_name` that shard a local dimension over one of the
-/// `bound_manual_axes` of the enclosing manual regions. Manual dimension ownership belongs to region boundaries: local
-/// operations may change manual variation through collectives, but must not manufacture a global placement, which
-/// lowered sharding constraints would otherwise silently strip (refer to `lower_sharding_constraint`). First-class
-/// dimensions and references carry no placement of their own.
-fn validate_local_output_placement(
-    operation_name: &str,
-    output_types: &[ArrayIrType],
-    bound_manual_axes: &[String],
-) -> Result<(), Error> {
-    let assigns_bound_manual_axis = output_types.iter().any(|output_type| {
-        let sharding = match output_type {
-            ArrayIrType::Array(output_type) => output_type.sharding(),
-            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => None,
-        };
-        sharding.into_iter().flat_map(Sharding::dimensions).any(|dimension| match dimension {
-            ShardingDimension::Sharded(axes) => axes.iter().any(|axis| bound_manual_axes.contains(axis)),
-            ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
-        })
-    });
-    if assigns_bound_manual_axis {
-        return Err(ProgramError::UnsupportedOperation {
-            message: format!("`{operation_name}` cannot assign bound manual mesh axes to local output dimensions"),
-        }
-        .into());
-    }
-    Ok(())
-}
-
 /// Module-scoped lowering state shared across nested regions. StableHLO collectives use the channel counter and the
 /// innermost enclosing `sdy.manual_computation` region's [`ShardMapBoundary`], while other lowerings consume immutable
 /// target and representation policy stored alongside that shared state.
@@ -813,33 +914,33 @@ fn validate_local_output_placement(
 #[derive(Clone)]
 pub(crate) struct CollectiveLoweringState {
     /// Module-scoped counter producing the next collective channel id.
-    pub(crate) channel_ids: Rc<Cell<usize>>,
+    channel_ids: Rc<Cell<usize>>,
 
     /// Enclosing manual regions, ordered from outermost to innermost for named-axis resolution.
     manual_regions: Vec<Rc<ShardMapBoundary>>,
 
     /// Axes bound by every enclosing manual region, excluded from shard-local placement constraints.
-    pub(crate) bound_manual_axes: Vec<String>,
+    bound_manual_axes: Vec<String>,
 
-    /// PJRT platform name of the compilation target (e.g., `"cuda"` or `"cpu"`), or `None` when the lowering has
-    /// no target information. Platform-gated lowerings such as fused attention consult this and
-    /// fall back to their portable form when it is absent.
+    /// PJRT platform name of the compilation target (e.g., `"cuda"` or `"cpu"`), or `None` when the lowering has no
+    /// target information. Lowerings that depend on the platform, such as fused attention, consult this and fall back
+    /// to their portable form when it is absent.
     target_platform: Option<Rc<str>>,
 
     /// Backend representation used to lower ragged dots in this module.
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 
     /// Module-owned private decompositions used by named StableHLO composites.
-    pub(crate) named_compositions: Option<Rc<NamedCompositionFunctionMap>>,
+    named_compositions: Option<Rc<NamedCompositionFunctionMap>>,
 
-    /// Module-scoped flag recording whether any recursive lowering path constructed an instruction-specific
-    /// (non-base) location from a non-unknown [`Provenance`]. It selects the module serialization mode after
-    /// lowering completes: only a module that actually carries provenance locations is printed with debug
-    /// information, so provenance-free modules keep their existing byte-identical StableHLO text and cache keys.
+    /// Flag of the module recording whether any recursive lowering path constructed a location specific to an
+    /// instruction (i.e., not the base location) from a known [`Provenance`]. It selects the module serialization mode
+    /// after lowering completes. Only a module that actually carries provenance locations is printed with debug
+    /// information, so modules without provenance keep their existing StableHLO text and cache keys byte for byte.
     has_provenance: Rc<Cell<bool>>,
 
     /// Whether any emitted instruction requires the runtime assertion handler.
-    pub(crate) has_assertions: Rc<Cell<bool>>,
+    has_assertions: Rc<Cell<bool>>,
 
     /// Runtime contracts declared by emitted operations across every nested lowering scope.
     runtime_requirements: Rc<RefCell<Vec<RuntimeRequirement>>>,
@@ -874,45 +975,20 @@ impl CollectiveLoweringState {
         self
     }
 
-    /// Returns the suffix of `captured_values` that holds the values of the session constants reachable in this scope.
-    /// A scope whose `captured_values` table cannot hold them (e.g., a shared private function) has no such values.
-    pub(crate) fn session_values<'v, V>(&self, captured_values: &'v [V]) -> &'v [V] {
-        captured_values
-            .len()
-            .checked_sub(self.session_constants.len())
-            .map_or(&[], |start| &captured_values[start..])
-    }
-
-    /// Returns the value of `constant` in a scope whose captured values are `captured_values`.
-    pub(crate) fn lower_session_constant<'b, 'c: 'b, 't: 'c>(
-        &self,
-        constant: &SessionConstant,
-        captured_values: &[ValueRef<'b, 'c, 't>],
-    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
-        let values = self.session_values(captured_values);
-        self.session_constants
-            .iter()
-            .position(|candidate| candidate == constant)
-            .filter(|_| values.len() == self.session_constants.len())
-            .map(|index| values[index])
-            .ok_or_else(|| {
-                Error::Lowering(LoweringError::UnreachableSessionConstant { constant: constant.to_string() })
-            })
-    }
-
     /// Returns a copy of this state carrying the PJRT platform name of the compilation target.
     pub(crate) fn with_target_platform(mut self, target_platform: Option<&str>) -> Self {
         self.target_platform = target_platform.map(Rc::from);
         self
     }
 
-    /// Returns a copy of this state carrying the grouped-dot lowering strategy.
+    /// Returns a copy of this state carrying the [`RaggedDotLoweringStrategy`] of the module.
     pub(crate) fn with_ragged_dot_lowering_strategy(mut self, strategy: RaggedDotLoweringStrategy) -> Self {
         self.ragged_dot_lowering_strategy = strategy;
         self
     }
 
-    /// Returns a copy of this state carrying the module's named-composition decomposition registry.
+    /// Returns a copy of this state carrying the registry of the private decompositions of the named compositions of
+    /// the module.
     fn with_named_compositions(mut self, named_compositions: Rc<NamedCompositionFunctionMap>) -> Self {
         self.named_compositions = Some(named_compositions);
         self
@@ -924,13 +1000,68 @@ impl CollectiveLoweringState {
         self.target_platform.as_deref()
     }
 
-    /// Returns the grouped-dot lowering strategy for this module.
+    /// Returns the ragged dot lowering strategy for this module.
     pub(crate) fn ragged_dot_lowering_strategy(&self) -> RaggedDotLoweringStrategy {
         self.ragged_dot_lowering_strategy
     }
 
-    /// Derives the state used inside one `sdy.manual_computation` region's body. The target platform, grouped-dot
-    /// representation, named compositions, provenance state, and module channel allocator are inherited, while the
+    /// Returns the suffix of `captured_values` that holds the values of the session constants reachable in this scope.
+    /// A scope whose `captured_values` table cannot hold them (e.g., a shared private function) has no such values.
+    pub(crate) fn session_values<'o, V>(&self, captured_values: &'o [V]) -> &'o [V] {
+        captured_values
+            .len()
+            .checked_sub(self.session_constants.len())
+            .map_or(&[], |start| &captured_values[start..])
+    }
+
+    /// Returns the innermost enclosing manual region's [`ShardMapBoundary`], or `None` outside manual regions.
+    pub(crate) fn manual_shard_map(&self) -> Option<&ShardMapBoundary> {
+        self.manual_regions.last().map(Rc::as_ref)
+    }
+
+    /// Returns the nearest enclosing region binding `axis_name`.
+    pub(crate) fn manual_axis_region(&self, axis_name: &str) -> Option<&ShardMapBoundary> {
+        self.manual_regions
+            .iter()
+            .rev()
+            .find(|region| region.manual_axes().iter().any(|axis| axis == axis_name))
+            .map(Rc::as_ref)
+    }
+
+    /// Returns `true` if any recursive lowering path constructed a location specific to an instruction from a known
+    /// [`Provenance`].
+    pub(crate) fn has_provenance(&self) -> bool {
+        self.has_provenance.get()
+    }
+
+    /// Returns the module-scoped counter producing the next collective channel id.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn channel_ids(&self) -> &Rc<Cell<usize>> {
+        &self.channel_ids
+    }
+
+    /// Returns the axes bound by every enclosing manual region, excluded from shard-local placement constraints.
+    #[inline]
+    pub(crate) fn bound_manual_axes(&self) -> &[String] {
+        &self.bound_manual_axes
+    }
+
+    /// Returns the module-owned private decompositions used by named StableHLO composites.
+    #[inline]
+    pub(crate) fn named_compositions(&self) -> Option<&Rc<NamedCompositionFunctionMap>> {
+        self.named_compositions.as_ref()
+    }
+
+    /// Returns a fresh module-unique channel id for one channeled collective.
+    pub(crate) fn next_channel_id(&self) -> usize {
+        let channel_id = self.channel_ids.get();
+        self.channel_ids.set(channel_id + 1);
+        channel_id
+    }
+
+    /// Derives the state used inside the body of one `sdy.manual_computation` region. The target platform, ragged dot
+    /// lowering strategy, named compositions, provenance state, and module channel allocator are inherited, while the
     /// provided [`ShardMapBoundary`] becomes the innermost manual region.
     pub(crate) fn enter_manual_region(&self, boundary: ShardMapBoundary) -> Self {
         let mut bound_manual_axes = self.bound_manual_axes.clone();
@@ -956,18 +1087,21 @@ impl CollectiveLoweringState {
         }
     }
 
-    /// Returns the innermost enclosing manual region's [`ShardMapBoundary`], or `None` outside manual regions.
-    pub(crate) fn manual_shard_map(&self) -> Option<&ShardMapBoundary> {
-        self.manual_regions.last().map(Rc::as_ref)
-    }
-
-    /// Returns the nearest enclosing region binding `axis_name`.
-    pub(crate) fn manual_axis_region(&self, axis_name: &str) -> Option<&ShardMapBoundary> {
-        self.manual_regions
+    /// Returns the value of `constant` in a scope whose captured values are `captured_values`.
+    pub(crate) fn lower_session_constant<'b, 'c: 'b, 't: 'c>(
+        &self,
+        constant: &SessionConstant,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+    ) -> Result<ValueRef<'b, 'c, 't>, Error> {
+        let values = self.session_values(captured_values);
+        self.session_constants
             .iter()
-            .rev()
-            .find(|region| region.manual_axes().iter().any(|axis| axis == axis_name))
-            .map(Rc::as_ref)
+            .position(|candidate| candidate == constant)
+            .filter(|_| values.len() == self.session_constants.len())
+            .map(|index| values[index])
+            .ok_or_else(|| {
+                Error::Lowering(LoweringError::UnreachableSessionConstant { constant: constant.to_string() })
+            })
     }
 
     /// Resolves a collective's actual manual binder and checks any payload mesh against it before communication, and
@@ -977,13 +1111,13 @@ impl CollectiveLoweringState {
     /// returned mesh. A payload without a mesh yields the binder mesh and is valid only when the owning operation's
     /// inference accepts that binder. Both meshes share their topology, so either one determines axis sizes and replica
     /// groups.
-    pub(crate) fn checked_collective_mesh<'s, A: Into<CollectiveAxes>>(
-        &'s self,
+    pub(crate) fn checked_collective_mesh<'o, A: Into<CollectiveAxes>>(
+        &'o self,
         operation_name: &str,
         axis_name: A,
         axis_size: usize,
-        payload_mesh: Option<&'s LogicalMesh>,
-    ) -> Result<&'s LogicalMesh, Error> {
+        payload_mesh: Option<&'o LogicalMesh>,
+    ) -> Result<&'o LogicalMesh, Error> {
         // Resolve the binding and recorded size first, preserving the replica-group diagnostics and the nearest
         // enclosing binder when another manual region shadows the axis name. That resolution also requires every named
         // axis to be bound on one mesh.
@@ -1011,11 +1145,11 @@ impl CollectiveLoweringState {
     ///
     /// # Errors
     ///
-    /// Returns a [`Error`] if no enclosing manual region binds `axis_name`, if the recorded axis size disagrees with
+    /// Returns an [`Error`] if no enclosing manual region binds `axis_name`, if the recorded axis size disagrees with
     /// that region, if a payload mesh differs from that region's mesh in its topology or in the axes it makes manual,
     /// if a tracked payload is used in an unchecked binding, if re-inference fails, or if it produces different output
     /// types.
-    pub(crate) fn check_manual_collective<T: PartialEq, A: Into<CollectiveAxes>>(
+    pub(crate) fn validate_manual_collective<T: PartialEq, A: Into<CollectiveAxes>>(
         &self,
         operation_name: &str,
         axis_name: A,
@@ -1050,13 +1184,6 @@ impl CollectiveLoweringState {
             .into());
         }
         Ok(())
-    }
-
-    /// Returns a fresh module-unique channel id for one channeled collective.
-    pub(crate) fn next_channel_id(&self) -> usize {
-        let channel_id = self.channel_ids.get();
-        self.channel_ids.set(channel_id + 1);
-        channel_id
     }
 
     /// Lowers one instruction's [`Provenance`] onto MLIR locations above the provided base location and records
@@ -1096,25 +1223,20 @@ impl CollectiveLoweringState {
         self.has_provenance.set(true);
         lower(context, provenance, base)
     }
-
-    /// Returns `true` if any recursive lowering path constructed an instruction-specific location from a
-    /// non-unknown [`Provenance`].
-    pub(crate) fn has_provenance(&self) -> bool {
-        self.has_provenance.get()
-    }
 }
 
 /// Serializes one lowered module to StableHLO text, printing MLIR debug information (i.e., locations) exactly when
-/// the lowering constructed instruction-specific provenance locations. Provenance-free modules keep the plain
-/// rendering, so their StableHLO text, snapshots, and compilation cache keys remain byte-identical to before
-/// provenance existed, while provenance-carrying modules embed their locations in the text and therefore in the
+/// the lowering constructed provenance locations specific to instructions. Modules without provenance keep the plain
+/// rendering, so their StableHLO text, snapshots, and compilation cache keys remain byte for byte what they were before
+/// provenance existed, while modules that carry provenance embed their locations in the text and therefore in the
 /// persistent compilation key derived from it. The pretty debug form is documented as unparsable and never used, and
 /// the elision thresholds are disabled because the plain rendering performs no elision either.
 ///
-/// Exact backend provenance can reduce compiled-artifact cache reuse, because two semantically equal modules with
-/// different provenance serialize (and therefore key) differently. If that cost ever matters, the correct extension
-/// is an explicit compilation option that strips provenance before lowering (making this helper fall back to the
-/// plain rendering); silently returning an artifact labeled with another program's provenance is never acceptable.
+/// Exact backend provenance can reduce the reuse of cached compiled artifacts, because two semantically equal modules
+/// with different provenance serialize differently and therefore have different keys. If that cost ever matters, the
+/// correct extension is an explicit compilation option that strips provenance before lowering, which makes this helper
+/// fall back to the plain rendering. Silently returning an artifact labeled with the provenance of another program is
+/// never acceptable.
 pub(crate) fn serialize_lowered_module(
     module: &Module<'_, '_>,
     collective_state: &CollectiveLoweringState,
@@ -1138,8 +1260,8 @@ pub(crate) fn serialize_lowered_module(
 /// entry function is named `function_name`.
 ///
 /// When `argument_shardings` and/or `result_shardings` are provided, the corresponding `sdy.sharding` attribute is
-/// attached to each function argument or result, which drives per-device boundary slicing (including uneven splits)
-/// in the XLA SPMD partitioner. When they are `None`, the corresponding values carry no sharding attributes, and Shardy
+/// attached to each function argument or result, which drives per-device boundary slicing (e.g., for uneven splits) in
+/// the XLA SPMD partitioner. When they are `None`, the corresponding values carry no sharding attributes, and Shardy
 /// propagates their placement from the program.
 ///
 /// # Parameters
@@ -1188,7 +1310,6 @@ where
 
 /// Lowers an arbitrary traced XLA program and returns both its textual module and exact physical entry signature.
 pub(crate) fn lower_mlir_module_for_program<
-    'o,
     Input,
     Output,
     ProgramInput,
@@ -1230,10 +1351,9 @@ where
 }
 
 /// Lowers an arbitrary traced XLA program like [`lower_mlir_module_for_program`], but with one optional sharding per
-/// entry function argument (captures first) and per result, so that only the values whose sharding is known carry an
-/// `sdy.sharding` attribute, while Shardy propagates the placement of the others from the program.
+/// entry function argument (i.e., captures first) and per result, so that only the values whose sharding is known carry
+/// an `sdy.sharding` attribute, while Shardy propagates the placement of the others from the program.
 pub(crate) fn lower_mlir_module_for_program_with_value_shardings<
-    'o,
     Input,
     Output,
     ProgramInput,
@@ -1272,20 +1392,19 @@ where
     )
 }
 
-/// Lowers a discharged program with logical external reference-state aliases on its entry boundary. The results
-/// flagged in `open_results` (one flag per logical output, or none at all) are lowered open over auto mesh axes, so that
-/// the compiler chooses their placement over those axes.
+/// Lowers a discharged program with logical external reference state aliases on its entry boundary. The results
+/// flagged in `open_results` (i.e., one flag per logical output, or none at all) are lowered open over auto mesh axes,
+/// so that the compiler chooses their placement over those axes.
 ///
-/// `reference_states` are the discharge artifact's external-state recipes; each must name a distinct logical state
-/// input. Each state input must survive the executable boundary. A mutated state must be a static device array and
-/// name a hidden output of the identical type and sharding; mutated pairs are recorded as `tf.aliasing_output`
-/// input-output aliases, which are non-semantic may-alias hints that merely permit backend buffer reuse. The runtime
-/// never donates reference-state inputs, so an alias never authorizes in-place mutation of the caller's state buffer.
-/// Read-only state may be finite bounded-dynamic because it has no hidden alias. The validation here owns the
-/// physical alias contract; the XLA domain additionally enforces the supported memory, sharding, and dynamic-shape
-/// classes before calling it.
+/// `reference_states` are the external state recipes of the discharge artifact, and each must name a distinct logical
+/// state input. Each state input must survive the executable boundary. A mutated state must be a static device array
+/// and name a hidden output of the identical type and sharding. Mutated pairs are recorded as `tf.aliasing_output`
+/// aliases between inputs and outputs, which are non-semantic hints that the buffers may alias and that merely permit
+/// backend buffer reuse. The runtime never donates reference state inputs, so an alias never authorizes in-place
+/// mutation of the state buffer of the caller. Read-only state may be finite and bounded dynamic because it has no
+/// hidden alias. The validation here owns the physical alias contract, and the XLA domain additionally enforces the
+/// supported memory, sharding, and dynamic shape classes before calling it.
 pub(crate) fn lower_mlir_module_for_program_with_reference_state<
-    'o,
     Input,
     Output,
     ProgramInput,
@@ -1352,6 +1471,505 @@ where
     session_constants
 }
 
+/// Value type that lowering can materialize as a StableHLO dense constant or bind to a captured argument (e.g., the
+/// values of [`ArrayOperation`] constants).
+pub(crate) trait MlirLowerableValue: 'static + CoreValue<Type = ArrayType> {
+    /// Builds a dense-elements attribute containing this value.
+    fn to_dense_elements_attribute<'c, 't>(
+        &self,
+        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+        context: &'c MlirContext<'t>,
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
+
+    /// Lowers this program constant inside a function body.
+    #[inline]
+    fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
+        &self,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut B,
+        context: &'c MlirContext<'t>,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>
+    where
+        B: Block<'b, 'c, 't>,
+        L: Copy + Location<'c, 't>,
+    {
+        let _ = captured_values;
+        lower_literal_value(self, block, context, location)
+    }
+}
+
+impl MlirLowerableValue for ArrayConstant {
+    fn to_dense_elements_attribute<'c, 't>(
+        &self,
+        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+        context: &'c MlirContext<'t>,
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
+        match self {
+            Self::Captured(value) => Err(ProgramError::Concretization {
+                message: format!(
+                    "captured constant #{} cannot be materialized as a literal without capture bindings",
+                    value.index()
+                ),
+            }
+            .into()),
+            Self::Session(value) => Err(ProgramError::Concretization {
+                message: format!("session constant `{value}` cannot be materialized as a literal"),
+            }
+            .into()),
+            Self::Boolean(value) => CoreArray::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
+        }
+    }
+
+    fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
+        &self,
+        captured_values: &[ValueRef<'b, 'c, 't>],
+        block: &mut B,
+        context: &'c MlirContext<'t>,
+        location: L,
+    ) -> Result<ValueRef<'b, 'c, 't>, Error>
+    where
+        B: Block<'b, 'c, 't>,
+        L: Copy + Location<'c, 't>,
+    {
+        match self {
+            Self::Captured(value) => lower_captured_constant(value, captured_values),
+            Self::Session(value) => {
+                Err(Error::Lowering(LoweringError::UnreachableSessionConstant { constant: value.to_string() }))
+            }
+            Self::Boolean(_) => lower_literal_value(self, block, context, location),
+        }
+    }
+}
+
+// `ArrayType` is used as the value representation for abstract linear XLA programs. It can type program atoms, but it
+// is not a concrete literal, so lowering paths that need a real value must supply it through captured arguments instead
+// of materializing it from type metadata.
+impl MlirLowerableValue for ArrayType {
+    fn to_dense_elements_attribute<'c, 't>(
+        &self,
+        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+        context: &'c MlirContext<'t>,
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
+        let _ = (tensor_type, context);
+        Err(ProgramError::Concretization {
+            message: format!("abstract XLA value `{self}` cannot be materialized as a StableHLO literal"),
+        }
+        .into())
+    }
+}
+
+// Concrete host literal lowering used by [`ConstantOperation`] and MLIR snapshot tooling.
+impl MlirLowerableValue for CoreArray {
+    fn to_dense_elements_attribute<'c, 't>(
+        &self,
+        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+        context: &'c MlirContext<'t>,
+    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
+        let data_type = self.r#type().data_type();
+        if data_type == DataType::Zero {
+            return types::lower_f64_scalar_elements_attribute(data_type, tensor_type, 0.0, context);
+        }
+        if data_type == DataType::Token {
+            return Err(Error::Lowering(LoweringError::UnsupportedElementType {
+                data_type,
+                context: "dense literal materialization".to_string(),
+            }));
+        }
+
+        // Layout-free arrays already store values in MLIR's logical row-major order. Explicit layouts instead require
+        // traversal through `ArrayAddressing`, which `logical_bytes` performs while omitting holes and tile padding.
+        let bytes = if self.r#type().layout().is_none() {
+            Cow::Borrowed(self.storage_bytes())
+        } else {
+            Cow::Owned(self.logical_bytes())
+        };
+
+        // Ryft storage uses portable little-endian element encodings, whereas MLIR's raw-buffer API consumes native
+        // storage representations. Normalize multi-byte components only on big-endian targets.
+        #[cfg(target_endian = "big")]
+        let bytes = {
+            let mut bytes = bytes;
+            let component_byte_count = match data_type {
+                DataType::I16 | DataType::U16 | DataType::BF16 | DataType::F16 => 2,
+                DataType::I32 | DataType::U32 | DataType::F32 | DataType::C64 => 4,
+                DataType::I64 | DataType::U64 | DataType::F64 | DataType::C128 => 8,
+                _ => 1,
+            };
+            if component_byte_count > 1 {
+                bytes.to_mut().chunks_exact_mut(component_byte_count).for_each(<[u8]>::reverse);
+            }
+            bytes
+        };
+
+        // MLIR's typed constructors own the required packing for one-bit values. Ryft deliberately keeps these values
+        // byte-padded in host arrays, so decode only their low bit at this representation boundary.
+        if matches!(data_type, DataType::Boolean | DataType::I1 | DataType::U1) {
+            return Ok(context
+                .dense_bool_elements_attribute(
+                    tensor_type,
+                    bytes.iter().map(|value| value & 1 != 0).collect::<Vec<_>>().as_slice(),
+                )?
+                .cast::<DenseElementsAttributeRef>()
+                .unwrap());
+        }
+
+        context.dense_elements_attribute_from_raw_buffer(tensor_type, bytes.as_ref()).map_err(Error::from)
+    }
+}
+
+/// Lowers a plain traced [`CoreProgram`](ryft_core::Program) to a textual StableHLO MLIR module.
+#[cfg(test)]
+pub(crate) fn to_mlir_module_for_plain_program<
+    V: MlirLowerableValue,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+    O: LowerableOperation<Type = ArrayType>,
+    S: AsRef<str>,
+>(
+    program: &CoreProgram<V, O, Input, Output>,
+    function_name: S,
+) -> Result<String, Error> {
+    to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy(
+        program,
+        function_name,
+        RaggedDotLoweringStrategy::default(),
+    )
+}
+
+/// Lowers a plain traced program like [`to_mlir_module_for_plain_program`], but with an explicit
+/// [`RaggedDotLoweringStrategy`].
+#[cfg(test)]
+pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy<
+    V: MlirLowerableValue,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+    O: LowerableOperation<Type = ArrayType>,
+    S: AsRef<str>,
+>(
+    program: &CoreProgram<V, O, Input, Output>,
+    function_name: S,
+    ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
+) -> Result<String, Error> {
+    let function_name = normalize_function_name(function_name.as_ref())?;
+    let context = MlirContext::new();
+    let location = context.unknown_location();
+    let module = context.module(location)?;
+    // This entry point lowers one whole module, so the collective lowering state is scoped to that module.
+    let collective_state =
+        CollectiveLoweringState::new().with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy);
+    let mut mesh = None;
+    for region in program.regions().iter() {
+        for atom in region.atoms() {
+            let atom_type = atom.r#type();
+            let Some(sharding) = atom_type.sharding() else {
+                continue;
+            };
+            mesh = Some(match mesh.take() {
+                Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
+                None => sharding.mesh().clone(),
+            });
+        }
+    }
+    if let Some(mesh) = mesh {
+        module.body()?.append_operation(mesh.to_mlir(location)?)?;
+    }
+
+    let input_tensor_types = program
+        .input_ids()
+        .iter()
+        .map(|atom_id| {
+            let input_atom = &program.atoms()[atom_id.index()];
+            lower_tensor_type(&input_atom.r#type().as_ref(), &context, location)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let output_tensor_types = program
+        .output_ids()
+        .iter()
+        .map(|atom_id| {
+            let output_atom = &program.atoms()[atom_id.index()];
+            lower_tensor_type(&output_atom.r#type().as_ref(), &context, location)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    module.body()?.append_operation({
+        let function_block = context.block(
+            input_tensor_types.iter().map(|tensor_type| (*tensor_type, location)).collect::<Vec<_>>().as_slice(),
+        );
+        {
+            let mut function_block_ref = function_block.as_ref();
+            let outputs = lower_plain_program_outputs(
+                program,
+                &mut function_block_ref,
+                &context,
+                location.as_ref(),
+                &collective_state,
+            )?;
+            function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
+        }
+        let mut function_region = context.region();
+        function_region.append_block(function_block)?;
+        func::func(
+            function_name.as_str(),
+            func::FuncAttributes {
+                arguments: input_tensor_types
+                    .iter()
+                    .zip(program.input_ids())
+                    .map(|(tensor_type, atom_id)| {
+                        let memory = program.atoms()[atom_id.index()].r#type().memory();
+                        let attributes = (memory != Memory::Device).then(|| {
+                            HashMap::from([(
+                                "mhlo.memory_kind".into(),
+                                context.string_attribute(memory_placement_kind(memory)).as_ref(),
+                            )])
+                        });
+                        TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
+                    })
+                    .collect(),
+                results: output_tensor_types
+                    .iter()
+                    .zip(program.output_ids())
+                    .map(|(tensor_type, atom_id)| {
+                        let memory = program.atoms()[atom_id.index()].r#type().memory();
+                        let attributes = (memory != Memory::Device).then(|| {
+                            HashMap::from([(
+                                "mhlo.memory_kind".into(),
+                                context.string_attribute(memory_placement_kind(memory)).as_ref(),
+                            )])
+                        });
+                        TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            function_region,
+            location,
+        )?
+    })?;
+
+    remove_unused_constants(&module)?;
+    if !module.verify()? {
+        return Err(Error::Lowering(LoweringError::VerificationFailure));
+    }
+
+    serialize_lowered_module(&module, &collective_state)
+}
+
+/// Collects the module mesh from the meshes referenced by emitted sharding constraints and nested-computation
+/// boundaries, starting from `existing`, and rejects every mesh whose topology differs from it with
+/// [`LoweringError::MismatchedMeshTopology`].
+pub(crate) fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+    program: &Program<ProgramInput, ProgramOutput, O>,
+    existing: Option<LogicalMesh>,
+) -> Result<Option<LogicalMesh>, Error>
+where
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
+{
+    // Attached computations share the canonical region arena. Type metadata alone does not require a mesh, because
+    // bounded dynamic replica lowering retains that metadata without emitting Shardy operations.
+    let mut mesh = existing;
+    for region in program.regions().iter() {
+        for instruction in region.instructions() {
+            // Payloads are recognized through their projections, so any family that embeds them declares their meshes.
+            let operation = instruction.operation();
+            let declared_mesh = operation
+                .projected_payload::<ShardMapOperation>()
+                .map(|operation| operation.boundary().mesh())
+                .or_else(|| {
+                    operation.projected_payload::<ReshardOperation>().map(|operation| operation.sharding().mesh())
+                })
+                .or_else(|| {
+                    operation
+                        .projected_payload::<ConstrainShardingOperation>()
+                        .map(|operation| operation.sharding().mesh())
+                });
+            let incoming = if let Some(mesh) = declared_mesh {
+                Some(mesh.clone())
+            } else {
+                let output_axes = operation
+                    .projected_payload::<DynamicBroadcastOperation>()
+                    .map(DynamicBroadcastOperation::output_axes)
+                    .or_else(|| {
+                        operation.projected_payload::<BroadcastOperation>().map(BroadcastOperation::output_axes)
+                    })
+                    .or_else(|| {
+                        operation.projected_payload::<BroadcastLikeOperation>().map(BroadcastLikeOperation::output_axes)
+                    });
+                let emits_constraint = if let Some(output_axes) = output_axes {
+                    let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
+                    let input_type = <&ArrayType>::try_from(input_type.as_ref()).map_err(ProgramError::from)?;
+                    let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
+                    let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
+                    broadcast_changes_explicit_sharding(input_type, output_type, output_axes)
+                } else if operation.projected_payload::<CastOperation<ArrayIrType>>().is_some()
+                    || operation.projected_payload::<CastOperation<ArrayType>>().is_some()
+                {
+                    // Casts of first-class dimensions carry no placement, and array casts constrain placement only
+                    // when the explicit placement changes.
+                    let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
+                    let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
+                    match (<&ArrayType>::try_from(input_type.as_ref()), <&ArrayType>::try_from(output_type.as_ref())) {
+                        (Ok(input_type), Ok(output_type)) => cast_changes_explicit_placement(input_type, output_type),
+                        _ => false,
+                    }
+                } else {
+                    operation
+                        .projected_payload::<DynamicReshapeOperation>()
+                        .is_some_and(|operation| operation.output_sharding().is_some())
+                        || operation
+                            .projected_payload::<ReshapeOperation>()
+                            .is_some_and(|operation| operation.output_sharding().is_some())
+                        || operation
+                            .projected_payload::<GatherOperation>()
+                            .is_some_and(|operation| operation.output_sharding().is_some())
+                        || operation
+                            .projected_payload::<ScatterOperation>()
+                            .is_some_and(|operation| operation.output_sharding().is_some())
+                        || operation.projected_payload::<ZeroOperation<ArrayType>>().is_some()
+                        || operation.projected_payload::<ZeroLikeOperation<ArrayType>>().is_some()
+                        || operation.projected_payload::<OneLikeOperation<ArrayType>>().is_some()
+                        || operation.projected_payload::<FillLikeOperation<ArrayType>>().is_some()
+                        || operation.projected_payload::<IotaLikeOperation<ArrayType>>().is_some()
+                };
+                if !emits_constraint {
+                    continue;
+                }
+                let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
+                let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
+                output_type.sharding().map(|sharding| sharding.mesh().clone())
+            };
+            if let Some(incoming) = incoming {
+                mesh = Some(match mesh.take() {
+                    Some(existing_mesh) => merge_logical_meshes(existing_mesh, &incoming)?,
+                    None => incoming,
+                });
+            }
+        }
+    }
+    Ok(mesh)
+}
+
+/// Removes every `stablehlo.constant` operation whose result has no uses from `module`, including those in nested
+/// regions. Lowering materializes first-class dimension extents eagerly (refer to
+/// [`lower_dimension_extent`](crate::lowering::types::lower_dimension_extent)), while their consumers
+/// often read them only for dynamic axes (e.g., the explicit-extent collectives only refine dynamic result axes), so a
+/// static extent would otherwise remain in the lowered module as a dead constant. Constants are pure, so removing an
+/// unused one never changes the semantics of the module.
+pub(crate) fn remove_unused_constants(module: &Module<'_, '_>) -> Result<(), Error> {
+    remove_unused_constants_in_block(module.body()?)
+}
+
+/// Lowers one traced instruction to the corresponding StableHLO operations through its [`LowerableOperation`]
+/// implementation and returns its output values. The ordered effect tokens of the enclosing scope flow through
+/// `effect_tokens`, and an instruction that uses the assertion token marks the module as requiring the runtime
+/// assertion handler.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
+    program: &Program<ProgramInput, ProgramOutput, O>,
+    instruction: &Instruction<O>,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+    captured_values: &[ValueRef<'b, 'c, 't>],
+    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
+    collective_state: &CollectiveLoweringState,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
+where
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
+{
+    let input_types = instruction
+        .inputs()
+        .iter()
+        .map(|input| program.atoms()[input.index()].r#type().into_owned())
+        .collect::<Vec<_>>();
+    let output_types = instruction
+        .outputs()
+        .iter()
+        .map(|output| program.atoms()[output.index()].r#type().into_owned())
+        .collect::<Vec<_>>();
+    // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's provenance
+    // through the lowerer's shared location, with the ambient location as its base.
+    let location = collective_state.instruction_location(context, instruction.provenance(), location);
+    let regions = if crate::operations::composites::lowers_without_regions(
+        instruction.operation(),
+        &input_types,
+        &output_types,
+        nested_functions,
+        collective_state.target_platform(),
+    ) {
+        Vec::new()
+    } else {
+        instruction
+            .regions()
+            .iter()
+            .map(|region| program.region_ref(*region).map(|region| region.to_program()))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut lowerer = Lowerer::new(*block, context, location)
+        .with_regions(regions)
+        .with_nested_functions(nested_functions.cloned())
+        .with_captured_values(captured_values)
+        .with_effect_tokens(*effect_tokens)
+        .with_collective_state(collective_state.clone());
+    let outputs =
+        instruction
+            .operation()
+            .lower(&mut lowerer, input_values, input_types.as_slice(), output_types.as_slice())?;
+    if lowerer.effect_tokens.ordered_assertion.is_some() {
+        collective_state.has_assertions.set(true);
+    }
+    *effect_tokens = lowerer.effect_tokens;
+    Ok(outputs)
+}
+
+/// Normalizes an MLIR symbol name provided by the user by trimming surrounding whitespace and one leading `@`.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::InvalidFunctionName`] when the normalized name is empty or contains whitespace.
+pub(crate) fn normalize_function_name(function_name: &str) -> Result<String, Error> {
+    let function_name = function_name.trim();
+    let function_name = function_name.strip_prefix('@').unwrap_or(function_name);
+    if function_name.is_empty() || function_name.chars().any(char::is_whitespace) {
+        return Err(Error::Lowering(LoweringError::InvalidFunctionName { function_name: function_name.to_string() }));
+    }
+    Ok(function_name.to_string())
+}
+
+/// Rejects array `output_types` of the operation named `operation_name` that shard a local dimension over one of the
+/// `bound_manual_axes` of the enclosing manual regions. Manual dimension ownership belongs to region boundaries. Local
+/// operations may change manual variation through collectives, but must not manufacture a global placement, which
+/// lowered sharding constraints would otherwise silently strip (refer to
+/// [`lower_sharding_constraint`](crate::operations::sharding::constrain_sharding::lower_sharding_constraint)).
+/// First-class dimensions and references carry no placement of their own.
+fn validate_local_output_placement(
+    operation_name: &str,
+    output_types: &[ArrayIrType],
+    bound_manual_axes: &[String],
+) -> Result<(), Error> {
+    let assigns_bound_manual_axis = output_types.iter().any(|output_type| {
+        let sharding = match output_type {
+            ArrayIrType::Array(output_type) => output_type.sharding(),
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => None,
+        };
+        sharding.into_iter().flat_map(Sharding::dimensions).any(|dimension| match dimension {
+            ShardingDimension::Sharded(axes) => axes.iter().any(|axis| bound_manual_axes.contains(axis)),
+            ShardingDimension::Replicated | ShardingDimension::Unconstrained => false,
+        })
+    });
+    if assigns_bound_manual_axis {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!("`{operation_name}` cannot assign bound manual mesh axes to local output dimensions"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Expands optional shardings of every value of a signature with `count` values into one optional sharding per value.
 /// Provided shardings are kept as they are, so that a count mismatch is still reported when the module is lowered.
 fn value_shardings(shardings: Option<&[Sharding]>, count: usize) -> Vec<Option<Sharding>> {
@@ -1361,9 +1979,10 @@ fn value_shardings(shardings: Option<&[Sharding]>, count: usize) -> Vec<Option<S
     }
 }
 
-/// Lowers the entry boundary, optionally exporting the runtime ordered-I/O chain.
+/// Lowers `program` to a [`LoweredModule`] for the lowering entry points above, validating its reference state
+/// aliases and entry boundary. When `export_effects` is set and the program has ordered I/O, the entry function also
+/// exports the runtime ordered I/O token chain as an extra argument and result.
 fn lower_mlir_module_for_program_with_effect_boundary<
-    'o,
     Input,
     Output,
     ProgramInput,
@@ -1523,8 +2142,8 @@ where
                     message: "reference-state aliases must be injective".to_string(),
                 }));
             }
-            // Distinct logical inputs (enforced through `state_inputs` above) map to distinct physical inputs, so
-            // this insertion can never displace an earlier alias.
+            // Distinct logical inputs, which `state_inputs` enforces above, map to distinct physical inputs, so this
+            // insertion can never displace an earlier alias.
             aliases.insert(physical_input_index, physical_output_index);
         }
     }
@@ -1535,8 +2154,8 @@ where
     let location = context.unknown_location();
     let module = context.module(location)?;
 
-    // Emit `sdy.mesh` declarations for any sharding referenced either by inner ops or by the
-    // optional signature shardings, so the func attributes can refer to `@mesh`.
+    // Emit `sdy.mesh` declarations for any sharding referenced either by inner operations or by the optional signature
+    // shardings, so the `func.func` attributes can refer to `@mesh`.
     let mut signature_mesh = None;
     for sharding in argument_shardings.iter().chain(result_shardings).flatten() {
         signature_mesh = Some(match signature_mesh.take() {
@@ -1550,8 +2169,8 @@ where
         module.body()?.append_operation(mesh_operation)?;
     }
 
-    // Trace each distinct named semantic decomposition once and retain it in the module-scoped lowering state so
-    // entry and nested function bodies resolve the same private symbol.
+    // Trace each distinct named semantic decomposition once and retain it in the lowering state of the module, so that
+    // the entry and nested function bodies resolve the same private symbol.
     let named_compositions = Rc::new(collect_named_composition_functions(program, target_platform)?);
 
     // Module-scoped lowering state, shared between the entry function body and private functions below so channel ids
@@ -1563,14 +2182,14 @@ where
         .with_session_constants(session_constants);
 
     // Deduplicate `jit_call` callees that occur more than once into shared private `func.func`s, so repeated nested
-    // programs (identical transformer blocks, or the per-block primal and pullback programs produced by `grad`) lower
+    // programs (e.g., identical transformer blocks or the per-block primal and pullback programs of `grad`) lower
     // to one function plus N `func.call`s instead of N inlined copies. The map is empty for modules without repeated
     // calls, in which case every `jit_call` inlines exactly as before.
     let nested_functions = Rc::new(collect_jit_call_functions(program, target_platform)?);
     {
         let mut module_block = module.body()?;
-        for key in &named_compositions.order {
-            let function = named_compositions.functions.get(key).unwrap();
+        for key in named_compositions.order() {
+            let function = named_compositions.functions().get(key).unwrap();
             emit_named_composition_function(
                 &mut module_block,
                 function,
@@ -1579,8 +2198,8 @@ where
                 location.as_ref(),
             )?;
         }
-        for key in &nested_functions.order {
-            let function = nested_functions.functions.get(key).expect("ordered keys are present in the map");
+        for key in nested_functions.order() {
+            let function = nested_functions.functions().get(key).unwrap();
             emit_jit_call_function(
                 &mut module_block,
                 function,
@@ -1647,10 +2266,10 @@ where
             }
         }
     }
-    // Internal layout constraints do not constrain the executable ABI. Declare layouts on the physical boundary,
-    // whose types already omit static zeros and include hidden extent scalars; tokens have no array type.
-    // Placement belongs to physical array slots, including captures, but never to the appended effect token.
-    // Default device placement needs no attribute; host identities still need attributes even without transfers.
+    // Internal layout constraints do not constrain the executable ABI. Declare layouts on the physical boundary, whose
+    // types already omit static zeros and include hidden extent scalars, while tokens have no array type. Placement
+    // belongs to physical array slots, including captures, but never to the appended effect token. Default device
+    // placement needs no attribute, but host identities still need attributes even without transfers.
     let function_arguments = physical_argument_tensor_types
         .iter()
         .enumerate()
@@ -1721,10 +2340,7 @@ where
             {
                 let value = match signature.input_mapping()[logical_index] {
                     Some(physical_index) => {
-                        let mut value = function_block
-                            .argument(physical_index)
-                            .expect("physical function block arguments should exist")
-                            .as_ref();
+                        let mut value = function_block.argument(physical_index).unwrap().as_ref();
                         let mut refined_type = physical_argument_types[physical_index].clone();
                         for input_dimension in signature
                             .input_dimensions()
@@ -1735,10 +2351,8 @@ where
                             dimensions[input_dimension.axis()] =
                                 array_type.shape().dimensions()[input_dimension.axis()].clone();
                             refined_type = refined_type.with_shape(Shape::new(dimensions));
-                            let size = function_block
-                                .argument(input_dimension.physical_input_index())
-                                .expect("hidden input dimension arguments should exist")
-                                .as_ref();
+                            let size =
+                                function_block.argument(input_dimension.physical_input_index()).unwrap().as_ref();
                             let operation = function_block_ref.append_operation(stable_hlo::set_dimension_size(
                                 value,
                                 size,
@@ -1746,10 +2360,7 @@ where
                                 input_dimension.axis(),
                                 location,
                             )?)?;
-                            value = operation
-                                .result(0)
-                                .expect("stablehlo.set_dimension_size should return one result")
-                                .as_ref();
+                            value = operation.result(0).unwrap().as_ref();
                         }
                         value
                     }
@@ -1762,17 +2373,17 @@ where
                     )?
                     .into_iter()
                     .next()
-                    .expect("a zero-space input constant should have one output"),
+                    .unwrap(),
                 };
                 debug_assert_eq!(value.r#type()?, tensor_type.as_ref());
                 logical_argument_values.push(value);
             }
             let (capture_values, public_input_values) = logical_argument_values.split_at(capture_types.len());
             // Ordinary module callers lower an unlifted program whose entry inputs are only the public arguments.
-            // The compilation domain instead supplies the capture-lifted program so core reference discharge and
-            // lowering observe the same arena; in that form the complete logical argument list is also the entry
-            // input list, while the leading prefix still serves attached `CaptureReference` constants. No third
-            // boundary form exists, so the entry input count must match one of those two shapes exactly.
+            // The compilation domain instead supplies the program with lifted captures, so that core reference
+            // discharge and lowering observe the same arena. In that form the complete logical argument list is also
+            // the entry input list, while the leading prefix still serves attached `CaptureReference` constants. No
+            // third boundary form exists, so the entry input count must match one of those two shapes exactly.
             // Session constants are not program inputs, so the lifted form omits the trailing session arguments of the
             // capture prefix from the entry inputs, while `capture_values` keeps them as its suffix for
             // `CollectiveLoweringState::lower_session_constant`.
@@ -1809,8 +2420,8 @@ where
             let mut physical_outputs = signature.project_outputs(logical_outputs.as_slice());
             // XLA writes the runtime-size trailer of a bounded dynamic result only in the `SliceToDynamic` that
             // `DynamicPadder` inserts before each output leaf. When several such leaves carry values that XLA proves
-            // equal (the same SSA value, or equal computations merged by CSE), one `SliceToDynamic` survives and copy
-            // insertion fills the other result with a plain copy of the bounded payload, which leaves its trailer
+            // equal (e.g., the same SSA value or equal computations merged by CSE), one `SliceToDynamic` survives and
+            // copy insertion fills the other result with a plain copy of the bounded payload, which leaves its trailer
             // unset (i.e., the buffer reports zero-sized dynamic dimensions). Routing these results through one
             // optimization barrier makes every leaf a distinct barrier result. XLA expands barriers only after copy
             // insertion, so each leaf keeps its own `SliceToDynamic`. A single dynamic result cannot alias a static
@@ -1858,8 +2469,10 @@ where
     if !module.verify()? {
         return Err(Error::Lowering(LoweringError::VerificationFailure));
     }
-    signature.requires_assertion_handler |= collective_state.has_assertions.get();
-    let requires_assertion_handler = signature.requires_assertion_handler;
+    if collective_state.has_assertions.get() {
+        signature.require_assertion_handler();
+    }
+    let requires_assertion_handler = signature.requires_assertion_handler();
     let mut runtime_requirements = collective_state.runtime_requirements.borrow().clone();
     if requires_assertion_handler {
         runtime_requirements.push(builtin_requirement("ryft.assert"));
@@ -1877,381 +2490,6 @@ where
     })
 }
 
-/// Value type that can be materialized as a StableHLO dense constant during benchmark lowering.
-pub(crate) trait MlirLowerableValue: CoreValue<Type = ArrayType> + 'static {
-    /// Builds a dense-elements attribute containing this value.
-    fn to_dense_elements_attribute<'c, 't>(
-        &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error>;
-
-    /// Lowers this program constant inside a function body.
-    #[inline]
-    fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
-        &self,
-        _captured_values: &[ValueRef<'b, 'c, 't>],
-        block: &mut B,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>
-    where
-        B: Block<'b, 'c, 't>,
-        L: Copy + Location<'c, 't>,
-    {
-        lower_literal_value(self, block, context, location)
-    }
-}
-
-impl MlirLowerableValue for ArrayConstant {
-    fn to_dense_elements_attribute<'c, 't>(
-        &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
-        match self {
-            Self::Captured(value) => Err(ProgramError::Concretization {
-                message: format!(
-                    "captured constant #{} cannot be materialized as a literal without capture bindings",
-                    value.index()
-                ),
-            }
-            .into()),
-            Self::Session(value) => Err(ProgramError::Concretization {
-                message: format!("session constant {value} cannot be materialized as a literal"),
-            }
-            .into()),
-            Self::Boolean(value) => CoreArray::scalar(*value)?.to_dense_elements_attribute(tensor_type, context),
-        }
-    }
-
-    fn lower_constant_value<'b, 'c: 'b, 't: 'c, B, L>(
-        &self,
-        captured_values: &[ValueRef<'b, 'c, 't>],
-        block: &mut B,
-        context: &'c MlirContext<'t>,
-        location: L,
-    ) -> Result<ValueRef<'b, 'c, 't>, Error>
-    where
-        B: Block<'b, 'c, 't>,
-        L: Copy + Location<'c, 't>,
-    {
-        match self {
-            Self::Captured(value) => lower_captured_constant(value, captured_values),
-            Self::Session(value) => {
-                Err(Error::Lowering(LoweringError::UnreachableSessionConstant { constant: value.to_string() }))
-            }
-            Self::Boolean(_) => lower_literal_value(self, block, context, location),
-        }
-    }
-}
-
-// [`ArrayType`] is used as the value representation for abstract linear XLA programs. It can type
-// program atoms, but it is not a concrete literal; lowering paths that need a real value must
-// supply it through captured arguments instead of materializing it from type metadata.
-impl MlirLowerableValue for ArrayType {
-    fn to_dense_elements_attribute<'c, 't>(
-        &self,
-        _tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        _context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
-        Err(ProgramError::Concretization {
-            message: format!("abstract XLA value `{self}` cannot be materialized as a StableHLO literal"),
-        }
-        .into())
-    }
-}
-
-// Concrete host literal lowering used by [`ConstantOperation`] and MLIR snapshot tooling.
-impl MlirLowerableValue for CoreArray {
-    fn to_dense_elements_attribute<'c, 't>(
-        &self,
-        tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
-        context: &'c MlirContext<'t>,
-    ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
-        let data_type = self.r#type().data_type();
-        if data_type == DataType::Zero {
-            return types::lower_f64_scalar_elements_attribute(data_type, tensor_type, 0.0, context);
-        }
-        if data_type == DataType::Token {
-            return Err(Error::Lowering(LoweringError::UnsupportedElementType {
-                data_type,
-                context: "dense literal materialization".to_string(),
-            }));
-        }
-
-        // Layout-free arrays already store values in MLIR's logical row-major order. Explicit layouts instead require
-        // traversal through `ArrayAddressing`, which `logical_bytes` performs while omitting holes and tile padding.
-        let bytes = if self.r#type().layout().is_none() {
-            Cow::Borrowed(self.storage_bytes())
-        } else {
-            Cow::Owned(self.logical_bytes())
-        };
-
-        // Ryft storage uses portable little-endian element encodings, whereas MLIR's raw-buffer API consumes native
-        // storage representations. Normalize multi-byte components only on big-endian targets.
-        #[cfg(target_endian = "big")]
-        let bytes = {
-            let mut bytes = bytes;
-            let component_byte_count = match data_type {
-                DataType::I16 | DataType::U16 | DataType::BF16 | DataType::F16 => 2,
-                DataType::I32 | DataType::U32 | DataType::F32 | DataType::C64 => 4,
-                DataType::I64 | DataType::U64 | DataType::F64 | DataType::C128 => 8,
-                _ => 1,
-            };
-            if component_byte_count > 1 {
-                bytes.to_mut().chunks_exact_mut(component_byte_count).for_each(<[u8]>::reverse);
-            }
-            bytes
-        };
-
-        // MLIR's typed constructors own the required packing for one-bit values. Ryft deliberately keeps these values
-        // byte-padded in host arrays, so decode only their low bit at this representation boundary.
-        if matches!(data_type, DataType::Boolean | DataType::I1 | DataType::U1) {
-            return Ok(context
-                .dense_bool_elements_attribute(
-                    tensor_type,
-                    bytes.iter().map(|value| value & 1 != 0).collect::<Vec<_>>().as_slice(),
-                )?
-                .cast::<DenseElementsAttributeRef>()
-                .unwrap());
-        }
-
-        context.dense_elements_attribute_from_raw_buffer(tensor_type, bytes.as_ref()).map_err(Error::from)
-    }
-}
-
-/// Lowers a plain traced [`CoreProgram`](ryft_core::Program) to a textual StableHLO MLIR module.
-#[cfg(test)]
-pub(crate) fn to_mlir_module_for_plain_program<
-    V: MlirLowerableValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-    O: LowerableOperation<Type = ArrayType>,
-    S: AsRef<str>,
->(
-    program: &CoreProgram<V, O, Input, Output>,
-    function_name: S,
-) -> Result<String, Error> {
-    to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy(
-        program,
-        function_name,
-        RaggedDotLoweringStrategy::default(),
-    )
-}
-
-/// Lowers a plain traced program with an explicit XLA grouped-dot representation.
-#[cfg(test)]
-pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy<
-    V: MlirLowerableValue,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-    O: LowerableOperation<Type = ArrayType>,
-    S: AsRef<str>,
->(
-    program: &CoreProgram<V, O, Input, Output>,
-    function_name: S,
-    ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
-) -> Result<String, Error> {
-    let function_name = normalize_function_name(function_name.as_ref())?;
-    let context = MlirContext::new();
-    let location = context.unknown_location();
-    let module = context.module(location)?;
-    // Module-scoped collective lowering state: this entry point lowers one whole module.
-    let collective_state =
-        CollectiveLoweringState::new().with_ragged_dot_lowering_strategy(ragged_dot_lowering_strategy);
-    let mut mesh = None;
-    for region in program.regions().iter() {
-        for atom in region.atoms() {
-            let atom_type = atom.r#type();
-            let Some(sharding) = atom_type.sharding() else {
-                continue;
-            };
-            mesh = Some(match mesh.take() {
-                Some(existing_mesh) => merge_logical_meshes(existing_mesh, sharding.mesh())?,
-                None => sharding.mesh().clone(),
-            });
-        }
-    }
-    if let Some(mesh) = mesh {
-        module.body()?.append_operation(mesh.to_mlir(location)?)?;
-    }
-
-    let input_tensor_types = program
-        .input_ids()
-        .iter()
-        .map(|atom_id| {
-            let input_atom = &program.atoms()[atom_id.index()];
-            lower_tensor_type(&input_atom.r#type().as_ref(), &context, location)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let output_tensor_types = program
-        .output_ids()
-        .iter()
-        .map(|atom_id| {
-            let output_atom = &program.atoms()[atom_id.index()];
-            lower_tensor_type(&output_atom.r#type().as_ref(), &context, location)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    module.body()?.append_operation({
-        let function_block = context.block(
-            input_tensor_types.iter().map(|tensor_type| (*tensor_type, location)).collect::<Vec<_>>().as_slice(),
-        );
-        {
-            let mut function_block_ref = function_block.as_ref();
-            let outputs = lower_plain_program_outputs(
-                program,
-                &mut function_block_ref,
-                &context,
-                location.as_ref(),
-                &collective_state,
-            )?;
-            function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
-        }
-        let mut function_region = context.region();
-        function_region.append_block(function_block)?;
-        func::func(
-            function_name.as_str(),
-            func::FuncAttributes {
-                arguments: input_tensor_types
-                    .iter()
-                    .zip(program.input_ids())
-                    .map(|(tensor_type, atom_id)| {
-                        let memory = program.atoms()[atom_id.index()].r#type().memory();
-                        let attributes = (memory != Memory::Device).then(|| {
-                            HashMap::from([(
-                                "mhlo.memory_kind".into(),
-                                context.string_attribute(memory_placement_kind(memory)).as_ref(),
-                            )])
-                        });
-                        TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
-                    })
-                    .collect(),
-                results: output_tensor_types
-                    .iter()
-                    .zip(program.output_ids())
-                    .map(|(tensor_type, atom_id)| {
-                        let memory = program.atoms()[atom_id.index()].r#type().memory();
-                        let attributes = (memory != Memory::Device).then(|| {
-                            HashMap::from([(
-                                "mhlo.memory_kind".into(),
-                                context.string_attribute(memory_placement_kind(memory)).as_ref(),
-                            )])
-                        });
-                        TypeAndAttributes { r#type: tensor_type.as_ref(), attributes }
-                    })
-                    .collect(),
-                ..Default::default()
-            },
-            function_region,
-            location,
-        )?
-    })?;
-
-    remove_unused_constants(&module)?;
-    if !module.verify()? {
-        return Err(Error::Lowering(LoweringError::VerificationFailure));
-    }
-
-    serialize_lowered_module(&module, &collective_state)
-}
-
-/// Collects the module mesh from the meshes referenced by emitted sharding constraints and nested-computation
-/// boundaries, starting from `existing`, and rejects every mesh whose topology differs from it with
-/// [`LoweringError::MismatchedMeshTopology`].
-pub(crate) fn collect_nested_sharding_mesh<ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
-    program: &Program<ProgramInput, ProgramOutput, O>,
-    existing: Option<LogicalMesh>,
-) -> Result<Option<LogicalMesh>, Error>
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    // Attached computations share the canonical region arena. Type metadata alone does not require a mesh:
-    // bounded-dynamic replica lowering retains that metadata without emitting Shardy operations.
-    let mut mesh = existing;
-    for region in program.regions().iter() {
-        for instruction in region.instructions() {
-            // Payloads are recognized through their projections, so any family that embeds them declares their meshes.
-            let operation = instruction.operation();
-            let declared_mesh = operation
-                .projected_payload::<ShardMapOperation>()
-                .map(|operation| operation.boundary().mesh())
-                .or_else(|| {
-                    operation.projected_payload::<ReshardOperation>().map(|operation| operation.sharding().mesh())
-                })
-                .or_else(|| {
-                    operation
-                        .projected_payload::<ConstrainShardingOperation>()
-                        .map(|operation| operation.sharding().mesh())
-                });
-            let incoming = if let Some(mesh) = declared_mesh {
-                Some(mesh.clone())
-            } else {
-                let output_axes = operation
-                    .projected_payload::<DynamicBroadcastOperation>()
-                    .map(DynamicBroadcastOperation::output_axes)
-                    .or_else(|| {
-                        operation.projected_payload::<BroadcastOperation>().map(BroadcastOperation::output_axes)
-                    })
-                    .or_else(|| {
-                        operation.projected_payload::<BroadcastLikeOperation>().map(BroadcastLikeOperation::output_axes)
-                    });
-                let emits_constraint = if let Some(output_axes) = output_axes {
-                    let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
-                    let input_type = <&ArrayType>::try_from(input_type.as_ref()).map_err(ProgramError::from)?;
-                    let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
-                    let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
-                    broadcast_changes_explicit_sharding(input_type, output_type, output_axes)
-                } else if operation.projected_payload::<CastOperation<ArrayIrType>>().is_some()
-                    || operation.projected_payload::<CastOperation<ArrayType>>().is_some()
-                {
-                    // Casts of first-class dimensions carry no placement, and array casts constrain placement only
-                    // when the explicit placement changes.
-                    let input_type = region.atoms()[instruction.inputs()[0].index()].r#type();
-                    let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
-                    match (<&ArrayType>::try_from(input_type.as_ref()), <&ArrayType>::try_from(output_type.as_ref())) {
-                        (Ok(input_type), Ok(output_type)) => cast_changes_explicit_placement(input_type, output_type),
-                        _ => false,
-                    }
-                } else {
-                    operation
-                        .projected_payload::<DynamicReshapeOperation>()
-                        .is_some_and(|operation| operation.output_sharding().is_some())
-                        || operation
-                            .projected_payload::<ReshapeOperation>()
-                            .is_some_and(|operation| operation.output_sharding().is_some())
-                        || operation
-                            .projected_payload::<GatherOperation>()
-                            .is_some_and(|operation| operation.output_sharding().is_some())
-                        || operation
-                            .projected_payload::<ScatterOperation>()
-                            .is_some_and(|operation| operation.output_sharding().is_some())
-                        || operation.projected_payload::<ZeroOperation<ArrayType>>().is_some()
-                        || operation.projected_payload::<ZeroLikeOperation<ArrayType>>().is_some()
-                        || operation.projected_payload::<OneLikeOperation<ArrayType>>().is_some()
-                        || operation.projected_payload::<FillLikeOperation<ArrayType>>().is_some()
-                        || operation.projected_payload::<IotaLikeOperation<ArrayType>>().is_some()
-                };
-                if !emits_constraint {
-                    continue;
-                }
-                let output_type = region.atoms()[instruction.outputs()[0].index()].r#type();
-                let output_type = <&ArrayType>::try_from(output_type.as_ref()).map_err(ProgramError::from)?;
-                output_type.sharding().map(|sharding| sharding.mesh().clone())
-            };
-            if let Some(incoming) = incoming {
-                mesh = Some(match mesh.take() {
-                    Some(existing_mesh) => merge_logical_meshes(existing_mesh, &incoming)?,
-                    None => incoming,
-                });
-            }
-        }
-    }
-    Ok(mesh)
-}
-
 /// Validates that `incoming` has the topology of the module mesh `existing`, which it returns. The module mesh keeps
 /// the axis types of the first mesh that declared it, because the emitted `sdy.mesh` records only axis names and sizes.
 ///
@@ -2267,16 +2505,6 @@ fn merge_logical_meshes(existing: LogicalMesh, incoming: &LogicalMesh) -> Result
         }));
     }
     Ok(existing)
-}
-
-/// Removes every `stablehlo.constant` operation whose result has no uses from `module`, including those in nested
-/// regions. Lowering materializes first-class dimension extents eagerly (refer to
-/// [`lower_dimension_extent`](crate::lowering::types::lower_dimension_extent)), while their consumers
-/// often read them only for dynamic axes (e.g., the explicit-extent collectives only refine dynamic result axes), so a
-/// static extent would otherwise remain in the lowered module as a dead constant. Constants are pure, so removing an
-/// unused one never changes the semantics of the module.
-pub(crate) fn remove_unused_constants(module: &Module<'_, '_>) -> Result<(), Error> {
-    remove_unused_constants_in_block(module.body()?)
 }
 
 /// Removes every unused `stablehlo.constant` operation from `block` and from the regions nested in its operations.
@@ -2299,80 +2527,6 @@ fn remove_unused_constants_in_block<'b, 'c: 'b, 't: 'c>(block: BlockRef<'b, 'c, 
         unsafe { block.remove_operation(constant)? };
     }
     Ok(())
-}
-
-/// Lowers one traced instruction to the corresponding StableHLO operation and returns its result value.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_instruction<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
-    program: &Program<ProgramInput, ProgramOutput, O>,
-    instruction: &Instruction<O>,
-    _atom_values: &[Option<ValueRef<'b, 'c, 't>>],
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    captured_values: &[ValueRef<'b, 'c, 't>],
-    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
-    collective_state: &CollectiveLoweringState,
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    let input_types = instruction
-        .inputs()
-        .iter()
-        .map(|input| program.atoms()[input.index()].r#type().into_owned())
-        .collect::<Vec<_>>();
-    let output_types = instruction
-        .outputs()
-        .iter()
-        .map(|output| program.atoms()[output.index()].r#type().into_owned())
-        .collect::<Vec<_>>();
-    // Every StableHLO operation generated from this one Ryft instruction inherits the instruction's provenance
-    // through the lowerer's shared location, with the ambient location as its base.
-    let location = collective_state.instruction_location(context, instruction.provenance(), location);
-    let regions = if crate::operations::composites::lowers_without_regions(
-        instruction.operation(),
-        &input_types,
-        &output_types,
-        nested_functions,
-        collective_state.target_platform(),
-    ) {
-        Vec::new()
-    } else {
-        instruction
-            .regions()
-            .iter()
-            .map(|region| program.region_ref(*region).map(|region| region.to_program()))
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    let mut lowerer = Lowerer::new(*block, context, location)
-        .with_regions(regions)
-        .with_nested_functions(nested_functions.cloned())
-        .with_captured_values(captured_values)
-        .with_effect_tokens(*effect_tokens)
-        .with_collective_state(collective_state.clone());
-    let outputs =
-        instruction
-            .operation()
-            .lower(&mut lowerer, input_values, input_types.as_slice(), output_types.as_slice())?;
-    if lowerer.effect_tokens.ordered_assertion.is_some() {
-        collective_state.has_assertions.set(true);
-    }
-    *effect_tokens = lowerer.effect_tokens;
-    Ok(outputs)
-}
-
-/// Normalizes a user-provided MLIR symbol name.
-pub(crate) fn normalize_function_name(function_name: &str) -> Result<String, Error> {
-    let function_name = function_name.trim();
-    let function_name = function_name.strip_prefix('@').unwrap_or(function_name);
-    if function_name.is_empty() || function_name.chars().any(char::is_whitespace) {
-        return Err(Error::Lowering(LoweringError::InvalidFunctionName { function_name: function_name.to_string() }));
-    }
-    Ok(function_name.to_string())
 }
 
 #[cfg(test)]

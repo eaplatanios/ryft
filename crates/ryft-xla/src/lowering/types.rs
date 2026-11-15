@@ -1,6 +1,6 @@
 use ryft_core::macros::check_count;
 use ryft_core::{
-    ArrayIrType, ArrayType, AtomId, CaptureReference, ComparisonDirection, DataType, Dimension as CoreDimension,
+    ArrayIrType, ArrayType, CaptureReference, ComparisonDirection, DataType, Dimension as CoreDimension,
     DimensionValue, Layout, ProgramError, Shape, Type as RyftType,
 };
 use ryft_mlir::dialects::stable_hlo;
@@ -47,13 +47,18 @@ pub(crate) fn lower_runtime_dimension_size_i64<'b, 'c: 'b, 't: 'c>(
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let size = block.append_operation(stable_hlo::get_dimension_size(input, axis, location)?)?;
-    let size = size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
+    let size = size.result(0).unwrap().as_ref();
     let i64_scalar = context.tensor_type(context.signless_integer_type(64), &[], None, location)?;
     let size = block.append_operation(stable_hlo::convert(size, i64_scalar, location)?)?;
-    Ok(size.result(0).expect("stablehlo.convert should return one result").as_ref())
+    Ok(size.result(0).unwrap().as_ref())
 }
 
-/// Returns the statically shaped physical-bound carrier type of one bounded dynamic array type.
+/// Returns the statically shaped carrier type of one bounded dynamic array type, in which every dynamic dimension is
+/// replaced by its physical bound (i.e., the largest extent that its exclusive upper bound admits).
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnsupportedOperation`] when a dynamic dimension has no finite positive upper bound.
 pub(crate) fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Error> {
     let dimensions = r#type
         .shape()
@@ -69,7 +74,7 @@ pub(crate) fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Error
                 .ok_or_else(|| {
                     Error::Lowering(LoweringError::UnsupportedOperation {
                         operation: "physical_bound_type".to_string(),
-                        reason: format!("dynamic dimension {variable} needs a finite positive physical bound"),
+                        reason: format!("dynamic dimension `{variable}` needs a finite positive physical bound"),
                     })
                 }),
         })
@@ -78,7 +83,8 @@ pub(crate) fn physical_bound_type(r#type: &ArrayType) -> Result<ArrayType, Error
 }
 
 /// Materializes the full physical buffer of one bounded dynamic value. The original runtime sizes are retained before
-/// each dynamic axis is widened to its physical bound, and every newly exposed lane is replaced with `padding_value`.
+/// each dynamic axis is widened to its physical bound, and every newly exposed position is replaced with
+/// `padding_value`.
 pub(crate) fn lower_physical_bound_value<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     r#type: &ArrayType,
@@ -90,7 +96,9 @@ pub(crate) fn lower_physical_bound_value<'b, 'c: 'b, 't: 'c>(
     lower_physical_bound_value_with_padding(value, r#type, padding_value, None, block, context, location)
 }
 
-/// Exposes bounded storage, masking inactive lanes with either an exact scalar value or a numeric constant.
+/// Exposes the bounded storage of one bounded dynamic value like [`lower_physical_bound_value`], masking the inactive
+/// positions with `scalar_padding`, which is an exact scalar value, when it is provided, and with the numeric constant
+/// `padding_value` otherwise.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
@@ -114,7 +122,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
                 return Ok(None);
             }
             let size = block.append_operation(stable_hlo::get_dimension_size(value, axis, location)?)?;
-            Ok(Some(size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref()))
+            Ok(Some(size.result(0).unwrap().as_ref()))
         })
         .collect::<Result<Vec<_>, Error>>()?;
     let physical_type = physical_bound_type(r#type)?;
@@ -129,7 +137,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
         let extent = dimension_extent_i32(physical_extent)?;
         let elements = context.dense_i32_elements_attribute(size_type, &[extent])?;
         let size = block.append_operation(stable_hlo::constant(elements, location)?)?;
-        let size = size.result(0).expect("stablehlo.constant should return one result").as_ref();
+        let size = size.result(0).unwrap().as_ref();
         physicalized_dimensions[axis] = CoreDimension::Static(physical_extent);
         let physicalized_type = r#type.clone().with_shape(Shape::new(physicalized_dimensions.clone()));
         let physicalized = block.append_operation(stable_hlo::set_dimension_size(
@@ -139,7 +147,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
             axis,
             location,
         )?)?;
-        data = physicalized.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+        data = physicalized.result(0).unwrap().as_ref();
     }
     let index_type = ArrayType::new(DataType::I32, physical_type.shape().clone());
     let index_tensor_type = lower_tensor_type(&index_type, context, location)?;
@@ -149,17 +157,17 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
             continue;
         }
         let indices = block.append_operation(stable_hlo::iota(index_tensor_type, axis, location)?)?;
-        let indices = indices.result(0).expect("stablehlo.iota should return one result").as_ref();
+        let indices = indices.result(0).unwrap().as_ref();
         let size = runtime_sizes[axis].unwrap();
         let size = block.append_operation(stable_hlo::broadcast(size, index_tensor_type, &[], location)?)?;
-        let size = size.result(0).expect("stablehlo.broadcast should return one result").as_ref();
+        let size = size.result(0).unwrap().as_ref();
         let axis_in_bounds = lower_compare_to_mlir(ComparisonDirection::LessThan, indices, size, block, location)?;
         in_bounds = Some(match in_bounds {
             None => axis_in_bounds,
             Some(in_bounds) => block
                 .append_operation(stable_hlo::and(in_bounds, axis_in_bounds, location)?)?
                 .result(0)
-                .expect("stablehlo.and should return one result")
+                .unwrap()
                 .as_ref(),
         });
     }
@@ -171,7 +179,7 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
             .unwrap()
             .as_ref()
     } else if physical_type.data_type().is_complex() {
-        // Padding belongs to the complex element type too; construct its real and imaginary components separately.
+        // Padding belongs to the complex element type too, so construct its real and imaginary components separately.
         let part_type = physical_type.clone().with_data_type(if physical_type.data_type() == DataType::C64 {
             DataType::F32
         } else {
@@ -185,11 +193,11 @@ pub(crate) fn lower_physical_bound_value_with_padding<'b, 'c: 'b, 't: 'c>(
         lower_f64_constant_splat(padding_value, &physical_type, physical_tensor_type, block, context, location)?
     };
     let masked = block.append_operation(stable_hlo::select(in_bounds.unwrap(), data, padding, location)?)?;
-    Ok(masked.result(0).expect("stablehlo.select should return one result").as_ref())
+    Ok(masked.result(0).unwrap().as_ref())
 }
 
-/// Restores the dynamic dimensions of `output_type` on a physical-bound value. Each entry in `sources` identifies
-/// the value and axis that define the corresponding output dimension.
+/// Restores the dynamic dimensions of `output_type` on a value of its [`physical_bound_type`]. Each entry in `sources`
+/// identifies the value and axis that define the corresponding output dimension.
 pub(crate) fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
     mut value: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
@@ -208,7 +216,7 @@ pub(crate) fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
         }
         let size =
             block.append_operation(stable_hlo::get_dimension_size(sources[axis].0, sources[axis].1, location)?)?;
-        let size = size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
+        let size = size.result(0).unwrap().as_ref();
         dimensions[axis] = dimension.clone();
         let refined_type = output_type.clone().with_shape(Shape::new(dimensions.clone()));
         let refined = block.append_operation(stable_hlo::set_dimension_size(
@@ -218,15 +226,16 @@ pub(crate) fn lower_restore_dynamic_dimensions<'b, 'c: 'b, 't: 'c>(
             axis,
             location,
         )?)?;
-        value = refined.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+        value = refined.result(0).unwrap().as_ref();
     }
     Ok(value)
 }
 
 /// Exposes the physical storage of one bounded dynamic value as a statically shaped value of its
 /// [`physical_bound_type`], by setting the runtime size of every dynamic axis to its physical bound. Unlike
-/// [`lower_physical_bound_value`], this does not mask the lanes beyond the runtime sizes, so it is only suitable for
-/// callers that discard those lanes again (e.g., by slicing to a static extent or by restoring the runtime sizes).
+/// [`lower_physical_bound_value`], this does not mask the positions beyond the runtime sizes, so it is only suitable
+/// for callers that discard those positions again (e.g., by slicing to a static extent or by restoring the runtime
+/// sizes).
 pub(crate) fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     r#type: &ArrayType,
@@ -244,7 +253,7 @@ pub(crate) fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
         let bound = physical_type.shape().dimensions()[axis].value().unwrap();
         let size = lower_unplaced_constant_output(
             &[ArrayType::scalar(DataType::I32)],
-            dimension_extent_i64(bound)?,
+            i64::from(dimension_extent_i32(bound)?),
             block,
             context,
             location,
@@ -259,7 +268,7 @@ pub(crate) fn lower_physical_storage<'b, 'c: 'b, 't: 'c>(
             axis,
             location,
         )?)?;
-        value = exposed.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+        value = exposed.result(0).unwrap().as_ref();
     }
     Ok(value)
 }
@@ -277,8 +286,8 @@ pub(crate) fn dimension_extent_i32(value: usize) -> Result<i32, Error> {
 }
 
 /// Lowers static start indices to scalar `i64` StableHLO constants, as consumed by the index operands of
-/// `stablehlo.dynamic_update_slice` when lowering the statically indexed `update_slice` operation (StableHLO has no
-/// statically indexed update operation).
+/// `stablehlo.dynamic_update_slice` when lowering the statically indexed `update_slice` operation, because StableHLO
+/// has no statically indexed update operation.
 pub(crate) fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     start_indices: &[usize],
     block: &mut B,
@@ -292,11 +301,19 @@ pub(crate) fn lower_static_index_constants<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 
         .map(|index| {
             let elements = lower_constant_elements_attribute(DataType::I64, tensor_type, *index as i64, context)?;
             let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-            Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
+            Ok(constant.result(0).unwrap().as_ref())
         })
         .collect()
 }
 
+/// Lowers `integer_value` as a constant of the single type in `output_types`, without applying its memory placement
+/// (refer to [`lower_constant_output`] for the placed variant). Scalars lower to one `stablehlo.constant`, while
+/// shaped outputs and complex values are built from scalar constants and broadcast to the output shape.
+///
+/// # Errors
+///
+/// Returns an [`Error`] when `output_types` does not contain exactly one type, or when the type cannot be lowered or
+/// represent `integer_value`.
 pub(crate) fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     output_types: &[ArrayType],
     integer_value: i64,
@@ -309,8 +326,8 @@ pub(crate) fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c
     let tensor_type = lower_tensor_type(output_type, context, location)?;
     let data_type = output_type.data_type();
 
-    // Complex constants are composed as `value + 0i` from two real part constants through `stablehlo.complex`, so
-    // that the dense-elements attribute helpers stay real-valued (MLIR has no complex scalar attribute to splat).
+    // Complex constants are composed as `value + 0i` from two real part constants through `stablehlo.complex`, so that
+    // the dense elements attribute helpers stay real valued, because MLIR has no complex scalar attribute to splat.
     if data_type.is_complex() {
         let part_data_type = if data_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
         let part_tensor_type =
@@ -321,16 +338,16 @@ pub(crate) fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c
         let imaginary_elements = lower_constant_elements_attribute(part_data_type, part_tensor_type, 0, context)?;
         let imaginary = block.append_operation(stable_hlo::constant(imaginary_elements, location)?)?;
         let complex = block.append_operation(stable_hlo::complex(
-            real.result(0).expect("stablehlo.constant should return one result").as_ref(),
-            imaginary.result(0).expect("stablehlo.constant should return one result").as_ref(),
+            real.result(0).unwrap().as_ref(),
+            imaginary.result(0).unwrap().as_ref(),
             location,
         )?)?;
-        let complex = complex.result(0).expect("stablehlo.complex should return one result").as_ref();
+        let complex = complex.result(0).unwrap().as_ref();
         if output_type.shape().dimensions().is_empty() {
             return Ok(vec![complex]);
         }
         let broadcast = block.append_operation(stable_hlo::broadcast(complex, tensor_type, &[], location)?)?;
-        return Ok(vec![broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()]);
+        return Ok(vec![broadcast.result(0).unwrap().as_ref()]);
     }
 
     if !output_type.shape().dimensions().is_empty() {
@@ -343,14 +360,15 @@ pub(crate) fn lower_unplaced_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c
             &[],
             location,
         )?)?;
-        return Ok(vec![broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref()]);
+        return Ok(vec![broadcast.result(0).unwrap().as_ref()]);
     }
     let elements = lower_constant_elements_attribute(data_type, tensor_type, integer_value, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-    Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
+    Ok(vec![constant.result(0).unwrap().as_ref()])
 }
 
-/// Lowers one integer-valued constant and applies its declared non-device memory placement to the final value.
+/// Lowers one constant with an integer value like [`lower_unplaced_constant_output`] and applies the declared memory
+/// placement of its output type to the final value when that placement is not the device memory.
 pub(crate) fn lower_constant_output<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + Location<'c, 't>>(
     output_types: &[ArrayType],
     integer_value: i64,
@@ -394,7 +412,7 @@ where
     let tensor_type = lower_tensor_type(&value_type, context, location)?;
     let elements = value.to_dense_elements_attribute(tensor_type, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-    let constant = constant.result(0).expect("stablehlo.constant should return one result").as_ref();
+    let constant = constant.result(0).unwrap().as_ref();
     annotate_output_memory(constant, &value_type, block, context, location)
 }
 
@@ -427,15 +445,14 @@ where
     let extent = dimension_extent_i64(value.extent())?;
     let elements = lower_constant_elements_attribute(DataType::I64, tensor_type, extent, context)?;
     let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-    Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref())
+    Ok(constant.result(0).unwrap().as_ref())
 }
 
 /// Lowers a traced constant atom to a StableHLO value and returns it. A captured constant forwards the hidden capture
 /// argument that carries its runtime value, and a session constant forwards the hidden entry argument that
-/// `collective_state` assigns to it, while an immediate dimension extent is materialized in place — which is exactly
-/// what makes extents usable inside a `shard_map` manual region, where no capture table is reachable.
+/// `collective_state` assigns to it, while an immediate dimension extent is materialized in place. The latter is
+/// exactly what makes extents usable inside a `shard_map` manual region, where no capture table is reachable.
 pub(crate) fn lower_constant<'b, 'c: 'b, 't: 'c, B, L>(
-    _atom_id: AtomId,
     value: &Constant,
     captured_values: &[ValueRef<'b, 'c, 't>],
     collective_state: &CollectiveLoweringState,
@@ -455,33 +472,9 @@ where
     }
 }
 
-/// Lowers an exact `u64` value as a splatted constant of `output_type`.
-fn lower_u64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
-    value: u64,
-    output_type: &ArrayType,
-    output_tensor_type: TensorTypeRef<'c, 't>,
-    block: &mut B,
-    context: &'c MlirContext<'t>,
-    location: L,
-) -> Result<ValueRef<'b, 'c, 't>, Error>
-where
-    B: Block<'b, 'c, 't>,
-    L: Copy + Location<'c, 't>,
-{
-    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(DataType::U64), context, location)?;
-    let attribute = context.dense_u64_elements_attribute(scalar_tensor_type, &[value])?;
-    let constant = block.append_operation(stable_hlo::constant(attribute, location)?)?;
-    let constant = constant.result(0).expect("stablehlo.constant should return one result").as_ref();
-    if output_type.shape().dimensions().is_empty() {
-        return Ok(constant);
-    }
-    let broadcast = block.append_operation(stable_hlo::broadcast(constant, output_tensor_type, &[], location)?)?;
-    Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
-}
-
-/// Lowers a scalar `u64` constant. Shared by the ragged-dot group-interval arithmetic, the
-/// `parallel_ragged_all_to_all` lane and batch-item arithmetic, and the
-/// [`AxisIndexOperation`](ryft_core::AxisIndexOperation) coordinate arithmetic.
+/// Lowers a scalar `u64` constant. It is shared by the group interval arithmetic of ragged dots, the device shard and
+/// batch item arithmetic of `parallel_ragged_all_to_all`, and the coordinate arithmetic of
+/// [`AxisIndexOperation`](ryft_core::AxisIndexOperation).
 pub(crate) fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     value: u64,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -493,8 +486,15 @@ pub(crate) fn lower_u64_scalar_constant<'b, 'c: 'b, 't: 'c>(
     lower_u64_constant_splat(value, &output_type, output_tensor_type, block, context, location)
 }
 
-/// Encodes an executable boundary's requested layout using PJRT's `mhlo.layout_mode` convention. Internal
-/// `LayoutConstraint` calls alone do not constrain the parameter or result ABI.
+/// Encodes the requested layout of an executable boundary value using the `mhlo.layout_mode` convention of PJRT, where
+/// `kind` names the boundary side (i.e., `"input"` or `"output"`). Internal `LayoutConstraint` custom calls (refer to
+/// [`lower_layout_constraint`](crate::operations::constants::lower_layout_constraint)) alone do not constrain the
+/// parameter or result ABI.
+///
+/// # Errors
+///
+/// Returns [`LoweringError::UnsupportedOperation`] for strided layouts and for bounded dynamic outputs whose layout is
+/// not row-major.
 pub(crate) fn lower_boundary_layout<'c, 't>(
     array_type: &ArrayType,
     kind: &str,
@@ -573,8 +573,8 @@ pub(crate) fn lower_element_type<'c, 't>(
                 context: "tensor element representation".to_string(),
             }));
         }
-        // StableHLO has no zero-information element type. Use an i1 tensor as an unobservable physical carrier while
-        // retaining the logical `DataType::Zero` in Ryft's lowered/compiled metadata.
+        // StableHLO has no element type that carries zero information. Use an `i1` tensor as an unobservable physical
+        // carrier while retaining the logical `DataType::Zero` in the lowered and compiled metadata of Ryft.
         DataType::Zero => context.signless_integer_type(1).as_ref(),
         DataType::Boolean => context.signless_integer_type(1).as_ref(),
         DataType::I1 => context.signless_integer_type(1).as_ref(),
@@ -584,8 +584,9 @@ pub(crate) fn lower_element_type<'c, 't>(
         DataType::I16 => context.signless_integer_type(16).as_ref(),
         DataType::I32 => context.signless_integer_type(32).as_ref(),
         DataType::I64 => context.signless_integer_type(64).as_ref(),
-        // StableHLO admits signless `i1` as its Boolean/one-bit carrier but rejects `ui1`. U1's unsigned semantics
-        // remain selected by Ryft operation metadata (e.g., comparison direction), while its sole bit is unchanged.
+        // StableHLO admits signless `i1` as its Boolean and one-bit carrier but rejects `ui1`. The unsigned semantics
+        // of `U1` remain selected by Ryft operation metadata (e.g., comparison direction), while its sole bit is
+        // unchanged.
         DataType::U1 => context.signless_integer_type(1).as_ref(),
         DataType::U2 => context.unsigned_integer_type(2).as_ref(),
         DataType::U4 => context.unsigned_integer_type(4).as_ref(),
@@ -613,10 +614,9 @@ pub(crate) fn lower_element_type<'c, 't>(
     })
 }
 
-/// Builds the dense-elements attribute for one traced splat constant.
-/// Lowers an arbitrary `f64` factor into a splatted scalar StableHLO constant whose element type
-/// matches `output_type`, then broadcasts that scalar to the full output shape. Used by the
-/// zero/one synthesis and literal-constant lowering.
+/// Lowers an arbitrary `f64` factor into a splatted scalar StableHLO constant whose element type matches
+/// `output_type`, then broadcasts that scalar to the full output shape. It is used when synthesizing zeros, ones, and
+/// padding values and when lowering literal constants.
 pub(crate) fn lower_f64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
     factor: f64,
     output_type: &ArrayType,
@@ -634,7 +634,7 @@ where
     let elements = lower_f64_scalar_elements_attribute(data_type, scalar_tensor_type, factor, context)?;
     let scalar_constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
     if output_type.shape().dimensions().is_empty() {
-        return Ok(scalar_constant.result(0).expect("stablehlo.constant should return one result").as_ref());
+        return Ok(scalar_constant.result(0).unwrap().as_ref());
     }
     let broadcast = block.append_operation(stable_hlo::broadcast(
         scalar_constant.result(0).unwrap().as_ref(),
@@ -642,13 +642,13 @@ where
         &[],
         location,
     )?)?;
-    Ok(broadcast.result(0).expect("stablehlo.broadcast should return one result").as_ref())
+    Ok(broadcast.result(0).unwrap().as_ref())
 }
 
-/// Builds a splatted dense-elements attribute holding `factor` converted to the given `data_type`. Boolean splats
+/// Builds a splatted dense elements attribute holding `factor` converted to the given `data_type`. Boolean splats
 /// hold `factor != 0.0`, integer splats truncate `factor`, and float splats round `factor` to the nearest
-/// representable value of the element type (covering every float format that [`lower_element_type`] supports,
-/// including the `f8`/`f6`/`f4` families). [`DataType::Zero`] admits only a zero factor, lowered as its `i1` carrier.
+/// representable value of the element type, for every float format that [`lower_element_type`] supports (e.g., the
+/// `f8`, `f6`, and `f4` families). [`DataType::Zero`] admits only a zero factor, lowered as its `i1` carrier.
 /// Integer attributes use the physical element type from [`lower_element_type`], including signless `i1` for `U1`.
 pub(crate) fn lower_f64_scalar_elements_attribute<'c, 't>(
     data_type: DataType,
@@ -718,9 +718,9 @@ pub(crate) fn lower_f64_scalar_elements_attribute<'c, 't>(
     }
 }
 
-/// Builds a splatted dense-elements attribute holding `integer_value` converted to the given `data_type`. Integer
-/// splats hold the exact `i64` value; every other data type routes through
-/// [`lower_f64_scalar_elements_attribute`] after a lossless widening of `integer_value` to `f64`. Integer attributes
+/// Builds a splatted dense elements attribute holding `integer_value` converted to the given `data_type`. Integer
+/// splats hold the exact `i64` value, and every other data type routes through
+/// [`lower_f64_scalar_elements_attribute`] after a widening of `integer_value` to `f64`. Integer attributes
 /// use the physical element type from [`lower_element_type`], including signless `i1` for `U1`.
 pub(crate) fn lower_constant_elements_attribute<'c, 't>(
     data_type: DataType,
@@ -808,7 +808,7 @@ pub(crate) fn lower_array_ir_type<'c, 't, L: Location<'c, 't>>(
     }
 }
 
-/// Packs scalar first-class dimension operands into the rank-one `i64` shape tensor consumed by dynamic StableHLO
+/// Packs scalar first-class dimension operands into the rank-1 `i64` shape tensor consumed by dynamic StableHLO
 /// shape operations.
 pub(crate) fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
     extents: &[ValueRef<'b, 'c, 't>],
@@ -821,24 +821,24 @@ pub(crate) fn lower_explicit_shape<'b, 'c: 'b, 't: 'c>(
     if extents.is_empty() {
         let elements = context.dense_i64_elements_attribute(shape_type, &[])?;
         let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-        return Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref());
+        return Ok(constant.result(0).unwrap().as_ref());
     }
 
     let dimensions = extents
         .iter()
         .map(|extent| {
             let reshape = block.append_operation(stable_hlo::reshape(*extent, &[1], location)?)?;
-            Ok(reshape.result(0).expect("stablehlo.reshape should return one result").as_ref())
+            Ok(reshape.result(0).unwrap().as_ref())
         })
         .collect::<Result<Vec<_>, Error>>()?;
     if let [dimension] = dimensions.as_slice() {
         return Ok(*dimension);
     }
     let shape = block.append_operation(stable_hlo::concatenate(dimensions.as_slice(), 0, location)?)?;
-    Ok(shape.result(0).expect("stablehlo.concatenate should return one result").as_ref())
+    Ok(shape.result(0).unwrap().as_ref())
 }
 
-/// Packs scalar first-class dimension operands into the rank-one `i32` shape tensor required by
+/// Packs scalar first-class dimension operands into the rank-1 `i32` shape tensor required by
 /// `stablehlo.dynamic_reshape`.
 pub(crate) fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
     extents: &[ValueRef<'b, 'c, 't>],
@@ -852,30 +852,54 @@ pub(crate) fn lower_explicit_reshape_shape<'b, 'c: 'b, 't: 'c>(
     if extents.is_empty() {
         let elements = context.dense_i32_elements_attribute(shape_type, &[])?;
         let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-        return Ok(constant.result(0).expect("stablehlo.constant should return one result").as_ref());
+        return Ok(constant.result(0).unwrap().as_ref());
     }
 
     let dimensions = extents
         .iter()
         .map(|extent| {
             let extent = block.append_operation(stable_hlo::convert(*extent, scalar_type, location)?)?;
-            let extent = extent.result(0).expect("stablehlo.convert should return one result").as_ref();
+            let extent = extent.result(0).unwrap().as_ref();
             let reshape = block.append_operation(stable_hlo::reshape(extent, &[1], location)?)?;
-            Ok(reshape.result(0).expect("stablehlo.reshape should return one result").as_ref())
+            Ok(reshape.result(0).unwrap().as_ref())
         })
         .collect::<Result<Vec<_>, Error>>()?;
     if let [dimension] = dimensions.as_slice() {
         return Ok(*dimension);
     }
     let shape = block.append_operation(stable_hlo::concatenate(dimensions.as_slice(), 0, location)?)?;
-    Ok(shape.result(0).expect("stablehlo.concatenate should return one result").as_ref())
+    Ok(shape.result(0).unwrap().as_ref())
+}
+
+/// Lowers an exact `u64` value as a splatted constant of `output_type`.
+fn lower_u64_constant_splat<'b, 'c: 'b, 't: 'c, B, L>(
+    value: u64,
+    output_type: &ArrayType,
+    output_tensor_type: TensorTypeRef<'c, 't>,
+    block: &mut B,
+    context: &'c MlirContext<'t>,
+    location: L,
+) -> Result<ValueRef<'b, 'c, 't>, Error>
+where
+    B: Block<'b, 'c, 't>,
+    L: Copy + Location<'c, 't>,
+{
+    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(DataType::U64), context, location)?;
+    let attribute = context.dense_u64_elements_attribute(scalar_tensor_type, &[value])?;
+    let constant = block.append_operation(stable_hlo::constant(attribute, location)?)?;
+    let constant = constant.result(0).unwrap().as_ref();
+    if output_type.shape().dimensions().is_empty() {
+        return Ok(constant);
+    }
+    let broadcast = block.append_operation(stable_hlo::broadcast(constant, output_tensor_type, &[], location)?)?;
+    Ok(broadcast.result(0).unwrap().as_ref())
 }
 
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{ConvertElementTypeOperation, Placeholder};
+    use ryft_core::{ConvertElementTypeOperation, Placeholder, ReferenceType, TiledLayout};
 
     use crate::lowering::tests::{ProgramBuilder, dynamic_dimension};
     use crate::lowering::to_mlir_module_for_plain_program;
@@ -915,21 +939,25 @@ mod tests {
     }
 
     #[test]
-    fn test_static_dimensions() {
-        let static_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        assert_eq!(static_dimensions(&static_type).unwrap(), vec![2, 3]);
-        let dimension = ryft_core::DimensionVariable::new("size", ryft_core::DimensionBounds::unbounded());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.into()]));
+    fn test_physical_bound_type() {
+        // Every bounded dynamic dimension is replaced by the largest extent that its exclusive upper bound admits.
+        let bounded = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![dynamic_dimension("rows", Some(6)), CoreDimension::Static(3)]),
+        );
+        assert_eq!(physical_bound_type(&bounded).unwrap(), ArrayType::new_static(DataType::F32, [5, 3]));
+
+        let unbounded = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", None)]));
         assert!(matches!(
-            static_dimensions(&dynamic_type),
-            Err(Error::Array(error)) if matches!(error.as_ref(),
-                ArrayError::DynamicShape { shape } if shape == dynamic_type.shape(),
-            ),
+            physical_bound_type(&unbounded),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "physical_bound_type"
+                    && reason == "dynamic dimension `rows` needs a finite positive physical bound",
         ));
     }
 
     #[test]
-    fn test_dimension_extent_i64_rejects_out_of_range_values() {
+    fn test_dimension_extent_i64() {
         if usize::MAX <= i64::MAX as usize {
             return;
         }
@@ -947,7 +975,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dimension_extent_i32_rejects_out_of_range_values() {
+    fn test_dimension_extent_i32() {
         let value = i32::MAX as usize + 1;
         let error = dimension_extent_i32(value).unwrap_err();
         let Error::Core(core_error) = error else { unreachable!() };
@@ -959,9 +987,21 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_boundary_layout() {
-        use ryft_core::TiledLayout;
+    fn test_static_dimensions() {
+        let static_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        assert_eq!(static_dimensions(&static_type).unwrap(), vec![2, 3]);
+        let dimension = ryft_core::DimensionVariable::new("size", ryft_core::DimensionBounds::unbounded());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![dimension.into()]));
+        assert!(matches!(
+            static_dimensions(&dynamic_type),
+            Err(Error::Array(error)) if matches!(error.as_ref(),
+                ArrayError::DynamicShape { shape } if shape == dynamic_type.shape(),
+            ),
+        ));
+    }
 
+    #[test]
+    fn test_lower_boundary_layout() {
         let context = MlirContext::new();
         let plain = ArrayType::new_static(DataType::F32, [2, 3]);
         assert!(lower_boundary_layout(&plain, "input", &context).unwrap().is_none());
@@ -971,10 +1011,22 @@ mod tests {
     }
 
     #[test]
-    fn test_stable_hlo_dynamic_dimension_bound_converts_exclusive_bounds() {
+    fn test_stable_hlo_dynamic_dimension_bound() {
         assert_eq!(stable_hlo_dynamic_dimension_bound(&CoreDimension::Static(4)), None);
         assert_eq!(stable_hlo_dynamic_dimension_bound(&dynamic_dimension("unbounded", None)), None);
         assert_eq!(stable_hlo_dynamic_dimension_bound(&dynamic_dimension("bounded", Some(6))), Some(5));
+    }
+
+    #[test]
+    fn test_lower_array_ir_type() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        assert!(matches!(
+            lower_array_ir_type(&reference_type, &context, location),
+            Err(Error::Lowering(LoweringError::UnresolvedReference { construct }))
+                if construct == reference_type.to_string(),
+        ));
     }
 
     #[test]
@@ -996,7 +1048,7 @@ mod tests {
                     expected,
                 );
                 assert_eq!(
-                    lower_f64_scalar_elements_attribute(data_type, tensor_type, integer_value as f64 + 0.75, &context,)
+                    lower_f64_scalar_elements_attribute(data_type, tensor_type, integer_value as f64 + 0.75, &context)
                         .unwrap()
                         .to_string(),
                     expected,

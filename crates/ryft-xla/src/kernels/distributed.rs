@@ -1,9 +1,9 @@
 //! Experimental distributed kernel execution and native participant admission.
 //!
 //! Native kernels currently execute only on a fixed, fully addressable, single-process device mesh. Multiple local
-//! devices share the existing PJRT [`ExecutionFence`]; its terminal result joins every participating device, including
-//! asynchronous failures. The check in this module runs at the common XLA submission boundary before input resharding,
-//! donation, or device submission, including restored executables and stateful calls.
+//! devices share the existing PJRT [`ExecutionFence`], whose terminal result joins every participating device,
+//! including asynchronous failures. The check in this module runs at the common XLA submission boundary before input
+//! resharding, donation, or device submission, including restored executables and stateful calls.
 //!
 //! Compilation agreement already belongs to [`DistributedRuntime`]. Its
 //! [`compilation_artifact_exchange`](crate::DistributedRuntime::compilation_artifact_exchange) compares ordered rounds,
@@ -11,21 +11,23 @@
 //! Kernel compiler, target, plugin, and topology identities participate in those keys. Artifact agreement does not
 //! establish collective completion and cannot authorize a cross-process launch.
 //!
-//! [`DistributedKernel`] provides an explicit host-staged functional route over the existing distributed runtime.
-//! It coordinates per-process local kernels, PJRT downloads/uploads and bounded KV chunks. It does not submit a native
-//! multi-process mesh. CPU needs no cross-host PJRT extension for this route; CUDA/ROCm extension presence does not
-//! change its transport or imply native collective qualification. External references and observable I/O are rejected.
+//! [`DistributedKernel`] provides an explicit functional route through host transfers over the existing distributed
+//! runtime. It coordinates per-process local kernels, PJRT downloads and uploads, and bounded KV chunks. It does not
+//! submit a native multi-process mesh. CPU needs no cross-host PJRT extension for this route, and the presence of a
+//! CUDA or ROCm extension does not change its transport or imply native collective qualification. External references
+//! and observable I/O are rejected.
 //!
 //! [`DistributedKernel::call_async`] returns the existing [`StatefulExecution`]. Preflight and host transfers block
-//! before submission; its completion retains the existing native fence and runtime. Awaiting completes the distributed
-//! readiness barrier. No background worker advances that barrier, and readiness queries only report cached terminal
-//! results. Blocking [`DistributedKernel::call`] delegates to this same path.
+//! before submission, and its completion retains the existing native fence and runtime. Awaiting completes the
+//! distributed readiness barrier. No background worker advances that barrier, and readiness queries only report cached
+//! terminal results. Blocking [`DistributedKernel::call`] delegates to this same path.
 //!
-//! The runtime service and participants must be trusted and cooperative. Published/reassembled chunks are bounded,
-//! but the existing KV API allocates returned values before this layer can inspect their lengths; this is not a
-//! hostile-peer allocation firewall. KV records remain scoped to the runtime launch until its service is destroyed.
-//! Cross-process in-place reference publication remains unsupported: all outputs are functional and private until
-//! successful completion. All-ready means native completion, not atomic delivery to every host after a network fault.
+//! The runtime service and participants must be trusted and cooperative. Published and reassembled chunks are bounded,
+//! but the existing KV API allocates returned values before this layer can inspect their lengths, so this is not an
+//! allocation firewall against hostile peers. KV records remain scoped to the runtime launch until its service is
+//! destroyed. Cross-process in-place reference publication remains unsupported, so all outputs are functional and
+//! private until successful completion. Readiness of every participant means native completion, not atomic delivery to
+//! every host after a network fault.
 
 // TODO(eaplatanios): Review this module.
 
@@ -43,11 +45,12 @@ use sha2::{Digest, Sha256};
 
 use crate::kernels::KernelEmbeddingError;
 use crate::kernels::aot::{KernelAotError, LoadedKernel};
+use crate::kernels::staging::KernelExecutionFacts;
 use crate::{Array, DistributedRuntime, Error, FromPjrt};
 
 // TODO(eaplatanios): Promote distributed kernel errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
-/// Failure in host-coordinated kernel execution. Submitted device work is drained before returning an error.
+/// Failure in kernel execution coordinated by the host. Submitted device work is drained before returning an error.
 ///
 /// Converting to [`Error`] unwraps [`Self::Xla`] and wraps every other variant in [`Error::Custom`]. Converting an
 /// [`Error`] into this type uses [`Self::Xla`], so round trips preserve canonical errors and shared custom payloads.
@@ -71,8 +74,9 @@ pub enum DistributedKernelError {
     /// A participant reported a terminal failure.
     #[error("distributed kernel participant {process} failed: {message}")]
     Participant {
-        /// Initialization-owned participant index.
+        /// Participant index owned by runtime initialization.
         process: usize,
+
         /// Bounded diagnostic reported by that participant.
         message: String,
     },
@@ -82,6 +86,7 @@ pub enum DistributedKernelError {
     Reporting {
         /// Original local failure.
         failure: String,
+
         /// Failure of its coordination publication.
         reporting: ryft_pjrt::Error,
     },
@@ -124,45 +129,30 @@ impl From<DistributedKernelError> for crate::Error {
 }
 
 impl DistributedKernelError {
-    /// Constructs an exact coordination-owned contract diagnostic.
+    /// Constructs an exact diagnostic for a contract owned by coordination.
     fn invalid(message: impl Into<String>) -> Self {
         Self::Invalid { message: message.into() }
     }
 }
 
-/// Rejects participant sets without a qualified collective completion contract before any native submission.
-pub(crate) fn validate_kernel_participants(client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), KernelEmbeddingError> {
-    let process = client.process_index()?;
-    if mesh.devices().iter().any(|device| device.process_index() != process) {
-        return Err(KernelEmbeddingError::Invalid {
-            message: "cross-process kernel execution requires a qualified collective ordering and completion contract"
-                .to_owned(),
-        });
-    }
-    let addressable = client.addressable_devices()?.iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?;
-    if mesh.devices().iter().any(|device| !addressable.contains(device)) {
-        return Err(KernelEmbeddingError::Invalid {
-            message: "kernel execution requires every mesh device to be addressable by the submitting client"
-                .to_owned(),
-        });
-    }
-    Ok(())
-}
-
-/// Explicit host-staged transport limits. Device copies use PJRT; inter-process bytes use the runtime's KV store.
+/// Transport limits for explicit host transfers. Device copies use PJRT, and inter-process bytes use the runtime's KV
+/// store.
 ///
 /// Deadlines and cancellation are cooperative between native operations. A native fence is always drained even when
-/// that exceeds the coordination deadline. The coordinator retains chunks until the distributed runtime shuts down;
-/// the round limit bounds retention for this coordinator, and callers control the number of coordinators they create.
+/// that exceeds the coordination deadline. The coordinator retains chunks until the distributed runtime shuts down.
+/// The round limit bounds retention for this coordinator, and callers control the number of coordinators they create.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DistributedKernelOptions {
     /// Maximum bytes published by each participant in one round.
     maximum_transfer_bytes: usize,
+
     /// Maximum bytes in one KV chunk before the existing store's hexadecimal transport encoding.
     chunk_bytes: usize,
-    /// Coordination deadline, excluding no native work; expiration cannot interrupt a native wait.
+
+    /// Coordination deadline, which is checked between native operations and cannot interrupt a native wait.
     timeout: Duration,
+
     /// Maximum rounds whose retained input chunks this coordinator can publish.
     maximum_rounds: u64,
 }
@@ -171,9 +161,7 @@ impl DistributedKernelOptions {
     /// Creates bounded host transport options. Byte budgets are positive and cannot exceed 64 MiB per participant.
     pub fn new(maximum_transfer_bytes: usize, timeout: Duration) -> Result<Self, DistributedKernelError> {
         if maximum_transfer_bytes == 0 || maximum_transfer_bytes > 64 * 1024 * 1024 || timeout.is_zero() {
-            return Err(DistributedKernelError::Invalid {
-                message: "invalid host transport byte budget or timeout".into(),
-            });
+            return Err(DistributedKernelError::invalid("invalid host transport byte budget or timeout"));
         }
         Ok(Self {
             maximum_transfer_bytes,
@@ -183,20 +171,10 @@ impl DistributedKernelOptions {
         })
     }
 
-    /// Returns the per-participant byte budget.
-    pub fn maximum_transfer_bytes(&self) -> usize {
-        self.maximum_transfer_bytes
-    }
-
-    /// Returns the native-wait-aware coordination deadline.
-    pub fn timeout(&self) -> Duration {
-        self.timeout
-    }
-
     /// Sets a positive chunk size no larger than one MiB or the participant byte budget.
     pub fn with_chunk_bytes(mut self, bytes: usize) -> Result<Self, DistributedKernelError> {
         if bytes == 0 || bytes > self.maximum_transfer_bytes.min(1024 * 1024) {
-            return Err(DistributedKernelError::Invalid { message: "invalid host transport chunk size".into() });
+            return Err(DistributedKernelError::invalid("invalid host transport chunk size"));
         }
         self.chunk_bytes = bytes;
         Ok(self)
@@ -205,101 +183,64 @@ impl DistributedKernelOptions {
     /// Sets the positive per-coordinator round limit, bounding retained KV payloads over its lifetime.
     pub fn with_maximum_rounds(mut self, rounds: u64) -> Result<Self, DistributedKernelError> {
         if rounds == 0 || rounds > 1024 {
-            return Err(DistributedKernelError::Invalid { message: "round limit must be between one and 1024".into() });
+            return Err(DistributedKernelError::invalid("round limit must be between one and 1024"));
         }
         self.maximum_rounds = rounds;
         Ok(self)
     }
+
+    /// Returns the per-participant byte budget.
+    pub fn maximum_transfer_bytes(&self) -> usize {
+        self.maximum_transfer_bytes
+    }
+
+    /// Returns the coordination deadline, which never interrupts a native wait.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
 }
 
-/// One participant's exact preflight record, constructed from its loaded executable and live local topology.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KernelPreflight {
-    /// Initialization-owned sender index.
-    process: usize,
-    /// Declared runtime participant count.
-    processes: usize,
-    /// Exact canonical source and compiler-binding identity.
-    identity: Vec<u8>,
-    /// Locally validated plugin and canonical device topology identity.
-    execution: Vec<u8>,
-    /// Canonical logical byte counts in input order.
-    sizes: Vec<usize>,
-    /// Source-process owner for each local argument index.
-    sources: Vec<usize>,
-    /// Exact bounded transport and deadline policy.
-    options: DistributedKernelOptions,
-}
-
-/// A completed input download and its bounded KV chunk checksum.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KernelTransfer {
-    /// Exact canonical logical payload length.
-    size: usize,
-    /// SHA-256 of every ordered payload byte.
-    checksum: [u8; 32],
-}
-
-/// A local native terminal state; an absent error means the full execution fence completed successfully.
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct KernelTerminal {
-    /// Absent only after successful whole-execution completion.
-    failure: Option<String>,
-}
-
-/// Functional distributed execution through explicit host staging, with one ordered call at a time.
+/// Functional distributed execution through explicit host transfers, with one ordered call at a time.
 ///
 /// Every participant constructs coordinators and calls them in the same order. For argument `i`, `sources[i]` selects
-/// the process supplying that argument's value; all processes supply their complete local input vector. Source rows may
-/// differ, supporting local data parallel calls, rings and broadcasts without an additional transfer graph. Every
-/// participant uses the same semantic kernel and compiler configuration; its actual local topology is independently
+/// the process supplying that argument's value, and all processes supply their complete local input vector. Source rows
+/// may differ, supporting local data parallel calls, rings, and broadcasts without an additional transfer graph. Every
+/// participant uses the same semantic kernel and compiler configuration. Its actual local topology is independently
 /// validated and included in the collectively acknowledged preflight manifest.
 ///
-/// Setup blocks the host for existing PJRT downloads and uploads; `call_async` then returns a pending native execution.
-/// Inputs are copied into fresh invocation buffers, including locally sourced inputs, so functional read-write aliases
-/// cannot mutate caller-owned inputs. External reference slots and observable I/O are forbidden. Kernel assertions
-/// retain their native failure semantics. Native multi-process meshes and PJRT collective support are not implied.
+/// Setup blocks the host for existing PJRT downloads and uploads, and [`DistributedKernel::call_async`] then returns a
+/// pending native execution. Inputs are copied into fresh invocation buffers, including locally sourced inputs, so
+/// functional read-write aliases cannot mutate caller-owned inputs. External reference slots and observable I/O are
+/// forbidden. Kernel assertions retain their native failure semantics. Native multi-process meshes and PJRT collective
+/// support are not implied.
 ///
 /// Outputs remain private until every participant advertises a successful native fence. This proves completion, not
-/// atomic delivery to every host: a network failure after readiness may prevent one process receiving a result already
-/// visible elsewhere. Cancellation cannot revoke a returned immutable output or abort submitted device work.
-/// The runtime, loaded kernel and their existing client/session resources must outlive this coordinator.
-pub struct DistributedKernel<'r, 'c> {
-    /// Existing loaded kernel; its client/session lifetime is retained by the caller.
-    kernel: &'r LoadedKernel<'c>,
+/// atomic delivery to every host, because a network failure after readiness may prevent one process from receiving a
+/// result already visible elsewhere. Cancellation cannot revoke a returned immutable output or abort submitted device
+/// work. The runtime, the loaded kernel, and their existing client and session resources must outlive this coordinator.
+pub struct DistributedKernel<'o, 'c> {
+    /// Existing loaded kernel, whose client and session lifetime is retained by the caller.
+    kernel: &'o LoadedKernel<'c>,
+
     /// Shared coordination ownership, also retained by pending native completions.
     coordination: Arc<KernelCoordination>,
+
     /// Checked next round within this reserved coordinator.
     round: u64,
+
     /// Canonical logical byte counts for each argument.
     sizes: Vec<usize>,
-    /// Previous pending call; later setup cannot overtake its completion.
+
+    /// Previous pending call, whose completion later setup cannot overtake.
     previous: Option<CoreReferenceCompletion>,
 }
 
-/// Metadata and existing runtime ownership shared with pending completion; no worker or registry is created.
-struct KernelCoordination {
-    /// Existing runtime owner retained through pending completion.
-    runtime: DistributedRuntime,
-    /// Launch identity and unique ordered coordinator reservation.
-    prefix: Vec<u8>,
-    /// Initialization-owned local participant index.
-    process: usize,
-    /// Initialization-owned participant count.
-    processes: usize,
-    /// Checked bounded transport policy.
-    options: DistributedKernelOptions,
-}
-
-impl<'r, 'c> DistributedKernel<'r, 'c> {
+impl<'o, 'c> DistributedKernel<'o, 'c> {
     /// Creates one coordinator over a loaded stateless kernel and an existing distributed runtime.
     /// The initial transport supports one fully addressable device per participant and static array boundaries.
     pub fn new(
         runtime: &DistributedRuntime,
-        kernel: &'r LoadedKernel<'c>,
+        kernel: &'o LoadedKernel<'c>,
         options: DistributedKernelOptions,
     ) -> Result<Self, DistributedKernelError> {
         let options = DistributedKernelOptions::new(options.maximum_transfer_bytes, options.timeout)?
@@ -317,7 +258,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
         if identity.len() > 64 * 1024 || execution.len() > 64 * 1024 {
             return Err(DistributedKernelError::invalid("kernel identity exceeds the coordination metadata budget"));
         }
-        let actual = crate::kernels::KernelExecutionFacts::from_target(domain.target()?, mesh)?.configuration_key()?;
+        let actual = KernelExecutionFacts::from_target(domain.target()?, mesh)?.configuration_key()?;
         if actual != execution {
             return Err(DistributedKernelError::invalid("loaded kernel live execution identity changed"));
         }
@@ -372,9 +313,10 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
     }
 
     /// Starts a call after bounded host preflight and transfers, returning a pending native completion.
-    /// Outputs remain private inside the existing `StatefulExecution` until all participants complete successfully.
+    /// Outputs remain private inside the existing [`StatefulExecution`] until all participants complete successfully.
     /// A later call first awaits this call. Dropping the coordinator and all completion handles drains native work
-    /// and reports abandonment; dropping only the returned handle does not cancel work retained by the coordinator.
+    /// and reports abandonment, while dropping only the returned handle does not cancel work retained by the
+    /// coordinator.
     pub fn call_async(
         &mut self,
         inputs: Vec<Array<'c>>,
@@ -424,7 +366,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
         self.call_async(inputs, sources, cancelled)?.r#await()
     }
 
-    /// Performs ordered agreement, bounded host transfers and the ordinary completion-bearing invocation.
+    /// Performs ordered agreement, bounded host transfers, and the ordinary invocation that carries the completion.
     fn run(
         &self,
         round: u64,
@@ -433,7 +375,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
         cancelled: &AtomicBool,
         deadline: Instant,
     ) -> Result<Execution<Vec<Array<'c>>>, DistributedKernelError> {
-        self.coordination.check(cancelled, deadline)?;
+        self.coordination.validate_progress(cancelled, deadline)?;
         let (domain, types, mesh, identity, execution) = self.kernel.distributed_parts();
         if inputs.len() != types.len()
             || sources.len() != types.len()
@@ -498,7 +440,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
             }
         }
         for (index, input) in inputs.iter().enumerate() {
-            self.coordination.check(cancelled, deadline)?;
+            self.coordination.validate_progress(cancelled, deadline)?;
             input.block_until_ready()?;
             let shard = input.addressable_shards().next().unwrap();
             let buffer =
@@ -510,7 +452,7 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
                     "downloaded input byte count differs from its canonical type",
                 ));
             }
-            self.coordination.check(cancelled, deadline)?;
+            self.coordination.validate_progress(cancelled, deadline)?;
             for (chunk, bytes) in bytes.chunks(self.coordination.options.chunk_bytes).enumerate() {
                 self.coordination.runtime.key_value_store().put(
                     &self.coordination.key(round, self.coordination.process, &format!("input/{index}/{chunk}")),
@@ -553,9 +495,27 @@ impl<'r, 'c> DistributedKernel<'r, 'c> {
             value.block_until_ready()?;
             arguments.push(value);
         }
-        self.coordination.check(cancelled, deadline)?;
+        self.coordination.validate_progress(cancelled, deadline)?;
         Ok(self.kernel.call(arguments)?)
     }
+}
+
+/// Metadata and existing runtime ownership shared with pending completion. No worker or registry is created.
+struct KernelCoordination {
+    /// Existing runtime owner retained through pending completion.
+    runtime: DistributedRuntime,
+
+    /// Launch identity and unique ordered coordinator reservation.
+    prefix: Vec<u8>,
+
+    /// Local participant index owned by runtime initialization.
+    process: usize,
+
+    /// Participant count owned by runtime initialization.
+    processes: usize,
+
+    /// Checked bounded transport policy.
+    options: DistributedKernelOptions,
 }
 
 impl KernelCoordination {
@@ -572,7 +532,7 @@ impl KernelCoordination {
         }
     }
 
-    /// Encodes a fixed, launch-scoped rendezvous key without a process-local registry.
+    /// Encodes a fixed rendezvous key, scoped to the launch, without a process-local registry.
     fn key(&self, round: u64, process: usize, suffix: &str) -> Vec<u8> {
         let mut key = self.prefix.clone();
         key.extend_from_slice(format!("/{round:016x}/{process:08x}/{suffix}").as_bytes());
@@ -604,7 +564,7 @@ impl KernelCoordination {
         deadline: Instant,
     ) -> Result<Vec<u8>, DistributedKernelError> {
         loop {
-            self.check(cancelled, deadline)?;
+            self.validate_progress(cancelled, deadline)?;
             for participant in 0..self.processes {
                 match self.runtime.key_value_store().try_get(&self.key(round, participant, "terminal")) {
                     Ok(bytes) => {
@@ -636,7 +596,7 @@ impl KernelCoordination {
     }
 
     /// Checks cooperative cancellation and the coordination deadline between native operations.
-    fn check(&self, cancelled: &AtomicBool, deadline: Instant) -> Result<(), DistributedKernelError> {
+    fn validate_progress(&self, cancelled: &AtomicBool, deadline: Instant) -> Result<(), DistributedKernelError> {
         if cancelled.load(Ordering::Acquire) {
             return Err(DistributedKernelError::Cancelled);
         }
@@ -647,18 +607,68 @@ impl KernelCoordination {
     }
 }
 
-/// Existing native completion plus owned host coordination; outputs remain in `StatefulExecution`.
+/// One participant's exact preflight record, constructed from its loaded executable and live local topology.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KernelPreflight {
+    /// Sender index owned by runtime initialization.
+    process: usize,
+
+    /// Declared runtime participant count.
+    processes: usize,
+
+    /// Exact canonical identity of the source and the compiler binding.
+    identity: Vec<u8>,
+
+    /// Locally validated plugin and canonical device topology identity.
+    execution: Vec<u8>,
+
+    /// Canonical logical byte counts in input order.
+    sizes: Vec<usize>,
+
+    /// Source process that owns each local argument index.
+    sources: Vec<usize>,
+
+    /// Exact bounded transport and deadline policy.
+    options: DistributedKernelOptions,
+}
+
+/// A completed input download and its bounded KV chunk checksum.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KernelTransfer {
+    /// Exact canonical logical payload length.
+    size: usize,
+
+    /// SHA-256 of every ordered payload byte.
+    checksum: [u8; 32],
+}
+
+/// A local native terminal state. An absent error means the full execution fence completed successfully.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KernelTerminal {
+    /// Absent only after the whole execution completed successfully.
+    failure: Option<String>,
+}
+
+/// Existing native completion plus owned host coordination. Outputs remain in [`StatefulExecution`].
 struct KernelCompletion {
     /// Coordination ownership retained independently of the public output handle.
     coordination: Arc<KernelCoordination>,
+
     /// Ordered call index within the coordinator.
     round: u64,
+
     /// Cooperative coordination deadline.
     deadline: Instant,
-    /// Existing whole-native-execution fence with its resource ownership.
+
+    /// Existing fence over the whole native execution, with its resource ownership.
     fence: ExecutionFence,
+
     /// Shared cooperative cancellation request.
     cancelled: Arc<AtomicBool>,
+
     /// Cached immutable outcome, serialized across completion observers.
     terminal: Mutex<Option<Result<(), Arc<str>>>>,
 }
@@ -669,10 +679,10 @@ impl KernelCompletion {
         if let Err(error) = self.fence.block_until_ready() {
             return Err(self.coordination.report_failure(self.round, error.into()));
         }
-        if let Err(error) = self.coordination.check(&self.cancelled, self.deadline) {
+        if let Err(error) = self.coordination.validate_progress(&self.cancelled, self.deadline) {
             return Err(self.coordination.report_failure(self.round, error));
         }
-        // A lost put acknowledgement is ambiguous: after this attempt, never overwrite readiness with failure.
+        // A lost put acknowledgement is ambiguous, so after this attempt, never overwrite readiness with failure.
         self.coordination.put_json(
             self.round,
             self.coordination.process,
@@ -720,7 +730,7 @@ impl ReferenceCompletionBackend for KernelCompletion {
 impl Drop for KernelCompletion {
     fn drop(&mut self) {
         if self.terminal.get_mut().expect("distributed completion mutex poisoned").is_none() {
-            // Last-handle abandonment drains work and notifies peers; native buffers are never released early.
+            // Abandoning the last handle drains work and notifies peers, and native buffers are never released early.
             let error = match self.fence.block_until_ready() {
                 Ok(()) => DistributedKernelError::Cancelled,
                 Err(error) => error.into(),
@@ -731,18 +741,40 @@ impl Drop for KernelCompletion {
     }
 }
 
+/// Rejects participant sets without a qualified collective completion contract before any native submission.
+pub(crate) fn validate_kernel_participants(client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), KernelEmbeddingError> {
+    let process = client.process_index()?;
+    if mesh.devices().iter().any(|device| device.process_index() != process) {
+        return Err(KernelEmbeddingError::Invalid {
+            message: "cross-process kernel execution requires a qualified collective ordering and completion contract"
+                .to_owned(),
+        });
+    }
+    let addressable = client.addressable_devices()?.iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?;
+    if mesh.devices().iter().any(|device| !addressable.contains(device)) {
+        return Err(KernelEmbeddingError::Invalid {
+            message: "kernel execution requires every mesh device to be addressable by the submitting client"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use pretty_assertions::assert_eq;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
+    use pretty_assertions::assert_eq;
     use ryft_core::{LogicalMesh, MeshAxis, MeshAxisType};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::tests::execution_client;
+    use crate::tests::{cpu_client, execution_client};
 
     use super::*;
 
-    /// Produces a real CPU-loaded scalar identity through the existing AOT persistence fixture.
+    /// Produces a real scalar identity loaded on the CPU through the existing AOT persistence fixture.
     fn loaded<'c>(domain: &crate::Domain<'c>, mesh: &DeviceMesh, compiler_options: u32) -> LoadedKernel<'c> {
         let compiler = crate::kernels::staging::tests::binding(compiler_options);
         crate::kernels::aot::tests::executable_bundle(domain, mesh, ryft_core::DataType::I32, false, &compiler)
@@ -768,16 +800,18 @@ mod tests {
 
     /// Runs real child processes with required sockets, retaining both child statuses for the qualification log.
     fn processes(mode: &str) {
-        use std::process::{Command, Stdio};
-        use std::time::{Duration, Instant};
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("distributed kernel tests require loopback sockets");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap().to_string();
         drop(listener);
         let mut children = (0..2)
             .map(|process| {
                 Command::new(std::env::current_exe().unwrap())
-                    .args(["--exact", "kernels::distributed::tests::test_distributed_kernel_process", "--nocapture"])
+                    .args([
+                        "--exact",
+                        "kernels::distributed::tests::test_distributed_kernel_process",
+                        "--ignored",
+                        "--nocapture",
+                    ])
                     .env("RYFT_KERNEL_PROCESS", process.to_string())
                     .env("RYFT_KERNEL_ADDRESS", &address)
                     .env("RYFT_KERNEL_MODE", mode)
@@ -898,13 +932,11 @@ mod tests {
         processes("late_failure");
     }
 
+    // Child process entry point of the multi-process tests above, which run it with `--ignored`.
     #[test]
+    #[ignore = "child process entry point of the distributed kernel tests"]
     fn test_distributed_kernel_process() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let Ok(process) = std::env::var("RYFT_KERNEL_PROCESS") else {
-            return;
-        };
-        let process = process.parse::<usize>().unwrap();
+        let process = std::env::var("RYFT_KERNEL_PROCESS").unwrap().parse::<usize>().unwrap();
         let address = std::env::var("RYFT_KERNEL_ADDRESS").unwrap();
         let mode = std::env::var("RYFT_KERNEL_MODE").unwrap();
         let plugin = load_cpu_plugin().unwrap();
@@ -960,7 +992,8 @@ mod tests {
                 if process == 0 {
                     assert!(matches!(result, Err(DistributedKernelError::Cancelled)));
                 } else {
-                    assert!(matches!(result, Err(DistributedKernelError::Participant { process: 0, .. })));
+                    assert!(matches!(result, Err(DistributedKernelError::Participant { process: 0, message })
+                        if message == "distributed kernel call cancelled"));
                 }
             }
             "cancel_dispatched" => {
@@ -1037,7 +1070,7 @@ mod tests {
                         Err(ryft_pjrt::Error::NotFound { .. })
                     ));
                 }
-                // The actual loaded source semantics agree; only the validated compiler-binding identities differ.
+                // The actual loaded source semantics agree, and only the validated compiler binding identities differ.
                 assert_eq!(identities[0][0], identities[1][0]);
                 assert_ne!(identities[0][1], identities[1][1]);
             }
@@ -1048,7 +1081,9 @@ mod tests {
                     assert!(matches!(result, Err(DistributedKernelError::Invalid { message })
                     if message == "input count or source-process routing differs from the kernel boundary"));
                 } else {
-                    assert!(matches!(result, Err(DistributedKernelError::Participant { process: 0, .. })));
+                    assert!(matches!(result, Err(DistributedKernelError::Participant { process: 0, message })
+                        if message == "invalid distributed kernel call: \
+                            input count or source-process routing differs from the kernel boundary"));
                 }
             }
             "order" => {
@@ -1072,7 +1107,15 @@ mod tests {
                     assert!(serde_json::from_slice::<KernelTerminal>(&ready).unwrap().failure.is_none());
                     cancelled.store(true, Ordering::Release);
                 }
-                assert!(matches!(pending.r#await(), Err(DistributedKernelError::Completion { .. })));
+                let expected = if process == 0 {
+                    "distributed kernel participant 1 failed: distributed kernel call cancelled"
+                } else {
+                    "distributed kernel call cancelled"
+                };
+                assert!(matches!(
+                    pending.r#await(),
+                    Err(DistributedKernelError::Completion { message }) if message.as_ref() == expected,
+                ));
                 let ready = runtime
                     .key_value_store()
                     .get(&coordinator.coordination.key(0, 0, "terminal"), Duration::from_secs(5))
@@ -1086,7 +1129,12 @@ mod tests {
                     drop(pending);
                     drop(coordinator);
                 } else {
-                    assert!(matches!(pending.r#await(), Err(DistributedKernelError::Completion { .. })));
+                    assert!(matches!(
+                        pending.r#await(),
+                        Err(DistributedKernelError::Completion { message })
+                            if message.as_ref()
+                                == "distributed kernel participant 0 failed: distributed kernel call cancelled",
+                    ));
                 }
             }
             _ => panic!("unexpected process mode"),
@@ -1120,15 +1168,12 @@ mod tests {
             devices,
         )
         .unwrap();
-        assert!(validate_kernel_participants(&client, &mesh).is_ok());
+        validate_kernel_participants(&client, &mesh).unwrap();
     }
 
     #[test]
     fn test_validate_kernel_participants_multiple_local_devices() {
-        let client = load_cpu_plugin()
-            .unwrap()
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
+        let client = cpu_client(2);
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -1142,7 +1187,7 @@ mod tests {
             devices,
         )
         .unwrap();
-        assert!(validate_kernel_participants(&client, &mesh).is_ok());
+        validate_kernel_participants(&client, &mesh).unwrap();
     }
 
     #[test]

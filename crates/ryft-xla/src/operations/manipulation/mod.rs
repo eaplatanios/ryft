@@ -2,31 +2,31 @@
 pub(crate) mod broadcasting;
 /// StableHLO lowering of concatenation operations. Concatenation result refinements resize bounded storage, so
 /// reconciling a different result extent or allocation bound requires finite input and output allocation bounds.
-pub(crate) mod concatenation;
-/// StableHLO lowering of element type conversion operations.
+mod concatenation;
+/// StableHLO lowering of conversion operations (i.e., element type conversions, bitcasts, precision reductions, and
+/// casts between compatible array types).
 pub(crate) mod conversions;
 /// StableHLO lowering of gathering operations.
-pub(crate) mod gathering;
+mod gathering;
 /// StableHLO lowering of memory placement operations.
 pub(crate) mod memory;
 /// StableHLO lowering of padding operations. Padding result refinements resize bounded storage, so reconciling a
 /// different result extent or allocation bound requires finite input and output allocation bounds.
-pub(crate) mod padding;
+mod padding;
 /// StableHLO lowering of reshaping operations.
-pub(crate) mod reshaping;
+mod reshaping;
 /// StableHLO lowering of reversing operations.
-pub(crate) mod reversing;
+mod reversing;
 /// StableHLO lowering of scattering operations.
-pub(crate) mod scattering;
+mod scattering;
 /// StableHLO lowering of slicing operations.
-pub(crate) mod slicing;
+mod slicing;
 /// StableHLO lowering of transposition operations.
-pub(crate) mod transposition;
+mod transposition;
 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::operations::manipulation::indexing::index;
     use ryft_core::{
         ArrayIrType, ArrayOperation, ArrayType, BatchAxis, ConcatenateOperation, DataType, Dimension as CoreDimension,
         DimensionAddOperation, DimensionBounds, DimensionMulOperation, DimensionOperation, DimensionSize,
@@ -34,19 +34,18 @@ mod tests {
         DynamicReshape, DynamicReshapeOperation, DynamicScatter, DynamicSlice, DynamicSliceOperation,
         DynamicSliceWithDimensions, Gather, GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions,
         Indexing, Placeholder, Reshape, Scatter, ScatterMode, ScatterOptions, ScatterReductionKind, Shape,
-        TracingContext, Typed, TypedProgram, ValueProjection, batch,
+        TracingContext, Typed, TypedProgram, ValueProjection, batch, index,
     };
-    use ryft_pjrt::Client;
-    #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::domains::tests::{domain_mesh, read_f64s};
     use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_to_bytes};
     use crate::{Array, Constant, Options, Session};
 
-    /// Checks compiled basic and broadcast advanced reads and repeated indexed updates on the provided backend.
-    fn assert_compiled_indexing(client: &Client<'_>) {
+    #[test]
+    fn test_compiled_indexing() {
+        // Compiled basic and broadcast advanced reads and repeated indexed updates.
+        let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let input_types = vec![
@@ -71,10 +70,10 @@ mod tests {
         )
         .unwrap();
         let bytes = [
-            values_to_bytes(&[0_f64, 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11.]),
-            values_to_bytes(&[2_i64, 0]),
-            values_to_bytes(&[1_i64, 1, 3]),
-            values_to_bytes(&[1_f64; 6]),
+            values_to_bytes(&[0f64, 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11.]),
+            values_to_bytes(&[2i64, 0]),
+            values_to_bytes(&[1i64, 1, 3]),
+            values_to_bytes(&[1f64; 6]),
         ];
         let inputs = input_types
             .into_iter()
@@ -89,12 +88,14 @@ mod tests {
         // A huge negative stride selects only the last row and must not wrap when lowered to signed attributes.
         assert_eq!(outputs[3].shape().as_slice(), &[1, 4]);
         assert_eq!(read_f64s(&client, &outputs[3]), vec![8., 9., 10., 11.]);
-        // Duplicate advanced coordinates contribute twice; the original input remains a value, not a mutable view.
+        // Duplicate advanced coordinates contribute twice, and the original input remains a value, not a mutable view.
         assert_eq!(read_f64s(&client, &outputs[2]), vec![0., 3., 2., 4., 4., 5., 6., 7., 8., 11., 10., 12.]);
     }
 
-    /// Replays one symbolic indexing graph at distinct concrete extents on the provided backend.
-    fn assert_compiled_indexing_symbolic_extent(client: &Client<'_>) {
+    #[test]
+    fn test_compiled_indexing_symbolic_extent() {
+        // One symbolic indexing graph replays at distinct concrete extents.
+        let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let extent = CoreDimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(4, Some(6)).unwrap()));
@@ -150,9 +151,9 @@ mod tests {
             .unwrap();
             let bytes = [
                 values_to_bytes(values),
-                values_to_bytes(&[1_i64, 1, -1]),
-                values_to_bytes(&[10_f64, 20., 30.]),
-                values_to_bytes(&[0_f64; 3]),
+                values_to_bytes(&[1i64, 1, -1]),
+                values_to_bytes(&[10f64, 20., 30.]),
+                values_to_bytes(&[0f64; 3]),
                 values_to_bytes(values),
             ];
             let inputs = input_types
@@ -180,10 +181,10 @@ mod tests {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        // Build each symbolic graph and its pullback once, then replay both at the two concrete signatures in
-        // the pinned JAX oracle, plus empty rows for the conveniences that admit them. Keep dimension residuals
-        // internal to a fused primal/pullback; this verifies retained
-        // graph specialization, without asserting reuse of one bounded executable across physical shapes.
+        // Build each symbolic graph and its pullback once, then replay both at the two concrete signatures in the
+        // pinned JAX oracle, plus empty rows for the conveniences that admit them. Keep dimension residuals internal to
+        // a fused primal and pullback. This verifies retained graph specialization, without asserting reuse of one
+        // bounded executable across physical shapes.
         for name in [
             "reshape",
             "broadcast",
@@ -468,7 +469,7 @@ mod tests {
                         (vec![3, 2, 4], [&values[4..12], &values[4..12], &values[start..start + 8]].concat())
                     }
                     "mapped_source_slice" => {
-                        let expected = [1_usize, 1, 3, 0]
+                        let expected = [1usize, 1, 3, 0]
                             .into_iter()
                             .enumerate()
                             .flat_map(|(column, start)| {
@@ -534,18 +535,18 @@ mod tests {
                     &domain,
                     mesh.clone(),
                 )
-                .unwrap_or_else(|error| panic!("{name}, n={size} native trace: {error}"));
+                .unwrap_or_else(|error| panic!("{name}, n={size} compilation: {error}"));
                 let bytes = [
                     values_to_bytes(&values),
                     if name == "mapped_source_slice" {
-                        values_to_bytes(&[1_i32, 1, 3, 0])
+                        values_to_bytes(&[1i32, 1, 3, 0])
                     } else {
-                        values_to_bytes(&[1_i32, 1, 3][..index_count])
+                        values_to_bytes(&[1i32, 1, 3][..index_count])
                     },
-                    values_to_bytes(&[1_i32]),
-                    values_to_bytes(&[0_i32]),
-                    values_to_bytes(&vec![1_f64; index_count * if name == "column_scatter_query" { size } else { 4 }]),
-                    values_to_bytes(&vec![1_f64; expected.len()]),
+                    values_to_bytes(&[1i32]),
+                    values_to_bytes(&[0i32]),
+                    values_to_bytes(&vec![1f64; index_count * if name == "column_scatter_query" { size } else { 4 }]),
+                    values_to_bytes(&vec![1f64; expected.len()]),
                 ];
                 let inputs = input_types
                     .into_iter()
@@ -561,7 +562,7 @@ mod tests {
                 assert_eq!(outputs[0].shape().as_slice(), output_type.static_shape().unwrap().as_slice());
                 assert_eq!(read_f64s(&client, &outputs[0]), expected, "{name}, n={size}");
                 let mut gradient =
-                    vec![if name == "broadcast" || name == "concatenate" { 2_f64 } else { 1_f64 }; size * 4];
+                    vec![if name == "broadcast" || name == "concatenate" { 2f64 } else { 1f64 }; size * 4];
                 if name == "gather" || name == "gather_axis" {
                     gradient.fill(0.);
                     gradient[4..8].fill(2.);
@@ -595,7 +596,7 @@ mod tests {
                 if name == "mapped_source_slice" {
                     // Each mapped column contributes only to its own clipped window, including the nonleading map.
                     gradient.fill(0.);
-                    for (column, start) in [1_usize, 1, 3, 0].into_iter().enumerate() {
+                    for (column, start) in [1usize, 1, 3, 0].into_iter().enumerate() {
                         let start = start.min(size - 2);
                         gradient[start * 4 + column] = 1.;
                         gradient[(start + 1) * 4 + column] = 1.;
@@ -605,30 +606,5 @@ mod tests {
                 assert_eq!(read_f64s(&client, &outputs[1]), gradient, "{name} pullback, n={size}");
             }
         }
-    }
-
-    #[test]
-    fn test_compiled_indexing() {
-        assert_compiled_indexing(&execution_client());
-    }
-
-    #[cfg(feature = "cuda-13")]
-    #[test]
-    fn test_compiled_indexing_on_cuda() {
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                ..Default::default()
-            }))
-            .unwrap();
-        assert_compiled_indexing(&client);
-        assert_compiled_indexing_symbolic_extent(&client);
-    }
-
-    #[test]
-    fn test_compiled_indexing_symbolic_extent() {
-        assert_compiled_indexing_symbolic_extent(&execution_client());
     }
 }

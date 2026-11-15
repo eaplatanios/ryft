@@ -1,35 +1,38 @@
-//! Typed compiler-output embedding into the existing XLA custom-call and compilation lifecycle.
+//! Typed embedding of compiler outputs into the existing XLA custom call and compilation lifecycle.
 //!
-//! Compiler outputs retain their adapter ownership. An XLA-owned [`KernelOutputEmbedding`] validates and translates
-//! one concrete output type; [`CompiledKernel`] retains the verified source until that selection is complete and
-//! emits the canonical custom call into ordinary staging. Existing XLA lowering, executable caching, persistence,
-//! and PJRT fences then own the program. This module does not introduce a second executable or module cache.
+//! Compiler outputs retain their adapter ownership. A [`KernelOutputEmbedding`], owned by XLA, validates and
+//! translates one concrete output type. [`CompiledKernel`] retains the verified source until that selection is
+//! complete and emits the canonical custom call into ordinary staging. Existing XLA lowering, executable caching,
+//! persistence, and PJRT fences then own the program. This module does not introduce a second executable or module
+//! cache.
 //!
 //! [`stage_kernel`] preserves the complete kernel call through batching, control flow, and rematerialization.
 //! Differentiation requires an explicit [`stage_kernel_with_jvp`], [`stage_kernel_with_vjp`], or pure
-//! [`stage_kernel_with_fallback`] contract, or retained custom derivative rules ([`stage_kernel_with_rules`]).
-//! Specialize scalar-prefetched values with [`KernelDefinition::specialize_prefetch`] before XLA staging; transforms
-//! never read captured device buffers back to the host. Local per-shard compilation retains full sharding metadata and
-//! requires every manual axis to be bound by an enclosing shard map with the same axis descriptor. Automatic
-//! partitioning and collectives are rejected.
+//! [`stage_kernel_with_fallback`] contract, or retained custom derivative rules (i.e., [`stage_kernel_with_rules`]).
+//! Specialize scalar-prefetched values with [`KernelDefinition::specialize_prefetch`] before XLA staging, because
+//! transforms never read captured device buffers back to the host. Local per-shard compilation retains full sharding
+//! metadata and requires every manual axis to be bound by an enclosing shard map with the same axis descriptor.
+//! Automatic partitioning and collectives are rejected.
 //!
 //! [`KernelTuningRequest`] defines a finite, fingerprinted schedule search. Call [`KernelTuner::load`] or
 //! [`KernelTuner::run`] explicitly, sharing a tuner per device and controlling external contention. Samples measure
-//! host submission through actual completion; any runner-owned readback must be part of its declared methodology.
+//! host submission through actual completion, and any readback owned by the runner must be part of its declared
+//! methodology.
 //! Cancellation stops further submissions and awaits work already submitted. Measurements do not imply portable
-//! performance rankings or device-only timing.
+//! performance rankings or timing of device work alone.
 //!
 //! [`KernelAotBundle`] exports checked portable source, [`KernelCompilationReport`], StableHLO, compatibility facts,
 //! and the existing complete executable envelope. Import checks compatibility before native loading and returns a
-//! [`LoadedKernel`] using the ordinary asynchronous execution path. Unsupported source codecs fail explicitly;
+//! [`LoadedKernel`] using the ordinary asynchronous execution path. Unsupported source codecs fail explicitly, and
 //! recompilation after incompatibility is an explicit caller decision. [`DistributedKernel`] coordinates functional
-//! calls over an existing distributed runtime using explicit host staging and the canonical pending completion.
-//! See [`distributed`] for ordering, cancellation, topology admission and publication semantics.
+//! calls over an existing distributed runtime using explicit host transfers and the canonical pending completion.
+//! See [`distributed`] for ordering, cancellation, topology admission, and publication semantics.
 //!
-//! The optional `triton` feature adds direct typed-TTIR compilation with `TritonEmbedding`. CUDA artifacts reuse
-//! [`CudaKernelEmbedding`]; ROCm artifacts use a HIP runtime extension enabled by `rocm`. Both retain the same
-//! staging, persistence and whole-execution completion path. Compiler-free Triton AOT loading reconstructs the
-//! binding with recorded compiler configuration; it still requires a compatible runtime and device. AMD hardware
+//! The optional `triton` feature adds direct typed TTIR compilation with `TritonEmbedding`. CUDA artifacts reuse
+//! [`CudaKernelEmbedding`], and ROCm artifacts use a HIP runtime extension enabled by `rocm`. Both retain the same
+//! staging, persistence, and completion path over the whole execution. Triton AOT loading without a compiler
+//! reconstructs the binding with recorded compiler configuration, but it still requires a compatible runtime and
+//! device. AMD hardware
 //! execution remains unqualified, and unsupported portable operations fail before native compilation.
 
 // TODO(eaplatanios): Review this module.
@@ -57,7 +60,7 @@ mod cuda;
 mod cutile;
 pub mod distributed;
 #[cfg(feature = "mosaic-gpu")]
-pub(crate) mod mosaic;
+mod mosaic;
 #[cfg(feature = "rocm")]
 mod rocm;
 mod staging;
@@ -88,31 +91,16 @@ pub use staging::{
 #[cfg(feature = "rocm")]
 pub use rocm::RocmKernelEmbedding;
 
-/// Typed FFI target used by persisted ROCm kernel calls.
-pub const ROCM_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.rocm";
-
 pub use cuda::{
     CUDA_KERNEL_CUSTOM_CALL_TARGET, CudaKernelBufferBinding, CudaKernelEmbedding, CudaKernelParameterBinding,
 };
-
-/// Returns available native kernel providers without initializing their drivers.
-pub(crate) fn runtime_providers<'c>() -> Vec<Arc<dyn RuntimeProvider<'c> + 'c>> {
-    #[cfg(feature = "rocm")]
-    {
-        vec![cuda::runtime_provider(), rocm::runtime_provider()]
-    }
-    #[cfg(not(feature = "rocm"))]
-    {
-        vec![cuda::runtime_provider()]
-    }
-}
 
 // TODO(eaplatanios): Promote kernel embedding errors to dedicated `ryft_xla::Error` variants after
 // this support leaves experimental status.
 /// Invalid compiler output or unsupported XLA embedding contract.
 #[derive(Debug, Error)]
 pub enum KernelEmbeddingError {
-    /// PJRT registration or execution-context setup failed.
+    /// PJRT registration or execution context setup failed.
     #[error(transparent)]
     Runtime(#[from] ryft_pjrt::Error),
 
@@ -133,7 +121,7 @@ pub enum KernelEmbeddingError {
     #[error("kernel compilation failed: {0}")]
     Compiler(#[source] Box<dyn std::error::Error + Send + Sync>),
 
-    /// A canonical type or custom-call alias check failed.
+    /// A canonical type or custom call alias check failed.
     #[error(transparent)]
     Type(#[from] TypeError),
 
@@ -147,7 +135,7 @@ pub enum KernelEmbeddingError {
     /// This bridge cannot represent an externally observable effect of the kernel.
     #[error("kernel embedding does not support external effect `{effect}`")]
     UnsupportedEffect {
-        /// Effect that requires a separate supported token/handler contract.
+        /// Effect that requires a separate supported token and handler contract.
         effect: EffectClass,
     },
 }
@@ -167,19 +155,23 @@ impl From<ryft_kernels::KernelError> for crate::Error {
     }
 }
 
-/// XLA-owned conversion of one adapter-owned compiler output into a canonical custom call.
+/// Typed FFI target used by persisted ROCm kernel calls.
+pub const ROCM_KERNEL_CUSTOM_CALL_TARGET: &str = "ryft.kernel.rocm";
+
+/// Conversion, owned by XLA, of one compiler output owned by an adapter into a canonical custom call.
 ///
-/// Implementations are trusted integration code: they must validate the output's version, physical argument map,
+/// Implementations are trusted integration code, so they must validate the output's version, physical argument map,
 /// required buffers, target requirements, and serialized payload before returning. An adapter output never needs to
-/// depend on this trait: XLA integration implements the trait for its own bridge over the foreign output type.
-/// Ready and deferred outputs use the same boundary; a deferred bridge additionally validates its native decoder
-/// and compiler-input schema. Registration and target capability checks must precede native loading or execution.
+/// depend on this trait, because the XLA integration implements the trait for its own bridge over the foreign output
+/// type. Ready and deferred outputs use the same boundary, and a deferred bridge additionally validates its native
+/// decoder and compiler input schema. Registration and target capability checks must precede native loading or
+/// execution.
 ///
 /// [`CompiledKernel`] independently validates the logical signature, operation-local aliases, and effects, adds
-/// semantic/compiler identity, and discharges only the definition's proven-local reference state. A bridge cannot
-/// request external reference-state slots or alter the kernel's logical inputs and results. An embedding implementing
-/// native checked assertions must return precisely [`EffectClass::OrderedAssertion`], preserving their token chain;
-/// a pure call cannot discharge or silently discard an observable assertion.
+/// semantic and compiler identity, and discharges only the reference state that the definition proves local. A bridge
+/// cannot request external reference state slots or alter the kernel's logical inputs and results. An embedding
+/// implementing native checked assertions must return precisely [`EffectClass::OrderedAssertion`], preserving their
+/// token chain, because a pure call cannot discharge or silently discard an observable assertion.
 pub trait KernelOutputEmbedding<Output, Extension: CoreOperation<Type = ArrayIrType> = NoKernelExtension> {
     /// Returns deterministic bytes covering target names, physical mappings, payload schemas, and plugin ABI facts.
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError>;
@@ -192,9 +184,9 @@ pub trait KernelOutputEmbedding<Output, Extension: CoreOperation<Type = ArrayIrT
     ) -> Result<CustomCallOperation, KernelEmbeddingError>;
 }
 
-/// Selected compiler output together with the immutable source definition and its canonical custom-call embedding.
+/// Selected compiler output together with the immutable source definition and its canonical custom call embedding.
 ///
-/// Selection is explicit; no constructor falls back to another compiler. The retained definition prevents an opaque
+/// Selection is explicit, and no constructor falls back to another compiler. The retained definition prevents an opaque
 /// payload from masquerading as an unverified kernel. Binding emits the selected custom call only after validating
 /// the exact logical inputs. Its attributes participate in existing StableHLO-based compilation and persistence keys.
 #[derive(Clone, Debug)]
@@ -233,10 +225,10 @@ where
         Self::from_output(kernel, &configuration, &output, embedding)
     }
 
-    /// Embeds an already available typed output, permitting runtime-only use when its native format supports it.
-    /// `configuration` must be the complete key emitted by the compiler that produced `output`; an integration must
-    /// validate persisted adapter/schema/plugin compatibility before invoking this constructor on reloaded output.
-    /// The embedding configuration is independently included in the resulting custom-call identity.
+    /// Embeds an already available typed output, permitting use with only a runtime when its native format supports
+    /// it. `configuration` must be the complete key emitted by the compiler that produced `output`, and an integration
+    /// must validate persisted adapter, schema, and plugin compatibility before invoking this constructor on reloaded
+    /// output. The embedding configuration is independently included in the resulting custom call identity.
     pub fn from_output<Output, B: KernelOutputEmbedding<Output, Extension>>(
         kernel: &VerifiedKernel<'_, Extension>,
         configuration: &[u8],
@@ -343,7 +335,7 @@ where
     }
 
     /// Binds the selected call through ordinary staging or an existing compilation domain after exact input checking.
-    /// External reference-state arguments are absent; all operands and outputs are ordinary array values.
+    /// External reference state arguments are absent, and all operands and outputs are ordinary array values.
     pub fn bind<C>(&self, context: &C, inputs: &[C::Value]) -> Result<Vec<C::Value>, ProgramError>
     where
         C: Context<Type = ArrayIrType, Operation: From<CustomCallOperation>>,
@@ -356,7 +348,19 @@ where
     }
 }
 
-/// Validates the native memref ABI and fixes complete row-major operand/result layouts, including default types.
+/// Returns available native kernel providers without initializing their drivers.
+pub(crate) fn runtime_providers<'c>() -> Vec<Arc<dyn RuntimeProvider<'c> + 'c>> {
+    #[cfg(feature = "rocm")]
+    {
+        vec![cuda::runtime_provider(), rocm::runtime_provider()]
+    }
+    #[cfg(not(feature = "rocm"))]
+    {
+        vec![cuda::runtime_provider()]
+    }
+}
+
+/// Validates the native memref ABI and fixes complete row-major operand and result layouts, including default types.
 pub(crate) fn dense_memory_layouts(
     inputs: &[ArrayType],
     outputs: &[ArrayType],
@@ -391,7 +395,8 @@ pub(crate) fn dense_memory_layouts(
     })
 }
 
-/// Requires already-local manual shards; adapter selection never synthesizes partitioning or a collective.
+/// Requires manual shards that are already local, because adapter selection never synthesizes partitioning or a
+/// collective.
 pub(crate) fn validate_kernel_sharding(
     parameters: &[ArrayType],
     bound_axes: &BTreeMap<String, MeshAxis>,
@@ -429,20 +434,21 @@ pub(crate) mod tests {
     use std::convert::Infallible;
     use std::error::Error as StandardError;
 
-    use indoc::formatdoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrOperation, ArrayIrValue, Context, DataType, Placeholder,
-        ProgramBuilder as CoreProgramBuilder, ReferenceRead, ReferenceWrite, ShardingError,
+        Array as CoreArray, ArrayIrOperation, ArrayIrValue, ArrayOperation, Context, DataType, LogicalMesh, MeshAxis,
+        Placeholder, ProgramBuilder as CoreProgramBuilder, ReferenceRead, ReferenceWrite, Sharding, ShardingError,
+        TiledLayout, Tracer as CoreTracer, TracingContext,
     };
     use ryft_kernels::{
-        BlockMapping, BoundaryPolicy, Grid, KernelCallOperation, KernelCompilationError, KernelParameter,
-        KernelParameterAccess,
+        BlockMapping, BoundaryPolicy, Grid, KernelCallOperation, KernelCompilationError,
+        KernelOperation as PortableKernelOperation, KernelParameter, KernelParameterAccess,
     };
 
-    use crate::Constant;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::operations::ProgramBuilder;
+    use crate::{Constant, Operation};
 
     use super::*;
 
@@ -484,6 +490,7 @@ pub(crate) mod tests {
         fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
             Ok(b"ryft.test.deferred_copy.schema1".to_vec())
         }
+
         fn custom_call(
             &self,
             kernel: &VerifiedKernel<'_>,
@@ -517,32 +524,37 @@ pub(crate) mod tests {
 
         fn admit(
             &self,
-            _kernel: &VerifiedKernel<'_>,
+            kernel: &VerifiedKernel<'_>,
             target: &bool,
-            _options: &u32,
-            _schedule: &KernelSchedule,
+            options: &u32,
+            schedule: &KernelSchedule,
         ) -> Result<(), KernelCompilationError<Infallible>> {
+            let _ = (kernel, options, schedule);
             if *target {
                 Ok(())
             } else {
                 Err(KernelCompilationError::Unavailable { message: "fixture target unavailable".to_owned() })
             }
         }
+
         fn configuration_key(
             &self,
-            _target: &bool,
+            target: &bool,
             options: &u32,
-            _schedule: &KernelSchedule,
+            schedule: &KernelSchedule,
         ) -> Result<Vec<u8>, KernelCompilationError<Infallible>> {
+            let _ = (target, schedule);
             Ok(options.to_le_bytes().to_vec())
         }
+
         fn compile(
             &self,
-            _kernel: &VerifiedKernel<'_>,
-            _target: &bool,
-            _options: &u32,
-            _schedule: &KernelSchedule,
+            kernel: &VerifiedKernel<'_>,
+            target: &bool,
+            options: &u32,
+            schedule: &KernelSchedule,
         ) -> Result<DeferredCopy, KernelCompilationError<Infallible>> {
+            let _ = (kernel, target, options, schedule);
             Ok(DeferredCopy { schema: 1 })
         }
     }
@@ -585,7 +597,8 @@ pub(crate) mod tests {
         assert!(first.custom_call().effects().classes().is_empty());
         assert!(matches!(
             CompiledKernel::from_compiler(&verified, &Compiler, &false, &1, &schedule, &DeferredEmbedding),
-            Err(KernelEmbeddingError::Compiler(_))
+            Err(KernelEmbeddingError::Compiler(error))
+                if error.to_string() == "kernel compiler is unavailable: fixture target unavailable",
         ));
     }
 
@@ -646,16 +659,40 @@ pub(crate) mod tests {
         let compiled =
             CompiledKernel::from_output(&verified, b"configuration", &DeferredCopy { schema: 1 }, &DeferredEmbedding)
                 .unwrap();
-        let metadata = compiled.custom_call().to_string();
-        assert!(metadata.contains("ryft.kernel.provenance"));
-        assert!(metadata.contains("copy_output"));
-        assert!(metadata.contains("ryft.kernel.semantic"));
+        assert_eq!(
+            compiled.custom_call().to_string(),
+            indoc! {r#"
+                custom_call [
+                    target=ryft.test.deferred_copy,
+                    deferred.schema=1,
+                    ryft.kernel.schema=2,
+                    ryft.kernel.semantic="a13779bf5aa2b6f0aa69c7a71dcdf0702cf41862d7f35b5c0a06ff82d257bc77",
+                    ryft.kernel.configuration="9b504f8715e50a1265774108552c85c4822b04e39355818c680592419a1e0f7d",
+                    ryft.kernel.provenance="[\"copy_output\"]",
+                    input_output_alias=0->0,
+                ]
+            "#}
+            .trim_end(),
+        );
         let unknown = super::tests::definition();
         let unknown = VerifiedKernel::new(&unknown, 1).unwrap();
         let compiled =
             CompiledKernel::from_output(&unknown, b"configuration", &DeferredCopy { schema: 1 }, &DeferredEmbedding)
                 .unwrap();
-        assert!(!compiled.custom_call().to_string().contains("ryft.kernel.provenance"));
+        assert_eq!(
+            compiled.custom_call().to_string(),
+            indoc! {r#"
+                custom_call [
+                    target=ryft.test.deferred_copy,
+                    deferred.schema=1,
+                    ryft.kernel.schema=2,
+                    ryft.kernel.semantic="a13779bf5aa2b6f0aa69c7a71dcdf0702cf41862d7f35b5c0a06ff82d257bc77",
+                    ryft.kernel.configuration="9b504f8715e50a1265774108552c85c4822b04e39355818c680592419a1e0f7d",
+                    input_output_alias=0->0,
+                ]
+            "#}
+            .trim_end(),
+        );
     }
 
     #[test]
@@ -672,15 +709,18 @@ pub(crate) mod tests {
     fn test_compiled_kernel_from_output_rejects_changed_aliases_and_effects() {
         /// Supplies an intentionally mismatched typed embedding to test the independent logical checks.
         struct ChangedEmbedding(bool);
+
         impl KernelOutputEmbedding<()> for ChangedEmbedding {
             fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
                 Ok(b"ryft.test.changed.schema1".to_vec())
             }
+
             fn custom_call(
                 &self,
-                _kernel: &VerifiedKernel<'_>,
-                _output: &(),
+                kernel: &VerifiedKernel<'_>,
+                output: &(),
             ) -> Result<CustomCallOperation, KernelEmbeddingError> {
+                let _ = (kernel, output);
                 let operation = CustomCallOperation::new("test.changed", vec![ArrayType::scalar(DataType::I32)]);
                 if self.0 {
                     Ok(operation.with_input_output_alias(0, 0)?.with_effect_class(EffectClass::OrderedIo))
@@ -704,9 +744,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_compiled_kernel_from_output_rejects_external_body_effects() {
-        use ryft_core::ArrayOperation;
-        use ryft_kernels::KernelOperation as PortableKernelOperation;
-
         for effect in [EffectClass::OrderedIo, EffectClass::OrderedState, EffectClass::OrderedAssertion] {
             let logical = definition().operation().clone();
             let mut builder = CoreProgramBuilder::<ArrayIrValue<CoreArray>, PortableKernelOperation>::new();
@@ -729,6 +766,91 @@ pub(crate) mod tests {
                 Err(KernelEmbeddingError::UnsupportedEffect { effect: actual }) if actual == effect,
             ));
         }
+    }
+
+    #[test]
+    fn test_compiled_kernel_from_output_rejects_invalid_custom_calls() {
+        /// Returns a fixed custom call so that each test case isolates one boundary check.
+        struct FixedEmbedding(CustomCallOperation);
+
+        impl KernelOutputEmbedding<()> for FixedEmbedding {
+            fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
+                Ok(b"ryft.test.fixed.schema1".to_vec())
+            }
+
+            fn custom_call(
+                &self,
+                kernel: &VerifiedKernel<'_>,
+                output: &(),
+            ) -> Result<CustomCallOperation, KernelEmbeddingError> {
+                let _ = (kernel, output);
+                Ok(self.0.clone())
+            }
+        }
+
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let scalar = ArrayType::scalar(DataType::I32);
+        let changed_output = CustomCallOperation::new("test.fixed", vec![ArrayType::scalar(DataType::F32)]);
+        assert!(matches!(
+            CompiledKernel::from_output(&verified, b"config", &(), &FixedEmbedding(changed_output)),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "compiler output types differ from the logical kernel results",
+        ));
+        let empty_target = CustomCallOperation::new("", vec![scalar.clone()]).with_input_output_alias(0, 0).unwrap();
+        assert!(matches!(
+            CompiledKernel::from_output(&verified, b"config", &(), &FixedEmbedding(empty_target)),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "custom-call target must be nonempty and contain no NUL",
+        ));
+        let reserved_attribute = CustomCallOperation::new("test.fixed", vec![scalar])
+            .with_input_output_alias(0, 0)
+            .unwrap()
+            .with_attribute("ryft.kernel.schema", 1i64);
+        assert!(matches!(
+            CompiledKernel::from_output(&verified, b"config", &(), &FixedEmbedding(reserved_attribute)),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "duplicate or reserved custom-call attribute `ryft.kernel.schema`",
+        ));
+    }
+
+    #[test]
+    fn test_compiled_kernel_bind() {
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let compiled =
+            CompiledKernel::from_output(&verified, b"configuration", &DeferredCopy { schema: 1 }, &DeferredEmbedding)
+                .unwrap();
+        let (_, program) = TracingContext::<Constant, Operation>::trace(
+            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| compiled.bind(inputs[0].context(), &inputs),
+            vec![ArrayIrType::Array(ArrayType::scalar(DataType::I32))],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {r#"
+                lambda %0:i32[] .
+                let %1:i32[] = custom_call [
+                    target=ryft.test.deferred_copy,
+                    deferred.schema=1,
+                    ryft.kernel.schema=2,
+                    ryft.kernel.semantic="a13779bf5aa2b6f0aa69c7a71dcdf0702cf41862d7f35b5c0a06ff82d257bc77",
+                    ryft.kernel.configuration="9b504f8715e50a1265774108552c85c4822b04e39355818c680592419a1e0f7d",
+                    input_output_alias=0->0,
+                ] %0
+                in (%1)
+            "#}
+            .trim_end(),
+        );
+        let error = TracingContext::<Constant, Operation>::trace(
+            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| compiled.bind(inputs[0].context(), &inputs),
+            vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::Type(TypeError::invalid("compiled kernel input types do not match its logical signature")),
+        );
     }
 
     #[test]
@@ -777,10 +899,9 @@ pub(crate) mod tests {
         "#}
         );
     }
+
     #[test]
     fn test_dense_memory_layouts() {
-        use ryft_core::TiledLayout;
-
         let matrix = ArrayType::new_static(DataType::F32, [2, 3]);
         let scalar = ArrayType::new_static(DataType::F32, []);
         let layouts = dense_memory_layouts(&[matrix.clone(), scalar.clone()], &[matrix.clone()], "mosaic GPU").unwrap();
@@ -802,8 +923,6 @@ pub(crate) mod tests {
 
     #[test]
     fn test_validate_kernel_sharding() {
-        use ryft_core::{LogicalMesh, MeshAxis, Sharding};
-
         let mesh = LogicalMesh::new(vec![MeshAxis::new("device", 2, MeshAxisType::Manual).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::Sharded(vec!["device".to_owned()])])
             .unwrap()
@@ -811,7 +930,7 @@ pub(crate) mod tests {
             .unwrap();
         let local = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
         let bound = BTreeMap::from([("device".to_owned(), mesh.axes()[0].clone())]);
-        assert!(validate_kernel_sharding(&[local.clone()], &bound).is_ok());
+        validate_kernel_sharding(&[local.clone()], &bound).unwrap();
         assert!(matches!(
             validate_kernel_sharding(&[local.clone()], &BTreeMap::new()),
             Err(KernelEmbeddingError::Invalid { message })
@@ -827,7 +946,7 @@ pub(crate) mod tests {
         let replicated = ArrayType::new_static(DataType::F32, [8])
             .with_sharding(Sharding::replicated(mesh.clone(), 1))
             .unwrap();
-        assert!(validate_kernel_sharding(&[replicated], &BTreeMap::new()).is_ok());
+        validate_kernel_sharding(&[replicated], &BTreeMap::new()).unwrap();
         let unconstrained = ArrayType::new_static(DataType::F32, [8])
             .with_sharding(Sharding::new(mesh, vec![ShardingDimension::Unconstrained]).unwrap())
             .unwrap();

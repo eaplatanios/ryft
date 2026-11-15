@@ -45,6 +45,32 @@ pub(crate) fn lower_replication_constraint<'b, 'c: 'b, 't: 'c>(
     Ok(lower_constraint(&[input_value], &replicated, axes, bound_manual_axes, block, location, true)?[0])
 }
 
+impl LowerableOperation for ConstrainShardingOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
+        // The constraint is untracked, so the output type is the input type, and the emitted constraint must
+        // carry the input's tracked placement alongside the constraint's own auto-axis placement. Unlike a tracked
+        // placement, the constraint does describe the placement along auto axes, so its dimensions stay closed.
+        check_count!("output", output_types, 1, ProgramError);
+        let sharding = self.lowered_sharding(&output_types[0]).map_err(ProgramError::from)?;
+        lower_constraint(
+            input_values,
+            &sharding,
+            &[],
+            lowerer.collective_state().bound_manual_axes(),
+            &mut lowerer.block(),
+            lowerer.location(),
+            false,
+        )
+    }
+}
+
 /// Lowers a tensor placement constraint after excluding mesh axes bound by enclosing manual regions, whose dimensions
 /// are open over auto axes when `open_over_auto_axes` is set, except for `closed_dimensions` (refer to
 /// [`ShardyTensorSharding`]).
@@ -59,7 +85,8 @@ fn lower_constraint<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     check_count!("input", input_values, 1, ProgramError);
     // Bound manual axes describe ownership outside this local tensor and cannot appear on constraints inside the
-    // manual region. Restrict only the attribute's mesh inventory; its symbol still names the module's full mesh.
+    // manual region. Restrict only the attribute's mesh inventory, because its symbol still names the module's full
+    // mesh.
     let local_sharding;
     let sharding = if bound_manual_axes.is_empty() {
         sharding
@@ -107,30 +134,217 @@ fn lower_constraint<'b, 'c: 'b, 't: 'c>(
         .to_mlir(location)?;
     let operation =
         block.append_operation(shardy::sharding_constraint(input_values[0], sharding_attribute, location)?)?;
-    Ok(vec![operation.result(0).expect("sdy.sharding_constraint should return one result").as_ref()])
+    Ok(vec![operation.result(0).unwrap().as_ref()])
 }
 
-impl LowerableOperation for ConstrainShardingOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        // The constraint is untracked, so the output type is the input type, and the emitted constraint must
-        // carry the input's tracked placement alongside the constraint's own auto-axis placement. Unlike a tracked
-        // placement, the constraint does describe the placement along auto axes, so its dimensions stay closed.
-        check_count!("output", output_types, 1, ProgramError);
-        let sharding = self.lowered_sharding(&output_types[0]).map_err(ProgramError::from)?;
-        lower_constraint(
-            input_values,
-            &sharding,
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+    use ryft_core::{
+        ConstrainSharding, DataType, Dimension as CoreDimension, MeshAxis, MeshAxisType, Operation as CoreOperation,
+        Shape, ShardMapBoundary, Sin,
+    };
+    use ryft_mlir::{Context as MlirContext, Location};
+
+    use crate::domains::tests::two_device_mesh;
+    use crate::lowering::CollectiveLoweringState;
+    use crate::lowering::types::lower_tensor_type;
+    use crate::operations::Operation;
+    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
+    use crate::{Array, CompiledFunction, Options, Session, compile_with_options};
+
+    use super::*;
+
+    /// Returns the mesh with the manual axis `m`, the explicit axis `x`, and the auto axis `y`, each of size two.
+    fn test_mesh() -> LogicalMesh {
+        LogicalMesh::new(vec![
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap()
+    }
+
+    /// Returns the `f32[4, 2]` type placed along `x` on its first dimension.
+    fn test_input_type() -> ArrayType {
+        let sharding =
+            Sharding::new(test_mesh(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                .unwrap();
+        ArrayType::new_static(ryft_core::DataType::F32, [4, 2]).with_sharding(sharding).unwrap()
+    }
+
+    #[test]
+    fn test_lower_sharding_constraint() {
+        // The constraints are rendered outside any function, so their detached operands print as unknown SSA values.
+        let input_type = test_input_type();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let outputs = lower_sharding_constraint(
+            &[input],
+            input_type.sharding().unwrap(),
             &[],
-            &lowerer.collective_state.bound_manual_axes,
-            &mut lowerer.block,
-            lowerer.location,
-            false,
+            &mut block.as_ref(),
+            location.as_ref(),
         )
+        .unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(outputs, vec![operations[0].result(0).unwrap().as_ref()]);
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{"x", ?}, {?}], replicated={"m"}> : tensor<4x2xf32>"#
+            ],
+        );
+    }
+
+    #[test]
+    fn test_lower_replication_constraint() {
+        let input_type = test_input_type();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let output = lower_replication_constraint(
+            input,
+            input_type.sharding().unwrap(),
+            &[0],
+            &[],
+            &mut block.as_ref(),
+            location.as_ref(),
+        )
+        .unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(output, operations[0].result(0).unwrap().as_ref());
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{}, {?}], replicated={"m", "x"}> : tensor<4x2xf32>"#
+            ],
+        );
+    }
+
+    #[test]
+    fn test_constrain_sharding_operation_lower() {
+        let input_type = test_input_type();
+        let mesh = test_mesh().with_axis_types(["y"], MeshAxisType::Auto).unwrap();
+        let constraint =
+            Sharding::new(mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])]).unwrap();
+        let operation = ConstrainShardingOperation::new(constraint);
+        let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+        let outputs = operation.lower(&mut lowerer, &[input], &[input_type], &output_types).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(outputs, vec![operations[0].result(0).unwrap().as_ref()]);
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![
+                r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{"x"}, {"y"}], replicated={"m"}> : tensor<4x2xf32>"#
+            ],
+        );
+    }
+
+    #[test]
+    fn test_constrain_sharding_operation_lower_omits_bound_manual_axes() {
+        // Inside a manual region over `m`, the constraint names neither `m` nor its unreduced state. Dropping every
+        // unreduced axis also drops the kind of the pending reduction, which falls back to the default sum kind.
+        let mesh = test_mesh();
+        let input_type = ArrayType::new_static(ryft_core::DataType::F32, [4, 2])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["m"])
+                    .unwrap()
+                    .with_unreduced_kind(UnreducedKind::Max)
+                    .unwrap(),
+            )
+            .unwrap();
+        let operation = ConstrainShardingOperation::new(
+            Sharding::new(mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                .unwrap(),
+        );
+        let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let input = block.argument(0).unwrap().as_ref();
+        let state = CollectiveLoweringState::new()
+            .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), vec!["m".to_string()]).unwrap());
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> =
+            Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state);
+        operation.lower(&mut lowerer, &[input], &[input_type], &output_types).unwrap();
+        let operations = block.operations().unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(
+            operations.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec![r#"%0 = sdy.sharding_constraint <<UNKNOWN SSA VALUE>> <@mesh, [{"x"}, {}]> : tensor<4x2xf32>"#],
+        );
+    }
+
+    #[test]
+    fn test_constrain_sharding_operation_lower_executes_on_cpu() {
+        // `ConstrainSharding::constrain_sharding` works inside a function compiled with `compile` over an auto mesh
+        // axis. The propagation hint is staged into the trace and lowers to `sdy.sharding_constraint`, and the output
+        // array carries the sharding derived from its input on each device.
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(&client, MeshAxisType::Auto);
+        let engine = Session::new(&client).domain();
+
+        let shape = Shape::new(vec![CoreDimension::Static(4)]);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new(DataType::F32, shape);
+        let target_sharding = sharded.clone();
+
+        // The user invokes `constrain_sharding` directly inside the staged closure, so it is compiled into the same
+        // MLIR program as the rest of the function body. Types record no placement over auto mesh axes,
+        // so the input placement is an `input_shardings` override.
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile_with_options(
+            move |x| {
+                let constrained = x.constrain_sharding(&target_sharding).unwrap();
+                constrained.sin().unwrap()
+            },
+            input_type.clone(),
+            &engine,
+            Options::new(mesh.clone()).with_input_shardings(vec![sharded.clone()]),
+        )
+        .unwrap();
+
+        let values = [0.0f32, 0.5, 1.0, 1.5];
+        let source = Array::from_host_buffer_with_sharding(
+            &engine,
+            input_type,
+            sharded.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
+        assert_eq!(output.sharding(), &sharded);
+
+        let mut observed: Vec<f32> = Vec::with_capacity(values.len());
+        for device in client.addressable_devices().unwrap().iter().take(2) {
+            let device_id = device.id().unwrap();
+            let shard_bytes = output
+                .device_shard(device_id)
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap();
+            observed.extend(values_from_bytes::<f32>(shard_bytes.as_slice()));
+        }
+        for (got, &input) in observed.iter().zip(values.iter()) {
+            assert!((got - input.sin()).abs() < 1e-5, "got {got}, expected ~{}", input.sin());
+        }
     }
 }

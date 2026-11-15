@@ -1,3 +1,7 @@
+//! Crate error type of `ryft-xla`. [`Error`] is the single error type that public `ryft-xla` entry points return. It
+//! groups conditions owned by this crate (e.g., [`LoweringError`] and [`CompilationError`]), keeps foreign `ryft-core`,
+//! PJRT, and MLIR errors in their canonical carriers, and carries errors of typed extensions in [`Error::Custom`].
+
 use std::sync::Arc;
 
 use ryft_core::{
@@ -9,12 +13,12 @@ use ryft_pjrt::Error as PjrtError;
 
 use crate::{ArrayError, CompilationError, ExecutionError, LoweringError, RuntimeError};
 
-/// Errors returned by array preparation, tracing, lowering, compilation, and execution in `ryft-xla`. XLA-owned
-/// conditions are grouped by their owning contracts, while foreign errors keep their canonical carriers. Public entry
+/// Errors returned by array preparation, tracing, lowering, compilation, and execution in `ryft-xla`. Conditions
+/// owned by XLA are grouped by their owning contracts, while foreign errors keep their canonical carriers. Public entry
 /// points return this type even when their failure is owned by a more specific group. Batching and differentiation
 /// errors first convert through [`ProgramError`], preserving normalized core payloads. Core and array errors are
-/// boxed to keep this carrier compact. Converting either payload allocates one box on the error path, and cloning the
-/// error clones its boxed payload.
+/// boxed to keep this carrier compact. Converting either payload allocates one box on the error path, and cloning
+/// the error clones its boxed payload.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -263,6 +267,23 @@ mod tests {
             ),
         ));
         assert_eq!(reference.to_string(), "reference is frozen");
+
+        // Errors of the individual core components convert into the corresponding core error.
+        let parameter = ParameterError::MissingParameters { expected_count: 2, paths: None };
+        let layout = LayoutError::InvalidLayout { message: "tile is empty".into() };
+        let sharding = ShardingError::EmptyMeshAxisName;
+        let axis = AxisError::DuplicateAxis { axis: 1 };
+        let r#type = TypeError::invalid("type is invalid");
+        for (error, expected) in [
+            (Error::from(parameter.clone()), CoreError::from(parameter)),
+            (Error::from(layout.clone()), CoreError::from(layout)),
+            (Error::from(sharding.clone()), CoreError::from(sharding)),
+            (Error::from(axis.clone()), CoreError::from(axis)),
+            (Error::from(r#type.clone()), CoreError::from(r#type)),
+        ] {
+            let Error::Core(core_error) = error else { unreachable!() };
+            assert_eq!(*core_error, expected);
+        }
 
         let dimension =
             DimensionError::ExtentExceedsBackendWidth { value: i32::MAX as usize + 1, maximum: i32::MAX as usize };

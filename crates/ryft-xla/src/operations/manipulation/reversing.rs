@@ -9,16 +9,17 @@ impl LowerableOperation for ReverseOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
+        input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::reverse(
+        let _ = input_types;
+        let result = lowerer.block().append_operation(stable_hlo::reverse(
             input_values[0],
             self.axes()
                 .normalize(output_types[0].rank())
                 .map_err(|error| ProgramError::from(TypeError::invalid(error.to_string())))?
                 .as_slice(),
-            lowerer.location,
+            lowerer.location(),
         )?)?;
         Ok(vec![result.result(0).unwrap().as_ref()])
     }
@@ -40,7 +41,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lower_reverse() {
+    fn test_reverse_operation_lower() {
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F64, [3]));
         let output = builder.add_instruction(ReverseOperation::new([-1]), Vec::new(), vec![input], None).unwrap()[0];
@@ -71,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_reverse_dynamic_extent() {
+    fn test_reverse_operation_lower_dynamic_extent() {
         let mut builder = ProgramBuilder::new();
         let input =
             builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("length", Some(5))])));

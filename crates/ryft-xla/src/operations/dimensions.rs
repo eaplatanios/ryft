@@ -11,50 +11,16 @@ use ryft_mlir::{
 };
 
 use crate::lowering::EffectTokens;
-use crate::lowering::types::{lower_constant_elements_attribute, lower_dimension_extent, lower_static_index_constants};
+use crate::lowering::types::{
+    lower_constant_elements_attribute, lower_dimension_extent, lower_static_index_constants, lower_tensor_type,
+};
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_ADD_KIND, ASSERT_BOUNDS_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_DIV_KIND,
     ASSERT_KIND_ATTRIBUTE, ASSERT_LEFT_ATTRIBUTE, ASSERT_MUL_KIND, ASSERT_POW_KIND, ASSERT_REM_KIND,
     ASSERT_RIGHT_ATTRIBUTE, ASSERT_SUB_KIND, lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
 use crate::operations::comparisons::lower_compare_to_mlir;
-use crate::operations::lower_tensor_type;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
-
-/// Lowers one runtime safety check for dimension arithmetic whose declared bounds do not prove totality.
-pub(crate) fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
-    operation: &DimensionOperation<DimensionValue>,
-    left_type: &DimensionType,
-    right_type: &DimensionType,
-    left: ValueRef<'b, 'c, 't>,
-    right: ValueRef<'b, 'c, 't>,
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<(), Error> {
-    let kind = match operation {
-        DimensionOperation::Add(_) => ASSERT_ADD_KIND,
-        DimensionOperation::Sub(_) => ASSERT_SUB_KIND,
-        DimensionOperation::Mul(_) => ASSERT_MUL_KIND,
-        DimensionOperation::Pow(_) => ASSERT_POW_KIND,
-        DimensionOperation::Div(_) => ASSERT_DIV_KIND,
-        DimensionOperation::Rem(_) => ASSERT_REM_KIND,
-        _ => return Ok(()),
-    };
-    let predicate = lower_deliberately_false_assertion_predicate(left, block, context, location)?;
-    let left_name = left_type.dimension().to_string();
-    let right_name = right_type.dimension().to_string();
-    let backend_config = context.dictionary_attribute(&[
-        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute(operation.name())),
-        context.named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(kind)),
-        context
-            .named_attribute(context.identifier(ASSERT_LEFT_ATTRIBUTE), context.string_attribute(left_name.as_str())),
-        context
-            .named_attribute(context.identifier(ASSERT_RIGHT_ATTRIBUTE), context.string_attribute(right_name.as_str())),
-    ]);
-    lower_assertion_custom_call(predicate, &[left, right], backend_config, effect_tokens, block, context, location)
-}
 
 impl LowerableOperation for DimensionSizeOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
@@ -62,11 +28,12 @@ impl LowerableOperation for DimensionSizeOperation {
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[ArrayIrType],
-        _output_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context;
-        let location = lowerer.location;
-        let block = &mut lowerer.block;
+        let _ = output_types;
+        let context = lowerer.context();
+        let location = lowerer.location();
+        let block = &mut lowerer.block();
         let [input] = input_values else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
         };
@@ -82,14 +49,14 @@ impl LowerableOperation for DimensionSizeOperation {
                 })?;
                 let elements = lower_constant_elements_attribute(DataType::I64, output_type, extent, context)?;
                 let constant = block.append_operation(stable_hlo::constant(elements, location)?)?;
-                Ok(vec![constant.result(0).expect("stablehlo.constant should return one result").as_ref()])
+                Ok(vec![constant.result(0).unwrap().as_ref()])
             }
             CoreDimension::Dynamic(_) => {
                 let size = block.append_operation(stable_hlo::get_dimension_size(*input, self.axis(), location)?)?;
-                let size = size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
+                let size = size.result(0).unwrap().as_ref();
                 let output_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
                 let converted = block.append_operation(stable_hlo::convert(size, output_type, location)?)?;
-                Ok(vec![converted.result(0).expect("stablehlo.convert should return one result").as_ref()])
+                Ok(vec![converted.result(0).unwrap().as_ref()])
             }
         }
     }
@@ -100,24 +67,25 @@ impl LowerableOperation for DimensionFromScalarOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayIrType],
-        _output_types: &[ArrayIrType],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context;
-        let location = lowerer.location;
-        let effect_tokens = &mut lowerer.effect_tokens;
-        let block = &mut lowerer.block;
+        let _ = (input_types, output_types);
+        let context = lowerer.context();
+        let location = lowerer.location();
+        let block = &mut lowerer.block();
+        let effect_tokens = lowerer.effect_tokens_mut();
         let [input] = input_values else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
         };
         let i64_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
         let converted = block.append_operation(stable_hlo::convert(*input, i64_type, location)?)?;
-        let converted = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
+        let converted = converted.result(0).unwrap().as_ref();
         let bounds = self.output_type().bounds();
         let lower = lower_static_index_constants(&[bounds.lower()], block, context, location)?[0];
         let at_least_lower =
             lower_compare_to_mlir(ComparisonDirection::GreaterThanOrEqual, converted, lower, block, location)?;
-        // Do not encode an exclusive maximum-plus-one in the signed runtime extent representation.
+        // Do not encode an exclusive upper bound, one past the maximum, in the signed runtime extent representation.
         let predicate = match bounds.upper().filter(|upper| *upper <= ryft_core::MAX_DIMENSION_EXTENT) {
             Some(upper) => {
                 let upper = lower_static_index_constants(&[upper], block, context, location)?[0];
@@ -154,11 +122,12 @@ impl LowerableOperation for DimensionFromScalarOperation {
 impl LowerableOperation for DimensionToScalarOperation {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayIrType],
-        _output_types: &[ArrayIrType],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (lowerer, input_types, output_types);
         let [input] = input_values else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: input_values.len() }.into());
         };
@@ -171,13 +140,14 @@ impl LowerableOperation for ConstantOperation<DimensionValue> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[DimensionType],
-        _output_types: &[DimensionType],
+        input_types: &[DimensionType],
+        output_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (input_types, output_types);
         if !input_values.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
         }
-        Ok(vec![lower_dimension_extent(self.value(), &mut lowerer.block, lowerer.context, lowerer.location)?])
+        Ok(vec![lower_dimension_extent(self.value(), &mut lowerer.block(), lowerer.context(), lowerer.location())?])
     }
 }
 
@@ -187,8 +157,9 @@ impl LowerableOperation for DimensionMaxOperation {
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
-        _output_types: &[DimensionType],
+        output_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = output_types;
         lower_dimension_arithmetic(&DimensionOperation::Max(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -199,8 +170,9 @@ impl LowerableOperation for DimensionMinOperation {
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
-        _output_types: &[DimensionType],
+        output_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = output_types;
         lower_dimension_arithmetic(&DimensionOperation::Min(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -211,8 +183,9 @@ impl LowerableOperation for DimensionAddOperation {
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
-        _output_types: &[DimensionType],
+        output_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = output_types;
         lower_dimension_arithmetic(&DimensionOperation::Add(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -223,8 +196,9 @@ impl LowerableOperation for DimensionSubOperation {
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
-        _output_types: &[DimensionType],
+        output_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = output_types;
         lower_dimension_arithmetic(&DimensionOperation::Sub(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -235,8 +209,9 @@ impl LowerableOperation for SaturatingSubOperation<DimensionType> {
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
-        _output_types: &[DimensionType],
+        output_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = output_types;
         lower_dimension_arithmetic(&DimensionOperation::SaturatingSub(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -247,8 +222,9 @@ impl LowerableOperation for DimensionMulOperation {
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
-        _output_types: &[DimensionType],
+        output_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = output_types;
         lower_dimension_arithmetic(&DimensionOperation::Mul(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -259,8 +235,9 @@ impl LowerableOperation for DimensionDivOperation {
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
-        _output_types: &[DimensionType],
+        output_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = output_types;
         lower_dimension_arithmetic(&DimensionOperation::Div(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -271,8 +248,9 @@ impl LowerableOperation for DimensionRemOperation {
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
-        _output_types: &[DimensionType],
+        output_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = output_types;
         lower_dimension_arithmetic(&DimensionOperation::Rem(self.clone()), lowerer, input_values, input_types)
     }
 }
@@ -283,32 +261,33 @@ impl LowerableOperation for DimensionPowOperation {
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
         input_types: &[DimensionType],
-        _output_types: &[DimensionType],
+        output_types: &[DimensionType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = output_types;
         lower_dimension_arithmetic(&DimensionOperation::Pow(self.clone()), lowerer, input_values, input_types)
     }
 }
 
 /// Lowers one first-class dimension arithmetic operation on scalar `i64` extents. Arithmetic that the operand bounds
-/// do not prove safe keeps the checked eager semantics through a runtime assertion on the ordered-assertion chain.
+/// do not prove safe keeps the checked eager semantics through a runtime assertion on the ordered assertion chain.
 fn lower_dimension_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     operation: &DimensionOperation<DimensionValue>,
     lowerer: &mut Lowerer<'b, 'c, 't, O>,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[DimensionType],
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let context = lowerer.context;
-    let location = lowerer.location;
-    let effect_tokens = &mut lowerer.effect_tokens;
-    let block = &mut lowerer.block;
+    let context = lowerer.context();
+    let location = lowerer.location();
+    let block = &mut lowerer.block();
+    let effect_tokens = lowerer.effect_tokens_mut();
     let [left, right] = input_values else {
         return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_values.len() }.into());
     };
     let [left_type, right_type] = input_types else {
         return Err(ProgramError::InvalidInputCount { expected: 2, actual: input_types.len() }.into());
     };
-    // Bounds-proven arithmetic lowers without assertion overhead. Otherwise, preserve eager checked
-    // semantics with one diagnostic runtime check on the ordered-assertion chain.
+    // Arithmetic that the bounds prove safe lowers without assertion overhead. Otherwise, preserve the checked eager
+    // semantics with one diagnostic runtime check on the ordered assertion chain.
     let requires_runtime_assertion = operation.effects().classes().contains(EffectClass::OrderedAssertion);
     if requires_runtime_assertion {
         lower_dimension_arithmetic_assertion(
@@ -332,7 +311,7 @@ fn lower_dimension_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         let constants = lower_static_index_constants(&[0, 1], block, context, location)?;
         let positive = lower_compare_to_mlir(ComparisonDirection::GreaterThan, *right, constants[0], block, location)?;
         let selected = block.append_operation(stable_hlo::select(positive, *right, constants[1], location)?)?;
-        selected.result(0).expect("stablehlo.select should return one result").as_ref()
+        selected.result(0).unwrap().as_ref()
     } else {
         *right
     };
@@ -343,7 +322,7 @@ fn lower_dimension_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
             let difference = block.append_operation(stable_hlo::subtract(*left, *right, location)?)?;
             let difference = difference.result(0).unwrap().as_ref();
             let tensor_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), context, location)?;
-            let elements = lower_constant_elements_attribute(DataType::I64, tensor_type, 0_i64, context)?;
+            let elements = lower_constant_elements_attribute(DataType::I64, tensor_type, 0i64, context)?;
             let zero = block.append_operation(stable_hlo::constant(elements, location)?)?;
             let zero = zero.result(0).unwrap().as_ref();
             block.append_operation(stable_hlo::maximum(difference, zero, location)?)?
@@ -356,11 +335,10 @@ fn lower_dimension_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         DimensionOperation::Max(_) => block.append_operation(stable_hlo::maximum(*left, *right, location)?)?,
         _ => unreachable!(),
     };
-    // For the same no-data-dependency reason, an unproven subtraction can hand a negative extent to
-    // consumers such as `set_dimension_size`, and unproven addition/multiplication/power can hand
-    // them a wrapped negative, failing inside XLA before the host callback reports the original
-    // operands. Clamping the unproven data path to zero keeps it well-defined so the assertion owns
-    // the diagnostic.
+    // Because of the same missing data dependency, an unproven subtraction can hand a negative extent to consumers
+    // such as `set_dimension_size`, and an unproven addition, multiplication, or power can hand them a wrapped
+    // negative, failing inside XLA before the host callback reports the original operands. Clamping the unproven data
+    // path to zero keeps it well defined, so that the assertion owns the diagnostic.
     let result = if requires_runtime_assertion
         && matches!(
             operation,
@@ -378,18 +356,355 @@ fn lower_dimension_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     Ok(vec![result.result(0).unwrap().as_ref()])
 }
 
+/// Lowers one runtime safety check for dimension arithmetic whose declared bounds do not prove totality.
+fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
+    operation: &DimensionOperation<DimensionValue>,
+    left_type: &DimensionType,
+    right_type: &DimensionType,
+    left: ValueRef<'b, 'c, 't>,
+    right: ValueRef<'b, 'c, 't>,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), Error> {
+    let kind = match operation {
+        DimensionOperation::Add(_) => ASSERT_ADD_KIND,
+        DimensionOperation::Sub(_) => ASSERT_SUB_KIND,
+        DimensionOperation::Mul(_) => ASSERT_MUL_KIND,
+        DimensionOperation::Pow(_) => ASSERT_POW_KIND,
+        DimensionOperation::Div(_) => ASSERT_DIV_KIND,
+        DimensionOperation::Rem(_) => ASSERT_REM_KIND,
+        _ => return Ok(()),
+    };
+    let predicate = lower_deliberately_false_assertion_predicate(left, block, context, location)?;
+    let left_name = left_type.dimension().to_string();
+    let right_name = right_type.dimension().to_string();
+    let backend_config = context.dictionary_attribute(&[
+        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute(operation.name())),
+        context.named_attribute(context.identifier(ASSERT_KIND_ATTRIBUTE), context.string_attribute(kind)),
+        context
+            .named_attribute(context.identifier(ASSERT_LEFT_ATTRIBUTE), context.string_attribute(left_name.as_str())),
+        context
+            .named_attribute(context.identifier(ASSERT_RIGHT_ATTRIBUTE), context.string_attribute(right_name.as_str())),
+    ]);
+    lower_assertion_custom_call(predicate, &[left, right], backend_config, effect_tokens, block, context, location)
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayType, DataType, DimensionBounds, DimensionVariable, Placeholder};
+    use ryft_core::{CompilationCacheDomain, DimensionBounds, DimensionVariable, Placeholder, Shape};
 
+    use crate::domains::tests::{domain_mesh, read_i64s, replicated_scalar_type};
     use crate::lowering::tests::{MixedValue, execute_mixed_program};
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
-    use crate::tests::execution_client;
-    use crate::{Constant, to_mlir_module_for_program};
+    use crate::tests::{cpu_client, execution_client};
+    use crate::{Array, Constant, Options, Session, to_mlir_module_for_program};
 
     use super::*;
+
+    /// Lowers one binary dimension arithmetic operation over two dimension inputs, whose boundary values are `i64`
+    /// scalars, to a rendered StableHLO module.
+    fn lowered_binary_dimension_module(
+        operation: DimensionOperation<DimensionValue>,
+        left_type: DimensionType,
+        right_type: DimensionType,
+    ) -> String {
+        let mut builder = ArrayIrProgramBuilder::new();
+        let left = builder.add_input(left_type.into());
+        let right = builder.add_input(right_type.into());
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let boundary_type = ArrayType::scalar(DataType::I64);
+        to_mlir_module_for_program(
+            &program,
+            &[],
+            &[boundary_type.clone(), boundary_type.clone()],
+            &[boundary_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_dimension_size_operation_lower() {
+        // Static extents lower to constants, and dynamic extents read the runtime size of their dimension.
+        let input_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                CoreDimension::Static(3),
+                CoreDimension::Dynamic(DimensionVariable::new("size", DimensionBounds::new(1, Some(5)).unwrap())),
+            ]),
+        );
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let static_size = builder
+            .add_instruction(DimensionSizeOperation::new(&input_type, 0).unwrap(), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let dynamic_size = builder
+            .add_instruction(DimensionSizeOperation::new(&input_type, 1).unwrap(), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![static_size, dynamic_size],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let boundary_type = ArrayType::scalar(DataType::I64);
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &[input_type],
+            &[boundary_type.clone(), boundary_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<3x4xf32>, %arg1: tensor<i32>) -> (tensor<i64>, tensor<i64>) {
+                %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 1 : (tensor<3x4xf32>, tensor<i32>) -> tensor<3x?xf32, #stablehlo.bounds<?, 4>>
+                %c = stablehlo.constant dense<3> : tensor<i64>
+                %1 = stablehlo.get_dimension_size %0, dim = 1 : (tensor<3x?xf32, #stablehlo.bounds<?, 4>>) -> tensor<i32>
+                %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                return %c, %2 : tensor<i64>, tensor<i64>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_dimension_from_scalar_operation_lower_reports_bounds_failures() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::I64);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
+
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 1, "{}", lowered.stable_hlo());
+        let compiled = domain.compile_program(&lowered).unwrap();
+        assert!(compiled.requires_assertion_handler());
+        // Some PJRT plugins do not serialize executables containing host callbacks. When serialization is available,
+        // exercise the path of cache hits and prove that its metadata about runtime features survives restoration.
+        let compiled = match domain.serialize_program(&compiled).unwrap() {
+            Some(bytes) => domain.deserialize_program(bytes.as_slice()).unwrap().unwrap(),
+            None => compiled,
+        };
+        assert!(compiled.requires_assertion_handler());
+
+        let valid =
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 4i64.to_ne_bytes().as_slice()).unwrap();
+        let valid = domain.execute_program(&compiled, vec![valid]).unwrap();
+        assert_eq!(read_i64s(&client, &valid[0]), vec![4]);
+
+        let invalid = Array::from_host_buffer(&domain, input_type, mesh, 9i64.to_ne_bytes().as_slice()).unwrap();
+        let error = domain.execute_program(&compiled, vec![invalid]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "`dimension_from_scalar` failed: input dimension `extent` = 9 is outside its declared bounds [1, 9)",
+        );
+    }
+
+    #[test]
+    fn test_dimension_max_operation_lower() {
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(3)).unwrap());
+        let module = lowered_binary_dimension_module(
+            DimensionOperation::Max(DimensionMaxOperation::new(&left_type, &right_type).unwrap()),
+            left_type,
+            right_type,
+        );
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+                %0 = stablehlo.maximum %arg0, %arg1 : tensor<i64>
+                return %0 : tensor<i64>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_dimension_min_operation_lower() {
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(3)).unwrap());
+        let module = lowered_binary_dimension_module(
+            DimensionOperation::Min(DimensionMinOperation::new(&left_type, &right_type).unwrap()),
+            left_type,
+            right_type,
+        );
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+                %0 = stablehlo.minimum %arg0, %arg1 : tensor<i64>
+                return %0 : tensor<i64>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_dimension_add_operation_lower() {
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(3)).unwrap());
+        let module = lowered_binary_dimension_module(
+            DimensionOperation::Add(DimensionAddOperation::new(&left_type, &right_type).unwrap()),
+            left_type,
+            right_type,
+        );
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+                %0 = stablehlo.add %arg0, %arg1 : tensor<i64>
+                return %0 : tensor<i64>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_dimension_sub_operation_lower_clamps_unproven_data_path() {
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let build = |left_bounds: DimensionBounds, right_bounds: DimensionBounds| {
+            let left_variable = DimensionVariable::new("left", left_bounds);
+            let right_variable = DimensionVariable::new("right", right_bounds);
+            let left_type = DimensionType::from(left_variable.clone());
+            let right_type = DimensionType::from(right_variable.clone());
+            let mut builder = ArrayIrProgramBuilder::new();
+            let left = builder.add_input(scalar_type.clone().into());
+            let right = builder.add_input(scalar_type.clone().into());
+            let left = builder
+                .add_instruction(DimensionFromScalarOperation::new(left_variable.into()), Vec::new(), vec![left], None)
+                .unwrap()[0];
+            let right = builder
+                .add_instruction(
+                    DimensionFromScalarOperation::new(right_variable.into()),
+                    Vec::new(),
+                    vec![right],
+                    None,
+                )
+                .unwrap()[0];
+            let difference = builder
+                .add_instruction(
+                    DimensionOperation::Sub(DimensionSubOperation::new(&left_type, &right_type).unwrap()),
+                    Vec::new(),
+                    vec![left, right],
+                    None,
+                )
+                .unwrap()[0];
+            let output =
+                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![difference], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+                .unwrap();
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![scalar_type.clone(), scalar_type.clone()],
+                &vec![scalar_type.clone()],
+                "main",
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        // An unproven subtraction keeps its diagnostic assertions, which are two gateway checks and one arithmetic
+        // check. Because the assertion custom call has no StableHLO data dependency on the subtraction, the data path
+        // is clamped to zero so that downstream extent consumers cannot fail inside XLA before the host callback
+        // reports the original operands.
+        let unproven = build(DimensionBounds::new(1, Some(9)).unwrap(), DimensionBounds::new(1, Some(9)).unwrap());
+        assert_eq!(
+            unproven,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+                %0 = stablehlo.convert %arg0 : tensor<i64>
+                %c = stablehlo.constant dense<1> : tensor<i64>
+                %1 = stablehlo.compare GE, %0, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                %c_0 = stablehlo.constant dense<9> : tensor<i64>
+                %2 = stablehlo.compare LT, %0, %c_0, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                %3 = stablehlo.and %1, %2 : tensor<i1>
+                %4 = stablehlo.after_all  : !stablehlo.token
+                %5 = stablehlo.custom_call @ryft.assert(%3, %0, %4) {api_version = 4 : i32, backend_config = {actor = "dimension_from_scalar", detail = "[1, 9)", kind = "bounds", left = "left"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                %6 = stablehlo.convert %arg1 : tensor<i64>
+                %c_1 = stablehlo.constant dense<1> : tensor<i64>
+                %7 = stablehlo.compare GE, %6, %c_1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                %c_2 = stablehlo.constant dense<9> : tensor<i64>
+                %8 = stablehlo.compare LT, %6, %c_2, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                %9 = stablehlo.and %7, %8 : tensor<i1>
+                %10 = stablehlo.custom_call @ryft.assert(%9, %6, %5) {api_version = 4 : i32, backend_config = {actor = "dimension_from_scalar", detail = "[1, 9)", kind = "bounds", left = "right"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                %c_3 = stablehlo.constant dense<0> : tensor<i64>
+                %11 = stablehlo.compare LT, %0, %c_3, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                %12 = stablehlo.custom_call @ryft.assert(%11, %0, %6, %10) {api_version = 4 : i32, backend_config = {actor = "dimension_sub", kind = "sub", left = "left", right = "right"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                %13 = stablehlo.subtract %0, %6 : tensor<i64>
+                %c_4 = stablehlo.constant dense<0> : tensor<i64>
+                %14 = stablehlo.maximum %13, %c_4 : tensor<i64>
+                return %14 : tensor<i64>
+              }
+            }
+            "#},
+        );
+
+        // A subtraction that the bounds prove safe lowers without an arithmetic assertion and without a clamp.
+        let proven = build(DimensionBounds::new(5, Some(9)).unwrap(), DimensionBounds::new(1, Some(3)).unwrap());
+        assert_eq!(
+            proven,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+                %0 = stablehlo.convert %arg0 : tensor<i64>
+                %c = stablehlo.constant dense<5> : tensor<i64>
+                %1 = stablehlo.compare GE, %0, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                %c_0 = stablehlo.constant dense<9> : tensor<i64>
+                %2 = stablehlo.compare LT, %0, %c_0, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                %3 = stablehlo.and %1, %2 : tensor<i1>
+                %4 = stablehlo.after_all  : !stablehlo.token
+                %5 = stablehlo.custom_call @ryft.assert(%3, %0, %4) {api_version = 4 : i32, backend_config = {actor = "dimension_from_scalar", detail = "[5, 9)", kind = "bounds", left = "left"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                %6 = stablehlo.convert %arg1 : tensor<i64>
+                %c_1 = stablehlo.constant dense<1> : tensor<i64>
+                %7 = stablehlo.compare GE, %6, %c_1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                %c_2 = stablehlo.constant dense<3> : tensor<i64>
+                %8 = stablehlo.compare LT, %6, %c_2, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                %9 = stablehlo.and %7, %8 : tensor<i1>
+                %10 = stablehlo.custom_call @ryft.assert(%9, %6, %5) {api_version = 4 : i32, backend_config = {actor = "dimension_from_scalar", detail = "[1, 3)", kind = "bounds", left = "right"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                %11 = stablehlo.subtract %0, %6 : tensor<i64>
+                return %11 : tensor<i64>
+              }
+            }
+            "#},
+        );
+    }
 
     #[test]
     fn test_saturating_sub_operation_lower() {
@@ -443,69 +758,169 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_clamps_unproven_dimension_arithmetic_data_paths() {
-        use ryft_core::{
-            DimensionFromScalarOperation, DimensionOperation, DimensionSubOperation, DimensionToScalarOperation,
-        };
+    fn test_dimension_mul_operation_lower() {
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(3)).unwrap());
+        let module = lowered_binary_dimension_module(
+            DimensionOperation::Mul(DimensionMulOperation::new(&left_type, &right_type).unwrap()),
+            left_type,
+            right_type,
+        );
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+                %0 = stablehlo.multiply %arg0, %arg1 : tensor<i64>
+                return %0 : tensor<i64>
+              }
+            }
+            "#},
+        );
+    }
 
-        let scalar_type = ArrayType::scalar(DataType::I64);
-        let build = |left_bounds: DimensionBounds, right_bounds: DimensionBounds| {
-            let left_variable = DimensionVariable::new("left", left_bounds);
-            let right_variable = DimensionVariable::new("right", right_bounds);
-            let left_type = DimensionType::from(left_variable.clone());
-            let right_type = DimensionType::from(right_variable.clone());
+    #[test]
+    fn test_dimension_div_operation_lower() {
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(3)).unwrap());
+        let module = lowered_binary_dimension_module(
+            DimensionOperation::Div(DimensionDivOperation::new(&left_type, &right_type).unwrap()),
+            left_type,
+            right_type,
+        );
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+                %0 = stablehlo.divide %arg0, %arg1 : tensor<i64>
+                return %0 : tensor<i64>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_dimension_rem_operation_lower() {
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(3)).unwrap());
+        let module = lowered_binary_dimension_module(
+            DimensionOperation::Rem(DimensionRemOperation::new(&left_type, &right_type).unwrap()),
+            left_type,
+            right_type,
+        );
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+                %0 = stablehlo.remainder %arg0, %arg1 : tensor<i64>
+                return %0 : tensor<i64>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_dimension_pow_operation_lower() {
+        let left_type = DimensionType::new("left", DimensionBounds::new(1, Some(9)).unwrap());
+        let right_type = DimensionType::new("right", DimensionBounds::new(1, Some(3)).unwrap());
+        let module = lowered_binary_dimension_module(
+            DimensionOperation::Pow(DimensionPowOperation::new(&left_type, &right_type).unwrap()),
+            left_type,
+            right_type,
+        );
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>) -> tensor<i64> {
+                %0 = stablehlo.power %arg0, %arg1 : tensor<i64>
+                return %0 : tensor<i64>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_dimension_arithmetic_preserves_checked_diagnostics() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = replicated_scalar_type(&mesh, DataType::I64);
+        let bounds = DimensionBounds::new(0, Some(10)).unwrap();
+        let left_type = DimensionType::new("left", bounds);
+        let right_type = DimensionType::new("right", bounds);
+        let check = |operation: DimensionOperation<DimensionValue>,
+                     valid_operands: (i64, i64),
+                     expected_output: i64,
+                     invalid_operands: (i64, i64),
+                     expected_error: &str| {
             let mut builder = ArrayIrProgramBuilder::new();
-            let left = builder.add_input(scalar_type.clone().into());
-            let right = builder.add_input(scalar_type.clone().into());
+            let left_input = builder.add_input(input_type.clone().into());
+            let right_input = builder.add_input(input_type.clone().into());
             let left = builder
-                .add_instruction(DimensionFromScalarOperation::new(left_variable.into()), Vec::new(), vec![left], None)
+                .add_instruction(
+                    DimensionFromScalarOperation::new(left_type.clone()),
+                    Vec::new(),
+                    vec![left_input],
+                    None,
+                )
                 .unwrap()[0];
             let right = builder
                 .add_instruction(
-                    DimensionFromScalarOperation::new(right_variable.into()),
+                    DimensionFromScalarOperation::new(right_type.clone()),
                     Vec::new(),
-                    vec![right],
+                    vec![right_input],
                     None,
                 )
                 .unwrap()[0];
-            let difference = builder
-                .add_instruction(
-                    DimensionOperation::Sub(DimensionSubOperation::new(&left_type, &right_type).unwrap()),
-                    Vec::new(),
-                    vec![left, right],
-                    None,
-                )
-                .unwrap()[0];
+            let result = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
             let output =
-                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![difference], None).unwrap()[0];
+                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![result], None).unwrap()[0];
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
                 .unwrap();
-            to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![scalar_type.clone(), scalar_type.clone()],
-                &vec![scalar_type.clone()],
-                "main",
-                None,
-                None,
-            )
-            .unwrap()
+            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 3, "{}", lowered.stable_hlo());
+            let compiled = domain.compile_program(&lowered).unwrap();
+            let input = |value: i64| {
+                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                    .unwrap()
+            };
+
+            let output =
+                domain.execute_program(&compiled, vec![input(valid_operands.0), input(valid_operands.1)]).unwrap();
+            assert_eq!(read_i64s(&client, &output[0]), vec![expected_output]);
+            let error = domain
+                .execute_program(&compiled, vec![input(invalid_operands.0), input(invalid_operands.1)])
+                .unwrap_err();
+            assert_eq!(error.to_string(), expected_error);
         };
 
-        // An unproven subtraction keeps its diagnostic assertion (two gateway checks plus one arithmetic check), and
-        // because the assertion custom call has no StableHLO data dependency on the subtraction, the data path is
-        // clamped to zero so downstream extent consumers cannot fail inside XLA before the host callback reports the
-        // original operands.
-        let unproven = build(DimensionBounds::new(1, Some(9)).unwrap(), DimensionBounds::new(1, Some(9)).unwrap());
-        assert_eq!(unproven.matches("stablehlo.subtract").count(), 1, "{unproven}");
-        assert_eq!(unproven.matches("stablehlo.maximum").count(), 1, "{unproven}");
-        assert_eq!(unproven.matches("@ryft.assert").count(), 3, "{unproven}");
-
-        // A bounds-proven subtraction lowers without an arithmetic assertion and without a clamp.
-        let proven = build(DimensionBounds::new(5, Some(9)).unwrap(), DimensionBounds::new(1, Some(3)).unwrap());
-        assert_eq!(proven.matches("stablehlo.subtract").count(), 1, "{proven}");
-        assert_eq!(proven.matches("stablehlo.maximum").count(), 0, "{proven}");
-        assert_eq!(proven.matches("@ryft.assert").count(), 2, "{proven}");
+        check(
+            DimensionOperation::Sub(DimensionSubOperation::new(&left_type, &right_type).unwrap()),
+            (5, 2),
+            3,
+            (2, 5),
+            "`dimension_sub` requires left >= right; got left=2, right=5",
+        );
+        check(
+            DimensionOperation::Div(DimensionDivOperation::new(&left_type, &right_type).unwrap()),
+            (7, 3),
+            2,
+            (7, 0),
+            "`dimension_div` requires right > 0; got left=7, right=0",
+        );
+        check(
+            DimensionOperation::Rem(DimensionRemOperation::new(&left_type, &right_type).unwrap()),
+            (7, 3),
+            1,
+            (7, 0),
+            "`dimension_rem` requires right > 0; got left=7, right=0",
+        );
     }
 }

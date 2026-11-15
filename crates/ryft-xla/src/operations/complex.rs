@@ -14,39 +14,41 @@ impl LowerableOperation for ComplexOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::complex(input_values[0], input_values[1], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.complex should return one result").as_ref()])
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::complex(
+            input_values[0],
+            input_values[1],
+            lowerer.location(),
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
 // StableHLO has no conjugation operation, so `conjugate` lowers to the `complex(real(z), negate(imag(z)))`
-// composition (the same decomposition JAX's `conj` lowering uses).
+// composition, which is the same decomposition that JAX's `conj` lowering uses.
 impl LowerableOperation for ConjugateOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let real = lowerer.block.append_operation(stable_hlo::real(input_values[0], lowerer.location)?)?;
-        let imaginary = lowerer.block.append_operation(stable_hlo::imag(input_values[0], lowerer.location)?)?;
-        let negated = lowerer.block.append_operation(stable_hlo::negate(
-            imaginary.result(0).expect("stablehlo.imag should return one result").as_ref(),
-            lowerer.location,
+        let _ = (input_types, output_types);
+        let real = lowerer.block().append_operation(stable_hlo::real(input_values[0], lowerer.location())?)?;
+        let imaginary = lowerer.block().append_operation(stable_hlo::imag(input_values[0], lowerer.location())?)?;
+        let negated = lowerer
+            .block()
+            .append_operation(stable_hlo::negate(imaginary.result(0).unwrap().as_ref(), lowerer.location())?)?;
+        let result = lowerer.block().append_operation(stable_hlo::complex(
+            real.result(0).unwrap().as_ref(),
+            negated.result(0).unwrap().as_ref(),
+            lowerer.location(),
         )?)?;
-        let result = lowerer.block.append_operation(stable_hlo::complex(
-            real.result(0).expect("stablehlo.real should return one result").as_ref(),
-            negated.result(0).expect("stablehlo.negate should return one result").as_ref(),
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.complex should return one result").as_ref()])
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -55,11 +57,12 @@ impl LowerableOperation for RealOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::real(input_values[0], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.real should return one result").as_ref()])
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::real(input_values[0], lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -68,18 +71,20 @@ impl LowerableOperation for ImaginaryOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::imag(input_values[0], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.imag should return one result").as_ref()])
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::imag(input_values[0], lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
 /// Brings the imaginary component of the complex `value` onto the principal branch `[-pi, pi]`, which is where the
-/// raw-input prefixes of a complex log-sum-exp `cumulative` must land to agree with its combined prefixes. Phases that
-/// already lie on the branch are kept exactly as they are, and others are reduced through `atan2` of their sine and
-/// cosine rather than through a floating-point remainder by `2π`, which cannot reduce huge arguments accurately.
+/// prefixes of a complex log-sum-exp `cumulative` that are raw inputs must land to agree with its combined prefixes.
+/// Phases that already lie on the branch are kept exactly as they are, and others are reduced through `atan2` of
+/// their sine and cosine rather than through a floating-point remainder by `2π`, which cannot reduce huge arguments
+/// accurately.
 pub(crate) fn lower_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     output_type: &ArrayType,
@@ -167,15 +172,61 @@ pub(crate) fn lower_select_principal_phase_to_mlir<'b, 'c: 'b, 't: 'c>(
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
-    use ryft_core::{Conjugate, Real, differentiate_at};
+    use ryft_core::{ArrayOperation, Conjugate, Placeholder, Real, differentiate_at};
 
     use crate::Session;
     use crate::domains::tests::domain_mesh;
+    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module};
+    use crate::lowering::to_mlir_module_for_plain_program;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::values::ArrayConstant;
 
     use super::*;
+
+    #[test]
+    fn test_complex_operation_lower() {
+        let mut builder = ProgramBuilder::new();
+        let real = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
+        let imaginary = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
+        let output = builder
+            .add_instruction(ArrayOperation::Complex(ComplexOperation::new()), Vec::new(), vec![real, imaginary], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>, %arg1: tensor<2xf32>) -> tensor<2xcomplex<f32>> {
+                    %0 = stablehlo.complex %arg0, %arg1 : tensor<2xcomplex<f32>>
+                    return %0 : tensor<2xcomplex<f32>>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_conjugate_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Conjugate(ConjugateOperation::new()), DataType::C64, vec![2]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2xcomplex<f32>>) -> tensor<2xcomplex<f32>> {
+                    %0 = stablehlo.real %arg0 : (tensor<2xcomplex<f32>>) -> tensor<2xf32>
+                    %1 = stablehlo.imag %arg0 : (tensor<2xcomplex<f32>>) -> tensor<2xf32>
+                    %2 = stablehlo.negate %1 : tensor<2xf32>
+                    %3 = stablehlo.complex %0, %2 : tensor<2xcomplex<f32>>
+                    return %3 : tensor<2xcomplex<f32>>
+                  }
+                }
+            "},
+        );
+    }
 
     #[test]
     fn test_conjugate_operation_lower_differentiation() {
@@ -190,5 +241,35 @@ mod tests {
         let gradient =
             differentiate_at(input).gradient(|z| (z.clone() * z.conjugate().unwrap()).real().unwrap()).unwrap();
         assert_eq!(values_from_bytes::<Complex<f32>>(&gradient.copy_to_host().unwrap()), [(z + z).conj()]);
+    }
+
+    #[test]
+    fn test_real_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Real(RealOperation::new()), DataType::C64, vec![2]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2xcomplex<f32>>) -> tensor<2xf32> {
+                    %0 = stablehlo.real %arg0 : (tensor<2xcomplex<f32>>) -> tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_imaginary_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Imaginary(ImaginaryOperation::new()), DataType::C64, vec![2]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2xcomplex<f32>>) -> tensor<2xf32> {
+                    %0 = stablehlo.imag %arg0 : (tensor<2xcomplex<f32>>) -> tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
     }
 }

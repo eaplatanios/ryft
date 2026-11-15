@@ -17,7 +17,7 @@ use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding};
 
 // TODO(eaplatanios): Review this module.
 
-/// Embeds a validated cuTile artifact using the existing session-owned CUDA launcher.
+/// Embeds a validated cuTile artifact using the existing CUDA launcher owned by the session.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct CuTileEmbedding;
 
@@ -72,11 +72,11 @@ impl KernelOutputEmbedding<CompiledKernel> for CuTileEmbedding {
 
 impl KernelTarget for Target {
     fn admit_execution(&self, facts: &KernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
-        if !facts.platform_name.eq_ignore_ascii_case("cuda")
-            || facts.platform_version != "cuda 13020"
-            || !facts.has_ffi_extension
-            || facts.pjrt_version != ryft_pjrt::VERSION
-            || facts.devices.is_empty()
+        if !facts.platform_name().eq_ignore_ascii_case("cuda")
+            || facts.platform_version() != "cuda 13020"
+            || !facts.has_ffi_extension()
+            || facts.pjrt_version() != ryft_pjrt::VERSION
+            || facts.devices().is_empty()
         {
             return Err(KernelEmbeddingError::Invalid {
                 message: "cuTile requires the pinned CUDA 13.2 PJRT platform and FFI ABI".to_owned(),
@@ -84,8 +84,8 @@ impl KernelTarget for Target {
         }
         let (major, minor) = self.compute_capability();
         let capability = format!("{major}.{minor}");
-        for device in &facts.devices {
-            if device.attributes.get("compute_capability") != Some(&ryft_pjrt::Value::String(capability.clone())) {
+        for device in facts.devices() {
+            if device.attributes().get("compute_capability") != Some(&ryft_pjrt::Value::String(capability.clone())) {
                 return Err(KernelEmbeddingError::Invalid {
                     message: format!("cuTile requires exact device compute capability `{capability}`"),
                 });
@@ -105,22 +105,22 @@ mod tests {
 
     use super::*;
 
+    /// Execution facts with `platform_version` and `devices`, without opening a native client.
+    fn facts_with(platform_version: &str, devices: Vec<KernelDeviceFacts>) -> KernelExecutionFacts {
+        KernelExecutionFacts::new("CUDA", platform_version, ryft_pjrt::VERSION, true, BTreeMap::new(), devices)
+    }
+
+    /// Facts of the one device of the qualified Spark.
+    fn devices() -> Vec<KernelDeviceFacts> {
+        vec![KernelDeviceFacts::new(
+            "GB10",
+            BTreeMap::from([("compute_capability".to_owned(), ryft_pjrt::Value::String("12.1".to_owned()))]),
+        )]
+    }
+
     /// Exact qualified Spark execution facts, without opening a native client.
     fn facts() -> KernelExecutionFacts {
-        KernelExecutionFacts {
-            platform_name: "CUDA".to_owned(),
-            platform_version: "cuda 13020".to_owned(),
-            pjrt_version: ryft_pjrt::VERSION,
-            has_ffi_extension: true,
-            attributes: BTreeMap::new(),
-            devices: vec![KernelDeviceFacts {
-                kind: "GB10".to_owned(),
-                attributes: BTreeMap::from([(
-                    "compute_capability".to_owned(),
-                    ryft_pjrt::Value::String("12.1".to_owned()),
-                )]),
-            }],
-        }
+        facts_with("cuda 13020", devices())
     }
 
     #[test]
@@ -137,18 +137,16 @@ mod tests {
     #[test]
     fn test_target_admit_execution() {
         let target = Target::new(12, 1).unwrap();
-        assert!(target.admit_execution(&facts()).is_ok());
+        target.admit_execution(&facts()).unwrap();
         assert!(matches!(
             Target::new(12, 0).unwrap().admit_execution(&facts()),
             Err(KernelEmbeddingError::Invalid { message })
                 if message == "cuTile requires exact device compute capability `12.0`",
         ));
-        let mut execution = facts();
-        execution.platform_version = "cuda 12090".to_owned();
+        let execution = facts_with("cuda 12090", devices());
         assert!(matches!(target.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
             if message == "cuTile requires the pinned CUDA 13.2 PJRT platform and FFI ABI"));
-        execution = facts();
-        execution.devices.clear();
+        let execution = facts_with("cuda 13020", Vec::new());
         assert!(matches!(target.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
             if message == "cuTile requires the pinned CUDA 13.2 PJRT platform and FFI ABI"));
     }

@@ -1,4 +1,4 @@
-//! Concrete HSACO embedding and session-owned HIP execution through XLA FFI.
+//! Concrete HSACO embedding and HIP execution owned by the session through XLA FFI.
 
 use std::sync::Arc;
 
@@ -42,18 +42,11 @@ impl From<ryft_rocm::Error> for Error {
     }
 }
 
-/// Custom-call buffer supplying one physical HIP pointer argument.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-enum RocmKernelBufferBinding {
-    Input(usize),
-    Output(usize),
-}
-
 /// Embeds a validated HSACO artifact with one pointer per canonical logical parameter.
 ///
 /// Buffers use dense row-major layouts and canonical declaration order. Read-only parameters use operands and
-/// write-only parameters use result buffers. Read-write aliases, scalar prefetch and device assertion transports
-/// are rejected. The session owns native modules until every submitted whole-execution fence completes.
+/// write-only parameters use result buffers. Read-write aliases, scalar prefetch, and device assertion transports
+/// are rejected. The session owns native modules until every submitted fence over a whole execution completes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RocmKernelEmbedding {
     /// Explicitly selected registered handler.
@@ -61,13 +54,13 @@ pub struct RocmKernelEmbedding {
 }
 
 impl RocmKernelEmbedding {
-    /// Selects an existing handler; the built-in handler is [`ROCM_KERNEL_CUSTOM_CALL_TARGET`].
+    /// Selects an existing handler. The built-in handler is [`ROCM_KERNEL_CUSTOM_CALL_TARGET`].
     pub fn new(target_name: String) -> Self {
         Self { target_name }
     }
 
     /// Reconstructs an artifact and validates its redundant payload and logical signature before loading native code.
-    /// The digest detects corruption; it does not authenticate executable code from an untrusted producer.
+    /// The digest detects corruption, but it does not authenticate executable code from an untrusted producer.
     pub fn from_custom_call<Extension: CoreOperation<Type = ArrayIrType>>(
         kernel: &VerifiedKernel<'_, Extension>,
         operation: &CustomCallOperation,
@@ -219,6 +212,21 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<RocmKer
     }
 }
 
+/// Returns the built-in ROCm provider without loading HIP or a PJRT plugin.
+pub(super) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+    Arc::new(RocmRuntimeProvider)
+}
+
+/// Custom call buffer supplying one physical HIP pointer argument.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum RocmKernelBufferBinding {
+    /// Read-only custom call operand at the specified index.
+    Input(usize),
+
+    /// Write-only custom call result at the specified index.
+    Output(usize),
+}
+
 /// Persistent HIP artifact metadata, reconstructed through the canonical artifact validator.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -307,7 +315,7 @@ impl RocmEnvelope {
     }
 }
 
-/// Stable session allocation borrowed by XLA until all whole-execution fences complete.
+/// Stable session allocation borrowed by XLA until all fences over whole executions complete.
 struct RocmKernelRuntime {
     /// Concrete bounded HIP module owner.
     launcher: RocmKernelLauncher,
@@ -325,6 +333,19 @@ impl RocmKernelRuntime {
             FfiHandlerTraits::NONE,
         )?;
         Ok(Self { launcher })
+    }
+}
+
+impl<'c> RuntimeExtension<'c> for RocmKernelRuntime {
+    fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
+        crate::kernels::distributed::validate_kernel_participants(client, mesh)?;
+        Ok(())
+    }
+
+    fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
+        // The session owns this stable instance and retains its invocation lease until the whole launch completes.
+        let data = (self as *const Self).cast_mut().cast();
+        unsafe { resources.add_ffi_user_data(FfiUserData::new(ROCM_RUNTIME_TYPE_ID, data)) }
     }
 }
 
@@ -350,24 +371,6 @@ impl<'c> RuntimeProvider<'c> for RocmRuntimeProvider {
         }
         Ok(Arc::new(RocmKernelRuntime::new(client)?))
     }
-}
-
-impl<'c> RuntimeExtension<'c> for RocmKernelRuntime {
-    fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
-        crate::kernels::distributed::validate_kernel_participants(client, mesh)?;
-        Ok(())
-    }
-
-    fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
-        // The session owns this stable instance and retains its invocation lease through whole-launch completion.
-        let data = (self as *const Self).cast_mut().cast();
-        unsafe { resources.add_ffi_user_data(FfiUserData::new(ROCM_RUNTIME_TYPE_ID, data)) }
-    }
-}
-
-/// Returns the built-in ROCm provider without loading HIP or a PJRT plugin.
-pub(super) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
-    Arc::new(RocmRuntimeProvider)
 }
 
 /// Decodes and validates the invocation before borrowing HIP buffer and stream handles.
@@ -405,6 +408,8 @@ fn launch_rocm_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
     }
     // The runtime preparation hook inserts this pointer. Its session retains the stable instance through completion.
     let runtime = unsafe { &*data.cast::<RocmKernelRuntime>() };
+    // Each raw buffer pointer stays valid for the duration of this handler call, because XLA owns the operand and
+    // result buffers of the invocation until the handler returns and the launch below is enqueued on its stream.
     let mut arguments = Vec::new();
     for (binding, (element_type, dimensions)) in envelope.argument_bindings.iter().zip(&envelope.parameter_types) {
         let buffer = match *binding {
@@ -434,8 +439,9 @@ fn launch_rocm_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
                 .map_err(|error| FfiError::invalid_argument(error.to_string()))?,
         );
     }
-    // XLA supplies current-stream ordering and owns the primary-context buffers. The HIP owner validates capture,
-    // device, artifact resources and module lifetime; the session retains its existing execution fence.
+    // XLA supplies the ordering of the current stream and owns the buffers of the primary context. The HIP owner
+    // validates capture, device, artifact resources, and module lifetime, and the session retains its existing
+    // execution fence.
     let stream = unsafe { RocmStream::from_raw(context.stream()?) }
         .map_err(|error| FfiError::invalid_argument(error.to_string()))?;
     unsafe { runtime.launcher.launch(&artifact, &RocmKernelLaunch::new(stream, arguments)) }
@@ -463,7 +469,10 @@ unsafe extern "C" fn rocm_kernel_handler(frame: *mut XLA_FFI_CallFrame) -> *mut 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{Array as CoreArray, ArrayType};
+    use ryft_core::{
+        Array as CoreArray, ArrayIrValue, ArrayOperation, ArrayType, Placeholder, ProgramBuilder as CoreProgramBuilder,
+    };
+    use ryft_kernels::{KernelDefinition, KernelOperation};
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::RuntimeError;
@@ -565,22 +574,51 @@ mod tests {
     }
 
     #[test]
-    fn test_rocm_runtime_provider_initialize() {
-        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let target = Target::from_client(&client).unwrap();
-        let provider = runtime_provider();
-        let error = provider
-            .initialize(&client, &target, &builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET))
-            .err()
+    fn test_rocm_kernel_embedding_custom_call_rejects_changed_grid() {
+        let r#type = ArrayType::new_static(DataType::F32, [256]);
+        let definition = vector::definition(&r#type, &r#type).unwrap();
+        let artifact = artifact()
+            .with_launch_dimensions(RocmKernelLaunchDimensions::new([2, 1, 1], [256, 1, 1], 0).unwrap())
             .unwrap();
-        assert!(
-            matches!(error.downcast_custom::<KernelEmbeddingError>(), Some(KernelEmbeddingError::Invalid { message })
-            if message == "rocm artifact calls require a rocm platform")
-        );
-        let requirement = RuntimeRequirement::new(ROCM_KERNEL_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
-        assert!(matches!(provider.initialize(&client, &target, &requirement),
-            Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
-                if identifier == ROCM_KERNEL_CUSTOM_CALL_TARGET));
+        assert!(matches!(RocmKernelEmbedding::new(ROCM_KERNEL_CUSTOM_CALL_TARGET.to_owned())
+            .custom_call(&VerifiedKernel::new(&definition, 1).unwrap(), &artifact),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "rocm artifact grid differs from the verified parallel grid"));
+    }
+
+    #[test]
+    fn test_rocm_kernel_embedding_custom_call_rejects_effects() {
+        for effect in [EffectClass::OrderedIo, EffectClass::OrderedState, EffectClass::OrderedAssertion] {
+            let logical = crate::kernels::tests::definition().operation().clone();
+            let mut builder = CoreProgramBuilder::<ArrayIrValue<CoreArray>, KernelOperation>::new();
+            builder.add_input(logical.parameters()[0].body_type());
+            builder
+                .add_instruction(
+                    ArrayOperation::<CoreArray>::CustomCall(
+                        CustomCallOperation::new("test.external", vec![]).with_effect_class(effect),
+                    ),
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .unwrap();
+            let body = builder.build(vec![], vec![Placeholder], vec![]).unwrap();
+            let definition = KernelDefinition::new(logical, body).unwrap();
+            let verified = VerifiedKernel::new(&definition, 1).unwrap();
+            let result =
+                RocmKernelEmbedding::new(ROCM_KERNEL_CUSTOM_CALL_TARGET.to_owned()).custom_call(&verified, &artifact());
+            assert!(matches!(result,
+                Err(KernelEmbeddingError::UnsupportedEffect { effect: actual }) if actual == effect));
+        }
+    }
+
+    #[test]
+    fn test_rocm_kernel_embedding_custom_call_rejects_aliases() {
+        let definition = crate::kernels::tests::definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let embedding = RocmKernelEmbedding::new(ROCM_KERNEL_CUSTOM_CALL_TARGET.to_owned());
+        assert!(matches!(embedding.custom_call(&verified, &artifact()), Err(KernelEmbeddingError::Invalid { message })
+            if message == "rocm embedding requires specialized prefetch and no read-write aliases"));
     }
 
     #[test]
@@ -606,44 +644,21 @@ mod tests {
     }
 
     #[test]
-    fn test_rocm_kernel_embedding_custom_call_rejects_changed_grid() {
-        let r#type = ArrayType::new_static(DataType::F32, [256]);
-        let definition = vector::definition(&r#type, &r#type).unwrap();
-        let artifact = artifact()
-            .with_launch_dimensions(RocmKernelLaunchDimensions::new([2, 1, 1], [256, 1, 1], 0).unwrap())
+    fn test_rocm_runtime_provider_initialize() {
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let target = Target::from_client(&client).unwrap();
+        let provider = runtime_provider();
+        let error = provider
+            .initialize(&client, &target, &builtin_requirement(ROCM_KERNEL_CUSTOM_CALL_TARGET))
+            .err()
             .unwrap();
-        assert!(matches!(RocmKernelEmbedding::new(ROCM_KERNEL_CUSTOM_CALL_TARGET.to_owned())
-            .custom_call(&VerifiedKernel::new(&definition, 1).unwrap(), &artifact),
-            Err(KernelEmbeddingError::Invalid { message })
-                if message == "rocm artifact grid differs from the verified parallel grid"));
-    }
-
-    #[test]
-    fn test_rocm_kernel_embedding_custom_call_rejects_effects() {
-        use ryft_core::{ArrayIrValue, ArrayOperation, Placeholder, ProgramBuilder as CoreProgramBuilder};
-        use ryft_kernels::{KernelDefinition, KernelOperation};
-
-        for effect in [EffectClass::OrderedIo, EffectClass::OrderedState, EffectClass::OrderedAssertion] {
-            let logical = crate::kernels::tests::definition().operation().clone();
-            let mut builder = CoreProgramBuilder::<ArrayIrValue<CoreArray>, KernelOperation>::new();
-            builder.add_input(logical.parameters()[0].body_type());
-            builder
-                .add_instruction(
-                    ArrayOperation::<CoreArray>::CustomCall(
-                        CustomCallOperation::new("test.external", vec![]).with_effect_class(effect),
-                    ),
-                    vec![],
-                    vec![],
-                    None,
-                )
-                .unwrap();
-            let body = builder.build(vec![], vec![Placeholder], vec![]).unwrap();
-            let definition = KernelDefinition::new(logical, body).unwrap();
-            let verified = VerifiedKernel::new(&definition, 1).unwrap();
-            let result =
-                RocmKernelEmbedding::new(ROCM_KERNEL_CUSTOM_CALL_TARGET.to_owned()).custom_call(&verified, &artifact());
-            assert!(matches!(result,
-                Err(KernelEmbeddingError::UnsupportedEffect { effect: actual }) if actual == effect));
-        }
+        assert!(
+            matches!(error.downcast_custom::<KernelEmbeddingError>(), Some(KernelEmbeddingError::Invalid { message })
+            if message == "rocm artifact calls require a rocm platform")
+        );
+        let requirement = RuntimeRequirement::new(ROCM_KERNEL_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
+        assert!(matches!(provider.initialize(&client, &target, &requirement),
+            Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
+                if identifier == ROCM_KERNEL_CUSTOM_CALL_TARGET));
     }
 }

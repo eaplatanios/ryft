@@ -22,12 +22,13 @@ use crate::{Constant, Error};
 
 // TODO(eaplatanios): Review this module.
 
-/// Returns backend-local input types for a named decomposition after boundary validation and differentiation.
+/// Returns the backend-local input types of a named decomposition after boundary validation and differentiation, which
+/// are `input_types` with their varying manual axes cleared.
 ///
-/// Private decomposition functions contain local array computations and have no manual-axis binders. Manual variation
-/// has already determined the enclosing program's explicit transitions and adjoints, so it must not trigger new
+/// Private decomposition functions contain local array computations and bind no manual axes. Manual variation has
+/// already determined the explicit transitions and adjoints of the enclosing program, so it must not trigger new
 /// transitions when expanding these functions. Retain mesh placement and reduction state, and keep the original types
-/// in the named-composition key so the external operation contract remains unchanged.
+/// in the [`NamedCompositionKey`] so the external operation contract remains unchanged.
 pub(crate) fn named_composition_input_types(input_types: &[ArrayType]) -> Result<Vec<ArrayIrType>, Error> {
     input_types
         .iter()
@@ -69,47 +70,84 @@ pub(crate) fn lower_decomposition_call<'b, 'c: 'b, 't: 'c>(
         },
         location,
     )?)?;
-    Ok((0..output_types.len())
-        .map(|index| call.result(index).expect("func.call should return one result per output").as_ref())
-        .collect())
+    Ok((0..output_types.len()).map(|index| call.result(index).unwrap().as_ref()).collect())
 }
 
-/// Identity of one generated named-composition decomposition at a concrete typed boundary.
+/// Identity of one generated decomposition of a named composition at a concrete typed boundary.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NamedCompositionKey {
     /// Semantic identity of the composition, whose name also names the emitted private function.
-    pub(crate) composite: CompositeKey,
+    composite: CompositeKey,
 
     /// Logical operand types of the composition boundary.
-    pub(crate) input_types: Vec<ArrayType>,
+    input_types: Vec<ArrayType>,
 
     /// Logical result types of the composition boundary.
-    pub(crate) output_types: Vec<ArrayType>,
+    output_types: Vec<ArrayType>,
+}
+
+impl NamedCompositionKey {
+    /// Creates the key of the decomposition of `composite` at the boundary with the provided logical types.
+    pub(crate) fn new(composite: CompositeKey, input_types: Vec<ArrayType>, output_types: Vec<ArrayType>) -> Self {
+        Self { composite, input_types, output_types }
+    }
 }
 
 /// Private decomposition function emitted for one [`NamedCompositionKey`].
 pub(crate) struct NamedCompositionFunction {
     /// Module-unique decomposition symbol.
-    pub(crate) symbol: String,
+    symbol: String,
 
     /// Canonical typed decomposition program.
-    pub(crate) program: FlatProgram,
+    program: FlatProgram,
+}
+
+impl NamedCompositionFunction {
+    /// Returns the module-unique decomposition symbol.
+    #[inline]
+    pub(crate) fn symbol(&self) -> &str {
+        &self.symbol
+    }
 }
 
 /// Module-owned registry of canonical named compositions and their private decomposition functions.
 #[derive(Default)]
 pub(crate) struct NamedCompositionFunctionMap {
     /// Functions indexed by semantic operation and typed boundary.
-    pub(crate) functions: HashMap<NamedCompositionKey, NamedCompositionFunction>,
+    functions: HashMap<NamedCompositionKey, NamedCompositionFunction>,
 
-    /// Stable first-occurrence order used for deterministic function emission.
-    pub(crate) order: Vec<NamedCompositionKey>,
+    /// Keys in the stable order of their first occurrence, used for deterministic function emission.
+    order: Vec<NamedCompositionKey>,
 }
 
 impl NamedCompositionFunctionMap {
+    /// Returns the functions indexed by semantic operation and typed boundary.
+    #[inline]
+    pub(crate) fn functions(&self) -> &HashMap<NamedCompositionKey, NamedCompositionFunction> {
+        &self.functions
+    }
+
+    /// Returns the keys in the stable order of their first occurrence, used for deterministic function emission.
+    #[inline]
+    pub(crate) fn order(&self) -> &[NamedCompositionKey] {
+        &self.order
+    }
+
+    /// Returns the registered decomposition for `operation` at the provided typed boundary, or `None` when no
+    /// decomposition is registered for it.
+    pub(crate) fn get(
+        &self,
+        operation: &ScaledDotOperation,
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Option<&NamedCompositionFunction>, Error> {
+        Ok(self.functions.get(&scaled_dot_composition_key(operation, input_types, output_types)?))
+    }
+
     /// Registers one typed decomposition lazily, sharing an existing private function when the complete semantic key
-    /// is already present. The registry is independent of the operation family that produced `key` and `program`;
-    /// closed backend operation enums only decide when to call this seam.
+    /// is already present. The registry is independent of the operation family that produced `key` and `program`, and
+    /// closed backend operation enums only decide when to call this seam. A key whose composite name is already taken
+    /// by another key receives a symbol suffixed with the number of earlier keys of that name.
     fn register<F: FnOnce() -> Result<FlatProgram, Error>>(
         &mut self,
         key: NamedCompositionKey,
@@ -127,19 +165,10 @@ impl NamedCompositionFunctionMap {
         self.order.push(key);
         Ok(())
     }
-
-    /// Returns the registered decomposition for `operation` at the provided typed boundary.
-    pub(crate) fn get(
-        &self,
-        operation: &ScaledDotOperation,
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Option<&NamedCompositionFunction>, Error> {
-        Ok(self.functions.get(&scaled_dot_composition_key(operation, input_types, output_types)?))
-    }
 }
 
 /// Collects every named semantic composition required by `program` and traces each distinct typed decomposition once.
+/// Composite calls that a backend implementation replaces on `target_platform` contribute no compositions.
 pub(crate) fn collect_named_composition_functions<Input, Output, O: LowerableOperationFamily>(
     program: &Program<Input, Output, O>,
     target_platform: Option<&str>,
@@ -148,6 +177,8 @@ where
     Input: Parameterized<Constant>,
     Output: Parameterized<Constant>,
 {
+    /// Registers the compositions of `region` and of the computation regions that its instructions attach, visiting
+    /// each region at most once.
     fn walk<O: LowerableOperationFamily>(
         region: RegionRef<'_, Constant, O>,
         map: &mut NamedCompositionFunctionMap,
@@ -226,7 +257,7 @@ where
     Ok(map)
 }
 
-/// Emits one private named-composition decomposition function.
+/// Emits the private decomposition function of one named composition into `module_block`.
 pub(crate) fn emit_named_composition_function<'b, 'c: 'b, 't: 'c>(
     module_block: &mut BlockRef<'b, 'c, 't>,
     function: &NamedCompositionFunction,
@@ -335,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_named_composition_registry_supports_downstream_semantics() {
+    fn test_named_composition_function_map_register() {
         // Registration consumes a semantic key and an ordinary typed program, not a Ryft operation enum variant.
         // Consequently a downstream lowerer can use the same sharing seam after performing its own family conversion.
         let boundary_type = ArrayType::scalar(DataType::F32);
@@ -370,5 +401,30 @@ mod tests {
         assert_eq!(registry.functions.len(), 1);
         assert_eq!(registry.order.len(), 1);
         assert_eq!(registry.functions.values().next().unwrap().symbol, "downstream.example");
+    }
+
+    #[test]
+    fn test_named_composition_function_map_register_suffixes_shared_names() {
+        // Keys that share a composite name but differ in their boundary types receive distinct symbols, suffixed with
+        // the number of earlier keys of that name.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![4.into()]));
+        let composite = CompositeKey::new("downstream.example", 1);
+        let mut registry = NamedCompositionFunctionMap::default();
+        for boundary_type in [scalar_type.clone(), vector_type.clone(), scalar_type.clone()] {
+            let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
+                |inputs: Vec<Tracer<'static>>| Ok(inputs),
+                vec![ArrayIrType::from(boundary_type.clone())],
+            )
+            .unwrap();
+            let key = NamedCompositionKey::new(composite.clone(), vec![boundary_type.clone()], vec![boundary_type]);
+            registry.register(key, || Ok(program.into_simplified().unwrap())).unwrap();
+        }
+
+        assert_eq!(
+            registry.order().iter().map(|key| registry.functions()[key].symbol()).collect::<Vec<_>>(),
+            vec!["downstream.example", "downstream.example_1"],
+        );
+        assert_eq!(registry.order()[1].input_types, vec![vector_type]);
     }
 }

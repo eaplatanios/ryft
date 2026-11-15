@@ -19,23 +19,24 @@ use crate::{Constant, Error};
 // TODO(eaplatanios): Review this module.
 
 #[cfg(test)]
+use ryft_core::ArrayType;
+#[cfg(test)]
+use ryft_mlir::Type;
+
+#[cfg(test)]
 use crate::Operation;
 #[cfg(test)]
 use crate::lowering::types::lower_literal_value;
 #[cfg(test)]
 use crate::lowering::{LowerableOperation, LoweringError, MlirLowerableValue};
-#[cfg(test)]
-use ryft_core::ArrayType;
-#[cfg(test)]
-use ryft_mlir::Type;
 
-/// Inlines a nested sub-program into the given block by mapping the provided input
-/// MLIR values to the body's input atoms, lowering constants and instructions in topological
-/// order, and returning lowered values corresponding to the program's output atoms.
+/// Inlines a nested program into the given block by mapping the provided input MLIR values to the input atoms of its
+/// body, lowering constants and instructions in topological order, and returning the lowered values that correspond
+/// to the output atoms of the program.
 ///
-/// `effect_tokens` are the per-class tokens of the lowering scope the program inlines into. They flow into each
-/// instruction's lowerer and the updated tokens are read back out after the instruction lowers, so same-class effects
-/// chain in program order and the caller observes the program's final tokens.
+/// `effect_tokens` are the per-class tokens of the lowering scope the program inlines into. They flow into the lowerer
+/// of each instruction and the updated tokens are read back out after the instruction lowers, so effects of the same
+/// class chain in program order and the caller observes the final tokens of the program.
 ///
 /// When `optimization_barrier` selects any input, one
 /// [`stablehlo.optimization_barrier`](https://openxla.org/stablehlo/spec#optimization_barrier) wraps the selected
@@ -72,8 +73,136 @@ pub(crate) fn lower_nested_program_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperat
     )
 }
 
+/// Lowers one plain traced program to values inside `block`, whose arguments are the program inputs. This test-only
+/// path supports no attached regions.
+#[cfg(test)]
+pub(crate) fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
+    program: &CoreProgram<V, O, Input, Output>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+    collective_state: &CollectiveLoweringState,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
+where
+    V: MlirLowerableValue,
+    O: LowerableOperation<Type = ArrayType>,
+    Input: Parameterized<V>,
+    Output: Parameterized<V>,
+{
+    let input_values = (0..program.input_ids().len())
+        .map(|index| block.argument(index).unwrap().as_ref())
+        .collect::<Vec<_>>();
+    // The per-class effect chains of the function body are created lazily and dropped at the end of that body.
+    let mut effect_tokens = EffectTokens::default();
+    replay_program_into_block(
+        program,
+        input_values,
+        block,
+        context,
+        location,
+        |_, value, block, context, location| lower_literal_value(value, block, context, location),
+        |instruction, inputs, block, context, location| {
+            let input_types = instruction
+                .inputs()
+                .iter()
+                .map(|input| program.atoms()[input.index()].r#type().into_owned())
+                .collect::<Vec<_>>();
+            let output_types = instruction
+                .outputs()
+                .iter()
+                .map(|output| program.atoms()[output.index()].r#type().into_owned())
+                .collect::<Vec<_>>();
+            if !instruction.regions().is_empty() {
+                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: instruction.operation().name().to_string(),
+                    reason: format!(
+                        "plain-program lowering does not support attached regions for `{}`; use the production \
+                         array IR XLA lowerer",
+                        instruction.operation().name(),
+                    ),
+                }));
+            }
+            let location = collective_state.instruction_location(context, instruction.provenance(), location);
+            let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(*block, context, location)
+                .with_effect_tokens(std::mem::take(&mut effect_tokens))
+                .with_collective_state(collective_state.clone());
+            let outputs =
+                instruction
+                    .operation()
+                    .lower(&mut lowerer, inputs, input_types.as_slice(), output_types.as_slice())?;
+            if lowerer.effect_tokens.ordered_assertion.is_some() {
+                collective_state.has_assertions.set(true);
+            }
+            effect_tokens = lowerer.effect_tokens;
+            Ok(outputs)
+        },
+    )
+}
+
+/// Lowers one traced program with explicit array inputs and the enclosing effect chains, and returns its lowered
+/// outputs.
+///
+/// # Errors
+///
+/// Returns an [`Error`] wrapping [`ProgramError::InvalidInputCount`] when the number of `input_values` differs from
+/// the number of program inputs, and propagates the errors of lowering its constants and instructions.
+pub(crate) fn lower_program_outputs_with_inputs<
+    'b,
+    'c: 'b,
+    't: 'c,
+    ProgramInput,
+    ProgramOutput,
+    O: LowerableOperationFamily,
+>(
+    program: &Program<ProgramInput, ProgramOutput, O>,
+    captured_values: &[ValueRef<'b, 'c, 't>],
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
+    collective_state: &CollectiveLoweringState,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
+where
+    ProgramInput: Parameterized<Constant>,
+    ProgramOutput: Parameterized<Constant>,
+{
+    if input_values.len() != program.input_ids().len() {
+        return Err(ProgramError::InvalidInputCount {
+            expected: program.input_ids().len(),
+            actual: input_values.len(),
+        }
+        .into());
+    }
+    replay_program_into_block(
+        program,
+        input_values.to_vec(),
+        block,
+        context,
+        location,
+        |_, value, block, context, location| {
+            lower_constant(value, captured_values, collective_state, block, context, location)
+        },
+        |instruction, inputs, block, context, location| {
+            lower_instruction(
+                program,
+                instruction,
+                inputs,
+                block,
+                context,
+                location,
+                captured_values,
+                nested_functions,
+                collective_state,
+                effect_tokens,
+            )
+        },
+    )
+}
+
 /// Inlines a borrowed nested region into the given block without materializing the region itself. Refer to the
-/// documentation of [`lower_nested_program_inline`] for the effect-token and optimization-barrier contracts.
+/// documentation of [`lower_nested_program_inline`] for the effect token and optimization barrier contracts.
 #[allow(clippy::too_many_arguments)]
 fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     region: RegionRef<'_, Constant, O>,
@@ -91,8 +220,8 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     let selected_input_indices =
         (0..input_values.len()).filter(|index| optimization_barrier.selects(*index)).collect::<Vec<_>>();
     if !selected_input_indices.is_empty() {
-        // The barrier results mirror its inputs: the selected input values first, followed by the present tokens in
-        // the order in which they were appended.
+        // The barrier results mirror its inputs, with the selected input values first, followed by the present tokens
+        // in the order in which they were appended.
         let barrier_inputs = selected_input_indices
             .iter()
             .map(|index| input_values[*index])
@@ -117,8 +246,8 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         block,
         context,
         location,
-        |atom_id, value, block, context, location| {
-            lower_constant(atom_id, value, captured_values, collective_state, block, context, location)
+        |_, value, block, context, location| {
+            lower_constant(value, captured_values, collective_state, block, context, location)
         },
         |instruction, inputs, block, context, location| {
             let input_types = instruction
@@ -168,8 +297,8 @@ fn lower_nested_region_inline<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     )
 }
 
-/// Drives [`CoreProgram::interpret_with`](ryft_core::Program::interpret_with) to lower a staged program into MLIR ops
-/// appended to `block`.
+/// Drives [`CoreProgram::interpret_with`](ryft_core::Program::interpret_with) to lower a staged program into MLIR
+/// operations appended to `block`.
 ///
 /// The two callbacks plug in lowering policies for [`Atom::Constant`](ryft_core::Atom::Constant)s and [`Instruction`]s
 /// respectively while the generic interpreter handles use-count tracking and atom bookkeeping. Each callback receives a
@@ -185,7 +314,7 @@ fn replay_program_into_block<
     Input,
     Output,
     LiftConstant,
-    ApplyOp,
+    ApplyOperation,
 >(
     program: &CoreProgram<V, O, Input, Output>,
     input_values: Vec<ValueRef<'b, 'c, 't>>,
@@ -193,7 +322,7 @@ fn replay_program_into_block<
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     mut lift_constant: LiftConstant,
-    mut apply_op: ApplyOp,
+    mut apply_operation: ApplyOperation,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
     O: CoreOperation<Type = T>,
@@ -206,7 +335,7 @@ where
         &'c MlirContext<'t>,
         LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>,
-    ApplyOp: FnMut(
+    ApplyOperation: FnMut(
         &Instruction<O>,
         &[ValueRef<'b, 'c, 't>],
         &mut BlockRef<'b, 'c, 't>,
@@ -215,23 +344,24 @@ where
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>,
 {
     let mut block_for_constants = *block;
-    let mut block_for_ops = *block;
+    let mut block_for_operations = *block;
     program.interpret_with(
         input_values,
         |atom_id, value| lift_constant(atom_id, value, &mut block_for_constants, context, location),
-        |instruction, inputs| apply_op(instruction, inputs, &mut block_for_ops, context, location),
+        |instruction, inputs| apply_operation(instruction, inputs, &mut block_for_operations, context, location),
     )
 }
 
-/// Drives [`RegionRef::interpret_with`] to lower a borrowed region into MLIR ops appended to `block`.
-fn replay_region_ref_into_block<'b, 'c: 'b, 't: 'c, O, V, LiftConstant, ApplyOp>(
+/// Drives [`RegionRef::interpret_with`] to lower a borrowed region into MLIR operations appended to `block`, like
+/// [`replay_program_into_block`] does for a whole program.
+fn replay_region_ref_into_block<'b, 'c: 'b, 't: 'c, O, V, LiftConstant, ApplyOperation>(
     region: RegionRef<'_, V, O>,
     input_values: Vec<ValueRef<'b, 'c, 't>>,
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
     mut lift_constant: LiftConstant,
-    mut apply_op: ApplyOp,
+    mut apply_operation: ApplyOperation,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
 where
     V: CoreValue,
@@ -243,7 +373,7 @@ where
         &'c MlirContext<'t>,
         LocationRef<'c, 't>,
     ) -> Result<ValueRef<'b, 'c, 't>, Error>,
-    ApplyOp: FnMut(
+    ApplyOperation: FnMut(
         &Instruction<O>,
         &[ValueRef<'b, 'c, 't>],
         &mut BlockRef<'b, 'c, 't>,
@@ -252,150 +382,11 @@ where
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>,
 {
     let mut block_for_constants = *block;
-    let mut block_for_ops = *block;
+    let mut block_for_operations = *block;
     region.interpret_with(
         input_values,
         |atom_id, value| lift_constant(atom_id, value, &mut block_for_constants, context, location),
-        |instruction, inputs| apply_op(instruction, inputs, &mut block_for_ops, context, location),
-    )
-}
-
-/// Lowers one plain traced program to values inside a block.
-#[cfg(test)]
-pub(crate) fn lower_plain_program_outputs<'b, 'c: 'b, 't: 'c, O, V, Input, Output>(
-    program: &CoreProgram<V, O, Input, Output>,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    collective_state: &CollectiveLoweringState,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
-where
-    V: MlirLowerableValue,
-    O: LowerableOperation<Type = ArrayType>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
-    let input_values = (0..program.input_ids().len())
-        .map(|index| block.argument(index).expect("body block arguments should exist").as_ref())
-        .collect::<Vec<_>>();
-    // Function-body-scoped per-class effect chains are created lazily and dropped at the end of the function body.
-    let mut effect_tokens = EffectTokens::default();
-    replay_program_into_block(
-        program,
-        input_values,
-        block,
-        context,
-        location,
-        |_, value, block, context, location| lower_literal_value(value, block, context, location),
-        |instruction, inputs, block, context, location| {
-            let input_types = instruction
-                .inputs()
-                .iter()
-                .map(|input| program.atoms()[input.index()].r#type().into_owned())
-                .collect::<Vec<_>>();
-            let output_types = instruction
-                .outputs()
-                .iter()
-                .map(|output| program.atoms()[output.index()].r#type().into_owned())
-                .collect::<Vec<_>>();
-            if !instruction.regions().is_empty() {
-                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: instruction.operation().name().to_string(),
-                    reason: format!(
-                        "plain-program lowering does not support attached regions for `{}`; use the production \
-                         array IR XLA lowerer",
-                        instruction.operation().name(),
-                    ),
-                }));
-            }
-            let location = collective_state.instruction_location(context, instruction.provenance(), location);
-            let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(*block, context, location)
-                .with_effect_tokens(std::mem::take(&mut effect_tokens))
-                .with_collective_state(collective_state.clone());
-            let outputs =
-                instruction
-                    .operation()
-                    .lower(&mut lowerer, inputs, input_types.as_slice(), output_types.as_slice())?;
-            if lowerer.effect_tokens.ordered_assertion.is_some() {
-                collective_state.has_assertions.set(true);
-            }
-            effect_tokens = lowerer.effect_tokens;
-            Ok(outputs)
-        },
-    )
-}
-
-/// Lowers one traced program with explicit array inputs and the enclosing effect chains.
-pub(crate) fn lower_program_outputs_with_inputs<
-    'b,
-    'c: 'b,
-    't: 'c,
-    ProgramInput,
-    ProgramOutput,
-    O: LowerableOperationFamily,
->(
-    program: &Program<ProgramInput, ProgramOutput, O>,
-    captured_values: &[ValueRef<'b, 'c, 't>],
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
-    collective_state: &CollectiveLoweringState,
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error>
-where
-    ProgramInput: Parameterized<Constant>,
-    ProgramOutput: Parameterized<Constant>,
-{
-    if input_values.len() != program.input_ids().len() {
-        return Err(ProgramError::InvalidInputCount {
-            expected: program.input_ids().len(),
-            actual: input_values.len(),
-        }
-        .into());
-    }
-    // Mirror table of every lowered atom value. Shard-map operations look up captured global primals by `AtomId`,
-    // so we keep a parallel table alongside `Program::interpret_with`'s use-count-tracked one. `ValueRef` is
-    // `Copy`, so this mirror is cheap.
-    let mut atom_values = vec![None; program.atoms().len()];
-    for (atom_id, value) in program.input_ids().iter().copied().zip(input_values.iter().copied()) {
-        atom_values[atom_id.index()] = Some(value);
-    }
-    let atom_values = std::cell::RefCell::new(atom_values);
-    replay_program_into_block(
-        program,
-        input_values.to_vec(),
-        block,
-        context,
-        location,
-        |atom_id, value, block, context, location| {
-            let lowered = lower_constant(atom_id, value, captured_values, collective_state, block, context, location)?;
-            atom_values.borrow_mut()[atom_id.index()] = Some(lowered);
-            Ok(lowered)
-        },
-        |instruction, inputs, block, context, location| {
-            let mut table = atom_values.borrow_mut();
-            let lowered_outputs = lower_instruction(
-                program,
-                instruction,
-                table.as_slice(),
-                inputs,
-                block,
-                context,
-                location,
-                captured_values,
-                nested_functions,
-                collective_state,
-                effect_tokens,
-            )?;
-            for (output_atom, lowered_output) in
-                instruction.outputs().iter().copied().zip(lowered_outputs.iter().copied())
-            {
-                table[output_atom.index()] = Some(lowered_output);
-            }
-            Ok(lowered_outputs)
-        },
+        |instruction, inputs| apply_operation(instruction, inputs, &mut block_for_operations, context, location),
     )
 }
 
@@ -403,7 +394,7 @@ where
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{AddOperation, ArrayType, DataType, MulOperation, Placeholder};
+    use ryft_core::{AddOperation, ArrayType, DataType, MulOperation, Placeholder, PrintOperation};
     use ryft_mlir::dialects::func;
     use ryft_mlir::{Block, Location, Operation as MlirOperation, Region, TypeAndAttributes, Value as MlirValue};
 
@@ -415,7 +406,7 @@ mod tests {
 
     /// Inlines `program` into the body of a `main` function behind an optimization barrier on all of its inputs,
     /// returns the inlined outputs from that function, and renders the verified module. When `ordered_io` is set, the
-    /// enclosing scope already holds an ordered-I/O token when the program is inlined, so the barrier must thread it.
+    /// enclosing scope already holds an ordered I/O token when the program is inlined, so the barrier must thread it.
     fn lower_nested_program_inline_behind_input_barrier(
         program: &FlatProgram,
         input_types: &[ArrayType],
@@ -518,10 +509,8 @@ mod tests {
 
     #[test]
     fn test_lower_nested_program_inline_input_optimization_barrier_orders_effects() {
-        use ryft_core::PrintOperation;
-
-        // The enclosing ordered-I/O token goes through the same barrier as the inputs, so the body's print consumes
-        // the barrier's token result and is sequenced after the barrier.
+        // The enclosing ordered I/O token goes through the same barrier as the inputs, so the print of the body
+        // consumes the token result of the barrier and is sequenced after the barrier.
         let array_type = ArrayType::new_static(DataType::F32, [2]);
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(array_type.clone());
@@ -547,5 +536,41 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_lower_program_outputs_with_inputs_rejects_input_count_mismatch() {
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::new();
+        let left = builder.add_input(array_type.clone());
+        let right = builder.add_input(array_type.clone());
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let tensor_type = lower_tensor_type(&array_type, &context, location).unwrap();
+        let block = context.block(&[(tensor_type, location)]);
+        let mut block = block.as_ref();
+        let input = block.argument(0).unwrap().as_ref();
+        assert!(matches!(
+            lower_program_outputs_with_inputs(
+                &program,
+                &[],
+                &[input],
+                &mut block,
+                &context,
+                location.as_ref(),
+                None,
+                &CollectiveLoweringState::new(),
+                &mut EffectTokens::default(),
+            ),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
+            ),
+        ));
     }
 }

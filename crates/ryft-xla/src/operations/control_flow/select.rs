@@ -1,3 +1,12 @@
+//! Lowering of [`SelectOperation`] to [StableHLO `select`](https://openxla.org/stablehlo/spec#select).
+//!
+//! StableHLO requires the condition and both branches of a `stablehlo.select` to match the output shape exactly, so
+//! [`normalize_select_operands`] first broadcasts and converts them. The condition becomes a Boolean array of the
+//! output shape and each branch takes the output type, and an `I1` branch of a wider output type first recovers its
+//! sign. When the output has more than one dynamic axis, each input whose shape differs from the output shape is
+//! broadcast at its physical bound and then given the runtime extent of every output axis, which is read from an input
+//! that carries that axis.
+
 use ryft_core::macros::check_count;
 use ryft_core::{ArrayType, DataType, Dimension as CoreDimension, SELECT_OPERATION_NAME, SelectOperation};
 use ryft_mlir::dialects::stable_hlo;
@@ -14,8 +23,34 @@ use crate::operations::constants::lower_layout_constraint;
 use crate::operations::normalize_elementwise_operand;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
-/// Normalizes a select condition and both branches to the exact tensor descriptors required by StableHLO.
-pub(crate) fn normalize_select_operands<'b, 'c: 'b, 't: 'c, B, L>(
+impl LowerableOperation for SelectOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let [condition, on_true, on_false] = normalize_select_operands(
+            input_values,
+            input_types,
+            output_types,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+        let result =
+            lowerer
+                .block()
+                .append_operation(stable_hlo::select(condition, on_true, on_false, lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
+    }
+}
+
+/// Normalizes the condition and both branches of a [`SelectOperation`] to the exact tensor descriptors that
+/// `stablehlo.select` requires, and returns them as `[condition, on_true, on_false]`. The condition is converted to a
+/// Boolean array of the output shape and each branch to the output type.
+fn normalize_select_operands<'b, 'c: 'b, 't: 'c, B, L>(
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
@@ -39,8 +74,8 @@ where
         .filter(|dimension| matches!(dimension, CoreDimension::Dynamic(_)))
         .count()
         > 1;
-    // Each dynamic output extent is inherited from a right-aligned input dimension. Cross-broadcasts such as
-    // [rows, 1] and [1, columns] need different inputs for different axes, rather than one full-shape exemplar.
+    // Each dynamic output extent is inherited from a right-aligned input dimension. Cross broadcasts such as
+    // `[rows, 1]` and `[1, columns]` need different inputs for different axes, rather than one input of the full shape.
     let mut sources = vec![(input_values[0], 0); output_type.rank()];
     if multiple_dynamic_axes {
         for (output_axis, dimension) in output_type.shape().dimensions().iter().enumerate() {
@@ -56,7 +91,7 @@ where
             sources[output_axis] = source.ok_or_else(|| {
                 Error::Lowering(LoweringError::UnsupportedOperation {
                     operation: SELECT_OPERATION_NAME.to_string(),
-                    reason: format!("cannot recover select output axis {output_axis} extent from its inputs"),
+                    reason: format!("cannot recover `select` output axis {output_axis} extent from its inputs"),
                 })
             })?;
         }
@@ -65,8 +100,8 @@ where
     for index in 0..3 {
         let target_type =
             if index == 0 { output_type.clone().with_data_type(DataType::Boolean) } else { output_type.clone() };
-        // StableHLO stores I1 in a predicate carrier. Recover its signed value before promoting a branch,
-        // while equal-I1 branches keep their original carrier and the Boolean condition stays a predicate.
+        // StableHLO stores `I1` in a predicate carrier. Recover its signed value before promoting a branch, while
+        // `I1` branches of an `I1` output keep their original carrier and the Boolean condition stays a predicate.
         if index != 0 && input_types[index].data_type() == DataType::I1 && output_type.data_type() != DataType::I1 {
             inputs[index] = lower_signed_one_bit_to_mlir(inputs[index], block, context, location)?;
         }
@@ -91,7 +126,7 @@ where
                 Error::Lowering(LoweringError::UnsupportedOperation {
                     operation: SELECT_OPERATION_NAME.to_string(),
                     reason: format!(
-                        "cannot broadcast rank-{} select input to rank-{} output",
+                        "cannot broadcast rank-{} `select` input to rank-{} output",
                         converted_type.rank(),
                         target_type.rank(),
                     ),
@@ -125,47 +160,64 @@ where
     Ok(inputs)
 }
 
-impl LowerableOperation for SelectOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let [condition, on_true, on_false] = normalize_select_operands(
-            input_values,
-            input_types,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
-        let result =
-            lowerer
-                .block
-                .append_operation(stable_hlo::select(condition, on_true, on_false, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.select should return one result").as_ref()])
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::{CompareOperation, ComparisonDirection, Placeholder, Select, SelectOperation, Shape};
+    use ryft_core::{CompareOperation, ComparisonDirection, Placeholder, Select, Shape};
 
-    use crate::Session;
     use crate::domains::tests::domain_mesh;
     use crate::lowering::tests::{
         MixedValue, ProgramBuilder, dynamic_dimension, execute_mixed_program, unproject_plain_program,
     };
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::values::ArrayConstant;
+    use crate::{Session, to_mlir_module_for_program};
 
     use super::*;
 
     #[test]
-    fn test_select_lowering_broadcasts_scalars_over_multiple_dynamic_axes() {
+    fn test_select_operation_lower() {
+        // A scalar condition broadcasts to the output shape before `stablehlo.select`, while branches of the output
+        // type pass through unchanged.
+        let condition_type = ArrayType::scalar(DataType::Boolean);
+        let branch_type = ArrayType::new_static(DataType::F32, [3]);
+        let mut builder = ProgramBuilder::new();
+        let condition = builder.add_input(condition_type.clone());
+        let on_true = builder.add_input(branch_type.clone());
+        let on_false = builder.add_input(branch_type.clone());
+        let selected = builder
+            .add_instruction(SelectOperation::new(), Vec::new(), vec![condition, on_true, on_false], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![selected], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        assert_eq!(
+            to_mlir_module_for_program(
+                &program,
+                &[],
+                &[condition_type, branch_type.clone(), branch_type.clone()],
+                &[branch_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<3xf32>, %arg2: tensor<3xf32>) -> tensor<3xf32> {
+                    %0 = stablehlo.broadcast_in_dim %arg0, dims = [] : (tensor<i1>) -> tensor<3xi1>
+                    %1 = stablehlo.select %0, %arg1, %arg2 : tensor<3xi1>, tensor<3xf32>
+                    return %1 : tensor<3xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_select_operation_lower_broadcasts_scalars_over_multiple_dynamic_axes() {
         let input_type = ArrayType::new(
             DataType::F64,
             Shape::new(vec![dynamic_dimension("rows", Some(5)), dynamic_dimension("columns", Some(5))]),
@@ -231,7 +283,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_lowering_cross_broadcasts_multiple_dynamic_axes() {
+    fn test_select_operation_lower_cross_broadcasts_multiple_dynamic_axes() {
         let rows = dynamic_dimension("rows", Some(5));
         let columns = dynamic_dimension("columns", Some(5));
         let mut builder = ProgramBuilder::new();
@@ -259,7 +311,7 @@ mod tests {
             MixedValue::Array(vec![10., 20., 30., 99.], vec![1, 4]),
             MixedValue::Array(vec![-7.], Vec::new()),
         ];
-        // No input has the output shape: the row extent comes from the condition and the column extent from
+        // No input has the output shape. The row extent comes from the condition and the column extent from
         // the true branch. Both stretched inputs must broadcast their bounded storage before restoring sizes.
         assert_eq!(
             execute_mixed_program(&client, &program, &inputs, &[2, 3]).unwrap(),
@@ -276,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_lowering_promotes_signed_one_bit_branches() {
+    fn test_select_operation_lower_promotes_signed_one_bit_branches() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -287,12 +339,56 @@ mod tests {
         // A set I1 bit represents -1, even when selection promotes it to a wider branch type. Both branch positions
         // are exercised so that recovering the sign cannot depend on the selected side.
         assert_eq!(
-            values_from_bytes::<i32>(&Select::select(&condition, &signed, &wide).unwrap().copy_to_host().unwrap()),
+            values_from_bytes::<i32>(&condition.select(&signed, &wide).unwrap().copy_to_host().unwrap()),
             [-1, 3, 0, 5],
         );
         assert_eq!(
-            values_from_bytes::<i32>(&Select::select(&condition, &wide, &signed).unwrap().copy_to_host().unwrap()),
+            values_from_bytes::<i32>(&condition.select(&wide, &signed).unwrap().copy_to_host().unwrap()),
             [2, -1, 4, 0],
         );
+    }
+
+    #[test]
+    fn test_normalize_select_operands() {
+        // An output with more than one dynamic axis takes the runtime extent of each axis from an input that carries
+        // it, so an output axis that no input carries and an input of higher rank than the output are rejected.
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let rows = dynamic_dimension("rows", Some(5));
+        let columns = dynamic_dimension("columns", Some(5));
+        let output_type = ArrayType::new(DataType::F64, Shape::new(vec![rows.clone(), columns.clone()]));
+        let normalize = |input_types: [ArrayType; 3]| {
+            let block = context.block(
+                &input_types
+                    .iter()
+                    .map(|r#type| (lower_tensor_type(r#type, &context, location).unwrap(), location))
+                    .collect::<Vec<_>>(),
+            );
+            let input_values = (0..3).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+            normalize_select_operands(
+                &input_values,
+                &input_types,
+                std::slice::from_ref(&output_type),
+                &mut block.as_ref(),
+                &context,
+                location,
+            )
+            .map(|_| ())
+        };
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        assert!(matches!(
+            normalize([ArrayType::scalar(DataType::Boolean), scalar_type.clone(), scalar_type]),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "select" && reason == "cannot recover `select` output axis 0 extent from its inputs",
+        ));
+        assert!(matches!(
+            normalize([
+                ArrayType::new_static(DataType::Boolean, [2, 2, 2]),
+                output_type.clone(),
+                output_type.clone(),
+            ]),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "select" && reason == "cannot broadcast rank-3 `select` input to rank-2 output",
+        ));
     }
 }

@@ -21,10 +21,443 @@ use crate::operations::assertions::{
 };
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
+impl LowerableOperation for SliceOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        // Static limits slice the input directly. A dynamic limit keeps its bounded dynamic axis whole, so the input is
+        // first exposed as its static physical allocation (i.e., each dynamic axis is widened to its physical bound),
+        // sliced with that bound as the limit along each such axis, and the logical extents of the output's dynamic
+        // axes are then restored from the same axes of the input. The elements beyond each logical extent are never
+        // masked, because restoring the logical extents discards them again.
+        let context = lowerer.context();
+        let location = lowerer.location();
+        let block = &mut lowerer.block();
+        check_count!("input", input_values, 1, ProgramError);
+        check_count!("input", input_types, 1, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let static_limits = self.limits().iter().map(CoreDimension::value).collect::<Option<Vec<_>>>();
+        if let Some(limits) = static_limits {
+            let result = block.append_operation(stable_hlo::slice(
+                input_values[0],
+                self.start_indices(),
+                &limits,
+                self.strides(),
+                location,
+            )?)?;
+            return Ok(vec![result.result(0).unwrap().as_ref()]);
+        }
+
+        let input_type = &input_types[0];
+        let physical_type = physical_bound_type(input_type)?;
+        let size_type = lower_tensor_type(&ArrayType::scalar(DataType::I32), context, location)?;
+        let mut physical = input_values[0];
+        let mut physical_dimensions = input_type.shape().dimensions().to_vec();
+        for (axis, dimension) in physical_type.shape().dimensions().iter().enumerate() {
+            if physical_dimensions[axis] == *dimension {
+                continue;
+            }
+            let extent = dimension_extent_i32(dimension.value().unwrap())?;
+            let elements = context.dense_i32_elements_attribute(size_type, &[extent])?;
+            let size = block.append_operation(stable_hlo::constant(elements, location)?)?.result(0).unwrap().as_ref();
+            physical_dimensions[axis] = dimension.clone();
+            let physical_type = input_type.clone().with_shape(Shape::new(physical_dimensions.clone()));
+            physical = block
+                .append_operation(stable_hlo::set_dimension_size(
+                    physical,
+                    size,
+                    lower_tensor_type(&physical_type, context, location)?,
+                    axis,
+                    location,
+                )?)?
+                .result(0)
+                .unwrap()
+                .as_ref();
+        }
+        let limits = self
+            .limits()
+            .iter()
+            .zip(physical_type.shape().dimensions())
+            .map(|(limit, physical_extent)| limit.value().or(physical_extent.value()).unwrap())
+            .collect::<Vec<_>>();
+        let result = block.append_operation(stable_hlo::slice(
+            physical,
+            self.start_indices(),
+            &limits,
+            self.strides(),
+            location,
+        )?)?;
+        let result = result.result(0).unwrap().as_ref();
+        let sources = (0..input_type.rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
+        Ok(vec![lower_restore_dynamic_dimensions(result, &output_types[0], &sources, block, context, location)?])
+    }
+}
+
+impl LowerableOperation for UpdateSliceOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
+        check_count!("input", input_values, 2, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let index_values = lower_static_index_constants(
+            self.start_indices(),
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+        let result = lowerer.block().append_operation(stable_hlo::dynamic_update_slice(
+            input_values[0],
+            input_values[1],
+            index_values.as_slice(),
+            lowerer.location(),
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
+    }
+}
+
+impl LowerableOperation for DynamicSliceOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_values, self.sizes().len() + 1, ProgramError);
+        check_count!("input", input_types, self.sizes().len() + 1, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let starts = lower_slice_start_indices(
+            input_values[0],
+            &input_types[0],
+            &input_values[1..],
+            &input_types[1..],
+            self.sizes(),
+            self.allows_negative_indices(),
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+        let result = lowerer.block().append_operation(stable_hlo::dynamic_slice(
+            input_values[0],
+            &starts,
+            self.sizes(),
+            lowerer.location(),
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
+    }
+}
+
+impl LowerableOperation for DynamicUpdateSliceOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("output", output_types, 1, ProgramError);
+        check_count!("input", input_values, output_types[0].rank() + 2, ProgramError);
+        check_count!("input", input_types, output_types[0].rank() + 2, ProgramError);
+        let sizes = static_dimensions(&input_types[1])?;
+        let starts = lower_slice_start_indices(
+            input_values[0],
+            &input_types[0],
+            &input_values[2..],
+            &input_types[2..],
+            &sizes,
+            self.allows_negative_indices(),
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+        let result = lowerer.block().append_operation(stable_hlo::dynamic_update_slice(
+            input_values[0],
+            input_values[1],
+            &starts,
+            lowerer.location(),
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
+    }
+}
+
+impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let context = lowerer.context();
+        let location = lowerer.location();
+        let block = &mut lowerer.block();
+        let effect_tokens = lowerer.effect_tokens_mut();
+        check_count!("input", input_types, input_values.len(), ProgramError);
+        let Some((input, bounds)) = input_values.split_first() else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+        };
+        let input_type = <&ArrayType>::try_from(&input_types[0])?;
+        let [output_type] = output_types else {
+            return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
+        };
+        let output_type = <&ArrayType>::try_from(output_type)?;
+        let rank = output_type.rank();
+        if bounds.len() != 2 * rank {
+            return Err(ProgramError::InvalidInputCount { expected: 1 + 2 * rank, actual: input_values.len() }.into());
+        }
+        let (starts, sizes) = bounds.split_at(rank);
+        let mut starts = starts.to_vec();
+        let start_types = &input_types[1..1 + rank];
+        let size_types = &input_types[1 + rank..];
+        let mut physical_sizes = Vec::with_capacity(rank);
+        let mut physical_spans = Vec::with_capacity(rank);
+        for axis in 0..rank {
+            // An array start (e.g., one that differs across devices) is first converted to the signed `i64` carrier
+            // of dimension starts. Unsigned starts saturate at the largest `i64` value, which is out of bounds for
+            // every input, and a start whose value is unknown before it runs proves no window, so it is checked at
+            // runtime.
+            let unknown_start = DimensionType::new("start", DimensionBounds::unbounded());
+            let start_type = match &start_types[axis] {
+                ArrayIrType::Array(array_start_type) => {
+                    starts[axis] = lower_array_start(starts[axis], array_start_type, block, context, location)?;
+                    &unknown_start
+                }
+                start_type => <&DimensionType>::try_from(start_type)?,
+            };
+            let size_type = <&DimensionType>::try_from(&size_types[axis])?;
+            // Clamping is relative to the logical span, not the larger physical allocation window.
+            // Normalize once and reuse the same origin for validation and extraction.
+            let zero_start = DimensionType::new("start", DimensionBounds::new(0, Some(1)).unwrap());
+            let start_type = if self.bounds() == DynamicSliceBounds::Clamp {
+                let constants = lower_static_index_constants(&[0, 1, self.strides()[axis]], block, context, location)?;
+                let difference = block
+                    .append_operation(stable_hlo::subtract(sizes[axis], constants[1], location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                let steps = block
+                    .append_operation(stable_hlo::maximum(difference, constants[0], location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                let steps = block
+                    .append_operation(stable_hlo::multiply(steps, constants[2], location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                let occupied = block
+                    .append_operation(stable_hlo::minimum(sizes[axis], constants[1], location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                let span =
+                    block.append_operation(stable_hlo::add(steps, occupied, location)?)?.result(0).unwrap().as_ref();
+                let input_size = lower_runtime_dimension_size_i64(*input, axis, block, context, location)?;
+                let maximum_start = block
+                    .append_operation(stable_hlo::subtract(input_size, span, location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                let maximum_start = block
+                    .append_operation(stable_hlo::maximum(maximum_start, constants[0], location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                if matches!(start_types[axis], ArrayIrType::Array(_)) {
+                    // Unlike dimension starts, array starts can be negative, which clamping raises to zero.
+                    starts[axis] = block
+                        .append_operation(stable_hlo::maximum(starts[axis], constants[0], location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                }
+                starts[axis] = block
+                    .append_operation(stable_hlo::minimum(starts[axis], maximum_start, location)?)?
+                    .result(0)
+                    .unwrap()
+                    .as_ref();
+                &zero_start
+            } else {
+                start_type
+            };
+            let plan = DynamicSliceAxisPlan::new(
+                axis,
+                self.strides()[axis],
+                &input_type.shape().dimensions()[axis],
+                start_type,
+                size_type,
+            )?;
+            if plan.needs_runtime_assertion {
+                let input_size = lower_runtime_dimension_size_i64(*input, axis, block, context, location)?;
+                lower_dynamic_slice_assertion(
+                    axis,
+                    self.strides()[axis],
+                    input_size,
+                    starts[axis],
+                    sizes[axis],
+                    effect_tokens,
+                    block,
+                    context,
+                    location,
+                )?;
+            }
+            physical_sizes.push(plan.size);
+            physical_spans.push(plan.span);
+        }
+
+        // Reserve enough trailing storage for the maximum window at every valid runtime start. Without this,
+        // native `stablehlo.dynamic_slice` clamps a small valid runtime slice near the end to fit the larger bound
+        // window.
+        // Only the requested logical size is exposed, so padded values never become observable elements.
+        let padding_value = if input_type.data_type() == DataType::F8E8M0FNU { 1 } else { 0 };
+        let physical_input =
+            lower_physical_bound_value(*input, input_type, padding_value as f64, block, context, location)?;
+        let padding = lower_constant_output(
+            &[ArrayType::scalar(input_type.data_type())],
+            padding_value,
+            block,
+            context,
+            location,
+        )?[0];
+        let high_padding = physical_spans.iter().map(|span| *span as i64).collect::<Vec<_>>();
+        let padded = block
+            .append_operation(stable_hlo::pad(
+                physical_input,
+                padding,
+                &vec![0; rank],
+                &high_padding,
+                &vec![0; rank],
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let slice =
+            block.append_operation(stable_hlo::dynamic_slice(padded, &starts, physical_spans.as_slice(), location)?)?;
+        let mut result = slice.result(0).unwrap().as_ref();
+        if self.strides().iter().any(|stride| *stride != 1) {
+            let start_indices = vec![0; rank];
+            let slice = block.append_operation(stable_hlo::slice(
+                result,
+                start_indices.as_slice(),
+                physical_spans.as_slice(),
+                self.strides(),
+                location,
+            )?)?;
+            result = slice.result(0).unwrap().as_ref();
+        }
+
+        let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
+        let mut refined_type = output_type
+            .clone()
+            .with_shape(Shape::new(physical_sizes.iter().copied().map(CoreDimension::Static).collect()));
+        for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
+            if !matches!(dimension, CoreDimension::Dynamic(_)) {
+                continue;
+            }
+            let size = block.append_operation(stable_hlo::convert(sizes[axis], i32_scalar_type, location)?)?;
+            let size = size.result(0).unwrap().as_ref();
+            let mut dimensions = refined_type.shape().dimensions().to_vec();
+            dimensions[axis] = dimension;
+            refined_type = refined_type.with_shape(Shape::new(dimensions));
+            let refined_tensor_type = lower_tensor_type(&refined_type, context, location)?;
+            let refined = block.append_operation(stable_hlo::set_dimension_size(
+                result,
+                size,
+                refined_tensor_type,
+                axis,
+                location,
+            )?)?;
+            result = refined.result(0).unwrap().as_ref();
+        }
+        Ok(vec![result])
+    }
+}
+
+/// Physical lowering plan for one axis of a first-class dynamic shape slice.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct DynamicSliceAxisPlan {
+    /// Maximum logical output size admitted by the size operand's type.
+    size: usize,
+
+    /// Maximum physical input span needed to realize [`Self::size`] elements at the static stride.
+    span: usize,
+
+    /// Whether declared bounds leave some runtime combinations of input, start, and size that need a checked
+    /// assertion.
+    needs_runtime_assertion: bool,
+}
+
+impl DynamicSliceAxisPlan {
+    /// Plans one axis of a first-class dynamic shape slice from its declared input, start, and size bounds.
+    fn new(
+        axis: usize,
+        stride: usize,
+        input_dimension: &CoreDimension,
+        start_type: &DimensionType,
+        size_type: &DimensionType,
+    ) -> Result<Self, Error> {
+        let Some(size_upper) = size_type.bounds().upper() else {
+            return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
+                reason: format!("`{DYNAMIC_SLICE_OPERATION_NAME}` size on axis {axis} needs a finite upper bound"),
+            }));
+        };
+        let size = size_upper - 1;
+        let span = if size == 0 {
+            0
+        } else {
+            (size - 1).checked_mul(stride).and_then(|size| size.checked_add(1)).ok_or_else(|| {
+                Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
+                    reason: format!("`{DYNAMIC_SLICE_OPERATION_NAME}` physical span overflows on axis {axis}"),
+                })
+            })?
+        };
+        let (input_minimum, input_physical_size) = match input_dimension {
+            CoreDimension::Static(extent) => (*extent, *extent),
+            CoreDimension::Dynamic(variable) => {
+                let Some(upper) = variable.bounds().upper() else {
+                    return Err(Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
+                        reason: format!(
+                            "`{DYNAMIC_SLICE_OPERATION_NAME}` input on axis {axis} needs a finite upper bound"
+                        ),
+                    }));
+                };
+                (variable.bounds().lower(), upper - 1)
+            }
+        };
+        let padded_size = input_physical_size.checked_add(span).ok_or_else(|| {
+            Error::Lowering(LoweringError::UnsupportedOperation {
+                operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
+                reason: format!("`{DYNAMIC_SLICE_OPERATION_NAME}` padded input size overflows on axis {axis}"),
+            })
+        })?;
+        dimension_extent_i32(padded_size)?;
+        let bounds_prove_runtime_in_bounds = start_type
+            .bounds()
+            .upper()
+            .and_then(|upper| upper.checked_sub(1))
+            .and_then(|start_maximum| start_maximum.checked_add(span))
+            .is_some_and(|limit| limit <= input_minimum);
+        Ok(Self { size, span, needs_runtime_assertion: !bounds_prove_runtime_in_bounds })
+    }
+}
+
 /// Normalizes scalar slice starts against logical input dimensions before native allocation-based clamping. Signed
 /// starts count from the end of their axis once when `allow_negative_indices` is set, unsigned indices are widened
 /// before clamping, and only then are bounded starts converted to the common signed i64 carrier.
-pub(crate) fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
+fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     input_type: &ArrayType,
     starts: &[ValueRef<'b, 'c, 't>],
@@ -38,14 +471,14 @@ pub(crate) fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
     check_count!("input", starts, input_type.rank(), ProgramError);
     check_count!("input", start_types, input_type.rank(), ProgramError);
     check_count!("input", sizes, input_type.rank(), ProgramError);
-    // A signed start wraps only under the negative-index policy; unsigned starts cannot be negative and Boolean starts
+    // A signed start wraps only under the negative index policy. Unsigned starts cannot be negative, and Boolean starts
     // are predicate carriers that never wrap.
     let wraps = |start_type: &ArrayType| {
         allow_negative_indices && !start_type.data_type().is_unsigned() && start_type.data_type() != DataType::I1
     };
     // Native clamping already has the right bounds for static inputs and uniformly typed ordinary signed indices.
-    // Keep that common path direct, wrapping negative starts in their own type when the static extents fit it;
-    // unsigned extremes, predicate carriers, mixed scalar types, and extents beyond the index type need normalization.
+    // Keep that common path direct, wrapping negative starts in their own type when the static extents fit it. Unsigned
+    // extremes, predicate carriers, mixed scalar types, and extents beyond the index type need normalization.
     if let Some(static_shape) = input_type.static_shape()
         && start_types.first().is_none_or(|first| {
             matches!(first.data_type(), DataType::I8 | DataType::I16 | DataType::I32 | DataType::I64)
@@ -167,81 +600,8 @@ fn max_value(data_type: DataType) -> i64 {
     }
 }
 
-/// Lowers a slice. Static limits slice the input directly. A dynamic limit keeps its bounded dynamic axis whole, so
-/// the input is first exposed as its static physical allocation (i.e., each dynamic axis is widened to its physical
-/// bound), sliced with that bound as the limit along each such axis, and the logical extents of the output's dynamic
-/// axes are then restored from the same axes of the input. The lanes beyond each logical extent are never masked,
-/// because restoring the logical extents discards them again.
-pub(crate) fn lower_slice_to_mlir<'b, 'c: 'b, 't: 'c>(
-    operation: &SliceOperation,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    check_count!("input", input_values, 1, ProgramError);
-    check_count!("input", input_types, 1, ProgramError);
-    check_count!("output", output_types, 1, ProgramError);
-    let static_limits = operation.limits().iter().map(CoreDimension::value).collect::<Option<Vec<_>>>();
-    if let Some(limits) = static_limits {
-        let result = block.append_operation(stable_hlo::slice(
-            input_values[0],
-            operation.start_indices(),
-            &limits,
-            operation.strides(),
-            location,
-        )?)?;
-        return Ok(vec![result.result(0).expect("stablehlo.slice should return one result").as_ref()]);
-    }
-
-    let input_type = &input_types[0];
-    let physical_type = physical_bound_type(input_type)?;
-    let size_type = lower_tensor_type(&ArrayType::scalar(DataType::I32), context, location)?;
-    let mut physical = input_values[0];
-    let mut physical_dimensions = input_type.shape().dimensions().to_vec();
-    for (axis, dimension) in physical_type.shape().dimensions().iter().enumerate() {
-        if physical_dimensions[axis] == *dimension {
-            continue;
-        }
-        let extent = dimension_extent_i32(dimension.value().unwrap())?;
-        let elements = context.dense_i32_elements_attribute(size_type, &[extent])?;
-        let size = block.append_operation(stable_hlo::constant(elements, location)?)?.result(0).unwrap().as_ref();
-        physical_dimensions[axis] = dimension.clone();
-        let physical_type = input_type.clone().with_shape(Shape::new(physical_dimensions.clone()));
-        physical = block
-            .append_operation(stable_hlo::set_dimension_size(
-                physical,
-                size,
-                lower_tensor_type(&physical_type, context, location)?,
-                axis,
-                location,
-            )?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-    }
-    let limits = operation
-        .limits()
-        .iter()
-        .zip(physical_type.shape().dimensions())
-        .map(|(limit, physical_extent)| limit.value().or(physical_extent.value()).unwrap())
-        .collect::<Vec<_>>();
-    let result = block.append_operation(stable_hlo::slice(
-        physical,
-        operation.start_indices(),
-        &limits,
-        operation.strides(),
-        location,
-    )?)?;
-    let result = result.result(0).expect("stablehlo.slice should return one result").as_ref();
-    let sources = (0..input_type.rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
-    Ok(vec![lower_restore_dynamic_dimensions(result, &output_types[0], &sources, block, context, location)?])
-}
-
-/// Lowers one runtime bounds check for an axis of a dynamic-shape-slice operation.
-pub(crate) fn lower_dynamic_slice_assertion<'b, 'c: 'b, 't: 'c>(
+/// Lowers one runtime bounds check for an axis of a first-class dynamic shape [`DynamicSliceOperation`].
+fn lower_dynamic_slice_assertion<'b, 'c: 'b, 't: 'c>(
     axis: usize,
     stride: usize,
     input_size: ValueRef<'b, 'c, 't>,
@@ -254,7 +614,7 @@ pub(crate) fn lower_dynamic_slice_assertion<'b, 'c: 'b, 't: 'c>(
 ) -> Result<(), Error> {
     let predicate = lower_deliberately_false_assertion_predicate(start, block, context, location)?;
     let detail = format!("{axis}:{stride}");
-    let backend_config = context.dictionary_attribute(&[
+    let backend_configuration = context.dictionary_attribute(&[
         context.named_attribute(
             context.identifier(ASSERT_ACTOR_ATTRIBUTE),
             context.string_attribute(DYNAMIC_SLICE_OPERATION_NAME),
@@ -268,78 +628,12 @@ pub(crate) fn lower_dynamic_slice_assertion<'b, 'c: 'b, 't: 'c>(
     lower_assertion_custom_call(
         predicate,
         &[input_size, start, size],
-        backend_config,
+        backend_configuration,
         effect_tokens,
         block,
         context,
         location,
     )
-}
-
-/// Physical lowering plan for one axis of a first-class dynamic shape slice.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DynamicSliceAxisPlan {
-    /// Maximum logical output size admitted by the size operand's type.
-    pub(crate) size: usize,
-
-    /// Maximum physical input span needed to realize [`Self::size`] elements at the static stride.
-    pub(crate) span: usize,
-
-    /// Whether declared bounds leave some runtime input/start/size combinations that need a checked assertion.
-    pub(crate) needs_runtime_assertion: bool,
-}
-
-/// Plans one axis of a first-class dynamic shape slice from its declared input, start, and size bounds.
-pub(crate) fn plan_dynamic_slice_axis(
-    axis: usize,
-    stride: usize,
-    input_dimension: &CoreDimension,
-    start_type: &DimensionType,
-    size_type: &DimensionType,
-) -> Result<DynamicSliceAxisPlan, Error> {
-    let Some(size_upper) = size_type.bounds().upper() else {
-        return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
-            reason: format!("{DYNAMIC_SLICE_OPERATION_NAME} size on axis {axis} needs a finite upper bound",),
-        }));
-    };
-    let size = size_upper - 1;
-    let span = if size == 0 {
-        0
-    } else {
-        (size - 1).checked_mul(stride).and_then(|size| size.checked_add(1)).ok_or_else(|| {
-            Error::Lowering(LoweringError::UnsupportedOperation {
-                operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
-                reason: format!("{DYNAMIC_SLICE_OPERATION_NAME} physical span overflows on axis {axis}"),
-            })
-        })?
-    };
-    let (input_minimum, input_physical_size) = match input_dimension {
-        CoreDimension::Static(extent) => (*extent, *extent),
-        CoreDimension::Dynamic(variable) => {
-            let Some(upper) = variable.bounds().upper() else {
-                return Err(Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
-                    reason: format!("{DYNAMIC_SLICE_OPERATION_NAME} input on axis {axis} needs a finite upper bound",),
-                }));
-            };
-            (variable.bounds().lower(), upper - 1)
-        }
-    };
-    let padded_size = input_physical_size.checked_add(span).ok_or_else(|| {
-        Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: DYNAMIC_SLICE_OPERATION_NAME.to_string(),
-            reason: format!("{DYNAMIC_SLICE_OPERATION_NAME} padded input size overflows on axis {axis}"),
-        })
-    })?;
-    dimension_extent_i32(padded_size)?;
-    let bounds_prove_runtime_in_bounds = start_type
-        .bounds()
-        .upper()
-        .and_then(|upper| upper.checked_sub(1))
-        .and_then(|start_maximum| start_maximum.checked_add(span))
-        .is_some_and(|limit| limit <= input_minimum);
-    Ok(DynamicSliceAxisPlan { size, span, needs_runtime_assertion: !bounds_prove_runtime_in_bounds })
 }
 
 /// Converts a rank-0 integer array start of a first-class dynamic shape slice of type `start_type` to the signed `i64`
@@ -381,305 +675,6 @@ fn lower_array_start<'b, 'c: 'b, 't: 'c>(
         .as_ref())
 }
 
-impl LowerableOperation for SliceOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        lower_slice_to_mlir(
-            self,
-            input_values,
-            input_types,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )
-    }
-}
-
-impl LowerableOperation for UpdateSliceOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        check_count!("input", input_values, 2, ProgramError);
-        check_count!("output", output_types, 1, ProgramError);
-        let index_values =
-            lower_static_index_constants(self.start_indices(), &mut lowerer.block, lowerer.context, lowerer.location)?;
-        let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
-            input_values[0],
-            input_values[1],
-            index_values.as_slice(),
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.dynamic_update_slice should return one result").as_ref()])
-    }
-}
-
-impl LowerableOperation for DynamicSliceOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        check_count!("input", input_values, self.sizes().len() + 1, ProgramError);
-        check_count!("input", input_types, self.sizes().len() + 1, ProgramError);
-        check_count!("output", output_types, 1, ProgramError);
-        let starts = lower_slice_start_indices(
-            input_values[0],
-            &input_types[0],
-            &input_values[1..],
-            &input_types[1..],
-            self.sizes(),
-            self.allows_negative_indices(),
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
-        let result = lowerer.block.append_operation(stable_hlo::dynamic_slice(
-            input_values[0],
-            &starts,
-            self.sizes(),
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).unwrap().as_ref()])
-    }
-}
-
-impl LowerableOperation for DynamicUpdateSliceOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        check_count!("output", output_types, 1, ProgramError);
-        check_count!("input", input_values, output_types[0].rank() + 2, ProgramError);
-        check_count!("input", input_types, output_types[0].rank() + 2, ProgramError);
-        let sizes = static_dimensions(&input_types[1])?;
-        let starts = lower_slice_start_indices(
-            input_values[0],
-            &input_types[0],
-            &input_values[2..],
-            &input_types[2..],
-            &sizes,
-            self.allows_negative_indices(),
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
-        let result = lowerer.block.append_operation(stable_hlo::dynamic_update_slice(
-            input_values[0],
-            input_values[1],
-            &starts,
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).unwrap().as_ref()])
-    }
-}
-
-impl LowerableOperation for DynamicSliceOperation<ArrayIrType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context;
-        let location = lowerer.location;
-        let effect_tokens = &mut lowerer.effect_tokens;
-        let block = &mut lowerer.block;
-        let Some((input, bounds)) = input_values.split_first() else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-        };
-        let input_type = <&ArrayType>::try_from(&input_types[0])?;
-        let [output_type] = output_types else {
-            return Err(ProgramError::InvalidOutputCount { expected: 1, actual: output_types.len() }.into());
-        };
-        let output_type = <&ArrayType>::try_from(output_type)?;
-        let rank = output_type.rank();
-        if bounds.len() != 2 * rank {
-            return Err(ProgramError::InvalidInputCount { expected: 1 + 2 * rank, actual: input_values.len() }.into());
-        }
-        let (starts, sizes) = bounds.split_at(rank);
-        let mut starts = starts.to_vec();
-        let start_types = &input_types[1..1 + rank];
-        let size_types = &input_types[1 + rank..];
-        let mut physical_sizes = Vec::with_capacity(rank);
-        let mut physical_spans = Vec::with_capacity(rank);
-        for axis in 0..rank {
-            // An array start (e.g., one that differs across devices) is first converted to the signed `i64` carrier
-            // of dimension starts. Unsigned starts saturate at the largest `i64` value, which is out of bounds for
-            // every input, and a start whose value is unknown before it runs proves no window, so it is checked at
-            // runtime.
-            let unknown_start = DimensionType::new("start", DimensionBounds::unbounded());
-            let start_type = match &start_types[axis] {
-                ArrayIrType::Array(array_start_type) => {
-                    starts[axis] = lower_array_start(starts[axis], array_start_type, block, context, location)?;
-                    &unknown_start
-                }
-                start_type => <&DimensionType>::try_from(start_type)?,
-            };
-            let size_type = <&DimensionType>::try_from(&size_types[axis])?;
-            // Clamping is relative to the logical span, not the larger physical allocation window.
-            // Normalize once and reuse the same origin for validation and extraction.
-            let zero_start = DimensionType::new("start", DimensionBounds::new(0, Some(1)).unwrap());
-            let start_type = if self.bounds() == DynamicSliceBounds::Clamp {
-                let constants = lower_static_index_constants(&[0, 1, self.strides()[axis]], block, context, location)?;
-                let difference = block
-                    .append_operation(stable_hlo::subtract(sizes[axis], constants[1], location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref();
-                let steps = block
-                    .append_operation(stable_hlo::maximum(difference, constants[0], location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref();
-                let steps = block
-                    .append_operation(stable_hlo::multiply(steps, constants[2], location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref();
-                let occupied = block
-                    .append_operation(stable_hlo::minimum(sizes[axis], constants[1], location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref();
-                let span =
-                    block.append_operation(stable_hlo::add(steps, occupied, location)?)?.result(0).unwrap().as_ref();
-                let input_size = lower_runtime_dimension_size_i64(*input, axis, block, context, location)?;
-                let maximum_start = block
-                    .append_operation(stable_hlo::subtract(input_size, span, location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref();
-                let maximum_start = block
-                    .append_operation(stable_hlo::maximum(maximum_start, constants[0], location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref();
-                if matches!(start_types[axis], ArrayIrType::Array(_)) {
-                    // Unlike dimension starts, array starts can be negative, which clamping raises to zero.
-                    starts[axis] = block
-                        .append_operation(stable_hlo::maximum(starts[axis], constants[0], location)?)?
-                        .result(0)
-                        .unwrap()
-                        .as_ref();
-                }
-                starts[axis] = block
-                    .append_operation(stable_hlo::minimum(starts[axis], maximum_start, location)?)?
-                    .result(0)
-                    .unwrap()
-                    .as_ref();
-                &zero_start
-            } else {
-                start_type
-            };
-            let plan = plan_dynamic_slice_axis(
-                axis,
-                self.strides()[axis],
-                &input_type.shape().dimensions()[axis],
-                start_type,
-                size_type,
-            )?;
-            if plan.needs_runtime_assertion {
-                let input_size = lower_runtime_dimension_size_i64(*input, axis, block, context, location)?;
-                lower_dynamic_slice_assertion(
-                    axis,
-                    self.strides()[axis],
-                    input_size,
-                    starts[axis],
-                    sizes[axis],
-                    effect_tokens,
-                    block,
-                    context,
-                    location,
-                )?;
-            }
-            physical_sizes.push(plan.size);
-            physical_spans.push(plan.span);
-        }
-
-        // Reserve enough trailing storage for the maximum window at every valid runtime start. Without this,
-        // native dynamic_slice clamps a small valid runtime slice near the end to fit the larger bound window.
-        // Only the requested logical size is exposed, so padded values never become observable elements.
-        let padding_value = if input_type.data_type() == DataType::F8E8M0FNU { 1 } else { 0 };
-        let physical_input =
-            lower_physical_bound_value(*input, input_type, padding_value as f64, block, context, location)?;
-        let padding = lower_constant_output(
-            &[ArrayType::scalar(input_type.data_type())],
-            padding_value,
-            block,
-            context,
-            location,
-        )?[0];
-        let high_padding = physical_spans.iter().map(|span| *span as i64).collect::<Vec<_>>();
-        let padded = block
-            .append_operation(stable_hlo::pad(
-                physical_input,
-                padding,
-                &vec![0; rank],
-                &high_padding,
-                &vec![0; rank],
-                location,
-            )?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-        let slice =
-            block.append_operation(stable_hlo::dynamic_slice(padded, &starts, physical_spans.as_slice(), location)?)?;
-        let mut result = slice.result(0).expect("stablehlo.dynamic_slice should return one result").as_ref();
-        if self.strides().iter().any(|stride| *stride != 1) {
-            let start_indices = vec![0; rank];
-            let slice = block.append_operation(stable_hlo::slice(
-                result,
-                start_indices.as_slice(),
-                physical_spans.as_slice(),
-                self.strides(),
-                location,
-            )?)?;
-            result = slice.result(0).expect("stablehlo.slice should return one result").as_ref();
-        }
-
-        let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
-        let mut refined_type = output_type
-            .clone()
-            .with_shape(Shape::new(physical_sizes.iter().copied().map(CoreDimension::Static).collect()));
-        for (axis, dimension) in output_type.shape().dimensions().iter().cloned().enumerate() {
-            if !matches!(dimension, CoreDimension::Dynamic(_)) {
-                continue;
-            }
-            let size = block.append_operation(stable_hlo::convert(sizes[axis], i32_scalar_type, location)?)?;
-            let size = size.result(0).expect("stablehlo.convert should return one result").as_ref();
-            let mut dimensions = refined_type.shape().dimensions().to_vec();
-            dimensions[axis] = dimension;
-            refined_type = refined_type.with_shape(Shape::new(dimensions));
-            let refined_tensor_type = lower_tensor_type(&refined_type, context, location)?;
-            let refined = block.append_operation(stable_hlo::set_dimension_size(
-                result,
-                size,
-                refined_tensor_type,
-                axis,
-                location,
-            )?)?;
-            result = refined.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
-        }
-        Ok(vec![result])
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -687,318 +682,37 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, Context, DataType, Dimension as CoreDimension,
-        DimensionBounds, DimensionFromScalarOperation, DimensionVariable, DynamicSlice, DynamicSliceOperation,
-        DynamicUpdateSlice, DynamicUpdateSliceOperation, EagerContext, Linearization, Placeholder,
-        ReverseModeDifferentiate, Shape, Slice, TypedProgram, UpdateSlice, UpdateSliceOperation, ValueProjection,
+        Add, Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, ConstantOperation, Context,
+        CotangentDestinationKind, DataType, Dimension as CoreDimension, DimensionBounds, DimensionConstant,
+        DimensionFromScalar, DimensionFromScalarOperation, DimensionOperation, DimensionType, DimensionValue,
+        DimensionVariable, Div, DynamicBroadcastOperation, DynamicSlice, DynamicSliceOperation,
+        DynamicSliceWithDimensions, DynamicUpdateSlice, DynamicUpdateSliceOperation, EagerContext, Linearization, Pad,
+        Placeholder, ReverseModeDifferentiate, Shape, Slice, StagingContext, TracingContext, Typed, TypedProgram,
+        UpdateSlice, UpdateSliceOperation, ValueProjection,
     };
+    use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
-    use crate::domains::tests::{domain_mesh, read_f64s};
+    use crate::domains::tests::{
+        domain_mesh, f32_vector, program_array, read_f32s, read_f64s, replicated_scalar_type, replicated_vector_type,
+    };
     use crate::lowering::tests::{
         ProgramBuilder, ragged_dot_cpu_compilation_options, test_matrix_type, unproject_plain_program,
     };
     use crate::lowering::to_mlir_module_for_plain_program;
-    use crate::operations::constants::dynamic_constructor_types;
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::values::ArrayConstant;
-    use crate::{Array, Constant, Options, Session, to_mlir_module_for_program};
+    use crate::{Array, Constant, Options, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 
-    #[test]
-    fn test_lower_dynamic_slice_indices() {
-        let client = execution_client();
-        for (index_type, index_bytes, negative) in [
-            (DataType::I1, vec![1_u8], true),
-            (DataType::I8, vec![127_u8], false),
-            (DataType::U64, values_to_bytes(&[u64::MAX]), false),
-        ] {
-            let input_type = ArrayType::new(
-                DataType::I64,
-                Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
-                    "rows",
-                    DimensionBounds::new(2, Some(5)).unwrap(),
-                ))]),
-            );
-            let update_type = ArrayType::new_static(DataType::I64, [1]);
-            let index_type = ArrayType::scalar(index_type);
-            let mut builder = ProgramBuilder::new();
-            let input = builder.add_input(input_type.clone());
-            let update = builder.add_input(update_type.clone());
-            let index = builder.add_input(index_type.clone());
-            let sliced = builder
-                .add_instruction(DynamicSliceOperation::new(vec![1]), Vec::new(), vec![input, index], None)
-                .unwrap()[0];
-            let updated = builder
-                .add_instruction(DynamicUpdateSliceOperation::new(), Vec::new(), vec![input, update, index], None)
-                .unwrap()[0];
-            let program = unproject_plain_program(
-                builder
-                    .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
-                        vec![sliced, updated],
-                        vec![Placeholder; 3],
-                        vec![Placeholder; 2],
-                    )
-                    .unwrap(),
-            );
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![input_type.clone(), update_type.clone(), index_type.clone()],
-                &vec![update_type, input_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
-            let executable = client
-                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
-                .unwrap();
-            let device = executable.addressable_devices().unwrap().remove(0);
-            let values = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993];
-            for size in [2_i32, 4] {
-                let inputs = [
-                    (values_to_bytes(&values), BufferType::I64, vec![4]),
-                    (values_to_bytes(&[42_i64]), BufferType::I64, vec![1]),
-                    (index_bytes.clone(), Array::physical_buffer_type(index_type.data_type()), vec![]),
-                    (values_to_bytes(&[size]), BufferType::I32, vec![]),
-                ]
-                .into_iter()
-                .map(|(bytes, data_type, shape)| ExecutionInput {
-                    buffer: Arc::new(
-                        client
-                            .buffer(bytes.as_slice(), data_type, shape.as_slice(), None, device.clone(), None)
-                            .unwrap(),
-                    ),
-                    donatable: false,
-                })
-                .collect::<Vec<_>>();
-                let outputs = executable
-                    .execute(
-                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
-                        vec![],
-                        0,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &[],
-                    )
-                    .unwrap()
-                    .block_until_ready()
-                    .unwrap()
-                    .remove(0)
-                    .outputs;
-                let axis = if negative { 0 } else { size as usize - 1 };
-                assert_eq!(
-                    values_from_bytes::<i64>(&outputs[0].copy_to_host(None).unwrap().r#await().unwrap()),
-                    vec![values[axis]],
-                );
-                let mut expected = values[..size as usize].to_vec();
-                expected[axis] = 42;
-                let bytes = outputs[1].copy_to_host(None).unwrap().r#await().unwrap();
-                assert_eq!(values_from_bytes::<i64>(&bytes[..size as usize * 8]), expected);
-                assert_eq!(
-                    values_from_bytes::<i64>(&outputs[2].copy_to_host(None).unwrap().r#await().unwrap()),
-                    vec![i64::from(size)],
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_lower_dynamic_slice_runtime_windows() {
-        let client = execution_client();
-        crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
-        let input_type = ArrayType::new_static(DataType::I64, [4]);
-        let scalar_type = ArrayType::scalar(DataType::I64);
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(input_type.clone().into());
-        let mut bounds = Vec::new();
-        for name in ["start", "size"] {
-            let scalar = builder.add_input(scalar_type.clone().into());
-            bounds.push(
-                builder
-                    .add_instruction(
-                        DimensionFromScalarOperation::new(
-                            DimensionVariable::new(name, DimensionBounds::new(0, Some(5)).unwrap()).into(),
-                        ),
-                        Vec::new(),
-                        vec![scalar],
-                        None,
-                    )
-                    .unwrap()[0],
-            );
-        }
-        let result = builder
-            .add_instruction(
-                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
-                Vec::new(),
-                vec![input, bounds[0], bounds[1]],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
-            .unwrap();
-        let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-        let module = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![input_type, scalar_type.clone(), scalar_type],
-            &vec![output_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
-        let executable = client
-            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
-            .unwrap();
-        let device = executable.addressable_devices().unwrap().remove(0);
-        let values = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993];
-        for (start, size) in [(3_i64, 1_i64), (2, 2), (0, 4), (4, 0), (3, 2)] {
-            let inputs = [
-                (values_to_bytes(&values), vec![4]),
-                (values_to_bytes(&[start]), vec![]),
-                (values_to_bytes(&[size]), vec![]),
-            ]
-            .into_iter()
-            .map(|(bytes, shape)| ExecutionInput {
-                buffer: Arc::new(
-                    client
-                        .buffer(bytes.as_slice(), BufferType::I64, shape.as_slice(), None, device.clone(), None)
-                        .unwrap(),
-                ),
-                donatable: false,
-            })
-            .collect::<Vec<_>>();
-            let result = executable
-                .execute(
-                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
-                    vec![],
-                    0,
-                    None,
-                    None,
-                    None,
-                    None,
-                    &[],
-                )
-                .and_then(|execution| execution.block_until_ready());
-            if start + size > 4 {
-                assert!(result.err().unwrap().to_string().contains("dynamic_slice"));
-            } else {
-                let outputs = result.unwrap().remove(0).outputs;
-                let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
-                assert_eq!(
-                    values_from_bytes::<i64>(&bytes[..size as usize * 8]),
-                    &values[start as usize..(start + size) as usize],
-                );
-                assert_eq!(
-                    values_from_bytes::<i64>(&outputs[1].copy_to_host(None).unwrap().r#await().unwrap()),
-                    vec![size],
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_lower_dynamic_slice_runtime_windows_array_starts() {
-        // An array start (e.g., one that differs across devices) is converted to the `i64` carrier of dimension starts.
-        // Checked bounds reject a negative start and a window past the end at runtime, while clamped bounds move both
-        // into the input, including an unsigned start beyond the largest `i64` value.
-        let client = execution_client();
-        crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
-        let input_type = ArrayType::new_static(DataType::I64, [4]);
-        let size_type = ArrayType::scalar(DataType::I64);
-        let values = [10_i64, 20, 30, 40];
-        for (bounds, start_type, starts) in [
-            (DynamicSliceBounds::Checked, DataType::I64, vec![(1_u64, Some(1_usize)), (2, Some(2)), (3, None)]),
-            (DynamicSliceBounds::Checked, DataType::I64, vec![((-1_i64) as u64, None)]),
-            (DynamicSliceBounds::Clamp, DataType::I64, vec![((-1_i64) as u64, Some(0)), (3, Some(2))]),
-            (DynamicSliceBounds::Clamp, DataType::U64, vec![(u64::MAX, Some(2)), (1, Some(1))]),
-        ] {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let input = builder.add_input(input_type.clone().into());
-            let start = builder.add_input(ArrayType::scalar(start_type).into());
-            let size = builder.add_input(size_type.clone().into());
-            let size = builder
-                .add_instruction(
-                    DimensionFromScalarOperation::new(
-                        DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap()).into(),
-                    ),
-                    Vec::new(),
-                    vec![size],
-                    None,
-                )
-                .unwrap()[0];
-            let result = builder
-                .add_instruction(
-                    DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_bounds(bounds),
-                    Vec::new(),
-                    vec![input, start, size],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
-                .unwrap();
-            let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &vec![input_type.clone(), ArrayType::scalar(start_type), size_type.clone()],
-                &vec![output_type],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
-            let executable = client
-                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
-                .unwrap();
-            let device = executable.addressable_devices().unwrap().remove(0);
-            let start_buffer_type = if start_type == DataType::U64 { BufferType::U64 } else { BufferType::I64 };
-            for (start, expected_start) in starts {
-                let inputs = [
-                    (values_to_bytes(&values), BufferType::I64, vec![4]),
-                    (start.to_ne_bytes().to_vec(), start_buffer_type, vec![]),
-                    (values_to_bytes(&[2_i64]), BufferType::I64, vec![]),
-                ]
-                .into_iter()
-                .map(|(bytes, buffer_type, shape)| ExecutionInput {
-                    buffer: Arc::new(
-                        client
-                            .buffer(bytes.as_slice(), buffer_type, shape.as_slice(), None, device.clone(), None)
-                            .unwrap(),
-                    ),
-                    donatable: false,
-                })
-                .collect::<Vec<_>>();
-                let result = executable
-                    .execute(
-                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
-                        vec![],
-                        0,
-                        None,
-                        None,
-                        None,
-                        None,
-                        &[],
-                    )
-                    .and_then(|execution| execution.block_until_ready());
-                match expected_start {
-                    None => assert!(result.err().unwrap().to_string().contains("dynamic_slice")),
-                    Some(expected_start) => {
-                        let outputs = result.unwrap().remove(0).outputs;
-                        let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
-                        assert_eq!(values_from_bytes::<i64>(&bytes[..16]), &values[expected_start..expected_start + 2]);
-                    }
-                }
-            }
-        }
+    /// Extracts the unsupported operation diagnostic produced by [`DynamicSliceAxisPlan::new`].
+    fn unsupported_operation(error: Error) -> String {
+        let Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }) = error else {
+            panic!("expected an unsupported-operation error but received {error}");
+        };
+        reason
     }
 
     #[test]
@@ -1012,18 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_slice_operation_lower() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
-        let update = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[5f32, 6.0]));
-        let output = input.update_slice(&update, &[1]).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![1.0, 5.0, 6.0, 4.0]);
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_slicing_operations() {
+    fn test_slice_operation_lower_with_update_and_dynamic_slices() {
         let input_type = test_matrix_type(2, 3);
         let update_type = test_matrix_type(1, 2);
         let index_type = ArrayType::scalar(DataType::I32);
@@ -1100,8 +803,8 @@ mod tests {
             "#},
         );
 
-        // Static `sizes` make the result exact even when an operand axis is dynamic; no first-class result extent or
-        // dynamic-slice-size operand is needed.
+        // Static `sizes` make the result exact even when an operand axis is dynamic, so neither a first-class result
+        // extent nor a dynamic slice size operand is needed.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type =
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows), CoreDimension::Static(3)]));
@@ -1117,14 +820,48 @@ mod tests {
             .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        assert!(stablehlo.contains("stablehlo.dynamic_slice"), "{stablehlo}");
-        assert!(stablehlo.contains("sizes = [1, 2]"), "{stablehlo}");
-        assert!(stablehlo.contains("-> tensor<1x2xf32>"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<?x3xf32, #stablehlo.bounds<4, ?>>, %arg1: tensor<i32>, %arg2: tensor<i32>) -> tensor<1x2xf32> {
+                    %0 = stablehlo.convert %arg1 : (tensor<i32>) -> tensor<i64>
+                    %1 = stablehlo.get_dimension_size %arg0, dim = 0 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %3 = stablehlo.compare LT, %0, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %4 = stablehlo.add %0, %2 : tensor<i64>
+                    %5 = stablehlo.select %3, %4, %0 : tensor<i1>, tensor<i64>
+                    %c_0 = stablehlo.constant dense<1> : tensor<i64>
+                    %6 = stablehlo.subtract %2, %c_0 : tensor<i64>
+                    %7 = stablehlo.convert %6 : tensor<i64>
+                    %8 = stablehlo.maximum %5, %c : tensor<i64>
+                    %9 = stablehlo.minimum %8, %7 : tensor<i64>
+                    %10 = stablehlo.convert %9 : tensor<i64>
+                    %11 = stablehlo.convert %arg2 : (tensor<i32>) -> tensor<i64>
+                    %12 = stablehlo.get_dimension_size %arg0, dim = 1 : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %13 = stablehlo.convert %12 : (tensor<i32>) -> tensor<i64>
+                    %c_1 = stablehlo.constant dense<0> : tensor<i64>
+                    %14 = stablehlo.compare LT, %11, %c_1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %15 = stablehlo.add %11, %13 : tensor<i64>
+                    %16 = stablehlo.select %14, %15, %11 : tensor<i1>, tensor<i64>
+                    %c_2 = stablehlo.constant dense<2> : tensor<i64>
+                    %17 = stablehlo.subtract %13, %c_2 : tensor<i64>
+                    %18 = stablehlo.convert %17 : tensor<i64>
+                    %19 = stablehlo.maximum %16, %c_1 : tensor<i64>
+                    %20 = stablehlo.minimum %19, %18 : tensor<i64>
+                    %21 = stablehlo.convert %20 : tensor<i64>
+                    %22 = stablehlo.dynamic_slice %arg0, %10, %21, sizes = [1, 2] : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<i64>, tensor<i64>) -> tensor<1x2xf32>
+                    return %22 : tensor<1x2xf32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_whole_axis_dynamic_slice() {
-        // A dynamic limit keeps its bounded dynamic axis whole: the lowering slices the physical allocation, whose
+    fn test_slice_operation_lower_dynamic_limit() {
+        // A dynamic limit keeps its bounded dynamic axis whole. The lowering slices the physical allocation, whose
         // dynamic axis is widened to its bound, and then restores that axis's logical extent from the input.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let input_type = ArrayType::new(
@@ -1164,14 +901,12 @@ mod tests {
     }
 
     #[test]
-    fn test_slicing_vjp_pullbacks_lower_to_stablehlo() {
-        use ryft_core::Slice;
-
+    fn test_slice_operation_lower_pullbacks() {
         // The static slice pullback writes the cotangent into a zero array at the static offsets via the
-        // statically indexed update-slice, which lowers to `stablehlo.dynamic_update_slice` with constant indices.
-        // The structural-zero destination is emitted as a `ZeroOperation` instruction in the pullback, which lowers
+        // statically indexed `update_slice`, which lowers to `stablehlo.dynamic_update_slice` with constant indices.
+        // The structural zero destination is emitted as a `ZeroOperation` instruction in the pullback, which lowers
         // through the canonical zero path to a scalar constant broadcast to the array shape. The reverse path
-        // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`; this slice
+        // stages the pullback over the primal operation family taking `[output_cotangents ++ residuals]`. This slice
         // pullback captures no residuals, so the pullback consumes only the single output cotangent.
         let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
             .vjp(
@@ -1199,7 +934,7 @@ mod tests {
         );
 
         // The strided slice pullback pads the cotangent with a zero scalar using the inverse padding
-        // (`low = start`, `interior = stride - 1`), which lowers to `stablehlo.pad`.
+        // (i.e., `low = start` and `interior = stride - 1`), which lowers to `stablehlo.pad`.
         let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
             .vjp(
                 |x, ()| Ok(x.slice(&[1], &[6], &[2]).unwrap()),
@@ -1223,15 +958,12 @@ mod tests {
             "#},
         );
 
-        // The pad pullback first edge-unpads the cotangent and then slices it with the non-unit interior stride for the
-        // input. It constructs a Boolean padding-position mask for the padding-value cotangent so non-finite values at
-        // input positions cannot contaminate its sum.
+        // The pad pullback first removes the edge padding from the cotangent and then slices it with the non-unit
+        // interior stride for the input. It constructs a Boolean padding position mask for the padding value cotangent
+        // so non-finite values at input positions cannot contaminate its sum.
         let (_, pullback): (CoreArray, _) = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new()
             .vjp(
-                |(x, padding_value), ()| {
-                    use ryft_core::Pad;
-                    Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap())
-                },
+                |(x, padding_value), ()| Ok(x.pad(&padding_value, &[1], &[2], &[1]).unwrap()),
                 (CoreArray::vector(vec![1.0, 2.0, 3.0]).unwrap(), CoreArray::scalar(9.0).unwrap()),
                 (),
             )
@@ -1302,11 +1034,121 @@ mod tests {
     }
 
     #[test]
-    fn test_slicing_vjp_reference_pullback_lowers_without_dense_zero() {
-        use ryft_core::CotangentDestinationKind;
+    fn test_update_slice_operation_lower() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&[1f32, 2.0, 3.0, 4.0]));
+        let update = replicated_array(&domain, &mesh, DataType::F32, &[2], &values_to_bytes(&[5f32, 6.0]));
+        let output = input.update_slice(&update, &[1]).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&output.copy_to_host().unwrap()), vec![1.0, 5.0, 6.0, 4.0]);
+    }
 
+    #[test]
+    fn test_dynamic_slice_operation_lower() {
+        let client = execution_client();
+        for (index_type, index_bytes, negative) in [
+            (DataType::I1, vec![1u8], true),
+            (DataType::I8, vec![127u8], false),
+            (DataType::U64, values_to_bytes(&[u64::MAX]), false),
+        ] {
+            let input_type = ArrayType::new(
+                DataType::I64,
+                Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
+                    "rows",
+                    DimensionBounds::new(2, Some(5)).unwrap(),
+                ))]),
+            );
+            let update_type = ArrayType::new_static(DataType::I64, [1]);
+            let index_type = ArrayType::scalar(index_type);
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let update = builder.add_input(update_type.clone());
+            let index = builder.add_input(index_type.clone());
+            let sliced = builder
+                .add_instruction(DynamicSliceOperation::new(vec![1]), Vec::new(), vec![input, index], None)
+                .unwrap()[0];
+            let updated = builder
+                .add_instruction(DynamicUpdateSliceOperation::new(), Vec::new(), vec![input, update, index], None)
+                .unwrap()[0];
+            let program = unproject_plain_program(
+                builder
+                    .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                        vec![sliced, updated],
+                        vec![Placeholder; 3],
+                        vec![Placeholder; 2],
+                    )
+                    .unwrap(),
+            );
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type.clone(), update_type.clone(), index_type.clone()],
+                &vec![update_type, input_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap().remove(0);
+            let values = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993];
+            for size in [2i32, 4] {
+                let inputs = [
+                    (values_to_bytes(&values), BufferType::I64, vec![4]),
+                    (values_to_bytes(&[42i64]), BufferType::I64, vec![1]),
+                    (index_bytes.clone(), Array::physical_buffer_type(index_type.data_type()), vec![]),
+                    (values_to_bytes(&[size]), BufferType::I32, vec![]),
+                ]
+                .into_iter()
+                .map(|(bytes, data_type, shape)| ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(bytes.as_slice(), data_type, shape.as_slice(), None, device.clone(), None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                })
+                .collect::<Vec<_>>();
+                let outputs = executable
+                    .execute(
+                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .block_until_ready()
+                    .unwrap()
+                    .remove(0)
+                    .outputs;
+                let axis = if negative { 0 } else { size as usize - 1 };
+                assert_eq!(
+                    values_from_bytes::<i64>(&outputs[0].copy_to_host(None).unwrap().r#await().unwrap()),
+                    vec![values[axis]],
+                );
+                let mut expected = values[..size as usize].to_vec();
+                expected[axis] = 42;
+                let bytes = outputs[1].copy_to_host(None).unwrap().r#await().unwrap();
+                assert_eq!(values_from_bytes::<i64>(&bytes[..size as usize * 8]), expected);
+                assert_eq!(
+                    values_from_bytes::<i64>(&outputs[2].copy_to_host(None).unwrap().r#await().unwrap()),
+                    vec![i64::from(size)],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dynamic_slice_operation_lower_reference_pullback_without_dense_zero() {
         // The runtime index remains an input after transposition. Functionalizing the buffer update must keep
-        // only the selected-block addition, without constructing a full-size zero cotangent first.
+        // only the selected block addition, without constructing a full size zero cotangent first.
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F64, [5])));
         let start = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I32)));
@@ -1360,107 +1202,44 @@ mod tests {
         );
     }
 
-    /// Creates a first-class dimension type with the provided bounds.
-    pub(crate) fn dimension_type(name: &str, bounds: DimensionBounds) -> DimensionType {
-        DimensionType::new(name, bounds)
-    }
+    #[test]
+    fn test_dynamic_slice_operation_lower_clamps_unsigned_indices_without_narrowing() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let input = Value::Array(f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]));
+        let index = Value::Array(
+            Array::from_host_buffer(&domain, ArrayType::scalar(DataType::U64), mesh.clone(), u64::MAX.to_ne_bytes())
+                .unwrap(),
+        );
 
-    /// Extracts the unsupported-operation diagnostic produced by the physical slice planner.
-    fn unsupported_operation(error: Error) -> String {
-        let Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }) = error else {
-            panic!("expected an unsupported-operation error but received {error}");
-        };
-        op
+        // An unsigned index larger than `i64::MAX` selects the last valid slice, rather than wrapping negative.
+        let sliced = domain
+            .bind(
+                Operation::Array(ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![1]))),
+                Vec::new(),
+                &[input.clone(), index.clone()],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, program_array(&sliced[0])), vec![3.0]);
+        let updated = domain
+            .bind(
+                Operation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation::new())),
+                Vec::new(),
+                &[input, Value::Array(f32_vector(&domain, &mesh, &[9.0])), index],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, program_array(&updated[0])), vec![1.0, 2.0, 9.0]);
     }
 
     #[test]
-    fn test_dynamic_constructor_types() {
-        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
-        let output_type = ArrayType::new(DataType::C64, Shape::new(vec![size.into(), 2.into()]));
-        assert_eq!(
-            dynamic_constructor_types("one_like", 1, &[output_type.clone().into()]).unwrap(),
-            (output_type, ArrayType::new_static(DataType::C64, [4, 2])),
-        );
-
-        let size = DimensionVariable::new("size", DimensionBounds::unbounded());
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
-        assert!(matches!(
-            dynamic_constructor_types("zero_like", 1, &[output_type.into()]),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
-                if op == "zero_like output dimension `size` needs a finite upper bound for physical buffer allocation",
-        ));
-
-        let bound = i32::MAX as usize + 1;
-        let size = DimensionVariable::new("size", DimensionBounds::non_negative(Some(bound + 1)).unwrap());
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![size.into()]));
-        let error = dynamic_constructor_types("one_like", 1, &[output_type.into()]).unwrap_err();
-        let Error::Core(core_error) = error else { unreachable!() };
-        let ryft_core::Error::Type(error) = *core_error else { unreachable!() };
-        assert_eq!(
-            error.downcast_custom::<ryft_core::DimensionError>(),
-            Some(&ryft_core::DimensionError::ExtentExceedsBackendWidth { value: bound, maximum: i32::MAX as usize }),
-        );
-    }
-
-    #[test]
-    fn test_plan_dynamic_slice_axis() {
-        let unbounded = dimension_type("unbounded", DimensionBounds::unbounded());
-        let bounded_start = dimension_type("start", DimensionBounds::non_negative(Some(5)).unwrap());
-        let bounded_size = dimension_type("size", DimensionBounds::non_negative(Some(5)).unwrap());
-
-        assert_eq!(
-            unsupported_operation(
-                plan_dynamic_slice_axis(2, 1, &CoreDimension::Static(4), &bounded_start, &unbounded).unwrap_err(),
-            ),
-            "dynamic_slice size on axis 2 needs a finite upper bound",
-        );
-
-        let unbounded_input = CoreDimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded()));
-        assert_eq!(
-            unsupported_operation(
-                plan_dynamic_slice_axis(1, 1, &unbounded_input, &bounded_start, &bounded_size).unwrap_err(),
-            ),
-            "dynamic_slice input on axis 1 needs a finite upper bound",
-        );
-
-        let overflowing_size = dimension_type("size", DimensionBounds::non_negative(Some(usize::MAX)).unwrap());
-        assert_eq!(
-            unsupported_operation(
-                plan_dynamic_slice_axis(3, 2, &CoreDimension::Static(usize::MAX), &bounded_start, &overflowing_size,)
-                    .unwrap_err(),
-            ),
-            "dynamic_slice physical span overflows on axis 3",
-        );
-
-        assert_eq!(
-            plan_dynamic_slice_axis(0, 1, &CoreDimension::Static(3), &bounded_start, &bounded_size).unwrap(),
-            DynamicSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
-        );
-
-        let bounded_input =
-            CoreDimension::Dynamic(DimensionVariable::new("input", DimensionBounds::positive(Some(5)).unwrap()));
-        assert_eq!(
-            plan_dynamic_slice_axis(0, 1, &bounded_input, &bounded_start, &bounded_size).unwrap(),
-            DynamicSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
-        );
-
-        let proven_start = dimension_type("start", DimensionBounds::non_negative(Some(1)).unwrap());
-        let proven_size = dimension_type("size", DimensionBounds::non_negative(Some(4)).unwrap());
-        assert_eq!(
-            plan_dynamic_slice_axis(0, 1, &CoreDimension::Static(4), &proven_start, &proven_size).unwrap(),
-            DynamicSliceAxisPlan { size: 3, span: 3, needs_runtime_assertion: false },
-        );
-    }
-
-    #[test]
-    fn test_compiled_dynamic_update_slice_partial_pullbacks() {
-        // `DynamicUpdateSliceOperation`'s transpose stages only the contributions whose accumulators are needed: with
-        // only the operand cotangent requested it stages one `dynamic_update_slice` of the cotangent with a zero
-        // update and no `dynamic_slice`, and with only the update cotangent requested it stages one `dynamic_slice`
+    fn test_dynamic_update_slice_operation_lower_partial_pullbacks() {
+        // The transpose of `DynamicUpdateSliceOperation` stages only the contributions whose accumulators are needed.
+        // With only the operand cotangent requested, it stages one `dynamic_update_slice` of the cotangent with a zero
+        // update and no `dynamic_slice`, and with only the update cotangent requested, it stages one `dynamic_slice`
         // of the cotangent and no zero. The shared symbolic manipulation harness always differentiates with respect
-        // to every array input, so this runs both pruned pullbacks on the CPU PJRT client used by the other tests
-        // (the `cutile` feature only enables compilation of the kernel module) at symbolic operand extents, with an
-        // in-bounds start and a start that clamps to the last rows.
+        // to every array input, so this runs both pruned pullbacks on the test execution client at symbolic operand
+        // extents, with an in-bounds start and a start that clamps to the last rows.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
@@ -1535,13 +1314,13 @@ mod tests {
                 &domain,
                 mesh.clone(),
             )
-            .unwrap_or_else(|error| panic!("n={size} native trace: {error}"));
+            .unwrap_or_else(|error| panic!("n={size} compilation: {error}"));
             let bytes = [
                 values_to_bytes(values),
-                values_to_bytes(&[100_f64; 8]),
+                values_to_bytes(&[100f64; 8]),
                 values_to_bytes(&[row]),
-                values_to_bytes(&[0_i32]),
-                values_to_bytes(&vec![1_f64; size * 4]),
+                values_to_bytes(&[0i32]),
+                values_to_bytes(&vec![1f64; size * 4]),
             ];
             let inputs = input_types
                 .into_iter()
@@ -1558,7 +1337,7 @@ mod tests {
             assert_eq!(outputs[1].shape().as_slice(), gradient_shape, "n={size}, row={row}");
             outputs.iter().map(|output| read_f64s(&client, output)).collect::<Vec<_>>()
         };
-        // Row start 1 updates rows 1 and 2; row start 9 clamps to the last two rows of the input.
+        // Row start 1 updates rows 1 and 2, and row start 9 clamps to the last two rows of the input.
         let four_rows = [0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15.];
         let five_rows = [0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 12., 13., 14., 15., 16., 17., 18., 19.];
         let four_rows_in_bounds = [0., 1., 2., 3., 100., 100., 100., 100., 100., 100., 100., 100., 12., 13., 14., 15.];
@@ -1569,11 +1348,11 @@ mod tests {
             [0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11., 100., 100., 100., 100., 100., 100., 100., 100.];
 
         // The symbolic input extent keeps the linearization inside a `linear_call`, so each pullback is the
-        // transposed call: its forward region runs the transpose rule, while its transpose region carries the
+        // transposed call. Its forward region runs the transpose rule, while its transpose region carries the
         // original forward for re-transposition. Pinning both regions checks which contributions were pruned.
 
-        // Only the operand cotangent: the update accumulator is unneeded, so the transpose zeroes the updated window
-        // of the cotangent without slicing it.
+        // With only the operand cotangent requested, the update accumulator is unneeded, so the transpose zeroes the
+        // updated window of the cotangent without slicing it.
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
         let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
@@ -1621,9 +1400,9 @@ mod tests {
             ],
         );
 
-        // Only the update cotangent: the operand accumulator is unneeded, so the transpose slices the updated window
-        // out of the cotangent without materializing a zero update. The retained operand extent and the zero operand
-        // tangent belong to the original forward region, which materializes the missing operand tangent.
+        // With only the update cotangent requested, the operand accumulator is unneeded, so the transpose slices the
+        // updated window out of the cotangent without materializing a zero update. The retained operand extent and the
+        // zero operand tangent belong to the original forward region, which materializes the missing operand tangent.
         let linearization = program.linearize_with_respect_to(&[1]).unwrap();
         let pullback = linearization.pullback().unwrap().into_program();
         assert_eq!(
@@ -1662,6 +1441,616 @@ mod tests {
         assert_eq!(
             execute(&linearization, &pullback, 5, &five_rows, 9, &[2, 4]),
             vec![five_rows_clamped.to_vec(), vec![1.; 8]],
+        );
+    }
+
+    #[test]
+    fn test_dynamic_slice_operation_lower_runtime_windows() {
+        let client = execution_client();
+        crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        let input_type = ArrayType::new_static(DataType::I64, [4]);
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let mut bounds = Vec::new();
+        for name in ["start", "size"] {
+            let scalar = builder.add_input(scalar_type.clone().into());
+            bounds.push(
+                builder
+                    .add_instruction(
+                        DimensionFromScalarOperation::new(
+                            DimensionVariable::new(name, DimensionBounds::new(0, Some(5)).unwrap()).into(),
+                        ),
+                        Vec::new(),
+                        vec![scalar],
+                        None,
+                    )
+                    .unwrap()[0],
+            );
+        }
+        let result = builder
+            .add_instruction(
+                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                Vec::new(),
+                vec![input, bounds[0], bounds[1]],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![input_type, scalar_type.clone(), scalar_type],
+            &vec![output_type],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        let executable = client
+            .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+            .unwrap();
+        let device = executable.addressable_devices().unwrap().remove(0);
+        let values = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993];
+        for (start, size) in [(3i64, 1i64), (2, 2), (0, 4), (4, 0), (3, 2)] {
+            let inputs = [
+                (values_to_bytes(&values), vec![4]),
+                (values_to_bytes(&[start]), vec![]),
+                (values_to_bytes(&[size]), vec![]),
+            ]
+            .into_iter()
+            .map(|(bytes, shape)| ExecutionInput {
+                buffer: Arc::new(
+                    client
+                        .buffer(bytes.as_slice(), BufferType::I64, shape.as_slice(), None, device.clone(), None)
+                        .unwrap(),
+                ),
+                donatable: false,
+            })
+            .collect::<Vec<_>>();
+            let result = executable
+                .execute(
+                    vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                    vec![],
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                    &[],
+                )
+                .and_then(|execution| execution.block_until_ready());
+            if start + size > 4 {
+                assert_eq!(
+                    result.err().unwrap().to_string(),
+                    format!("`dynamic_slice` limit {} exceeds input axis 0 extent 4", start + size),
+                );
+            } else {
+                let outputs = result.unwrap().remove(0).outputs;
+                let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+                assert_eq!(
+                    values_from_bytes::<i64>(&bytes[..size as usize * 8]),
+                    &values[start as usize..(start + size) as usize],
+                );
+                assert_eq!(
+                    values_from_bytes::<i64>(&outputs[1].copy_to_host(None).unwrap().r#await().unwrap()),
+                    vec![size],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_dynamic_slice_operation_lower_runtime_windows_array_starts() {
+        // An array start (e.g., one that differs across devices) is converted to the `i64` carrier of dimension starts.
+        // Checked bounds reject a negative start and a window past the end at runtime, while clamped bounds move both
+        // into the input, including an unsigned start beyond the largest `i64` value.
+        let client = execution_client();
+        crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
+        let input_type = ArrayType::new_static(DataType::I64, [4]);
+        let size_type = ArrayType::scalar(DataType::I64);
+        let values = [10i64, 20, 30, 40];
+        for (bounds, start_type, starts) in [
+            (
+                DynamicSliceBounds::Checked,
+                DataType::I64,
+                vec![(1u64, Ok(1usize)), (2, Ok(2)), (3, Err("`dynamic_slice` limit 5 exceeds input axis 0 extent 4"))],
+            ),
+            (
+                DynamicSliceBounds::Checked,
+                DataType::I64,
+                vec![((-1i64) as u64, Err("`dynamic_slice` start -1 is out of bounds for input axis 0 extent 4"))],
+            ),
+            (DynamicSliceBounds::Clamp, DataType::I64, vec![((-1i64) as u64, Ok(0)), (3, Ok(2))]),
+            (DynamicSliceBounds::Clamp, DataType::U64, vec![(u64::MAX, Ok(2)), (1, Ok(1))]),
+        ] {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(input_type.clone().into());
+            let start = builder.add_input(ArrayType::scalar(start_type).into());
+            let size = builder.add_input(size_type.clone().into());
+            let size = builder
+                .add_instruction(
+                    DimensionFromScalarOperation::new(
+                        DimensionVariable::new("size", DimensionBounds::new(0, Some(5)).unwrap()).into(),
+                    ),
+                    Vec::new(),
+                    vec![size],
+                    None,
+                )
+                .unwrap()[0];
+            let result = builder
+                .add_instruction(
+                    DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_bounds(bounds),
+                    Vec::new(),
+                    vec![input, start, size],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![result], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap();
+            let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type.clone(), ArrayType::scalar(start_type), size_type.clone()],
+                &vec![output_type],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+            let executable = client
+                .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
+                .unwrap();
+            let device = executable.addressable_devices().unwrap().remove(0);
+            let start_buffer_type = if start_type == DataType::U64 { BufferType::U64 } else { BufferType::I64 };
+            for (start, expected_start) in starts {
+                let inputs = [
+                    (values_to_bytes(&values), BufferType::I64, vec![4]),
+                    (start.to_ne_bytes().to_vec(), start_buffer_type, vec![]),
+                    (values_to_bytes(&[2i64]), BufferType::I64, vec![]),
+                ]
+                .into_iter()
+                .map(|(bytes, buffer_type, shape)| ExecutionInput {
+                    buffer: Arc::new(
+                        client
+                            .buffer(bytes.as_slice(), buffer_type, shape.as_slice(), None, device.clone(), None)
+                            .unwrap(),
+                    ),
+                    donatable: false,
+                })
+                .collect::<Vec<_>>();
+                let result = executable
+                    .execute(
+                        vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                        vec![],
+                        0,
+                        None,
+                        None,
+                        None,
+                        None,
+                        &[],
+                    )
+                    .and_then(|execution| execution.block_until_ready());
+                match expected_start {
+                    Err(expected_error) => assert_eq!(result.err().unwrap().to_string(), expected_error),
+                    Ok(expected_start) => {
+                        let outputs = result.unwrap().remove(0).outputs;
+                        let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+                        assert_eq!(values_from_bytes::<i64>(&bytes[..16]), &values[expected_start..expected_start + 2]);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_dynamic_slice_operation_lower_with_dimensions() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = replicated_vector_type(&mesh, 6);
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let start = builder
+            .add_instruction(
+                Operation::Dimension(DimensionOperation::Constant(ConstantOperation::new(
+                    DimensionValue::constant(1).unwrap(),
+                ))),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let size = builder
+            .add_instruction(
+                Operation::Dimension(DimensionOperation::Constant(ConstantOperation::new(
+                    DimensionValue::constant(3).unwrap(),
+                ))),
+                Vec::new(),
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let output = builder
+            .add_instruction(
+                Operation::DynamicSlice(
+                    DynamicSliceOperation::<ArrayIrType>::from_rank(1).with_strides(vec![2]).unwrap(),
+                ),
+                Vec::new(),
+                vec![input, start, size],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let lowering = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(
+            lowering.stable_hlo(),
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=1]>
+                  func.func @main(%arg0: tensor<6xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) -> (tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {
+                    %c = stablehlo.constant dense<1> : tensor<i64>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.pad %arg0, %cst, low = [0], high = [5], interior = [0] : (tensor<6xf32>, tensor<f32>) -> tensor<11xf32>
+                    %1 = stablehlo.dynamic_slice %0, %c, sizes = [5] : (tensor<11xf32>, tensor<i64>) -> tensor<5xf32>
+                    %2 = stablehlo.slice %1 [0:5:2] : (tensor<5xf32>) -> tensor<3xf32>
+                    return %2 : tensor<3xf32>
+                  }
+                }
+            "#},
+        );
+        let compiled = domain.compile_program(&lowering).unwrap();
+        let input =
+            Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]))
+                .unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input]).unwrap();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].shape().as_slice(), &[3]);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![1.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn test_dynamic_slice_operation_lower_pullback_with_runtime_size() {
+        // The size comes from device data and changes without recompilation. Seed the pullback with the sliced
+        // values so this fixture tests both the strided forward slice and its adjoint, which scatters individual
+        // points, including an empty result.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = replicated_vector_type(&mesh, 6);
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(input_type.clone().into());
+        let size = builder.add_input(size_type.clone().into());
+        let size = builder
+            .add_instruction(
+                DimensionFromScalarOperation::new(
+                    DimensionVariable::new("size", DimensionBounds::new(0, Some(4)).unwrap()).into(),
+                ),
+                Vec::new(),
+                vec![size],
+                None,
+            )
+            .unwrap()[0];
+        let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(9).unwrap()));
+        let output = builder
+            .add_instruction(
+                DynamicSliceOperation::<ArrayIrType>::from_rank(1)
+                    .with_strides(vec![2])
+                    .unwrap()
+                    .with_bounds(ryft_core::DynamicSliceBounds::Clamp),
+                Vec::new(),
+                vec![input, start, size],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        let context = TracingContext::<Constant, Operation>::new();
+        let inputs = vec![context.input(input_type.clone().into()), context.input(size_type.clone().into())];
+        let mut outputs = linearization.primal().interpret_in_context(&context, inputs).unwrap();
+        let mut arguments = vec![outputs[0].clone()];
+        arguments.extend(outputs.split_off(1));
+        outputs.extend(pullback.interpret_in_context(&context, arguments).unwrap());
+        let combined = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Constant>, Vec<Constant>>(
+                outputs.iter().map(|output| output.atom_id().unwrap()).collect(),
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let lowered = domain.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let input =
+            Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&[0f32, 1., 2., 3., 4., 5.]))
+                .unwrap();
+        let size = Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), values_to_bytes(&[2i64])).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input.clone(), size]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[2]);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![3., 5.]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0., 0., 0., 3., 0., 5.]);
+        let size = Array::from_host_buffer(&domain, size_type, mesh, values_to_bytes(&[0i64])).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input, size]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[0]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0f32; 6]);
+    }
+
+    #[test]
+    fn test_dynamic_slice_operation_lower_pullback_with_runtime_input_shape() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = ArrayType::new_static(DataType::F32, [4, 5]);
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let context = TracingContext::<Constant, Operation>::new();
+        let input = context.input(input_type.clone().into());
+        let rows = context
+            .input(scalar_type.clone().into())
+            .to_dimension(DimensionVariable::new("rows", DimensionBounds::new(0, Some(5)).unwrap()))
+            .unwrap();
+        let columns = context
+            .input(scalar_type.clone().into())
+            .to_dimension(DimensionVariable::new("columns", DimensionBounds::new(0, Some(6)).unwrap()))
+            .unwrap();
+        let zero = context.dimension_constant(0).unwrap();
+        let one = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(1).unwrap()).unwrap();
+        let two = ValueProjection::<DimensionType>::into_projected(context.dimension_constant(2).unwrap()).unwrap();
+        let height = ValueProjection::<DimensionType>::into_projected(rows.clone()).unwrap();
+        let height = height.add(&one).unwrap().div(&two).unwrap().into_value();
+        let width = ValueProjection::<DimensionType>::into_projected(columns.clone()).unwrap();
+        let width = width.add(&one).unwrap().div(&two).unwrap().into_value();
+        // The inner slice receives an array whose shape is only known at runtime. Its pullback must allocate that
+        // exact shape, before the outer prefix slice embeds it back into the original static input shape.
+        let prefix = input
+            .dynamic_slice_with_dimensions(&[zero.clone(), zero.clone()], &[rows, columns], &[1, 1])
+            .unwrap();
+        let output = prefix.dynamic_slice_with_dimensions(&[zero.clone(), zero], &[height, width], &[2, 2]).unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![output.atom_id().unwrap()],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize_with_respect_to(&[0]).unwrap();
+        let pullback = linearization.pullback().unwrap().into_program();
+        let context = TracingContext::<Constant, Operation>::new();
+        let inputs = vec![
+            context.input(input_type.clone().into()),
+            context.input(scalar_type.clone().into()),
+            context.input(scalar_type.clone().into()),
+        ];
+        let mut outputs = linearization.primal().interpret_in_context(&context, inputs).unwrap();
+        let mut arguments = vec![outputs[0].clone()];
+        arguments.extend(outputs.split_off(1));
+        // Replaying arithmetic dimensions creates fresh identities. Instantiate this standalone pullback's
+        // formal dimension identities for the replayed residual signature before importing its operations.
+        let input_types = arguments.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let pullback = pullback.with_instantiated_type_identities(&input_types).unwrap();
+        outputs.extend(pullback.interpret_in_context(&context, arguments).unwrap());
+        let combined = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Constant>, Vec<Constant>>(
+                outputs.iter().map(|output| output.atom_id().unwrap()).collect(),
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let lowered = domain.lower_program(&combined, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let values = [
+            0f32,
+            1.,
+            2.,
+            3.,
+            f32::NAN,
+            5.,
+            6.,
+            7.,
+            8.,
+            f32::NAN,
+            10.,
+            11.,
+            12.,
+            13.,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+            f32::NAN,
+        ];
+        let input = Array::from_host_buffer(&domain, input_type, mesh.clone(), values_to_bytes(&values)).unwrap();
+        let rows =
+            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[3i64])).unwrap();
+        let columns =
+            Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), values_to_bytes(&[4i64])).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input.clone(), rows, columns.clone()]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[2, 2]);
+        assert_eq!(read_f32s(&client, &outputs[0]), vec![0., 2., 10., 12.]);
+        assert_eq!(
+            read_f32s(&client, &outputs[1]),
+            vec![0., 0., 2., 0., 0., 0., 0., 0., 0., 0., 10., 0., 12., 0., 0., 0., 0., 0., 0., 0.]
+        );
+        let rows = Array::from_host_buffer(&domain, scalar_type, mesh, values_to_bytes(&[0i64])).unwrap();
+        let outputs = domain.execute_program(&compiled, vec![input, rows, columns]).unwrap();
+        assert_eq!(outputs[0].shape().as_slice(), &[0, 2]);
+        assert_eq!(read_f32s(&client, &outputs[1]), vec![0f32; 20]);
+    }
+
+    #[test]
+    fn test_dynamic_slice_operation_lower_checks_runtime_extents() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let size_type = replicated_scalar_type(&mesh, DataType::I64);
+        let value_type = replicated_scalar_type(&mesh, DataType::F32);
+        let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let result_extent = DimensionVariable::new("result_extent", DimensionBounds::new(0, Some(5)).unwrap());
+
+        // The result extent is independent of the input extent at the type level. Lowering uses their finite physical
+        // bounds for one specialization and preserves the eager `result_extent <= input_extent` contract with an
+        // ordered runtime assertion.
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input_size = builder.add_input(size_type.clone().into());
+        let result_size = builder.add_input(size_type.clone().into());
+        let value = builder.add_input(value_type.clone().into());
+        let input_dimension = builder
+            .add_instruction(DimensionFromScalarOperation::new(input_extent.into()), Vec::new(), vec![input_size], None)
+            .unwrap()[0];
+        let result_dimension = builder
+            .add_instruction(
+                DimensionFromScalarOperation::new(result_extent.into()),
+                Vec::new(),
+                vec![result_size],
+                None,
+            )
+            .unwrap()[0];
+        let input = builder
+            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, input_dimension], None)
+            .unwrap()[0];
+        let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(0).unwrap()));
+        let output = builder
+            .add_instruction(
+                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                Vec::new(),
+                vec![input, start, result_dimension],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 3, "{}", lowered.stable_hlo());
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let scalar =
+            |r#type: ArrayType, bytes: &[u8]| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap();
+        let inputs = |input_size: i64, result_size: i64| {
+            vec![
+                scalar(size_type.clone(), input_size.to_ne_bytes().as_slice()),
+                scalar(size_type.clone(), result_size.to_ne_bytes().as_slice()),
+                scalar(value_type.clone(), 7.0f32.to_ne_bytes().as_slice()),
+            ]
+        };
+
+        let eager = program
+            .interpret_in_context(&domain, inputs(4, 2).into_iter().map(Value::Array).collect::<Vec<_>>())
+            .unwrap();
+        let compiled_valid = domain.execute_program(&compiled, inputs(4, 2)).unwrap();
+        assert_eq!(read_f32s(&client, program_array(&eager[0])), vec![7.0, 7.0]);
+        assert_eq!(read_f32s(&client, &compiled_valid[0]), read_f32s(&client, program_array(&eager[0])));
+
+        let error = match domain.execute_program(&compiled, inputs(2, 4)) {
+            Ok(invalid) => invalid[0].block_until_ready().unwrap_err().to_string(),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(error, "`dynamic_slice` limit 4 exceeds input axis 0 extent 2");
+    }
+
+    #[test]
+    fn test_dynamic_slice_operation_lower_input_type_count() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let index_type = lower_tensor_type(&ArrayType::scalar(DataType::I64), &context, location).unwrap();
+        let block = context.block(&[
+            (lower_tensor_type(&ArrayType::new_static(DataType::I64, [4]), &context, location).unwrap(), location),
+            (index_type, location),
+            (index_type, location),
+        ]);
+        let inputs = (0..3).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+        let mut lowerer: Lowerer<'_, '_, '_, Operation> = Lowerer::new(block.as_ref(), &context, location.as_ref());
+        let output_types = vec![ArrayIrType::Array(ArrayType::new_static(DataType::I64, [2]))];
+        assert!(matches!(
+            DynamicSliceOperation::<ArrayIrType>::from_rank(1).lower(&mut lowerer, &inputs, &[], &output_types),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 3, actual: 0 }),
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_dynamic_slice_axis_plan_new() {
+        let unbounded = DimensionType::new("unbounded", DimensionBounds::unbounded());
+        let bounded_start = DimensionType::new("start", DimensionBounds::non_negative(Some(5)).unwrap());
+        let bounded_size = DimensionType::new("size", DimensionBounds::non_negative(Some(5)).unwrap());
+
+        assert_eq!(
+            unsupported_operation(
+                DynamicSliceAxisPlan::new(2, 1, &CoreDimension::Static(4), &bounded_start, &unbounded).unwrap_err(),
+            ),
+            "`dynamic_slice` size on axis 2 needs a finite upper bound",
+        );
+
+        let unbounded_input = CoreDimension::Dynamic(DimensionVariable::new("input", DimensionBounds::unbounded()));
+        assert_eq!(
+            unsupported_operation(
+                DynamicSliceAxisPlan::new(1, 1, &unbounded_input, &bounded_start, &bounded_size).unwrap_err(),
+            ),
+            "`dynamic_slice` input on axis 1 needs a finite upper bound",
+        );
+
+        let overflowing_size = DimensionType::new("size", DimensionBounds::non_negative(Some(usize::MAX)).unwrap());
+        assert_eq!(
+            unsupported_operation(
+                DynamicSliceAxisPlan::new(3, 2, &CoreDimension::Static(usize::MAX), &bounded_start, &overflowing_size)
+                    .unwrap_err(),
+            ),
+            "`dynamic_slice` physical span overflows on axis 3",
+        );
+
+        let unit_size = DimensionType::new("size", DimensionBounds::non_negative(Some(2)).unwrap());
+        assert_eq!(
+            unsupported_operation(
+                DynamicSliceAxisPlan::new(0, 1, &CoreDimension::Static(usize::MAX), &bounded_start, &unit_size)
+                    .unwrap_err(),
+            ),
+            "`dynamic_slice` padded input size overflows on axis 0",
+        );
+
+        assert_eq!(
+            DynamicSliceAxisPlan::new(0, 1, &CoreDimension::Static(3), &bounded_start, &bounded_size).unwrap(),
+            DynamicSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
+        );
+
+        let bounded_input =
+            CoreDimension::Dynamic(DimensionVariable::new("input", DimensionBounds::positive(Some(5)).unwrap()));
+        assert_eq!(
+            DynamicSliceAxisPlan::new(0, 1, &bounded_input, &bounded_start, &bounded_size).unwrap(),
+            DynamicSliceAxisPlan { size: 4, span: 4, needs_runtime_assertion: true },
+        );
+
+        let proven_start = DimensionType::new("start", DimensionBounds::non_negative(Some(1)).unwrap());
+        let proven_size = DimensionType::new("size", DimensionBounds::non_negative(Some(4)).unwrap());
+        assert_eq!(
+            DynamicSliceAxisPlan::new(0, 1, &CoreDimension::Static(4), &proven_start, &proven_size).unwrap(),
+            DynamicSliceAxisPlan { size: 3, span: 3, needs_runtime_assertion: false },
         );
     }
 }

@@ -19,9 +19,41 @@ use crate::operations::reductions::build_reduce_body_region;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
-/// Lowers gather with its explicit index-vector axis. Fill mode masks whole out-of-bounds windows, and clip mode
-/// clamps against logical input sizes even when the allocation is larger. Comparisons preserve index signedness.
-pub(crate) fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
+impl LowerableOperation for GatherOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let values = lower_gather_to_mlir(
+            self,
+            input_values,
+            input_types,
+            output_types,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+        if self.output_sharding().is_some() {
+            lower_sharding_constraint(
+                &values,
+                output_types[0].sharding().unwrap(),
+                lowerer.collective_state().bound_manual_axes(),
+                &mut lowerer.block(),
+                lowerer.location(),
+            )
+        } else {
+            Ok(values)
+        }
+    }
+}
+
+/// Lowers a [`GatherOperation`] with its explicit index vector axis. [`GatherMode::Fill`] masks whole out-of-bounds
+/// windows, and [`GatherMode::Clip`] clamps against logical input sizes even when the allocation is larger. Comparisons
+/// preserve index signedness.
+fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &GatherOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
@@ -33,8 +65,8 @@ pub(crate) fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     check_count!("input", input_values, 2, ProgramError);
     check_count!("input", input_types, 2, ProgramError);
     check_count!("output", output_types, 1, ProgramError);
-    // Native gather expects integer indices; the one-bit MLIR carrier instead denotes a predicate. Widen every
-    // index family without changing its signedness and recover I1's numeric value (-1 or 0) explicitly.
+    // Native gather expects integer indices, whereas the one-bit MLIR carrier denotes a predicate. Widen every index
+    // family without changing its signedness and explicitly recover the numeric value of I1 (i.e., -1 or 0).
     let index_data_type = if input_types[1].data_type().is_unsigned() { DataType::U64 } else { DataType::I64 };
     let indices_type = input_types[1].clone().with_data_type(index_data_type);
     let mut indices = block
@@ -61,11 +93,12 @@ pub(crate) fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
         index_vector_dimension,
     )?;
     // Paired axes select matching batch coordinates and do not contribute window coordinates. Use the
-    // canonical window entry when the extent proves which form is valid: zero for an empty axis and one for a
-    // nonempty axis. A retained symbolic batch may have used zero to admit an empty extent; leaving that entry zero
-    // after specialization to a nonempty batch can make XLA replace the entire gather with zeros. If the extent can
-    // still be zero or positive, retain the original entry: changing it to one would violate the gather window bound
-    // on a runtime-empty input. This does not add support for unspecialized runtime-zero batching.
+    // canonical window entry when the extent proves which form is valid, which is zero for an empty axis and one for a
+    // nonempty axis. A retained symbolic batch may have used zero to admit an empty extent, and leaving that entry
+    // zero after specialization to a nonempty batch can make XLA replace the entire gather with zeros. If the extent
+    // can still be zero or positive, retain the original entry, because changing it to one would violate the gather
+    // window bound on an input that is empty at runtime. This does not add support for unspecialized batching over
+    // extents that are zero at runtime.
     let mut slice_sizes = operation.slice_sizes().to_vec();
     for &(axis, _) in dimensions.batching_dimensions() {
         let bounds = input_types[0].dimension(axis).bounds();
@@ -96,8 +129,9 @@ pub(crate) fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     let physical_output_type = physical_bound_type(&output_types[0])?;
     let indices = lower_physical_bound_value(indices, &indices_type, 0.0, block, context, location)?;
 
-    // Widen before comparing: a legal input extent can exceed an i8/u8 index's range. In particular, converting u64
-    // indices to i64 would incorrectly turn its largest values into negative indices or wrap a clipping operation.
+    // Widen before comparing, because a legal input extent can exceed the range of an i8 or u8 index. In particular,
+    // converting u64 indices to i64 would incorrectly turn its largest values into negative indices or wrap a clipping
+    // operation.
     let mut upper_bounds = Vec::with_capacity(dimensions.start_index_map().len());
     for &axis in dimensions.start_index_map() {
         let extent = match input_types[0].shape().dimensions()[axis] {
@@ -144,14 +178,7 @@ pub(crate) fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
             .as_ref();
         // Componentwise clamping can reorder lexicographically sorted index vectors, so discard the sorting hint.
         let clipped = block
-            .append_operation(stable_hlo::gather(
-                input_values[0],
-                clipped,
-                attribute,
-                operation.slice_sizes(),
-                false,
-                location,
-            )?)?
+            .append_operation(stable_hlo::gather(input_values[0], clipped, attribute, &slice_sizes, false, location)?)?
             .result(0)
             .unwrap()
             .as_ref();
@@ -230,49 +257,16 @@ pub(crate) fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(vec![lower_restore_dynamic_dimensions(filled, &output_types[0], &sources, block, context, location)?])
 }
 
-impl LowerableOperation for GatherOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let values = lower_gather_to_mlir(
-            self,
-            input_values,
-            input_types,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
-        if self.output_sharding().is_some() {
-            lower_sharding_constraint(
-                &values,
-                output_types[0].sharding().unwrap(),
-                &lowerer.collective_state.bound_manual_axes,
-                &mut lowerer.block,
-                lowerer.location,
-            )
-        } else {
-            Ok(values)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
-    #[cfg(test)]
-    use ryft_core::Complex as ComplexNumber;
     use ryft_core::{
         Array as CoreArray, ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType, BatchAxis,
-        BatchableOperation, BatchingContext, DataType, Diagonal, Dimension as CoreDimension, DimensionBounds,
-        DimensionSize, DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Gather,
+        BatchableOperation, BatchingContext, Complex as ComplexNumber, DataType, Diagonal, Dimension as CoreDimension,
+        DimensionBounds, DimensionSize, DimensionVariable, DynamicArrayExtentBatchingPolicy, EmptyRegionDriver, Gather,
         GatherDimensionNumbers, GatherMode, GatherOperation, GatherOptions, LogicalMesh, MeshAxis, MeshAxisType,
         Placeholder, ProgramBuilder as CoreProgramBuilder, ProjectedContext, Reduce, ReductionKind,
         ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape, Sharding, ShardingDimension, Typed,
@@ -288,14 +282,9 @@ mod tests {
     use crate::{Array, Options, Session, to_mlir_module_for_program};
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_gather() {
-        use ryft_core::{
-            Dimension as CoreDimension, DimensionBounds, DimensionVariable, GatherDimensionNumbers, GatherOperation,
-            Shape,
-        };
-
-        // Take whole rows of a [3, 2] matrix at the row indices in a [2, 1] index array: offset axis 1 carries the
-        // row (slice sizes [1, 2]); axis 0 is collapsed (start-index driven). Output is [2, 2].
+    fn test_gather_operation_lower() {
+        // Take whole rows of a [3, 2] matrix at the row indices in a [2, 1] index array. Offset axis 1 carries the
+        // row with slice sizes [1, 2], and axis 0 is collapsed because the start indices select it. Output is [2, 2].
         let operand_type =
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
         let indices_type =
@@ -316,15 +305,21 @@ mod tests {
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
 
-        assert!(stablehlo.contains("stablehlo.gather"), "{stablehlo}");
-        assert!(stablehlo.contains("offset_dims = [1]"), "{stablehlo}");
-        assert!(stablehlo.contains("collapsed_slice_dims = [0]"), "{stablehlo}");
-        assert!(stablehlo.contains("start_index_map = [0]"), "{stablehlo}");
-        assert!(stablehlo.contains("slice_sizes = array<i64: 1, 2>"), "{stablehlo}");
-        assert!(stablehlo.contains("-> tensor<2x2xf32>"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<3x2xf32>, %arg1: tensor<2x1xi32>) -> tensor<2x2xf32> {
+                    %0 = stablehlo.convert %arg1 : (tensor<2x1xi32>) -> tensor<2x1xi64>
+                    %1 = "stablehlo.gather"(%arg0, %0) <{dimension_numbers = #stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1, 2>}> : (tensor<3x2xf32>, tensor<2x1xi64>) -> tensor<2x2xf32>
+                    return %1 : tensor<2x2xf32>
+                  }
+                }
+            "#},
+        );
 
-        // A dynamic query-batch axis remains the same array identity through gather; it is not reconstructed from a
-        // shape operand or lowered through `stablehlo.dynamic_gather`.
+        // A dynamic query batch axis remains the same array identity through gather, so it is not reconstructed from
+        // a shape operand or lowered through `stablehlo.dynamic_gather`.
         let query = DimensionVariable::new("query", DimensionBounds::new(1, Some(5)).unwrap());
         let indices_type =
             ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Dynamic(query), CoreDimension::Static(1)]));
@@ -346,38 +341,87 @@ mod tests {
             )
             .unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        assert!(stablehlo.contains("stablehlo.gather"), "{stablehlo}");
-        assert!(!stablehlo.contains("stablehlo.dynamic_gather"), "{stablehlo}");
-        assert!(stablehlo.contains("tensor<?x2xf32, #stablehlo.bounds<4, ?>>"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<3x2xf32>, %arg1: tensor<?x1xi32, #stablehlo.bounds<4, ?>>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>> {
+                    %0 = stablehlo.convert %arg1 : (tensor<?x1xi32, #stablehlo.bounds<4, ?>>) -> tensor<?x1xi64, #stablehlo.bounds<4, ?>>
+                    %1 = "stablehlo.gather"(%arg0, %0) <{dimension_numbers = #stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1, 2>}> : (tensor<3x2xf32>, tensor<?x1xi64, #stablehlo.bounds<4, ?>>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    return %1 : tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_lower_gather_fill_windows() {
+    fn test_gather_operation_lower_clip_mode() {
+        // `Clip` is the default out-of-bounds behavior of StableHLO `gather`, so a gather in `Clip` mode lowers to the
+        // bare `stablehlo.gather` without extra clamp operations, just like the in-bounds default, rather than
+        // failing.
+        let operand_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
+        let indices_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
+        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2])
+            .with_mode(GatherMode::Clip);
+        let mut builder = ProgramBuilder::new();
+        let operand = builder.add_input(operand_type);
+        let indices = builder.add_input(indices_type);
+        let output = builder
+            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<3x2xf32>, %arg1: tensor<2x1xi32>) -> tensor<2x2xf32> {
+                    %0 = stablehlo.convert %arg1 : (tensor<2x1xi32>) -> tensor<2x1xi64>
+                    %1 = "stablehlo.gather"(%arg0, %0) <{dimension_numbers = #stablehlo.gather<offset_dims = [1], collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1, 2>}> : (tensor<3x2xf32>, tensor<2x1xi64>) -> tensor<2x2xf32>
+                    return %1 : tensor<2x2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_gather_operation_lower_fill_windows() {
         let client = execution_client();
         let input =
-            CoreArray::from_elements(ArrayType::new_static(DataType::I64, [300]), &(0_i64..300).collect::<Vec<_>>())
+            CoreArray::from_elements(ArrayType::new_static(DataType::I64, [300]), &(0i64..300).collect::<Vec<_>>())
                 .unwrap();
-        let fill = 9_007_199_254_740_993_i64;
+        let fill = 9_007_199_254_740_993i64;
         let windows = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![], vec![0]), vec![3])
             .with_mode(GatherMode::Fill { value: None });
         let cases = [
             (
-                CoreArray::scalar(7_i64).unwrap(),
+                CoreArray::scalar(7i64).unwrap(),
                 CoreArray::from_elements(ArrayType::new_static(DataType::I32, [2, 0]), &[] as &[i32]).unwrap(),
                 GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![], vec![]), vec![])
                     .with_mode(GatherMode::Fill { value: None }),
-                values_to_bytes(&[7_i64, 7]),
+                values_to_bytes(&[7i64, 7]),
             ),
             (
-                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [2, 3]), &[10_i64, 20, 30, 40, 50, 60])
+                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [2, 3]), &[10i64, 20, 30, 40, 50, 60])
                     .unwrap(),
-                CoreArray::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[0_i32, 2, 1, 3]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I32, [2, 2, 1]), &[0i32, 2, 1, 3]).unwrap(),
                 GatherOperation::new(
                     GatherDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![(0, 0)]),
                     vec![1, 1],
                 )
                 .with_mode(GatherMode::Fill { value: None }),
-                values_to_bytes(&[10_i64, 30, 50, i64::MIN]),
+                values_to_bytes(&[10i64, 30, 50, i64::MIN]),
             ),
             (
                 input.clone(),
@@ -391,7 +435,7 @@ mod tests {
             ),
             (
                 input.clone(),
-                CoreArray::from_elements(ArrayType::new_static(DataType::I8, [3, 1]), &[-1_i8, 0, 127]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I8, [3, 1]), &[-1i8, 0, 127]).unwrap(),
                 windows
                     .clone()
                     .with_mode(GatherMode::Fill { value: Some(Box::new(CoreArray::scalar(fill).unwrap())) }),
@@ -399,30 +443,29 @@ mod tests {
             ),
             (
                 input.clone(),
-                CoreArray::from_elements(ArrayType::new_static(DataType::U64, [3, 1]), &[0_u64, 299, u64::MAX])
-                    .unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::U64, [3, 1]), &[0u64, 299, u64::MAX]).unwrap(),
                 windows.clone(),
-                values_to_bytes(&[0_i64, 1, 2, i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN]),
+                values_to_bytes(&[0i64, 1, 2, i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN, i64::MIN]),
             ),
             (
                 input,
-                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [2, 1]), &[297_i64, 298]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [2, 1]), &[297i64, 298]).unwrap(),
                 windows,
-                values_to_bytes(&[297_i64, 298, 299, i64::MIN, i64::MIN, i64::MIN]),
+                values_to_bytes(&[297i64, 298, 299, i64::MIN, i64::MIN, i64::MIN]),
             ),
             (
                 CoreArray::from_elements(
                     ArrayType::new_static(DataType::C64, [1]),
-                    &[ComplexNumber::new(2.0_f32, -3.0)],
+                    &[ComplexNumber::new(2.0f32, -3.0)],
                 )
                 .unwrap(),
-                CoreArray::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[0_i32, 1]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I32, [2, 1]), &[0i32, 1]).unwrap(),
                 GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1]).with_mode(
                     GatherMode::Fill {
-                        value: Some(Box::new(CoreArray::scalar(ComplexNumber::new(-0.0_f32, 7.0)).unwrap())),
+                        value: Some(Box::new(CoreArray::scalar(ComplexNumber::new(-0.0f32, 7.0)).unwrap())),
                     },
                 ),
-                values_to_bytes(&[2.0_f32, -3.0, -0.0, 7.0]),
+                values_to_bytes(&[2.0f32, -3.0, -0.0, 7.0]),
             ),
         ];
         for (input, indices, operation, expected) in cases {
@@ -529,11 +572,11 @@ mod tests {
                 .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
                 .unwrap();
             let device = executable.addressable_devices().unwrap().remove(0);
-            for query_size in [2_i32, 1, 0] {
+            for query_size in [2i32, 1, 0] {
                 let inputs = [
-                    (values_to_bytes(&[10_i64, 20, 30, 40]), BufferType::I64, vec![4]),
-                    (values_to_bytes(&[1_i64, 3]), BufferType::I64, vec![2, 1]),
-                    (values_to_bytes(&[2_i32]), BufferType::I32, vec![]),
+                    (values_to_bytes(&[10i64, 20, 30, 40]), BufferType::I64, vec![4]),
+                    (values_to_bytes(&[1i64, 3]), BufferType::I64, vec![2, 1]),
+                    (values_to_bytes(&[2i32]), BufferType::I32, vec![]),
                     (values_to_bytes(&[query_size]), BufferType::I32, vec![]),
                 ]
                 .into_iter()
@@ -562,7 +605,7 @@ mod tests {
                     .unwrap()
                     .remove(0)
                     .outputs;
-                let expected = if mode == GatherMode::Clip { vec![20_i64, 20] } else { vec![20, i64::MIN] };
+                let expected = if mode == GatherMode::Clip { vec![20i64, 20] } else { vec![20, i64::MIN] };
                 let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
                 let actual = values_from_bytes::<i64>(&bytes[..query_size as usize * 8]);
                 assert_eq!(actual, &expected[..query_size as usize]);
@@ -575,7 +618,94 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_gather_fill_differentiation() {
+    fn test_gather_operation_lower_clip_batching_windows() {
+        // The paired batching axis has a zero window, which lowering replaces with a window of one because the input
+        // has at least one row. Clipping against the logical extents of a dynamic input gathers a second time, and
+        // that gather must use the same windows.
+        let rows = CoreDimension::Dynamic(DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap()));
+        let input_type = ArrayType::new(DataType::I64, Shape::new(vec![rows.clone(), CoreDimension::Static(4)]));
+        let indices_type = ArrayType::new(DataType::I64, Shape::new(vec![rows.clone(), CoreDimension::Static(1)]));
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        let indices = builder.add_input(indices_type.clone());
+        let output = builder
+            .add_instruction(
+                GatherOperation::new(
+                    GatherDimensionNumbers::new(vec![], vec![1], vec![1]).with_batching_dimensions(vec![(0, 0)]),
+                    vec![0, 1],
+                )
+                .with_mode(GatherMode::Clip),
+                Vec::new(),
+                vec![input, indices],
+                None,
+            )
+            .unwrap()[0];
+        let program = unproject_plain_program(
+            builder
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap(),
+        );
+        let module = to_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![input_type, indices_type],
+            &vec![ArrayType::new(DataType::I64, Shape::new(vec![rows]))],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4x4xi64>, %arg1: tensor<4x1xi64>, %arg2: tensor<i32>, %arg3: tensor<i32>) -> (tensor<?xi64, #stablehlo.bounds<4>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<4x4xi64>, tensor<i32>) -> tensor<?x4xi64, #stablehlo.bounds<4, ?>>
+                    %1 = stablehlo.set_dimension_size %arg1, %arg3, dim = 0 : (tensor<4x1xi64>, tensor<i32>) -> tensor<?x1xi64, #stablehlo.bounds<4, ?>>
+                    %2 = stablehlo.convert %1 : tensor<?x1xi64, #stablehlo.bounds<4, ?>>
+                    %3 = "stablehlo.gather"(%0, %2) <{dimension_numbers = #stablehlo.gather<collapsed_slice_dims = [1], operand_batching_dims = [0], start_indices_batching_dims = [0], start_index_map = [1], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1, 1>}> : (tensor<?x4xi64, #stablehlo.bounds<4, ?>>, tensor<?x1xi64, #stablehlo.bounds<4, ?>>) -> tensor<?xi64, #stablehlo.bounds<4>>
+                    %4 = stablehlo.get_dimension_size %2, dim = 0 : (tensor<?x1xi64, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %c = stablehlo.constant dense<4> : tensor<i32>
+                    %5 = stablehlo.set_dimension_size %2, %c, dim = 0 : (tensor<?x1xi64, #stablehlo.bounds<4, ?>>, tensor<i32>) -> tensor<4x1xi64>
+                    %6 = stablehlo.iota dim = 0 : tensor<4x1xi32>
+                    %7 = stablehlo.broadcast_in_dim %4, dims = [] : (tensor<i32>) -> tensor<4x1xi32>
+                    %8 = stablehlo.compare LT, %6, %7, SIGNED : (tensor<4x1xi32>, tensor<4x1xi32>) -> tensor<4x1xi1>
+                    %c_0 = stablehlo.constant dense<0> : tensor<i64>
+                    %9 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<i64>) -> tensor<4x1xi64>
+                    %10 = stablehlo.select %8, %5, %9 : tensor<4x1xi1>, tensor<4x1xi64>
+                    %c_1 = stablehlo.constant dense<4> : tensor<i64>
+                    %c_2 = stablehlo.constant dense<1> : tensor<i64>
+                    %11 = stablehlo.subtract %c_1, %c_2 : tensor<i64>
+                    %12 = stablehlo.reshape %11 : (tensor<i64>) -> tensor<1xi64>
+                    %13 = stablehlo.convert %12 : tensor<1xi64>
+                    %14 = stablehlo.broadcast_in_dim %13, dims = [1] : (tensor<1xi64>) -> tensor<4x1xi64>
+                    %c_3 = stablehlo.constant dense<0> : tensor<i64>
+                    %15 = stablehlo.broadcast_in_dim %c_3, dims = [] : (tensor<i64>) -> tensor<4x1xi64>
+                    %16 = stablehlo.maximum %10, %15 : tensor<4x1xi64>
+                    %17 = stablehlo.minimum %16, %14 : tensor<4x1xi64>
+                    %18 = "stablehlo.gather"(%0, %17) <{dimension_numbers = #stablehlo.gather<collapsed_slice_dims = [1], operand_batching_dims = [0], start_indices_batching_dims = [0], start_index_map = [1], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1, 1>}> : (tensor<?x4xi64, #stablehlo.bounds<4, ?>>, tensor<4x1xi64>) -> tensor<4xi64>
+                    %19 = stablehlo.get_dimension_size %18, dim = 0 : (tensor<4xi64>) -> tensor<i32>
+                    %c_4 = stablehlo.constant dense<4> : tensor<i32>
+                    %20 = stablehlo.set_dimension_size %18, %c_4, dim = 0 : (tensor<4xi64>, tensor<i32>) -> tensor<4xi64>
+                    %21 = stablehlo.iota dim = 0 : tensor<4xi32>
+                    %22 = stablehlo.broadcast_in_dim %19, dims = [] : (tensor<i32>) -> tensor<4xi32>
+                    %23 = stablehlo.compare LT, %21, %22, SIGNED : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi1>
+                    %c_5 = stablehlo.constant dense<0> : tensor<i64>
+                    %24 = stablehlo.broadcast_in_dim %c_5, dims = [] : (tensor<i64>) -> tensor<4xi64>
+                    %25 = stablehlo.select %23, %20, %24 : tensor<4xi1>, tensor<4xi64>
+                    %26 = stablehlo.get_dimension_size %3, dim = 0 : (tensor<?xi64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %27 = stablehlo.set_dimension_size %25, %26, dim = 0 : (tensor<4xi64>, tensor<i32>) -> tensor<?xi64, #stablehlo.bounds<4>>
+                    %28 = stablehlo.get_dimension_size %27, dim = 0 : (tensor<?xi64, #stablehlo.bounds<4>>) -> tensor<i32>
+                    %29 = stablehlo.convert %28 : (tensor<i32>) -> tensor<i64>
+                    return %27, %29 : tensor<?xi64, #stablehlo.bounds<4>>, tensor<i64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_gather_operation_lower_fill_differentiation() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -601,38 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_clip_mode_gather_to_bare_op() {
-        use ryft_core::{Dimension as CoreDimension, GatherDimensionNumbers, GatherMode, GatherOperation, Shape};
-
-        // `Clip` is StableHLO `gather`'s default out-of-bounds behavior, so a `Clip`-mode gather lowers to the bare
-        // `stablehlo.gather` (no extra clamp ops) just like the in-bounds default rather than erroring.
-        let operand_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
-        let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
-        let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![1], vec![0], vec![0]), vec![1, 2])
-            .with_mode(GatherMode::Clip);
-        let mut builder = ProgramBuilder::new();
-        let operand = builder.add_input(operand_type);
-        let indices = builder.add_input(indices_type);
-        let output = builder
-            .add_instruction(ArrayOperation::Gather(operation), Vec::new(), vec![operand, indices], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-
-        assert!(stablehlo.contains("stablehlo.gather"), "{stablehlo}");
-        assert!(stablehlo.contains("-> tensor<2x2xf32>"), "{stablehlo}");
-    }
-
-    #[test]
-    fn test_lower_gather_to_mlir_diagonal() {
+    fn test_lower_gather_to_mlir_diagonal_matches_reference_backend() {
         // A diagonal is a slice of its two axes followed by one gather over iota indices, which lowers and executes
         // like the reference backend, including for offsets, axes with different extents, and empty diagonals.
         let client = execution_client();
@@ -663,7 +762,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_indexed_output_sharding() {
+    fn test_gather_operation_lower_output_sharding() {
         let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
@@ -699,15 +798,35 @@ mod tests {
             )
             .unwrap();
         let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        assert_eq!(module.matches("sdy.sharding_constraint").count(), 2);
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  sdy.mesh @mesh = <["x"=2]>
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<2x1xi32>, %arg2: tensor<2xf32>) -> (tensor<2xf32>, tensor<4xf32>) {
+                    %0 = stablehlo.convert %arg1 : (tensor<2x1xi32>) -> tensor<2x1xi64>
+                    %1 = "stablehlo.gather"(%arg0, %0) <{dimension_numbers = #stablehlo.gather<collapsed_slice_dims = [0], start_index_map = [0], index_vector_dim = 1>, indices_are_sorted = false, slice_sizes = array<i64: 1>}> : (tensor<4xf32>, tensor<2x1xi64>) -> tensor<2xf32>
+                    %2 = sdy.sharding_constraint %1 <@mesh, [{"x"}]> : tensor<2xf32>
+                    %3 = stablehlo.convert %arg1 : (tensor<2x1xi32>) -> tensor<2x1xi64>
+                    %4 = "stablehlo.scatter"(%arg0, %3, %arg2) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}> ({
+                    ^bb0(%arg3: tensor<f32>, %arg4: tensor<f32>):
+                      %6 = stablehlo.add %arg3, %arg4 : tensor<f32>
+                      stablehlo.return %6 : tensor<f32>
+                    }) : (tensor<4xf32>, tensor<2x1xi64>, tensor<2xf32>) -> tensor<4xf32>
+                    %5 = sdy.sharding_constraint %4 <@mesh, [{"x"}]> : tensor<4xf32>
+                    return %2, %5 : tensor<2xf32>, tensor<4xf32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_compiled_jointly_mapped_gather_over_possibly_empty_extent() {
+    fn test_gather_operation_lower_jointly_mapped_over_possibly_empty_extent() {
         // Jointly mapping the input and the indices of a gather over a dynamic extent whose lower bound is zero
         // stages one gather with paired batching axes and a zero batching window. This runs the transformed program
-        // on the CPU PJRT client used by the other tests (the `cutile` feature only enables compilation of the kernel
-        // module) at empty and nonempty mapped extents, through both the primal and its pullback.
+        // on the test execution client at empty and nonempty mapped extents, through both the primal and its
+        // pullback.
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
@@ -717,8 +836,8 @@ mod tests {
         let operation = GatherOperation::new(GatherDimensionNumbers::new(vec![], vec![0], vec![0]), vec![1])
             .with_mode(GatherMode::Clip);
         // The public `batch` entry runs under the static extent policy, which rejects a dynamic mapped axis before any
-        // operation rule runs, so the joint rule is driven through the dynamic extent policy exactly as the ryft-core
-        // reproduction does, with the mapped extent read from the staged input.
+        // operation rule runs, so the joint rule is driven through the dynamic extent policy directly, with the mapped
+        // extent read from the staged input.
         let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
             |inputs| {
                 let extent = inputs[0].dimension_size(0).unwrap();
@@ -741,9 +860,8 @@ mod tests {
         .unwrap()
         .into_inner();
         let program = staged.source_program().program().clone();
-        let rendered = program.to_string();
         assert_eq!(
-            rendered,
+            program.to_string(),
             indoc! {"
                 lambda %0:f64[n, 4], %1:i32[n, 1] .
                 let %2:f64[n] = gather [
@@ -755,17 +873,15 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert!(rendered.contains("slice_sizes=[0, 1]"));
-        assert!(rendered.contains("batching=[(0, 0)]"));
         let linearization = program.linearize_with_respect_to(&[0]).unwrap();
         let pullback = linearization.pullback().unwrap().into_program();
-        let all_indices = [1_i32, 3, 0, 2, 3];
-        for size in [0_usize, 4, 5] {
+        let all_indices = [1i32, 3, 0, 2, 3];
+        for size in [0usize, 4, 5] {
             let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
             let indices = &all_indices[..size];
             let expected =
                 indices.iter().enumerate().map(|(row, &index)| values[row * 4 + index as usize]).collect::<Vec<_>>();
-            let mut gradient = vec![0_f64; size * 4];
+            let mut gradient = vec![0f64; size * 4];
             for (row, &index) in indices.iter().enumerate() {
                 gradient[row * 4 + index as usize] = 1.;
             }
@@ -803,8 +919,8 @@ mod tests {
                 &domain,
                 mesh.clone(),
             )
-            .unwrap_or_else(|error| panic!("n={size} native trace: {error}"));
-            let bytes = [values_to_bytes(&values), values_to_bytes(indices), values_to_bytes(&vec![1_f64; size])];
+            .unwrap_or_else(|error| panic!("n={size} compilation: {error}"));
+            let bytes = [values_to_bytes(&values), values_to_bytes(indices), values_to_bytes(&vec![1f64; size])];
             let inputs = input_types
                 .into_iter()
                 .zip(bytes)

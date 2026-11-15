@@ -7,17 +7,130 @@ use crate::lowering::types::{lower_f64_constant_splat, lower_tensor_type};
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
+impl LowerableOperation for SinOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
+        if output_types[0].data_type().is_complex() {
+            return Ok(vec![lower_complex_sine_or_cosine(
+                input_values[0],
+                &output_types[0],
+                true,
+                &mut lowerer.block(),
+                lowerer.context(),
+                lowerer.location(),
+            )?]);
+        }
+        let result = lowerer.block().append_operation(stable_hlo::sine(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location(),
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
+    }
+}
+
+impl LowerableOperation for CosOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
+        if output_types[0].data_type().is_complex() {
+            return Ok(vec![lower_complex_sine_or_cosine(
+                input_values[0],
+                &output_types[0],
+                false,
+                &mut lowerer.block(),
+                lowerer.context(),
+                lowerer.location(),
+            )?]);
+        }
+        let result = lowerer.block().append_operation(stable_hlo::cosine(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location(),
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
+    }
+}
+
+impl LowerableOperation for TanOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::tan(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location(),
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
+    }
+}
+
+impl LowerableOperation for Atan2Operation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
+        let [left, right] = normalize_binary_elementwise_operands(
+            input_values,
+            output_types,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+        let result = lowerer.block().append_operation(stable_hlo::atan2(left, right, lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
+    }
+}
+
+impl LowerableOperation for TanhOperation<ArrayType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::tanh(
+            input_values[0],
+            lower_accuracy(self.accuracy()),
+            lowerer.location(),
+        )?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
+    }
+}
+
 /// Lowers complex sine or cosine through real operations while preserving an exact zero component for a zero real
 /// input. The direct StableHLO complex trigonometric operations can evaluate a mathematically zero product as
 /// `0 * inf`, yielding NaN when the imaginary component is large enough to overflow the hyperbolic factor. Small
-/// imaginary components use `expm1` to avoid cancellation; large components scale the trigonometric factor before
+/// imaginary components use `expm1` to avoid cancellation. Large components scale the trigonometric factor before
 /// forming the exponential product to avoid intermediate overflow.
 ///
 /// # Parameters
 ///
 ///   - `input`: Complex tensor whose elementwise sine or cosine is lowered.
-///   - `output_type`: Inferred complex output type, used to construct same-shaped real constants.
-///   - `sine`: If `true`, lowers sine; otherwise, lowers cosine.
+///   - `output_type`: Inferred complex output type, used to construct real constants of the same shape.
+///   - `sine`: Whether to lower sine rather than cosine.
 ///   - `block`: Destination block for the StableHLO decomposition.
 ///   - `context`: MLIR context that owns all emitted types and attributes.
 ///   - `location`: Source location attached to emitted operations.
@@ -44,9 +157,9 @@ where
     let two = lower_f64_constant_splat(2.0, &part_type, part_tensor_type, block, context, location)?;
 
     let real = block.append_operation(stable_hlo::real(input, location)?)?;
-    let real = real.result(0).expect("stablehlo.real should return one result").as_ref();
+    let real = real.result(0).unwrap().as_ref();
     let imaginary = block.append_operation(stable_hlo::imag(input, location)?)?;
-    let imaginary = imaginary.result(0).expect("stablehlo.imag should return one result").as_ref();
+    let imaginary = imaginary.result(0).unwrap().as_ref();
     let real_is_zero = block.append_operation(stable_hlo::compare(
         real,
         zero,
@@ -54,43 +167,37 @@ where
         stable_hlo::ComparisonType::Float,
         location,
     )?)?;
-    let real_is_zero = real_is_zero.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let real_is_zero = real_is_zero.result(0).unwrap().as_ref();
     let real_sine = block.append_operation(stable_hlo::sine(real, Accuracy::Default, location)?)?;
-    let real_sine = real_sine.result(0).expect("stablehlo.sine should return one result").as_ref();
+    let real_sine = real_sine.result(0).unwrap().as_ref();
     let real_cosine = block.append_operation(stable_hlo::cosine(real, Accuracy::Default, location)?)?;
-    let real_cosine = real_cosine.result(0).expect("stablehlo.cosine should return one result").as_ref();
+    let real_cosine = real_cosine.result(0).unwrap().as_ref();
     let negative_imaginary = block.append_operation(stable_hlo::negate(imaginary, location)?)?;
-    let negative_imaginary = negative_imaginary.result(0).expect("stablehlo.negate should return one result").as_ref();
+    let negative_imaginary = negative_imaginary.result(0).unwrap().as_ref();
     let positive_exponential_minus_one =
         block.append_operation(stable_hlo::exponential_minus_one(imaginary, Accuracy::Default, location)?)?;
-    let positive_exponential_minus_one = positive_exponential_minus_one
-        .result(0)
-        .expect("stablehlo.exponential_minus_one should return one result")
-        .as_ref();
+    let positive_exponential_minus_one = positive_exponential_minus_one.result(0).unwrap().as_ref();
     let negative_exponential_minus_one =
         block.append_operation(stable_hlo::exponential_minus_one(negative_imaginary, Accuracy::Default, location)?)?;
-    let negative_exponential_minus_one = negative_exponential_minus_one
-        .result(0)
-        .expect("stablehlo.exponential_minus_one should return one result")
-        .as_ref();
+    let negative_exponential_minus_one = negative_exponential_minus_one.result(0).unwrap().as_ref();
     let sinh_numerator = block.append_operation(stable_hlo::subtract(
         positive_exponential_minus_one,
         negative_exponential_minus_one,
         location,
     )?)?;
-    let sinh_numerator = sinh_numerator.result(0).expect("stablehlo.subtract should return one result").as_ref();
+    let sinh_numerator = sinh_numerator.result(0).unwrap().as_ref();
     let sinh = block.append_operation(stable_hlo::divide(sinh_numerator, two, location)?)?;
-    let sinh = sinh.result(0).expect("stablehlo.divide should return one result").as_ref();
+    let sinh = sinh.result(0).unwrap().as_ref();
     let cosh_without_two = block.append_operation(stable_hlo::add(
         positive_exponential_minus_one,
         negative_exponential_minus_one,
         location,
     )?)?;
-    let cosh_without_two = cosh_without_two.result(0).expect("stablehlo.add should return one result").as_ref();
+    let cosh_without_two = cosh_without_two.result(0).unwrap().as_ref();
     let cosh_numerator = block.append_operation(stable_hlo::add(cosh_without_two, two, location)?)?;
-    let cosh_numerator = cosh_numerator.result(0).expect("stablehlo.add should return one result").as_ref();
+    let cosh_numerator = cosh_numerator.result(0).unwrap().as_ref();
     let cosh = block.append_operation(stable_hlo::divide(cosh_numerator, two, location)?)?;
-    let cosh = cosh.result(0).expect("stablehlo.divide should return one result").as_ref();
+    let cosh = cosh.result(0).unwrap().as_ref();
 
     // Scale the trigonometric factor before the second exponential multiplication. This keeps representable
     // components finite even when `exp(abs(imaginary))`, or the hyperbolic factor itself, would overflow. Above
@@ -167,7 +274,7 @@ where
             .unwrap()
             .as_ref();
         // Extremely small trigonometric factors can still produce finite components when the half exponential
-        // overflows. Combine exponents for that rare case; retain exact zeros before taking a logarithm.
+        // overflows. Combine exponents for that rare case, and retain exact zeros before taking a logarithm.
         let absolute = block.append_operation(stable_hlo::abs(factor, location)?)?.result(0).unwrap().as_ref();
         let logarithm = block
             .append_operation(stable_hlo::log(absolute, Accuracy::Default, location)?)?
@@ -226,25 +333,22 @@ where
         // Mask the overflowing factor before multiplication as well as selecting the final complex result. Some XLA
         // optimization paths otherwise speculate the unselected `0 * inf` expression and preserve its NaN.
         let safe_cosh = block.append_operation(stable_hlo::select(real_is_zero, zero, cosh, location)?)?;
-        let safe_cosh = safe_cosh.result(0).expect("stablehlo.select should return one result").as_ref();
+        let safe_cosh = safe_cosh.result(0).unwrap().as_ref();
         let real_result = block.append_operation(stable_hlo::multiply(real_sine, safe_cosh, location)?)?;
-        let real_result = real_result.result(0).expect("stablehlo.multiply should return one result").as_ref();
+        let real_result = real_result.result(0).unwrap().as_ref();
         let imaginary_result = block.append_operation(stable_hlo::multiply(real_cosine, sinh, location)?)?;
-        let imaginary_result =
-            imaginary_result.result(0).expect("stablehlo.multiply should return one result").as_ref();
+        let imaginary_result = imaginary_result.result(0).unwrap().as_ref();
         (real_result, imaginary_result)
     } else {
         let real_result = block.append_operation(stable_hlo::multiply(real_cosine, cosh, location)?)?;
-        let real_result = real_result.result(0).expect("stablehlo.multiply should return one result").as_ref();
+        let real_result = real_result.result(0).unwrap().as_ref();
         let negative_real_sine = block.append_operation(stable_hlo::negate(real_sine, location)?)?;
-        let negative_real_sine =
-            negative_real_sine.result(0).expect("stablehlo.negate should return one result").as_ref();
+        let negative_real_sine = negative_real_sine.result(0).unwrap().as_ref();
         let safe_sinh = block.append_operation(stable_hlo::select(real_is_zero, zero, sinh, location)?)?;
-        let safe_sinh = safe_sinh.result(0).expect("stablehlo.select should return one result").as_ref();
+        let safe_sinh = safe_sinh.result(0).unwrap().as_ref();
         let imaginary_result =
             block.append_operation(stable_hlo::multiply(negative_real_sine, safe_sinh, location)?)?;
-        let imaginary_result =
-            imaginary_result.result(0).expect("stablehlo.multiply should return one result").as_ref();
+        let imaginary_result = imaginary_result.result(0).unwrap().as_ref();
         (real_result, imaginary_result)
     };
     let real_result = block
@@ -258,124 +362,16 @@ where
         .unwrap()
         .as_ref();
     let ordinary_result = block.append_operation(stable_hlo::complex(real_result, imaginary_result, location)?)?;
-    let ordinary_result = ordinary_result.result(0).expect("stablehlo.complex should return one result").as_ref();
+    let ordinary_result = ordinary_result.result(0).unwrap().as_ref();
     let zero_real_result = if sine {
         block.append_operation(stable_hlo::complex(zero, imaginary_result, location)?)?
     } else {
         block.append_operation(stable_hlo::complex(real_result, zero, location)?)?
     };
-    let zero_real_result = zero_real_result.result(0).expect("stablehlo.complex should return one result").as_ref();
+    let zero_real_result = zero_real_result.result(0).unwrap().as_ref();
     let result =
         block.append_operation(stable_hlo::select(real_is_zero, zero_real_result, ordinary_result, location)?)?;
-    Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
-}
-
-impl LowerableOperation for SinOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        if output_types[0].data_type().is_complex() {
-            return Ok(vec![lower_complex_sine_or_cosine(
-                input_values[0],
-                &output_types[0],
-                true,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?]);
-        }
-        let result = lowerer.block.append_operation(stable_hlo::sine(
-            input_values[0],
-            lower_accuracy(self.accuracy()),
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.sine should return one result").as_ref()])
-    }
-}
-
-impl LowerableOperation for CosOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        if output_types[0].data_type().is_complex() {
-            return Ok(vec![lower_complex_sine_or_cosine(
-                input_values[0],
-                &output_types[0],
-                false,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
-            )?]);
-        }
-        let result = lowerer.block.append_operation(stable_hlo::cosine(
-            input_values[0],
-            lower_accuracy(self.accuracy()),
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.cosine should return one result").as_ref()])
-    }
-}
-
-impl LowerableOperation for TanOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::tan(
-            input_values[0],
-            lower_accuracy(self.accuracy()),
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).unwrap().as_ref()])
-    }
-}
-
-impl LowerableOperation for Atan2Operation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let [left, right] = normalize_binary_elementwise_operands(
-            input_values,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
-        let result = lowerer.block.append_operation(stable_hlo::atan2(left, right, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.atan2 should return one result").as_ref()])
-    }
-}
-
-impl LowerableOperation for TanhOperation<ArrayType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::tanh(
-            input_values[0],
-            lower_accuracy(self.accuracy()),
-            lowerer.location,
-        )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.tanh should return one result").as_ref()])
-    }
+    Ok(result.result(0).unwrap().as_ref())
 }
 
 #[cfg(test)]
@@ -395,31 +391,323 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_complex_sine_and_cosine() {
-        let complex_type = ArrayType::scalar(DataType::C64);
+    fn test_sin_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Sin(SinOperation::new()), DataType::F32, vec![4]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.sine %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_sin_operation_lower_complex() {
+        // Complex inputs decompose into real arithmetic that selects the paths for small arguments, scaled factors,
+        // and logarithms while preserving exact zero components.
+        let module = lowered_unary_module(ArrayOperation::Sin(SinOperation::new()), DataType::C64, vec![]).unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<complex<f32>>) -> tensor<complex<f32>> {
+                %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                %cst_0 = stablehlo.constant dense<2.000000e+00> : tensor<f32>
+                %0 = stablehlo.real %arg0 : (tensor<complex<f32>>) -> tensor<f32>
+                %1 = stablehlo.imag %arg0 : (tensor<complex<f32>>) -> tensor<f32>
+                %2 = stablehlo.compare EQ, %0, %cst, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %3 = stablehlo.sine %0 : tensor<f32>
+                %4 = stablehlo.cosine %0 : tensor<f32>
+                %5 = stablehlo.negate %1 : tensor<f32>
+                %6 = stablehlo.exponential_minus_one %1 : tensor<f32>
+                %7 = stablehlo.exponential_minus_one %5 : tensor<f32>
+                %8 = stablehlo.subtract %6, %7 : tensor<f32>
+                %9 = stablehlo.divide %8, %cst_0 : tensor<f32>
+                %10 = stablehlo.add %6, %7 : tensor<f32>
+                %11 = stablehlo.add %10, %cst_0 : tensor<f32>
+                %12 = stablehlo.divide %11, %cst_0 : tensor<f32>
+                %13 = stablehlo.abs %1 : tensor<f32>
+                %cst_1 = stablehlo.constant dense<5.000000e-01> : tensor<f32>
+                %cst_2 = stablehlo.constant dense<2.000000e+01> : tensor<f32>
+                %cst_3 = stablehlo.constant dense<0x7F800000> : tensor<f32>
+                %cst_4 = stablehlo.constant dense<0.693147182> : tensor<f32>
+                %14 = stablehlo.compare GT, %13, %cst_2, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %15 = stablehlo.multiply %13, %cst_1 : tensor<f32>
+                %16 = stablehlo.exponential %15 : tensor<f32>
+                %17 = stablehlo.compare EQ, %16, %cst_3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %18 = stablehlo.compare LT, %1, %cst, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %19 = stablehlo.multiply %3, %16 : tensor<f32>
+                %20 = stablehlo.multiply %19, %cst_1 : tensor<f32>
+                %21 = stablehlo.multiply %20, %16 : tensor<f32>
+                %22 = stablehlo.abs %3 : tensor<f32>
+                %23 = stablehlo.log %22 : tensor<f32>
+                %24 = stablehlo.add %13, %23 : tensor<f32>
+                %25 = stablehlo.subtract %24, %cst_4 : tensor<f32>
+                %26 = stablehlo.exponential %25 : tensor<f32>
+                %27 = stablehlo.sign %3 : tensor<f32>
+                %28 = stablehlo.multiply %27, %26 : tensor<f32>
+                %29 = stablehlo.select %17, %28, %21 : tensor<i1>, tensor<f32>
+                %30 = stablehlo.compare EQ, %3, %cst, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %31 = stablehlo.select %30, %3, %29 : tensor<i1>, tensor<f32>
+                %32 = stablehlo.negate %4 : tensor<f32>
+                %33 = stablehlo.select %18, %32, %4 : tensor<i1>, tensor<f32>
+                %34 = stablehlo.multiply %33, %16 : tensor<f32>
+                %35 = stablehlo.multiply %34, %cst_1 : tensor<f32>
+                %36 = stablehlo.multiply %35, %16 : tensor<f32>
+                %37 = stablehlo.abs %33 : tensor<f32>
+                %38 = stablehlo.log %37 : tensor<f32>
+                %39 = stablehlo.add %13, %38 : tensor<f32>
+                %40 = stablehlo.subtract %39, %cst_4 : tensor<f32>
+                %41 = stablehlo.exponential %40 : tensor<f32>
+                %42 = stablehlo.sign %33 : tensor<f32>
+                %43 = stablehlo.multiply %42, %41 : tensor<f32>
+                %44 = stablehlo.select %17, %43, %36 : tensor<i1>, tensor<f32>
+                %45 = stablehlo.compare EQ, %33, %cst, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %46 = stablehlo.select %45, %33, %44 : tensor<i1>, tensor<f32>
+                %47 = stablehlo.select %2, %cst, %12 : tensor<i1>, tensor<f32>
+                %48 = stablehlo.multiply %3, %47 : tensor<f32>
+                %49 = stablehlo.multiply %4, %9 : tensor<f32>
+                %50 = stablehlo.select %14, %31, %48 : tensor<i1>, tensor<f32>
+                %51 = stablehlo.select %14, %46, %49 : tensor<i1>, tensor<f32>
+                %52 = stablehlo.complex %50, %51 : tensor<complex<f32>>
+                %53 = stablehlo.complex %cst, %51 : tensor<complex<f32>>
+                %54 = stablehlo.select %2, %53, %52 : tensor<i1>, tensor<complex<f32>>
+                return %54 : tensor<complex<f32>>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_cos_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Cos(CosOperation::new()), DataType::F32, vec![4]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.cosine %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_cos_operation_lower_complex() {
+        // Complex inputs decompose into real arithmetic that selects the paths for small arguments, scaled factors,
+        // and logarithms while preserving exact zero components.
+        let module = lowered_unary_module(ArrayOperation::Cos(CosOperation::new()), DataType::C64, vec![]).unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<complex<f32>>) -> tensor<complex<f32>> {
+                %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                %cst_0 = stablehlo.constant dense<2.000000e+00> : tensor<f32>
+                %0 = stablehlo.real %arg0 : (tensor<complex<f32>>) -> tensor<f32>
+                %1 = stablehlo.imag %arg0 : (tensor<complex<f32>>) -> tensor<f32>
+                %2 = stablehlo.compare EQ, %0, %cst, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %3 = stablehlo.sine %0 : tensor<f32>
+                %4 = stablehlo.cosine %0 : tensor<f32>
+                %5 = stablehlo.negate %1 : tensor<f32>
+                %6 = stablehlo.exponential_minus_one %1 : tensor<f32>
+                %7 = stablehlo.exponential_minus_one %5 : tensor<f32>
+                %8 = stablehlo.subtract %6, %7 : tensor<f32>
+                %9 = stablehlo.divide %8, %cst_0 : tensor<f32>
+                %10 = stablehlo.add %6, %7 : tensor<f32>
+                %11 = stablehlo.add %10, %cst_0 : tensor<f32>
+                %12 = stablehlo.divide %11, %cst_0 : tensor<f32>
+                %13 = stablehlo.abs %1 : tensor<f32>
+                %cst_1 = stablehlo.constant dense<5.000000e-01> : tensor<f32>
+                %cst_2 = stablehlo.constant dense<2.000000e+01> : tensor<f32>
+                %cst_3 = stablehlo.constant dense<0x7F800000> : tensor<f32>
+                %cst_4 = stablehlo.constant dense<0.693147182> : tensor<f32>
+                %14 = stablehlo.compare GT, %13, %cst_2, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %15 = stablehlo.multiply %13, %cst_1 : tensor<f32>
+                %16 = stablehlo.exponential %15 : tensor<f32>
+                %17 = stablehlo.compare EQ, %16, %cst_3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %18 = stablehlo.compare LT, %1, %cst, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %19 = stablehlo.multiply %4, %16 : tensor<f32>
+                %20 = stablehlo.multiply %19, %cst_1 : tensor<f32>
+                %21 = stablehlo.multiply %20, %16 : tensor<f32>
+                %22 = stablehlo.abs %4 : tensor<f32>
+                %23 = stablehlo.log %22 : tensor<f32>
+                %24 = stablehlo.add %13, %23 : tensor<f32>
+                %25 = stablehlo.subtract %24, %cst_4 : tensor<f32>
+                %26 = stablehlo.exponential %25 : tensor<f32>
+                %27 = stablehlo.sign %4 : tensor<f32>
+                %28 = stablehlo.multiply %27, %26 : tensor<f32>
+                %29 = stablehlo.select %17, %28, %21 : tensor<i1>, tensor<f32>
+                %30 = stablehlo.compare EQ, %4, %cst, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %31 = stablehlo.select %30, %4, %29 : tensor<i1>, tensor<f32>
+                %32 = stablehlo.negate %3 : tensor<f32>
+                %33 = stablehlo.select %18, %32, %3 : tensor<i1>, tensor<f32>
+                %34 = stablehlo.multiply %33, %16 : tensor<f32>
+                %35 = stablehlo.multiply %34, %cst_1 : tensor<f32>
+                %36 = stablehlo.multiply %35, %16 : tensor<f32>
+                %37 = stablehlo.abs %33 : tensor<f32>
+                %38 = stablehlo.log %37 : tensor<f32>
+                %39 = stablehlo.add %13, %38 : tensor<f32>
+                %40 = stablehlo.subtract %39, %cst_4 : tensor<f32>
+                %41 = stablehlo.exponential %40 : tensor<f32>
+                %42 = stablehlo.sign %33 : tensor<f32>
+                %43 = stablehlo.multiply %42, %41 : tensor<f32>
+                %44 = stablehlo.select %17, %43, %36 : tensor<i1>, tensor<f32>
+                %45 = stablehlo.compare EQ, %33, %cst, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                %46 = stablehlo.select %45, %33, %44 : tensor<i1>, tensor<f32>
+                %47 = stablehlo.negate %46 : tensor<f32>
+                %48 = stablehlo.multiply %4, %12 : tensor<f32>
+                %49 = stablehlo.negate %3 : tensor<f32>
+                %50 = stablehlo.select %2, %cst, %9 : tensor<i1>, tensor<f32>
+                %51 = stablehlo.multiply %49, %50 : tensor<f32>
+                %52 = stablehlo.select %14, %31, %48 : tensor<i1>, tensor<f32>
+                %53 = stablehlo.select %14, %47, %51 : tensor<i1>, tensor<f32>
+                %54 = stablehlo.complex %52, %53 : tensor<complex<f32>>
+                %55 = stablehlo.complex %52, %cst : tensor<complex<f32>>
+                %56 = stablehlo.select %2, %55, %54 : tensor<i1>, tensor<complex<f32>>
+                return %56 : tensor<complex<f32>>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_tan_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Tan(TanOperation::new()), DataType::F32, vec![2]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.tan %arg0 : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Tan(TanOperation::new()), DataType::C64, vec![2]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xcomplex<f32>>) -> tensor<2xcomplex<f32>> {
+                    %0 = stablehlo.tan %arg0 : tensor<2xcomplex<f32>>
+                    return %0 : tensor<2xcomplex<f32>>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::Tan(TanOperation::new().with_accuracy(ryft_core::Accuracy::Highest)),
+                DataType::F32,
+                vec![2],
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.tan %arg0 {result_accuracy = #stablehlo.result_accuracy<mode = #stablehlo.result_accuracy_mode<HIGHEST>>} : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_atan2_operation_lower() {
         let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(complex_type);
-        let sine = builder
-            .add_instruction(ArrayOperation::Sin(SinOperation::new()), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let cosine = builder
-            .add_instruction(ArrayOperation::Cos(CosOperation::new()), Vec::new(), vec![input], None)
+        let left = builder.add_input(ArrayType::new_static(DataType::F32, [4]));
+        let right = builder.add_input(ArrayType::new_static(DataType::F32, [4]));
+        let output = builder
+            .add_instruction(ArrayOperation::Atan2(Atan2Operation::new()), Vec::new(), vec![left, right], None)
             .unwrap()[0];
         let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
-                vec![sine, cosine],
-                vec![Placeholder],
-                vec![Placeholder, Placeholder],
-            )
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.atan2 %arg0, %arg1 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
 
-        assert_eq!(stablehlo.matches("stablehlo.real").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.imag").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.exponential_minus_one").count(), 4, "{stablehlo}");
-        // Select the small-argument, scaled, and logarithmic paths while preserving exact zero components.
-        assert_eq!(stablehlo.matches("stablehlo.select").count(), 18, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.complex").count(), 4, "{stablehlo}");
+    #[test]
+    fn test_atan2_operation_lower_complex_differentiation() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let y = Complex::new(0.7f32, -0.2);
+        let x = Complex::new(-0.3f32, 0.4);
+        let y_array = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[y]));
+        let x_array = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[x]));
+
+        // Complex `atan2(y, x)` uses the principal value and its two holomorphic partial derivatives away from
+        // singularities and branch cuts. XLA's complex arithmetic may associate differently than the host's.
+        let (value, (y_gradient, x_gradient)) =
+            differentiate_at((y_array, x_array)).holomorphic().value_and_gradient(|(y, x)| y.atan2(&x)).unwrap();
+        let denominator = x * x + y * y;
+        let imaginary_unit = Complex::new(0f32, 1.0);
+        let expected_value = -imaginary_unit * ((x + imaginary_unit * y) / denominator.sqrt()).ln();
+        let value = values_from_bytes::<Complex<f32>>(&value.copy_to_host().unwrap());
+        assert_eq!(value.len(), 1);
+        assert!((value[0] - expected_value).norm() < 1e-5, "{} vs {expected_value}", value[0]);
+        let y_gradient = values_from_bytes::<Complex<f32>>(&y_gradient.copy_to_host().unwrap());
+        assert_eq!(y_gradient.len(), 1);
+        assert!((y_gradient[0] - x / denominator).norm() < 1e-5, "{}", y_gradient[0]);
+        let x_gradient = values_from_bytes::<Complex<f32>>(&x_gradient.copy_to_host().unwrap());
+        assert_eq!(x_gradient.len(), 1);
+        assert!((x_gradient[0] + y / denominator).norm() < 1e-5, "{}", x_gradient[0]);
+    }
+
+    #[test]
+    fn test_tanh_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Tanh(TanhOperation::new()), DataType::F32, vec![4]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.tanh %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_tanh_operation_lower_complex_large_real() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        // Real parts large enough to overflow the intermediate exponentials saturate to `±1 + 0i` without NaN.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C128,
+            &[3],
+            &values_to_bytes(&[
+                Complex::new(400f64, 1.0),
+                Complex::new(f64::INFINITY, 1.0),
+                Complex::new(-400f64, 1.0),
+            ]),
+        );
+        assert_eq!(
+            values_from_bytes::<Complex<f64>>(&input.tanh().unwrap().copy_to_host().unwrap()),
+            [Complex::new(1f64, 0.0), Complex::new(1f64, 0.0), Complex::new(-1f64, 0.0)],
+        );
     }
 
     #[test]
@@ -474,98 +762,5 @@ mod tests {
         assert!((cosine[0].re / 2.2448064e38 - 1.0).abs() < 2e-7, "{}", cosine[0]);
         assert_eq!(cosine[0].im, 0.0);
         assert_eq!(cosine[1], Complex::new(f32::INFINITY, 0f32));
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_tangent() {
-        assert_eq!(
-            lowered_unary_module(ArrayOperation::Tan(TanOperation::new()), DataType::F32, vec![2]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
-                    %0 = stablehlo.tan %arg0 : tensor<2xf32>
-                    return %0 : tensor<2xf32>
-                  }
-                }
-            "#},
-        );
-        assert_eq!(
-            lowered_unary_module(ArrayOperation::Tan(TanOperation::new()), DataType::C64, vec![2]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2xcomplex<f32>>) -> tensor<2xcomplex<f32>> {
-                    %0 = stablehlo.tan %arg0 : tensor<2xcomplex<f32>>
-                    return %0 : tensor<2xcomplex<f32>>
-                  }
-                }
-            "#},
-        );
-        assert_eq!(
-            lowered_unary_module(
-                ArrayOperation::Tan(TanOperation::new().with_accuracy(ryft_core::Accuracy::Highest)),
-                DataType::F32,
-                vec![2],
-            )
-            .unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
-                    %0 = stablehlo.tan %arg0 {result_accuracy = #stablehlo.result_accuracy<mode = #stablehlo.result_accuracy_mode<HIGHEST>>} : tensor<2xf32>
-                    return %0 : tensor<2xf32>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_atan2_operation_lower_complex_differentiation() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        let y = Complex::new(0.7f32, -0.2);
-        let x = Complex::new(-0.3f32, 0.4);
-        let y_array = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[y]));
-        let x_array = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[x]));
-
-        // Complex `atan2(y, x)` uses the principal value and its two holomorphic partial derivatives away from
-        // singularities and branch cuts. XLA's complex arithmetic may associate differently than the host's.
-        let (value, (y_gradient, x_gradient)) =
-            differentiate_at((y_array, x_array)).holomorphic().value_and_gradient(|(y, x)| y.atan2(&x)).unwrap();
-        let denominator = x * x + y * y;
-        let imaginary_unit = Complex::new(0f32, 1.0);
-        let expected_value = -imaginary_unit * ((x + imaginary_unit * y) / denominator.sqrt()).ln();
-        let value = values_from_bytes::<Complex<f32>>(&value.copy_to_host().unwrap());
-        assert_eq!(value.len(), 1);
-        assert!((value[0] - expected_value).norm() < 1e-5, "{} vs {expected_value}", value[0]);
-        let y_gradient = values_from_bytes::<Complex<f32>>(&y_gradient.copy_to_host().unwrap());
-        assert_eq!(y_gradient.len(), 1);
-        assert!((y_gradient[0] - x / denominator).norm() < 1e-5, "{}", y_gradient[0]);
-        let x_gradient = values_from_bytes::<Complex<f32>>(&x_gradient.copy_to_host().unwrap());
-        assert_eq!(x_gradient.len(), 1);
-        assert!((x_gradient[0] + y / denominator).norm() < 1e-5, "{}", x_gradient[0]);
-    }
-
-    #[test]
-    fn test_tanh_operation_lower_complex_large_real() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        // Real parts large enough to overflow the intermediate exponentials saturate to `±1 + 0i` without NaN.
-        let input = replicated_array(
-            &domain,
-            &mesh,
-            DataType::C128,
-            &[3],
-            &values_to_bytes(&[
-                Complex::new(400f64, 1.0),
-                Complex::new(f64::INFINITY, 1.0),
-                Complex::new(-400f64, 1.0),
-            ]),
-        );
-        assert_eq!(
-            values_from_bytes::<Complex<f64>>(&input.tanh().unwrap().copy_to_host().unwrap()),
-            [Complex::new(1f64, 0.0), Complex::new(1f64, 0.0), Complex::new(-1f64, 0.0)],
-        );
     }
 }

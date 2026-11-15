@@ -31,14 +31,14 @@ pub(crate) mod parallel_vary;
 
 /// Resolves the replica groups of the named mesh axes `axis_name` inside the enclosing `shard_map` manual regions,
 /// returning the groups together with the combined axis size. Devices are linearized row-major over the mesh axes, so
-/// the devices whose coordinates differ only along the named axes form one replica group: the group bases enumerate
+/// the devices whose coordinates differ only along the named axes form one replica group. The group bases enumerate
 /// the coordinate combinations of the other axes, and the group members are ordered by their positions along the
 /// combined axis, which linearizes the named axes in the given order with the first name major (refer to
-/// [`CollectiveAxes`]). Errors outside manual regions, for axes that no enclosing region binds as manual mesh axes,
-/// and for axes whose binding regions have meshes with different topologies. The groups depend only on the names and
-/// sizes of the mesh axes in order, so regions whose meshes differ only in axis types (e.g., a nested region inside
+/// [`CollectiveAxes`]). Returns an error outside manual regions, for axes that no enclosing region binds as manual mesh
+/// axes, and for axes whose binding regions have meshes with different topologies. The groups depend only on the names
+/// and sizes of the mesh axes in order, so regions whose meshes differ only in axis types (e.g., a nested region inside
 /// `auto_axes` or `explicit_axes`, which retype a free axis) bind axes of one collective.
-pub(crate) fn mesh_axis_replica_groups<A: Into<CollectiveAxes>>(
+fn mesh_axis_replica_groups<A: Into<CollectiveAxes>>(
     collective_state: &CollectiveLoweringState,
     axis_name: A,
 ) -> Result<(Vec<Vec<usize>>, usize), Error> {
@@ -49,8 +49,8 @@ pub(crate) fn mesh_axis_replica_groups<A: Into<CollectiveAxes>>(
     if collective_state.manual_shard_map().is_none() {
         return Err(ProgramError::UnsupportedOperation {
             message: format!(
-                "collective over axis `{axis_names}` can only be lowered inside a \
-                     {SHARD_MAP_OPERATION_NAME} manual region",
+                "collective over axis `{axis_names}` can only be lowered inside a `{SHARD_MAP_OPERATION_NAME}` manual \
+                 region",
             ),
         }
         .into());
@@ -60,8 +60,8 @@ pub(crate) fn mesh_axis_replica_groups<A: Into<CollectiveAxes>>(
         let Some(axis_region) = collective_state.manual_axis_region(axis_name) else {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
-                    "collective over axis `{axis_name}` cannot lower inside this shard_map manual region because the \
-                    region does not bind that axis as a manual mesh axis",
+                    "collective over axis `{axis_name}` cannot lower inside this `{SHARD_MAP_OPERATION_NAME}` manual \
+                     region because the region does not bind that axis as a manual mesh axis",
                 ),
             }
             .into());
@@ -147,7 +147,7 @@ pub(crate) fn collective_replica_groups<A: Into<CollectiveAxes>>(
 }
 
 /// Removes one statically singleton tensor axis while preserving every remaining dynamic dimension.
-pub(crate) fn collapse_singleton_axis<'b, 'c: 'b, 't: 'c>(
+fn collapse_singleton_axis<'b, 'c: 'b, 't: 'c>(
     value: ValueRef<'b, 'c, 't>,
     output_array_type: &ArrayType,
     block: &mut BlockRef<'b, 'c, 't>,
@@ -156,17 +156,17 @@ pub(crate) fn collapse_singleton_axis<'b, 'c: 'b, 't: 'c>(
 ) -> Result<ValueRef<'b, 'c, 't>, Error> {
     let output_type = lower_tensor_type(output_array_type, context, location)?;
     let reshape = block.append_operation(stable_hlo::reshape_with_output_type(value, output_type, location)?)?;
-    Ok(reshape.result(0).expect("stablehlo.reshape should return one result").as_ref())
+    Ok(reshape.result(0).unwrap().as_ref())
 }
 
 /// Applies one axis-ordered explicit dimension operand per result axis to one native collective result.
-pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
+fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
     mut result: ValueRef<'b, 'c, 't>,
     extents: &[ValueRef<'b, 'c, 't>],
     output_type: &ArrayType,
-    block: &mut ryft_mlir::BlockRef<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
-    location: ryft_mlir::LocationRef<'c, 't>,
+    location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
     if output_type.rank() != extents.len() {
         return Err(ProgramError::InvalidInputCount { expected: output_type.rank(), actual: extents.len() }.into());
@@ -178,7 +178,7 @@ pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
             continue;
         }
         let extent = block.append_operation(stable_hlo::convert(extent, i32_scalar_type, location)?)?;
-        let extent = extent.result(0).expect("stablehlo.convert should return one result").as_ref();
+        let extent = extent.result(0).unwrap().as_ref();
         let refined = block.append_operation(stable_hlo::set_dimension_size(
             result,
             extent,
@@ -186,7 +186,7 @@ pub(crate) fn refine_collective_result_dimensions<'b, 'c: 'b, 't: 'c>(
             axis,
             location,
         )?)?;
-        result = refined.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
+        result = refined.result(0).unwrap().as_ref();
     }
     Ok(vec![result])
 }
@@ -196,19 +196,25 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, Array as CoreArray, ArrayOperation, AxisIndex, ConvertElementType, DataType, DimensionBounds,
-        DimensionType, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, ParallelAllGather,
-        ParallelAllToAllOperation, ParallelCastOperation, ParallelCastTarget, ParallelPermuteOperation, ParallelReduce,
-        ParallelReduceOperation, ParallelVaryOperation, ReductionKind, Shape, ShardMapBoundary, ShardMapOptions,
-        Sharding, ShardingDimension, Value as CoreValue, auto_axes,
+        Add, Array as CoreArray, ArrayOperation, AxisIndex, CollectiveOptions, ConvertElementType, DataType, Device,
+        DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, ParallelAllGather,
+        ParallelAllGatherOutputVariance, ParallelAllToAll, ParallelAllToAllOperation, ParallelCastOperation,
+        ParallelCastTarget, ParallelPermute, ParallelPermuteOperation, ParallelReduce, ParallelSumScatter,
+        ParallelVaryOperation, ReductionKind, Shape, ShardMapBoundary, ShardMapOptions, Sharding, ShardingDimension,
+        TypeError, Value as CoreValue, auto_axes, shard_map,
     };
     use ryft_mlir::{Block, Location, Value as MlirValue};
+    use ryft_pjrt::{BufferType, Program};
 
-    use crate::lowering::tests::{shard_map_module, test_manual_mesh, test_vector_type};
-    use crate::lowering::types::lower_array_ir_type;
+    use crate::execution::ExecutionArguments;
+    use crate::lowering::tests::{
+        shard_map_module, static_sharded_array_type, test_manual_mesh, test_spmd_compilation_options, test_vector_type,
+    };
     use crate::operations::Operation;
-    use crate::tracing::ArrayTracer;
-    use crate::{LowerableOperation, Lowerer, MemberLowerableOperation};
+    use crate::operations::sharding::shard_map::tests::execute_inputs_on_cpu_devices;
+    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
+    use crate::tracing::{ArrayTracer, TracedProgram, trace, trace_with_context};
+    use crate::{Array, FromPjrt, LowerableOperation, Lowerer, Session};
 
     use super::*;
 
@@ -228,11 +234,305 @@ mod tests {
         let mut lowerer: Lowerer<'_, '_, '_, Operation> =
             Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state.clone());
         let result = operation.lower(&mut lowerer, &[input], &[input_type], output_types);
-        assert_eq!(state.channel_ids.get(), 1);
+        assert_eq!(state.channel_ids().get(), 1);
         assert!(block.operations()?.collect::<Result<Vec<_>, _>>()?.is_empty());
         let outputs = result?;
         assert_eq!(outputs, vec![input]);
         Ok(())
+    }
+
+    #[test]
+    fn test_mesh_axis_replica_groups() {
+        // Devices are linearized row-major, so device `3 * x + y` has coordinates `(x, y)`.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let state = CollectiveLoweringState::new()
+            .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
+        assert_eq!(mesh_axis_replica_groups(&state, "x").unwrap(), (vec![vec![0, 3], vec![1, 4], vec![2, 5]], 2));
+        assert_eq!(mesh_axis_replica_groups(&state, "y").unwrap(), (vec![vec![0, 1, 2], vec![3, 4, 5]], 3));
+
+        // The first name of a combined axis is major.
+        assert_eq!(mesh_axis_replica_groups(&state, ["x", "y"]).unwrap(), (vec![vec![0, 1, 2, 3, 4, 5]], 6));
+        assert_eq!(mesh_axis_replica_groups(&state, ["y", "x"]).unwrap(), (vec![vec![0, 3, 1, 4, 2, 5]], 6));
+    }
+
+    #[test]
+    fn test_mesh_axis_replica_groups_execute_multi_axis_collectives_on_cpu() {
+        // Over several manual axes, the participants are positioned along the combined axis, which linearizes the axes
+        // in the given order with the first axis major. Every device holds its tile of `0..n`, sharded along
+        // `("x", "y")` on a 2x2 mesh, so the expected values are those of JAX's collectives with tuple axis names
+        // (`.tasks/shard_map_jax_parity_gaps/m3_oracles.py`).
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x", "y"])]).unwrap();
+        let run = |n: usize, body: &dyn Fn(ArrayTracer) -> Result<ArrayTracer, ProgramError>| {
+            let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
+                |_, x: ArrayTracer| {
+                    Ok(shard_map(
+                        |x: ArrayTracer| body(x),
+                        x,
+                        mesh.clone(),
+                        sharded.clone(),
+                        sharded.clone(),
+                        ShardMapOptions::new(),
+                    )?)
+                },
+                ArrayType::new_static(DataType::F32, [n]).with_sharding(sharded.clone()).unwrap(),
+            )
+            .unwrap();
+            let tile = n / 4;
+            let values = (0..n).map(|value| value as f32).collect::<Vec<_>>();
+            let tiles: [&[f32]; 4] = std::array::from_fn(|device| &values[device * tile..(device + 1) * tile]);
+            execute_inputs_on_cpu_devices(traced.to_mlir_module("main").unwrap(), &[(&[tile as u64], tiles)]).concat()
+        };
+        for (axes, scatter, all_to_all, gather) in [
+            (
+                ["x", "y"],
+                vec![24.0, 28.0, 32.0, 36.0],
+                vec![0.0, 4.0, 8.0, 12.0, 1.0, 5.0, 9.0, 13.0, 2.0, 6.0, 10.0, 14.0, 3.0, 7.0, 11.0, 15.0],
+                [0.0, 1.0, 2.0, 3.0],
+            ),
+            (
+                ["y", "x"],
+                vec![24.0, 32.0, 28.0, 36.0],
+                vec![0.0, 8.0, 4.0, 12.0, 2.0, 10.0, 6.0, 14.0, 1.0, 9.0, 5.0, 13.0, 3.0, 11.0, 7.0, 15.0],
+                [0.0, 2.0, 1.0, 3.0],
+            ),
+        ] {
+            assert_eq!(run(16, &|x| Ok(x.parallel_sum_scatter_tiled(axes, 0)?)), scatter);
+            assert_eq!(run(16, &|x| Ok(x.parallel_all_to_all_tiled(axes, 0, 0)?)), all_to_all);
+            assert_eq!(run(4, &|x| Ok(x.parallel_all_gather_tiled(axes, 0)?)), gather.repeat(4));
+        }
+        let pairs = vec![(0, 1), (1, 2), (2, 3), (3, 0)];
+        assert_eq!(run(4, &|x| Ok(x.parallel_permute(["x", "y"], pairs.clone())?)), vec![3.0, 0.0, 1.0, 2.0]);
+        assert_eq!(run(4, &|x| Ok(x.parallel_permute(["y", "x"], pairs.clone())?)), vec![3.0, 2.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_mesh_axis_replica_groups_rejects_unresolvable_axes() {
+        let outer_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap();
+        let inner_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap(),
+            MeshAxis::new("y", 3, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let state = CollectiveLoweringState::new()
+            .enter_manual_region(ShardMapBoundary::new(outer_mesh, Vec::new(), Vec::new(), Vec::new()).unwrap())
+            .enter_manual_region(ShardMapBoundary::new(inner_mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
+        assert!(matches!(
+            mesh_axis_replica_groups(&state, Vec::<String>::new()),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if message == "collective requires at least one axis name",
+            ),
+        ));
+        assert!(matches!(
+            mesh_axis_replica_groups(&state, ["x", "y"]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if message
+                        == "collective over axes `(x, y)` spans manual regions whose meshes have different topologies",
+            ),
+        ));
+        assert!(matches!(
+            mesh_axis_replica_groups(&state, "z"),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if message
+                        == "collective over axis `z` cannot lower inside this `shard_map` manual region because the \
+                            region does not bind that axis as a manual mesh axis",
+            ),
+        ));
+        assert!(matches!(
+            mesh_axis_replica_groups(&CollectiveLoweringState::new(), "x"),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if message == "collective over axis `x` can only be lowered inside a `shard_map` manual region",
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_collective_replica_groups() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 4, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let state = CollectiveLoweringState::new()
+            .enter_manual_region(ShardMapBoundary::new(mesh, Vec::new(), Vec::new(), Vec::new()).unwrap());
+        assert_eq!(
+            collective_replica_groups(&state, "y", 4, None).unwrap(),
+            (vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]], 4),
+        );
+
+        // Logical participant groups expand within every fixed coordinate of the other axes, in order.
+        assert_eq!(
+            collective_replica_groups(&state, "y", 4, Some(&[vec![0, 2], vec![3, 1]])).unwrap(),
+            (vec![vec![0, 2], vec![3, 1], vec![4, 6], vec![7, 5]], 2),
+        );
+        assert!(matches!(
+            collective_replica_groups(&state, "y", 2, None),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if message == "collective over axis `y` records size 2, but the enclosing mesh axis has size 4",
+            ),
+        ));
+        assert!(matches!(
+            collective_replica_groups(&state, "y", 4, Some(&[vec![0, 4]])),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if message == "collective over axis `y` has group member 4 outside axis size 4",
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_collective_replica_groups_execute_grouped_shape_changing_collectives_on_cpu() {
+        let client = cpu_client(4);
+        let domain = Session::new(&client).domain();
+        let client_devices = client.addressable_devices().unwrap();
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+        let mesh = device_mesh.logical_mesh().clone();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let traced: TracedProgram<ArrayType, (ArrayType, ArrayType, ArrayType)> = trace(
+            {
+                let sharding = sharding.clone();
+                move |x: ArrayTracer| {
+                    shard_map(
+                        |local_x: ArrayTracer| {
+                            let options =
+                                CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+                            Ok((
+                                local_x.parallel_all_gather_with_options(
+                                    "x",
+                                    0,
+                                    options.clone(),
+                                    ParallelAllGatherOutputVariance::Varying,
+                                )?,
+                                local_x.clone().parallel_sum_scatter_with_options("x", 0, options.clone())?,
+                                local_x.parallel_all_to_all_with_options("x", 0, 0, options)?,
+                            ))
+                        },
+                        x,
+                        mesh.clone(),
+                        sharding.clone(),
+                        (sharding.clone(), sharding.clone(), sharding.clone()),
+                        ShardMapOptions::new(),
+                    )
+                    .unwrap()
+                }
+            },
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(16)])),
+        )
+        .unwrap();
+
+        let module = traced.to_mlir_module("main").unwrap();
+        assert_eq!(module.matches("replica_groups = dense<[[0, 2], [3, 1]]> : tensor<2x2xi64>").count(), 3, "{module}");
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let values = (0..4).map(|offset| (device_index * 4 + offset) as f32).collect::<Vec<_>>();
+                client
+                    .buffer(
+                        values_to_bytes(values.as_slice()).as_slice(),
+                        BufferType::F32,
+                        [4u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let input_array = Array::from_addressable_buffers(
+            &domain,
+            static_sharded_array_type(DataType::F32, &[16], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let executable = client
+            .compile(&Program::Mlir { bytecode: module.into_bytes() }, &test_spmd_compilation_options(4))
+            .unwrap();
+        let execution_device_ids = executable
+            .addressable_devices()
+            .unwrap()
+            .iter()
+            .map(|device| device.id().unwrap())
+            .collect::<Vec<_>>();
+        let execute_arguments =
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(
+                execute_arguments.as_execution_device_inputs(),
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        let expected_gather = [
+            vec![0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0],
+            vec![12.0, 13.0, 14.0, 15.0, 4.0, 5.0, 6.0, 7.0],
+            vec![0.0, 1.0, 2.0, 3.0, 8.0, 9.0, 10.0, 11.0],
+            vec![12.0, 13.0, 14.0, 15.0, 4.0, 5.0, 6.0, 7.0],
+        ];
+        let expected_scatter = [vec![8.0, 10.0], vec![20.0, 22.0], vec![12.0, 14.0], vec![16.0, 18.0]];
+        let expected_parallel_all_to_all = [
+            vec![0.0, 1.0, 8.0, 9.0],
+            vec![14.0, 15.0, 6.0, 7.0],
+            vec![2.0, 3.0, 10.0, 11.0],
+            vec![12.0, 13.0, 4.0, 5.0],
+        ];
+        for (device_index, output) in outputs.into_iter().enumerate() {
+            assert_eq!(output.outputs.len(), 3);
+            let actual = output
+                .outputs
+                .into_iter()
+                .map(|buffer| {
+                    let bytes = buffer.copy_to_host(None).unwrap().r#await().unwrap();
+                    values_from_bytes::<f32>(bytes.as_slice())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                vec![
+                    expected_gather[device_index].clone(),
+                    expected_scatter[device_index].clone(),
+                    expected_parallel_all_to_all[device_index].clone(),
+                ],
+            );
+        }
     }
 
     #[test]
@@ -320,7 +620,8 @@ mod tests {
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
-                        if *message == "collective over axis `x` can only be lowered inside a shard_map manual region",
+                        if *message
+                            == "collective over axis `x` can only be lowered inside a `shard_map` manual region",
                 ),
             ));
         }
@@ -368,9 +669,8 @@ mod tests {
                     core_error.as_ref(),
                     ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
                         if *message
-                            == "collective over axis `x` cannot lower \
-                            inside this shard_map manual region because \
-                            the region does not bind that axis as a manual mesh axis",
+                            == "collective over axis `x` cannot lower inside this `shard_map` manual region \
+                                because the region does not bind that axis as a manual mesh axis",
                 ),
             ));
         }
@@ -378,8 +678,6 @@ mod tests {
 
     #[test]
     fn test_manual_collective_lowering_revalidates_raw_bindings() {
-        use ryft_core::CollectiveOptions;
-
         let mesh = test_manual_mesh("x", 2);
         let replicated = Sharding::replicated(mesh.clone(), 1);
         let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
@@ -415,165 +713,38 @@ mod tests {
                     ArrayOperation::ParallelPermute(operation) => operation.mesh().is_none(),
                     _ => unreachable!(),
                 };
-                assert_eq!(result.is_ok(), matching_mesh && sharding == &varying, "{operation}: {result:?}");
-                if result.is_err() {
-                    // Reject the contract before allocating a channel or emitting a communication operation.
-                    assert_eq!(state.channel_ids.get(), 1);
+                let name = operation.name();
+                let output = match &operation {
+                    ArrayOperation::ParallelAllToAll(_) => "exchanged",
+                    _ => "permuted",
+                };
+                let expected = if !matching_mesh {
+                    Some(ProgramError::MalformedProgram(format!(
+                        "`{name}` operation mesh does not match the enclosing manual axis `x` mesh",
+                    )))
+                } else if sharding == &unreduced {
+                    Some(ProgramError::Type(TypeError::invalid(format!("`{name}` does not support unreduced inputs"))))
+                } else if sharding == &replicated {
+                    Some(ProgramError::Type(TypeError::invalid(format!(
+                        "`{name}` input must vary over manual axis `x`; pass an invariant value through \
+                         `parallel_vary` first so that the {output} output is typed as varying",
+                    ))))
                 } else {
-                    state.channel_ids.set(1);
+                    None
+                };
+                match (result, expected) {
+                    (Ok(outputs), None) => {
+                        assert_eq!(outputs.len(), 1);
+                        state.channel_ids().set(1);
+                    }
+                    (Err(Error::Core(error)), Some(expected)) => {
+                        assert_eq!(error.as_ref(), &ryft_core::Error::Program(expected));
+                        // Reject the contract before allocating a channel or emitting a communication operation.
+                        assert_eq!(state.channel_ids().get(), 1);
+                    }
+                    (result, expected) => panic!("{operation}: expected {expected:?} but got {result:?}"),
                 }
             }
-        }
-    }
-
-    #[test]
-    fn test_array_ir_manual_collective_lowering_revalidates_dynamic_raw_bindings() {
-        use ryft_core::{CollectiveOptions, MemberOperation};
-
-        let mesh = test_manual_mesh("x", 2);
-        let replicated = Sharding::replicated(mesh.clone(), 1);
-        let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
-        let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap();
-        let state = CollectiveLoweringState::new().enter_manual_region(
-            ShardMapBoundary::new(mesh, vec![replicated.clone()], vec![replicated.clone()], Vec::new()).unwrap(),
-        );
-        let extent = DimensionType::new("items", DimensionBounds::new(0, Some(9)).unwrap());
-        let operation = ParallelAllToAllOperation::new("x".to_string(), 2, 0, 0, CollectiveOptions::tiled());
-        for sharding in [&replicated, &varying, &unreduced] {
-            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![extent.dimension().clone()]))
-                .with_sharding(sharding.clone())
-                .unwrap();
-            let input_types = vec![input_type.into(), extent.clone().into()];
-            let output_types = operation.infer_parent_output_types(&input_types, &[]).unwrap();
-            let context = MlirContext::new();
-            let location = context.unknown_location();
-            let mlir_types = input_types
-                .iter()
-                .map(|r#type| (lower_array_ir_type(r#type, &context, location).unwrap(), location))
-                .collect::<Vec<_>>();
-            let block = context.block(&mlir_types);
-            let inputs =
-                (0..input_types.len()).map(|index| block.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
-            let mut lowerer: Lowerer<'_, '_, '_, Operation> =
-                Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state.clone());
-            let result = operation.lower_in_parent(&mut lowerer, &inputs, &input_types, &output_types);
-            assert_eq!(result.is_ok(), sharding == &varying, "{sharding}: {result:?}");
-            if result.is_err() {
-                assert_eq!(state.channel_ids.get(), 1);
-            } else {
-                state.channel_ids.set(1);
-            }
-        }
-    }
-
-    #[test]
-    fn test_parallel_reduce_lowering_revalidates_meshless_bindings() {
-        // A meshless (e.g., grouped) reduction inside a checked binding must record outputs that vary along its axis,
-        // because an output typed as invariant would be accepted as replicated although the devices can hold
-        // different values. A mesh reduction tracks manual variation, so its binding must check it.
-        let mesh = test_manual_mesh("x", 2);
-        let replicated = Sharding::replicated(mesh.clone(), 1);
-        let varying = replicated.clone().with_varying_manual_axes(["x"]).unwrap();
-        let checked = ShardMapBoundary::new(mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let unchecked = checked.clone().with_check_manual_variation(false);
-        let lower = |operation: &ParallelReduceOperation, boundary: &ShardMapBoundary, sharding: &Sharding| {
-            let input_type = test_vector_type(2).with_sharding(sharding.clone()).unwrap();
-            let output_types = operation.infer_output_types(std::slice::from_ref(&input_type), &[]).unwrap();
-            let state = CollectiveLoweringState::new().enter_manual_region(boundary.clone());
-            let context = MlirContext::new();
-            let location = context.unknown_location();
-            let tensor_type = lower_tensor_type(&input_type, &context, location).unwrap();
-            let block = context.block(&[(tensor_type, location)]);
-            let input = block.argument(0).unwrap().as_ref();
-            let mut lowerer: Lowerer<'_, '_, '_, Operation> =
-                Lowerer::new(block.as_ref(), &context, location.as_ref()).with_collective_state(state);
-            operation.lower(&mut lowerer, &[input], &[input_type], &output_types).map(|_| ())
-        };
-        let sum = ParallelReduceOperation::new(ReductionKind::Sum, "x".to_string());
-        let grouped =
-            ParallelReduceOperation::grouped(ReductionKind::Sum, "x".to_string(), 2, vec![vec![0], vec![1]]).unwrap();
-        let tracked = sum.clone().with_mesh(mesh);
-
-        // Meshless reductions whose recorded outputs vary along the axis and every reduction of an unchecked binding
-        // that records no mesh lower.
-        assert!(lower(&grouped, &checked, &varying).is_ok());
-        assert!(lower(&sum, &checked, &varying).is_ok());
-        assert!(lower(&tracked, &checked, &varying).is_ok());
-        assert!(lower(&sum, &unchecked, &replicated).is_ok());
-        assert!(lower(&grouped, &unchecked, &replicated).is_ok());
-
-        // Meshless reductions whose recorded outputs are invariant along the axis are rejected in a checked binding.
-        for operation in [&sum, &grouped] {
-            assert!(matches!(
-                lower(operation, &checked, &replicated),
-                Err(Error::Core(core_error)) if matches!(
-                    core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
-                        if *message == "`parallel_reduce` without tracked mesh metadata types its outputs as invariant \
-                                        along manual axis `x` inside a checked manual region",
-                ),
-            ));
-        }
-
-        // Mesh reductions are rejected in an unchecked binding.
-        assert!(matches!(
-            lower(&tracked, &unchecked, &varying),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
-                    if *message == "`parallel_reduce` cannot use tracked mesh metadata inside an unchecked manual binding",
-            ),
-        ));
-    }
-
-    #[test]
-    fn test_collective_mesh_validation_uses_the_nearest_manual_binder() {
-        let outer_mesh = test_manual_mesh("x", 2);
-        let inner_mesh = test_manual_mesh("x", 3);
-        let outer = ShardMapBoundary::new(outer_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let inner = ShardMapBoundary::new(inner_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let state = CollectiveLoweringState::new().enter_manual_region(outer).enter_manual_region(inner);
-        assert_eq!(state.checked_collective_mesh("parallel_permute", "x", 3, None).unwrap(), &inner_mesh);
-        assert!(state.checked_collective_mesh("parallel_permute", "x", 3, Some(&outer_mesh)).is_err());
-        assert!(matches!(
-            state.checked_collective_mesh("parallel_permute", "x", 2, Some(&outer_mesh)),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
-                    if *message == "collective over axis `x` records size 2, but the enclosing mesh axis has size 3",
-            ),
-        ));
-
-        // A payload mesh that retypes only a free axis of the binder mesh (e.g., inside `auto_axes`) is accepted and
-        // returned, while a payload mesh that retypes a manual axis or has another topology is still rejected.
-        let binder_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-        let binder = ShardMapBoundary::new(binder_mesh.clone(), Vec::new(), Vec::new(), Vec::new()).unwrap();
-        let state = CollectiveLoweringState::new().enter_manual_region(binder);
-        let free_axis_retyped_mesh = binder_mesh.with_axis_types(["y"], MeshAxisType::Auto).unwrap();
-        let manual_axis_retyped_mesh = binder_mesh.with_axis_types(["x"], MeshAxisType::Explicit).unwrap();
-        let other_topology_mesh = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 4, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap();
-        assert_eq!(state.checked_collective_mesh("parallel_permute", "x", 2, None).unwrap(), &binder_mesh);
-        assert_eq!(
-            state.checked_collective_mesh("parallel_permute", "x", 2, Some(&free_axis_retyped_mesh)).unwrap(),
-            &free_axis_retyped_mesh,
-        );
-        for payload_mesh in [&manual_axis_retyped_mesh, &other_topology_mesh] {
-            assert!(matches!(
-                state.checked_collective_mesh("parallel_permute", "x", 2, Some(payload_mesh)),
-                Err(Error::Core(core_error)) if matches!(
-                    core_error.as_ref(),
-                    ryft_core::Error::Program(ProgramError::MalformedProgram(message))
-                        if *message == "`parallel_permute` operation mesh does not match the enclosing manual axis `x` mesh",
-                ),
-            ));
         }
     }
 

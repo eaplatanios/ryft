@@ -1,11 +1,11 @@
-//! Staging-cost and runtime benchmark for rematerialization (i.e., gradient checkpointing).
+//! Staging cost and runtime benchmark for rematerialization (i.e., gradient checkpointing).
 //!
 //! Every workload is the gradient of the sum of the outputs of a multilayer perceptron whose layers compute
 //! `h ↦ tanh(h · w₁) · w₂` with respect to its parameters, staged, lowered, compiled, and executed through the XLA
-//! domain on the CPU (or on a CUDA GPU with the `cuda-13` feature and `RYFT_BENCHMARK_PLATFORM=cuda-13`). The
+//! domain on the CPU, or on a CUDA GPU with the `cuda-13` feature and `RYFT_BENCHMARK_PLATFORM=cuda-13`. The
 //! benchmark reports:
 //!
-//!   - **Staging cost:** the tracing, lowering, and compilation times and the number of StableHLO operations of the
+//!   - **Staging cost:** the staging, lowering, and compilation times and the number of StableHLO operations of the
 //!     gradients of a model whose layers are called one after the other (i.e., repeated calls) and of a single layer
 //!     nested in up to three rematerialized calls, against the same functions without rematerialization.
 //!   - **Runtime:** the memory that the compiled gradient of a model that scans over its layers requires (i.e., the
@@ -36,14 +36,31 @@ use ryft_core::{
     differentiate_at, rematerialize,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
+#[cfg(feature = "cuda-13")]
+use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 use ryft_xla::{Array, Domain, FromPjrt, Operation, Options, Session, Value};
 
 // TODO(eaplatanios): Review this module.
 
+/// Name of the tag of the first dot product of a layer, `h · w₁`, under [`Checkpointing::OffloadNames`].
+const UP_PROJECTION_NAME: &str = "up_projection";
+
+/// Name of the tag of the second dot product of a layer, `tanh(h · w₁) · w₂`, under [`Checkpointing::OffloadNames`].
+const DOWN_PROJECTION_NAME: &str = "down_projection";
+
+/// Tracer over which the benchmarked functions are staged.
 type Tracer<'c> = DomainTracer<Domain<'c>>;
+
+/// Input types of a benchmarked gradient, which are the hidden state and the two parameter matrices.
 type BenchmarkInput = (ArrayIrType, ArrayIrType, ArrayIrType);
+
+/// Output types of a benchmarked gradient, which are the gradients of the two parameter matrices.
 type BenchmarkOutput = (ArrayIrType, ArrayIrType);
+
+/// Staged gradient of a benchmarked function.
 type BenchmarkStagedFunction<'c> = CoreStagedFunction<Domain<'c>, BenchmarkInput, BenchmarkOutput>;
+
+/// Compiled gradient of a benchmarked function.
 type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Domain<'c>, BenchmarkInput, BenchmarkOutput>;
 
 /// Rematerialization of a layer.
@@ -79,12 +96,6 @@ impl Checkpointing {
     }
 }
 
-/// Name of the tag of the first dot product of a layer, `h · w₁`, under [`Checkpointing::OffloadNames`].
-const UP_PROJECTION_NAME: &str = "up_projection";
-
-/// Name of the tag of the second dot product of a layer, `tanh(h · w₁) · w₂`, under [`Checkpointing::OffloadNames`].
-const DOWN_PROJECTION_NAME: &str = "down_projection";
-
 /// Shape of a benchmarked multilayer perceptron.
 #[derive(Copy, Clone, Debug)]
 struct Model {
@@ -103,10 +114,10 @@ struct Model {
 
 /// Measurements of one compiled gradient.
 struct Measurement<'c> {
-    /// Duration of tracing the gradient.
-    trace: Duration,
+    /// Duration of staging the gradient.
+    staging: Duration,
 
-    /// Duration of lowering the traced gradient to StableHLO.
+    /// Duration of lowering the staged gradient to StableHLO.
     lower: Duration,
 
     /// Duration of compiling the lowered gradient.
@@ -153,7 +164,7 @@ fn layer<'c>(tagged: bool, hidden: Tracer<'c>, up: Tracer<'c>, down: Tracer<'c>)
     Ok(down_projection.into_value())
 }
 
-/// Applies [`layer`] rematerialized with `policy` and the provided optimization-barrier and tagging flags.
+/// Applies [`layer`] rematerialized with `policy` and the provided optimization barrier and tagging flags.
 fn rematerialized_layer<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
     policy: P,
     optimization_barrier: bool,
@@ -171,7 +182,7 @@ fn rematerialized_layer<'c, P: Clone + ResidualPolicy<ArrayIrType>>(
         .call((hidden, up, down))
 }
 
-/// Applies [`layer`] with the provided rematerialization and optimization-barrier flag.
+/// Applies [`layer`] with the provided rematerialization and optimization barrier flag.
 fn checkpointed_layer<'c>(
     checkpointing: Checkpointing,
     optimization_barrier: bool,
@@ -219,7 +230,7 @@ fn array_type(shape: &[usize]) -> ArrayType {
 }
 
 /// Returns the type of an `f32` array of the provided shape that is replicated over `mesh`, which is the type of the
-/// inputs of the benchmarked functions (whose bodies are traced over the unannotated types of [`array_type`]).
+/// inputs of the benchmarked functions, whose bodies are traced over the unannotated types of [`array_type`].
 fn replicated_array_type(mesh: &DeviceMesh, shape: &[usize]) -> ArrayType {
     array_type(shape)
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), shape.len()))
@@ -227,7 +238,7 @@ fn replicated_array_type(mesh: &DeviceMesh, shape: &[usize]) -> ArrayType {
 }
 
 /// Returns an array replicated over `mesh` with deterministic centered values of variance `1 / fan_in`.
-/// Distinct seeds separate inputs and parameter matrices; the generator continues across stacked layers so that
+/// Distinct seeds separate inputs and parameter matrices, and the generator continues across stacked layers so that
 /// their weights differ. Reusing the same seed and shape reproduces identical inputs across benchmark variants.
 fn array<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in: usize, mut seed: u64) -> Array<'c> {
     let size = shape.iter().product::<usize>();
@@ -271,8 +282,8 @@ where
     domain
         .stage(
             |(hidden, up, down)| {
-                // The hidden state is differentiated too, so that every input belongs to the differentiated function, and
-                // its gradient is discarded.
+                // The hidden state is differentiated too, so that every input belongs to the differentiated function,
+                // and its gradient is discarded.
                 let (_, up, down) = differentiate_at((hidden, up, down))
                     .gradient(|(hidden, up, down)| {
                         let (_, apply) = DomainTracingContext::<Domain<'c>>::trace(
@@ -339,22 +350,23 @@ fn stage_scanned_gradient<'c>(
     )
 }
 
-/// Lowers, compiles, analyzes, and executes `staged` at `inputs`, whose staging took `trace`.
+/// Lowers, compiles, analyzes, and executes `staged` at `inputs`, whose staging took `staging`.
 fn measure<'c>(
     domain: &Domain<'c>,
     staged: BenchmarkStagedFunction<'c>,
-    trace: Duration,
+    staging: Duration,
     inputs: (Array<'c>, Array<'c>, Array<'c>),
     execution_count: usize,
 ) -> Measurement<'c> {
     let start = Instant::now();
-    let lowered = staged.lower(&domain).unwrap();
+    let lowered = staged.lower(domain).unwrap();
     let lower = start.elapsed();
     let operation_count = lowered.lowered_program().stable_hlo().matches(" = stablehlo.").count();
     let start = Instant::now();
-    let compiled: BenchmarkCompiledFunction<'c> = lowered.compile(&domain).unwrap();
+    let compiled: BenchmarkCompiledFunction<'c> = lowered.compile(domain).unwrap();
     let compile = start.elapsed();
-    let memory = domain.analyze(compiled.executable()).unwrap().memory;
+    let analysis = domain.analyze(compiled.executable()).unwrap();
+    let memory = analysis.memory();
     let inputs = (Value::Array(inputs.0), Value::Array(inputs.1), Value::Array(inputs.2));
     let execute = || {
         let (up, down) = compiled.executable().execute(domain, inputs.clone()).unwrap();
@@ -372,13 +384,13 @@ fn measure<'c>(
         .collect::<Vec<_>>();
     executions.sort_unstable();
     Measurement {
-        trace,
+        staging,
         lower,
         compile,
         operation_count,
-        temporary_bytes: memory.map(|memory| memory.device_temporary_size_in_bytes),
-        peak_bytes: memory.map(|memory| memory.device_peak_memory_in_bytes),
-        host_temporary_bytes: memory.map(|memory| memory.host_temporary_size_in_bytes),
+        temporary_bytes: memory.map(|memory| memory.device_temporary_size_in_bytes()),
+        peak_bytes: memory.map(|memory| memory.device_peak_memory_in_bytes()),
+        host_temporary_bytes: memory.map(|memory| memory.host_temporary_size_in_bytes()),
         execution: executions[execution_count / 2],
         gradients: gradients.into(),
     }
@@ -391,8 +403,8 @@ fn mebibytes(bytes: Option<usize>) -> String {
 
 /// Validates gradient structure, finite values, and agreement within `1e-5 + 1e-4 * |expected|`, returning the maximum
 /// absolute difference. Reports the element with the largest excess over its tolerance when agreement fails.
-/// Each gradient contains `parameter_layer_count` contiguous parameter matrices, each with a nonzero finite norm;
-/// scanned parameters use the model's layer count, while shared parameters and single-layer workloads use one.
+/// Each gradient contains `parameter_layer_count` contiguous parameter matrices, each with a nonzero finite norm.
+/// Scanned parameters use the model's layer count, while shared parameters and single-layer workloads use one.
 fn validate_gradients(
     actual: &[(Shape, Vec<f32>)],
     expected: &[(Shape, Vec<f32>)],
@@ -489,7 +501,7 @@ fn report(
     let difference = validate_gradients(&read(measurement), &read(reference), parameter_layer_count)?;
     println!(
         "| {name} | {:.1} | {:.1} | {:.1} | {} | {} | {} | {} | {:.2} | {difference:.1e} |",
-        measurement.trace.as_secs_f64() * 1e3,
+        measurement.staging.as_secs_f64() * 1e3,
         measurement.lower.as_secs_f64() * 1e3,
         measurement.compile.as_secs_f64() * 1e3,
         measurement.operation_count,
@@ -505,7 +517,7 @@ fn report(
 fn print_header(title: &str) {
     println!("\n{title}\n");
     println!(
-        "| Variant | Trace (ms) | Lower (ms) | Compile (ms) | StableHLO operations | Temporary (MiB) | Peak (MiB) \
+        "| Variant | Staging (ms) | Lower (ms) | Compile (ms) | StableHLO operations | Temporary (MiB) | Peak (MiB) \
          | Host temporary (MiB) | Execution (ms) | Maximum absolute gradient difference |",
     );
     println!("|---|---|---|---|---|---|---|---|---|---|");
@@ -516,7 +528,6 @@ fn client() -> Client<'static> {
     match env::var("RYFT_BENCHMARK_PLATFORM").as_deref() {
         #[cfg(feature = "cuda-13")]
         Ok("cuda-13") => {
-            use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
             let options = GpuClientOptions {
                 platform: Some(GpuPlatform::CUDA),
                 allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
@@ -753,6 +764,21 @@ mod tests {
                 validate_gradients(actual, expected, 2),
                 Err(ProgramError::InvalidArgument { message })
                     if message == format!("{role} gradient 0 layer 1 has a zero or nonfinite squared norm")
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_dimensions() {
+        assert!(matches!(
+            parse_dimensions("2,3,4,5"),
+            Ok(Model { batch_size: 2, width: 3, expanded_width: 4, layer_count: 5 }),
+        ));
+        for argument in ["2,3,4", "2,3,4,5,6", "2,0,4,5", "2,x,4,5", ""] {
+            assert!(matches!(
+                parse_dimensions(argument),
+                Err(ProgramError::InvalidArgument { message })
+                    if message == format!("expected four positive comma-separated `--dimensions`, got `{argument}`")
             ));
         }
     }

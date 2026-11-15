@@ -1,4 +1,4 @@
-//! CUDA array/scalar ABI embedding and validated payload reconstruction.
+//! CUDA array and scalar ABI embedding and validated payload reconstruction.
 
 use std::sync::Arc;
 
@@ -48,13 +48,13 @@ impl From<ryft_cuda::Error> for Error {
     }
 }
 
-/// Custom-call buffer supplying one logical CUDA array parameter.
+/// Custom call buffer supplying one logical CUDA array parameter.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CudaKernelBufferBinding {
-    /// Read-only custom-call operand at the specified index.
+    /// Read-only custom call operand at the specified index.
     Input(usize),
 
-    /// Writable custom-call result at the specified index, including read-write aliased results.
+    /// Writable custom call result at the specified index, including read-write aliased results.
     Output(usize),
 }
 
@@ -83,14 +83,15 @@ impl CudaKernelParameterBinding {
 
 /// XLA embedding of a ready [`CudaKernelArtifact`] with array pointers and static scalar arguments.
 ///
-/// Every logical array must appear exactly once in the physical parameter bindings. Read-only arrays use custom-call
-/// operands; writable arrays use results, and read-write arrays retain their canonical operand/result alias. Static
-/// scalars expand a compiler-owned ABI without adding logical array parameters or a second launch path.
+/// Every logical array must appear exactly once in the physical parameter bindings. Read-only arrays use custom call
+/// operands, writable arrays use results, and read-write arrays retain their canonical alias between an operand and a
+/// result. Static scalars expand a compiler-owned ABI without adding logical array parameters or a second launch path.
 ///
-/// Select [`CUDA_KERNEL_CUSTOM_CALL_TARGET`] to use the session-owned native handler. The XLA domain initializes
-/// its launcher during compilation and reload, supplies execution-context user data at submission, and retains
-/// whole-execution fences through session cleanup. Other target names select explicitly registered handlers with
-/// the same payload contract. Artifact construction and embedding alone do not establish executable-code safety.
+/// Select [`CUDA_KERNEL_CUSTOM_CALL_TARGET`] to use the native handler owned by the session. The XLA domain
+/// initializes its launcher during compilation and reload, supplies execution context user data at submission, and
+/// retains fences over whole executions through session cleanup. Other target names select explicitly registered
+/// handlers with the same payload contract. Artifact construction and embedding alone do not establish the safety of
+/// executable code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CudaKernelEmbedding {
     /// Registered XLA FFI target that decodes this envelope.
@@ -107,12 +108,12 @@ pub struct CudaKernelEmbedding {
 }
 
 impl CudaKernelEmbedding {
-    /// Creates a pointer-ABI mapping for an explicitly selected registered target.
+    /// Creates a mapping of pointer arguments for an explicitly selected registered target.
     pub fn new(target_name: String, parameter_order: Vec<usize>) -> Self {
         Self::from_parameters(target_name, parameter_order.into_iter().map(CudaKernelParameterBinding::Array).collect())
     }
 
-    /// Creates an array/scalar mapping for an explicitly selected registered target.
+    /// Creates a mapping of array and scalar arguments for an explicitly selected registered target.
     /// The complete logical signature and physical ABI are validated when the artifact is embedded.
     pub fn from_parameters(target_name: String, parameters: Vec<CudaKernelParameterBinding>) -> Self {
         Self { target_name, parameters, row_major_layouts: false, assertions: false }
@@ -183,11 +184,6 @@ impl CudaKernelEmbedding {
         Ok((embedding, artifact))
     }
 
-    /// Returns the physical argument sources in CUDA ABI order.
-    pub fn parameters(&self) -> &[CudaKernelParameterBinding] {
-        &self.parameters
-    }
-
     /// Requires dense row-major layouts for all logical buffers, including arrays without an explicit layout.
     /// This is part of the compiler ABI and is preserved through executable serialization.
     pub fn with_row_major_layouts(mut self, required: bool) -> Self {
@@ -196,14 +192,20 @@ impl CudaKernelEmbedding {
     }
 
     /// Declares that the native artifact implements every ordered assertion in the verified body. XLA supplies
-    /// trailing input/result tokens, while the shared CUDA handler submits work on the invocation stream. Device
-    /// failures propagate through the existing whole-execution fence; tokens are never passed as kernel arguments.
+    /// trailing input and result tokens, while the shared CUDA handler submits work on the invocation stream. Device
+    /// failures propagate through the existing fence over the whole execution, and tokens are never passed as kernel
+    /// arguments.
     pub fn with_assertions(mut self, enabled: bool) -> Self {
         self.assertions = enabled;
         self
     }
 
-    /// Resolves each logical array, in declaration order, to the existing custom-call input/result buffer slots.
+    /// Returns the physical argument sources in CUDA ABI order.
+    pub fn parameters(&self) -> &[CudaKernelParameterBinding] {
+        &self.parameters
+    }
+
+    /// Resolves each logical array, in declaration order, to the existing custom call input and result buffer slots.
     /// Writable arguments use results so input liveness and donation remain XLA's ordinary functional alias policy.
     pub fn argument_bindings<Extension: CoreOperation<Type = ArrayIrType>>(
         &self,
@@ -381,7 +383,12 @@ impl<Extension: CoreOperation<Type = ArrayIrType>> KernelOutputEmbedding<CudaKer
     }
 }
 
-/// Versioned XLA persistence envelope; canonical CUDA objects are reconstructed through their own validators.
+/// Returns the built-in CUDA provider without loading a driver or a PJRT plugin.
+pub(super) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
+    Arc::new(CudaRuntimeProvider)
+}
+
+/// Versioned XLA persistence envelope. Canonical CUDA objects are reconstructed through their own validators.
 /// Fields serialize the existing artifact and launch metadata without introducing a second runtime representation.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -401,7 +408,7 @@ struct CudaEnvelope {
     /// Canonical target architecture.
     architecture: String,
 
-    /// Canonical producer-neutral ABI schema.
+    /// Canonical ABI schema, independent of the producing compiler.
     abi_schema: String,
 
     /// Canonical ABI version.
@@ -413,7 +420,7 @@ struct CudaEnvelope {
     /// Block launch dimensions.
     block: [u32; 3],
 
-    /// Dynamic shared-memory byte count.
+    /// Dynamic shared memory byte count.
     shared_memory_bytes: u32,
 
     /// Physical argument sources, with array indices in logical declaration order.
@@ -425,7 +432,7 @@ struct CudaEnvelope {
     /// Whether the native kernel implements ordered device assertions with trailing FFI token slots.
     assertions: bool,
 
-    /// Logical arrays resolved to canonical custom-call buffer slots.
+    /// Logical arrays resolved to canonical custom call buffer slots.
     argument_bindings: Vec<CudaKernelBufferBinding>,
 
     /// Exact logical element types and static shapes used to validate native FFI buffers.
@@ -503,8 +510,9 @@ impl CudaEnvelope {
     }
 }
 
-/// Session-owned launcher borrowed by native execution contexts. The session waits its existing execution fences
-/// before dropping this object, so cached modules are released while the externally borrowed PJRT client is alive.
+/// Launcher owned by the session and borrowed by native execution contexts. The session waits on its existing
+/// execution fences before dropping this object, so cached modules are released while the externally borrowed PJRT
+/// client is alive.
 struct CudaKernelRuntime {
     /// Existing driver owner, including its canonical bounded module cache and cleanup reporting.
     #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
@@ -516,7 +524,7 @@ impl CudaKernelRuntime {
     fn new(client: &Client<'_>) -> Result<Self, Error> {
         #[cfg(not(any(feature = "cuda-12", feature = "cuda-13")))]
         {
-            let _client = client;
+            let _ = client;
             Err(KernelEmbeddingError::Invalid {
                 message: "cuda artifact execution requires the `cuda-12` or `cuda-13` feature".to_owned(),
             }
@@ -534,6 +542,19 @@ impl CudaKernelRuntime {
             )?;
             Ok(Self { launcher })
         }
+    }
+}
+
+impl<'c> RuntimeExtension<'c> for CudaKernelRuntime {
+    fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
+        crate::kernels::distributed::validate_kernel_participants(client, mesh)?;
+        Ok(())
+    }
+
+    fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
+        // The session owns this stable instance and retains its invocation lease until the whole launch completes.
+        let data = (self as *const Self).cast_mut().cast();
+        unsafe { resources.add_ffi_user_data(FfiUserData::new(CUDA_RUNTIME_TYPE_ID, data)) }
     }
 }
 
@@ -559,24 +580,6 @@ impl<'c> RuntimeProvider<'c> for CudaRuntimeProvider {
         }
         Ok(Arc::new(CudaKernelRuntime::new(client)?))
     }
-}
-
-impl<'c> RuntimeExtension<'c> for CudaKernelRuntime {
-    fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
-        crate::kernels::distributed::validate_kernel_participants(client, mesh)?;
-        Ok(())
-    }
-
-    fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
-        // The session owns this stable instance and retains its invocation lease through whole-launch completion.
-        let data = (self as *const Self).cast_mut().cast();
-        unsafe { resources.add_ffi_user_data(FfiUserData::new(CUDA_RUNTIME_TYPE_ID, data)) }
-    }
-}
-
-/// Returns the built-in CUDA provider without loading a driver or a PJRT plugin.
-pub(super) fn runtime_provider<'c>() -> Arc<dyn RuntimeProvider<'c> + 'c> {
-    Arc::new(CudaRuntimeProvider)
 }
 
 /// Decodes one ready artifact and submits it on the invocation's current CUDA stream.
@@ -610,7 +613,7 @@ fn launch_cuda_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
         return Err(FfiError::invalid_argument("missing session cuda runtime"));
     }
     // The only producer is this runtime's preparation hook. The session retains its stable allocation through
-    // every whole-program execution, including calls whose output handles were dropped.
+    // every execution of the whole program, including calls whose output handles were dropped.
     let runtime = unsafe { &*data.cast::<CudaKernelRuntime>() };
     let mut buffers = Vec::with_capacity(envelope.argument_bindings.len());
     for (logical, binding) in envelope.argument_bindings.iter().enumerate() {
@@ -639,6 +642,8 @@ fn launch_cuda_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
         }
         buffers.push(buffer);
     }
+    // Each buffer pointer stays valid for the duration of this handler call, because XLA owns the operand and result
+    // buffers of the invocation until the handler returns and the launch below is enqueued on the invocation stream.
     let arguments = envelope
         .parameters
         .iter()
@@ -648,8 +653,9 @@ fn launch_cuda_kernel(frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| FfiError::invalid_argument(error.to_string()))?;
-    // XLA owns buffer readiness, functional aliasing and the invocation stream. CUDA owner checks context, device,
-    // graph capture and canonical launch limits; session completion retains modules through all queued work.
+    // XLA owns buffer readiness, functional aliasing, and the invocation stream. The CUDA owner checks context,
+    // device, graph capture, and canonical launch limits, and session completion retains modules through all queued
+    // work.
     let launch =
         unsafe { context.cuda_kernel_launch(arguments) }.map_err(|error| FfiError::internal(error.to_string()))?;
     unsafe { runtime.launcher.launch(&artifact, &launch) }.map_err(|error| FfiError::internal(error.to_string()))
@@ -676,14 +682,25 @@ unsafe extern "C" fn cuda_kernel_handler(frame: *mut XLA_FFI_CallFrame) -> *mut 
 
 #[cfg(test)]
 mod tests {
+    use indoc::formatdoc;
     use pretty_assertions::assert_eq;
-    use ryft_kernels::VerifiedKernel;
+    use ryft_core::{
+        ArrayIrOperation, ArrayType, Context, DataType, DimensionBounds, DimensionFromScalarOperation,
+        DimensionVariable, Placeholder, ReferenceRead, ReferenceWrite,
+    };
+    use ryft_kernels::{KernelCallOperation, KernelDefinition, KernelParameter, VerifiedKernel};
+    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+    use ryft_pjrt::extensions::ffi::{
+        XLA_FFI_ArgType_BUFFER, XLA_FFI_Buffer, XLA_FFI_DataType_S32, XLA_FFI_DataType_TOKEN, XLA_FFI_RetType_BUFFER,
+    };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
-    use crate::RuntimeError;
     use crate::domains::runtime_requirements;
     use crate::kernels::CompiledKernel;
     use crate::kernels::tests::definition;
+    use crate::lowering::lower_mlir_module_for_program;
+    use crate::operations::ProgramBuilder;
+    use crate::{Constant, RuntimeError};
 
     use super::*;
 
@@ -701,6 +718,35 @@ mod tests {
         .unwrap()
     }
 
+    /// Decodes the envelope that `operation` embeds in its payload attribute.
+    fn envelope(operation: &CustomCallOperation) -> CudaEnvelope {
+        let payload = operation
+            .attributes()
+            .iter()
+            .find_map(|(name, attribute)| match (name.as_str(), attribute) {
+                ("ryft.cuda.payload", CustomCallAttribute::String(payload)) => Some(payload),
+                _ => None,
+            })
+            .unwrap();
+        serde_json::from_str(payload).unwrap()
+    }
+
+    /// Rebuilds `original` around `envelope`, with a matching digest so that only the envelope contents are invalid.
+    fn with_envelope(original: &CustomCallOperation, envelope: &CudaEnvelope) -> CustomCallOperation {
+        let payload = serde_json::to_string(envelope).unwrap();
+        CustomCallOperation::new(original.target_name(), original.output_types().to_vec())
+            .with_input_output_alias(0, 0)
+            .unwrap()
+            .with_attribute("ryft.cuda.sha256", hex::encode(Sha256::digest(payload.as_bytes())))
+            .with_attribute("ryft.cuda.payload", payload)
+    }
+
+    /// Returns the payload of `operation` as StableHLO prints it inside a string attribute, and its digest.
+    fn printed_payload(operation: &CustomCallOperation) -> (String, String) {
+        let payload = serde_json::to_string(&envelope(operation)).unwrap();
+        (payload.replace('"', "\\22"), hex::encode(Sha256::digest(payload.as_bytes())))
+    }
+
     #[test]
     fn test_error_from_cuda_error() {
         let error = Error::from(ryft_cuda::Error::integration("missing CUDA context"));
@@ -712,18 +758,18 @@ mod tests {
     }
 
     #[test]
-    fn test_cuda_kernel_embedding_new() {
-        let embedding = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![0]);
-        assert_eq!(embedding.parameters(), &[CudaKernelParameterBinding::Array(0)]);
-    }
-
-    #[test]
     fn test_cuda_kernel_parameter_binding_parameter_type() {
         assert_eq!(CudaKernelParameterBinding::Array(3).parameter_type(), CudaKernelParameterType::DevicePointer);
         assert_eq!(
             CudaKernelParameterBinding::I32(-4).parameter_type(),
             CudaKernelParameterType::Scalar(CudaScalarType::I32),
         );
+    }
+
+    #[test]
+    fn test_cuda_kernel_embedding_new() {
+        let embedding = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![0]);
+        assert_eq!(embedding.parameters(), &[CudaKernelParameterBinding::Array(0)]);
     }
 
     #[test]
@@ -799,44 +845,6 @@ mod tests {
     }
 
     #[test]
-    fn test_cuda_kernel_embedding_declares_runtime_without_external_effects() {
-        use ryft_core::{ArrayType, DataType, Placeholder};
-
-        use crate::Constant;
-        use crate::lowering::lower_mlir_module_for_program;
-        use crate::operations::ProgramBuilder;
-
-        let definition = definition();
-        let verified = VerifiedKernel::new(&definition, 1).unwrap();
-        let artifact = artifact(vec![CudaKernelParameterType::DevicePointer]);
-        let embedding = CudaKernelEmbedding::new(CUDA_KERNEL_CUSTOM_CALL_TARGET.to_owned(), vec![0]);
-        let compiled = CompiledKernel::from_output(&verified, b"identity", &artifact, &embedding).unwrap();
-        let scalar = ArrayType::scalar(DataType::I32);
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(scalar.clone().into());
-        let output = builder.add_instruction(compiled.custom_call().clone(), vec![], vec![input], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let lowered = lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![scalar.clone()],
-            &vec![scalar],
-            "main",
-            None,
-            None,
-            Some("cuda"),
-        )
-        .unwrap();
-        let (module, signature, assertions, requirements) = lowered.into_parts();
-        assert!(module.contains("stablehlo.custom_call @ryft.kernel.cuda"));
-        assert_eq!(requirements.as_ref(), &[builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET)]);
-        assert!(!signature.has_effects());
-        assert!(!assertions);
-    }
-
-    #[test]
     fn test_cuda_kernel_embedding_from_custom_call_rejects_corruption() {
         let definition = definition();
         let verified = VerifiedKernel::new(&definition, 1).unwrap();
@@ -850,13 +858,56 @@ mod tests {
     }
 
     #[test]
+    fn test_cuda_kernel_embedding_from_custom_call_rejects_invalid_envelope() {
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let embedding = CudaKernelEmbedding::new(CUDA_KERNEL_CUSTOM_CALL_TARGET.to_owned(), vec![0]);
+        let original =
+            embedding.custom_call(&verified, &artifact(vec![CudaKernelParameterType::DevicePointer])).unwrap();
+        let rejection =
+            |operation: &CustomCallOperation| match CudaKernelEmbedding::from_custom_call(&verified, operation) {
+                Err(KernelEmbeddingError::Invalid { message }) => message,
+                result => panic!("expected an invalid envelope, got {result:?}"),
+            };
+
+        let missing = CustomCallOperation::new(original.target_name(), original.output_types().to_vec());
+        assert_eq!(rejection(&missing), "expected exactly one string attribute `ryft.cuda.payload`");
+
+        let mut version = envelope(&original);
+        version.version = 3;
+        assert_eq!(rejection(&with_envelope(&original, &version)), "unsupported CUDA embedding schema `3`");
+
+        let mut count = envelope(&original);
+        count.argument_bindings.push(CudaKernelBufferBinding::Input(0));
+        assert_eq!(
+            rejection(&with_envelope(&original, &count)),
+            "cuda buffer binding count differs from its physical ABI",
+        );
+
+        let mut buffer = envelope(&original);
+        buffer.argument_bindings[0] = CudaKernelBufferBinding::Output(1);
+        assert_eq!(
+            rejection(&with_envelope(&original, &buffer)),
+            "cuda payload references a missing custom-call buffer",
+        );
+
+        let mut bindings = envelope(&original);
+        bindings.argument_bindings[0] = CudaKernelBufferBinding::Input(0);
+        assert_eq!(
+            rejection(&with_envelope(&original, &bindings)),
+            "cuda buffer bindings differ from the logical kernel signature",
+        );
+
+        let mut metadata = envelope(&original);
+        metadata.parameter_types[0].1 = vec![4];
+        assert_eq!(
+            rejection(&with_envelope(&original, &metadata)),
+            "cuda custom-call signature differs from its verified kernel",
+        );
+    }
+
+    #[test]
     fn test_cuda_kernel_embedding_with_row_major_layouts() {
-        use ryft_core::{ArrayType, DataType, Placeholder};
-
-        use crate::Constant;
-        use crate::lowering::lower_mlir_module_for_program;
-        use crate::operations::ProgramBuilder;
-
         let definition = definition();
         let verified = VerifiedKernel::new(&definition, 1).unwrap();
         let artifact = artifact(vec![CudaKernelParameterType::DevicePointer]);
@@ -876,6 +927,7 @@ mod tests {
         assert_eq!(embedding.with_row_major_layouts(false), original);
 
         // The layout contract applies to caller-registered CUDA targets as well as the built-in target.
+        let (payload, digest) = printed_payload(&operation);
         let scalar = ArrayType::scalar(DataType::I32);
         let mut builder = ProgramBuilder::new();
         let input = builder.add_input(scalar.clone().into());
@@ -895,18 +947,21 @@ mod tests {
         )
         .unwrap();
         let (module, _, _, _) = lowered.into_parts();
-        assert!(module.contains("operand_layouts = [dense<> : tensor<0xindex>]"));
-        assert!(module.contains("result_layouts = [dense<> : tensor<0xindex>]"));
+        assert_eq!(
+            module,
+            formatdoc! {r#"
+            module {{
+              func.func @main(%arg0: tensor<i32>) -> tensor<i32> {{
+                %0 = stablehlo.custom_call @ryft.test.ready(%arg0) {{api_version = 4 : i32, backend_config = {{ryft.cuda.payload = "{payload}", ryft.cuda.row_major = true, ryft.cuda.sha256 = "{digest}"}}, operand_layouts = [dense<> : tensor<0xindex>], output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>], result_layouts = [dense<> : tensor<0xindex>]}} : (tensor<i32>) -> tensor<i32>
+                return %0 : tensor<i32>
+              }}
+            }}
+        "#},
+        );
     }
 
     #[test]
     fn test_cuda_kernel_embedding_with_assertions() {
-        use ryft_core::{
-            ArrayIrOperation, Context, DimensionBounds, DimensionFromScalarOperation, DimensionVariable, ReferenceRead,
-            ReferenceWrite,
-        };
-        use ryft_kernels::KernelDefinition;
-
         let template = definition();
         let definition: KernelDefinition = KernelDefinition::trace(template.operation().clone(), |(references, _)| {
             let value = references[0].read()?;
@@ -936,137 +991,86 @@ mod tests {
     }
 
     #[test]
-    fn test_cuda_runtime_provider_initialize() {
-        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let target = Target::from_client(&client).unwrap();
-        let provider = runtime_provider();
-        let error = provider
-            .initialize(&client, &target, &builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET))
-            .err()
-            .unwrap();
-        assert!(
-            matches!(error.downcast_custom::<KernelEmbeddingError>(), Some(KernelEmbeddingError::Invalid { message })
-            if message == "cuda artifact calls require a cuda platform")
+    fn test_cuda_kernel_embedding_argument_bindings() {
+        let template = definition();
+        let mapping = template.operation().parameters()[0].mapping().clone();
+        let scalar = ArrayType::scalar(DataType::I32);
+        let parameters =
+            [KernelParameterAccess::ReadWrite, KernelParameterAccess::ReadOnly, KernelParameterAccess::WriteOnly]
+                .into_iter()
+                .map(|access| KernelParameter::new(scalar.clone(), access, mapping.clone()).unwrap())
+                .collect();
+        let operation = KernelCallOperation::new(template.operation().grid().clone(), parameters).unwrap();
+        let definition: KernelDefinition = KernelDefinition::trace(operation, |(references, _)| {
+            references[0].write(&references[1].read()?)?;
+            references[2].write(&references[1].read()?)
+        })
+        .unwrap();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let embedding = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![2, 0, 1]);
+        assert_eq!(
+            embedding.argument_bindings(&verified).unwrap(),
+            vec![
+                CudaKernelBufferBinding::Output(0),
+                CudaKernelBufferBinding::Input(1),
+                CudaKernelBufferBinding::Output(1),
+            ],
         );
-        let requirement = RuntimeRequirement::new(CUDA_KERNEL_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
-        assert!(matches!(provider.initialize(&client, &target, &requirement),
-            Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
-                if identifier == CUDA_KERNEL_CUSTOM_CALL_TARGET));
-    }
-
-    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
-    #[test]
-    fn test_cuda_envelope_validate_frame() {
-        use ryft_pjrt::extensions::ffi::{
-            XLA_FFI_ArgType_BUFFER, XLA_FFI_Buffer, XLA_FFI_DataType_S32, XLA_FFI_DataType_TOKEN,
-            XLA_FFI_RetType_BUFFER,
-        };
-
-        let definition = definition();
-        let verified = VerifiedKernel::new(&definition, 1).unwrap();
-        let embedding =
-            CudaKernelEmbedding::new(CUDA_KERNEL_CUSTOM_CALL_TARGET.to_owned(), vec![0]).with_assertions(true);
-        let operation =
-            embedding.custom_call(&verified, &artifact(vec![CudaKernelParameterType::DevicePointer])).unwrap();
-        let payload = operation
-            .attributes()
-            .iter()
-            .find_map(|(name, attribute)| match (name.as_str(), attribute) {
-                ("ryft.cuda.payload", CustomCallAttribute::String(value)) => Some(value),
-                _ => None,
-            })
-            .unwrap();
-        let envelope: CudaEnvelope = serde_json::from_str(payload).unwrap();
-
-        // All C fields are integers or pointers, so zero initialization is valid. Only buffer metadata is read:
-        // these frames deliberately have no API, execution context, device allocation, or initialized runtime.
-        let validate = |input_count, output_count, input_type, output_type, missing_input| {
-            let mut input: XLA_FFI_Buffer = unsafe { std::mem::zeroed() };
-            input.struct_size = size_of::<XLA_FFI_Buffer>();
-            input.data_type = input_type;
-            let mut output: XLA_FFI_Buffer = unsafe { std::mem::zeroed() };
-            output.struct_size = size_of::<XLA_FFI_Buffer>();
-            output.data_type = output_type;
-            let mut input_types = [XLA_FFI_ArgType_BUFFER; 2];
-            let mut output_types = [XLA_FFI_RetType_BUFFER; 2];
-            let mut inputs = [std::ptr::null_mut(), (&mut input as *mut XLA_FFI_Buffer).cast()];
-            let mut outputs = [std::ptr::null_mut(), (&mut output as *mut XLA_FFI_Buffer).cast()];
-            if missing_input {
-                inputs[1] = std::ptr::null_mut();
-            }
-            let mut raw: XLA_FFI_CallFrame = unsafe { std::mem::zeroed() };
-            raw.struct_size = size_of::<XLA_FFI_CallFrame>();
-            raw.args.struct_size = std::mem::size_of_val(&raw.args);
-            raw.args.size = input_count;
-            raw.args.types = input_types.as_mut_ptr();
-            raw.args.args = inputs.as_mut_ptr();
-            raw.rets.struct_size = std::mem::size_of_val(&raw.rets);
-            raw.rets.size = output_count;
-            raw.rets.types = output_types.as_mut_ptr();
-            raw.rets.rets = outputs.as_mut_ptr();
-            // The frame and all metadata pointees remain alive until validation returns.
-            let frame = unsafe { FfiCallFrame::from_c_api(&mut raw) }.unwrap();
-            envelope.validate_frame(&frame)
-        };
-        assert_eq!(validate(2, 2, XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_TOKEN, false), Ok(()));
-        for (inputs, outputs) in [(1, 2), (2, 1), (0, 0), (3, 2)] {
-            assert!(matches!(
-                validate(inputs, outputs, XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_TOKEN, false),
-                Err(FfiError::InvalidArgument { message, .. })
-                    if message == "cuda frame buffer counts differ from the declared signature",
-            ));
-        }
-        for (input, output) in
-            [(XLA_FFI_DataType_S32, XLA_FFI_DataType_TOKEN), (XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_S32)]
-        {
-            assert!(matches!(
-                validate(2, 2, input, output, false),
-                Err(FfiError::InvalidArgument { message, .. })
-                    if message == "cuda assertion ABI requires trailing input and result tokens",
-            ));
-        }
+        let duplicate = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![0, 0, 1]);
         assert!(matches!(
-            validate(2, 2, XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_TOKEN, true),
-            Err(FfiError::InvalidArgument { message, .. })
-                if message == "encountered null buffer pointer for XLA FFI input",
-        ));
-    }
-
-    #[test]
-    fn test_cuda_kernel_embedding_from_custom_call_rejects_changed_buffer_metadata() {
-        let definition = definition();
-        let verified = VerifiedKernel::new(&definition, 1).unwrap();
-        let embedding = CudaKernelEmbedding::new(CUDA_KERNEL_CUSTOM_CALL_TARGET.to_owned(), vec![0]);
-        let artifact = artifact(vec![CudaKernelParameterType::DevicePointer]);
-        let original = embedding.custom_call(&verified, &artifact).unwrap();
-        let payload = original
-            .attributes()
-            .iter()
-            .find_map(|(name, value)| match (name.as_str(), value) {
-                ("ryft.cuda.payload", CustomCallAttribute::String(payload)) => Some(payload),
-                _ => None,
-            })
-            .unwrap();
-        let mut envelope: CudaEnvelope = serde_json::from_str(payload).unwrap();
-        envelope.parameter_types[0].1 = vec![4];
-        let payload = serde_json::to_string(&envelope).unwrap();
-        let changed = CustomCallOperation::new(original.target_name(), original.output_types().to_vec())
-            .with_input_output_alias(0, 0)
-            .unwrap()
-            .with_attribute("ryft.cuda.sha256", hex::encode(Sha256::digest(payload.as_bytes())))
-            .with_attribute("ryft.cuda.payload", payload);
-        assert!(matches!(
-            CudaKernelEmbedding::from_custom_call(&verified, &changed),
+            duplicate.argument_bindings(&verified),
             Err(KernelEmbeddingError::Invalid { message })
-                if message == "cuda custom-call signature differs from its verified kernel",
+                if message == "cuda pointer mapping must name every logical parameter exactly once",
         ));
+    }
+
+    #[test]
+    fn test_cuda_kernel_embedding_custom_call() {
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let artifact = artifact(vec![CudaKernelParameterType::DevicePointer]);
+        let embedding = CudaKernelEmbedding::new(CUDA_KERNEL_CUSTOM_CALL_TARGET.to_owned(), vec![0]);
+        let compiled = CompiledKernel::from_output(&verified, b"identity", &artifact, &embedding).unwrap();
+        let (payload, digest) = printed_payload(compiled.custom_call());
+        let semantic = hex::encode(Sha256::digest(definition.semantic_key().unwrap().as_bytes()));
+        let configuration = "31cb32dbd5d2f6a4a82541f4443af30574ac09c9ef92c26deb583159d519412c";
+        let scalar = ArrayType::scalar(DataType::I32);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(scalar.clone().into());
+        let output = builder.add_instruction(compiled.custom_call().clone(), vec![], vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = lower_mlir_module_for_program(
+            &program,
+            &[],
+            &vec![scalar.clone()],
+            &vec![scalar],
+            "main",
+            None,
+            None,
+            Some("cuda"),
+        )
+        .unwrap();
+        let (module, signature, assertions, requirements) = lowered.into_parts();
+        assert_eq!(
+            module,
+            formatdoc! {r#"
+            module {{
+              func.func @main(%arg0: tensor<i32>) -> tensor<i32> {{
+                %0 = stablehlo.custom_call @ryft.kernel.cuda(%arg0) {{api_version = 4 : i32, backend_config = {{ryft.cuda.payload = "{payload}", ryft.cuda.sha256 = "{digest}", ryft.kernel.configuration = "{configuration}", ryft.kernel.schema = 2 : i64, ryft.kernel.semantic = "{semantic}"}}, operand_layouts = [dense<> : tensor<0xindex>], output_operand_aliases = [#stablehlo.output_operand_alias<output_tuple_indices = [], operand_index = 0, operand_tuple_indices = []>], result_layouts = [dense<> : tensor<0xindex>]}} : (tensor<i32>) -> tensor<i32>
+                return %0 : tensor<i32>
+              }}
+            }}
+        "#},
+        );
+        assert_eq!(requirements.as_ref(), &[builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET)]);
+        assert!(!signature.has_effects());
+        assert!(!assertions);
     }
 
     #[test]
     fn test_cuda_kernel_embedding_custom_call_rejects_host_memory() {
-        use ryft_core::{ArrayType, ReferenceRead, ReferenceWrite};
-        use ryft_kernels::{KernelCallOperation, KernelDefinition, KernelParameter};
-
         let template = definition();
         let parameter = KernelParameter::new(
             ArrayType::scalar(DataType::I32).with_memory(Memory::Host { pinned: true }),
@@ -1101,5 +1105,89 @@ mod tests {
         let embedding = CudaKernelEmbedding::new("ryft.test.ready".to_owned(), vec![0]);
         assert!(matches!(embedding.custom_call(&verified, &scalar), Err(KernelEmbeddingError::Invalid { message })
             if message == "cuda artifact ABI does not match the declared parameter mapping"));
+    }
+
+    #[cfg(any(feature = "cuda-12", feature = "cuda-13"))]
+    #[test]
+    fn test_cuda_envelope_validate_frame() {
+        let definition = definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let embedding =
+            CudaKernelEmbedding::new(CUDA_KERNEL_CUSTOM_CALL_TARGET.to_owned(), vec![0]).with_assertions(true);
+        let operation =
+            embedding.custom_call(&verified, &artifact(vec![CudaKernelParameterType::DevicePointer])).unwrap();
+        let envelope = envelope(&operation);
+
+        // All C fields are integers or pointers, so zero initialization is valid. Only buffer metadata is read, because
+        // these frames deliberately have no API, execution context, device allocation, or initialized runtime.
+        let validate = |input_count, output_count, input_type, output_type, missing_input| {
+            let mut input: XLA_FFI_Buffer = unsafe { std::mem::zeroed() };
+            input.struct_size = size_of::<XLA_FFI_Buffer>();
+            input.data_type = input_type;
+            let mut output: XLA_FFI_Buffer = unsafe { std::mem::zeroed() };
+            output.struct_size = size_of::<XLA_FFI_Buffer>();
+            output.data_type = output_type;
+            let mut input_types = [XLA_FFI_ArgType_BUFFER; 2];
+            let mut output_types = [XLA_FFI_RetType_BUFFER; 2];
+            let mut inputs = [std::ptr::null_mut(), (&mut input as *mut XLA_FFI_Buffer).cast()];
+            let mut outputs = [std::ptr::null_mut(), (&mut output as *mut XLA_FFI_Buffer).cast()];
+            if missing_input {
+                inputs[1] = std::ptr::null_mut();
+            }
+            let mut raw: XLA_FFI_CallFrame = unsafe { std::mem::zeroed() };
+            raw.struct_size = size_of::<XLA_FFI_CallFrame>();
+            raw.args.struct_size = size_of_val(&raw.args);
+            raw.args.size = input_count;
+            raw.args.types = input_types.as_mut_ptr();
+            raw.args.args = inputs.as_mut_ptr();
+            raw.rets.struct_size = size_of_val(&raw.rets);
+            raw.rets.size = output_count;
+            raw.rets.types = output_types.as_mut_ptr();
+            raw.rets.rets = outputs.as_mut_ptr();
+            // The frame and all metadata pointees remain alive until validation returns.
+            let frame = unsafe { FfiCallFrame::from_c_api(&mut raw) }.unwrap();
+            envelope.validate_frame(&frame)
+        };
+        assert_eq!(validate(2, 2, XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_TOKEN, false), Ok(()));
+        for (inputs, outputs) in [(1, 2), (2, 1), (0, 0), (3, 2)] {
+            assert!(matches!(
+                validate(inputs, outputs, XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_TOKEN, false),
+                Err(FfiError::InvalidArgument { message, .. })
+                    if message == "cuda frame buffer counts differ from the declared signature",
+            ));
+        }
+        for (input, output) in
+            [(XLA_FFI_DataType_S32, XLA_FFI_DataType_TOKEN), (XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_S32)]
+        {
+            assert!(matches!(
+                validate(2, 2, input, output, false),
+                Err(FfiError::InvalidArgument { message, .. })
+                    if message == "cuda assertion ABI requires trailing input and result tokens",
+            ));
+        }
+        assert!(matches!(
+            validate(2, 2, XLA_FFI_DataType_TOKEN, XLA_FFI_DataType_TOKEN, true),
+            Err(FfiError::InvalidArgument { message, .. })
+                if message == "encountered null buffer pointer for XLA FFI input",
+        ));
+    }
+
+    #[test]
+    fn test_cuda_runtime_provider_initialize() {
+        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
+        let target = Target::from_client(&client).unwrap();
+        let provider = runtime_provider();
+        let error = provider
+            .initialize(&client, &target, &builtin_requirement(CUDA_KERNEL_CUSTOM_CALL_TARGET))
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error.downcast_custom::<KernelEmbeddingError>(), Some(KernelEmbeddingError::Invalid { message })
+            if message == "cuda artifact calls require a cuda platform")
+        );
+        let requirement = RuntimeRequirement::new(CUDA_KERNEL_CUSTOM_CALL_TARGET, 2, Vec::new()).unwrap();
+        assert!(matches!(provider.initialize(&client, &target, &requirement),
+            Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version: 2 }))
+                if identifier == CUDA_KERNEL_CUSTOM_CALL_TARGET));
     }
 }

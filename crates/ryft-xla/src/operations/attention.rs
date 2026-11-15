@@ -1,11 +1,11 @@
-//! cuDNN fused-attention implementations of the named attention definitions.
+//! cuDNN fused attention implementations of the named attention definitions.
 //!
-//! The named attention definitions (refer to [`AttentionKey`]) carry their portable bodies, which every backend can
-//! lower. On CUDA targets, this module replaces eligible calls with cuDNN's fused multi-head attention custom calls,
-//! selected by [`select_attention_implementation`] from the decoded key and the boundary of each call. This module
-//! owns only the fused kernels' eligibility, physical-bound materialization, ABI configuration, and output refinement.
-//! The attention mathematics (e.g., grouped-head expansion, masking, and softmax) remain exclusively in the core
-//! bodies.
+//! The named attention definitions, which [`AttentionKey`](ryft_core::AttentionKey) identifies, carry their portable
+//! bodies, which every backend can lower. On CUDA targets, this module replaces eligible calls with cuDNN's fused
+//! multi-head attention custom calls, which `select_attention_implementation` selects from the decoded key and the
+//! boundary of each call. This module owns only the fused kernels' eligibility, physical bound materialization, ABI
+//! configuration, and output refinement. The attention mathematics (e.g., grouped head expansion, masking, and softmax)
+//! remain exclusively in the core bodies.
 
 use ryft_core::macros::check_count;
 use ryft_core::{
@@ -29,21 +29,48 @@ use crate::operations::extrema::FloatExtremumForm;
 use crate::operations::reductions::lower_reduce_to_mlir;
 use crate::{Error, LoweringError};
 
-/// Seed of the dropout masks of the fused attention kernels. Calls with dropout but without a dropout state have an
-/// implementation-defined mask (refer to [`AttentionInputs::dropout_state`]), and this fixed seed makes the forward and
-/// backward kernels of one boundary apply the same mask.
+/// Seed of the dropout masks of the fused attention kernels. Calls with dropout but without a dropout state, which
+/// [`AttentionInputs::dropout_state`] holds, have a mask that the implementation defines, and this fixed seed makes the
+/// forward and backward kernels of one boundary apply the same mask.
 const FMHA_DROPOUT_SEED: u64 = 42;
+
+/// The cuDNN fMHA proto JSON dot dimension numbers block of the two forward attention matrix products under the
+/// `BTNH` operand convention, exactly as validated on hardware. `bmm1 = Q·Kᵀ` contracts the head axis and
+/// `bmm2 = P·V` contracts the key/value sequence axis.
+const FMHA_FORWARD_DOT_DIMENSION_NUMBERS: &str = "\"bmm1_dot_dimension_numbers\":\
+     {\"lhs_contracting_dimensions\":[\"3\"],\"rhs_contracting_dimensions\":[\"3\"],\
+     \"lhs_batch_dimensions\":[\"0\",\"2\"],\"rhs_batch_dimensions\":[\"0\",\"2\"]},\
+     \"bmm2_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"3\"],\
+     \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
+     \"rhs_batch_dimensions\":[\"0\",\"2\"]}";
+
+/// The cuDNN fMHA proto JSON dot dimension numbers block of the four backward gradient matrix products (i.e.,
+/// `bmm1_grad_gemm1 = dS·K`, `bmm1_grad_gemm2 = dSᵀ·Q`, `bmm2_grad_gemm1 = dO·Vᵀ`, and `bmm2_grad_gemm2 = Pᵀ·dO`),
+/// exactly as validated on hardware. These replace the forward `bmm1`/`bmm2` blocks in the backward call's
+/// configuration.
+const FMHA_BACKWARD_DOT_DIMENSION_NUMBERS: &str = "\"bmm1_grad_gemm1_dot_dimension_numbers\":\
+     {\"lhs_contracting_dimensions\":[\"2\"],\"rhs_contracting_dimensions\":[\"1\"],\
+     \"lhs_batch_dimensions\":[\"0\",\"1\"],\"rhs_batch_dimensions\":[\"0\",\"2\"]},\
+     \"bmm1_grad_gemm2_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"3\"],\
+     \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
+     \"rhs_batch_dimensions\":[\"0\",\"2\"]},\
+     \"bmm2_grad_gemm1_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"2\"],\
+     \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
+     \"rhs_batch_dimensions\":[\"0\",\"2\"]},\
+     \"bmm2_grad_gemm2_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"3\"],\
+     \"rhs_contracting_dimensions\":[\"3\"],\"lhs_batch_dimensions\":[\"0\",\"2\"],\
+     \"rhs_batch_dimensions\":[\"0\",\"2\"]}";
 
 /// Returns the implementation that replaces the calls of the named attention definition `key` with the provided
 /// input and output types when lowering for `target_platform`, or [`None`] when the calls lower their portable body.
 ///
-/// Keys that do not name an attention definition, malformed attention keys, and boundaries that are not array-typed
-/// are declined. [`AttentionImplementation::Portable`] always lowers the body, and so does a call with a dropout state,
-/// because the fused kernels cannot reproduce the mask of a caller-provided random state.
-/// [`AttentionImplementation::Automatic`] selects the fused kernels when [`fmha_eligibility`] accepts the boundary and
-/// its head dimension is within [`fmha_portable_head_dimension_limit`], and the body otherwise.
-/// [`AttentionImplementation::Fused`] selects the fused kernels when they are eligible and an implementation that
-/// reports why they are not otherwise, so that it never silently changes the requested numerics.
+/// Keys that do not name an attention definition, malformed attention keys, and boundaries whose types are not array
+/// types are declined. [`AttentionImplementation::Portable`] always lowers the body, and so does a call with a dropout
+/// state, because the fused kernels cannot reproduce the mask of a random state that the caller provides.
+/// [`AttentionImplementation::Automatic`] selects the fused kernels when [`fused_attention_eligibility`] accepts the
+/// boundary and its head dimension is within [`fused_attention_portable_head_dimension_limit`], and the body
+/// otherwise. [`AttentionImplementation::Fused`] selects the fused kernels when they are eligible and an
+/// implementation that reports why they are not otherwise, so that it never silently changes the requested numerics.
 pub(crate) fn select_attention_implementation(
     key: &CompositeKey,
     input_types: &[ArrayIrType],
@@ -84,7 +111,7 @@ pub(crate) fn select_attention_implementation(
     if input_types.len() != expected_input_count {
         return None;
     }
-    match fmha_eligibility(configuration, input_structure, input_types.as_slice(), target_platform) {
+    match fused_attention_eligibility(configuration, input_structure, input_types.as_slice(), target_platform) {
         // The largest head dimension that cuDNN supports depends on the GPU architecture, which lowering does not
         // know, so the automatic implementation only selects the fused kernels within the limit that holds for
         // every architecture. A request for the fused kernels is passed on, and cuDNN reports a head dimension that
@@ -94,7 +121,7 @@ pub(crate) fn select_attention_implementation(
                 && attention_dimensions(&input_types[0]).ok().and_then(|[_, _, _, head]| head.value()).is_none_or(
                     |head_dimension| {
                         let training = !matches!(key, AttentionKey::Forward { return_residual: false, .. });
-                        head_dimension > fmha_portable_head_dimension_limit(training)
+                        head_dimension > fused_attention_portable_head_dimension_limit(training)
                     },
                 ) =>
         {
@@ -113,406 +140,11 @@ pub(crate) fn select_attention_implementation(
     }
 }
 
-/// Canonical `[batch, sequence, heads, head_dimension]` dimensions of one rank-three or rank-four attention type.
-fn attention_dimensions(input_type: &ArrayType) -> Result<[CoreDimension; 4], Error> {
-    match input_type.shape().dimensions() {
-        [sequence, heads, head_dimension] => {
-            Ok([CoreDimension::Static(1), sequence.clone(), heads.clone(), head_dimension.clone()])
-        }
-        [batch, sequence, heads, head_dimension] => {
-            Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
-        }
-        _ => Err(Error::Lowering(LoweringError::UnsupportedOperation {
-            operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
-            reason: format!(
-                "{} operand must have rank 3 or 4 but got rank {}",
-                DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
-                input_type.rank(),
-            ),
-        })),
-    }
-}
-
-/// Returns the physical maximum extent of one attention dimension.
-fn attention_physical_extent(dimension: &CoreDimension) -> Result<usize, Error> {
-    match dimension {
-        CoreDimension::Static(extent) => Ok(*extent),
-        CoreDimension::Dynamic(variable) => {
-            variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
-                Error::Lowering(LoweringError::UnsupportedOperation {
-                    operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
-                    reason: format!(
-                        "{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME} dimension {variable} needs a finite positive physical \
-                         bound",
-                    ),
-                })
-            })
-        }
-    }
-}
-
-/// Returns an [`ArrayType`] with the provided data type and dimensions used by the attention lowerings.
-pub(super) fn attention_array_type<D: Clone + Into<CoreDimension>>(data_type: DataType, dimensions: &[D]) -> ArrayType {
-    ArrayType::new(data_type, Shape::new(dimensions.iter().cloned().map(Into::into).collect()))
-}
-
-/// The cuDNN fMHA proto-JSON dot-dimension-number block of the two forward attention matrix products under the
-/// `BTNH` operand convention (`bmm1 = Q·Kᵀ` contracting the head axis, `bmm2 = P·V` contracting the key/value
-/// sequence axis), exactly as validated on hardware.
-const FMHA_FORWARD_DOT_DIMENSION_NUMBERS: &str = "\"bmm1_dot_dimension_numbers\":\
-     {\"lhs_contracting_dimensions\":[\"3\"],\"rhs_contracting_dimensions\":[\"3\"],\
-     \"lhs_batch_dimensions\":[\"0\",\"2\"],\"rhs_batch_dimensions\":[\"0\",\"2\"]},\
-     \"bmm2_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"3\"],\
-     \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
-     \"rhs_batch_dimensions\":[\"0\",\"2\"]}";
-
-/// The cuDNN fMHA proto-JSON dot-dimension-number block of the four backward gradient matrix products
-/// (`bmm1_grad_gemm1 = dS·K`, `bmm1_grad_gemm2 = dSᵀ·Q`, `bmm2_grad_gemm1 = dO·Vᵀ`, `bmm2_grad_gemm2 = Pᵀ·dO`),
-/// exactly as validated on hardware. These replace the forward `bmm1`/`bmm2` blocks in the backward call's
-/// configuration.
-const FMHA_BACKWARD_DOT_DIMENSION_NUMBERS: &str = "\"bmm1_grad_gemm1_dot_dimension_numbers\":\
-     {\"lhs_contracting_dimensions\":[\"2\"],\"rhs_contracting_dimensions\":[\"1\"],\
-     \"lhs_batch_dimensions\":[\"0\",\"1\"],\"rhs_batch_dimensions\":[\"0\",\"2\"]},\
-     \"bmm1_grad_gemm2_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"3\"],\
-     \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
-     \"rhs_batch_dimensions\":[\"0\",\"2\"]},\
-     \"bmm2_grad_gemm1_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"2\"],\
-     \"rhs_contracting_dimensions\":[\"1\"],\"lhs_batch_dimensions\":[\"0\",\"1\"],\
-     \"rhs_batch_dimensions\":[\"0\",\"2\"]},\
-     \"bmm2_grad_gemm2_dot_dimension_numbers\":{\"lhs_contracting_dimensions\":[\"3\"],\
-     \"rhs_contracting_dimensions\":[\"3\"],\"lhs_batch_dimensions\":[\"0\",\"2\"],\
-     \"rhs_batch_dimensions\":[\"0\",\"2\"]}";
-
-/// Renders the `GpuBackendConfig` proto-JSON string of one cuDNN fMHA custom call — the raw backend-config form
-/// (not typed-FFI dictionaries) that XLA's cuDNN custom-call compiler parses — with the score scale, the
-/// intermediate `[batch, q_heads, q_seq, kv_seq]` score shape at the operand element type (load-bearing on the
-/// backward path, where the `P` descriptor and residual strides derive from it), the mask kind, the
-/// forward or backward dot-dimension-number block, the dropout rate and the fixed seed [`FMHA_DROPOUT_SEED`] (the
-/// rate is the hardware-validated default `0.0` when dropout is off), and the sliding-window length.
-fn fmha_backend_config(
-    element_type: &str,
-    intermediate_dimensions: [usize; 4],
-    scale: f64,
-    mask_type: &str,
-    dot_dimension_numbers: &str,
-    dropout: Option<f64>,
-    sliding_window_length: usize,
-) -> String {
-    let [batch, heads, query_sequence, key_value_sequence] = intermediate_dimensions;
-    // The `{:?}` rate formatting keeps the validated `0.0` spelling for the off state while rendering set rates
-    // with their shortest round-trip form.
-    let dropout_rate = dropout.unwrap_or(0.0);
-    let seed = FMHA_DROPOUT_SEED;
-    format!(
-        "{{\"operation_queue_id\":\"0\",\"cudnn_fmha_backend_config\":{{\
-         \"algorithm\":{{\"algo_id\":\"0\",\"math_type\":\"TENSOR_OP_MATH\",\"tuning_knobs\":\
-         {{\"17\":\"1\",\"24\":\"0\"}},\"is_cudnn_frontend\":true,\"workspace_size\":\"0\"}},\
-         \"fmha_scale\":{scale},\"intermediate_tensor_shape\":{{\"element_type\":\"{element_type}\",\
-         \"dimensions\":[\"{batch}\",\"{heads}\",\"{query_sequence}\",\"{key_value_sequence}\"],\
-         \"tuple_shapes\":[],\"layout\":{{\"dim_level_types\":[],\"dim_unique\":[],\"dim_ordered\":[],\
-         \"minor_to_major\":[\"3\",\"2\",\"1\",\"0\"],\"tiles\":[],\"element_size_in_bits\":\"0\",\
-         \"memory_space\":\"0\",\"index_primitive_type\":\"PRIMITIVE_TYPE_INVALID\",\
-         \"pointer_primitive_type\":\"PRIMITIVE_TYPE_INVALID\",\
-         \"dynamic_shape_metadata_prefix_bytes\":\"0\"}},\
-         \"is_dynamic_dimension\":[false,false,false,false]}},\
-         \"is_flash_attention\":true,\"mask_type\":\"{mask_type}\",\
-         {dot_dimension_numbers},\
-         \"dropout_rate\":{dropout_rate:?},\"seed\":{seed},\"sliding_window_length\":{sliding_window_length},\
-         \"max_seg_per_batch\":1,\"is_paged_attention\":false}}}}",
-    )
-}
-
-/// Returns the cuDNN fMHA custom-call target name for the provided feature set: the name varies only with the bias
-/// operand and dropout (`__cudnn$fmha[ScaleBias]Softmax[Dropout][Backward]`) — padding, sliding windows, and
-/// grouped-query head counts are carried by the backend configuration and the operand shapes instead.
-fn fmha_target_name(has_bias: bool, has_dropout: bool, backward: bool) -> String {
-    format!(
-        "__cudnn$fmha{}Softmax{}{}",
-        if has_bias { "ScaleBias" } else { "" },
-        if has_dropout { "Dropout" } else { "" },
-        if backward { "Backward" } else { "" },
-    )
-}
-
-/// Returns the cuDNN fMHA `mask_type` configuration value for the provided built-in mask and sequence-length
-/// presence: the padding mask kinds compose the built-in mask with the appended `i32[batch]` sequence-length
-/// operands.
-fn fmha_mask_type(causal: bool, has_sequence_lengths: bool) -> &'static str {
-    match (causal, has_sequence_lengths) {
-        (false, false) => "NO_MASK",
-        (true, false) => "CAUSAL",
-        (false, true) => "PADDING",
-        (true, true) => "PADDING_CAUSAL",
-    }
-}
-
-/// Returns the largest head dimension that cuDNN supports on every GPU architecture, for the fused kernels of
-/// training when `training` is set (i.e., the forward kernel that returns the residual, and the backward kernel) and
-/// for the forward kernel of inference otherwise. Its
-/// [support matrix](https://docs.nvidia.com/cudnn/operations/Attention/#support-matrix) allows `256` for inference on
-/// every architecture, and `128` for training on every architecture other than Hopper, which allows `256`.
-fn fmha_portable_head_dimension_limit(training: bool) -> usize {
-    if training { 128 } else { 256 }
-}
-
-/// Returns the sliding window length of the cuDNN fMHA configuration, which is the left radius of the local window
-/// and the position itself, and zero without a window. A window whose length the 32-bit configuration cannot
-/// represent admits every earlier position of every sequence, so it records no window and is causal masking instead
-/// (refer to [`fmha_is_causal`]).
-fn fmha_sliding_window_length(configuration: AttentionConfiguration) -> usize {
-    configuration
-        .local_window()
-        .and_then(|(left, _)| left.checked_add(1))
-        .filter(|length| *length <= i32::MAX as usize)
-        .unwrap_or(0)
-}
-
-/// Returns whether the cuDNN fMHA configuration masks causally, which it does for causal attention and for a local
-/// window that [`fmha_sliding_window_length`] cannot record. Such a window still hides every later position, because
-/// the fused kernels only take windows whose right radius is zero, and that is exactly causal masking.
-fn fmha_is_causal(configuration: AttentionConfiguration) -> bool {
-    configuration.causal() || (configuration.local_window().is_some() && fmha_sliding_window_length(configuration) == 0)
-}
-
-/// Result of checking one attention boundary against the complete cuDNN fMHA contract.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum FmhaEligibility {
-    /// The boundary can use the fused custom call without changing its semantics.
-    Eligible,
-
-    /// The boundary must use the portable decomposition, with the reason used by forced-fused diagnostics.
-    Ineligible(&'static str),
-}
-
-/// Checks one attention boundary against the semantic and physical requirements of the cuDNN fMHA adapter.
-fn fmha_eligibility(
-    configuration: AttentionConfiguration,
-    input_structure: AttentionInputs<Placeholder>,
-    input_types: &[ArrayType],
-    target_platform: Option<&str>,
-) -> Result<FmhaEligibility, Error> {
-    // The right radius of a configuration with causal masking is always zero.
-    if configuration.local_window().is_some_and(|(_, right)| right != 0) {
-        return Ok(FmhaEligibility::Ineligible("a nonzero right local-window radius requires causal masking"));
-    }
-    if target_platform != Some("cuda") {
-        return Ok(FmhaEligibility::Ineligible("the target platform is not CUDA"));
-    }
-    if !matches!(input_types[0].data_type(), DataType::BF16 | DataType::F16) {
-        return Ok(FmhaEligibility::Ineligible("the operand data type is not `f16` or `bf16`"));
-    }
-    let [_, _, _, head_dimension] = attention_dimensions(&input_types[0])?;
-    let Some(head_dimension) = head_dimension.value() else {
-        return Ok(FmhaEligibility::Ineligible("the head dimension is not static"));
-    };
-    // cuDNN rejects an empty head dimension and an empty key/value sequence, for which the portable body returns
-    // empty outputs and uniform attention over nothing, while it accepts an empty batch and an empty query sequence.
-    if head_dimension == 0 {
-        return Ok(FmhaEligibility::Ineligible("the head dimension is empty"));
-    }
-    if head_dimension % 8 != 0 {
-        return Ok(FmhaEligibility::Ineligible("the head dimension is not divisible by eight"));
-    }
-    let [_, key_value_sequence, _, _] = attention_dimensions(&input_types[1])?;
-    if key_value_sequence.value() == Some(0) {
-        return Ok(FmhaEligibility::Ineligible("the key/value sequence is empty"));
-    }
-    if input_types[..3].iter().any(|r#type| r#type.static_shape().is_none())
-        && input_structure.query_sequence_lengths.is_none()
-        && input_structure.key_value_sequence_lengths.is_none()
-    {
-        return Ok(FmhaEligibility::Ineligible("bounded-dynamic operands require query or key/value sequence lengths"));
-    }
-    Ok(FmhaEligibility::Eligible)
-}
-
-/// Canonical operand indices of one attention boundary.
-fn attention_input_indices(input_structure: AttentionInputs<Placeholder>) -> AttentionInputs<usize> {
-    AttentionInputs::from_parameters(input_structure, 0..input_structure.parameter_count())
-        .expect("the generated indices match the attention input structure")
-}
-
-/// Adds the implicit batch dimension required by the cuDNN `BTNH` ABI to one physical rank-three operand.
-fn normalize_fmha_operand<'b, 'c: 'b, 't: 'c>(
-    value: ValueRef<'b, 'c, 't>,
-    r#type: &ArrayType,
-    block: &mut BlockRef<'b, 'c, 't>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    if r#type.rank() == 4 {
-        return Ok(value);
-    }
-    let mut dimensions = vec![1];
-    dimensions.extend(static_dimensions(r#type)?);
-    let normalized = block.append_operation(stable_hlo::reshape(value, dimensions.as_slice(), location)?)?;
-    Ok(normalized.result(0).expect("stablehlo.reshape should return one result").as_ref())
-}
-
-/// Broadcasts one physical bias or mask from its normalized rank-four shape to the complete fMHA score shape.
-fn broadcast_fmha_score_operand<'b, 'c: 'b, 't: 'c>(
-    value: ValueRef<'b, 'c, 't>,
-    r#type: &ArrayType,
-    score_type: &ArrayType,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let mut dimensions = vec![1; 4 - r#type.rank()];
-    dimensions.extend(static_dimensions(r#type)?);
-    let value = if r#type.rank() == 4 {
-        value
-    } else {
-        let reshaped = block.append_operation(stable_hlo::reshape(value, dimensions.as_slice(), location)?)?;
-        reshaped.result(0).expect("stablehlo.reshape should return one result").as_ref()
-    };
-    let broadcast = block.append_operation(stable_hlo::broadcast(
-        value,
-        lower_tensor_type(score_type, context, location)?,
-        &[0, 1, 2, 3],
-        location,
-    )?)?;
-    Ok(broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref())
-}
-
-/// Converts the optional Boolean mask to additive bias and combines it with the optional user bias at the physical
-/// `[batch, heads, query_sequence, key_value_sequence]` score shape expected by cuDNN.
-#[allow(clippy::too_many_arguments)]
-fn prepare_fmha_bias<'b, 'c: 'b, 't: 'c>(
-    inputs: &AttentionInputs<usize>,
-    physical_inputs: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    score_type: &ArrayType,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Option<ValueRef<'b, 'c, 't>>, Error> {
-    let bias = inputs
-        .bias
-        .map(|index| {
-            // A broadcast keeps the element type of its input, so a bias with another data type is broadcast at its
-            // own data type and only then converted to the data type of the scores.
-            let bias = broadcast_fmha_score_operand(
-                physical_inputs[index],
-                &physical_bound_type(&input_types[index])?,
-                &score_type.clone().with_data_type(input_types[index].data_type()),
-                block,
-                context,
-                location,
-            )?;
-            let bias_data_type = input_types[index].data_type();
-            if bias_data_type == score_type.data_type() {
-                return Ok::<_, Error>(bias);
-            }
-
-            // A finite bias beyond the range of the data type of the scores would become infinite there, where the
-            // portable body keeps it finite, and a row of such biases would turn its softmax into NaNs. Finite biases
-            // therefore saturate at the largest finite magnitude of that data type before they are converted, while
-            // infinite biases and NaNs convert as they are. The saturation runs in the data type of an `f64` bias
-            // and in `f32` for every other bias data type.
-            let working_data_type = if bias_data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
-            let working_tensor_type =
-                lower_tensor_type(&score_type.clone().with_data_type(working_data_type), context, location)?;
-            let bias = if bias_data_type == working_data_type {
-                bias
-            } else {
-                let widened = block.append_operation(stable_hlo::convert(bias, working_tensor_type, location)?)?;
-                widened.result(0).expect("stablehlo.convert should return one result").as_ref()
-            };
-            let limit = if score_type.data_type() == DataType::F16 { 65_504.0 } else { 3.389_531_389_251_535_5e38 };
-            let scalar_type = ArrayType::scalar(working_data_type);
-            let scalar_tensor_type = lower_tensor_type(&scalar_type, context, location)?;
-            let lower = lower_f64_constant_splat(-limit, &scalar_type, scalar_tensor_type, block, context, location)?;
-            let upper = lower_f64_constant_splat(limit, &scalar_type, scalar_tensor_type, block, context, location)?;
-            let saturated = block.append_operation(stable_hlo::clamp(lower, bias, upper, location)?)?;
-            let saturated = saturated.result(0).expect("stablehlo.clamp should return one result").as_ref();
-            let finite = block.append_operation(stable_hlo::is_finite(bias, location)?)?;
-            let finite = finite.result(0).expect("stablehlo.is_finite should return one result").as_ref();
-            let bias = block.append_operation(stable_hlo::select(finite, saturated, bias, location)?)?;
-            let bias = bias.result(0).expect("stablehlo.select should return one result").as_ref();
-            let converted = block.append_operation(stable_hlo::convert(
-                bias,
-                lower_tensor_type(score_type, context, location)?,
-                location,
-            )?)?;
-            Ok::<_, Error>(converted.result(0).expect("stablehlo.convert should return one result").as_ref())
-        })
-        .transpose()?;
-    let mask = inputs
-        .mask
-        .map(|index| {
-            let mask = broadcast_fmha_score_operand(
-                physical_inputs[index],
-                &physical_bound_type(&input_types[index])?,
-                &score_type.clone().with_data_type(DataType::Boolean),
-                block,
-                context,
-                location,
-            )?;
-            let tensor_type = lower_tensor_type(score_type, context, location)?;
-            let zero = lower_f64_constant_splat(0.0, score_type, tensor_type, block, context, location)?;
-            // These are the pinned JAX/cuDNN wrapper's deliberately conservative finite mask sentinels. They avoid
-            // a cuDNN subtraction bug that can surface when two values sit at the element type's extreme finite
-            // magnitude.
-            let masked_value = if score_type.data_type() == DataType::F16 { -32_768.0 } else { -2_199_023_255_552.0 };
-            let masked = lower_f64_constant_splat(masked_value, score_type, tensor_type, block, context, location)?;
-            let selected = block.append_operation(stable_hlo::select(mask, zero, masked, location)?)?;
-            Ok::<_, Error>(selected.result(0).expect("stablehlo.select should return one result").as_ref())
-        })
-        .transpose()?;
-    match (bias, mask) {
-        (Some(bias), Some(mask)) => {
-            let combined = block.append_operation(stable_hlo::add(bias, mask, location)?)?;
-            Ok(Some(combined.result(0).expect("stablehlo.add should return one result").as_ref()))
-        }
-        (Some(bias), None) => Ok(Some(bias)),
-        (None, Some(mask)) => Ok(Some(mask)),
-        (None, None) => Ok(None),
-    }
-}
-
-/// Synthesizes one full per-batch sequence-length vector for the sequence axis of `source`.
-#[allow(clippy::too_many_arguments)]
-fn synthesize_fmha_sequence_lengths<'b, 'c: 'b, 't: 'c>(
-    source: ValueRef<'b, 'c, 't>,
-    source_axis: usize,
-    batch: &CoreDimension,
-    physical_batch: usize,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let size = block.append_operation(stable_hlo::get_dimension_size(source, source_axis, location)?)?;
-    let size = size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
-    let physical_type = attention_array_type(DataType::I32, &[physical_batch]);
-    let lengths = block.append_operation(stable_hlo::broadcast(
-        size,
-        lower_tensor_type(&physical_type, context, location)?,
-        &[],
-        location,
-    )?)?;
-    let mut lengths = lengths.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
-    if matches!(batch, CoreDimension::Dynamic(_)) {
-        let batch_size = block.append_operation(stable_hlo::get_dimension_size(source, 0, location)?)?;
-        let batch_size = batch_size.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
-        let logical_type = attention_array_type(DataType::I32, std::slice::from_ref(batch));
-        let dynamic = block.append_operation(stable_hlo::set_dimension_size(
-            lengths,
-            batch_size,
-            lower_tensor_type(&logical_type, context, location)?,
-            0,
-            location,
-        )?)?;
-        lengths = dynamic.result(0).expect("stablehlo.set_dimension_size should return one result").as_ref();
-        lengths = lower_physical_bound_value(lengths, &logical_type, 0.0, block, context, location)?;
-    }
-    Ok(lengths)
-}
-
 /// Lowers one call of the forward attention definition with the provided configuration, input structure, and
-/// residual request to cuDNN's fused ABI, for a boundary that [`fmha_eligibility`] accepts.
+/// residual request to cuDNN's fused ABI, for a boundary that [`fused_attention_eligibility`] accepts.
 ///
 /// An eligible `bf16`/`f16` CUDA call emits `__cudnn$fmha[ScaleBias]Softmax[Dropout]` with physical `BNTH` inputs and
-/// restores the logical rank and dynamic dimensions of its outputs. Optional bias and sequence-length inputs retain the
+/// restores the logical rank and dynamic dimensions of its outputs. Optional bias and sequence length inputs retain the
 /// canonical [`AttentionInputs`] order until the final ABI assembly.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
@@ -561,13 +193,14 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
             .collect::<Result<Vec<_>, _>>()?;
         for index in 0..3 {
             let physical_type = physical_bound_type(&input_types[index])?;
-            physical_inputs[index] = normalize_fmha_operand(physical_inputs[index], &physical_type, block, location)?;
+            physical_inputs[index] =
+                normalize_fused_attention_operand(physical_inputs[index], &physical_type, block, location)?;
         }
         let score_type = attention_array_type(
             data_type,
             &[physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
         );
-        let bias = prepare_fmha_bias(
+        let bias = prepare_fused_attention_bias(
             &indices,
             physical_inputs.as_slice(),
             input_types,
@@ -579,7 +212,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
         let sequence_lengths = if uses_sequence_lengths {
             let query_lengths = match indices.query_sequence_lengths {
                 Some(index) => physical_inputs[index],
-                None => synthesize_fmha_sequence_lengths(
+                None => synthesize_fused_attention_sequence_lengths(
                     input_values[0],
                     input_types[0].rank() - 3,
                     &batch,
@@ -591,7 +224,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
             };
             let key_value_lengths = match indices.key_value_sequence_lengths {
                 Some(index) => physical_inputs[index],
-                None => synthesize_fmha_sequence_lengths(
+                None => synthesize_fused_attention_sequence_lengths(
                     input_values[1],
                     input_types[1].rank() - 3,
                     &batch,
@@ -606,18 +239,19 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
             None
         };
         let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
-        let backend_config = fmha_backend_config(
+        let backend_config = fused_attention_backend_config(
             element_type,
             [physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
             configuration.scale_for(head_dimension),
-            fmha_mask_type(fmha_is_causal(configuration), sequence_lengths.is_some()),
+            fused_attention_mask_type(fused_attention_is_causal(configuration), sequence_lengths.is_some()),
             FMHA_FORWARD_DOT_DIMENSION_NUMBERS,
             configuration.dropout(),
-            fmha_sliding_window_length(configuration),
+            fused_attention_sliding_window_length(configuration),
         );
-        // The operand order matches the traced operand order exactly: the bias sits after the value and the
-        // `i32[batch]` sequence lengths trail. The workspace result is declared at size zero (the compiler resizes
-        // it as needed), and the training form inserts the `f32[b, n, t]` log-sum-exp residual before it.
+        // The operand order matches the operand order of the boundary exactly, so the bias sits after the value and
+        // the `i32[batch]` sequence lengths trail. The workspace result is declared at size zero, because the
+        // compiler resizes it as needed, and the training form inserts the `f32[b, n, t]` log-sum-exp residual
+        // before it.
         let mut operands = physical_inputs[..3].to_vec();
         if let Some(bias) = bias {
             operands.push(bias);
@@ -642,7 +276,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
         result_layouts.push(vec![0]);
         let custom_call = block.append_operation(stable_hlo::custom_call(
             operands.as_slice(),
-            fmha_target_name(bias.is_some(), configuration.dropout().is_some(), false).as_str(),
+            fused_attention_target_name(bias.is_some(), configuration.dropout().is_some(), false).as_str(),
             false,
             Some(context.string_attribute(backend_config.as_str()).as_ref()),
             CustomCallApiVersion::StatusReturning,
@@ -653,17 +287,16 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
             &custom_call_output_types,
             location,
         )?)?;
-        let attended =
-            custom_call.result(0).expect("stablehlo.custom_call should return the attention output").as_ref();
+        let attended = custom_call.result(0).unwrap().as_ref();
         let result = block.append_operation(stable_hlo::transpose(attended, &[0, 2, 1, 3], location)?)?;
-        let mut result = result.result(0).expect("stablehlo.transpose should return one result").as_ref();
+        let mut result = result.result(0).unwrap().as_ref();
         if input_types[0].rank() == 3 {
             let reshaped = block.append_operation(stable_hlo::reshape(
                 result,
                 &[physical_query_sequence, heads, head_dimension],
                 location,
             )?)?;
-            result = reshaped.result(0).expect("stablehlo.reshape should return one result").as_ref();
+            result = reshaped.result(0).unwrap().as_ref();
         }
         let output_sources = (0..input_types[0].rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
         let result = lower_restore_dynamic_dimensions(
@@ -676,22 +309,19 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
         )?;
         let mut results = vec![result];
         if return_residual {
-            let residual = custom_call
-                .result(1)
-                .expect("stablehlo.custom_call should return the log-sum-exp residual")
-                .as_ref();
+            let residual = custom_call.result(1).unwrap().as_ref();
             // The kernels return the residual in `f32`, which is the data type of the residual of the definition for
             // every query data type, so it only moves from the `BNT` form of the kernels to the `BTN` form. It is
             // never rounded to the query data type, because the backward kernels consume it exactly as returned.
             let residual = block.append_operation(stable_hlo::transpose(residual, &[0, 2, 1], location)?)?;
-            let mut residual = residual.result(0).expect("stablehlo.transpose should return one result").as_ref();
+            let mut residual = residual.result(0).unwrap().as_ref();
             if input_types[0].rank() == 3 {
                 let reshaped = block.append_operation(stable_hlo::reshape(
                     residual,
                     &[physical_query_sequence, heads],
                     location,
                 )?)?;
-                residual = reshaped.result(0).expect("stablehlo.reshape should return one result").as_ref();
+                residual = reshaped.result(0).unwrap().as_ref();
             }
             let residual_sources = (0..output_types[1].rank()).map(|axis| (input_values[0], axis)).collect::<Vec<_>>();
             results.push(lower_restore_dynamic_dimensions(
@@ -708,7 +338,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Lowers one call of the backward attention definition with the provided configuration and input structure
-/// to cuDNN's fused backward ABI, for a boundary that [`fmha_eligibility`] accepts.
+/// to cuDNN's fused backward ABI, for a boundary that [`fused_attention_eligibility`] accepts.
 ///
 /// The canonical input boundary is reordered into cuDNN's `(Q, K, V, residual, dO[, bias], O[, query lengths,
 /// key/value lengths])` ABI, the call emits `__cudnn$fmha[ScaleBias]Softmax[Dropout]Backward`, and each cotangent's
@@ -773,13 +403,14 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
             .collect::<Result<Vec<_>, _>>()?;
         for index in [0, 1, 2, offset, offset + 2] {
             let physical_type = physical_bound_type(&input_types[index])?;
-            physical_inputs[index] = normalize_fmha_operand(physical_inputs[index], &physical_type, block, location)?;
+            physical_inputs[index] =
+                normalize_fused_attention_operand(physical_inputs[index], &physical_type, block, location)?;
         }
         let score_type = attention_array_type(
             data_type,
             &[physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
         );
-        let bias = prepare_fmha_bias(
+        let bias = prepare_fused_attention_bias(
             &indices,
             physical_inputs.as_slice(),
             input_types,
@@ -791,7 +422,7 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
         let sequence_lengths = if uses_sequence_lengths {
             let query_lengths = match indices.query_sequence_lengths {
                 Some(index) => physical_inputs[index],
-                None => synthesize_fmha_sequence_lengths(
+                None => synthesize_fused_attention_sequence_lengths(
                     input_values[0],
                     input_types[0].rank() - 3,
                     &batch,
@@ -803,7 +434,7 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
             };
             let key_value_lengths = match indices.key_value_sequence_lengths {
                 Some(index) => physical_inputs[index],
-                None => synthesize_fmha_sequence_lengths(
+                None => synthesize_fused_attention_sequence_lengths(
                     input_values[1],
                     input_types[1].rank() - 3,
                     &batch,
@@ -818,14 +449,14 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
             None
         };
         let element_type = if data_type == DataType::BF16 { "BF16" } else { "F16" };
-        let backend_config = fmha_backend_config(
+        let backend_config = fused_attention_backend_config(
             element_type,
             [physical_batch, heads, physical_query_sequence, physical_key_value_sequence],
             configuration.scale_for(head_dimension),
-            fmha_mask_type(fmha_is_causal(configuration), sequence_lengths.is_some()),
+            fused_attention_mask_type(fused_attention_is_causal(configuration), sequence_lengths.is_some()),
             FMHA_BACKWARD_DOT_DIMENSION_NUMBERS,
             configuration.dropout(),
-            fmha_sliding_window_length(configuration),
+            fused_attention_sliding_window_length(configuration),
         );
         let residual_input = if input_types[0].rank() == 3 {
             let reshaped = block.append_operation(stable_hlo::reshape(
@@ -833,16 +464,16 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
                 &[1, physical_query_sequence, heads],
                 location,
             )?)?;
-            reshaped.result(0).expect("stablehlo.reshape should return one result").as_ref()
+            reshaped.result(0).unwrap().as_ref()
         } else {
             physical_inputs[offset + 1]
         };
         // The residual of the definition has the `f32` data type that the kernels consume, so it only returns from
         // the `BTN` form to the `BNT` form of the kernels.
         let residual = block.append_operation(stable_hlo::transpose(residual_input, &[0, 2, 1], location)?)?;
-        let residual = residual.result(0).expect("stablehlo.transpose should return one result").as_ref();
-        // The kernel call order differs from the traced operand order: `(Q, K, V, residual, dO[, bias], O
-        // [, q_seqlen, kv_seqlen])`, with the bias between the output cotangent and the forward output.
+        let residual = residual.result(0).unwrap().as_ref();
+        // The kernel call order `(Q, K, V, residual, dO[, bias], O[, q_seqlen, kv_seqlen])` differs from the operand
+        // order of the boundary, and places the bias between the output cotangent and the forward output.
         let mut operands =
             vec![physical_inputs[0], physical_inputs[1], physical_inputs[2], residual, physical_inputs[offset + 2]];
         let mut operand_layouts =
@@ -877,7 +508,7 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
         result_layouts.push(vec![0]);
         let custom_call = block.append_operation(stable_hlo::custom_call(
             operands.as_slice(),
-            fmha_target_name(bias.is_some(), configuration.dropout().is_some(), true).as_str(),
+            fused_attention_target_name(bias.is_some(), configuration.dropout().is_some(), true).as_str(),
             false,
             Some(context.string_attribute(backend_config.as_str()).as_ref()),
             CustomCallApiVersion::StatusReturning,
@@ -889,20 +520,20 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
             location,
         )?)?;
         // Each gradient comes back in the physical `[b, n, seq, h]` layout and transposes to the logical
-        // `BTNH`/`BSNH` layout (a pure bitcast given the declared result layouts); the bias cotangent keeps its
-        // own shape.
+        // `BTNH`/`BSNH` layout, which is a pure bitcast given the declared result layouts. The bias cotangent keeps
+        // its own shape.
         let mut results = Vec::with_capacity(output_types.len());
         for index in 0..3 {
-            let gradient = custom_call.result(index).expect("stablehlo.custom_call should return the gradient");
+            let gradient = custom_call.result(index).unwrap();
             let transposed =
                 block.append_operation(stable_hlo::transpose(gradient.as_ref(), &[0, 2, 1, 3], location)?)?;
-            let transposed = transposed.result(0).expect("stablehlo.transpose should return one result").as_ref();
+            let transposed = transposed.result(0).unwrap().as_ref();
             let mut transposed = transposed;
             if input_types[index].rank() == 3 {
                 let dimensions = static_dimensions(&physical_bound_type(&output_types[index])?)?;
                 let reshaped =
                     block.append_operation(stable_hlo::reshape(transposed, dimensions.as_slice(), location)?)?;
-                transposed = reshaped.result(0).expect("stablehlo.reshape should return one result").as_ref();
+                transposed = reshaped.result(0).unwrap().as_ref();
             }
             let sources = (0..input_types[index].rank()).map(|axis| (input_values[index], axis)).collect::<Vec<_>>();
             results.push(lower_restore_dynamic_dimensions(
@@ -928,8 +559,7 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
                 .enumerate()
                 .filter_map(|(axis, (bias, score))| (*bias == 1 && score != bias).then_some(axis))
                 .collect::<Vec<_>>();
-            let mut bias_cotangent =
-                custom_call.result(3).expect("stablehlo.custom_call should return the bias cotangent").as_ref();
+            let mut bias_cotangent = custom_call.result(3).unwrap().as_ref();
             if !reduced_axes.is_empty() {
                 let reduced_dimensions = score_dimensions
                     .iter()
@@ -957,7 +587,7 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
                     location,
                 )?)?
                 .result(0)
-                .expect("stablehlo.reshape should return one result")
+                .unwrap()
                 .as_ref();
             if bias_type.data_type() != data_type {
                 let converted = block.append_operation(stable_hlo::convert(
@@ -965,7 +595,7 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
                     lower_tensor_type(&physical_bias_type, context, location)?,
                     location,
                 )?)?;
-                bias_cotangent = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
+                bias_cotangent = converted.result(0).unwrap().as_ref();
             }
             let sources = (0..bias_type.rank()).map(|axis| (input_values[bias_index], axis)).collect::<Vec<_>>();
             results.push(lower_restore_dynamic_dimensions(
@@ -981,6 +611,375 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
     }
 }
 
+/// Result of checking one attention boundary against the complete cuDNN fMHA contract.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum FmhaEligibility {
+    /// The boundary can use the fused custom call without changing its semantics.
+    Eligible,
+
+    /// The boundary must use the portable decomposition, with the reason that the diagnostics of explicit requests for
+    /// the fused kernels report.
+    Ineligible(&'static str),
+}
+
+/// Canonical `[batch, sequence, heads, head_dimension]` dimensions of one rank-3 or rank-4 attention type.
+fn attention_dimensions(input_type: &ArrayType) -> Result<[CoreDimension; 4], Error> {
+    match input_type.shape().dimensions() {
+        [sequence, heads, head_dimension] => {
+            Ok([CoreDimension::Static(1), sequence.clone(), heads.clone(), head_dimension.clone()])
+        }
+        [batch, sequence, heads, head_dimension] => {
+            Ok([batch.clone(), sequence.clone(), heads.clone(), head_dimension.clone()])
+        }
+        _ => Err(Error::Lowering(LoweringError::UnsupportedOperation {
+            operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
+            reason: format!(
+                "`{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` operand must have rank 3 or 4 but got rank {}",
+                input_type.rank(),
+            ),
+        })),
+    }
+}
+
+/// Returns the physical maximum extent of one attention dimension.
+fn attention_physical_extent(dimension: &CoreDimension) -> Result<usize, Error> {
+    match dimension {
+        CoreDimension::Static(extent) => Ok(*extent),
+        CoreDimension::Dynamic(variable) => {
+            variable.bounds().upper().and_then(|upper| upper.checked_sub(1)).ok_or_else(|| {
+                Error::Lowering(LoweringError::UnsupportedOperation {
+                    operation: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME.to_string(),
+                    reason: format!(
+                        "`{DOT_PRODUCT_ATTENTION_COMPOSITE_NAME}` dimension {variable} needs a finite positive \
+                         physical bound",
+                    ),
+                })
+            })
+        }
+    }
+}
+
+/// Returns an [`ArrayType`] with the provided data type and dimensions used by the attention lowerings.
+fn attention_array_type<D: Clone + Into<CoreDimension>>(data_type: DataType, dimensions: &[D]) -> ArrayType {
+    ArrayType::new(data_type, Shape::new(dimensions.iter().cloned().map(Into::into).collect()))
+}
+
+/// Renders the `GpuBackendConfig` proto JSON string of one cuDNN fMHA custom call, which is the raw backend
+/// configuration form that XLA's cuDNN custom call compiler parses rather than a typed FFI dictionary. The string
+/// carries the score scale, the intermediate `[batch, q_heads, q_seq, kv_seq]` score shape at the operand element
+/// type, the mask kind, the forward or backward dot dimension numbers block, the dropout rate and the fixed seed
+/// [`FMHA_DROPOUT_SEED`], and the sliding window length. The score shape is load bearing on the backward path, where
+/// the `P` descriptor and residual strides derive from it, and the rate is the default `0.0` that was validated on
+/// hardware when dropout is off.
+fn fused_attention_backend_config(
+    element_type: &str,
+    intermediate_dimensions: [usize; 4],
+    scale: f64,
+    mask_type: &str,
+    dot_dimension_numbers: &str,
+    dropout: Option<f64>,
+    sliding_window_length: usize,
+) -> String {
+    let [batch, heads, query_sequence, key_value_sequence] = intermediate_dimensions;
+    // The `{:?}` rate formatting keeps the validated `0.0` spelling for the off state while rendering set rates
+    // with their shortest round trip form.
+    let dropout_rate = dropout.unwrap_or(0.0);
+    let seed = FMHA_DROPOUT_SEED;
+    format!(
+        "{{\"operation_queue_id\":\"0\",\"cudnn_fmha_backend_config\":{{\
+         \"algorithm\":{{\"algo_id\":\"0\",\"math_type\":\"TENSOR_OP_MATH\",\"tuning_knobs\":\
+         {{\"17\":\"1\",\"24\":\"0\"}},\"is_cudnn_frontend\":true,\"workspace_size\":\"0\"}},\
+         \"fmha_scale\":{scale},\"intermediate_tensor_shape\":{{\"element_type\":\"{element_type}\",\
+         \"dimensions\":[\"{batch}\",\"{heads}\",\"{query_sequence}\",\"{key_value_sequence}\"],\
+         \"tuple_shapes\":[],\"layout\":{{\"dim_level_types\":[],\"dim_unique\":[],\"dim_ordered\":[],\
+         \"minor_to_major\":[\"3\",\"2\",\"1\",\"0\"],\"tiles\":[],\"element_size_in_bits\":\"0\",\
+         \"memory_space\":\"0\",\"index_primitive_type\":\"PRIMITIVE_TYPE_INVALID\",\
+         \"pointer_primitive_type\":\"PRIMITIVE_TYPE_INVALID\",\
+         \"dynamic_shape_metadata_prefix_bytes\":\"0\"}},\
+         \"is_dynamic_dimension\":[false,false,false,false]}},\
+         \"is_flash_attention\":true,\"mask_type\":\"{mask_type}\",\
+         {dot_dimension_numbers},\
+         \"dropout_rate\":{dropout_rate:?},\"seed\":{seed},\"sliding_window_length\":{sliding_window_length},\
+         \"max_seg_per_batch\":1,\"is_paged_attention\":false}}}}",
+    )
+}
+
+/// Returns the cuDNN fMHA custom call target name for the provided feature set. The name varies only with the bias
+/// operand, dropout, and direction, as in `__cudnn$fmha[ScaleBias]Softmax[Dropout][Backward]`, because the backend
+/// configuration and the operand shapes carry the padding, sliding windows, and grouped query head counts instead.
+fn fused_attention_target_name(has_bias: bool, has_dropout: bool, backward: bool) -> String {
+    format!(
+        "__cudnn$fmha{}Softmax{}{}",
+        if has_bias { "ScaleBias" } else { "" },
+        if has_dropout { "Dropout" } else { "" },
+        if backward { "Backward" } else { "" },
+    )
+}
+
+/// Returns the cuDNN fMHA `mask_type` configuration value for the provided built-in mask and the presence of sequence
+/// lengths. The padding mask kinds compose the built-in mask with the appended `i32[batch]` sequence length operands.
+fn fused_attention_mask_type(causal: bool, has_sequence_lengths: bool) -> &'static str {
+    match (causal, has_sequence_lengths) {
+        (false, false) => "NO_MASK",
+        (true, false) => "CAUSAL",
+        (false, true) => "PADDING",
+        (true, true) => "PADDING_CAUSAL",
+    }
+}
+
+/// Returns the largest head dimension that cuDNN supports on every GPU architecture, for the fused kernels of
+/// training when `training` is set (i.e., the forward kernel that returns the residual, and the backward kernel) and
+/// for the forward kernel of inference otherwise. Its
+/// [support matrix](https://docs.nvidia.com/cudnn/operations/Attention/#support-matrix) allows `256` for inference on
+/// every architecture, and `128` for training on every architecture other than Hopper, which allows `256`.
+fn fused_attention_portable_head_dimension_limit(training: bool) -> usize {
+    if training { 128 } else { 256 }
+}
+
+/// Returns the sliding window length of the cuDNN fMHA configuration, which is the left radius of the local window
+/// and the position itself, and zero without a window. A window whose length the 32-bit configuration cannot
+/// represent admits every earlier position of every sequence, so it records no window and is causal masking instead,
+/// which [`fused_attention_is_causal`] reports.
+fn fused_attention_sliding_window_length(configuration: AttentionConfiguration) -> usize {
+    configuration
+        .local_window()
+        .and_then(|(left, _)| left.checked_add(1))
+        .filter(|length| *length <= i32::MAX as usize)
+        .unwrap_or(0)
+}
+
+/// Returns whether the cuDNN fMHA configuration masks causally, which it does for causal attention and for a local
+/// window that [`fused_attention_sliding_window_length`] cannot record. Such a window still hides every later
+/// position, because the fused kernels only take windows whose right radius is zero, and that is exactly causal
+/// masking.
+fn fused_attention_is_causal(configuration: AttentionConfiguration) -> bool {
+    configuration.causal()
+        || (configuration.local_window().is_some() && fused_attention_sliding_window_length(configuration) == 0)
+}
+
+/// Checks one attention boundary against the semantic and physical requirements of the cuDNN fMHA adapter.
+fn fused_attention_eligibility(
+    configuration: AttentionConfiguration,
+    input_structure: AttentionInputs<Placeholder>,
+    input_types: &[ArrayType],
+    target_platform: Option<&str>,
+) -> Result<FmhaEligibility, Error> {
+    // The right radius of a configuration with causal masking is always zero.
+    if configuration.local_window().is_some_and(|(_, right)| right != 0) {
+        return Ok(FmhaEligibility::Ineligible("a nonzero right local-window radius requires causal masking"));
+    }
+    if target_platform != Some("cuda") {
+        return Ok(FmhaEligibility::Ineligible("the target platform is not CUDA"));
+    }
+    if !matches!(input_types[0].data_type(), DataType::BF16 | DataType::F16) {
+        return Ok(FmhaEligibility::Ineligible("the operand data type is not `f16` or `bf16`"));
+    }
+    let [_, _, _, head_dimension] = attention_dimensions(&input_types[0])?;
+    let Some(head_dimension) = head_dimension.value() else {
+        return Ok(FmhaEligibility::Ineligible("the head dimension is not static"));
+    };
+    // cuDNN rejects an empty head dimension and an empty key/value sequence, for which the portable body returns
+    // empty outputs and uniform attention over nothing, while it accepts an empty batch and an empty query sequence.
+    if head_dimension == 0 {
+        return Ok(FmhaEligibility::Ineligible("the head dimension is empty"));
+    }
+    if head_dimension % 8 != 0 {
+        return Ok(FmhaEligibility::Ineligible("the head dimension is not divisible by eight"));
+    }
+    let [_, key_value_sequence, _, _] = attention_dimensions(&input_types[1])?;
+    if key_value_sequence.value() == Some(0) {
+        return Ok(FmhaEligibility::Ineligible("the key/value sequence is empty"));
+    }
+    if input_types[..3].iter().any(|r#type| r#type.static_shape().is_none())
+        && input_structure.query_sequence_lengths.is_none()
+        && input_structure.key_value_sequence_lengths.is_none()
+    {
+        return Ok(FmhaEligibility::Ineligible("bounded-dynamic operands require query or key/value sequence lengths"));
+    }
+    Ok(FmhaEligibility::Eligible)
+}
+
+/// Canonical operand indices of one attention boundary.
+fn attention_input_indices(input_structure: AttentionInputs<Placeholder>) -> AttentionInputs<usize> {
+    AttentionInputs::from_parameters(input_structure, 0..input_structure.parameter_count()).unwrap()
+}
+
+/// Adds the implicit batch dimension required by the cuDNN `BTNH` ABI to one physical rank-3 operand.
+fn normalize_fused_attention_operand<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    r#type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    if r#type.rank() == 4 {
+        return Ok(value);
+    }
+    let mut dimensions = vec![1];
+    dimensions.extend(static_dimensions(r#type)?);
+    let normalized = block.append_operation(stable_hlo::reshape(value, dimensions.as_slice(), location)?)?;
+    Ok(normalized.result(0).unwrap().as_ref())
+}
+
+/// Broadcasts one physical bias or mask from its normalized rank-4 shape to the complete fMHA score shape.
+fn broadcast_fused_attention_score_operand<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    r#type: &ArrayType,
+    score_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let mut dimensions = vec![1; 4 - r#type.rank()];
+    dimensions.extend(static_dimensions(r#type)?);
+    let value = if r#type.rank() == 4 {
+        value
+    } else {
+        let reshaped = block.append_operation(stable_hlo::reshape(value, dimensions.as_slice(), location)?)?;
+        reshaped.result(0).unwrap().as_ref()
+    };
+    let broadcast = block.append_operation(stable_hlo::broadcast(
+        value,
+        lower_tensor_type(score_type, context, location)?,
+        &[0, 1, 2, 3],
+        location,
+    )?)?;
+    Ok(broadcast.result(0).unwrap().as_ref())
+}
+
+/// Converts the optional Boolean mask to additive bias and combines it with the optional user bias at the physical
+/// `[batch, heads, query_sequence, key_value_sequence]` score shape expected by cuDNN.
+#[allow(clippy::too_many_arguments)]
+fn prepare_fused_attention_bias<'b, 'c: 'b, 't: 'c>(
+    inputs: &AttentionInputs<usize>,
+    physical_inputs: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
+    score_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Option<ValueRef<'b, 'c, 't>>, Error> {
+    let bias = inputs
+        .bias
+        .map(|index| {
+            // A broadcast keeps the element type of its input, so a bias with another data type is broadcast at its
+            // own data type and only then converted to the data type of the scores.
+            let bias = broadcast_fused_attention_score_operand(
+                physical_inputs[index],
+                &physical_bound_type(&input_types[index])?,
+                &score_type.clone().with_data_type(input_types[index].data_type()),
+                block,
+                context,
+                location,
+            )?;
+            let bias_data_type = input_types[index].data_type();
+            if bias_data_type == score_type.data_type() {
+                return Ok::<_, Error>(bias);
+            }
+
+            // A finite bias beyond the range of the data type of the scores would become infinite there, where the
+            // portable body keeps it finite, and a row of such biases would turn its softmax into NaNs. Finite biases
+            // therefore saturate at the largest finite magnitude of that data type before they are converted, while
+            // infinite biases and NaNs convert as they are. The saturation runs in the data type of an `f64` bias
+            // and in `f32` for every other bias data type.
+            let working_data_type = if bias_data_type == DataType::F64 { DataType::F64 } else { DataType::F32 };
+            let working_tensor_type =
+                lower_tensor_type(&score_type.clone().with_data_type(working_data_type), context, location)?;
+            let bias = if bias_data_type == working_data_type {
+                bias
+            } else {
+                let widened = block.append_operation(stable_hlo::convert(bias, working_tensor_type, location)?)?;
+                widened.result(0).unwrap().as_ref()
+            };
+            let limit = if score_type.data_type() == DataType::F16 { 65_504.0 } else { 3.389_531_389_251_535_5e38 };
+            let scalar_type = ArrayType::scalar(working_data_type);
+            let scalar_tensor_type = lower_tensor_type(&scalar_type, context, location)?;
+            let lower = lower_f64_constant_splat(-limit, &scalar_type, scalar_tensor_type, block, context, location)?;
+            let upper = lower_f64_constant_splat(limit, &scalar_type, scalar_tensor_type, block, context, location)?;
+            let saturated = block.append_operation(stable_hlo::clamp(lower, bias, upper, location)?)?;
+            let saturated = saturated.result(0).unwrap().as_ref();
+            let finite = block.append_operation(stable_hlo::is_finite(bias, location)?)?;
+            let finite = finite.result(0).unwrap().as_ref();
+            let bias = block.append_operation(stable_hlo::select(finite, saturated, bias, location)?)?;
+            let bias = bias.result(0).unwrap().as_ref();
+            let converted = block.append_operation(stable_hlo::convert(
+                bias,
+                lower_tensor_type(score_type, context, location)?,
+                location,
+            )?)?;
+            Ok::<_, Error>(converted.result(0).unwrap().as_ref())
+        })
+        .transpose()?;
+    let mask = inputs
+        .mask
+        .map(|index| {
+            let mask = broadcast_fused_attention_score_operand(
+                physical_inputs[index],
+                &physical_bound_type(&input_types[index])?,
+                &score_type.clone().with_data_type(DataType::Boolean),
+                block,
+                context,
+                location,
+            )?;
+            let tensor_type = lower_tensor_type(score_type, context, location)?;
+            let zero = lower_f64_constant_splat(0.0, score_type, tensor_type, block, context, location)?;
+            // These are the pinned JAX/cuDNN wrapper's deliberately conservative finite mask sentinels. They avoid
+            // a cuDNN subtraction bug that can surface when two values sit at the element type's extreme finite
+            // magnitude.
+            let masked_value = if score_type.data_type() == DataType::F16 { -32_768.0 } else { -2_199_023_255_552.0 };
+            let masked = lower_f64_constant_splat(masked_value, score_type, tensor_type, block, context, location)?;
+            let selected = block.append_operation(stable_hlo::select(mask, zero, masked, location)?)?;
+            Ok::<_, Error>(selected.result(0).unwrap().as_ref())
+        })
+        .transpose()?;
+    match (bias, mask) {
+        (Some(bias), Some(mask)) => {
+            let combined = block.append_operation(stable_hlo::add(bias, mask, location)?)?;
+            Ok(Some(combined.result(0).unwrap().as_ref()))
+        }
+        (Some(bias), None) => Ok(Some(bias)),
+        (None, Some(mask)) => Ok(Some(mask)),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Synthesizes one full sequence length vector, with one entry per batch item, for the sequence axis of `source`.
+#[allow(clippy::too_many_arguments)]
+fn synthesize_fused_attention_sequence_lengths<'b, 'c: 'b, 't: 'c>(
+    source: ValueRef<'b, 'c, 't>,
+    source_axis: usize,
+    batch: &CoreDimension,
+    physical_batch: usize,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let size = block.append_operation(stable_hlo::get_dimension_size(source, source_axis, location)?)?;
+    let size = size.result(0).unwrap().as_ref();
+    let physical_type = attention_array_type(DataType::I32, &[physical_batch]);
+    let lengths = block.append_operation(stable_hlo::broadcast(
+        size,
+        lower_tensor_type(&physical_type, context, location)?,
+        &[],
+        location,
+    )?)?;
+    let mut lengths = lengths.result(0).unwrap().as_ref();
+    if matches!(batch, CoreDimension::Dynamic(_)) {
+        let batch_size = block.append_operation(stable_hlo::get_dimension_size(source, 0, location)?)?;
+        let batch_size = batch_size.result(0).unwrap().as_ref();
+        let logical_type = attention_array_type(DataType::I32, std::slice::from_ref(batch));
+        let dynamic = block.append_operation(stable_hlo::set_dimension_size(
+            lengths,
+            batch_size,
+            lower_tensor_type(&logical_type, context, location)?,
+            0,
+            location,
+        )?)?;
+        lengths = dynamic.result(0).unwrap().as_ref();
+        lengths = lower_physical_bound_value(lengths, &logical_type, 0.0, block, context, location)?;
+    }
+    Ok(lengths)
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "cuda-13")]
@@ -988,21 +987,20 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         Array as CoreArray, ArrayOperation, DOT_PRODUCT_ATTENTION_COMPOSITE_VERSION,
-        DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, Device, DeviceMesh, Differentiate, DimensionBounds,
+        DOT_PRODUCT_ATTENTION_DIFFERENTIABLE_COMPOSITE_NAME, DeviceMesh, Differentiate, DimensionBounds,
         DimensionVariable, DomainTracingContext, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Mul,
         ProjectedContext, Reduce, Sharding, ShardingDimension, Typed, Value as CoreValue,
         differentiable_dot_product_attention, dot_product_attention,
     };
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::domains::Tracer;
     use crate::domains::tests::domain_mesh;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::operations::FlatProgram;
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, Domain, FromPjrt, Session, to_mlir_module_for_program};
+    use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::{Array, Domain, Session, to_mlir_module_for_program};
 
     use super::*;
 
@@ -1096,8 +1094,8 @@ mod tests {
     }
 
     /// Returns the `[2, 4, heads, 8]` input types of attention over `data_type` arrays with `query_heads` query heads
-    /// and `key_value_heads` key/value heads, followed by an optional broadcast-batch bias `[1, query_heads, 4, 4]`
-    /// and an optional pair of `i32[2]` sequence lengths.
+    /// and `key_value_heads` key/value heads, followed by an optional bias `[1, query_heads, 4, 4]`
+    /// that broadcasts along the batch dimension and an optional pair of `i32[2]` sequence lengths.
     fn extended_input_types(
         data_type: DataType,
         query_heads: usize,
@@ -1131,7 +1129,7 @@ mod tests {
         target_platform: Option<&str>,
     ) -> Result<String, Error> {
         lower_mlir_module_for_program(program, &[], input_types, output_types, "main", None, None, target_platform)
-            .map(|module| module.stable_hlo)
+            .map(|module| module.into_stable_hlo())
     }
 
     #[test]
@@ -1221,7 +1219,9 @@ mod tests {
         assert!(matches!(
             select(AttentionImplementation::Fused, dropout, stateful, &stateful_types, Some("cuda")),
             Some(NamedCompositeImplementation::FusedAttentionUnavailable { reason, .. })
-                if reason.starts_with("the fused kernels cannot reproduce the dropout mask of a dropout state"),
+                if reason
+                    == "the fused kernels cannot reproduce the dropout mask of a dropout state; omit the dropout state \
+                        to use the fused kernels' own mask",
         ));
         assert!(matches!(
             select(AttentionImplementation::Automatic, dropout, input_structure, &forward_types, Some("cuda")),
@@ -1275,7 +1275,109 @@ mod tests {
     }
 
     #[test]
-    fn test_fused_attention_on_cuda() {
+    fn test_select_attention_implementation_head_dimension_limits() {
+        // cuDNN supports head dimensions up to a limit that depends on the GPU architecture, which lowering does not
+        // know. The automatic implementation therefore selects the fused kernels up to the limit of every
+        // architecture, which is `256` for inference and `128` for the kernels of training, and the portable body
+        // beyond it. A request for the fused kernels is passed on to cuDNN for every head dimension.
+        let automatic = AttentionConfiguration::new().with_scale(0.125);
+        let fused = automatic.with_implementation(AttentionImplementation::Fused);
+        let input_structure = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
+        let is_fused = |configuration: AttentionConfiguration, head_dimension: usize, return_residual: bool| {
+            let input_types = vec![attention_array_type(DataType::BF16, &[1, 4, 2, head_dimension]); 3];
+            let program = forward_program(configuration, input_structure, return_residual, input_types, 1);
+            lower(&program, Some("cuda")).unwrap().contains("stablehlo.custom_call @__cudnn$fmha")
+        };
+        for (head_dimension, return_residual, selected) in [
+            (128, false, true),
+            (256, false, true),
+            (264, false, false),
+            (1024, false, false),
+            (128, true, true),
+            (136, true, false),
+            (256, true, false),
+        ] {
+            assert_eq!(is_fused(automatic, head_dimension, return_residual), selected, "{head_dimension}");
+            assert!(is_fused(fused, head_dimension, return_residual), "{head_dimension}");
+        }
+    }
+
+    #[test]
+    fn test_select_attention_implementation_fused_unavailable() {
+        // Requesting the fused kernels for calls that they cannot implement reports why instead of silently lowering
+        // the portable body (e.g., `f32` operands on CUDA, any operands without a CUDA target, a dropout state, an
+        // empty head dimension or key/value sequence, or a padded right local window).
+        let fused = AttentionConfiguration::new()
+            .with_scale(0.125)
+            .with_causal(true)
+            .with_implementation(AttentionImplementation::Fused);
+        let (input_structure, input_types) = extended_input_types(DataType::F32, 2, 2, false, false);
+        let program = forward_program(fused, input_structure, false, input_types.clone(), 1);
+        for (target_platform, reason) in
+            [(Some("cuda"), "the operand data type is not `f16` or `bf16`"), (None, "the target platform is not CUDA")]
+        {
+            assert!(matches!(
+                lower(&program, target_platform),
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason: message }))
+                    if operation == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME
+                        && message == format!("the fused attention implementation is unavailable because {reason}"),
+            ));
+        }
+        assert!(matches!(
+            lower(&training_program(fused, input_structure, input_types), Some("cuda")),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason == "the fused attention implementation is unavailable because the operand data type is not `f16` or `bf16`",
+        ));
+
+        let (input_structure, input_types) = extended_input_types(DataType::BF16, 2, 2, false, false);
+        let state_type = attention_array_type(DataType::U64, &[2]);
+        let stateful_types = input_types.into_iter().chain([state_type]).collect::<Vec<_>>();
+        let stateful = AttentionInputs { dropout_state: Some(Placeholder), ..input_structure };
+        let program = forward_program(fused.with_dropout(0.5), stateful, false, stateful_types, 1);
+        assert!(matches!(
+            lower(&program, Some("cuda")),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason
+                    == "the fused attention implementation is unavailable because the fused kernels cannot reproduce the dropout mask of a dropout \
+                        state; omit the dropout state to use the fused kernels' own mask",
+        ));
+
+        // cuDNN rejects an empty head dimension and an empty key/value sequence.
+        for (query_dimensions, key_value_dimensions, reason) in [
+            ([2, 4, 2, 0], [2, 4, 2, 0], "the head dimension is empty"),
+            ([2, 4, 2, 8], [2, 0, 2, 8], "the key/value sequence is empty"),
+        ] {
+            let query_type = attention_array_type(DataType::BF16, &query_dimensions);
+            let key_value_type = attention_array_type(DataType::BF16, &key_value_dimensions);
+            let program = forward_program(
+                fused,
+                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
+                false,
+                vec![query_type, key_value_type.clone(), key_value_type],
+                1,
+            );
+            assert!(matches!(
+                lower(&program, Some("cuda")),
+                Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason: message }))
+                    if operation == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME
+                        && message == format!("the fused attention implementation is unavailable because {reason}"),
+            ));
+        }
+
+        // The fused kernels have no right local window radius. Causal masking makes that radius zero, so only a
+        // configuration without it can request one.
+        let (input_structure, input_types) = extended_input_types(DataType::BF16, 2, 2, false, true);
+        let windowed = fused.with_causal(false).with_local_window((2, 1));
+        let program = forward_program(windowed, input_structure, false, input_types, 1);
+        assert!(matches!(
+            lower(&program, Some("cuda")),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason == "the fused attention implementation is unavailable because a nonzero right local-window radius requires causal masking",
+        ));
+    }
+
+    #[test]
+    fn test_lower_fused_attention() {
         // Qualifying causal BF16 attention uses the cuDNN fMHA ABI and preserves the causal mask, while the unmasked
         // F16 form uses the same target with `NO_MASK`.
         for (data_type, causal, mask_type, element_type) in
@@ -1377,36 +1479,91 @@ mod tests {
         assert!(!module.contains("\\22sliding_window_length\\22:1"));
     }
 
+    #[cfg(feature = "cuda-13")]
     #[test]
-    fn test_fused_attention_head_dimension_limits() {
-        // cuDNN supports head dimensions up to a limit that depends on the GPU architecture, which lowering does not
-        // know. The automatic implementation therefore selects the fused kernels up to the limit of every
-        // architecture, which is `256` for inference and `128` for the kernels of training, and the portable body
-        // beyond it. A request for the fused kernels is passed on to cuDNN for every head dimension.
-        let automatic = AttentionConfiguration::new().with_scale(0.125);
-        let fused = automatic.with_implementation(AttentionImplementation::Fused);
-        let input_structure = AttentionInputs::new(Placeholder, Placeholder, Placeholder);
-        let is_fused = |configuration: AttentionConfiguration, head_dimension: usize, return_residual: bool| {
-            let input_types = vec![attention_array_type(DataType::BF16, &[1, 4, 2, head_dimension]); 3];
-            let program = forward_program(configuration, input_structure, return_residual, input_types, 1);
-            lower(&program, Some("cuda")).unwrap().contains("stablehlo.custom_call @__cudnn$fmha")
+    fn test_fused_attention_saturates_wide_bias_on_cuda() {
+        // An `f32` bias of `1e6` is finite but beyond the range of `f16`, where it would be infinite and turn the
+        // softmax of its row into NaNs. The fused kernels receive it saturated at the largest finite `f16` instead,
+        // which still attends only to the first key/value position, like the portable body does with the bias itself.
+        let client = load_cuda_13_plugin()
+            .unwrap()
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let halves = |dimensions: &[usize], values: &[f32]| {
+            let values = values.iter().copied().map(half::f16::from_f32).collect::<Vec<_>>();
+            replicated_array(&domain, &mesh, DataType::F16, dimensions, values_to_bytes(values.as_slice()).as_slice())
         };
-        for (head_dimension, return_residual, selected) in [
-            (128, false, true),
-            (256, false, true),
-            (264, false, false),
-            (1024, false, false),
-            (128, true, true),
-            (136, true, false),
-            (256, true, false),
+        let values = (0..16).map(|index| if index < 8 { 1.0 } else { 2.0 }).collect::<Vec<_>>();
+        for implementation in [AttentionImplementation::Fused, AttentionImplementation::Portable] {
+            let function = dot_product_attention::<ArrayContext<'_>>(
+                AttentionConfiguration::new().with_implementation(implementation),
+            );
+            let inputs = AttentionInputs {
+                bias: Some(replicated_array(
+                    &domain,
+                    &mesh,
+                    DataType::F32,
+                    &[1, 1, 1, 2],
+                    values_to_bytes(&[1e6f32, 0.0]).as_slice(),
+                )),
+                ..AttentionInputs::new(
+                    halves(&[1, 1, 1, 8], &[0.0; 8]),
+                    halves(&[1, 2, 1, 8], &[0.0; 16]),
+                    halves(&[1, 2, 1, 8], values.as_slice()),
+                )
+            };
+            let output = function.call(inputs).unwrap().copy_to_host().unwrap();
+            let output = values_from_bytes::<half::f16>(&output).into_iter().map(half::f16::to_f32).collect::<Vec<_>>();
+            assert_eq!(output, vec![1.0; 8], "{implementation}");
+        }
+    }
+
+    #[cfg(feature = "cuda-13")]
+    #[test]
+    fn test_fused_attention_declines_empty_inputs_on_cuda() {
+        // cuDNN rejects an empty head dimension and an empty key/value sequence, so the automatic implementation
+        // evaluates the portable body for them. The scores of an empty head dimension are zero, so each query row
+        // attends uniformly to the three key/value positions and its residual is `log(3)`, and a query row that has
+        // no key/value position to attend to has the residual of an empty sum of exponentials.
+        let client = load_cuda_13_plugin()
+            .unwrap()
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let function = dot_product_attention::<ArrayContext<'_>>(AttentionConfiguration::new());
+        for (query_dimensions, key_value_dimensions, expected_residual) in [
+            ([1, 2, 1, 0], [1, 3, 1, 0], [3f32.ln(), 3f32.ln()]),
+            ([1, 2, 1, 8], [1, 0, 1, 8], [f32::NEG_INFINITY, f32::NEG_INFINITY]),
         ] {
-            assert_eq!(is_fused(automatic, head_dimension, return_residual), selected, "{head_dimension}");
-            assert!(is_fused(fused, head_dimension, return_residual), "{head_dimension}");
+            let device = |dimensions: &[usize]| {
+                let bytes = vec![0u8; 2 * dimensions.iter().product::<usize>()];
+                replicated_array(&domain, &mesh, DataType::BF16, dimensions, bytes.as_slice())
+            };
+            let (output, residual) = function
+                .call_with_residual(AttentionInputs::new(
+                    device(&query_dimensions),
+                    device(&key_value_dimensions),
+                    device(&key_value_dimensions),
+                ))
+                .unwrap();
+            assert_eq!(output.r#type().static_shape().unwrap().dimensions(), query_dimensions.as_slice());
+            assert_eq!(values_from_bytes::<f32>(&residual.copy_to_host().unwrap()), expected_residual);
         }
     }
 
     #[test]
-    fn test_fused_attention_backward_on_cuda() {
+    fn test_lower_fused_attention_backward() {
         // Fused training stages the forward kernels with their residual and the backward kernels, which restore the
         // input cotangents and sum the score-shaped bias cotangent to the bias shape.
         let (input_structure, input_types) = extended_input_types(DataType::BF16, 2, 2, true, false);
@@ -1449,82 +1606,92 @@ mod tests {
         assert!(module.contains("stablehlo.exponential"));
     }
 
+    #[cfg(feature = "cuda-13")]
     #[test]
-    fn test_fused_attention_unavailable() {
-        // Requesting the fused kernels for calls that they cannot implement reports why instead of silently lowering
-        // the portable body (e.g., `f32` operands on CUDA, any operands without a CUDA target, a dropout state, an
-        // empty head dimension or key/value sequence, or a padded right local window).
-        let fused = AttentionConfiguration::new()
-            .with_scale(0.125)
-            .with_causal(true)
-            .with_implementation(AttentionImplementation::Fused);
-        let (input_structure, input_types) = extended_input_types(DataType::F32, 2, 2, false, false);
-        let program = forward_program(fused, input_structure, false, input_types.clone(), 1);
-        for (target_platform, reason) in
-            [(Some("cuda"), "the operand data type is not `f16` or `bf16`"), (None, "the target platform is not CUDA")]
-        {
-            assert!(matches!(
-                lower(&program, target_platform),
-                Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason: message }))
-                    if operation == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME
-                        && message == format!("the fused attention implementation is unavailable because {reason}"),
-            ));
-        }
-        assert!(matches!(
-            lower(&training_program(fused, input_structure, input_types), Some("cuda")),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
-                if reason.contains("the operand data type is not `f16` or `bf16`"),
-        ));
+    fn test_fused_attention_backward_matches_reference_backend_on_cuda() {
+        // Both `bf16` scores are `1000`, so the residual of the fused forward kernels is `1000 + log(2)`, which `f32`
+        // keeps and `bf16` would round to `1000`. The fused backward kernels consume the residual exactly as the
+        // forward kernels returned it, so their gradients agree with the portable gradients of the reference backend.
+        // Probabilities that were reconstructed from a rounded residual would be one instead of one half, which would
+        // double the value gradient.
+        let client = load_cuda_13_plugin()
+            .unwrap()
+            .client(ClientOptions::GPU(GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            }))
+            .unwrap();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let reference = |dimensions: &[usize], elements: &[f32]| {
+            let elements = elements.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
+            CoreArray::from_elements(ArrayType::new_static(DataType::BF16, dimensions.to_vec()), elements.as_slice())
+                .unwrap()
+        };
+        let device = |value: &CoreArray| {
+            let r#type = value.r#type();
+            let dimensions = r#type.static_shape().unwrap().dimensions().to_vec();
+            replicated_array(&domain, &mesh, r#type.data_type(), &dimensions, value.logical_bytes().as_slice())
+        };
+        let query = reference(&[1, 1, 1, 8], &[125.0; 8]);
+        let key = reference(&[1, 2, 1, 8], &[1.0; 16]);
+        let value =
+            reference(&[1, 2, 1, 8], &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let configuration = AttentionConfiguration::new().with_scale(1.0);
 
-        let (input_structure, input_types) = extended_input_types(DataType::BF16, 2, 2, false, false);
-        let state_type = attention_array_type(DataType::U64, &[2]);
-        let stateful_types = input_types.into_iter().chain([state_type]).collect::<Vec<_>>();
-        let stateful = AttentionInputs { dropout_state: Some(Placeholder), ..input_structure };
-        let program = forward_program(fused.with_dropout(0.5), stateful, false, stateful_types, 1);
-        assert!(matches!(
-            lower(&program, Some("cuda")),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
-                if reason.contains("the fused kernels cannot reproduce the dropout mask of a dropout state"),
-        ));
+        // Requesting the fused implementation never falls back to the portable body, so this call runs the kernels.
+        let function = differentiable_dot_product_attention::<ArrayContext<'_>>(
+            configuration.with_implementation(AttentionImplementation::Fused),
+        );
+        let inputs = AttentionInputs::new(device(&query), device(&key), device(&value));
+        let context = inputs.query.domain();
+        let (loss, gradients) = context
+            .differentiate_at(inputs)
+            .value_and_gradient(|inputs| {
+                function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
+            })
+            .unwrap();
 
-        // cuDNN rejects an empty head dimension and an empty key/value sequence.
-        for (query_dimensions, key_value_dimensions, reason) in [
-            ([2, 4, 2, 0], [2, 4, 2, 0], "the head dimension is empty"),
-            ([2, 4, 2, 8], [2, 0, 2, 8], "the key/value sequence is empty"),
+        let reference_function = differentiable_dot_product_attention::<ReferenceContext>(
+            configuration.with_implementation(AttentionImplementation::Portable),
+        );
+        let (reference_loss, reference_gradients) = ReferenceContext::new()
+            .differentiate_at(AttentionInputs::new(query, key, value))
+            .value_and_gradient(|inputs| {
+                reference_function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
+            })
+            .unwrap();
+        assert_eq!(reference_loss.to_f64s(), vec![4.0]);
+        assert_eq!(reference_gradients.value.to_f64s(), [vec![0.5; 8], vec![0.5; 8]].concat());
+        assert_eq!(reference_gradients.key.to_f64s(), [vec![250.0; 8], vec![-250.0; 8]].concat());
+
+        // The fused kernels are not bit-identical to the portable composition, so each comparison uses an explicit
+        // tolerance for the magnitude of its values.
+        for (actual, expected, tolerance) in [
+            (&loss, &reference_loss, 0.05),
+            (&gradients.query, &reference_gradients.query, 0.25),
+            (&gradients.key, &reference_gradients.key, 5.0),
+            (&gradients.value, &reference_gradients.value, 0.05),
         ] {
-            let query_type = attention_array_type(DataType::BF16, &query_dimensions);
-            let key_value_type = attention_array_type(DataType::BF16, &key_value_dimensions);
-            let program = forward_program(
-                fused,
-                AttentionInputs::new(Placeholder, Placeholder, Placeholder),
-                false,
-                vec![query_type, key_value_type.clone(), key_value_type],
-                1,
-            );
-            assert!(matches!(
-                lower(&program, Some("cuda")),
-                Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason: message }))
-                    if operation == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME
-                        && message == format!("the fused attention implementation is unavailable because {reason}"),
-            ));
+            assert_eq!(actual.r#type().shape(), expected.r#type().shape());
+            let actual = values_from_bytes::<u16>(&actual.copy_to_host().unwrap())
+                .into_iter()
+                .map(|bits| f64::from(bf16::from_bits(bits).to_f32()))
+                .collect::<Vec<_>>();
+            for (index, (actual, expected)) in actual.iter().zip(expected.to_f64s()).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "element {index} is {actual} but the reference is {expected}",
+                );
+            }
         }
-
-        // The fused kernels have no right local-window radius. Causal masking makes that radius zero, so only a
-        // configuration without it can request one.
-        let (input_structure, input_types) = extended_input_types(DataType::BF16, 2, 2, false, true);
-        let windowed = fused.with_causal(false).with_local_window((2, 1));
-        let program = forward_program(windowed, input_structure, false, input_types, 1);
-        assert!(matches!(
-            lower(&program, Some("cuda")),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
-                if reason.contains("a nonzero right local-window radius requires causal masking"),
-        ));
     }
 
     #[test]
     fn test_portable_attention() {
-        // Without target information, repeated calls share one function that contains the portable body: the score
-        // dot, causal mask, stable softmax, value dot, and final layout restoration.
+        // Without target information, repeated calls share one function that contains the portable body (i.e., the
+        // score dot, causal mask, stable softmax, value dot, and final layout restoration).
         let configuration = AttentionConfiguration::new().with_scale(0.125).with_causal(true);
         let input_types = vec![attention_array_type(DataType::F32, &[1, 4, 2, 8]); 3];
         let program = forward_program(
@@ -1558,7 +1725,7 @@ mod tests {
             assert!(module.contains("stablehlo.dot_general"));
         }
 
-        // Grouped-query expansion, a broadcast bias, causal and local masking, and the residual all live in the body.
+        // Grouped query expansion, a broadcast bias, causal and local masking, and the residual all live in the body.
         let (input_structure, input_types) = extended_input_types(DataType::F32, 4, 2, true, false);
         let program = forward_program(configuration.with_local_window((1, 0)), input_structure, true, input_types, 1);
         let module = lower(&program, None).unwrap();
@@ -1685,19 +1852,10 @@ mod tests {
         // return each gradient with the sharding of its input. None of this changes the elements, which are those of
         // the reference backend over inputs without a sharding. A key that is sharded along its sequence shards the
         // scores along the dimension over which the softmax reduces its maximum.
-        let client = load_cpu_plugin()
-            .unwrap()
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
+        let client = cpu_client(2);
         let domain = Session::new(&client).domain();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .into_iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(&client, "x", 2).devices().to_vec()).unwrap();
         let values = |start: f32, count: usize| (0..count).map(|index| start + 0.25 * index as f32).collect::<Vec<_>>();
         let placed = |dimensions: &[usize], axis: Option<usize>, start: f32| {
             let mut placements = vec![ShardingDimension::Replicated; dimensions.len()];
@@ -1776,175 +1934,10 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "cuda-13")]
-    #[test]
-    fn test_fused_attention_backward_matches_reference_backend_on_cuda() {
-        // Both `bf16` scores are `1000`, so the residual of the fused forward kernels is `1000 + log(2)`, which `f32`
-        // keeps and `bf16` would round to `1000`. The fused backward kernels consume the residual exactly as the
-        // forward kernels returned it, so their gradients agree with the portable gradients of the reference backend.
-        // Probabilities that were reconstructed from a rounded residual would be one instead of one half, which would
-        // double the value gradient.
-        let client = load_cuda_13_plugin()
-            .unwrap()
-            .client(ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                ..Default::default()
-            }))
-            .unwrap();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        let reference = |dimensions: &[usize], elements: &[f32]| {
-            let elements = elements.iter().copied().map(bf16::from_f32).collect::<Vec<_>>();
-            CoreArray::from_elements(ArrayType::new_static(DataType::BF16, dimensions.to_vec()), elements.as_slice())
-                .unwrap()
-        };
-        let device = |value: &CoreArray| {
-            let r#type = value.r#type();
-            let dimensions = r#type.static_shape().unwrap().dimensions().to_vec();
-            replicated_array(&domain, &mesh, r#type.data_type(), &dimensions, value.logical_bytes().as_slice())
-        };
-        let query = reference(&[1, 1, 1, 8], &[125.0; 8]);
-        let key = reference(&[1, 2, 1, 8], &[1.0; 16]);
-        let value =
-            reference(&[1, 2, 1, 8], &[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        let configuration = AttentionConfiguration::new().with_scale(1.0);
-
-        // Requesting the fused implementation never falls back to the portable body, so this call runs the kernels.
-        let function = differentiable_dot_product_attention::<ArrayContext<'_>>(
-            configuration.with_implementation(AttentionImplementation::Fused),
-        );
-        let inputs = AttentionInputs::new(device(&query), device(&key), device(&value));
-        let context = inputs.query.domain();
-        let (loss, gradients) = context
-            .differentiate_at(inputs)
-            .value_and_gradient(|inputs| {
-                function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
-            })
-            .unwrap();
-
-        let reference_function = differentiable_dot_product_attention::<ReferenceContext>(
-            configuration.with_implementation(AttentionImplementation::Portable),
-        );
-        let (reference_loss, reference_gradients) = ReferenceContext::new()
-            .differentiate_at(AttentionInputs::new(query, key, value))
-            .value_and_gradient(|inputs| {
-                reference_function.call(inputs).unwrap().reduce(&[0, 1, 2, 3], ReductionKind::Sum).unwrap()
-            })
-            .unwrap();
-        assert_eq!(reference_loss.to_f64s(), vec![4.0]);
-        assert_eq!(reference_gradients.value.to_f64s(), [vec![0.5; 8], vec![0.5; 8]].concat());
-        assert_eq!(reference_gradients.key.to_f64s(), [vec![250.0; 8], vec![-250.0; 8]].concat());
-
-        // The fused kernels are not bit-identical to the portable composition, so each comparison uses an explicit
-        // tolerance for the magnitude of its values.
-        for (actual, expected, tolerance) in [
-            (&loss, &reference_loss, 0.05),
-            (&gradients.query, &reference_gradients.query, 0.25),
-            (&gradients.key, &reference_gradients.key, 5.0),
-            (&gradients.value, &reference_gradients.value, 0.05),
-        ] {
-            assert_eq!(actual.r#type().shape(), expected.r#type().shape());
-            let actual = values_from_bytes::<u16>(&actual.copy_to_host().unwrap())
-                .into_iter()
-                .map(|bits| f64::from(bf16::from_bits(bits).to_f32()))
-                .collect::<Vec<_>>();
-            for (index, (actual, expected)) in actual.iter().zip(expected.to_f64s()).enumerate() {
-                assert!(
-                    (actual - expected).abs() <= tolerance,
-                    "element {index} is {actual} but the reference is {expected}",
-                );
-            }
-        }
-    }
-
-    #[cfg(feature = "cuda-13")]
-    #[test]
-    fn test_fused_attention_saturates_wide_bias_on_cuda() {
-        // An `f32` bias of `1e6` is finite but beyond the range of `f16`, where it would be infinite and turn the
-        // softmax of its row into NaNs. The fused kernels receive it saturated at the largest finite `f16` instead,
-        // which still attends only to the first key/value position, like the portable body does with the bias itself.
-        let client = load_cuda_13_plugin()
-            .unwrap()
-            .client(ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                ..Default::default()
-            }))
-            .unwrap();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        let halves = |dimensions: &[usize], values: &[f32]| {
-            let values = values.iter().copied().map(half::f16::from_f32).collect::<Vec<_>>();
-            replicated_array(&domain, &mesh, DataType::F16, dimensions, values_to_bytes(values.as_slice()).as_slice())
-        };
-        let values = (0..16).map(|index| if index < 8 { 1.0 } else { 2.0 }).collect::<Vec<_>>();
-        for implementation in [AttentionImplementation::Fused, AttentionImplementation::Portable] {
-            let function = dot_product_attention::<ArrayContext<'_>>(
-                AttentionConfiguration::new().with_implementation(implementation),
-            );
-            let inputs = AttentionInputs {
-                bias: Some(replicated_array(
-                    &domain,
-                    &mesh,
-                    DataType::F32,
-                    &[1, 1, 1, 2],
-                    values_to_bytes(&[1e6f32, 0.0]).as_slice(),
-                )),
-                ..AttentionInputs::new(
-                    halves(&[1, 1, 1, 8], &[0.0; 8]),
-                    halves(&[1, 2, 1, 8], &[0.0; 16]),
-                    halves(&[1, 2, 1, 8], values.as_slice()),
-                )
-            };
-            let output = function.call(inputs).unwrap().copy_to_host().unwrap();
-            let output = values_from_bytes::<half::f16>(&output).into_iter().map(half::f16::to_f32).collect::<Vec<_>>();
-            assert_eq!(output, vec![1.0; 8], "{implementation}");
-        }
-    }
-
-    #[cfg(feature = "cuda-13")]
-    #[test]
-    fn test_fused_attention_declines_empty_inputs_on_cuda() {
-        // cuDNN rejects an empty head dimension and an empty key/value sequence, so the automatic implementation
-        // evaluates the portable body for them. The scores of an empty head dimension are zero, so each query row
-        // attends uniformly to the three key/value positions and its residual is `log(3)`, and a query row that has
-        // no key/value position to attend to has the residual of an empty sum of exponentials.
-        let client = load_cuda_13_plugin()
-            .unwrap()
-            .client(ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                ..Default::default()
-            }))
-            .unwrap();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        let function = dot_product_attention::<ArrayContext<'_>>(AttentionConfiguration::new());
-        for (query_dimensions, key_value_dimensions, expected_residual) in [
-            ([1, 2, 1, 0], [1, 3, 1, 0], [3f32.ln(), 3f32.ln()]),
-            ([1, 2, 1, 8], [1, 0, 1, 8], [f32::NEG_INFINITY, f32::NEG_INFINITY]),
-        ] {
-            let device = |dimensions: &[usize]| {
-                let bytes = vec![0u8; 2 * dimensions.iter().product::<usize>()];
-                replicated_array(&domain, &mesh, DataType::BF16, dimensions, bytes.as_slice())
-            };
-            let (output, residual) = function
-                .call_with_residual(AttentionInputs::new(
-                    device(&query_dimensions),
-                    device(&key_value_dimensions),
-                    device(&key_value_dimensions),
-                ))
-                .unwrap();
-            assert_eq!(output.r#type().static_shape().unwrap().dimensions(), query_dimensions.as_slice());
-            assert_eq!(values_from_bytes::<f32>(&residual.copy_to_host().unwrap()), expected_residual);
-        }
-    }
-
     #[test]
     fn test_portable_attention_with_dynamic_extents() {
-        // Portable attention obtains every logical extent from the mixed array IR, so bounded-dynamic programs do not
-        // need to expose physical padding as sequence-length inputs and support the same grouped-query and window
+        // Portable attention obtains every logical extent from the mixed array IR, so bounded dynamic programs do not
+        // need to expose physical padding as sequence length inputs and support the same grouped query and window
         // configurations as static programs. Explicit lengths remain an independent semantic mask when provided.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(4)).unwrap());
         let operand_type = |heads: usize| {
@@ -1988,7 +1981,7 @@ mod tests {
             lower(&training_program(configuration, input_structure, input_types), None).unwrap();
         }
 
-        // Bounded-dynamic fused attention requires sequence lengths, which mask the physical padding.
+        // Bounded dynamic fused attention requires sequence lengths, which mask the physical padding.
         let fused = configuration.with_implementation(AttentionImplementation::Fused);
         let (input_structure, input_types) = boundary(2, true);
         let module = lower(&forward_program(fused, input_structure, false, input_types, 1), Some("cuda")).unwrap();
@@ -1998,13 +1991,15 @@ mod tests {
         assert!(matches!(
             lower(&forward_program(fused, input_structure, false, input_types, 1), Some("cuda")),
             Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
-                if reason.contains("bounded-dynamic operands require query or key/value sequence lengths"),
+                if reason
+                    == "the fused attention implementation is unavailable because bounded-dynamic operands require query or key/value sequence \
+                        lengths",
         ));
     }
 
     #[test]
     fn test_attention_jax_surface() {
-        // Rank-three attention, an arbitrary Boolean mask, one independently present sequence-length input, an
+        // Rank-3 attention, an arbitrary Boolean mask, one independently present sequence length input, an
         // asymmetric local window, default scaling, and a residual all lower through the portable body.
         let query_type = attention_array_type(DataType::F32, &[2, 1, 2]);
         let key_value_type = attention_array_type(DataType::F32, &[3, 1, 2]);
@@ -2028,7 +2023,7 @@ mod tests {
 
         // The cuDNN adapter normalizes `TNH` inputs, turns an arbitrary Boolean mask into an additive bias, and
         // synthesizes the absent key/value length vector while preserving a supported causal left window. The
-        // matching backward discards the synthetic mask-bias cotangent and returns the three input cotangents.
+        // matching backward discards the cotangent of the synthetic mask bias and returns the three input cotangents.
         let query_type = attention_array_type(DataType::F16, &[4, 2, 8]);
         let key_value_type = attention_array_type(DataType::F16, &[4, 2, 8]);
         let input_types = vec![

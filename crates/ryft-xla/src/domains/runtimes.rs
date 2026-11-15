@@ -1,3 +1,17 @@
+//! Native runtime extensions that compiled programs require and that sessions initialize lazily.
+//!
+//! A custom call declares the native runtime contracts that it depends on as [`RuntimeRequirement`]s, which
+//! [`with_runtime_requirements`] attaches under the reserved [`RUNTIME_REQUIREMENTS_ATTRIBUTE`] and
+//! [`runtime_requirements`] reads back. Compiled programs retain only these requirements and never an initialized
+//! extension, so cached executables stay independent of the session that produced them.
+//!
+//! [`RuntimeExtensions`] configures the [`RuntimeProvider`]s of a [`Session`](crate::Session) before the session is
+//! constructed. Each session initializes one [`RuntimeExtension`] instance for each requirement before it first
+//! compiles, loads, or executes a program that needs it, and shares that instance with later calls. Before each native
+//! submission, the required extensions attach invocation data to one [`ExecutionResources`], and the session retains
+//! those resources until the execution completes, even when its outputs are discarded. [`named_ffi_type_id`] gives
+//! providers deterministic native type IDs for their user data.
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::io::Write;
@@ -38,7 +52,7 @@ pub enum RuntimeError {
     #[error("runtime extension `{identifier}` does not support ABI version {version}")]
     UnsupportedVersion { identifier: String, version: u32 },
 
-    /// Provider-specific configuration does not match the selected runtime contract.
+    /// Configuration specific to the provider does not match the selected runtime contract.
     #[error("invalid configuration for runtime extension `{identifier}`: {reason}")]
     InvalidConfiguration { identifier: String, reason: String },
 
@@ -51,18 +65,20 @@ pub enum RuntimeError {
     DuplicateUserData { type_id: i64 },
 }
 
-/// Reserved source-operation attribute holding canonical runtime requirements. XLA lowering consumes this attribute;
-/// it is not forwarded to the native custom-call handler. Other custom-call attributes retain their usual meaning.
+/// Reserved attribute of a source operation that holds canonical runtime requirements. XLA lowering consumes this
+/// attribute and does not forward it to the native custom call handler. Other custom call attributes retain their usual
+/// meaning.
 pub const RUNTIME_REQUIREMENTS_ATTRIBUTE: &str = "ryft.runtime.requirements";
 
-/// Maximum size of one encoded runtime-requirement annotation, in bytes.
+/// Maximum size of one encoded runtime requirement annotation, in bytes.
 pub const MAX_RUNTIME_REQUIREMENTS_BYTES: usize = 1024 * 1024;
 
 /// Immutable, portable description of one runtime extension contract.
 ///
 /// Identifiers must be nonempty and contain no NUL. Providers own their ABI version and the interpretation of their
-/// canonical configuration bytes. Configuration describes runtime setup; per-kernel parameters remain in the kernel
-/// payload. Process-local registration IDs, pointers, and Rust type IDs must never appear here.
+/// canonical configuration bytes. Configuration describes runtime setup, while the parameters of each kernel remain in
+/// the kernel payload. Registration IDs that are local to a process, pointers, and Rust type IDs must never appear
+/// here.
 ///
 /// Compiled programs retain only these requirements. The invoking [`Session`](crate::Session) resolves them through
 /// its configured [`RuntimeProvider`]s, so cached executables retain no producing session or initialized extensions.
@@ -74,7 +90,7 @@ pub struct RuntimeRequirement {
     /// Version of the extension's invocation ABI.
     abi_version: u32,
 
-    /// Provider-owned deterministic runtime configuration.
+    /// Deterministic runtime configuration that the provider owns.
     configuration: Vec<u8>,
 }
 
@@ -124,40 +140,13 @@ impl<'de> Deserialize<'de> for RuntimeRequirement {
             /// Version of the extension's invocation ABI.
             abi_version: u32,
 
-            /// Provider-owned configuration, bounded by the public constructor.
+            /// Configuration that the provider owns, bounded by the public constructor.
             #[serde(deserialize_with = "deserialize_runtime_configuration")]
             configuration: Vec<u8>,
         }
         let fields = Fields::deserialize(deserializer)?;
         Self::new(fields.identifier, fields.abi_version, fields.configuration).map_err(serde::de::Error::custom)
     }
-}
-
-/// Decodes configuration without constructing an oversized byte vector from persisted metadata.
-fn deserialize_runtime_configuration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-    /// Sequence visitor enforcing the same limit as the public requirement constructor.
-    struct Configuration;
-
-    impl<'de> serde::de::Visitor<'de> for Configuration {
-        type Value = Vec<u8>;
-
-        fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-            write!(formatter, "a runtime configuration of at most {MAX_RUNTIME_REQUIREMENTS_BYTES} bytes")
-        }
-
-        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
-            let mut configuration = Vec::new();
-            while let Some(byte) = sequence.next_element::<u8>()? {
-                if configuration.len() == MAX_RUNTIME_REQUIREMENTS_BYTES {
-                    return Err(serde::de::Error::custom("runtime configuration exceeds the metadata size limit"));
-                }
-                configuration.push(byte);
-            }
-            Ok(configuration)
-        }
-    }
-
-    deserializer.deserialize_seq(Configuration)
 }
 
 /// Sorts and deduplicates requirements, rejecting incompatible declarations for one identifier.
@@ -263,7 +252,7 @@ pub fn runtime_requirements(operation: &CustomCallOperation) -> Result<Vec<Runti
     normalize_runtime_requirements(requirements)
 }
 
-/// Returns a deterministic native FFI type ID for the provider-owned user-data type called `name`.
+/// Returns a deterministic native FFI type ID for the user data type called `name` that a provider owns.
 ///
 /// Registering a type with an explicit ID through [`Client::register_ffi_type`] is idempotent for the same name and
 /// ID, so providers can register on every initialization, and native handlers can look up their user data with the
@@ -292,12 +281,12 @@ pub const fn named_ffi_type_id(name: &str) -> FfiTypeId {
 ///
 /// Providers register native types with explicit IDs from [`named_ffi_type_id`] and handlers through PJRT during
 /// initialization. Type registration is idempotent, and XLA accepts re-registration of an identical handler. Each
-/// session's providers can therefore register again without process-global bookkeeping, while native handlers look
-/// up their user data with the same constant ID.
+/// session's providers can therefore register again without bookkeeping that is global to the process, while native
+/// handlers look up their user data with the same constant ID.
 ///
 /// Providers and extensions may borrow the client without requiring a `'static` runtime. For example, a downstream
-/// crate can add a registration-only contract alongside the built-in providers and annotate its custom calls with
-/// the same requirement.
+/// crate can add a contract that only registers native handlers alongside the built-in providers and annotate its
+/// custom calls with the same requirement.
 ///
 /// # Example
 ///
@@ -346,8 +335,9 @@ pub trait RuntimeProvider<'c>: Send + Sync {
     /// Returns the contract identifier this provider implements.
     fn identifier(&self) -> &str;
 
-    /// Validates and initializes one client-associated contract instance. A failed initialization may be retried;
-    /// plugin-global registration steps must therefore be idempotent and preserve compatible partial progress.
+    /// Validates and initializes one contract instance associated with `client`. A failed initialization may be
+    /// retried, so registration steps that are global to the plugin must be idempotent and preserve compatible partial
+    /// progress.
     fn initialize(
         &self,
         client: &'c Client<'c>,
@@ -359,9 +349,9 @@ pub trait RuntimeProvider<'c>: Send + Sync {
 /// Live extension instance shared by calls through one session.
 ///
 /// The session keeps its stable allocation alive until all executions borrowing extension data have completed.
-/// Implementations must synchronize native handler access across devices and threads. Registration-only extensions
-/// may use the default preparation behavior, which does not create an execution context.
-/// A runtime borrowing its client cannot escape that client.
+/// Implementations must synchronize native handler access across devices and threads. Extensions that only register
+/// native handlers may use the default preparation behavior, which does not create an execution context. A runtime
+/// borrowing its client cannot escape that client.
 ///
 /// ```compile_fail
 /// use std::sync::Arc;
@@ -376,13 +366,15 @@ pub trait RuntimeProvider<'c>: Send + Sync {
 /// }
 /// ```
 pub trait RuntimeExtension<'c>: Send + Sync {
-    /// Checks invocation-specific device and participant restrictions before native submission.
-    fn validate_execution(&self, _client: &Client<'_>, _mesh: &DeviceMesh) -> Result<(), Error> {
+    /// Checks the device and participant restrictions of an invocation before native submission.
+    fn validate_execution(&self, client: &Client<'_>, mesh: &DeviceMesh) -> Result<(), Error> {
+        let _ = (client, mesh);
         Ok(())
     }
 
     /// Attaches invocation data and retains any additional owners needed through completion.
-    fn prepare(&self, _resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
+    fn prepare(&self, resources: &mut ExecutionResources<'c>) -> Result<(), Error> {
+        let _ = resources;
         Ok(())
     }
 }
@@ -398,7 +390,7 @@ pub struct RuntimeExtensions<'c> {
 }
 
 impl<'c> RuntimeExtensions<'c> {
-    /// Creates the built-in configuration. Providers are lazy; this does not load accelerator drivers.
+    /// Creates the built-in configuration. Providers are lazy, so this does not load accelerator drivers.
     pub fn new() -> Self {
         let mut configuration = Self::empty();
         let mut providers = crate::kernels::runtime_providers();
@@ -428,7 +420,8 @@ impl<'c> RuntimeExtensions<'c> {
     }
 
     /// Explicitly replaces a configured provider before session construction. This does not replace an incompatible
-    /// plugin-global native registration and does not mutate existing sessions using a cloned configuration.
+    /// native registration that is global to the plugin and does not mutate existing sessions using a cloned
+    /// configuration.
     pub fn with_replaced_provider(mut self, provider: Arc<dyn RuntimeProvider<'c> + 'c>) -> Result<Self, Error> {
         validate_identifier(provider.identifier())?;
         let identifier = provider.identifier().to_owned();
@@ -460,21 +453,19 @@ impl Debug for RuntimeExtensions<'_> {
     }
 }
 
-/// Erased ownership with the session's client lifetime, without requiring `Any` or `'static`.
-trait RetainedResource: Send + Sync {}
-impl<T: Send + Sync> RetainedResource for T {}
-
 /// Invocation data and owners prepared before one native submission.
 ///
 /// Retain stable allocations such as `Arc<T>` before attaching pointers into them. On preparation failure, the context
 /// is destroyed before retained owners. After submission, the session retains owners through the joined fence,
 /// including when outputs are discarded. Extensions contribute to one lazily created execution context. Ordinary
-/// execution and registration-only extensions create no context and introduce no additional destruction barrier.
+/// execution and extensions that only register native handlers create no context and introduce no additional
+/// destruction barrier.
 pub struct ExecutionResources<'c> {
     /// Client receiving this invocation's context.
     client: &'c Client<'c>,
 
-    /// Native context, allocated only when invocation data is first attached.
+    /// Native context, allocated only when invocation data is first attached. Fields drop in declaration order, so
+    /// this context is destroyed before the retained owners, including when preparation fails.
     context: Option<ExecutionContext>,
 
     /// Type identifiers already installed in this invocation.
@@ -490,43 +481,50 @@ impl<'c> ExecutionResources<'c> {
         self.client
     }
 
-    /// Retains an owner through whole-execution completion. Use a stable allocation such as `Arc` or `Box` when native
-    /// user data points into the retained value; moving a stack value into this function does not preserve its address.
+    /// Retains an owner until the whole execution completes. Use a stable allocation such as `Arc` or `Box` when native
+    /// user data points into the retained value, because moving a stack value into this function does not preserve its
+    /// address.
     pub fn retain<T: 'c + Send + Sync>(&mut self, owner: T) {
         self.retained.push(Box::new(owner));
     }
 
-    /// Adds one borrowed native user-data binding to this invocation, creating the context lazily.
+    /// Adds one borrowed native user data binding to this invocation, creating the context lazily.
+    ///
+    /// `data` pairs a native [`FfiTypeId`] with a raw pointer, which the native handlers of this invocation look up by
+    /// that type ID and dereference during execution.
     ///
     /// # Safety
     ///
-    /// The pointer must have the type registered under its native type ID and remain stable until completion. Its owner
-    /// must be this session's runtime instance or be retained through [`Self::retain`]. Native handlers may access it
-    /// concurrently on several devices; the pointee must support those accesses. This boundary permits third-party FFI
-    /// integrations while keeping native pointer insertion explicit.
+    /// Neither the pointer nor its pointee is checked. The pointer must point to a value of the type registered under
+    /// its native type ID and remain stable until completion. Its owner must be this session's runtime instance or be
+    /// retained through [`Self::retain`]. Native handlers may access it concurrently on several devices, so the pointee
+    /// must support those accesses. The function is public so that third-party FFI integrations can attach their own
+    /// data, and its `unsafe` boundary keeps native pointer insertion explicit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::DuplicateUserData`] if this invocation already holds user data for the same type ID, and
+    /// an [`Error`] if the execution context cannot be created or the native insertion fails.
     pub unsafe fn add_ffi_user_data(&mut self, data: FfiUserData) -> Result<(), Error> {
-        if !self.user_data.insert(data.type_id) {
-            return Err(RuntimeError::DuplicateUserData { type_id: data.type_id.into() }.into());
+        let type_id = data.type_id;
+        if self.user_data.contains(&type_id) {
+            return Err(RuntimeError::DuplicateUserData { type_id: type_id.into() }.into());
         }
         if self.context.is_none() {
             self.context = Some(self.client.execution_context()?);
         }
         unsafe { self.context.as_ref().unwrap().add_ffi_user_data(data) }?;
+
+        // The type ID is recorded only after the native insertion succeeds, so that a failed call can be retried.
+        self.user_data.insert(type_id);
         Ok(())
     }
 
-    /// Separates native context ownership from the session-owned resource lease.
-    pub(crate) fn into_parts(mut self) -> (Option<ExecutionContext>, RetainedExecutionResources<'c>) {
-        let context = self.context.take();
-        let needed = context.is_some() || !self.retained.is_empty();
-        let retained = std::mem::take(&mut self.retained);
+    /// Separates native context ownership from the resource lease that the session owns.
+    pub(crate) fn into_parts(self) -> (Option<ExecutionContext>, RetainedExecutionResources<'c>) {
+        let Self { context, retained, .. } = self;
+        let needed = context.is_some() || !retained.is_empty();
         (context, RetainedExecutionResources { needed, _owners: retained })
-    }
-}
-
-impl Drop for ExecutionResources<'_> {
-    fn drop(&mut self) {
-        drop(self.context.take());
     }
 }
 
@@ -535,59 +533,11 @@ pub(crate) struct RetainedExecutionResources<'c> {
     /// Whether the invocation borrowed data, even if its owner is the session's runtime instance itself.
     needed: bool,
 
-    /// Additional retained owners, destroyed after whole-execution completion.
+    /// Additional retained owners, destroyed after the whole execution completes.
     _owners: Vec<Box<dyn RetainedResource + 'c>>,
 }
 
-/// Initialization state for one session and complete runtime descriptor.
-enum Initialization<'c> {
-    /// No successful instance has been published.
-    Empty,
-
-    /// One thread initializes outside the registry lock.
-    Running(ThreadId),
-
-    /// Immutable stable instance shared by later calls.
-    Ready(Arc<dyn RuntimeExtension<'c> + 'c>),
-}
-
-/// Independent synchronization for one runtime, so unrelated initialization does not serialize.
-struct RuntimeInitialization<'c> {
-    /// Mutable initialization state.
-    state: Mutex<Initialization<'c>>,
-
-    /// Notification after successful initialization or retryable failure.
-    ready: Condvar,
-}
-
-/// Resets an unfinished initializer on error or unwind, without poisoning the instance slot.
-struct InitializationGuard<'o, 'c> {
-    /// Slot whose running state must be cleared unless publication succeeds.
-    slot: &'o RuntimeInitialization<'c>,
-
-    /// Whether initialization still needs rollback.
-    active: bool,
-}
-
-impl Drop for InitializationGuard<'_, '_> {
-    fn drop(&mut self) {
-        if self.active {
-            *self.slot.state.lock().expect("runtime initialization mutex poisoned") = Initialization::Empty;
-            self.slot.ready.notify_all();
-        }
-    }
-}
-
-/// One extension-using execution whose resources outlive discarded output handles.
-struct PendingExecution<'c> {
-    /// Completion of every participating device and native context cleanup.
-    fence: ExecutionFence,
-
-    /// Borrowed invocation resources retained until the fence is terminal.
-    _resources: RetainedExecutionResources<'c>,
-}
-
-/// Per-session runtime instances and pending resource ownership.
+/// Runtime instances of one session and the ownership of the resources of its pending executions.
 pub(crate) struct RuntimeRegistry<'c> {
     /// Externally owned client associated with all initialized instances.
     client: &'c Client<'c>,
@@ -595,7 +545,7 @@ pub(crate) struct RuntimeRegistry<'c> {
     /// Frozen provider configuration, shared by value rather than sharing initialized instances.
     configuration: RuntimeExtensions<'c>,
 
-    /// Per-requirement initialization slots.
+    /// Initialization slots, one for each requirement.
     instances: Mutex<HashMap<RuntimeRequirement, Arc<RuntimeInitialization<'c>>>>,
 
     /// Only launches that borrow extension resources, not ordinary PJRT work.
@@ -655,6 +605,8 @@ impl<'c> RuntimeRegistry<'c> {
                 completed.push(PendingExecution { fence: fence.clone(), _resources: resources });
             }
         }
+        // Completed executions no longer need their resources. They are dropped after the pending lock is released,
+        // so destructors of retained owners never run while that lock is held.
         drop(completed);
     }
 
@@ -734,28 +686,17 @@ impl<'c> RuntimeRegistry<'c> {
 impl Drop for RuntimeRegistry<'_> {
     fn drop(&mut self) {
         let pending = std::mem::take(self.pending.get_mut().expect("runtime completion mutex poisoned"));
+        // Native handlers may still read the retained resources of pending executions, so each execution must reach a
+        // terminal state before its resources are destroyed.
         for execution in pending {
-            // Failure is terminal too; diagnostics remain in the caller's fence and effect/reference state.
+            // Failure is terminal too, and its diagnostics remain in the caller's fence and in effect and reference
+            // state.
             match execution.fence.block_until_ready() {
                 Ok(()) | Err(_) => {}
             }
             drop(execution);
         }
     }
-}
-
-/// Validates an extension identifier at every public configuration boundary.
-fn validate_identifier(identifier: &str) -> Result<(), Error> {
-    if identifier.len() > MAX_RUNTIME_REQUIREMENTS_BYTES {
-        return Err(Error::SizeLimitExceeded { message: "runtime identifier exceeds the metadata size limit".into() });
-    }
-    if identifier.is_empty() || identifier.contains('\0') {
-        return Err(RuntimeError::InvalidRequirement {
-            reason: "identifier must be nonempty and contain no NUL".into(),
-        }
-        .into());
-    }
-    Ok(())
 }
 
 /// Constructs the fixed ABI used by built-in runtime providers.
@@ -787,6 +728,99 @@ pub(crate) fn validate_builtin_requirement(requirement: &RuntimeRequirement, ide
     Ok(())
 }
 
+/// Erased ownership with the session's client lifetime, without requiring `Any` or `'static`.
+trait RetainedResource: Send + Sync {}
+impl<T: Send + Sync> RetainedResource for T {}
+
+/// Initialization state for one session and complete runtime descriptor.
+enum Initialization<'c> {
+    /// No successful instance has been published.
+    Empty,
+
+    /// One thread initializes outside the registry lock.
+    Running(ThreadId),
+
+    /// Immutable stable instance shared by later calls.
+    Ready(Arc<dyn RuntimeExtension<'c> + 'c>),
+}
+
+/// Independent synchronization for one runtime, so unrelated initialization does not serialize.
+struct RuntimeInitialization<'c> {
+    /// Mutable initialization state.
+    state: Mutex<Initialization<'c>>,
+
+    /// Notification after successful initialization or retryable failure.
+    ready: Condvar,
+}
+
+/// Resets an unfinished initializer on error or unwind, without poisoning the instance slot.
+struct InitializationGuard<'o, 'c> {
+    /// Slot whose running state must be cleared unless publication succeeds.
+    slot: &'o RuntimeInitialization<'c>,
+
+    /// Whether initialization still needs rollback.
+    active: bool,
+}
+
+impl Drop for InitializationGuard<'_, '_> {
+    fn drop(&mut self) {
+        if self.active {
+            *self.slot.state.lock().expect("runtime initialization mutex poisoned") = Initialization::Empty;
+            self.slot.ready.notify_all();
+        }
+    }
+}
+
+/// One execution that uses extensions and whose resources outlive discarded output handles.
+struct PendingExecution<'c> {
+    /// Completion of every participating device and native context cleanup.
+    fence: ExecutionFence,
+
+    /// Borrowed invocation resources retained until the fence is terminal.
+    _resources: RetainedExecutionResources<'c>,
+}
+
+/// Decodes configuration without constructing an oversized byte vector from persisted metadata.
+fn deserialize_runtime_configuration<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+    /// Sequence visitor enforcing the same limit as the public requirement constructor.
+    struct Configuration;
+
+    impl<'de> serde::de::Visitor<'de> for Configuration {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "a runtime configuration of at most {MAX_RUNTIME_REQUIREMENTS_BYTES} bytes")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+            let mut configuration = Vec::new();
+            while let Some(byte) = sequence.next_element::<u8>()? {
+                if configuration.len() == MAX_RUNTIME_REQUIREMENTS_BYTES {
+                    return Err(serde::de::Error::custom("runtime configuration exceeds the metadata size limit"));
+                }
+                configuration.push(byte);
+            }
+            Ok(configuration)
+        }
+    }
+
+    deserializer.deserialize_seq(Configuration)
+}
+
+/// Validates an extension identifier at every public configuration boundary.
+fn validate_identifier(identifier: &str) -> Result<(), Error> {
+    if identifier.len() > MAX_RUNTIME_REQUIREMENTS_BYTES {
+        return Err(Error::SizeLimitExceeded { message: "runtime identifier exceeds the metadata size limit".into() });
+    }
+    if identifier.is_empty() || identifier.contains('\0') {
+        return Err(RuntimeError::InvalidRequirement {
+            reason: "identifier must be nonempty and contain no NUL".into(),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -812,16 +846,16 @@ mod tests {
         /// Whether the next initialization must fail before publishing an instance.
         fail: &'c AtomicBool,
 
-        /// Optional counter for per-invocation resource destruction.
+        /// Optional counter of the resources of each invocation that have been destroyed.
         drops: Option<Arc<AtomicUsize>>,
     }
 
-    /// Client-borrowing instance whose optional resources need whole-launch retention.
+    /// Instance borrowing the client, whose optional resources must be retained through the whole launch.
     struct CountingRuntime<'c> {
         /// Borrowed client checked during invocation preparation.
         client: &'c Client<'c>,
 
-        /// Optional per-invocation resource destructor counter.
+        /// Optional counter of the resources of each invocation that have been destroyed.
         drops: Option<Arc<AtomicUsize>>,
     }
 
@@ -842,9 +876,10 @@ mod tests {
         fn initialize(
             &self,
             client: &'c Client<'c>,
-            _target: &Target,
+            target: &Target,
             requirement: &RuntimeRequirement,
         ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+            let _ = target;
             validate_builtin_requirement(requirement, self.identifier)?;
             self.calls.fetch_add(1, Ordering::SeqCst);
             if self.fail.swap(false, Ordering::SeqCst) {
@@ -871,22 +906,40 @@ mod tests {
         assert_eq!(requirement.abi_version(), 2);
         assert_eq!(requirement.configuration(), &[1, 2]);
         for identifier in ["", "invalid\0identifier"] {
-            assert!(
-                matches!(RuntimeRequirement::new(identifier, 1, []), Err(Error::Runtime(RuntimeError::InvalidRequirement { reason })) if reason == "identifier must be nonempty and contain no NUL")
-            );
+            assert!(matches!(
+                RuntimeRequirement::new(identifier, 1, []),
+                Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                    if reason == "identifier must be nonempty and contain no NUL",
+            ));
         }
-        assert!(
+        assert_eq!(
             serde_json::from_str::<RuntimeRequirement>(r#"{"identifier":"","abi_version":1,"configuration":[]}"#)
-                .is_err()
+                .unwrap_err()
+                .to_string(),
+            "invalid runtime requirement: identifier must be nonempty and contain no NUL",
         );
         assert!(matches!(
             RuntimeRequirement::new("x".repeat(MAX_RUNTIME_REQUIREMENTS_BYTES + 1), 1, []),
-            Err(Error::SizeLimitExceeded { message }) if message == "runtime identifier exceeds the metadata size limit"
+            Err(Error::SizeLimitExceeded { message })
+                if message == "runtime identifier exceeds the metadata size limit",
         ));
         assert!(matches!(
             RuntimeRequirement::new("test.provider", 1, vec![0; MAX_RUNTIME_REQUIREMENTS_BYTES + 1]),
-            Err(Error::SizeLimitExceeded { message }) if message == "runtime configuration exceeds the metadata size limit"
+            Err(Error::SizeLimitExceeded { message })
+                if message == "runtime configuration exceeds the metadata size limit",
         ));
+    }
+
+    #[test]
+    fn test_runtime_requirement_deserialize_bounds_configuration() {
+        let encoded = serde_json::json!({
+            "identifier": "test.provider", "abi_version": 1,
+            "configuration": vec![0; MAX_RUNTIME_REQUIREMENTS_BYTES + 1],
+        });
+        assert_eq!(
+            serde_json::from_value::<RuntimeRequirement>(encoded).unwrap_err().to_string(),
+            "runtime configuration exceeds the metadata size limit",
+        );
     }
 
     #[test]
@@ -895,23 +948,12 @@ mod tests {
         let second = builtin_requirement("test.b");
         assert_eq!(
             normalize_runtime_requirements([second.clone(), first.clone(), second.clone()]).unwrap(),
-            vec![first.clone(), second]
+            vec![first.clone(), second],
         );
-        assert!(
-            matches!(normalize_runtime_requirements([first, RuntimeRequirement::new("test.a", 2, []).unwrap()]), Err(Error::Runtime(RuntimeError::ConflictingRequirements { identifier })) if identifier == "test.a")
-        );
-    }
-
-    #[test]
-    fn test_runtime_requirement_deserialization_bounds_configuration() {
-        let encoded = serde_json::json!({
-            "identifier": "test.provider", "abi_version": 1,
-            "configuration": vec![0; MAX_RUNTIME_REQUIREMENTS_BYTES + 1],
-        });
-        assert_eq!(
-            serde_json::from_value::<RuntimeRequirement>(encoded).unwrap_err().to_string(),
-            "runtime configuration exceeds the metadata size limit"
-        );
+        assert!(matches!(
+            normalize_runtime_requirements([first, RuntimeRequirement::new("test.a", 2, []).unwrap()]),
+            Err(Error::Runtime(RuntimeError::ConflictingRequirements { identifier })) if identifier == "test.a",
+        ));
     }
 
     #[test]
@@ -921,11 +963,13 @@ mod tests {
             with_runtime_requirements(call, [builtin_requirement("test.b"), builtin_requirement("test.a")]).unwrap();
         assert_eq!(
             runtime_requirements(&annotated).unwrap(),
-            vec![builtin_requirement("test.a"), builtin_requirement("test.b")]
+            vec![builtin_requirement("test.a"), builtin_requirement("test.b")],
         );
-        assert!(
-            matches!(with_runtime_requirements(annotated, [builtin_requirement("test.a")]), Err(Error::Runtime(RuntimeError::InvalidRequirement { reason })) if reason == "duplicate runtime-requirement annotation")
-        );
+        assert!(matches!(
+            with_runtime_requirements(annotated, [builtin_requirement("test.a")]),
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                if reason == "duplicate runtime-requirement annotation",
+        ));
     }
 
     #[test]
@@ -935,34 +979,43 @@ mod tests {
             RuntimeRequirement::new("test.provider", 1, vec![255; MAX_RUNTIME_REQUIREMENTS_BYTES]).unwrap();
         assert!(matches!(
             with_runtime_requirements(call, [requirement]),
-            Err(Error::SizeLimitExceeded { message }) if message == "runtime requirements exceed the metadata size limit"
+            Err(Error::SizeLimitExceeded { message })
+                if message == "runtime requirements exceed the metadata size limit",
         ));
     }
 
     #[test]
     fn test_runtime_requirements_rejects_invalid_annotations() {
         let call = || CustomCallOperation::new("test.call", vec![ArrayType::scalar(DataType::F32)]);
-        assert!(
-            matches!(runtime_requirements(&call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, true)), Err(Error::Runtime(RuntimeError::InvalidRequirement { reason })) if reason == "runtime requirements must be encoded as a string")
-        );
-        assert!(
-            matches!(runtime_requirements(&call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "[2,[]]")), Err(Error::Runtime(RuntimeError::InvalidRequirement { reason })) if reason == "unsupported runtime-requirement encoding version 2")
-        );
+        assert!(matches!(
+            runtime_requirements(&call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, true)),
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                if reason == "runtime requirements must be encoded as a string",
+        ));
+        assert!(matches!(
+            runtime_requirements(&call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "[2,[]]")),
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                if reason == "unsupported runtime-requirement encoding version 2",
+        ));
+        // The reason of a malformed annotation is the diagnostic of the JSON decoder.
         assert!(matches!(
             runtime_requirements(&call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "not json")),
-            Err(Error::Runtime(RuntimeError::InvalidRequirement { .. }))
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { .. })),
         ));
         let duplicate = call()
             .with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "[1,[]]")
             .with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, "[1,[]]");
-        assert!(
-            matches!(runtime_requirements(&duplicate), Err(Error::Runtime(RuntimeError::InvalidRequirement { reason })) if reason == "duplicate runtime-requirement annotation")
-        );
+        assert!(matches!(
+            runtime_requirements(&duplicate),
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                if reason == "duplicate runtime-requirement annotation",
+        ));
         assert!(matches!(
             runtime_requirements(
-                &call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, " ".repeat(MAX_RUNTIME_REQUIREMENTS_BYTES + 1))
+                &call().with_attribute(RUNTIME_REQUIREMENTS_ATTRIBUTE, " ".repeat(MAX_RUNTIME_REQUIREMENTS_BYTES + 1)),
             ),
-            Err(Error::SizeLimitExceeded { .. })
+            Err(Error::SizeLimitExceeded { message })
+                if message == "runtime requirements exceed the metadata size limit",
         ));
     }
 
@@ -984,6 +1037,18 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_extensions_new() {
+        // The built-in configuration provides the kernel runtimes of the enabled backends and the runtimes of the
+        // managed print and assertion handlers, and it is also the default configuration.
+        #[cfg(feature = "rocm")]
+        let expected = vec!["ryft.assert", "ryft.kernel.cuda", "ryft.kernel.rocm", "ryft.ordered-io", "ryft.print"];
+        #[cfg(not(feature = "rocm"))]
+        let expected = vec!["ryft.assert", "ryft.kernel.cuda", "ryft.ordered-io", "ryft.print"];
+        assert_eq!(RuntimeExtensions::new().identifiers().collect::<Vec<_>>(), expected);
+        assert_eq!(RuntimeExtensions::default().identifiers().collect::<Vec<_>>(), expected);
+    }
+
+    #[test]
     fn test_runtime_extensions_with_provider_and_replacement() {
         let calls = AtomicUsize::new(0);
         let fail = AtomicBool::new(false);
@@ -993,17 +1058,36 @@ mod tests {
         };
         let configuration = RuntimeExtensions::empty().with_provider(provider()).unwrap();
         assert_eq!(configuration.identifiers().collect::<Vec<_>>(), vec!["test.provider"]);
-        assert!(
-            matches!(configuration.clone().with_provider(provider()), Err(Error::Runtime(RuntimeError::DuplicateProvider { identifier })) if identifier == "test.provider")
-        );
-        assert!(configuration.with_replaced_provider(provider()).is_ok());
-        assert!(
-            matches!(RuntimeExtensions::empty().with_replaced_provider(provider()), Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.provider")
-        );
+        assert!(matches!(
+            configuration.clone().with_provider(provider()),
+            Err(Error::Runtime(RuntimeError::DuplicateProvider { identifier })) if identifier == "test.provider",
+        ));
+        let replaced = configuration.with_replaced_provider(provider()).unwrap();
+        assert_eq!(replaced.identifiers().collect::<Vec<_>>(), vec!["test.provider"]);
+        assert!(matches!(
+            RuntimeExtensions::empty().with_replaced_provider(provider()),
+            Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.provider",
+        ));
     }
 
     #[test]
-    fn test_runtime_registry_initializes_once_per_session_and_retries_failure() {
+    fn test_runtime_extensions_debug() {
+        let calls = AtomicUsize::new(0);
+        let fail = AtomicBool::new(false);
+        let configuration = RuntimeExtensions::empty()
+            .with_provider(Arc::new(CountingProvider {
+                identifier: "test.provider",
+                calls: &calls,
+                fail: &fail,
+                drops: None,
+            }))
+            .unwrap();
+        assert_eq!(format!("{:?}", RuntimeExtensions::empty()), "RuntimeExtensions { identifiers: [] }");
+        assert_eq!(format!("{configuration:?}"), r#"RuntimeExtensions { identifiers: ["test.provider"] }"#);
+    }
+
+    #[test]
+    fn test_runtime_registry_ensure_initializes_once_per_session_and_retries_failure() {
         let client = execution_client();
         let calls = AtomicUsize::new(0);
         let fail = AtomicBool::new(true);
@@ -1018,7 +1102,14 @@ mod tests {
         let first = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration.clone());
         let second = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
         let requirement = builtin_requirement("test.provider");
-        assert!(first.runtimes().ensure(std::slice::from_ref(&requirement), first.target().unwrap()).is_err());
+        assert_eq!(
+            first
+                .runtimes()
+                .ensure(std::slice::from_ref(&requirement), first.target().unwrap())
+                .unwrap_err()
+                .to_string(),
+            "fixture initialization failed",
+        );
         first.runtimes().ensure(std::slice::from_ref(&requirement), first.target().unwrap()).unwrap();
         first.runtimes().ensure(std::slice::from_ref(&requirement), first.target().unwrap()).unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -1027,7 +1118,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_registry_concurrent_initialization() {
+    fn test_runtime_registry_ensure_initializes_once_under_concurrent_calls() {
         let client = execution_client();
         let calls = AtomicUsize::new(0);
         let fail = AtomicBool::new(false);
@@ -1052,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_registry_retries_after_recursion_and_unwind() {
+    fn test_runtime_registry_ensure_retries_after_recursion_and_unwind() {
         /// Provider that first reenters the session and then panics before succeeding.
         struct ReentrantProvider<'c> {
             /// Weak association used solely to exercise recursive initialization without an ownership cycle.
@@ -1093,9 +1184,10 @@ mod tests {
         *provider.session.lock().unwrap() = Arc::downgrade(&session);
         let requirement = builtin_requirement("test.recursive");
         let ensure = || session.runtimes().ensure(std::slice::from_ref(&requirement), session.target().unwrap());
-        assert!(
-            matches!(ensure(), Err(Error::Runtime(RuntimeError::RecursiveInitialization { identifier })) if identifier == "test.recursive")
-        );
+        assert!(matches!(
+            ensure(),
+            Err(Error::Runtime(RuntimeError::RecursiveInitialization { identifier })) if identifier == "test.recursive",
+        ));
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(ensure)).is_err());
         ensure().unwrap();
         ensure().unwrap();
@@ -1103,7 +1195,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_registry_rejects_concurrent_initialization_cycles() {
+    fn test_runtime_registry_ensure_rejects_concurrent_initialization_cycles() {
         /// Two providers that attempt to initialize each other on separate threads.
         struct DependentProvider<'c> {
             /// This provider's public contract identifier.
@@ -1131,8 +1223,9 @@ mod tests {
                 &self,
                 client: &'c Client<'c>,
                 target: &Target,
-                _requirement: &RuntimeRequirement,
+                requirement: &RuntimeRequirement,
             ) -> Result<Arc<dyn RuntimeExtension<'c> + 'c>, Error> {
+                let _ = requirement;
                 if self.reenter.swap(false, Ordering::SeqCst) {
                     self.started.wait();
                     let session = self.session.lock().unwrap().upgrade().unwrap();
@@ -1172,10 +1265,15 @@ mod tests {
             let left = threads.spawn(move || run("test.left"));
             let right = threads.spawn(move || run("test.right"));
             let results = [left.join().unwrap(), right.join().unwrap()];
-            assert!(results.iter().any(|result| matches!(result, Err(Error::Runtime(RuntimeError::RecursiveInitialization { identifier })) if identifier == "test.left" || identifier == "test.right")));
+            // The thread that reenters second observes the cycle, while the other one may complete its initialization.
+            assert!(results.iter().any(|result| matches!(
+                result,
+                Err(Error::Runtime(RuntimeError::RecursiveInitialization { identifier }))
+                    if identifier == "test.left" || identifier == "test.right",
+            )));
             assert!(results.iter().all(|result| matches!(
                 result,
-                Ok(()) | Err(Error::Runtime(RuntimeError::RecursiveInitialization { .. }))
+                Ok(()) | Err(Error::Runtime(RuntimeError::RecursiveInitialization { .. })),
             )));
         });
         session
@@ -1185,16 +1283,17 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_registry_rejects_missing_provider_before_initialization() {
+    fn test_runtime_registry_ensure_rejects_missing_provider_before_initialization() {
         let client = execution_client();
         let session = Session::with_runtime_extensions(&client, CompilationContext::new(), RuntimeExtensions::empty());
-        assert!(
-            matches!(session.runtimes().ensure(&[builtin_requirement("test.missing")], session.target().unwrap()), Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.missing")
-        );
+        assert!(matches!(
+            session.runtimes().ensure(&[builtin_requirement("test.missing")], session.target().unwrap()),
+            Err(Error::Runtime(RuntimeError::MissingProvider { identifier })) if identifier == "test.missing",
+        ));
     }
 
     #[test]
-    fn test_runtime_registry_registration_only_creates_no_context_or_retained_launch() {
+    fn test_runtime_registry_prepare_registration_only_creates_no_context_or_retained_launch() {
         let client = execution_client();
         let calls = AtomicUsize::new(0);
         let fail = AtomicBool::new(false);
@@ -1220,6 +1319,41 @@ mod tests {
             promise.set(None).unwrap();
             fence.block_until_ready().unwrap();
         }
+    }
+
+    #[test]
+    fn test_runtime_registry_retain_releases_completed_resources_without_session_drop() {
+        let client = execution_client();
+        let calls = AtomicUsize::new(0);
+        let fail = AtomicBool::new(false);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let configuration = RuntimeExtensions::empty()
+            .with_provider(Arc::new(CountingProvider {
+                identifier: "test.provider",
+                calls: &calls,
+                fail: &fail,
+                drops: Some(Arc::clone(&drops)),
+            }))
+            .unwrap();
+        let session = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
+        let resources = session
+            .runtimes()
+            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(&client, "x", 1))
+            .unwrap();
+        let (_, lease) = resources.into_parts();
+        let (event, promise) = client.event(()).unwrap();
+        let fence = ExecutionFence::new(vec![event]);
+        session.runtimes().retain(&fence, lease);
+        promise.set(None).unwrap();
+        fence.block_until_ready().unwrap();
+        let resources = session
+            .runtimes()
+            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(&client, "x", 1))
+            .unwrap();
+        let (_, lease) = resources.into_parts();
+        session.runtimes().retain(&fence, lease);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        assert!(session.runtimes().pending.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1273,37 +1407,22 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_registry_releases_completed_resources_without_session_drop() {
-        let client = execution_client();
-        let calls = AtomicUsize::new(0);
-        let fail = AtomicBool::new(false);
-        let drops = Arc::new(AtomicUsize::new(0));
-        let configuration = RuntimeExtensions::empty()
-            .with_provider(Arc::new(CountingProvider {
-                identifier: "test.provider",
-                calls: &calls,
-                fail: &fail,
-                drops: Some(Arc::clone(&drops)),
-            }))
-            .unwrap();
-        let session = Session::with_runtime_extensions(&client, CompilationContext::new(), configuration);
-        let resources = session
-            .runtimes()
-            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(&client, "x", 1))
-            .unwrap();
-        let (_, lease) = resources.into_parts();
-        let (event, promise) = client.event(()).unwrap();
-        let fence = ExecutionFence::new(vec![event]);
-        session.runtimes().retain(&fence, lease);
-        promise.set(None).unwrap();
-        fence.block_until_ready().unwrap();
-        let resources = session
-            .runtimes()
-            .prepare(&[builtin_requirement("test.provider")], session.target().unwrap(), &domain_mesh(&client, "x", 1))
-            .unwrap();
-        let (_, lease) = resources.into_parts();
-        session.runtimes().retain(&fence, lease);
-        assert_eq!(drops.load(Ordering::SeqCst), 2);
-        assert!(session.runtimes().pending.lock().unwrap().is_empty());
+    fn test_validate_builtin_requirement() {
+        validate_builtin_requirement(&builtin_requirement("test.builtin"), "test.builtin").unwrap();
+        assert!(matches!(
+            validate_builtin_requirement(&builtin_requirement("test.other"), "test.builtin"),
+            Err(Error::Runtime(RuntimeError::InvalidRequirement { reason }))
+                if reason == "expected runtime extension `test.builtin`",
+        ));
+        assert!(matches!(
+            validate_builtin_requirement(&RuntimeRequirement::new("test.builtin", 2, []).unwrap(), "test.builtin"),
+            Err(Error::Runtime(RuntimeError::UnsupportedVersion { identifier, version }))
+                if identifier == "test.builtin" && version == 2,
+        ));
+        assert!(matches!(
+            validate_builtin_requirement(&RuntimeRequirement::new("test.builtin", 1, [0]).unwrap(), "test.builtin"),
+            Err(Error::Runtime(RuntimeError::InvalidConfiguration { identifier, reason }))
+                if identifier == "test.builtin" && reason == "built-in runtime configuration must be empty",
+        ));
     }
 }

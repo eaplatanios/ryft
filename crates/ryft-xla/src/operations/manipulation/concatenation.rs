@@ -11,74 +11,24 @@ use ryft_mlir::{
 use crate::lowering::EffectTokens;
 use crate::lowering::types::{
     dimension_extent_i32, dimension_extent_i64, lower_constant_output, lower_physical_bound_value,
-    lower_restore_dynamic_dimensions, lower_static_index_constants, physical_bound_type,
+    lower_restore_dynamic_dimensions, lower_static_index_constants, lower_tensor_type, physical_bound_type,
 };
 use crate::operations::assertions::{
     ASSERT_ACTOR_ATTRIBUTE, ASSERT_CONCATENATE_KIND, ASSERT_DETAIL_ATTRIBUTE, ASSERT_KIND_ATTRIBUTE,
     lower_assertion_custom_call, lower_deliberately_false_assertion_predicate,
 };
-use crate::operations::lower_tensor_type;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
-
-/// Joins inputs using a bounded fan-in tree so very wide concatenations do not create pathological compiler work.
-pub(crate) fn lower_concatenate_tree<'b, 'c: 'b, 't: 'c>(
-    inputs: &[ValueRef<'b, 'c, 't>],
-    axis: usize,
-    block: &mut BlockRef<'b, 'c, 't>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    if inputs.is_empty() {
-        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
-    }
-    let mut values = inputs.to_vec();
-    while values.len() > 1 {
-        values = values
-            .chunks(16)
-            .map(|chunk| {
-                if chunk.len() == 1 {
-                    return Ok(chunk[0]);
-                }
-                let joined = block.append_operation(stable_hlo::concatenate(chunk, axis, location)?)?;
-                Ok(joined.result(0).unwrap().as_ref())
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
-    }
-    Ok(values[0])
-}
-
-/// Lowers the dynamic explicit-result-extent check owned by array IR concatenation.
-pub(crate) fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
-    axis: usize,
-    actual: ValueRef<'b, 'c, 't>,
-    input_extents: &[ValueRef<'b, 'c, 't>],
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<(), Error> {
-    let predicate = lower_deliberately_false_assertion_predicate(actual, block, context, location)?;
-    let axis = axis.to_string();
-    let backend_config = context.dictionary_attribute(&[
-        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("concatenate")),
-        context.named_attribute(
-            context.identifier(ASSERT_KIND_ATTRIBUTE),
-            context.string_attribute(ASSERT_CONCATENATE_KIND),
-        ),
-        context.named_attribute(context.identifier(ASSERT_DETAIL_ATTRIBUTE), context.string_attribute(axis.as_str())),
-    ]);
-    let observed = std::iter::once(actual).chain(input_extents.iter().copied()).collect::<Vec<_>>();
-    lower_assertion_custom_call(predicate, observed.as_slice(), backend_config, effect_tokens, block, context, location)
-}
 
 impl LowerableOperation for ConcatenateOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        Ok(vec![lower_concatenate_tree(input_values, self.axis(), &mut lowerer.block, lowerer.location)?])
+        let _ = (input_types, output_types);
+        Ok(vec![lower_concatenate_tree(input_values, self.axis(), &mut lowerer.block(), lowerer.location())?])
     }
 }
 
@@ -90,10 +40,10 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
         input_types: &[ArrayIrType],
         output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let context = lowerer.context;
-        let location = lowerer.location;
-        let effect_tokens = &mut lowerer.effect_tokens;
-        let block = &mut lowerer.block;
+        let context = lowerer.context();
+        let location = lowerer.location();
+        let block = &mut lowerer.block();
+        let effect_tokens = lowerer.effect_tokens_mut();
         let Some((result_extent, array_inputs)) = input_values.split_last() else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }.into());
         };
@@ -120,10 +70,9 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
                     CoreDimension::Dynamic(_) => {
                         let extent =
                             block.append_operation(stable_hlo::get_dimension_size(*input, self.axis(), location)?)?;
-                        let extent =
-                            extent.result(0).expect("stablehlo.get_dimension_size should return one result").as_ref();
+                        let extent = extent.result(0).unwrap().as_ref();
                         let extent = block.append_operation(stable_hlo::convert(extent, i64_type, location)?)?;
-                        extent.result(0).expect("stablehlo.convert should return one result").as_ref()
+                        extent.result(0).unwrap().as_ref()
                     }
                 };
                 input_extents.push(extent);
@@ -178,8 +127,8 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
                 dimension_extent_i64(physical_output_type.dimension(self.axis()).value().unwrap())?
                     - dimension_extent_i64(physical_input_type.dimension(self.axis()).value().unwrap())?;
             if high_padding[self.axis()] != 0 {
-                // Padding is outside the logical extent; choose a representable value even for the exponent-only
-                // float format, which has no zero encoding.
+                // Padding is outside the logical extent, so choose a representable value even for the float format
+                // that only has exponent bits, which has no zero encoding.
                 let padding = lower_constant_output(
                     &[ArrayType::scalar(output_type.data_type())],
                     padding_value,
@@ -210,11 +159,70 @@ impl LowerableOperation for ConcatenateOperation<ArrayIrType> {
     }
 }
 
+/// Joins inputs using a bounded fan-in tree so very wide concatenations do not create pathological compiler work.
+fn lower_concatenate_tree<'b, 'c: 'b, 't: 'c>(
+    inputs: &[ValueRef<'b, 'c, 't>],
+    axis: usize,
+    block: &mut BlockRef<'b, 'c, 't>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    if inputs.is_empty() {
+        return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
+    }
+    let mut values = inputs.to_vec();
+    while values.len() > 1 {
+        values = values
+            .chunks(16)
+            .map(|chunk| {
+                if chunk.len() == 1 {
+                    return Ok(chunk[0]);
+                }
+                let joined = block.append_operation(stable_hlo::concatenate(chunk, axis, location)?)?;
+                Ok(joined.result(0).unwrap().as_ref())
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+    }
+    Ok(values[0])
+}
+
+/// Lowers the runtime check that the explicit result extent of an array IR [`ConcatenateOperation`] along `axis`, given
+/// by `actual`, equals the sum of `input_extents`.
+fn lower_concatenate_extent_assertion<'b, 'c: 'b, 't: 'c>(
+    axis: usize,
+    actual: ValueRef<'b, 'c, 't>,
+    input_extents: &[ValueRef<'b, 'c, 't>],
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), Error> {
+    let predicate = lower_deliberately_false_assertion_predicate(actual, block, context, location)?;
+    let axis = axis.to_string();
+    let backend_configuration = context.dictionary_attribute(&[
+        context.named_attribute(context.identifier(ASSERT_ACTOR_ATTRIBUTE), context.string_attribute("concatenate")),
+        context.named_attribute(
+            context.identifier(ASSERT_KIND_ATTRIBUTE),
+            context.string_attribute(ASSERT_CONCATENATE_KIND),
+        ),
+        context.named_attribute(context.identifier(ASSERT_DETAIL_ATTRIBUTE), context.string_attribute(axis.as_str())),
+    ]);
+    let observed = std::iter::once(actual).chain(input_extents.iter().copied()).collect::<Vec<_>>();
+    lower_assertion_custom_call(
+        predicate,
+        observed.as_slice(),
+        backend_configuration,
+        effect_tokens,
+        block,
+        context,
+        location,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
         ArrayIrType, ArrayType, Concatenate, ConcatenateOperation, ConstantOperation, DataType, Device, DeviceMesh,
@@ -222,10 +230,8 @@ mod tests {
         DimensionType, DimensionValue, DimensionVariable, EffectClasses, LogicalMesh, MeshAxis, MeshAxisType,
         Placeholder, Shape, Sharding, ShardingDimension, TypeError, Typed, TypedProgram,
     };
-    use ryft_pjrt::{
-        BufferType, ClientOptions, CpuClientOptions, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram,
-        load_cpu_plugin,
-    };
+    use ryft_mlir::Location;
+    use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::lowering::tests::{
         ProgramBuilder, dynamic_dimension, ragged_dot_cpu_compilation_options, test_matrix_type, test_vector_type,
@@ -233,15 +239,16 @@ mod tests {
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::lowering::types::physical_bound_type;
     use crate::operations::ProgramBuilder as ArrayIrProgramBuilder;
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
     use crate::values::ArrayConstant;
     use crate::{Array, CompiledFunction, Constant, FromPjrt, Session, ToPjrt, compile, to_mlir_module_for_program};
 
     use super::*;
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_concatenate() {
-        // A static-shaped concatenate along axis 0 lowers to a single `stablehlo.concatenate` joining the operands.
+    fn test_concatenate_operation_lower() {
+        // A concatenate with static shapes along axis 0 lowers to a single `stablehlo.concatenate` joining the
+        // operands.
         let first_type = test_matrix_type(1, 2);
         let second_type = test_matrix_type(3, 2);
         let mut builder = ProgramBuilder::new();
@@ -291,7 +298,7 @@ mod tests {
         );
 
         // A mixed concatenate whose static operand types prove its explicit result extent is pure and lowers without
-        // assertion callback or dimension-size machinery.
+        // an assertion callback or dimension size machinery.
         let first_type = test_matrix_type(1, 2);
         let second_type = test_matrix_type(3, 2);
         let result_extent = DimensionValue::constant(4).unwrap();
@@ -328,16 +335,22 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(stablehlo.matches("@ryft.assert").count(), 0, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.get_dimension_size").count(), 0, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.concatenate").count(), 1, "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<1x2xf32>, %arg1: tensor<3x2xf32>) -> tensor<4x2xf32> {
+                    %0 = stablehlo.concatenate %arg0, %arg1, dim = 0 : (tensor<1x2xf32>, tensor<3x2xf32>) -> tensor<4x2xf32>
+                    return %0 : tensor<4x2xf32>
+                  }
+                }
+            "#},
+        );
 
         // Once that extent is explicit, lowering reads the concrete logical input sizes, checks their sum on the
-        // ordered-assertion chain, and passes only the arrays to StableHLO's concatenate operation.
-        let first_variable =
-            DimensionVariable::new("first", DimensionBounds::new(0, Some(5)).expect("valid test bounds"));
-        let second_variable =
-            DimensionVariable::new("second", DimensionBounds::new(0, Some(5)).expect("valid test bounds"));
+        // ordered assertion chain, and passes only the arrays to the StableHLO concatenate operation.
+        let first_variable = DimensionVariable::new("first", DimensionBounds::new(0, Some(5)).unwrap());
+        let second_variable = DimensionVariable::new("second", DimensionBounds::new(0, Some(5)).unwrap());
         let first_type = ArrayType::new(
             DataType::F32,
             Shape::new(vec![CoreDimension::Dynamic(first_variable), CoreDimension::Static(2)]),
@@ -382,9 +395,34 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(stablehlo.matches("stablehlo.get_dimension_size").count(), 5, "{stablehlo}");
-        assert_eq!(stablehlo.matches("@ryft.assert").count(), 1, "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.concatenate"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4x2xf32>, %arg1: tensor<4x2xf32>, %arg2: tensor<i32>, %arg3: tensor<i32>) -> (tensor<?x2xf32, #stablehlo.bounds<8, ?>>, tensor<i64>) {
+                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    %1 = stablehlo.set_dimension_size %arg1, %arg3, dim = 0 : (tensor<4x2xf32>, tensor<i32>) -> tensor<?x2xf32, #stablehlo.bounds<4, ?>>
+                    %2 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                    %4 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                    %6 = stablehlo.add %3, %5 : tensor<i64>
+                    %7 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %8 = stablehlo.convert %7 : (tensor<i32>) -> tensor<i64>
+                    %9 = stablehlo.get_dimension_size %1, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<i32>
+                    %10 = stablehlo.convert %9 : (tensor<i32>) -> tensor<i64>
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %11 = stablehlo.compare LT, %6, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %12 = stablehlo.after_all  : !stablehlo.token
+                    %13 = stablehlo.custom_call @ryft.assert(%11, %6, %8, %10, %12) {api_version = 4 : i32, backend_config = {actor = "concatenate", detail = "0", kind = "concatenate"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                    %14 = stablehlo.concatenate %0, %1, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<4, ?>>, tensor<?x2xf32, #stablehlo.bounds<4, ?>>) -> tensor<?x2xf32, #stablehlo.bounds<8, ?>>
+                    %15 = stablehlo.get_dimension_size %14, dim = 0 : (tensor<?x2xf32, #stablehlo.bounds<8, ?>>) -> tensor<i32>
+                    %16 = stablehlo.convert %15 : (tensor<i32>) -> tensor<i64>
+                    return %14, %16 : tensor<?x2xf32, #stablehlo.bounds<8, ?>>, tensor<i64>
+                  }
+                }
+            "#},
+        );
 
         // A dynamic non-concatenated dimension is shared by the output cotangent and every input, so the transpose
         // slices it whole through a dynamic slice limit instead of looking up a hidden runtime size.
@@ -405,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_concatenate_refined_result_extents() {
+    fn test_concatenate_operation_lower_refined_result_extents() {
         let client = execution_client();
         crate::operations::assertions::ensure_assertion_handler_registered(&client).unwrap();
         // The actual sum is three, while the input allocation bounds sum to eight. Both tighter and wider declared
@@ -455,7 +493,8 @@ mod tests {
                 )
                 .unwrap();
                 let bound = physical_bound_type(&output_type).unwrap().dimension(0).value().unwrap();
-                // Inputs carry static storage plus hidden i32 extents; dynamic outputs also return hidden i64 extents.
+                // Inputs carry static storage plus hidden i32 extents, and dynamic outputs also return hidden i64
+                // extents.
                 let storage_type = format!("tensor<{bound}x{element}>");
                 let body = if output_type.static_shape().is_some() {
                     format!(
@@ -510,19 +549,19 @@ mod tests {
                     )
                     .unwrap();
                 let device = executable.addressable_devices().unwrap().remove(0);
-                // Decode complex fixture bytes as opaque words so assertions compare exact signed-zero and imaginary
-                // bits.
+                // Decode complex fixture bytes as opaque words so assertions compare the exact bits of signed zeros
+                // and imaginary parts.
                 let left = if data_type == DataType::I64 {
                     vec![i64::MAX, 13, 14, 15]
                 } else {
-                    values_from_bytes::<i64>(&values_to_bytes(&[1_f32, -2.0, -0.0, 0.0, 3.0, -4.0, 5.0, -6.0]))
+                    values_from_bytes::<i64>(&values_to_bytes(&[1f32, -2.0, -0.0, 0.0, 3.0, -4.0, 5.0, -6.0]))
                 };
                 let right = if data_type == DataType::I64 {
                     vec![i64::MIN, 9_007_199_254_740_993, 17, 18]
                 } else {
-                    values_from_bytes::<i64>(&values_to_bytes(&[-0_f32, 0.0, 7.0, -8.0, 9.0, -10.0, 11.0, -12.0]))
+                    values_from_bytes::<i64>(&values_to_bytes(&[-0f32, 0.0, 7.0, -8.0, 9.0, -10.0, 11.0, -12.0]))
                 };
-                for (left_size, right_size) in [(1_i32, 2_i32), (0, 3), (2, 2)] {
+                for (left_size, right_size) in [(1i32, 2i32), (0, 3), (2, 2)] {
                     let inputs = vec![
                         ExecutionInput {
                             buffer: Arc::new(
@@ -598,8 +637,10 @@ mod tests {
                         )
                         .and_then(|execution| execution.block_until_ready());
                     if left_size + right_size != 3 {
-                        assert!(matches!(execution, Err(error)
-                            if error.to_string().contains("expected 4 but got 3")));
+                        assert_eq!(
+                            execution.err().unwrap().to_string(),
+                            "`concatenate` result extent must equal the sum of input axis 0 extents; expected 4 but got 3",
+                        );
                         continue;
                     }
                     let execution = execution.unwrap().remove(0);
@@ -616,26 +657,8 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_concatenate_tree() {
-        let mut builder = ProgramBuilder::new();
-        let inputs = (0..33).map(|_| builder.add_input(test_vector_type(1))).collect::<Vec<_>>();
-        let joined = builder
-            .add_instruction(ConcatenateOperation::<ArrayType>::new(0, 1).unwrap(), Vec::new(), inputs, None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayConstant>, ArrayConstant>(vec![joined], vec![Placeholder; 33], Placeholder)
-            .unwrap();
-        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        assert_eq!(module.matches("stablehlo.concatenate").count(), 3);
-        assert!(module.contains("-> tensor<33xf32>"), "{module}");
-    }
-
-    #[test]
-    fn test_lower_concatenate_explicit_sharding() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
+    fn test_concatenate_operation_lower_explicit_sharding() {
+        let client = cpu_client(2);
         let devices = client.addressable_devices().unwrap();
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
@@ -653,9 +676,9 @@ mod tests {
         )
         .unwrap();
         let first =
-            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), values_to_bytes(&[1_i64, 2, 3, 4]))
+            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), values_to_bytes(&[1i64, 2, 3, 4]))
                 .unwrap();
-        let second = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[5_i64, 6, 7, 8])).unwrap();
+        let second = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[5i64, 6, 7, 8])).unwrap();
         let output = compiled.executable().execute(&domain, (first, second)).unwrap();
         assert_eq!(output.r#type().sharding(), Some(&sharding));
         for (index, device) in devices.iter().enumerate() {
@@ -668,8 +691,52 @@ mod tests {
                 .unwrap()
                 .r#await()
                 .unwrap();
-            let expected = if index == 0 { vec![1_i64, 2, 3, 4] } else { vec![5_i64, 6, 7, 8] };
+            let expected = if index == 0 { vec![1i64, 2, 3, 4] } else { vec![5i64, 6, 7, 8] };
             assert_eq!(values_from_bytes::<i64>(bytes.as_slice()), expected);
         }
+    }
+
+    #[test]
+    fn test_lower_concatenate_tree() {
+        let context = MlirContext::new();
+        let location = context.unknown_location();
+        let input_type = lower_tensor_type(&test_vector_type(1), &context, location).unwrap();
+        let block = context.block(&[(input_type, location)]);
+        assert!(matches!(
+            lower_concatenate_tree(&[], 0, &mut block.as_ref(), location.as_ref()),
+            Err(Error::Core(error)) if matches!(
+                error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+            ),
+        ));
+
+        let mut builder = ProgramBuilder::new();
+        let inputs = (0..33).map(|_| builder.add_input(test_vector_type(1))).collect::<Vec<_>>();
+        let joined = builder
+            .add_instruction(ConcatenateOperation::<ArrayType>::new(0, 1).unwrap(), Vec::new(), inputs, None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, ArrayConstant>(vec![joined], vec![Placeholder; 33], Placeholder)
+            .unwrap();
+        let module = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        // The 33 inputs are joined as two full chunks of 16 followed by one chunk of the two partial results and the
+        // last input.
+        let parameters = (0..33).map(|index| format!("%arg{index}: tensor<1xf32>")).collect::<Vec<_>>().join(", ");
+        let first = (0..16).map(|index| format!("%arg{index}")).collect::<Vec<_>>().join(", ");
+        let second = (16..32).map(|index| format!("%arg{index}")).collect::<Vec<_>>().join(", ");
+        let sixteen = vec!["tensor<1xf32>"; 16].join(", ");
+        assert_eq!(
+            module,
+            formatdoc! {"
+                module {{
+                  func.func @main({parameters}) -> tensor<33xf32> {{
+                    %0 = stablehlo.concatenate {first}, dim = 0 : ({sixteen}) -> tensor<16xf32>
+                    %1 = stablehlo.concatenate {second}, dim = 0 : ({sixteen}) -> tensor<16xf32>
+                    %2 = stablehlo.concatenate %0, %1, %arg32, dim = 0 : (tensor<16xf32>, tensor<16xf32>, tensor<1xf32>) -> tensor<33xf32>
+                    return %2 : tensor<33xf32>
+                  }}
+                }}
+            "},
+        );
     }
 }

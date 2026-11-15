@@ -45,7 +45,7 @@ pub enum CompilationError {
     #[error("invalid {kind} sharding count; expected {expected} but got {actual}")]
     ShardingCountMismatch { kind: &'static str, expected: usize, actual: usize },
 
-    /// A valid external-reference configuration cannot be represented by this backend's executable ABI.
+    /// A valid external reference configuration cannot be represented by this backend's executable ABI.
     #[error("unsupported XLA reference ABI: {reason}")]
     UnsupportedReferenceAbi { reason: String },
 

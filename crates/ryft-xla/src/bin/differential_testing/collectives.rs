@@ -24,7 +24,7 @@ use super::{DifferentialObservation, SCHEMA, execute_collective_inputs};
 #[serde(deny_unknown_fields)]
 pub(super) struct CollectiveCase {
     /// Stable observation identifier.
-    pub(super) id: String,
+    id: String,
 
     /// Collective operation to execute.
     operation: String,
@@ -35,7 +35,7 @@ pub(super) struct CollectiveCase {
     /// Physical input shape on each participant, including a leading batch axis for batching cases.
     local_shape: Vec<usize>,
 
-    /// Row-major mesh dimensions; omitted for a one-dimensional mesh.
+    /// Row-major mesh dimensions, which are omitted for a one-dimensional mesh.
     #[serde(default)]
     mesh_shape: Vec<usize>,
 
@@ -84,190 +84,41 @@ pub(super) struct CollectiveCase {
     replicated_input: bool,
 }
 
-/// Default one-dimensional mesh axis.
-fn default_axis_name() -> String {
-    "x".into()
-}
-
-/// Default direct execution policy.
-fn default_transform() -> String {
-    "primal".into()
-}
-
-/// Reads the same manifest used by the Python comparison harness.
-pub(super) fn registry() -> Result<Vec<CollectiveCase>, Box<dyn Error>> {
-    let cases: Vec<CollectiveCase> = serde_json::from_str(include_str!("collective_cases.json"))?;
-    for (index, case) in cases.iter().enumerate() {
-        if cases[..index].iter().any(|previous| previous.id == case.id) {
-            return Err(format!("duplicate collective case `{}`", case.id).into());
-        }
-        if !matches!(
-            case.operation.as_str(),
-            "all_gather"
-                | "sum_scatter"
-                | "all_to_all"
-                | "swap_axes"
-                | "permute"
-                | "shuffle"
-                | "reduce"
-                | "vary"
-                | "axis_index"
-        ) || !matches!(case.transform.as_str(), "primal" | "batch" | "jvp" | "vjp")
-            || !matches!(case.reduction.as_deref(), None | Some("sum" | "product" | "mean" | "min" | "max"))
-        {
-            return Err(format!("unknown operation, transform, or reduction in `{}`", case.id).into());
-        }
-        if case.participants == 0 || case.local_shape.is_empty() || case.local_shape.contains(&0) {
-            return Err(format!("invalid participant count or local shape in `{}`", case.id).into());
-        }
-    }
-    Ok(cases)
-}
-
 impl CollectiveCase {
-    /// Applies the selected operation to primal, batch, or differentiation tracers through the same capability API.
-    fn apply<V>(&self, input: V) -> Result<V, ProgramError>
-    where
-        V: ParallelAllGather<ArrayType>
-            + ParallelAllToAll<ArrayType>
-            + ParallelPermute<ArrayType>
-            + ParallelReduce<ArrayType>
-            + ParallelSumScatter<ArrayType>
-            + ParallelVary<ArrayType>,
-    {
-        let mut options = if self.tiled { ryft_core::CollectiveOptions::tiled() } else { Default::default() };
-        if let Some(groups) = &self.groups {
-            options = options.with_axis_index_groups(groups.clone());
-        }
-        match self.operation.as_str() {
-            "all_gather" => input.parallel_all_gather_with_options(
-                &self.axis_name,
-                self.tensor_axis,
-                options,
-                ParallelAllGatherOutputVariance::Varying,
-            ),
-            "sum_scatter" => input.parallel_sum_scatter_with_options(&self.axis_name, self.tensor_axis, options),
-            "all_to_all" => input.parallel_all_to_all_with_options(
-                &self.axis_name,
-                self.split_axis,
-                self.concatenation_axis,
-                options,
-            ),
-            "swap_axes" => match &self.groups {
-                Some(groups) => {
-                    input.parallel_swap_axes_with_axis_index_groups(&self.axis_name, self.tensor_axis, groups.clone())
-                }
-                None => input.parallel_swap_axes(&self.axis_name, self.tensor_axis),
-            },
-            "permute" => input.parallel_permute(&self.axis_name, self.pairs.clone()),
-            "shuffle" => input.parallel_shuffle(&self.axis_name, &self.permutation),
-            "vary" => input.parallel_vary(&self.axis_name),
-            "reduce" => {
-                let kind = match self.reduction.as_deref().unwrap_or("sum") {
-                    "sum" => ReductionKind::Sum,
-                    "product" => ReductionKind::Product,
-                    "mean" => ReductionKind::Mean,
-                    "min" => ReductionKind::Min,
-                    "max" => ReductionKind::Max,
-                    kind => panic!("unknown manifest reduction `{kind}`"),
-                };
-                match &self.groups {
-                    Some(groups) => input.parallel_reduce_with_axis_index_groups(kind, &self.axis_name, groups.clone()),
-                    None => input.parallel_reduce(kind, &self.axis_name),
-                }
+    /// Reads the same manifest used by the Python comparison harness.
+    pub(super) fn registry() -> Result<Vec<Self>, Box<dyn Error>> {
+        let cases: Vec<Self> = serde_json::from_str(include_str!("collective_cases.json"))?;
+        for (index, case) in cases.iter().enumerate() {
+            if cases[..index].iter().any(|previous| previous.id == case.id) {
+                return Err(format!("duplicate collective case `{}`", case.id).into());
             }
-            operation => panic!("unknown manifest operation `{operation}`"),
+            if !matches!(
+                case.operation.as_str(),
+                "all_gather"
+                    | "sum_scatter"
+                    | "all_to_all"
+                    | "swap_axes"
+                    | "permute"
+                    | "shuffle"
+                    | "reduce"
+                    | "vary"
+                    | "axis_index"
+            ) || !matches!(case.transform.as_str(), "primal" | "batch" | "jvp" | "vjp")
+                || !matches!(case.reduction.as_deref(), None | Some("sum" | "product" | "mean" | "min" | "max"))
+            {
+                return Err(format!("unknown operation, transform, or reduction in `{}`", case.id).into());
+            }
+            if case.participants == 0 || case.local_shape.is_empty() || case.local_shape.contains(&0) {
+                return Err(format!("invalid participant count or local shape in `{}`", case.id).into());
+            }
         }
+        Ok(cases)
     }
 
-    /// Stages an actual transform within the mesh binder so named collectives survive to XLA execution.
-    fn transformed(&self, input: ArrayTracer, seed: ArrayTracer) -> Result<Vec<ArrayTracer>, ProgramError> {
-        match self.transform.as_str() {
-            "primal" if self.operation == "axis_index" => {
-                let index = input.domain().axis_index(&self.axis_name)?;
-                let index = index.convert_element_type(ryft_core::DataType::F32)?;
-                let index_sharding = index
-                    .r#type()
-                    .sharding()
-                    .unwrap()
-                    .with_broadcasted_dimensions(input.r#type().rank(), &[])
-                    .map_err(ryft_core::TypeError::from)?;
-                let output_type =
-                    input.r#type().into_owned().with_sharding(index_sharding).map_err(ryft_core::TypeError::from)?;
-                Ok(vec![index.broadcast(output_type, &[])?])
-            }
-            "primal" => Ok(vec![self.apply(input)?]),
-            "batch" => {
-                // The leading physical dimension is the unrelated mapped axis. Collective tensor axes refer to
-                // the logical slice shape; batching restores the mapped axis at position zero after the collective.
-                let output = batch(|input| self.apply(input), input, BatchAxis::new(0), BatchAxis::new(0), None)?;
-                Ok(vec![output])
-            }
-            "jvp" => {
-                let (primal, tangent) = input.clone().into_value().domain().differentiate_at(input.into_value()).jvp(
-                    seed.into_value(),
-                    |input| {
-                        let input = ValueProjection::<ArrayType>::into_projected(input)?;
-                        Ok(self.apply(input)?.into_value())
-                    },
-                )?;
-                Ok(vec![
-                    ValueProjection::<ArrayType>::into_projected(primal)?,
-                    ValueProjection::<ArrayType>::into_projected(tangent)?,
-                ])
-            }
-            "vjp" => {
-                let primal_input = input.into_value();
-                let (primal, pullback) = primal_input.domain().differentiate_at(primal_input).vjp(|input| {
-                    let input = ValueProjection::<ArrayType>::into_projected(input)?;
-                    Ok(self.apply(input)?.into_value())
-                })?;
-                let primal = ValueProjection::<ArrayType>::into_projected(primal)?;
-                // A reduction's primal boundary is invariant on the addressed mesh axis. Its replicated outputs
-                // contribute all participant seeds to that invariant cotangent before entering the local pullback.
-                let seed = if self.operation == "reduce" {
-                    match &self.groups {
-                        Some(groups) => seed.parallel_reduce_with_axis_index_groups(
-                            ReductionKind::Sum,
-                            &self.axis_name,
-                            groups.clone(),
-                        )?,
-                        None => seed.parallel_reduce(ReductionKind::Sum, &self.axis_name)?,
-                    }
-                } else {
-                    seed
-                };
-                let cotangent = pullback.apply_materialized(seed.into_value())?;
-                Ok(vec![primal, ValueProjection::<ArrayType>::into_projected(cotangent)?])
-            }
-            transform => panic!("unknown manifest transform `{transform}`"),
-        }
-    }
-
-    /// Computes the physical result shape from the collective contract without using backend inference.
-    fn output_shape(&self, mesh_shape: &[usize]) -> Vec<usize> {
-        let axis_position = if self.axis_name == "y" { 1 } else { 0 };
-        let group_size = self.groups.as_ref().map_or(mesh_shape[axis_position], |groups| groups[0].len());
-        let mut shape = self.local_shape.clone();
-        let offset = usize::from(self.transform == "batch");
-        match self.operation.as_str() {
-            "all_gather" if self.tiled => shape[self.tensor_axis + offset] *= group_size,
-            "all_gather" => shape.insert(self.tensor_axis + offset, group_size),
-            "sum_scatter" if self.tiled => shape[self.tensor_axis + offset] /= group_size,
-            "sum_scatter" => {
-                shape.remove(self.tensor_axis + offset);
-            }
-            "all_to_all" if self.tiled => {
-                shape[self.split_axis + offset] /= group_size;
-                shape[self.concatenation_axis + offset] *= group_size;
-            }
-            "all_to_all" => {
-                shape.remove(self.split_axis + offset);
-                shape.insert(self.concatenation_axis + offset, group_size);
-            }
-            _ => {}
-        }
-        shape
+    /// Returns the stable observation identifier.
+    #[inline]
+    pub(super) fn id(&self) -> &str {
+        &self.id
     }
 
     /// Compiles and executes this case using one CPU device per logical participant.
@@ -404,6 +255,161 @@ impl CollectiveCase {
             stablehlo: Some(stablehlo),
         })
     }
+
+    /// Applies the selected operation to primal, batch, or differentiation tracers through the same capability API.
+    fn apply<V>(&self, input: V) -> Result<V, ProgramError>
+    where
+        V: ParallelAllGather<ArrayType>
+            + ParallelAllToAll<ArrayType>
+            + ParallelPermute<ArrayType>
+            + ParallelReduce<ArrayType>
+            + ParallelSumScatter<ArrayType>
+            + ParallelVary<ArrayType>,
+    {
+        let mut options = if self.tiled { ryft_core::CollectiveOptions::tiled() } else { Default::default() };
+        if let Some(groups) = &self.groups {
+            options = options.with_axis_index_groups(groups.clone());
+        }
+        match self.operation.as_str() {
+            "all_gather" => input.parallel_all_gather_with_options(
+                &self.axis_name,
+                self.tensor_axis,
+                options,
+                ParallelAllGatherOutputVariance::Varying,
+            ),
+            "sum_scatter" => input.parallel_sum_scatter_with_options(&self.axis_name, self.tensor_axis, options),
+            "all_to_all" => input.parallel_all_to_all_with_options(
+                &self.axis_name,
+                self.split_axis,
+                self.concatenation_axis,
+                options,
+            ),
+            "swap_axes" => match &self.groups {
+                Some(groups) => {
+                    input.parallel_swap_axes_with_axis_index_groups(&self.axis_name, self.tensor_axis, groups.clone())
+                }
+                None => input.parallel_swap_axes(&self.axis_name, self.tensor_axis),
+            },
+            "permute" => input.parallel_permute(&self.axis_name, self.pairs.clone()),
+            "shuffle" => input.parallel_shuffle(&self.axis_name, &self.permutation),
+            "vary" => input.parallel_vary(&self.axis_name),
+            "reduce" => {
+                let kind = match self.reduction.as_deref().unwrap_or("sum") {
+                    "sum" => ReductionKind::Sum,
+                    "product" => ReductionKind::Product,
+                    "mean" => ReductionKind::Mean,
+                    "min" => ReductionKind::Min,
+                    "max" => ReductionKind::Max,
+                    kind => panic!("unknown manifest reduction `{kind}`"),
+                };
+                match &self.groups {
+                    Some(groups) => input.parallel_reduce_with_axis_index_groups(kind, &self.axis_name, groups.clone()),
+                    None => input.parallel_reduce(kind, &self.axis_name),
+                }
+            }
+            operation => panic!("unknown manifest operation `{operation}`"),
+        }
+    }
+
+    /// Stages an actual transform within the mesh binder so named collectives survive to XLA execution.
+    fn transformed(&self, input: ArrayTracer, seed: ArrayTracer) -> Result<Vec<ArrayTracer>, ProgramError> {
+        match self.transform.as_str() {
+            "primal" if self.operation == "axis_index" => {
+                let index = input.domain().axis_index(&self.axis_name)?;
+                let index = index.convert_element_type(ryft_core::DataType::F32)?;
+                let index_sharding = index
+                    .r#type()
+                    .sharding()
+                    .unwrap()
+                    .with_broadcasted_dimensions(input.r#type().rank(), &[])
+                    .map_err(ryft_core::TypeError::from)?;
+                let output_type =
+                    input.r#type().into_owned().with_sharding(index_sharding).map_err(ryft_core::TypeError::from)?;
+                Ok(vec![index.broadcast(output_type, &[])?])
+            }
+            "primal" => Ok(vec![self.apply(input)?]),
+            "batch" => {
+                // The leading physical dimension is the unrelated mapped axis. Collective tensor axes refer to
+                // the logical slice shape, and batching restores the mapped axis at position zero after the collective.
+                let output = batch(|input| self.apply(input), input, BatchAxis::new(0), BatchAxis::new(0), None)?;
+                Ok(vec![output])
+            }
+            "jvp" => {
+                let (primal, tangent) = input.clone().into_value().domain().differentiate_at(input.into_value()).jvp(
+                    seed.into_value(),
+                    |input| {
+                        let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                        Ok(self.apply(input)?.into_value())
+                    },
+                )?;
+                Ok(vec![
+                    ValueProjection::<ArrayType>::into_projected(primal)?,
+                    ValueProjection::<ArrayType>::into_projected(tangent)?,
+                ])
+            }
+            "vjp" => {
+                let primal_input = input.into_value();
+                let (primal, pullback) = primal_input.domain().differentiate_at(primal_input).vjp(|input| {
+                    let input = ValueProjection::<ArrayType>::into_projected(input)?;
+                    Ok(self.apply(input)?.into_value())
+                })?;
+                let primal = ValueProjection::<ArrayType>::into_projected(primal)?;
+                // A reduction's primal boundary is invariant on the addressed mesh axis. Its replicated outputs
+                // contribute all participant seeds to that invariant cotangent before entering the local pullback.
+                let seed = if self.operation == "reduce" {
+                    match &self.groups {
+                        Some(groups) => seed.parallel_reduce_with_axis_index_groups(
+                            ReductionKind::Sum,
+                            &self.axis_name,
+                            groups.clone(),
+                        )?,
+                        None => seed.parallel_reduce(ReductionKind::Sum, &self.axis_name)?,
+                    }
+                } else {
+                    seed
+                };
+                let cotangent = pullback.apply_materialized(seed.into_value())?;
+                Ok(vec![primal, ValueProjection::<ArrayType>::into_projected(cotangent)?])
+            }
+            transform => panic!("unknown manifest transform `{transform}`"),
+        }
+    }
+
+    /// Computes the physical result shape from the collective contract without using backend inference.
+    fn output_shape(&self, mesh_shape: &[usize]) -> Vec<usize> {
+        let axis_position = if self.axis_name == "y" { 1 } else { 0 };
+        let group_size = self.groups.as_ref().map_or(mesh_shape[axis_position], |groups| groups[0].len());
+        let mut shape = self.local_shape.clone();
+        let offset = usize::from(self.transform == "batch");
+        match self.operation.as_str() {
+            "all_gather" if self.tiled => shape[self.tensor_axis + offset] *= group_size,
+            "all_gather" => shape.insert(self.tensor_axis + offset, group_size),
+            "sum_scatter" if self.tiled => shape[self.tensor_axis + offset] /= group_size,
+            "sum_scatter" => {
+                shape.remove(self.tensor_axis + offset);
+            }
+            "all_to_all" if self.tiled => {
+                shape[self.split_axis + offset] /= group_size;
+                shape[self.concatenation_axis + offset] *= group_size;
+            }
+            "all_to_all" => {
+                shape.remove(self.split_axis + offset);
+                shape.insert(self.concatenation_axis + offset, group_size);
+            }
+            _ => {}
+        }
+        shape
+    }
+}
+
+/// Default one-dimensional mesh axis.
+fn default_axis_name() -> String {
+    "x".into()
+}
+
+/// Default direct execution policy.
+fn default_transform() -> String {
+    "primal".into()
 }
 
 #[cfg(test)]
@@ -413,8 +419,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_registry() {
-        let cases = registry().unwrap();
+    fn test_collective_case_registry() {
+        let cases = CollectiveCase::registry().unwrap();
         assert_eq!(cases.first().unwrap().id, "collective_gather_1_untiled");
         assert!(cases.iter().any(|case| case.participants == 8));
         assert!(cases.iter().any(|case| case.mesh_shape == [2, 2]));
@@ -425,7 +431,7 @@ mod tests {
 
     #[test]
     fn test_collective_case_output_shape() {
-        let cases = registry().unwrap();
+        let cases = CollectiveCase::registry().unwrap();
         let gather = cases.iter().find(|case| case.id == "collective_gather_4_untiled").unwrap();
         assert_eq!(gather.output_shape(&[4]), vec![2, 4, 3]);
         let gather = cases.iter().find(|case| case.id == "collective_gather_tiled_axis_1").unwrap();

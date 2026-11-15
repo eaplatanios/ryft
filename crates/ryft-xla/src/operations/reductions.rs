@@ -6,7 +6,7 @@ use ryft_core::{
 use ryft_mlir::dialects::stable_hlo;
 use ryft_mlir::dialects::stable_hlo::Accuracy;
 use ryft_mlir::{
-    Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, LocationRef,
+    Attribute, Block, BlockRef, Context as MlirContext, DenseElementsAttributeRef, DetachedRegion, LocationRef,
     Operation as MlirOperation, Region, Size as MlirSize, TensorTypeRef, Type, Value as MlirValue, ValueRef,
 };
 
@@ -21,151 +21,11 @@ use crate::operations::extrema::{FloatExtremumForm, lower_extremum_to_mlir};
 use crate::operations::sharding::constrain_sharding::lower_replication_constraint;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
-/// Lowers an [`ArgMaxOperation`] (when `maximize` is `true`) or an [`ArgMinOperation`] along `axis` to a variadic
-/// `stablehlo.reduce` over the input and a `stablehlo.iota` of its indices along `axis`, returning the reduced indices.
-/// The reduction starts from the extremum identity of the input data type (i.e., the lowest value for `argmax` and the
-/// highest one for `argmin`) paired with index zero, and its comparator (refer to
-/// [`build_index_reduction_body_region`]) is commutative and associative, so that the result does not depend on the
-/// order in which XLA combines elements. Narrow floating-point inputs compare in `f32`, into which they convert exactly
-/// (including their NaNs and signed zeros), and signed one-bit inputs and indices use a signed byte carrier, because
-/// StableHLO treats `i1` as a predicate.
-///
-/// Bounded-dynamic inputs are supported as well: XLA's bounded-dynamic legalizer pads every input of a variadic
-/// `stablehlo.reduce` along a dynamic reduced axis with that input's own initial value, so padded positions hold the
-/// extremum identity paired with index zero. Such a pair never strictly beats a live element, and it ties with live
-/// elements only when every live element equals the identity, in which case index zero is the correct result. Dynamic
-/// axes that are not reduced pass through the reduction unchanged.
-pub(crate) fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
-    maximize: bool,
-    axis: usize,
-    input_value: ValueRef<'b, 'c, 't>,
-    input_type: &ArrayType,
-    output_type: &ArrayType,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let (value, value_data_type) = match input_type.data_type() {
-        DataType::I1 => (lower_signed_one_bit_to_mlir(input_value, block, context, location)?, DataType::I8),
-        data_type if data_type.is_floating_point() && !matches!(data_type, DataType::F32 | DataType::F64) => {
-            let working_type =
-                lower_tensor_type(&ArrayType::new(DataType::F32, input_type.shape().clone()), context, location)?;
-            let converted = block.append_operation(stable_hlo::convert(input_value, working_type, location)?)?;
-            (converted.result(0).expect("stablehlo.convert should return one result").as_ref(), DataType::F32)
-        }
-        data_type => (input_value, data_type),
-    };
-    let index_data_type = match output_type.data_type() {
-        DataType::I1 => DataType::I8,
-        data_type => data_type,
-    };
-
-    // `stablehlo.reduce` requires its inputs to share one shape, so the index iota takes the bounded-dynamic type of
-    // the input: it is built at the physical bound of every dynamic axis and then receives the runtime extents of the
-    // input. Statically shaped inputs need no refinement.
-    let index_type = ArrayType::new(index_data_type, input_type.shape().clone());
-    let physical_index_tensor_type = lower_tensor_type(&physical_bound_type(&index_type)?, context, location)?;
-    let indices = block.append_operation(stable_hlo::iota(physical_index_tensor_type, axis, location)?)?;
-    let indices = indices.result(0).expect("stablehlo.iota should return one result").as_ref();
-    let extent_sources = (0..index_type.rank()).map(|axis| (input_value, axis)).collect::<Vec<_>>();
-    let indices = lower_restore_dynamic_dimensions(indices, &index_type, &extent_sources, block, context, location)?;
-    let identity_kind = if maximize { ReductionKind::Max } else { ReductionKind::Min };
-    let value_identity = build_reduction_identity_constant(identity_kind, value_data_type, block, context, location)?;
-    let scalar_index_type = ArrayType::scalar(index_data_type);
-    let scalar_index_tensor_type = lower_tensor_type(&scalar_index_type, context, location)?;
-    let index_identity =
-        lower_f64_constant_splat(0.0, &scalar_index_type, scalar_index_tensor_type, block, context, location)?;
-    let body = build_index_reduction_body_region(maximize, value_data_type, index_data_type, context, location)?;
-    let reduced = block.append_operation(stable_hlo::reduce(
-        &[value, indices],
-        &[value_identity, index_identity],
-        &[axis],
-        body,
-        location,
-    )?)?;
-    let reduced_indices = reduced.result(1).expect("stablehlo.reduce should return one result per input").as_ref();
-    if index_data_type == output_type.data_type() {
-        return Ok(reduced_indices);
-    }
-    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
-    let converted = block.append_operation(stable_hlo::convert(reduced_indices, output_tensor_type, location)?)?;
-    Ok(converted.result(0).expect("stablehlo.convert should return one result").as_ref())
-}
-
-/// Builds the comparator region of [`lower_index_reduction_to_mlir`], which combines two `(value, index)` pairs by
-/// picking the left pair when its value is strictly better than the right one, or equivalent to it with a lower index.
-/// For `argmax` (when `maximize` is `true`), a value is strictly better when it is greater, and for `argmin` when it is
-/// smaller, comparing floating-point values with `FLOAT` semantics (so that `-0.0` and `+0.0` are equivalent).
-/// A floating-point NaN is also strictly better than every ordered value for both directions, and two NaNs are
-/// equivalent. Unlike JAX's comparator, which picks the left pair whenever its value is a NaN, this one is commutative
-/// and associative, so every combination order selects the first NaN and the lowest index among ties.
-fn build_index_reduction_body_region<'c, 't>(
-    maximize: bool,
-    value_data_type: DataType,
-    index_data_type: DataType,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
-    let value_tensor_type = lower_tensor_type(&ArrayType::scalar(value_data_type), context, location)?;
-    let index_tensor_type = lower_tensor_type(&ArrayType::scalar(index_data_type), context, location)?;
-    let block = context.block(&[
-        (value_tensor_type, location),
-        (index_tensor_type, location),
-        (value_tensor_type, location),
-        (index_tensor_type, location),
-    ]);
-    let mut region = context.region();
-    let mut block_ref = region.append_block(block)?;
-    let left_value = block_ref.argument(0)?.as_ref();
-    let left_index = block_ref.argument(1)?.as_ref();
-    let right_value = block_ref.argument(2)?.as_ref();
-    let right_index = block_ref.argument(3)?.as_ref();
-    let direction = if maximize { ComparisonDirection::GreaterThan } else { ComparisonDirection::LessThan };
-    let mut better = lower_compare_to_mlir(direction, left_value, right_value, &mut block_ref, location)?;
-    let mut equivalent =
-        lower_compare_to_mlir(ComparisonDirection::Equal, left_value, right_value, &mut block_ref, location)?;
-    if value_data_type.is_floating_point() {
-        let left_is_nan =
-            lower_compare_to_mlir(ComparisonDirection::NotEqual, left_value, left_value, &mut block_ref, location)?;
-        let right_is_nan =
-            lower_compare_to_mlir(ComparisonDirection::NotEqual, right_value, right_value, &mut block_ref, location)?;
-        let right_is_ordered =
-            lower_compare_to_mlir(ComparisonDirection::Equal, right_value, right_value, &mut block_ref, location)?;
-        let nan_beats_ordered =
-            block_ref.append_operation(stable_hlo::and(left_is_nan, right_is_ordered, location)?)?;
-        let nan_beats_ordered = nan_beats_ordered.result(0).expect("stablehlo.and should return one result").as_ref();
-        let both_nan = block_ref.append_operation(stable_hlo::and(left_is_nan, right_is_nan, location)?)?;
-        let both_nan = both_nan.result(0).expect("stablehlo.and should return one result").as_ref();
-        better = block_ref
-            .append_operation(stable_hlo::or(better, nan_beats_ordered, location)?)?
-            .result(0)
-            .expect("stablehlo.or should return one result")
-            .as_ref();
-        equivalent = block_ref
-            .append_operation(stable_hlo::or(equivalent, both_nan, location)?)?
-            .result(0)
-            .expect("stablehlo.or should return one result")
-            .as_ref();
-    }
-    let lower_index =
-        lower_compare_to_mlir(ComparisonDirection::LessThan, left_index, right_index, &mut block_ref, location)?;
-    let tie = block_ref.append_operation(stable_hlo::and(equivalent, lower_index, location)?)?;
-    let tie = tie.result(0).expect("stablehlo.and should return one result").as_ref();
-    let pick_left = block_ref.append_operation(stable_hlo::or(better, tie, location)?)?;
-    let pick_left = pick_left.result(0).expect("stablehlo.or should return one result").as_ref();
-    let value = block_ref.append_operation(stable_hlo::select(pick_left, left_value, right_value, location)?)?;
-    let value = value.result(0).expect("stablehlo.select should return one result").as_ref();
-    let index = block_ref.append_operation(stable_hlo::select(pick_left, left_index, right_index, location)?)?;
-    let index = index.result(0).expect("stablehlo.select should return one result").as_ref();
-    block_ref.append_operation(stable_hlo::r#return(&[value, index], location)?)?;
-    Ok(region)
-}
-
 /// Lowers the scalar product combiner of a `reduce` or `cumulative` body over `element_type`. Complex operands return
 /// the other operand when one of them is exactly the `1 + 0i` identity that seeds every reduction and pads every
-/// window, because multiplying by it is not exact under complex arithmetic: its zero imaginary component meets the
+/// window, because multiplying by it is not exact under complex arithmetic. Its zero imaginary component meets the
 /// other operand's infinite components as `0 · ∞ = NaN`. This is the same rule that `ryft-core`'s reference kernels
-/// apply to every product (including inputs whose elements are themselves exactly `1 + 0i`), so the two backends agree.
+/// apply to every product, including inputs whose elements are themselves exactly `1 + 0i`, so the two backends agree.
 /// Real products multiply directly.
 pub(crate) fn lower_product_combiner_to_mlir<'b, 'c: 'b, 't: 'c>(
     left: ValueRef<'b, 'c, 't>,
@@ -203,7 +63,7 @@ pub(crate) fn lower_product_combiner_to_mlir<'b, 'c: 'b, 't: 'c>(
         .as_ref())
 }
 
-/// Builds a reduction-body region for [`stable_hlo::reduce`] over the given scalar `element_type`. The generated
+/// Builds a reduction body region for [`stable_hlo::reduce`] over the given scalar `element_type`. The generated
 /// region has one block taking two scalar tensor arguments of `tensor<{element_type}>` and produces one scalar result
 /// through the combiner matching the reduction kind. Floating-point extrema use the provided [`FloatExtremumForm`],
 /// which no other combiner depends on.
@@ -213,14 +73,14 @@ pub(crate) fn build_reduce_body_region<'c, 't>(
     form: FloatExtremumForm,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
-) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
+) -> Result<DetachedRegion<'c, 't>, Error> {
     let scalar_array_type = ArrayType::scalar(element_type);
     let scalar_tensor_type = lower_tensor_type(&scalar_array_type, context, location)?;
     let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
     let mut region = context.region();
     let mut block_ref = region.append_block(block)?;
-    let lhs = block_ref.argument(0)?.as_ref();
-    let rhs = block_ref.argument(1)?.as_ref();
+    let left = block_ref.argument(0)?.as_ref();
+    let right = block_ref.argument(1)?.as_ref();
     let body_value = match kind {
         ReductionKind::LogSumExp => {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
@@ -232,27 +92,27 @@ pub(crate) fn build_reduce_body_region<'c, 't>(
                 ),
             }));
         }
-        ReductionKind::Sum | ReductionKind::Mean => block_ref
-            .append_operation(stable_hlo::add(lhs, rhs, location)?)?
-            .result(0)
-            .expect("stablehlo.add should return one result")
-            .as_ref(),
+        ReductionKind::Sum | ReductionKind::Mean => {
+            block_ref.append_operation(stable_hlo::add(left, right, location)?)?.result(0).unwrap().as_ref()
+        }
         ReductionKind::Product => {
-            lower_product_combiner_to_mlir(lhs, rhs, element_type, &mut block_ref, context, location)?
+            lower_product_combiner_to_mlir(left, right, element_type, &mut block_ref, context, location)?
         }
-        ReductionKind::Max | ReductionKind::Min => {
-            lower_extremum_to_mlir(kind == ReductionKind::Max, element_type, lhs, rhs, form, &mut block_ref, location)?
+        ReductionKind::Max | ReductionKind::Min => lower_extremum_to_mlir(
+            kind == ReductionKind::Max,
+            element_type,
+            left,
+            right,
+            form,
+            &mut block_ref,
+            location,
+        )?,
+        ReductionKind::Any => {
+            block_ref.append_operation(stable_hlo::or(left, right, location)?)?.result(0).unwrap().as_ref()
         }
-        ReductionKind::Any => block_ref
-            .append_operation(stable_hlo::or(lhs, rhs, location)?)?
-            .result(0)
-            .expect("stablehlo.or should return one result")
-            .as_ref(),
-        ReductionKind::All => block_ref
-            .append_operation(stable_hlo::and(lhs, rhs, location)?)?
-            .result(0)
-            .expect("stablehlo.and should return one result")
-            .as_ref(),
+        ReductionKind::All => {
+            block_ref.append_operation(stable_hlo::and(left, right, location)?)?.result(0).unwrap().as_ref()
+        }
     };
     block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
     Ok(region)
@@ -260,11 +120,11 @@ pub(crate) fn build_reduce_body_region<'c, 't>(
 
 /// Lowers an [`ArrayOperation::Reduce`](ryft_core::ArrayOperation::Reduce) dispatch using the reduction kind's scalar
 /// combiner and identity. [`ReductionKind::Mean`] divides a sum by the reduced element count, while
-/// [`ReductionKind::LogSumExp`] uses the guarded maximum-shifted expansion in [`lower_log_sum_exp_to_mlir`].
+/// [`ReductionKind::LogSumExp`] uses the guarded expansion shifted by the maximum in [`lower_log_sum_exp_to_mlir`].
 /// Floating-point extrema, including the maximum of that expansion, use the provided [`FloatExtremumForm`]. Callers
 /// that lower for a target obtain it from [`FloatExtremumForm::for_combiner`], and it has no effect on the other kinds.
 /// The [`FloatExtremumForm::TotalOrder`] extrema of the floating-point types that have [`TotalOrderKeys`] reduce those
-/// keys instead of comparing in the combiner (refer to [`lower_total_order_extremum_reduce_to_mlir`]).
+/// keys instead of comparing in the combiner, as [`lower_total_order_extremum_reduce_to_mlir`] describes.
 pub(crate) fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     kind: ReductionKind,
     axes: &[usize],
@@ -286,7 +146,7 @@ pub(crate) fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
                 DataType::BF16 | DataType::F16 | DataType::F8E3M4 | DataType::F8E4M3 | DataType::F8E5M2,
             ))
     {
-        // Keep both accumulation and mean normalization in `f32`; rounding the sum or count first can overflow.
+        // Keep both accumulation and mean normalization in `f32`, because rounding the sum or count first can overflow.
         let input_type = input_value.r#type()?.cast::<TensorTypeRef>().unwrap();
         let working_input_type = context.tensor_type(
             context.float32_type(),
@@ -339,9 +199,9 @@ pub(crate) fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
     }
     let initial_value = build_reduction_identity_constant(kind, element_type, block, context, location)?;
     let body_region = build_reduce_body_region(kind, element_type, form, context, location)?;
-    let reduce_op = stable_hlo::reduce(&[input_value], &[initial_value], axes, body_region, location)?;
-    let result = block.append_operation(reduce_op)?;
-    let reduced = result.result(0).expect("stablehlo.reduce should return one result").as_ref();
+    let reduced =
+        block.append_operation(stable_hlo::reduce(&[input_value], &[initial_value], axes, body_region, location)?)?;
+    let reduced = reduced.result(0).unwrap().as_ref();
     if !matches!(kind, ReductionKind::Mean) {
         return Ok(reduced);
     }
@@ -383,10 +243,195 @@ pub(crate) fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         lower_f64_constant_splat(count as f64, output_array_type, output_tensor_type, block, context, location)?
     };
     let mean = block.append_operation(stable_hlo::divide(reduced, divisor, location)?)?;
-    Ok(mean.result(0).expect("stablehlo.divide should return one result").as_ref())
+    Ok(mean.result(0).unwrap().as_ref())
 }
 
-/// Lowers [`ReductionKind::LogSumExp`] using a guarded maximum-shifted construction, since StableHLO has no
+/// Builds a scalar constant equal to the identity element for the given reduction kind, returned as an MLIR
+/// `tensor<{element_type}>` value, which serves as the `initial_values` argument of `stablehlo.reduce`.
+pub(crate) fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
+    kind: ReductionKind,
+    element_type: DataType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let scalar_array_type = ArrayType::scalar(element_type);
+    let scalar_tensor_type = lower_tensor_type(&scalar_array_type, context, location)?;
+    if element_type.is_complex() {
+        let real = match kind {
+            ReductionKind::Sum | ReductionKind::Mean => 0.0,
+            ReductionKind::Product => 1.0,
+            ReductionKind::Max => f64::NEG_INFINITY,
+            ReductionKind::Min => f64::INFINITY,
+            ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
+                return Err(Error::Lowering(LoweringError::UnsupportedElementType {
+                    data_type: element_type,
+                    context: format!("{kind} reduction identity"),
+                }));
+            }
+        };
+        let part_data_type = if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
+        let part_type = ArrayType::scalar(part_data_type);
+        let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
+        let real_value = lower_f64_constant_splat(real, &part_type, part_tensor_type, block, context, location)?;
+        // Products use `1 + 0i`, while lexicographic extrema need both components at the same bound.
+        let imaginary_value = if kind == ReductionKind::Product {
+            lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?
+        } else {
+            real_value
+        };
+        let complex = block.append_operation(stable_hlo::complex(real_value, imaginary_value, location)?)?;
+        return Ok(complex.result(0).unwrap().as_ref());
+    }
+    let attribute = build_reduction_identity_attribute(kind, element_type, scalar_tensor_type, context)?;
+    let result = block.append_operation(stable_hlo::constant(attribute, location)?)?;
+    Ok(result.result(0).unwrap().as_ref())
+}
+
+impl LowerableOperation for ReduceOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_types, 1, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        let element_type = output_types[0].data_type();
+
+        // The reduced dimensions can be sharded when the type of the input shards one of them over an explicit mesh
+        // axis, and when its mesh has an auto axis with more than one device, over which the compiler places values
+        // without the type describing it.
+        let shardable_sharding = input_types[0].sharding().filter(|sharding| {
+            self.axes().iter().any(|axis| sharding.dimensions()[*axis].has_explicit_axis(sharding.mesh()))
+                || sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
+        });
+
+        // XLA can only distribute a reduction whose combiner is a single operation. The total order form has such a
+        // combiner for the extrema that reduce integer keys, and XLA compiles those keys for every target, so a
+        // reduction whose dimensions can be sharded uses that form wherever it distributes. Other reductions keep
+        // the form of their target (e.g., the native extrema that XLA's GPU compiler fuses into Triton kernels).
+        let form = match shardable_sharding {
+            Some(_) if has_distributable_combiner(self.kind(), element_type, FloatExtremumForm::TotalOrder) => {
+                FloatExtremumForm::TotalOrder
+            }
+            _ => FloatExtremumForm::for_combiner(lowerer.collective_state().target_platform()),
+        };
+
+        // A combiner that XLA cannot distribute in any form reduces a copy of the input that is replicated along the
+        // reduced dimensions, so that every device reduces all of their elements itself. That gathers the shards
+        // along those dimensions, where a distributed reduction would only exchange its results, but it keeps the
+        // result of the combiner.
+        let mut input_value = input_values[0];
+        if let Some(sharding) = shardable_sharding
+            && !has_distributable_combiner(self.kind(), element_type, form)
+        {
+            input_value = lower_replication_constraint(
+                input_value,
+                sharding,
+                self.axes(),
+                lowerer.collective_state().bound_manual_axes(),
+                &mut lowerer.block(),
+                lowerer.location(),
+            )?;
+        }
+        let value = lower_reduce_to_mlir(
+            self.kind(),
+            self.axes(),
+            input_value,
+            &output_types[0],
+            form,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+        Ok(vec![value])
+    }
+}
+
+impl LowerableOperation for ArgMaxOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_types, 1, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        Ok(vec![lower_index_reduction_to_mlir(
+            true,
+            self.axis(),
+            input_values[0],
+            &input_types[0],
+            &output_types[0],
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?])
+    }
+}
+
+impl LowerableOperation for ArgMinOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        check_count!("input", input_types, 1, ProgramError);
+        check_count!("output", output_types, 1, ProgramError);
+        Ok(vec![lower_index_reduction_to_mlir(
+            false,
+            self.axis(),
+            input_values[0],
+            &input_types[0],
+            &output_types[0],
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?])
+    }
+}
+
+/// Signed integer keys whose order is the IEEE total order of the values of a floating-point data type. The key of a
+/// value with a clear sign bit is its bit pattern, and the key of a value with a set sign bit is that pattern with
+/// every other bit flipped, so that a larger magnitude gives a smaller key. The map is its own inverse, and it places
+/// negative zero directly below positive zero, the infinities beyond every finite value, and the NaNs beyond the
+/// infinity of their sign.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct TotalOrderKeys {
+    /// Signed integer data type that has the width of the floating-point data type.
+    data_type: DataType,
+
+    /// Largest value of [`Self::data_type`], which is also the mask of the bits that the keys of negative values flip.
+    maximum: i64,
+
+    /// Bit pattern, and therefore key, of positive infinity.
+    infinity: i64,
+
+    /// Bit pattern, and therefore key, of the positive quiet NaN without a payload.
+    quiet_nan: i64,
+}
+
+impl TotalOrderKeys {
+    /// Returns the [`TotalOrderKeys`] of `element_type`, or [`None`] when it is not one of the IEEE binary
+    /// interchange formats that have a signed integer data type of their width.
+    fn of(element_type: DataType) -> Option<Self> {
+        let (data_type, maximum, infinity, quiet_nan) = match element_type {
+            DataType::F16 => (DataType::I16, i16::MAX as i64, 0x7C00, 0x7E00),
+            DataType::BF16 => (DataType::I16, i16::MAX as i64, 0x7F80, 0x7FC0),
+            DataType::F32 => (DataType::I32, i32::MAX as i64, 0x7F80_0000, 0x7FC0_0000),
+            DataType::F64 => (DataType::I64, i64::MAX, 0x7FF0_0000_0000_0000, 0x7FF8_0000_0000_0000),
+            _ => return None,
+        };
+        Some(Self { data_type, maximum, infinity, quiet_nan })
+    }
+}
+
+/// Lowers [`ReductionKind::LogSumExp`] using a guarded construction shifted by the maximum, since StableHLO has no
 /// `logsumexp` primitive:
 ///
 /// ```text
@@ -396,13 +441,13 @@ pub(crate) fn lower_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
 /// ```
 ///
 /// Shifting by the maximum is what keeps the exponentials in range, and the `safe_m` substitution is what keeps the
-/// shift itself defined: a raw maximum of `-∞` (the maximum's identity, and therefore the result for an all-`-∞`
-/// slice or an empty reduction) would compute `-∞ - -∞ = NaN`, while substituting zero there leaves `log(0) + 0`,
-/// which is the correct `-∞`. The `+∞` maximum is guarded the same way, and NaN propagates through the sum. Complex
-/// operands take the maximum of their real components, which alone determine the magnitudes of their exponentials,
-/// and shift by it as a complex value with a zero imaginary component. The shift is broadcast back over the reduced
-/// axes with the identity map from the output's axes to the operand's kept axes, so both reductions see the operand's
-/// own shape. The maximum uses the provided [`FloatExtremumForm`].
+/// shift itself defined. A raw maximum of `-∞`, which is the maximum's identity and therefore the result for an
+/// all-`-∞` slice or an empty reduction, would compute `-∞ - -∞ = NaN`, while substituting zero there leaves
+/// `log(0) + 0`, which is the correct `-∞`. The `+∞` maximum is guarded the same way, and NaN propagates through the
+/// sum. Complex operands take the maximum of their real components, which alone determine the magnitudes of their
+/// exponentials, and shift by it as a complex value with a zero imaginary component. The shift is broadcast back over
+/// the reduced axes with the identity map from the output's axes to the operand's kept axes, so both reductions see the
+/// operand's own shape. The maximum uses the provided [`FloatExtremumForm`].
 fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     axes: &[usize],
     input_value: ValueRef<'b, 'c, 't>,
@@ -456,11 +501,11 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     let maximum =
         lower_reduce_to_mlir(ReductionKind::Max, axes, maximum_input, &shift_type, form, block, context, location)?;
     let finite = block.append_operation(stable_hlo::is_finite(maximum, location)?)?;
-    let finite = finite.result(0).expect("stablehlo.is_finite should return one result").as_ref();
+    let finite = finite.result(0).unwrap().as_ref();
     let shift_tensor_type = lower_tensor_type(&shift_type, context, location)?;
     let zero = lower_f64_constant_splat(0.0, &shift_type, shift_tensor_type, block, context, location)?;
     let shift = block.append_operation(stable_hlo::select(finite, maximum, zero, location)?)?;
-    let shift = shift.result(0).expect("stablehlo.select should return one result").as_ref();
+    let shift = shift.result(0).unwrap().as_ref();
     let shift = match element_type.is_complex() {
         true => block.append_operation(stable_hlo::complex(shift, zero, location)?)?.result(0).unwrap().as_ref(),
         false => shift,
@@ -468,11 +513,11 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
     let kept_axes = (0..input_tensor_type.rank()).filter(|axis| !axes.contains(axis)).collect::<Vec<_>>();
     let broadcast_shift =
         block.append_operation(stable_hlo::broadcast(shift, input_tensor_type, kept_axes.as_slice(), location)?)?;
-    let broadcast_shift = broadcast_shift.result(0).expect("stablehlo.broadcast should return one result").as_ref();
+    let broadcast_shift = broadcast_shift.result(0).unwrap().as_ref();
     let shifted = block.append_operation(stable_hlo::subtract(input_value, broadcast_shift, location)?)?;
-    let shifted = shifted.result(0).expect("stablehlo.subtract should return one result").as_ref();
+    let shifted = shifted.result(0).unwrap().as_ref();
     let exponentials = block.append_operation(stable_hlo::exponential(shifted, Accuracy::Default, location)?)?;
-    let exponentials = exponentials.result(0).expect("stablehlo.exponential should return one result").as_ref();
+    let exponentials = exponentials.result(0).unwrap().as_ref();
     let sum_initial_value =
         build_reduction_identity_constant(ReductionKind::Sum, element_type, block, context, location)?;
     let sum_body_region = build_reduce_body_region(ReductionKind::Sum, element_type, form, context, location)?;
@@ -483,50 +528,15 @@ fn lower_log_sum_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
         sum_body_region,
         location,
     )?)?;
-    let total = total.result(0).expect("stablehlo.reduce should return one result").as_ref();
+    let total = total.result(0).unwrap().as_ref();
     let logarithm = block.append_operation(stable_hlo::log(total, Accuracy::Default, location)?)?;
-    let logarithm = logarithm.result(0).expect("stablehlo.log should return one result").as_ref();
+    let logarithm = logarithm.result(0).unwrap().as_ref();
     let result = block.append_operation(stable_hlo::add(logarithm, shift, location)?)?;
-    Ok(result.result(0).expect("stablehlo.add should return one result").as_ref())
+    Ok(result.result(0).unwrap().as_ref())
 }
 
-/// Signed integer keys whose order is the IEEE total order of the values of a floating-point data type. The key of a
-/// value with a clear sign bit is its bit pattern, and the key of a value with a set sign bit is that pattern with
-/// every other bit flipped, so that a larger magnitude gives a smaller key. The map is its own inverse, and it places
-/// negative zero directly below positive zero, the infinities beyond every finite value, and the NaNs beyond the
-/// infinity of their sign.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct TotalOrderKeys {
-    /// Signed integer data type that has the width of the floating-point data type.
-    data_type: DataType,
-
-    /// Largest value of [`Self::data_type`], which is also the mask of the bits that the keys of negative values flip.
-    maximum: i64,
-
-    /// Bit pattern, and therefore key, of positive infinity.
-    infinity: i64,
-
-    /// Bit pattern, and therefore key, of the positive quiet NaN without a payload.
-    quiet_nan: i64,
-}
-
-impl TotalOrderKeys {
-    /// Returns the [`TotalOrderKeys`] of `element_type`, or [`None`] when it is not one of the IEEE binary
-    /// interchange formats that have a signed integer data type of their width.
-    fn of(element_type: DataType) -> Option<Self> {
-        let (data_type, maximum, infinity, quiet_nan) = match element_type {
-            DataType::F16 => (DataType::I16, i16::MAX as i64, 0x7C00, 0x7E00),
-            DataType::BF16 => (DataType::I16, i16::MAX as i64, 0x7F80, 0x7FC0),
-            DataType::F32 => (DataType::I32, i32::MAX as i64, 0x7F80_0000, 0x7FC0_0000),
-            DataType::F64 => (DataType::I64, i64::MAX, 0x7FF0_0000_0000_0000, 0x7FF8_0000_0000_0000),
-            _ => return None,
-        };
-        Some(Self { data_type, maximum, infinity, quiet_nan })
-    }
-}
-
-/// Lowers a floating-point [`ReductionKind::Max`] (when `maximum` is set) or [`ReductionKind::Min`] over `axes` as a
-/// reduction of the integer [`TotalOrderKeys`] of the input, whose combiner is the single integer
+/// Lowers a floating-point [`ReductionKind::Max`] when `maximum` is set, or a [`ReductionKind::Min`] otherwise, over
+/// `axes` as a reduction of the integer [`TotalOrderKeys`] of the input, whose combiner is the single integer
 /// `stablehlo.maximum` or `stablehlo.minimum`:
 ///
 /// ```text
@@ -539,10 +549,10 @@ impl TotalOrderKeys {
 /// the [`FloatExtremumForm::TotalOrder`] form of [`lower_extremum_to_mlir`]), but that combiner is not one that XLA
 /// can distribute. XLA partitions a reduction over a sharded dimension into a reduction of every shard that is
 /// followed by an all-reduce with the same combiner, and its backends implement all-reduce only for the combiners that
-/// consist of one operation that they recognize (refer to
-/// [`lower_collective_to_all_reduce`](crate::operations::collectives::parallel_reduce::lower_collective_to_all_reduce)).
-/// The comparisons move out of the combiner because the keys are computed once for every element, which costs what the
-/// expansion of the total order comparison inside of the combiner costs.
+/// consist of one operation that they recognize, as
+/// [`lower_collective_to_all_reduce`](crate::operations::collectives::parallel_reduce::lower_collective_to_all_reduce)
+/// describes. The comparisons move out of the combiner because the keys are computed once for every element, which
+/// costs what the expansion of the total order comparison inside of the combiner costs.
 ///
 /// Every NaN takes one key beyond the key of the identity (i.e., that of the positive quiet NaN for a maximum and
 /// that of the negative quiet NaN for a minimum), so that it wins the reduction whatever its sign is and the initial
@@ -572,9 +582,9 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         let scalar_type = lower_tensor_type(&ArrayType::scalar(keys.data_type), context, location)?;
         let elements = lower_constant_elements_attribute(keys.data_type, scalar_type, value, context)?;
         let scalar = block.append_operation(stable_hlo::constant(elements, location)?)?;
-        let scalar = scalar.result(0).expect("stablehlo.constant should return one result").as_ref();
+        let scalar = scalar.result(0).unwrap().as_ref();
         let splat = block.append_operation(stable_hlo::clamp(scalar, like, scalar, location)?)?;
-        Ok(splat.result(0).expect("stablehlo.clamp should return one result").as_ref())
+        Ok(splat.result(0).unwrap().as_ref())
     }
 
     /// Maps bit patterns to keys and keys to bit patterns, which are the same map.
@@ -594,11 +604,11 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
             stable_hlo::ComparisonType::Signed,
             location,
         )?)?;
-        let negative = negative.result(0).expect("stablehlo.compare should return one result").as_ref();
+        let negative = negative.result(0).unwrap().as_ref();
         let flipped = block.append_operation(stable_hlo::xor(values, mask, location)?)?;
-        let flipped = flipped.result(0).expect("stablehlo.xor should return one result").as_ref();
+        let flipped = flipped.result(0).unwrap().as_ref();
         let converted = block.append_operation(stable_hlo::select(negative, flipped, values, location)?)?;
-        Ok(converted.result(0).expect("stablehlo.select should return one result").as_ref())
+        Ok(converted.result(0).unwrap().as_ref())
     }
 
     let input_type = input_value.r#type()?;
@@ -615,7 +625,7 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         location,
     )?;
     let bits = block.append_operation(stable_hlo::bitcast_convert(input_value, input_keys_type, location)?)?;
-    let bits = bits.result(0).expect("stablehlo.bitcast_convert should return one result").as_ref();
+    let bits = bits.result(0).unwrap().as_ref();
     let input_keys = convert(bits, keys, block, context, location)?;
 
     // The keys of the negative infinity and of the negative quiet NaN are the complements of the keys of their
@@ -629,25 +639,25 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         stable_hlo::ComparisonType::Float,
         location,
     )?)?;
-    let is_nan = is_nan.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let is_nan = is_nan.result(0).unwrap().as_ref();
     let nan_keys = splat_like(nan_key, input_keys, keys, block, context, location)?;
     let input_keys = block.append_operation(stable_hlo::select(is_nan, nan_keys, input_keys, location)?)?;
-    let input_keys = input_keys.result(0).expect("stablehlo.select should return one result").as_ref();
+    let input_keys = input_keys.result(0).unwrap().as_ref();
 
     let kind = if maximum { ReductionKind::Max } else { ReductionKind::Min };
     let scalar_keys_type = lower_tensor_type(&ArrayType::scalar(keys.data_type), context, location)?;
     let identity = lower_constant_elements_attribute(keys.data_type, scalar_keys_type, identity_key, context)?;
     let identity = block.append_operation(stable_hlo::constant(identity, location)?)?;
-    let identity = identity.result(0).expect("stablehlo.constant should return one result").as_ref();
+    let identity = identity.result(0).unwrap().as_ref();
     let body_region = build_reduce_body_region(kind, keys.data_type, FloatExtremumForm::TotalOrder, context, location)?;
     let reduced =
         block.append_operation(stable_hlo::reduce(&[input_keys], &[identity], axes, body_region, location)?)?;
-    let reduced = reduced.result(0).expect("stablehlo.reduce should return one result").as_ref();
+    let reduced = reduced.result(0).unwrap().as_ref();
 
     let bits = convert(reduced, keys, block, context, location)?;
     let output_tensor_type = lower_tensor_type(output_array_type, context, location)?;
     let result = block.append_operation(stable_hlo::bitcast_convert(bits, output_tensor_type, location)?)?;
-    let result = result.result(0).expect("stablehlo.bitcast_convert should return one result").as_ref();
+    let result = result.result(0).unwrap().as_ref();
     if maximum {
         return Ok(result);
     }
@@ -660,57 +670,14 @@ fn lower_total_order_extremum_reduce_to_mlir<'b, 'c: 'b, 't: 'c>(
         stable_hlo::ComparisonType::Float,
         location,
     )?)?;
-    let is_nan = is_nan.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let is_nan = is_nan.result(0).unwrap().as_ref();
     let positive = block.append_operation(stable_hlo::abs(result, location)?)?;
-    let positive = positive.result(0).expect("stablehlo.abs should return one result").as_ref();
+    let positive = positive.result(0).unwrap().as_ref();
     let result = block.append_operation(stable_hlo::select(is_nan, positive, result, location)?)?;
-    Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
+    Ok(result.result(0).unwrap().as_ref())
 }
 
-/// Builds a scalar constant equal to the identity element for the given reduction kind, returned
-/// as an MLIR `tensor<{element_type}>` value. Used as the `initial_values` argument of
-/// `stablehlo.reduce`.
-pub(crate) fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
-    kind: ReductionKind,
-    element_type: DataType,
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    let scalar_array_type = ArrayType::scalar(element_type);
-    let scalar_tensor_type = lower_tensor_type(&scalar_array_type, context, location)?;
-    if element_type.is_complex() {
-        let real = match kind {
-            ReductionKind::Sum | ReductionKind::Mean => 0.0,
-            ReductionKind::Product => 1.0,
-            ReductionKind::Max => f64::NEG_INFINITY,
-            ReductionKind::Min => f64::INFINITY,
-            ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
-                return Err(Error::Lowering(LoweringError::UnsupportedElementType {
-                    data_type: element_type,
-                    context: format!("{kind} reduction identity"),
-                }));
-            }
-        };
-        let part_data_type = if element_type == DataType::C64 { DataType::F32 } else { DataType::F64 };
-        let part_type = ArrayType::scalar(part_data_type);
-        let part_tensor_type = lower_tensor_type(&part_type, context, location)?;
-        let real_value = lower_f64_constant_splat(real, &part_type, part_tensor_type, block, context, location)?;
-        // Products use `1 + 0i`; lexicographic extrema need both components at the same bound.
-        let imaginary_value = if kind == ReductionKind::Product {
-            lower_f64_constant_splat(0.0, &part_type, part_tensor_type, block, context, location)?
-        } else {
-            real_value
-        };
-        let complex = block.append_operation(stable_hlo::complex(real_value, imaginary_value, location)?)?;
-        return Ok(complex.result(0).expect("stablehlo.complex should return one result").as_ref());
-    }
-    let attribute = build_reduction_identity_attribute(kind, element_type, scalar_tensor_type, context)?;
-    let result = block.append_operation(stable_hlo::constant(attribute, location)?)?;
-    Ok(result.result(0).expect("stablehlo.constant should return one result").as_ref())
-}
-
-/// Builds a dense-elements attribute holding the identity element of the given reduction kind at the given element
+/// Builds a dense elements attribute holding the identity element of the given reduction kind at the given element
 /// type. `Sum` and `Mean` use zero, `Product` uses one, and `Max` and `Min` use the bounds returned by
 /// [`float_reduction_identity_bounds`] at float element types and the bounds returned by
 /// [`integer_reduction_identity_bounds`] at integer element types. Boolean `Any`/`Max` use `false`, while Boolean
@@ -718,7 +685,7 @@ pub(crate) fn build_reduction_identity_constant<'b, 'c: 'b, 't: 'c>(
 fn build_reduction_identity_attribute<'c, 't>(
     kind: ReductionKind,
     element_type: DataType,
-    tensor_type: ryft_mlir::TensorTypeRef<'c, 't>,
+    tensor_type: TensorTypeRef<'c, 't>,
     context: &'c MlirContext<'t>,
 ) -> Result<DenseElementsAttributeRef<'c, 't>, Error> {
     if let Some((minimum, maximum)) = float_reduction_identity_bounds(element_type) {
@@ -727,13 +694,11 @@ fn build_reduction_identity_attribute<'c, 't>(
             ReductionKind::Product => 1.0,
             ReductionKind::Max => minimum,
             ReductionKind::Min => maximum,
-            ReductionKind::Sum | ReductionKind::Mean => {
-                return Err(Error::Lowering(LoweringError::UnsupportedElementType {
-                    data_type: element_type,
-                    context: format!("{kind} reduction identity"),
-                }));
-            }
-            ReductionKind::LogSumExp | ReductionKind::Any | ReductionKind::All => {
+            ReductionKind::Sum
+            | ReductionKind::Mean
+            | ReductionKind::LogSumExp
+            | ReductionKind::Any
+            | ReductionKind::All => {
                 return Err(Error::Lowering(LoweringError::UnsupportedElementType {
                     data_type: element_type,
                     context: format!("{kind} reduction identity"),
@@ -797,10 +762,10 @@ fn float_reduction_identity_bounds(data_type: DataType) -> Option<(f64, f64)> {
     }
 }
 
-/// Returns the (minimum, maximum) values representable by the given integer data type, used as the `Max` and `Min`
+/// Returns the `(minimum, maximum)` values representable by the given integer data type, used as the `Max` and `Min`
 /// reduction identities. The values are raw `i64` payloads for [`lower_constant_elements_attribute`], which encodes
-/// them at the type's width and signedness — [`DataType::U64`]'s maximum therefore wraps to `-1`, whose
-/// two's-complement bits are exactly `u64::MAX`. Returns `None` for non-integer data types.
+/// them at the type's width and signedness. [`DataType::U64`]'s maximum therefore wraps to `-1`, whose two's
+/// complement bits are exactly `u64::MAX`. Returns `None` for non-integer data types.
 fn integer_reduction_identity_bounds(data_type: DataType) -> Option<(i64, i64)> {
     if data_type.is_signed() {
         let width = signed_integer_width(data_type).unwrap();
@@ -817,8 +782,8 @@ fn integer_reduction_identity_bounds(data_type: DataType) -> Option<(i64, i64)> 
 /// reduction of the provided kind over `element_type` in the provided [`FloatExtremumForm`]. XLA partitions a
 /// reduction over a sharded dimension into a reduction of every shard that is followed by an all-reduce with the same
 /// combiner, and its backends implement all-reduce only for the combiners that consist of one operation that they
-/// recognize. The combiners that do not are the lexicographic comparison of complex extrema, the complex product
-/// (refer to [`lower_product_combiner_to_mlir`]), and the comparisons and NaN selections of floating-point extrema
+/// recognize. The combiners that do not are the lexicographic comparison of complex extrema, the complex product of
+/// [`lower_product_combiner_to_mlir`], and the comparisons and NaN selections of floating-point extrema
 /// that do not reduce [`TotalOrderKeys`], which are also the extrema inside of a [`ReductionKind::LogSumExp`].
 fn has_distributable_combiner(kind: ReductionKind, element_type: DataType, form: FloatExtremumForm) -> bool {
     match kind {
@@ -834,112 +799,144 @@ fn has_distributable_combiner(kind: ReductionKind, element_type: DataType, form:
     }
 }
 
-impl LowerableOperation for ReduceOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        check_count!("input", input_types, 1, ProgramError);
-        check_count!("output", output_types, 1, ProgramError);
-        let element_type = output_types[0].data_type();
-
-        // The reduced dimensions can be sharded when the type of the input shards one of them over an explicit mesh
-        // axis, and when its mesh has an auto axis with more than one device, over which the compiler places values
-        // without the type describing it.
-        let shardable_sharding = input_types[0].sharding().filter(|sharding| {
-            self.axes().iter().any(|axis| sharding.dimensions()[*axis].has_explicit_axis(sharding.mesh()))
-                || sharding.mesh().axes().iter().any(|axis| axis.r#type() == MeshAxisType::Auto && axis.size() > 1)
-        });
-
-        // XLA can only distribute a reduction whose combiner is a single operation. The total order form has such a
-        // combiner for the extrema that reduce integer keys, and XLA compiles those keys for every target, so a
-        // reduction whose dimensions can be sharded uses that form wherever it distributes. Other reductions keep
-        // the form of their target (e.g., the native extrema that XLA's GPU compiler fuses into Triton kernels).
-        let form = match shardable_sharding {
-            Some(_) if has_distributable_combiner(self.kind(), element_type, FloatExtremumForm::TotalOrder) => {
-                FloatExtremumForm::TotalOrder
-            }
-            _ => FloatExtremumForm::for_combiner(lowerer.collective_state.target_platform()),
-        };
-
-        // A combiner that XLA cannot distribute in any form reduces a copy of the input that is replicated along the
-        // reduced dimensions, so that every device reduces all of their elements itself. That gathers the shards
-        // along those dimensions, where a distributed reduction would only exchange its results, but it keeps the
-        // result of the combiner.
-        let mut input_value = input_values[0];
-        if let Some(sharding) = shardable_sharding
-            && !has_distributable_combiner(self.kind(), element_type, form)
-        {
-            input_value = lower_replication_constraint(
-                input_value,
-                sharding,
-                self.axes(),
-                &lowerer.collective_state.bound_manual_axes,
-                &mut lowerer.block,
-                lowerer.location,
-            )?;
+/// Lowers an [`ArgMaxOperation`] when `maximize` is `true`, or an [`ArgMinOperation`] otherwise, along `axis` to a
+/// variadic `stablehlo.reduce` over the input and a `stablehlo.iota` of its indices along `axis`, returning the reduced
+/// indices. The reduction starts from the extremum identity of the input data type (i.e., the lowest value for
+/// `argmax` and the highest one for `argmin`) paired with index zero. Its comparator, which
+/// [`build_index_reduction_body_region`] builds, is commutative and associative, so that the result does not depend on
+/// the order in which XLA combines elements. Narrow floating-point inputs compare in `f32`, into which they convert
+/// exactly, including their NaNs and signed zeros. Signed one-bit inputs and indices use a signed byte carrier, because
+/// StableHLO treats `i1` as a predicate.
+///
+/// Bounded dynamic inputs are supported as well. XLA's bounded dynamic legalizer pads every input of a variadic
+/// `stablehlo.reduce` along a dynamic reduced axis with that input's own initial value, so padded positions hold the
+/// extremum identity paired with index zero. Such a pair never strictly beats a live element, and it ties with live
+/// elements only when every live element equals the identity, in which case index zero is the correct result. Dynamic
+/// axes that are not reduced pass through the reduction unchanged.
+fn lower_index_reduction_to_mlir<'b, 'c: 'b, 't: 'c>(
+    maximize: bool,
+    axis: usize,
+    input_value: ValueRef<'b, 'c, 't>,
+    input_type: &ArrayType,
+    output_type: &ArrayType,
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    let (value, value_data_type) = match input_type.data_type() {
+        DataType::I1 => (lower_signed_one_bit_to_mlir(input_value, block, context, location)?, DataType::I8),
+        data_type if data_type.is_floating_point() && !matches!(data_type, DataType::F32 | DataType::F64) => {
+            let working_type =
+                lower_tensor_type(&ArrayType::new(DataType::F32, input_type.shape().clone()), context, location)?;
+            let converted = block.append_operation(stable_hlo::convert(input_value, working_type, location)?)?;
+            (converted.result(0).unwrap().as_ref(), DataType::F32)
         }
-        let value = lower_reduce_to_mlir(
-            self.kind(),
-            self.axes(),
-            input_value,
-            &output_types[0],
-            form,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
-        Ok(vec![value])
+        data_type => (input_value, data_type),
+    };
+    let index_data_type = match output_type.data_type() {
+        DataType::I1 => DataType::I8,
+        data_type => data_type,
+    };
+
+    // `stablehlo.reduce` requires its inputs to share one shape, so the index iota takes the bounded dynamic type of
+    // the input. It is built at the physical bound of every dynamic axis and then receives the runtime extents of the
+    // input. Statically shaped inputs need no refinement.
+    let index_type = ArrayType::new(index_data_type, input_type.shape().clone());
+    let physical_index_tensor_type = lower_tensor_type(&physical_bound_type(&index_type)?, context, location)?;
+    let indices = block.append_operation(stable_hlo::iota(physical_index_tensor_type, axis, location)?)?;
+    let indices = indices.result(0).unwrap().as_ref();
+    let extent_sources = (0..index_type.rank()).map(|axis| (input_value, axis)).collect::<Vec<_>>();
+    let indices = lower_restore_dynamic_dimensions(indices, &index_type, &extent_sources, block, context, location)?;
+    let identity_kind = if maximize { ReductionKind::Max } else { ReductionKind::Min };
+    let value_identity = build_reduction_identity_constant(identity_kind, value_data_type, block, context, location)?;
+    let scalar_index_type = ArrayType::scalar(index_data_type);
+    let scalar_index_tensor_type = lower_tensor_type(&scalar_index_type, context, location)?;
+    let index_identity =
+        lower_f64_constant_splat(0.0, &scalar_index_type, scalar_index_tensor_type, block, context, location)?;
+    let body = build_index_reduction_body_region(maximize, value_data_type, index_data_type, context, location)?;
+    let reduced = block.append_operation(stable_hlo::reduce(
+        &[value, indices],
+        &[value_identity, index_identity],
+        &[axis],
+        body,
+        location,
+    )?)?;
+    let reduced_indices = reduced.result(1).unwrap().as_ref();
+    if index_data_type == output_type.data_type() {
+        return Ok(reduced_indices);
     }
+    let output_tensor_type = lower_tensor_type(output_type, context, location)?;
+    let converted = block.append_operation(stable_hlo::convert(reduced_indices, output_tensor_type, location)?)?;
+    Ok(converted.result(0).unwrap().as_ref())
 }
 
-impl LowerableOperation for ArgMaxOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        check_count!("input", input_types, 1, ProgramError);
-        check_count!("output", output_types, 1, ProgramError);
-        Ok(vec![lower_index_reduction_to_mlir(
-            true,
-            self.axis(),
-            input_values[0],
-            &input_types[0],
-            &output_types[0],
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?])
+/// Builds the comparator region of [`lower_index_reduction_to_mlir`], which combines two `(value, index)` pairs by
+/// picking the left pair when its value is strictly better than the right one, or equivalent to it with a lower index.
+/// For `argmax`, which `maximize` selects, a value is strictly better when it is greater, and for `argmin` when it is
+/// smaller. Floating-point values compare with `FLOAT` semantics, so that `-0.0` and `+0.0` are equivalent.
+/// A floating-point NaN is also strictly better than every ordered value for both directions, and two NaNs are
+/// equivalent. Unlike JAX's comparator, which picks the left pair whenever its value is a NaN, this one is commutative
+/// and associative, so every combination order selects the first NaN and the lowest index among ties.
+fn build_index_reduction_body_region<'c, 't>(
+    maximize: bool,
+    value_data_type: DataType,
+    index_data_type: DataType,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<DetachedRegion<'c, 't>, Error> {
+    let value_tensor_type = lower_tensor_type(&ArrayType::scalar(value_data_type), context, location)?;
+    let index_tensor_type = lower_tensor_type(&ArrayType::scalar(index_data_type), context, location)?;
+    let block = context.block(&[
+        (value_tensor_type, location),
+        (index_tensor_type, location),
+        (value_tensor_type, location),
+        (index_tensor_type, location),
+    ]);
+    let mut region = context.region();
+    let mut block_ref = region.append_block(block)?;
+    let left_value = block_ref.argument(0)?.as_ref();
+    let left_index = block_ref.argument(1)?.as_ref();
+    let right_value = block_ref.argument(2)?.as_ref();
+    let right_index = block_ref.argument(3)?.as_ref();
+    let direction = if maximize { ComparisonDirection::GreaterThan } else { ComparisonDirection::LessThan };
+    let mut better = lower_compare_to_mlir(direction, left_value, right_value, &mut block_ref, location)?;
+    let mut equivalent =
+        lower_compare_to_mlir(ComparisonDirection::Equal, left_value, right_value, &mut block_ref, location)?;
+    if value_data_type.is_floating_point() {
+        let left_is_nan =
+            lower_compare_to_mlir(ComparisonDirection::NotEqual, left_value, left_value, &mut block_ref, location)?;
+        let right_is_nan =
+            lower_compare_to_mlir(ComparisonDirection::NotEqual, right_value, right_value, &mut block_ref, location)?;
+        let right_is_ordered =
+            lower_compare_to_mlir(ComparisonDirection::Equal, right_value, right_value, &mut block_ref, location)?;
+        let nan_beats_ordered =
+            block_ref.append_operation(stable_hlo::and(left_is_nan, right_is_ordered, location)?)?;
+        let nan_beats_ordered = nan_beats_ordered.result(0).unwrap().as_ref();
+        let both_nan = block_ref.append_operation(stable_hlo::and(left_is_nan, right_is_nan, location)?)?;
+        let both_nan = both_nan.result(0).unwrap().as_ref();
+        better = block_ref
+            .append_operation(stable_hlo::or(better, nan_beats_ordered, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        equivalent = block_ref
+            .append_operation(stable_hlo::or(equivalent, both_nan, location)?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
     }
-}
-
-impl LowerableOperation for ArgMinOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        check_count!("input", input_types, 1, ProgramError);
-        check_count!("output", output_types, 1, ProgramError);
-        Ok(vec![lower_index_reduction_to_mlir(
-            false,
-            self.axis(),
-            input_values[0],
-            &input_types[0],
-            &output_types[0],
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?])
-    }
+    let lower_index =
+        lower_compare_to_mlir(ComparisonDirection::LessThan, left_index, right_index, &mut block_ref, location)?;
+    let tie = block_ref.append_operation(stable_hlo::and(equivalent, lower_index, location)?)?;
+    let tie = tie.result(0).unwrap().as_ref();
+    let pick_left = block_ref.append_operation(stable_hlo::or(better, tie, location)?)?;
+    let pick_left = pick_left.result(0).unwrap().as_ref();
+    let value = block_ref.append_operation(stable_hlo::select(pick_left, left_value, right_value, location)?)?;
+    let value = value.result(0).unwrap().as_ref();
+    let index = block_ref.append_operation(stable_hlo::select(pick_left, left_index, right_index, location)?)?;
+    let index = index.result(0).unwrap().as_ref();
+    block_ref.append_operation(stable_hlo::r#return(&[value, index], location)?)?;
+    Ok(region)
 }
 
 #[cfg(test)]
@@ -949,395 +946,23 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArgMax, ArgMin, ArrayOperation, BroadcastLike, Cumulative, Device, DeviceMesh, Dimension as CoreDimension,
-        DimensionBounds, DimensionVariable, Div, DomainTracer, Exp, Instruction, LogicalMesh, MeshAxis, MeshAxisType,
-        Placeholder, ProgramError, ProjectedContext, Reduce, ReduceOperation, Shape, Sharding, ShardingDimension, Sub,
-        composite,
+        ArgMax, ArgMin, ArrayOperation, BroadcastLike, ConvertElementType, Cumulative, DeviceMesh,
+        Dimension as CoreDimension, DimensionBounds, DimensionVariable, Div, DomainTracer, Exp, Instruction,
+        LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramError, ProjectedContext, Reduce, ReduceOperation,
+        Shape, Sharding, ShardingDimension, Sub, composite,
     };
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_mlir::Location;
 
-    use crate::domains::tests::domain_mesh;
+    use crate::domains::tests::{domain_mesh, read_f32s, replicated_vector_type, two_device_mesh};
     use crate::lowering::tests::{
         ProgramBuilder, lowered_reduce_module, lowered_unary_module, unproject_plain_program,
     };
     use crate::lowering::{lower_mlir_module_for_program, to_mlir_module_for_plain_program};
-    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
+    use crate::tests::{cpu_client, execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::values::ArrayConstant;
-    use crate::{Array, Domain, FromPjrt, Session, to_mlir_module_for_program};
+    use crate::{Array, CompiledFunction, Domain, Session, compile, to_mlir_module_for_program};
 
     use super::*;
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_log_sum_exp_as_a_guarded_max_shifted_reduction() {
-        // The expansion reduces the maximum over total order keys with the key of `-inf` as its identity, replaces a
-        // nonfinite maximum with zero so that an all-`-inf` or empty slice shifts by zero instead of computing
-        // `-inf - -inf`, broadcasts the safe maximum back over the reduced axis, and adds it to the logarithm of the
-        // shifted exponential sum.
-        assert_eq!(
-            lowered_unary_module(
-                ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::LogSumExp)),
-                DataType::F32,
-                vec![2, 3],
-            )
-            .unwrap(),
-            indoc! {"
-                module {
-                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2xf32> {
-                    %0 = stablehlo.bitcast_convert %arg0 : (tensor<2x3xf32>) -> tensor<2x3xi32>
-                    %c = stablehlo.constant dense<0> : tensor<i32>
-                    %1 = stablehlo.clamp %c, %0, %c : (tensor<i32>, tensor<2x3xi32>, tensor<i32>) -> tensor<2x3xi32>
-                    %c_0 = stablehlo.constant dense<2147483647> : tensor<i32>
-                    %2 = stablehlo.clamp %c_0, %0, %c_0 : (tensor<i32>, tensor<2x3xi32>, tensor<i32>) -> tensor<2x3xi32>
-                    %3 = stablehlo.compare LT, %0, %1, SIGNED : (tensor<2x3xi32>, tensor<2x3xi32>) -> tensor<2x3xi1>
-                    %4 = stablehlo.xor %0, %2 : tensor<2x3xi32>
-                    %5 = stablehlo.select %3, %4, %0 : tensor<2x3xi1>, tensor<2x3xi32>
-                    %6 = stablehlo.compare NE, %arg0, %arg0, FLOAT : \
-                      (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x3xi1>
-                    %c_1 = stablehlo.constant dense<2143289344> : tensor<i32>
-                    %7 = stablehlo.clamp %c_1, %5, %c_1 : (tensor<i32>, tensor<2x3xi32>, tensor<i32>) -> tensor<2x3xi32>
-                    %8 = stablehlo.select %6, %7, %5 : tensor<2x3xi1>, tensor<2x3xi32>
-                    %c_2 = stablehlo.constant dense<-2139095041> : tensor<i32>
-                    %9 = stablehlo.reduce(%8 init: %c_2) applies stablehlo.maximum across dimensions = [1] : \
-                      (tensor<2x3xi32>, tensor<i32>) -> tensor<2xi32>
-                    %c_3 = stablehlo.constant dense<0> : tensor<i32>
-                    %10 = stablehlo.clamp %c_3, %9, %c_3 : (tensor<i32>, tensor<2xi32>, tensor<i32>) -> tensor<2xi32>
-                    %c_4 = stablehlo.constant dense<2147483647> : tensor<i32>
-                    %11 = stablehlo.clamp %c_4, %9, %c_4 : (tensor<i32>, tensor<2xi32>, tensor<i32>) -> tensor<2xi32>
-                    %12 = stablehlo.compare LT, %9, %10, SIGNED : (tensor<2xi32>, tensor<2xi32>) -> tensor<2xi1>
-                    %13 = stablehlo.xor %9, %11 : tensor<2xi32>
-                    %14 = stablehlo.select %12, %13, %9 : tensor<2xi1>, tensor<2xi32>
-                    %15 = stablehlo.bitcast_convert %14 : (tensor<2xi32>) -> tensor<2xf32>
-                    %16 = stablehlo.is_finite %15 : (tensor<2xf32>) -> tensor<2xi1>
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %17 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2xf32>
-                    %18 = stablehlo.select %16, %15, %17 : tensor<2xi1>, tensor<2xf32>
-                    %19 = stablehlo.broadcast_in_dim %18, dims = [0] : (tensor<2xf32>) -> tensor<2x3xf32>
-                    %20 = stablehlo.subtract %arg0, %19 : tensor<2x3xf32>
-                    %21 = stablehlo.exponential %20 : tensor<2x3xf32>
-                    %cst_5 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %22 = stablehlo.reduce(%21 init: %cst_5) applies stablehlo.add across dimensions = [1] : \
-                      (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
-                    %23 = stablehlo.log %22 : tensor<2xf32>
-                    %24 = stablehlo.add %23, %18 : tensor<2xf32>
-                    return %24 : tensor<2xf32>
-                  }
-                }
-            "},
-        );
-    }
-
-    #[test]
-    fn test_lower_log_sum_exp_to_mlir_complex() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-
-        // Complex operands are shifted by the maximum of their real components, and `-∞ + 0i` padding contributes a
-        // zero exponential. XLA's complex exponential and logarithm round differently from the host's.
-        let first = Complex::new(1f32, 0.5);
-        let second = Complex::new(3f32, -2.0);
-        let shift = Complex::new(3f32, 0.0);
-        let input = replicated_array(
-            &domain,
-            &mesh,
-            DataType::C64,
-            &[3],
-            values_to_bytes(&[first, second, Complex::new(f32::NEG_INFINITY, 0.0)]).as_slice(),
-        );
-        let output = input.reduce_log_sum_exp(&[0]).unwrap();
-        let output = values_from_bytes::<Complex<f32>>(&output.copy_to_host().unwrap());
-        let expected = ((first - shift).exp() + (second - shift).exp()).ln() + shift;
-        assert_eq!(output.len(), 1);
-        assert!((output[0] - expected).norm() < 1e-5, "{} vs {expected}", output[0]);
-
-        // Even without reduced axes, the principal logarithm wraps phases outside its branch.
-        let input = replicated_array(
-            &domain,
-            &mesh,
-            DataType::C64,
-            &[2],
-            values_to_bytes(&[Complex::new(1f32, 4.0), Complex::new(2f32, -4.0)]).as_slice(),
-        );
-        let output = input.reduce_log_sum_exp(&[]).unwrap();
-        let output = values_from_bytes::<Complex<f32>>(&output.copy_to_host().unwrap());
-        let expected = [
-            Complex::new(1f32, 4.0 - 2.0 * std::f32::consts::PI),
-            Complex::new(2f32, -4.0 + 2.0 * std::f32::consts::PI),
-        ];
-        assert_eq!(output.len(), expected.len());
-        for (actual, expected) in output.into_iter().zip(expected) {
-            assert!((actual - expected).norm() < 1e-5, "{actual} vs {expected}");
-        }
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_bf16_reduce_max() {
-        assert_eq!(
-            lowered_reduce_module(DataType::BF16, ReductionKind::Max, vec![1], vec![2, 3]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<2xbf16> {
-                    %0 = stablehlo.bitcast_convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xi16>
-                    %c = stablehlo.constant dense<0> : tensor<i16>
-                    %1 = stablehlo.clamp %c, %0, %c : (tensor<i16>, tensor<2x3xi16>, tensor<i16>) -> tensor<2x3xi16>
-                    %c_0 = stablehlo.constant dense<32767> : tensor<i16>
-                    %2 = stablehlo.clamp %c_0, %0, %c_0 : (tensor<i16>, tensor<2x3xi16>, tensor<i16>) -> tensor<2x3xi16>
-                    %3 = stablehlo.compare LT, %0, %1, SIGNED : (tensor<2x3xi16>, tensor<2x3xi16>) -> tensor<2x3xi1>
-                    %4 = stablehlo.xor %0, %2 : tensor<2x3xi16>
-                    %5 = stablehlo.select %3, %4, %0 : tensor<2x3xi1>, tensor<2x3xi16>
-                    %6 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<2x3xbf16>, tensor<2x3xbf16>) -> tensor<2x3xi1>
-                    %c_1 = stablehlo.constant dense<32704> : tensor<i16>
-                    %7 = stablehlo.clamp %c_1, %5, %c_1 : (tensor<i16>, tensor<2x3xi16>, tensor<i16>) -> tensor<2x3xi16>
-                    %8 = stablehlo.select %6, %7, %5 : tensor<2x3xi1>, tensor<2x3xi16>
-                    %c_2 = stablehlo.constant dense<-32641> : tensor<i16>
-                    %9 = stablehlo.reduce(%8 init: %c_2) applies stablehlo.maximum across dimensions = [1] : (tensor<2x3xi16>, tensor<i16>) -> tensor<2xi16>
-                    %c_3 = stablehlo.constant dense<0> : tensor<i16>
-                    %10 = stablehlo.clamp %c_3, %9, %c_3 : (tensor<i16>, tensor<2xi16>, tensor<i16>) -> tensor<2xi16>
-                    %c_4 = stablehlo.constant dense<32767> : tensor<i16>
-                    %11 = stablehlo.clamp %c_4, %9, %c_4 : (tensor<i16>, tensor<2xi16>, tensor<i16>) -> tensor<2xi16>
-                    %12 = stablehlo.compare LT, %9, %10, SIGNED : (tensor<2xi16>, tensor<2xi16>) -> tensor<2xi1>
-                    %13 = stablehlo.xor %9, %11 : tensor<2xi16>
-                    %14 = stablehlo.select %12, %13, %9 : tensor<2xi1>, tensor<2xi16>
-                    %15 = stablehlo.bitcast_convert %14 : (tensor<2xi16>) -> tensor<2xbf16>
-                    return %15 : tensor<2xbf16>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_lower_mlir_module_for_program_lowers_reduce_extrema_natively_for_cuda() {
-        // XLA's GPU compiler fuses reductions into Triton kernels whose code generation fails on total-order
-        // comparisons, so a CUDA target lowers floating-point extrema to the native operations, which order the
-        // signed zeros there, and keeps the explicit NaN propagation.
-        let lowered = |kind: ReductionKind| {
-            let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
-            let output_type = ArrayType::new_static(DataType::F32, [2]);
-            let mut builder = ProgramBuilder::new();
-            let input = builder.add_input(input_type.clone());
-            let output = builder
-                .add_instruction(
-                    ArrayOperation::Reduce(ReduceOperation::new(vec![1], kind)),
-                    Vec::new(),
-                    vec![input],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap();
-            lower_mlir_module_for_program(
-                &unproject_plain_program(program),
-                &[],
-                &vec![input_type],
-                &vec![output_type],
-                "main",
-                None,
-                None,
-                Some("cuda"),
-            )
-            .unwrap()
-            .stable_hlo
-        };
-        assert_eq!(
-            lowered(ReductionKind::Max),
-            indoc! {"
-                module {
-                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2xf32> {
-                    %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [1] : \
-                      (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
-                     reducer(%arg1: tensor<f32>, %arg2: tensor<f32>)  {
-                      %1 = stablehlo.maximum %arg1, %arg2 : tensor<f32>
-                      %2 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
-                      %3 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
-                      %4 = stablehlo.select %3, %arg2, %1 : tensor<i1>, tensor<f32>
-                      %5 = stablehlo.select %2, %arg1, %4 : tensor<i1>, tensor<f32>
-                      stablehlo.return %5 : tensor<f32>
-                    }
-                    return %0 : tensor<2xf32>
-                  }
-                }
-            "},
-        );
-        assert_eq!(
-            lowered(ReductionKind::Min),
-            indoc! {"
-                module {
-                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2xf32> {
-                    %cst = stablehlo.constant dense<0x7F800000> : tensor<f32>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [1] : \
-                      (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
-                     reducer(%arg1: tensor<f32>, %arg2: tensor<f32>)  {
-                      %1 = stablehlo.minimum %arg1, %arg2 : tensor<f32>
-                      %2 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
-                      %3 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
-                      %4 = stablehlo.select %3, %arg2, %1 : tensor<i1>, tensor<f32>
-                      %5 = stablehlo.select %2, %arg1, %4 : tensor<i1>, tensor<f32>
-                      stablehlo.return %5 : tensor<f32>
-                    }
-                    return %0 : tensor<2xf32>
-                  }
-                }
-            "},
-        );
-    }
-
-    #[test]
-    fn test_reduce_operation_lower_replicates_undistributable_reductions() {
-        // XLA can only distribute a reduction whose combiner is a single operation, so the reduction of any other
-        // combiner over a dimension that an explicit mesh axis shards first constrains its input to be replicated
-        // along that dimension. The floating-point extrema that have total order keys reduce them with a single
-        // integer operation for every target, including CUDA, whose native form is not such a combiner.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharding = |dimensions: Vec<ShardingDimension>| Sharding::new(mesh.clone(), dimensions).unwrap();
-        let x = ShardingDimension::sharded(["x"]);
-        let lowered = |kind: ReductionKind, data_type: DataType, axis: usize, target_platform: Option<&str>| {
-            let input_type = ArrayType::new_static(data_type, [2, 4])
-                .with_sharding(sharding(vec![ShardingDimension::Replicated, x.clone()]))
-                .unwrap();
-            let output_dimensions = if axis == 1 { vec![ShardingDimension::Replicated] } else { vec![x.clone()] };
-            let output_type = ArrayType::new_static(data_type, [if axis == 1 { 2 } else { 4 }])
-                .with_sharding(sharding(output_dimensions))
-                .unwrap();
-            let mut builder = ProgramBuilder::new();
-            let input = builder.add_input(input_type.clone());
-            let output = builder
-                .add_instruction(
-                    ArrayOperation::Reduce(ReduceOperation::new(vec![axis], kind)),
-                    Vec::new(),
-                    vec![input],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap();
-            let argument_shardings = [input_type.sharding().unwrap().clone()];
-            let result_shardings = [output_type.sharding().unwrap().clone()];
-            lower_mlir_module_for_program(
-                &unproject_plain_program(program),
-                &[],
-                &vec![input_type],
-                &vec![output_type],
-                "main",
-                Some(&argument_shardings),
-                Some(&result_shardings),
-                target_platform,
-            )
-            .unwrap()
-            .stable_hlo
-        };
-        let constraint = r#"sdy.sharding_constraint %arg0 <@mesh, [{}, {}], replicated={"x"}>"#;
-        for (kind, data_type, target_platform, constrained) in [
-            (ReductionKind::Max, DataType::F32, Some("cuda"), false),
-            (ReductionKind::LogSumExp, DataType::F32, Some("cuda"), false),
-            (ReductionKind::Max, DataType::F32, None, false),
-            (ReductionKind::LogSumExp, DataType::F32, None, false),
-            (ReductionKind::Max, DataType::F8E5M2, None, true),
-            (ReductionKind::Max, DataType::F8E5M2, Some("cuda"), true),
-            (ReductionKind::Max, DataType::C64, None, true),
-            (ReductionKind::Max, DataType::C64, Some("cuda"), true),
-            (ReductionKind::Product, DataType::C64, None, true),
-            (ReductionKind::Product, DataType::F32, None, false),
-            (ReductionKind::Sum, DataType::C64, Some("cuda"), false),
-            (ReductionKind::Max, DataType::I32, Some("cuda"), false),
-        ] {
-            let module = lowered(kind, data_type, 1, target_platform);
-            assert_eq!(module.contains(constraint), constrained, "{kind} over {data_type}: {module}");
-
-            // A reduction over the other dimension does not reduce across the shards.
-            let module = lowered(kind, data_type, 0, target_platform);
-            assert!(!module.contains("sdy.sharding_constraint"), "{kind} over {data_type}: {module}");
-        }
-
-        // A maximum for CUDA reduces keys over the sharded dimension and compares natively over the other one.
-        let keys =
-            "applies stablehlo.maximum across dimensions = [1] : (tensor<2x4xi32>, tensor<i32>) -> tensor<2xi32>";
-        let module = lowered(ReductionKind::Max, DataType::F32, 1, Some("cuda"));
-        assert!(module.contains(keys), "{module}");
-        let module = lowered(ReductionKind::Max, DataType::F32, 0, Some("cuda"));
-        assert!(module.contains("stablehlo.maximum %arg1, %arg2 : tensor<f32>"), "{module}");
-        assert!(!module.contains("stablehlo.bitcast_convert"), "{module}");
-
-        // The compiler may shard any dimension over an auto mesh axis with more than one device, which the type of
-        // the input does not describe, so the constraint then closes the reduced dimension and leaves the other one
-        // open. An auto axis with one device cannot shard anything.
-        let lowered = |axis_size: usize| {
-            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", axis_size, MeshAxisType::Auto).unwrap()]).unwrap();
-            let input_type = ArrayType::new_static(DataType::C64, [2, 4])
-                .with_sharding(Sharding::replicated(mesh.clone(), 2))
-                .unwrap();
-            let output_type =
-                ArrayType::new_static(DataType::C64, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
-            let mut builder = ProgramBuilder::new();
-            let input = builder.add_input(input_type.clone());
-            let output = builder
-                .add_instruction(
-                    ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Max)),
-                    Vec::new(),
-                    vec![input],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap();
-            let argument_shardings = [input_type.sharding().unwrap().clone()];
-            let result_shardings = [output_type.sharding().unwrap().clone()];
-            lower_mlir_module_for_program(
-                &unproject_plain_program(program),
-                &[],
-                &vec![input_type],
-                &vec![output_type],
-                "main",
-                Some(&argument_shardings),
-                Some(&result_shardings),
-                None,
-            )
-            .unwrap()
-            .stable_hlo
-        };
-        assert!(lowered(2).contains("sdy.sharding_constraint %arg0 <@mesh, [{?}, {}]>"), "{}", lowered(2));
-        assert!(!lowered(1).contains("sdy.sharding_constraint"), "{}", lowered(1));
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_bf16_reduce_sum() {
-        assert_eq!(
-            lowered_reduce_module(DataType::BF16, ReductionKind::Sum, vec![0], vec![2, 3]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<3xbf16> {
-                    %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %1 = stablehlo.reduce(%0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>
-                    %2 = stablehlo.convert %1 : (tensor<3xf32>) -> tensor<3xbf16>
-                    return %2 : tensor<3xbf16>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_bf16_reduce_product() {
-        assert_eq!(
-            lowered_reduce_module(DataType::BF16, ReductionKind::Product, vec![0], vec![2, 3]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<3xbf16> {
-                    %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
-                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                    %1 = stablehlo.reduce(%0 init: %cst) applies stablehlo.multiply across dimensions = [0] : (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>
-                    %2 = stablehlo.convert %1 : (tensor<3xf32>) -> tensor<3xbf16>
-                    return %2 : tensor<3xbf16>
-                  }
-                }
-            "#},
-        );
-    }
 
     #[test]
     fn test_lower_product_combiner_to_mlir_complex_identity() {
@@ -1386,380 +1011,39 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_log_sum_exp_requires_negative_infinity() {
-        // A valid pairwise identity is insufficient for max-shifted padding, including in unchecked programs.
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(ArrayType::new_static(DataType::F8E4M3FN, [4]));
-        let output = builder.add_variable(ArrayType::scalar(DataType::F8E4M3FN));
-        builder.add_instruction_unchecked(Instruction::new(
-            ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::LogSumExp)),
-            vec![input],
-            vec![output],
-            Vec::new(),
-        ));
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
+    fn test_build_reduce_body_region() {
+        // `LogSumExp` has no scalar combiner, because it lowers to an expansion shifted by the maximum.
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
         assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
-                if op == "`reduce` with kind `log_sum_exp` requires a format with negative infinity but got `f8e4m3fn`",
+            build_reduce_body_region(
+                ReductionKind::LogSumExp,
+                DataType::F32,
+                FloatExtremumForm::TotalOrder,
+                &context,
+                location,
+            ),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "reduce"
+                    && reason == "`reduce` with kind `log_sum_exp` requires a maximum-shifted expansion instead of a \
+                                  scalar combiner",
         ));
     }
 
     #[test]
-    fn test_to_mlir_module_for_plain_program_preserves_dynamic_reduce_axes() {
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(batch), CoreDimension::Static(3)]));
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(input_type);
-        let output = builder
-            .add_instruction(
-                ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Sum)),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        assert!(stablehlo.contains("tensor<?x3xf32, #stablehlo.bounds<4, ?>>"), "{stablehlo}");
-        assert!(stablehlo.contains("-> tensor<?xf32, #stablehlo.bounds<4>>"), "{stablehlo}");
-        assert!(stablehlo.contains("across dimensions = [1]"), "{stablehlo}");
-
-        // Mean needs the removed-axis runtime extent as a divisor. That future dimension residual is an explicit
-        // Phase 6/7 boundary rather than an operand added to the primal reduce instruction.
-        let reduced = DimensionVariable::new("reduced", DimensionBounds::new(1, Some(5)).unwrap());
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(reduced), CoreDimension::Static(3)]));
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(input_type);
-        let output = builder
-            .add_instruction(
-                ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Mean)),
-                Vec::new(),
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
-                if op == "`reduce` mean over dynamically sized axis 0",
-        ));
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_bf16_reduce_mean() {
-        assert_eq!(
-            lowered_reduce_module(DataType::BF16, ReductionKind::Mean, vec![1], vec![2, 3]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<2xbf16> {
-                    %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %1 = stablehlo.reduce(%0 init: %cst) applies stablehlo.add across dimensions = [1] : (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
-                    %cst_0 = stablehlo.constant dense<3.000000e+00> : tensor<f32>
-                    %2 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<2xf32>
-                    %3 = stablehlo.divide %1, %2 : tensor<2xf32>
-                    %4 = stablehlo.convert %3 : (tensor<2xf32>) -> tensor<2xbf16>
-                    return %4 : tensor<2xbf16>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_full_reduce_mean_without_broadcast() {
-        assert_eq!(
-            lowered_reduce_module(DataType::F32, ReductionKind::Mean, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xf32>) -> tensor<f32> {
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
-                    %cst_0 = stablehlo.constant dense<4.000000e+00> : tensor<f32>
-                    %1 = stablehlo.divide %0, %cst_0 : tensor<f32>
-                    return %1 : tensor<f32>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_f16_reduce_min() {
-        assert_eq!(
-            lowered_reduce_module(DataType::F16, ReductionKind::Min, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xf16>) -> tensor<f16> {
-                    %0 = stablehlo.bitcast_convert %arg0 : (tensor<4xf16>) -> tensor<4xi16>
-                    %c = stablehlo.constant dense<0> : tensor<i16>
-                    %1 = stablehlo.clamp %c, %0, %c : (tensor<i16>, tensor<4xi16>, tensor<i16>) -> tensor<4xi16>
-                    %c_0 = stablehlo.constant dense<32767> : tensor<i16>
-                    %2 = stablehlo.clamp %c_0, %0, %c_0 : (tensor<i16>, tensor<4xi16>, tensor<i16>) -> tensor<4xi16>
-                    %3 = stablehlo.compare LT, %0, %1, SIGNED : (tensor<4xi16>, tensor<4xi16>) -> tensor<4xi1>
-                    %4 = stablehlo.xor %0, %2 : tensor<4xi16>
-                    %5 = stablehlo.select %3, %4, %0 : tensor<4xi1>, tensor<4xi16>
-                    %6 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<4xf16>, tensor<4xf16>) -> tensor<4xi1>
-                    %c_1 = stablehlo.constant dense<-32257> : tensor<i16>
-                    %7 = stablehlo.clamp %c_1, %5, %c_1 : (tensor<i16>, tensor<4xi16>, tensor<i16>) -> tensor<4xi16>
-                    %8 = stablehlo.select %6, %7, %5 : tensor<4xi1>, tensor<4xi16>
-                    %c_2 = stablehlo.constant dense<31744> : tensor<i16>
-                    %9 = stablehlo.reduce(%8 init: %c_2) applies stablehlo.minimum across dimensions = [0] : (tensor<4xi16>, tensor<i16>) -> tensor<i16>
-                    %c_3 = stablehlo.constant dense<0> : tensor<i16>
-                    %10 = stablehlo.clamp %c_3, %9, %c_3 : tensor<i16>
-                    %c_4 = stablehlo.constant dense<32767> : tensor<i16>
-                    %11 = stablehlo.clamp %c_4, %9, %c_4 : tensor<i16>
-                    %12 = stablehlo.compare LT, %9, %10, SIGNED : (tensor<i16>, tensor<i16>) -> tensor<i1>
-                    %13 = stablehlo.xor %9, %11 : tensor<i16>
-                    %14 = stablehlo.select %12, %13, %9 : tensor<i1>, tensor<i16>
-                    %15 = stablehlo.bitcast_convert %14 : (tensor<i16>) -> tensor<f16>
-                    %16 = stablehlo.compare NE, %15, %15, FLOAT : (tensor<f16>, tensor<f16>) -> tensor<i1>
-                    %17 = stablehlo.abs %15 : tensor<f16>
-                    %18 = stablehlo.select %16, %17, %15 : tensor<i1>, tensor<f16>
-                    return %18 : tensor<f16>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_f8e5m2_reduce_max_with_infinite_identity() {
-        assert_eq!(
-            lowered_reduce_module(DataType::F8E5M2, ReductionKind::Max, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xf8E5M2>) -> tensor<f8E5M2> {
-                    %cst = stablehlo.constant dense<0xFC> : tensor<f8E5M2>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<4xf8E5M2>, tensor<f8E5M2>) -> tensor<f8E5M2>
-                     reducer(%arg1: tensor<f8E5M2>, %arg2: tensor<f8E5M2>)  {
-                      %1 = stablehlo.compare GT, %arg1, %arg2, TOTALORDER : (tensor<f8E5M2>, tensor<f8E5M2>) -> tensor<i1>
-                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f8E5M2>
-                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f8E5M2>, tensor<f8E5M2>) -> tensor<i1>
-                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f8E5M2>, tensor<f8E5M2>) -> tensor<i1>
-                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f8E5M2>
-                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f8E5M2>
-                      stablehlo.return %6 : tensor<f8E5M2>
-                    }
-                    return %0 : tensor<f8E5M2>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_f8e4m3fn_reduce_max_with_finite_identity() {
-        assert_eq!(
-            lowered_reduce_module(DataType::F8E4M3FN, ReductionKind::Max, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xf8E4M3FN>) -> tensor<f8E4M3FN> {
-                    %cst = stablehlo.constant dense<-4.480000e+02> : tensor<f8E4M3FN>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<4xf8E4M3FN>, tensor<f8E4M3FN>) -> tensor<f8E4M3FN>
-                     reducer(%arg1: tensor<f8E4M3FN>, %arg2: tensor<f8E4M3FN>)  {
-                      %1 = stablehlo.compare GT, %arg1, %arg2, TOTALORDER : (tensor<f8E4M3FN>, tensor<f8E4M3FN>) -> tensor<i1>
-                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f8E4M3FN>
-                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f8E4M3FN>, tensor<f8E4M3FN>) -> tensor<i1>
-                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f8E4M3FN>, tensor<f8E4M3FN>) -> tensor<i1>
-                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f8E4M3FN>
-                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f8E4M3FN>
-                      stablehlo.return %6 : tensor<f8E4M3FN>
-                    }
-                    return %0 : tensor<f8E4M3FN>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_f8e4m3fn_reduce_sum() {
-        assert_eq!(
-            lowered_reduce_module(DataType::F8E4M3FN, ReductionKind::Sum, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xf8E4M3FN>) -> tensor<f8E4M3FN> {
-                    %0 = stablehlo.convert %arg0 : (tensor<4xf8E4M3FN>) -> tensor<4xf32>
-                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
-                    %1 = stablehlo.reduce(%0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
-                    %2 = stablehlo.convert %1 : (tensor<f32>) -> tensor<f8E4M3FN>
-                    return %2 : tensor<f8E4M3FN>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_f4e2m1fn_reduce_min_with_finite_identity() {
-        assert_eq!(
-            lowered_reduce_module(DataType::F4E2M1FN, ReductionKind::Min, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xf4E2M1FN>) -> tensor<f4E2M1FN> {
-                    %cst = stablehlo.constant dense<6.000000e+00> : tensor<f4E2M1FN>
-                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<4xf4E2M1FN>, tensor<f4E2M1FN>) -> tensor<f4E2M1FN>
-                     reducer(%arg1: tensor<f4E2M1FN>, %arg2: tensor<f4E2M1FN>)  {
-                      %1 = stablehlo.compare LT, %arg1, %arg2, TOTALORDER : (tensor<f4E2M1FN>, tensor<f4E2M1FN>) -> tensor<i1>
-                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f4E2M1FN>
-                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f4E2M1FN>, tensor<f4E2M1FN>) -> tensor<i1>
-                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f4E2M1FN>, tensor<f4E2M1FN>) -> tensor<i1>
-                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f4E2M1FN>
-                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f4E2M1FN>
-                      stablehlo.return %6 : tensor<f4E2M1FN>
-                    }
-                    return %0 : tensor<f4E2M1FN>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_i32_reduce_max_with_min_identity() {
-        assert_eq!(
-            lowered_reduce_module(DataType::I32, ReductionKind::Max, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xi32>) -> tensor<i32> {
-                    %c = stablehlo.constant dense<-2147483648> : tensor<i32>
-                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.maximum across dimensions = [0] : (tensor<4xi32>, tensor<i32>) -> tensor<i32>
-                    return %0 : tensor<i32>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_i64_reduce_sum() {
-        assert_eq!(
-            lowered_reduce_module(DataType::I64, ReductionKind::Sum, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xi64>) -> tensor<i64> {
-                    %c = stablehlo.constant dense<0> : tensor<i64>
-                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.add across dimensions = [0] : (tensor<4xi64>, tensor<i64>) -> tensor<i64>
-                    return %0 : tensor<i64>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_i64_reduce_product() {
-        assert_eq!(
-            lowered_reduce_module(DataType::I64, ReductionKind::Product, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xi64>) -> tensor<i64> {
-                    %c = stablehlo.constant dense<1> : tensor<i64>
-                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.multiply across dimensions = [0] : (tensor<4xi64>, tensor<i64>) -> tensor<i64>
-                    return %0 : tensor<i64>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_i32_reduce_mean_with_integer_division() {
-        assert_eq!(
-            lowered_reduce_module(DataType::I32, ReductionKind::Mean, vec![1], vec![2, 3]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2x3xi32>) -> tensor<2xi32> {
-                    %c = stablehlo.constant dense<0> : tensor<i32>
-                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.add across dimensions = [1] : (tensor<2x3xi32>, tensor<i32>) -> tensor<2xi32>
-                    %c_0 = stablehlo.constant dense<3> : tensor<i32>
-                    %1 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<i32>) -> tensor<2xi32>
-                    %2 = stablehlo.divide %0, %1 : tensor<2xi32>
-                    return %2 : tensor<2xi32>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_u8_reduce_min_with_max_identity() {
-        assert_eq!(
-            lowered_reduce_module(DataType::U8, ReductionKind::Min, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xui8>) -> tensor<ui8> {
-                    %c = stablehlo.constant dense<255> : tensor<ui8>
-                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.minimum across dimensions = [0] : (tensor<4xui8>, tensor<ui8>) -> tensor<ui8>
-                    return %0 : tensor<ui8>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_u64_reduce_min_with_max_identity() {
-        assert_eq!(
-            lowered_reduce_module(DataType::U64, ReductionKind::Min, vec![0], vec![4]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<4xui64>) -> tensor<ui64> {
-                    %c = stablehlo.constant dense<18446744073709551615> : tensor<ui64>
-                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.minimum across dimensions = [0] : (tensor<4xui64>, tensor<ui64>) -> tensor<ui64>
-                    return %0 : tensor<ui64>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_boolean_and_complex_reduce_max() {
-        assert_eq!(
-            lowered_reduce_module(DataType::Boolean, ReductionKind::Max, vec![0], vec![0]).unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<0xi1>) -> tensor<i1> {
-                    %c = stablehlo.constant dense<false> : tensor<i1>
-                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.maximum across dimensions = [0] : (tensor<0xi1>, tensor<i1>) -> tensor<i1>
-                    return %0 : tensor<i1>
-                  }
-                }
-            "#},
-        );
-
-        // StableHLO has no primitive with JAX's complex ordering contract, so the reduction body explicitly compares
-        // real components first and imaginary components only when the real components are equal.
-        let stablehlo = lowered_reduce_module(DataType::C64, ReductionKind::Max, vec![0], vec![0]).unwrap();
-        assert!(stablehlo.contains("tensor<complex<f32>>"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.reduce"), "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.real").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.imag").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.compare").count(), 3, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.select").count(), 2, "{stablehlo}");
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_supports_f8e8m0fnu_extrema_but_rejects_sum() {
-        assert!(matches!(
-            lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Sum, vec![0], vec![4]).unwrap_err(),
-            Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::F8E8M0FNU, context })
-                if context == "sum reduction identity",
-        ));
-        assert!(lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Max, vec![0], vec![0]).is_ok());
-        assert!(lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Min, vec![0], vec![0]).is_ok());
+    fn test_build_reduction_identity_constant() {
+        // Complex values have no identities for the Boolean reductions or for `LogSumExp`.
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let mut region = context.region();
+        let mut block = region.append_block(context.block_with_no_arguments()).unwrap();
+        for kind in [ReductionKind::Any, ReductionKind::All, ReductionKind::LogSumExp] {
+            assert!(matches!(
+                build_reduction_identity_constant(kind, DataType::C64, &mut block, &context, location),
+                Err(Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::C64, context }))
+                    if context == format!("{kind} reduction identity"),
+            ));
+        }
     }
 
     #[test]
@@ -1788,48 +1072,263 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_operation_lower_maximum_in_softmax() {
-        // XLA's GPU backend fuses a maximum reduction that is followed by the rest of a softmax into one Triton kernel,
-        // whose code generation rejects total-order comparisons in the body of that reduction, so the maximum lowers
-        // without them. The composite stages the softmax as one program, which the eager operations of the other
-        // tests never do, and its rows are the softmax of the logarithms of `1`, `2`, and `5` in two orders.
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        let softmax =
-            composite(|input: DomainTracer<ProjectedContext<Domain<'_>, ArrayType>>| -> Result<_, ProgramError> {
-                let maxima = input.reduce(&[1], ReductionKind::Max)?.broadcast_like(&input, &[0])?;
-                let exponentials = input.sub(&maxima)?.exp()?;
-                let sums = exponentials.reduce(&[1], ReductionKind::Sum)?.broadcast_like(&exponentials, &[0])?;
-                exponentials.div(&sums)
-            });
-        let logits = [1f32.ln(), 2f32.ln(), 5f32.ln(), 5f32.ln(), 1f32.ln(), 2f32.ln()];
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[2, 3], &values_to_bytes(&logits));
+    fn test_reduce_operation_lower_bf16_sum() {
+        assert_eq!(
+            lowered_reduce_module(DataType::BF16, ReductionKind::Sum, vec![0], vec![2, 3]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<3xbf16> {
+                    %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %1 = stablehlo.reduce(%0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>
+                    %2 = stablehlo.convert %1 : (tensor<3xf32>) -> tensor<3xbf16>
+                    return %2 : tensor<3xbf16>
+                  }
+                }
+            "#},
+        );
+    }
 
-        // A dimension that an explicit mesh axis shards reduces total order keys for every target, so that XLA can
-        // distribute the reduction. The mesh of this input has one device, which is enough to select the keys on
-        // the execution platform of the test, where the same softmax has to compile around them.
-        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharding = Sharding::new(
-            explicit_mesh.clone(),
-            vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])],
-        )
-        .unwrap();
-        let sharded_input = Array::from_host_buffer(
-            &domain,
-            ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(sharding).unwrap(),
-            DeviceMesh::new(explicit_mesh, mesh.devices().to_vec()).unwrap(),
-            values_to_bytes(&logits),
-        )
-        .unwrap();
-        for input in [input, sharded_input] {
-            let output = values_from_bytes::<f32>(&softmax.call(input).unwrap().copy_to_host().unwrap());
-            assert_eq!(output.len(), 6);
-            for (index, (actual, expected)) in
-                output.iter().zip([0.125f32, 0.25, 0.625, 0.625, 0.125, 0.25]).enumerate()
-            {
-                assert!((actual - expected).abs() < 1e-6, "element {index} is {actual} but the softmax is {expected}");
+    #[test]
+    fn test_reduce_operation_lower_f8e4m3fn_sum() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F8E4M3FN, ReductionKind::Sum, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf8E4M3FN>) -> tensor<f8E4M3FN> {
+                    %0 = stablehlo.convert %arg0 : (tensor<4xf8E4M3FN>) -> tensor<4xf32>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %1 = stablehlo.reduce(%0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
+                    %2 = stablehlo.convert %1 : (tensor<f32>) -> tensor<f8E4M3FN>
+                    return %2 : tensor<f8E4M3FN>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_i64_sum() {
+        assert_eq!(
+            lowered_reduce_module(DataType::I64, ReductionKind::Sum, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xi64>) -> tensor<i64> {
+                    %c = stablehlo.constant dense<0> : tensor<i64>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.add across dimensions = [0] : (tensor<4xi64>, tensor<i64>) -> tensor<i64>
+                    return %0 : tensor<i64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_bf16_product() {
+        assert_eq!(
+            lowered_reduce_module(DataType::BF16, ReductionKind::Product, vec![0], vec![2, 3]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<3xbf16> {
+                    %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
+                    %1 = stablehlo.reduce(%0 init: %cst) applies stablehlo.multiply across dimensions = [0] : (tensor<2x3xf32>, tensor<f32>) -> tensor<3xf32>
+                    %2 = stablehlo.convert %1 : (tensor<3xf32>) -> tensor<3xbf16>
+                    return %2 : tensor<3xbf16>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_i64_product() {
+        assert_eq!(
+            lowered_reduce_module(DataType::I64, ReductionKind::Product, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xi64>) -> tensor<i64> {
+                    %c = stablehlo.constant dense<1> : tensor<i64>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.multiply across dimensions = [0] : (tensor<4xi64>, tensor<i64>) -> tensor<i64>
+                    return %0 : tensor<i64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_product_with_zero_factors() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let engine = Session::new(&client).domain();
+        let input_type = replicated_vector_type(&mesh, 3);
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|value| value.reduce_product(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let gradient = compiled.gradient(&engine).unwrap();
+
+        // A zero factor retains the product of the other factors in its derivative, while two zeros erase every term.
+        for (values, expected, expected_gradient) in [
+            ([2f32, 3., 4.], 24., vec![12., 8., 6.]),
+            ([0f32, 3., 4.], 0., vec![12., 0., 0.]),
+            ([0f32, 0., 4.], 0., vec![0., 0., 0.]),
+        ] {
+            let input =
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
+            let output = compiled.executable().execute(&engine, input.clone()).unwrap();
+            assert_eq!(read_f32s(&client, &output), vec![expected]);
+            let output = gradient.executable().execute(&engine, input).unwrap();
+            assert_eq!(read_f32s(&client, &output), expected_gradient);
+        }
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_product_sharded_gradient() {
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
+        let engine = Session::new(&client).domain();
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|value| value.reduce_product(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let gradient = compiled.gradient(&engine).unwrap();
+
+        // Each input cotangent depends on factors held by the other device, including the sole zero's cotangent.
+        for (values, expected) in
+            [([2f32, 3., 4., 5.], vec![60f32, 40., 30., 24.]), ([0f32, 3., 4., 5.], vec![60f32, 0., 0., 0.])]
+        {
+            let input =
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
+            let output = gradient.executable().execute(&engine, input).unwrap();
+            assert_eq!(output.sharding(), input_type.sharding().unwrap());
+            let mut observed = Vec::new();
+            for device in client.addressable_devices().unwrap().iter().take(2) {
+                let bytes = output
+                    .device_shard(device.id().unwrap())
+                    .unwrap()
+                    .buffer()
+                    .unwrap()
+                    .copy_to_host(None)
+                    .unwrap()
+                    .r#await()
+                    .unwrap();
+                observed.extend(values_from_bytes::<f32>(&bytes));
             }
+            assert_eq!(observed, expected);
+        }
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_bf16_mean() {
+        assert_eq!(
+            lowered_reduce_module(DataType::BF16, ReductionKind::Mean, vec![1], vec![2, 3]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<2xbf16> {
+                    %0 = stablehlo.convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xf32>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %1 = stablehlo.reduce(%0 init: %cst) applies stablehlo.add across dimensions = [1] : (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+                    %cst_0 = stablehlo.constant dense<3.000000e+00> : tensor<f32>
+                    %2 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f32>) -> tensor<2xf32>
+                    %3 = stablehlo.divide %1, %2 : tensor<2xf32>
+                    %4 = stablehlo.convert %3 : (tensor<2xf32>) -> tensor<2xbf16>
+                    return %4 : tensor<2xbf16>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_full_mean_without_broadcast() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F32, ReductionKind::Mean, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<f32> {
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [0] : (tensor<4xf32>, tensor<f32>) -> tensor<f32>
+                    %cst_0 = stablehlo.constant dense<4.000000e+00> : tensor<f32>
+                    %1 = stablehlo.divide %0, %cst_0 : tensor<f32>
+                    return %1 : tensor<f32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_i32_mean_with_integer_division() {
+        assert_eq!(
+            lowered_reduce_module(DataType::I32, ReductionKind::Mean, vec![1], vec![2, 3]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xi32>) -> tensor<2xi32> {
+                    %c = stablehlo.constant dense<0> : tensor<i32>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.add across dimensions = [1] : (tensor<2x3xi32>, tensor<i32>) -> tensor<2xi32>
+                    %c_0 = stablehlo.constant dense<3> : tensor<i32>
+                    %1 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<i32>) -> tensor<2xi32>
+                    %2 = stablehlo.divide %0, %1 : tensor<2xi32>
+                    return %2 : tensor<2xi32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_empty_mean() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let engine = Session::new(&client).domain();
+        let input_type = replicated_vector_type(&mesh, 0);
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+            |value| value.reduce(&[0], ReductionKind::Mean).unwrap(),
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, &[]).unwrap();
+        let output = compiled.executable().execute(&engine, input).unwrap();
+        assert!(read_f32s(&client, &output)[0].is_nan());
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_narrow_floating_point_accumulation() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let engine = Session::new(&client).domain();
+
+        // Product retains the small growth of each factor, and the larger mean also needs a widened divisor.
+        for (kind, count, input, expected) in [
+            (ReductionKind::Sum, 4096, 1f32, 4096f32),
+            (ReductionKind::Product, 4096, 1.0009765625f32, 54.5f32),
+            (ReductionKind::Mean, 4096, 1f32, 1f32),
+            (ReductionKind::Mean, 70000, 1f32, 1f32),
+            (ReductionKind::LogSumExp, 4096, 0f32, 8.3203125f32),
+        ] {
+            let input_type = replicated_vector_type(&mesh, count);
+            let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+                |value| {
+                    value
+                        .convert_element_type(DataType::F16)
+                        .unwrap()
+                        .reduce(&[0], kind)
+                        .unwrap()
+                        .convert_element_type(DataType::F32)
+                        .unwrap()
+                },
+                input_type.clone(),
+                &engine,
+                mesh.clone(),
+            )
+            .unwrap();
+            let input =
+                Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&vec![input; count]))
+                    .unwrap();
+            let output = compiled.executable().execute(&engine, input).unwrap();
+            assert_eq!(read_f32s(&client, &output), vec![expected]);
         }
     }
 
@@ -1884,8 +1383,8 @@ mod tests {
             f16::NEG_ZERO.to_bits().to_ne_bytes(),
         );
 
-        // A dimension that an explicit mesh axis shards reduces total order keys for every target (including the
-        // ones whose form is otherwise native), with the same NaN propagation and order of the signed zeros.
+        // A dimension that an explicit mesh axis shards reduces total order keys for every target, including the ones
+        // whose form is otherwise native, with the same NaN propagation and order of the signed zeros.
         let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
         let device_mesh = DeviceMesh::new(explicit_mesh.clone(), mesh.devices().to_vec()).unwrap();
         let sharded = |data_type: DataType, bytes: Vec<u8>| {
@@ -1937,24 +1436,464 @@ mod tests {
     }
 
     #[test]
+    fn test_reduce_operation_lower_bf16_max() {
+        assert_eq!(
+            lowered_reduce_module(DataType::BF16, ReductionKind::Max, vec![1], vec![2, 3]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2x3xbf16>) -> tensor<2xbf16> {
+                    %0 = stablehlo.bitcast_convert %arg0 : (tensor<2x3xbf16>) -> tensor<2x3xi16>
+                    %c = stablehlo.constant dense<0> : tensor<i16>
+                    %1 = stablehlo.clamp %c, %0, %c : (tensor<i16>, tensor<2x3xi16>, tensor<i16>) -> tensor<2x3xi16>
+                    %c_0 = stablehlo.constant dense<32767> : tensor<i16>
+                    %2 = stablehlo.clamp %c_0, %0, %c_0 : (tensor<i16>, tensor<2x3xi16>, tensor<i16>) -> tensor<2x3xi16>
+                    %3 = stablehlo.compare LT, %0, %1, SIGNED : (tensor<2x3xi16>, tensor<2x3xi16>) -> tensor<2x3xi1>
+                    %4 = stablehlo.xor %0, %2 : tensor<2x3xi16>
+                    %5 = stablehlo.select %3, %4, %0 : tensor<2x3xi1>, tensor<2x3xi16>
+                    %6 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<2x3xbf16>, tensor<2x3xbf16>) -> tensor<2x3xi1>
+                    %c_1 = stablehlo.constant dense<32704> : tensor<i16>
+                    %7 = stablehlo.clamp %c_1, %5, %c_1 : (tensor<i16>, tensor<2x3xi16>, tensor<i16>) -> tensor<2x3xi16>
+                    %8 = stablehlo.select %6, %7, %5 : tensor<2x3xi1>, tensor<2x3xi16>
+                    %c_2 = stablehlo.constant dense<-32641> : tensor<i16>
+                    %9 = stablehlo.reduce(%8 init: %c_2) applies stablehlo.maximum across dimensions = [1] : (tensor<2x3xi16>, tensor<i16>) -> tensor<2xi16>
+                    %c_3 = stablehlo.constant dense<0> : tensor<i16>
+                    %10 = stablehlo.clamp %c_3, %9, %c_3 : (tensor<i16>, tensor<2xi16>, tensor<i16>) -> tensor<2xi16>
+                    %c_4 = stablehlo.constant dense<32767> : tensor<i16>
+                    %11 = stablehlo.clamp %c_4, %9, %c_4 : (tensor<i16>, tensor<2xi16>, tensor<i16>) -> tensor<2xi16>
+                    %12 = stablehlo.compare LT, %9, %10, SIGNED : (tensor<2xi16>, tensor<2xi16>) -> tensor<2xi1>
+                    %13 = stablehlo.xor %9, %11 : tensor<2xi16>
+                    %14 = stablehlo.select %12, %13, %9 : tensor<2xi1>, tensor<2xi16>
+                    %15 = stablehlo.bitcast_convert %14 : (tensor<2xi16>) -> tensor<2xbf16>
+                    return %15 : tensor<2xbf16>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_f16_min() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F16, ReductionKind::Min, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf16>) -> tensor<f16> {
+                    %0 = stablehlo.bitcast_convert %arg0 : (tensor<4xf16>) -> tensor<4xi16>
+                    %c = stablehlo.constant dense<0> : tensor<i16>
+                    %1 = stablehlo.clamp %c, %0, %c : (tensor<i16>, tensor<4xi16>, tensor<i16>) -> tensor<4xi16>
+                    %c_0 = stablehlo.constant dense<32767> : tensor<i16>
+                    %2 = stablehlo.clamp %c_0, %0, %c_0 : (tensor<i16>, tensor<4xi16>, tensor<i16>) -> tensor<4xi16>
+                    %3 = stablehlo.compare LT, %0, %1, SIGNED : (tensor<4xi16>, tensor<4xi16>) -> tensor<4xi1>
+                    %4 = stablehlo.xor %0, %2 : tensor<4xi16>
+                    %5 = stablehlo.select %3, %4, %0 : tensor<4xi1>, tensor<4xi16>
+                    %6 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<4xf16>, tensor<4xf16>) -> tensor<4xi1>
+                    %c_1 = stablehlo.constant dense<-32257> : tensor<i16>
+                    %7 = stablehlo.clamp %c_1, %5, %c_1 : (tensor<i16>, tensor<4xi16>, tensor<i16>) -> tensor<4xi16>
+                    %8 = stablehlo.select %6, %7, %5 : tensor<4xi1>, tensor<4xi16>
+                    %c_2 = stablehlo.constant dense<31744> : tensor<i16>
+                    %9 = stablehlo.reduce(%8 init: %c_2) applies stablehlo.minimum across dimensions = [0] : (tensor<4xi16>, tensor<i16>) -> tensor<i16>
+                    %c_3 = stablehlo.constant dense<0> : tensor<i16>
+                    %10 = stablehlo.clamp %c_3, %9, %c_3 : tensor<i16>
+                    %c_4 = stablehlo.constant dense<32767> : tensor<i16>
+                    %11 = stablehlo.clamp %c_4, %9, %c_4 : tensor<i16>
+                    %12 = stablehlo.compare LT, %9, %10, SIGNED : (tensor<i16>, tensor<i16>) -> tensor<i1>
+                    %13 = stablehlo.xor %9, %11 : tensor<i16>
+                    %14 = stablehlo.select %12, %13, %9 : tensor<i1>, tensor<i16>
+                    %15 = stablehlo.bitcast_convert %14 : (tensor<i16>) -> tensor<f16>
+                    %16 = stablehlo.compare NE, %15, %15, FLOAT : (tensor<f16>, tensor<f16>) -> tensor<i1>
+                    %17 = stablehlo.abs %15 : tensor<f16>
+                    %18 = stablehlo.select %16, %17, %15 : tensor<i1>, tensor<f16>
+                    return %18 : tensor<f16>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_f8e5m2_max_with_infinite_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F8E5M2, ReductionKind::Max, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf8E5M2>) -> tensor<f8E5M2> {
+                    %cst = stablehlo.constant dense<0xFC> : tensor<f8E5M2>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<4xf8E5M2>, tensor<f8E5M2>) -> tensor<f8E5M2>
+                     reducer(%arg1: tensor<f8E5M2>, %arg2: tensor<f8E5M2>)  {
+                      %1 = stablehlo.compare GT, %arg1, %arg2, TOTALORDER : (tensor<f8E5M2>, tensor<f8E5M2>) -> tensor<i1>
+                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f8E5M2>
+                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f8E5M2>, tensor<f8E5M2>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f8E5M2>, tensor<f8E5M2>) -> tensor<i1>
+                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f8E5M2>
+                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f8E5M2>
+                      stablehlo.return %6 : tensor<f8E5M2>
+                    }
+                    return %0 : tensor<f8E5M2>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_f8e4m3fn_max_with_finite_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F8E4M3FN, ReductionKind::Max, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf8E4M3FN>) -> tensor<f8E4M3FN> {
+                    %cst = stablehlo.constant dense<-4.480000e+02> : tensor<f8E4M3FN>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<4xf8E4M3FN>, tensor<f8E4M3FN>) -> tensor<f8E4M3FN>
+                     reducer(%arg1: tensor<f8E4M3FN>, %arg2: tensor<f8E4M3FN>)  {
+                      %1 = stablehlo.compare GT, %arg1, %arg2, TOTALORDER : (tensor<f8E4M3FN>, tensor<f8E4M3FN>) -> tensor<i1>
+                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f8E4M3FN>
+                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f8E4M3FN>, tensor<f8E4M3FN>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f8E4M3FN>, tensor<f8E4M3FN>) -> tensor<i1>
+                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f8E4M3FN>
+                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f8E4M3FN>
+                      stablehlo.return %6 : tensor<f8E4M3FN>
+                    }
+                    return %0 : tensor<f8E4M3FN>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_f4e2m1fn_min_with_finite_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::F4E2M1FN, ReductionKind::Min, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf4E2M1FN>) -> tensor<f4E2M1FN> {
+                    %cst = stablehlo.constant dense<6.000000e+00> : tensor<f4E2M1FN>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<4xf4E2M1FN>, tensor<f4E2M1FN>) -> tensor<f4E2M1FN>
+                     reducer(%arg1: tensor<f4E2M1FN>, %arg2: tensor<f4E2M1FN>)  {
+                      %1 = stablehlo.compare LT, %arg1, %arg2, TOTALORDER : (tensor<f4E2M1FN>, tensor<f4E2M1FN>) -> tensor<i1>
+                      %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f4E2M1FN>
+                      %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f4E2M1FN>, tensor<f4E2M1FN>) -> tensor<i1>
+                      %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f4E2M1FN>, tensor<f4E2M1FN>) -> tensor<i1>
+                      %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f4E2M1FN>
+                      %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f4E2M1FN>
+                      stablehlo.return %6 : tensor<f4E2M1FN>
+                    }
+                    return %0 : tensor<f4E2M1FN>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_f8e8m0fnu_supports_extrema_but_rejects_sum() {
+        assert!(matches!(
+            lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Sum, vec![0], vec![4]).unwrap_err(),
+            Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::F8E8M0FNU, context })
+                if context == "sum reduction identity",
+        ));
+        let maximum = lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Max, vec![0], vec![0]).unwrap();
+        assert_eq!(
+            maximum,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<0xf8E8M0FNU>) -> tensor<f8E8M0FNU> {
+                %cst = stablehlo.constant dense<5.877470e-39> : tensor<f8E8M0FNU>
+                %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<0xf8E8M0FNU>, tensor<f8E8M0FNU>) -> tensor<f8E8M0FNU>
+                 reducer(%arg1: tensor<f8E8M0FNU>, %arg2: tensor<f8E8M0FNU>)  {
+                  %1 = stablehlo.compare GT, %arg1, %arg2, TOTALORDER : (tensor<f8E8M0FNU>, tensor<f8E8M0FNU>) -> tensor<i1>
+                  %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f8E8M0FNU>
+                  %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f8E8M0FNU>, tensor<f8E8M0FNU>) -> tensor<i1>
+                  %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f8E8M0FNU>, tensor<f8E8M0FNU>) -> tensor<i1>
+                  %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f8E8M0FNU>
+                  %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f8E8M0FNU>
+                  stablehlo.return %6 : tensor<f8E8M0FNU>
+                }
+                return %0 : tensor<f8E8M0FNU>
+              }
+            }
+            "#},
+        );
+        let minimum = lowered_reduce_module(DataType::F8E8M0FNU, ReductionKind::Min, vec![0], vec![0]).unwrap();
+        assert_eq!(
+            minimum,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<0xf8E8M0FNU>) -> tensor<f8E8M0FNU> {
+                %cst = stablehlo.constant dense<1.701410e+38> : tensor<f8E8M0FNU>
+                %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<0xf8E8M0FNU>, tensor<f8E8M0FNU>) -> tensor<f8E8M0FNU>
+                 reducer(%arg1: tensor<f8E8M0FNU>, %arg2: tensor<f8E8M0FNU>)  {
+                  %1 = stablehlo.compare LT, %arg1, %arg2, TOTALORDER : (tensor<f8E8M0FNU>, tensor<f8E8M0FNU>) -> tensor<i1>
+                  %2 = stablehlo.select %1, %arg1, %arg2 : tensor<i1>, tensor<f8E8M0FNU>
+                  %3 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f8E8M0FNU>, tensor<f8E8M0FNU>) -> tensor<i1>
+                  %4 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f8E8M0FNU>, tensor<f8E8M0FNU>) -> tensor<i1>
+                  %5 = stablehlo.select %4, %arg2, %2 : tensor<i1>, tensor<f8E8M0FNU>
+                  %6 = stablehlo.select %3, %arg1, %5 : tensor<i1>, tensor<f8E8M0FNU>
+                  stablehlo.return %6 : tensor<f8E8M0FNU>
+                }
+                return %0 : tensor<f8E8M0FNU>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_i32_max_with_min_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::I32, ReductionKind::Max, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xi32>) -> tensor<i32> {
+                    %c = stablehlo.constant dense<-2147483648> : tensor<i32>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.maximum across dimensions = [0] : (tensor<4xi32>, tensor<i32>) -> tensor<i32>
+                    return %0 : tensor<i32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_u8_min_with_max_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::U8, ReductionKind::Min, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xui8>) -> tensor<ui8> {
+                    %c = stablehlo.constant dense<255> : tensor<ui8>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.minimum across dimensions = [0] : (tensor<4xui8>, tensor<ui8>) -> tensor<ui8>
+                    return %0 : tensor<ui8>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_u64_min_with_max_identity() {
+        assert_eq!(
+            lowered_reduce_module(DataType::U64, ReductionKind::Min, vec![0], vec![4]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xui64>) -> tensor<ui64> {
+                    %c = stablehlo.constant dense<18446744073709551615> : tensor<ui64>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.minimum across dimensions = [0] : (tensor<4xui64>, tensor<ui64>) -> tensor<ui64>
+                    return %0 : tensor<ui64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_boolean_max() {
+        assert_eq!(
+            lowered_reduce_module(DataType::Boolean, ReductionKind::Max, vec![0], vec![0]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<0xi1>) -> tensor<i1> {
+                    %c = stablehlo.constant dense<false> : tensor<i1>
+                    %0 = stablehlo.reduce(%arg0 init: %c) applies stablehlo.maximum across dimensions = [0] : (tensor<0xi1>, tensor<i1>) -> tensor<i1>
+                    return %0 : tensor<i1>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_complex_max() {
+        // StableHLO has no primitive with JAX's complex ordering contract, so the reduction body explicitly compares
+        // real components first and imaginary components only when the real components are equal.
+        let stablehlo = lowered_reduce_module(DataType::C64, ReductionKind::Max, vec![0], vec![0]).unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<0xcomplex<f32>>) -> tensor<complex<f32>> {
+                %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                %0 = stablehlo.complex %cst, %cst : tensor<complex<f32>>
+                %1 = stablehlo.reduce(%arg0 init: %0) across dimensions = [0] : (tensor<0xcomplex<f32>>, tensor<complex<f32>>) -> tensor<complex<f32>>
+                 reducer(%arg1: tensor<complex<f32>>, %arg2: tensor<complex<f32>>)  {
+                  %2 = stablehlo.real %arg1 : (tensor<complex<f32>>) -> tensor<f32>
+                  %3 = stablehlo.real %arg2 : (tensor<complex<f32>>) -> tensor<f32>
+                  %4 = stablehlo.imag %arg1 : (tensor<complex<f32>>) -> tensor<f32>
+                  %5 = stablehlo.imag %arg2 : (tensor<complex<f32>>) -> tensor<f32>
+                  %6 = stablehlo.compare EQ, %2, %3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %7 = stablehlo.compare GT, %2, %3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %8 = stablehlo.compare GT, %4, %5, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %9 = stablehlo.select %6, %8, %7 : tensor<i1>, tensor<i1>
+                  %10 = stablehlo.select %9, %arg1, %arg2 : tensor<i1>, tensor<complex<f32>>
+                  stablehlo.return %10 : tensor<complex<f32>>
+                }
+                return %1 : tensor<complex<f32>>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_complex_executes() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let engine = Session::new(&client).domain();
+        // Complex storage interleaves the real and imaginary components. Infinite real components force extrema
+        // to compare the imaginary component against the identity rather than deciding on the real component.
+        for (kind, components, expected) in [
+            (ReductionKind::Product, vec![2f32, 4., 6., 8.], vec![-20f32, 40.]),
+            (ReductionKind::Product, vec![], vec![1f32, 0.]),
+            (ReductionKind::Mean, vec![2f32, 4., 6., 8.], vec![4f32, 6.]),
+            (ReductionKind::Max, vec![f32::NEG_INFINITY, -1., f32::NEG_INFINITY, -1.], vec![f32::NEG_INFINITY, -1.]),
+            (ReductionKind::Min, vec![f32::INFINITY, 1., f32::INFINITY, 1.], vec![f32::INFINITY, 1.]),
+        ] {
+            let input_type = ArrayType::new_static(DataType::C64, [components.len() / 2])
+                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+                .unwrap();
+            let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+                compile(|value| value.reduce(&[0], kind).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+            let input =
+                Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&components)).unwrap();
+            let output = compiled.executable().execute(&engine, input).unwrap();
+            assert_eq!(read_f32s(&client, &output), expected);
+        }
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_extrema_natively_for_cuda() {
+        // XLA's GPU compiler fuses reductions into Triton kernels whose code generation fails on total order
+        // comparisons, so a CUDA target lowers floating-point extrema to the native operations, which order the
+        // signed zeros there, and keeps the explicit NaN propagation.
+        let lowered = |kind: ReductionKind| {
+            let input_type = ArrayType::new_static(DataType::F32, [2, 3]);
+            let output_type = ArrayType::new_static(DataType::F32, [2]);
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let output = builder
+                .add_instruction(
+                    ArrayOperation::Reduce(ReduceOperation::new(vec![1], kind)),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            lower_mlir_module_for_program(
+                &unproject_plain_program(program),
+                &[],
+                &vec![input_type],
+                &vec![output_type],
+                "main",
+                None,
+                None,
+                Some("cuda"),
+            )
+            .unwrap()
+            .into_stable_hlo()
+        };
+        assert_eq!(
+            lowered(ReductionKind::Max),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2xf32> {
+                    %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [1] : \
+                      (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+                     reducer(%arg1: tensor<f32>, %arg2: tensor<f32>)  {
+                      %1 = stablehlo.maximum %arg1, %arg2 : tensor<f32>
+                      %2 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %3 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %4 = stablehlo.select %3, %arg2, %1 : tensor<i1>, tensor<f32>
+                      %5 = stablehlo.select %2, %arg1, %4 : tensor<i1>, tensor<f32>
+                      stablehlo.return %5 : tensor<f32>
+                    }
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
+        assert_eq!(
+            lowered(ReductionKind::Min),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2xf32> {
+                    %cst = stablehlo.constant dense<0x7F800000> : tensor<f32>
+                    %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [1] : \
+                      (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+                     reducer(%arg1: tensor<f32>, %arg2: tensor<f32>)  {
+                      %1 = stablehlo.minimum %arg1, %arg2 : tensor<f32>
+                      %2 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %3 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %4 = stablehlo.select %3, %arg2, %1 : tensor<i1>, tensor<f32>
+                      %5 = stablehlo.select %2, %arg1, %4 : tensor<i1>, tensor<f32>
+                      stablehlo.return %5 : tensor<f32>
+                    }
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_maximum_in_softmax() {
+        // XLA's GPU backend fuses a maximum reduction that is followed by the rest of a softmax into one Triton kernel,
+        // whose code generation rejects total order comparisons in the body of that reduction, so the maximum lowers
+        // without them. The composite stages the softmax as one program, which the eager operations of the other
+        // tests never do, and its rows are the softmax of the logarithms of `1`, `2`, and `5` in two orders.
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let softmax =
+            composite(|input: DomainTracer<ProjectedContext<Domain<'_>, ArrayType>>| -> Result<_, ProgramError> {
+                let maxima = input.reduce(&[1], ReductionKind::Max)?.broadcast_like(&input, &[0])?;
+                let exponentials = input.sub(&maxima)?.exp()?;
+                let sums = exponentials.reduce(&[1], ReductionKind::Sum)?.broadcast_like(&exponentials, &[0])?;
+                exponentials.div(&sums)
+            });
+        let logits = [1f32.ln(), 2f32.ln(), 5f32.ln(), 5f32.ln(), 1f32.ln(), 2f32.ln()];
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[2, 3], &values_to_bytes(&logits));
+
+        // A dimension that an explicit mesh axis shards reduces total order keys for every target, so that XLA can
+        // distribute the reduction. The mesh of this input has one device, which is enough to select the keys on
+        // the execution platform of the test, where the same softmax has to compile around them.
+        let explicit_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = Sharding::new(
+            explicit_mesh.clone(),
+            vec![ShardingDimension::Replicated, ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        let sharded_input = Array::from_host_buffer(
+            &domain,
+            ArrayType::new_static(DataType::F32, [2, 3]).with_sharding(sharding).unwrap(),
+            DeviceMesh::new(explicit_mesh, mesh.devices().to_vec()).unwrap(),
+            values_to_bytes(&logits),
+        )
+        .unwrap();
+        for input in [input, sharded_input] {
+            let output = values_from_bytes::<f32>(&softmax.call(input).unwrap().copy_to_host().unwrap());
+            assert_eq!(output.len(), 6);
+            for (index, (actual, expected)) in
+                output.iter().zip([0.125f32, 0.25, 0.625, 0.625, 0.125, 0.25]).enumerate()
+            {
+                assert!((actual - expected).abs() < 1e-6, "element {index} is {actual} but the softmax is {expected}");
+            }
+        }
+    }
+
+    #[test]
     fn test_reduce_operation_lower_extrema_over_sharded_dimensions() {
         // XLA partitions a reduction over a sharded dimension into a reduction of every shard that is followed by an
         // all-reduce with the same combiner, and its backends implement all-reduce only for the plain combiners that
         // they recognize. Floating-point extrema over two devices still propagate NaNs and order negative zero below
         // positive zero, wherever the shards hold them.
-        let client = load_cpu_plugin()
-            .unwrap()
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
+        let client = cpu_client(2);
         let domain = Session::new(&client).domain();
-        let devices = client
-            .addressable_devices()
-            .unwrap()
-            .into_iter()
-            .map(|device| Device::from_pjrt(device).unwrap())
-            .collect::<Vec<_>>();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), devices).unwrap();
+        let mesh = DeviceMesh::new(logical_mesh.clone(), domain_mesh(&client, "x", 2).devices().to_vec()).unwrap();
         let sharded = |data_type: DataType, dimensions: &[usize], axis: usize, bytes: Vec<u8>| {
             let mut placements = vec![ShardingDimension::Replicated; dimensions.len()];
             placements[axis] = ShardingDimension::sharded(["x"]);
@@ -2031,8 +1970,8 @@ mod tests {
         );
 
         // Combiners that XLA cannot distribute reduce a replicated copy of the sharded dimension instead, which
-        // keeps their results. They are the lexicographic complex extrema, the complex product (whose combiner
-        // returns an infinite factor next to the `1 + 0i` identity as it is), and the extrema of the floating-point
+        // keeps their results. They are the lexicographic complex extrema, the complex product, whose combiner
+        // returns an infinite factor next to the `1 + 0i` identity as it is, and the extrema of the floating-point
         // types without keys.
         let complex =
             [Complex::new(1f32, 5.0), Complex::new(2.0, -3.0), Complex::new(2.0, 4.0), Complex::new(0.0, 0.0)];
@@ -2090,7 +2029,412 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_argmax_with_variadic_reduce() {
+    fn test_reduce_operation_lower_replicates_undistributable_reductions() {
+        // XLA can only distribute a reduction whose combiner is a single operation, so the reduction of any other
+        // combiner over a dimension that an explicit mesh axis shards first constrains its input to be replicated
+        // along that dimension. The floating-point extrema that have total order keys reduce them with a single
+        // integer operation for every target, including CUDA, whose native form is not such a combiner.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharding = |dimensions: Vec<ShardingDimension>| Sharding::new(mesh.clone(), dimensions).unwrap();
+        let x = ShardingDimension::sharded(["x"]);
+        let lowered = |kind: ReductionKind, data_type: DataType, axis: usize, target_platform: Option<&str>| {
+            let input_type = ArrayType::new_static(data_type, [2, 4])
+                .with_sharding(sharding(vec![ShardingDimension::Replicated, x.clone()]))
+                .unwrap();
+            let output_dimensions = if axis == 1 { vec![ShardingDimension::Replicated] } else { vec![x.clone()] };
+            let output_type = ArrayType::new_static(data_type, [if axis == 1 { 2 } else { 4 }])
+                .with_sharding(sharding(output_dimensions))
+                .unwrap();
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let output = builder
+                .add_instruction(
+                    ArrayOperation::Reduce(ReduceOperation::new(vec![axis], kind)),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let argument_shardings = [input_type.sharding().unwrap().clone()];
+            let result_shardings = [output_type.sharding().unwrap().clone()];
+            lower_mlir_module_for_program(
+                &unproject_plain_program(program),
+                &[],
+                &vec![input_type],
+                &vec![output_type],
+                "main",
+                Some(&argument_shardings),
+                Some(&result_shardings),
+                target_platform,
+            )
+            .unwrap()
+            .into_stable_hlo()
+        };
+        let constraint = r#"sdy.sharding_constraint %arg0 <@mesh, [{}, {}], replicated={"x"}>"#;
+        for (kind, data_type, target_platform, constrained) in [
+            (ReductionKind::Max, DataType::F32, Some("cuda"), false),
+            (ReductionKind::LogSumExp, DataType::F32, Some("cuda"), false),
+            (ReductionKind::Max, DataType::F32, None, false),
+            (ReductionKind::LogSumExp, DataType::F32, None, false),
+            (ReductionKind::Max, DataType::F8E5M2, None, true),
+            (ReductionKind::Max, DataType::F8E5M2, Some("cuda"), true),
+            (ReductionKind::Max, DataType::C64, None, true),
+            (ReductionKind::Max, DataType::C64, Some("cuda"), true),
+            (ReductionKind::Product, DataType::C64, None, true),
+            (ReductionKind::Product, DataType::F32, None, false),
+            (ReductionKind::Sum, DataType::C64, Some("cuda"), false),
+            (ReductionKind::Max, DataType::I32, Some("cuda"), false),
+        ] {
+            let module = lowered(kind, data_type, 1, target_platform);
+            assert_eq!(module.contains(constraint), constrained, "{kind} over {data_type}: {module}");
+
+            // A reduction over the other dimension does not reduce across the shards.
+            let module = lowered(kind, data_type, 0, target_platform);
+            assert!(!module.contains("sdy.sharding_constraint"), "{kind} over {data_type}: {module}");
+        }
+
+        // A maximum for CUDA reduces keys over the sharded dimension and compares natively over the other one.
+        let module = lowered(ReductionKind::Max, DataType::F32, 1, Some("cuda"));
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["x"=2]>
+              func.func @main(%arg0: tensor<2x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {"x"}]>}) -> (tensor<2xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}], replicated={"x"}>}) {
+                %0 = stablehlo.bitcast_convert %arg0 : (tensor<2x4xf32>) -> tensor<2x4xi32>
+                %c = stablehlo.constant dense<0> : tensor<i32>
+                %1 = stablehlo.clamp %c, %0, %c : (tensor<i32>, tensor<2x4xi32>, tensor<i32>) -> tensor<2x4xi32>
+                %c_0 = stablehlo.constant dense<2147483647> : tensor<i32>
+                %2 = stablehlo.clamp %c_0, %0, %c_0 : (tensor<i32>, tensor<2x4xi32>, tensor<i32>) -> tensor<2x4xi32>
+                %3 = stablehlo.compare LT, %0, %1, SIGNED : (tensor<2x4xi32>, tensor<2x4xi32>) -> tensor<2x4xi1>
+                %4 = stablehlo.xor %0, %2 : tensor<2x4xi32>
+                %5 = stablehlo.select %3, %4, %0 : tensor<2x4xi1>, tensor<2x4xi32>
+                %6 = stablehlo.compare NE, %arg0, %arg0, FLOAT : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xi1>
+                %c_1 = stablehlo.constant dense<2143289344> : tensor<i32>
+                %7 = stablehlo.clamp %c_1, %5, %c_1 : (tensor<i32>, tensor<2x4xi32>, tensor<i32>) -> tensor<2x4xi32>
+                %8 = stablehlo.select %6, %7, %5 : tensor<2x4xi1>, tensor<2x4xi32>
+                %c_2 = stablehlo.constant dense<-2139095041> : tensor<i32>
+                %9 = stablehlo.reduce(%8 init: %c_2) applies stablehlo.maximum across dimensions = [1] : (tensor<2x4xi32>, tensor<i32>) -> tensor<2xi32>
+                %c_3 = stablehlo.constant dense<0> : tensor<i32>
+                %10 = stablehlo.clamp %c_3, %9, %c_3 : (tensor<i32>, tensor<2xi32>, tensor<i32>) -> tensor<2xi32>
+                %c_4 = stablehlo.constant dense<2147483647> : tensor<i32>
+                %11 = stablehlo.clamp %c_4, %9, %c_4 : (tensor<i32>, tensor<2xi32>, tensor<i32>) -> tensor<2xi32>
+                %12 = stablehlo.compare LT, %9, %10, SIGNED : (tensor<2xi32>, tensor<2xi32>) -> tensor<2xi1>
+                %13 = stablehlo.xor %9, %11 : tensor<2xi32>
+                %14 = stablehlo.select %12, %13, %9 : tensor<2xi1>, tensor<2xi32>
+                %15 = stablehlo.bitcast_convert %14 : (tensor<2xi32>) -> tensor<2xf32>
+                return %15 : tensor<2xf32>
+              }
+            }
+            "#},
+        );
+        let module = lowered(ReductionKind::Max, DataType::F32, 0, Some("cuda"));
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["x"=2]>
+              func.func @main(%arg0: tensor<2x4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}, {"x"}]>}) -> (tensor<4xf32> {sdy.sharding = #sdy.sharding<@mesh, [{"x"}]>}) {
+                %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                %0 = stablehlo.reduce(%arg0 init: %cst) across dimensions = [0] : (tensor<2x4xf32>, tensor<f32>) -> tensor<4xf32>
+                 reducer(%arg1: tensor<f32>, %arg2: tensor<f32>)  {
+                  %1 = stablehlo.maximum %arg1, %arg2 : tensor<f32>
+                  %2 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %3 = stablehlo.compare NE, %arg2, %arg2, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %4 = stablehlo.select %3, %arg2, %1 : tensor<i1>, tensor<f32>
+                  %5 = stablehlo.select %2, %arg1, %4 : tensor<i1>, tensor<f32>
+                  stablehlo.return %5 : tensor<f32>
+                }
+                return %0 : tensor<4xf32>
+              }
+            }
+            "#},
+        );
+
+        // The compiler may shard any dimension over an auto mesh axis with more than one device, which the type of
+        // the input does not describe, so the constraint then closes the reduced dimension and leaves the other one
+        // open. An auto axis with one device cannot shard anything.
+        let lowered = |axis_size: usize| {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", axis_size, MeshAxisType::Auto).unwrap()]).unwrap();
+            let input_type = ArrayType::new_static(DataType::C64, [2, 4])
+                .with_sharding(Sharding::replicated(mesh.clone(), 2))
+                .unwrap();
+            let output_type =
+                ArrayType::new_static(DataType::C64, [2]).with_sharding(Sharding::replicated(mesh, 1)).unwrap();
+            let mut builder = ProgramBuilder::new();
+            let input = builder.add_input(input_type.clone());
+            let output = builder
+                .add_instruction(
+                    ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Max)),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            let argument_shardings = [input_type.sharding().unwrap().clone()];
+            let result_shardings = [output_type.sharding().unwrap().clone()];
+            lower_mlir_module_for_program(
+                &unproject_plain_program(program),
+                &[],
+                &vec![input_type],
+                &vec![output_type],
+                "main",
+                Some(&argument_shardings),
+                Some(&result_shardings),
+                None,
+            )
+            .unwrap()
+            .into_stable_hlo()
+        };
+        assert_eq!(
+            lowered(2),
+            indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["x"=2]>
+              func.func @main(%arg0: tensor<2x4xcomplex<f32>> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}]>}) -> (tensor<2xcomplex<f32>> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {
+                %0 = sdy.sharding_constraint %arg0 <@mesh, [{?}, {}]> : tensor<2x4xcomplex<f32>>
+                %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                %1 = stablehlo.complex %cst, %cst : tensor<complex<f32>>
+                %2 = stablehlo.reduce(%0 init: %1) across dimensions = [1] : (tensor<2x4xcomplex<f32>>, tensor<complex<f32>>) -> tensor<2xcomplex<f32>>
+                 reducer(%arg1: tensor<complex<f32>>, %arg2: tensor<complex<f32>>)  {
+                  %3 = stablehlo.real %arg1 : (tensor<complex<f32>>) -> tensor<f32>
+                  %4 = stablehlo.real %arg2 : (tensor<complex<f32>>) -> tensor<f32>
+                  %5 = stablehlo.imag %arg1 : (tensor<complex<f32>>) -> tensor<f32>
+                  %6 = stablehlo.imag %arg2 : (tensor<complex<f32>>) -> tensor<f32>
+                  %7 = stablehlo.compare EQ, %3, %4, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %8 = stablehlo.compare GT, %3, %4, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %9 = stablehlo.compare GT, %5, %6, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %10 = stablehlo.select %7, %9, %8 : tensor<i1>, tensor<i1>
+                  %11 = stablehlo.select %10, %arg1, %arg2 : tensor<i1>, tensor<complex<f32>>
+                  stablehlo.return %11 : tensor<complex<f32>>
+                }
+                return %2 : tensor<2xcomplex<f32>>
+              }
+            }
+            "#},
+        );
+        assert_eq!(
+            lowered(1),
+            indoc! {r#"
+            module {
+              sdy.mesh @mesh = <["x"=1]>
+              func.func @main(%arg0: tensor<2x4xcomplex<f32>> {sdy.sharding = #sdy.sharding<@mesh, [{}, {}]>}) -> (tensor<2xcomplex<f32>> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {
+                %cst = stablehlo.constant dense<0xFF800000> : tensor<f32>
+                %0 = stablehlo.complex %cst, %cst : tensor<complex<f32>>
+                %1 = stablehlo.reduce(%arg0 init: %0) across dimensions = [1] : (tensor<2x4xcomplex<f32>>, tensor<complex<f32>>) -> tensor<2xcomplex<f32>>
+                 reducer(%arg1: tensor<complex<f32>>, %arg2: tensor<complex<f32>>)  {
+                  %2 = stablehlo.real %arg1 : (tensor<complex<f32>>) -> tensor<f32>
+                  %3 = stablehlo.real %arg2 : (tensor<complex<f32>>) -> tensor<f32>
+                  %4 = stablehlo.imag %arg1 : (tensor<complex<f32>>) -> tensor<f32>
+                  %5 = stablehlo.imag %arg2 : (tensor<complex<f32>>) -> tensor<f32>
+                  %6 = stablehlo.compare EQ, %2, %3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %7 = stablehlo.compare GT, %2, %3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %8 = stablehlo.compare GT, %4, %5, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %9 = stablehlo.select %6, %8, %7 : tensor<i1>, tensor<i1>
+                  %10 = stablehlo.select %9, %arg1, %arg2 : tensor<i1>, tensor<complex<f32>>
+                  stablehlo.return %10 : tensor<complex<f32>>
+                }
+                return %1 : tensor<2xcomplex<f32>>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_log_sum_exp() {
+        // The expansion reduces the maximum over total order keys with the key of `-inf` as its identity, replaces a
+        // nonfinite maximum with zero so that an all-`-inf` or empty slice shifts by zero instead of computing
+        // `-inf - -inf`, broadcasts the safe maximum back over the reduced axis, and adds it to the logarithm of the
+        // shifted exponential sum.
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::LogSumExp)),
+                DataType::F32,
+                vec![2, 3],
+            )
+            .unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<2x3xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.bitcast_convert %arg0 : (tensor<2x3xf32>) -> tensor<2x3xi32>
+                    %c = stablehlo.constant dense<0> : tensor<i32>
+                    %1 = stablehlo.clamp %c, %0, %c : (tensor<i32>, tensor<2x3xi32>, tensor<i32>) -> tensor<2x3xi32>
+                    %c_0 = stablehlo.constant dense<2147483647> : tensor<i32>
+                    %2 = stablehlo.clamp %c_0, %0, %c_0 : (tensor<i32>, tensor<2x3xi32>, tensor<i32>) -> tensor<2x3xi32>
+                    %3 = stablehlo.compare LT, %0, %1, SIGNED : (tensor<2x3xi32>, tensor<2x3xi32>) -> tensor<2x3xi1>
+                    %4 = stablehlo.xor %0, %2 : tensor<2x3xi32>
+                    %5 = stablehlo.select %3, %4, %0 : tensor<2x3xi1>, tensor<2x3xi32>
+                    %6 = stablehlo.compare NE, %arg0, %arg0, FLOAT : \
+                      (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x3xi1>
+                    %c_1 = stablehlo.constant dense<2143289344> : tensor<i32>
+                    %7 = stablehlo.clamp %c_1, %5, %c_1 : (tensor<i32>, tensor<2x3xi32>, tensor<i32>) -> tensor<2x3xi32>
+                    %8 = stablehlo.select %6, %7, %5 : tensor<2x3xi1>, tensor<2x3xi32>
+                    %c_2 = stablehlo.constant dense<-2139095041> : tensor<i32>
+                    %9 = stablehlo.reduce(%8 init: %c_2) applies stablehlo.maximum across dimensions = [1] : \
+                      (tensor<2x3xi32>, tensor<i32>) -> tensor<2xi32>
+                    %c_3 = stablehlo.constant dense<0> : tensor<i32>
+                    %10 = stablehlo.clamp %c_3, %9, %c_3 : (tensor<i32>, tensor<2xi32>, tensor<i32>) -> tensor<2xi32>
+                    %c_4 = stablehlo.constant dense<2147483647> : tensor<i32>
+                    %11 = stablehlo.clamp %c_4, %9, %c_4 : (tensor<i32>, tensor<2xi32>, tensor<i32>) -> tensor<2xi32>
+                    %12 = stablehlo.compare LT, %9, %10, SIGNED : (tensor<2xi32>, tensor<2xi32>) -> tensor<2xi1>
+                    %13 = stablehlo.xor %9, %11 : tensor<2xi32>
+                    %14 = stablehlo.select %12, %13, %9 : tensor<2xi1>, tensor<2xi32>
+                    %15 = stablehlo.bitcast_convert %14 : (tensor<2xi32>) -> tensor<2xf32>
+                    %16 = stablehlo.is_finite %15 : (tensor<2xf32>) -> tensor<2xi1>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %17 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f32>) -> tensor<2xf32>
+                    %18 = stablehlo.select %16, %15, %17 : tensor<2xi1>, tensor<2xf32>
+                    %19 = stablehlo.broadcast_in_dim %18, dims = [0] : (tensor<2xf32>) -> tensor<2x3xf32>
+                    %20 = stablehlo.subtract %arg0, %19 : tensor<2x3xf32>
+                    %21 = stablehlo.exponential %20 : tensor<2x3xf32>
+                    %cst_5 = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                    %22 = stablehlo.reduce(%21 init: %cst_5) applies stablehlo.add across dimensions = [1] : \
+                      (tensor<2x3xf32>, tensor<f32>) -> tensor<2xf32>
+                    %23 = stablehlo.log %22 : tensor<2xf32>
+                    %24 = stablehlo.add %23, %18 : tensor<2xf32>
+                    return %24 : tensor<2xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_log_sum_exp_requires_negative_infinity() {
+        // A valid pairwise identity is insufficient for padding that is shifted by the maximum, including in unchecked
+        // programs.
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F8E4M3FN, [4]));
+        let output = builder.add_variable(ArrayType::scalar(DataType::F8E4M3FN));
+        builder.add_instruction_unchecked(Instruction::new(
+            ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::LogSumExp)),
+            vec![input],
+            vec![output],
+            Vec::new(),
+        ));
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason == "`reduce` with kind `log_sum_exp` requires a format with negative infinity but got `f8e4m3fn`",
+        ));
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_log_sum_exp_gradient() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let engine = Session::new(&client).domain();
+        let input_type = ArrayType::new_static(DataType::F64, [2])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|value| value.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone())
+                .unwrap();
+        let gradient = compiled.gradient(&engine).unwrap();
+
+        // Rounding the primal output at a large offset must not erase the derivative's normalization.
+        let input =
+            Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&[1e20f64, 1e20]))
+                .unwrap();
+        let output = gradient.executable().execute(&engine, input).unwrap();
+        assert_eq!(read_f32s(&client, &output.convert_element_type(DataType::F32).unwrap()), vec![0.5, 0.5]);
+
+        // The compiled guard for finite shifts must retain the undefined weight at an infinite input.
+        let input = Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
+        let output = gradient.executable().execute(&engine, input).unwrap();
+        let values = read_f32s(&client, &output.convert_element_type(DataType::F32).unwrap());
+        assert!(values[0].is_nan());
+        assert_eq!(values[1], 0.);
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_log_sum_exp_narrow_jvp() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let engine = Session::new(&client).domain();
+        let input_type = ArrayType::new_static(DataType::F16, [65536])
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|value| value.reduce_log_sum_exp(&[0]).unwrap(), input_type.clone(), &engine, mesh.clone())
+                .unwrap();
+        let differentiated = compiled.jvp(&engine).unwrap();
+        // The normalization count exceeds the largest finite `f16`, so derivative intermediates must stay widened.
+        let input =
+            Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
+        let (_, tangent) = differentiated.executable().execute(&engine, (input.clone(), input)).unwrap();
+        assert_eq!(read_f32s(&client, &tangent.convert_element_type(DataType::F32).unwrap()), vec![1.]);
+    }
+
+    #[test]
+    fn test_reduce_operation_lower_dynamic_axes() {
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(batch), CoreDimension::Static(3)]));
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(
+                ArrayOperation::Reduce(ReduceOperation::new(vec![1], ReductionKind::Sum)),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<?x3xf32, #stablehlo.bounds<4, ?>>) -> tensor<?xf32, #stablehlo.bounds<4>> {
+                %cst = stablehlo.constant dense<0.000000e+00> : tensor<f32>
+                %0 = stablehlo.reduce(%arg0 init: %cst) applies stablehlo.add across dimensions = [1] : (tensor<?x3xf32, #stablehlo.bounds<4, ?>>, tensor<f32>) -> tensor<?xf32, #stablehlo.bounds<4>>
+                return %0 : tensor<?xf32, #stablehlo.bounds<4>>
+              }
+            }
+            "#},
+        );
+
+        // Mean needs the runtime extent of the removed axis as a divisor, which the reduce instruction does not take as
+        // an operand, so the lowering rejects a mean over a dynamically sized axis.
+        let reduced = DimensionVariable::new("reduced", DimensionBounds::new(1, Some(5)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(reduced), CoreDimension::Static(3)]));
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(
+                ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Mean)),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason == "`reduce` mean over dynamically sized axis 0",
+        ));
+    }
+
+    #[test]
+    fn test_arg_max_operation_lower() {
         // An argmax lowers to a variadic `stablehlo.reduce` over the input and an index iota, starting from the lowest
         // value paired with index zero. Its comparator picks the left pair when its value is greater or a NaN facing an
         // ordered value, or when the values are equivalent (i.e., equal under `FLOAT` semantics or both NaN) and the
@@ -2142,6 +2486,102 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_arg_min_operation_lower() {
+        // An argmin starts from the highest value paired with index zero, and its comparator picks the left pair when
+        // its value is smaller. Narrow floating-point inputs compare in `f32`.
+        let input_type = ArrayType::new_static(DataType::BF16, [3]);
+        let output_type = ArrayType::scalar(DataType::I32);
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        let outputs = builder
+            .add_instruction(ArgMinOperation::new(0, DataType::I32), Vec::new(), vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let program = unproject_plain_program(program);
+        let module =
+            to_mlir_module_for_program(&program, &[], &[input_type], &[output_type], "main", None, None).unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<3xbf16>) -> tensor<i32> {
+                %0 = stablehlo.convert %arg0 : (tensor<3xbf16>) -> tensor<3xf32>
+                %1 = stablehlo.iota dim = 0 : tensor<3xi32>
+                %cst = stablehlo.constant dense<0x7F800000> : tensor<f32>
+                %c = stablehlo.constant dense<0> : tensor<i32>
+                %2:2 = stablehlo.reduce(%0 init: %cst), (%1 init: %c) across dimensions = [0] : (tensor<3xf32>, tensor<3xi32>, tensor<f32>, tensor<i32>) -> (tensor<f32>, tensor<i32>)
+                 reducer(%arg1: tensor<f32>, %arg3: tensor<f32>) (%arg2: tensor<i32>, %arg4: tensor<i32>)  {
+                  %3 = stablehlo.compare LT, %arg1, %arg3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %4 = stablehlo.compare EQ, %arg1, %arg3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %5 = stablehlo.compare NE, %arg1, %arg1, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %6 = stablehlo.compare NE, %arg3, %arg3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %7 = stablehlo.compare EQ, %arg3, %arg3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                  %8 = stablehlo.and %5, %7 : tensor<i1>
+                  %9 = stablehlo.and %5, %6 : tensor<i1>
+                  %10 = stablehlo.or %3, %8 : tensor<i1>
+                  %11 = stablehlo.or %4, %9 : tensor<i1>
+                  %12 = stablehlo.compare LT, %arg2, %arg4, SIGNED : (tensor<i32>, tensor<i32>) -> tensor<i1>
+                  %13 = stablehlo.and %11, %12 : tensor<i1>
+                  %14 = stablehlo.or %10, %13 : tensor<i1>
+                  %15 = stablehlo.select %14, %arg1, %arg3 : tensor<i1>, tensor<f32>
+                  %16 = stablehlo.select %14, %arg2, %arg4 : tensor<i1>, tensor<i32>
+                  stablehlo.return %15, %16 : tensor<f32>, tensor<i32>
+                }
+                return %2#1 : tensor<i32>
+              }
+            }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_log_sum_exp_to_mlir_complex() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // Complex operands are shifted by the maximum of their real components, and `-∞ + 0i` padding contributes a
+        // zero exponential. XLA's complex exponential and logarithm round differently from the host's.
+        let first = Complex::new(1f32, 0.5);
+        let second = Complex::new(3f32, -2.0);
+        let shift = Complex::new(3f32, 0.0);
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[3],
+            values_to_bytes(&[first, second, Complex::new(f32::NEG_INFINITY, 0.0)]).as_slice(),
+        );
+        let output = input.reduce_log_sum_exp(&[0]).unwrap();
+        let output = values_from_bytes::<Complex<f32>>(&output.copy_to_host().unwrap());
+        let expected = ((first - shift).exp() + (second - shift).exp()).ln() + shift;
+        assert_eq!(output.len(), 1);
+        assert!((output[0] - expected).norm() < 1e-5, "{} vs {expected}", output[0]);
+
+        // Even without reduced axes, the principal logarithm wraps phases outside its branch.
+        let input = replicated_array(
+            &domain,
+            &mesh,
+            DataType::C64,
+            &[2],
+            values_to_bytes(&[Complex::new(1f32, 4.0), Complex::new(2f32, -4.0)]).as_slice(),
+        );
+        let output = input.reduce_log_sum_exp(&[]).unwrap();
+        let output = values_from_bytes::<Complex<f32>>(&output.copy_to_host().unwrap());
+        let expected = [
+            Complex::new(1f32, 4.0 - 2.0 * std::f32::consts::PI),
+            Complex::new(2f32, -4.0 + 2.0 * std::f32::consts::PI),
+        ];
+        assert_eq!(output.len(), expected.len());
+        for (actual, expected) in output.into_iter().zip(expected) {
+            assert!((actual - expected).norm() < 1e-5, "{actual} vs {expected}");
+        }
     }
 
     #[test]

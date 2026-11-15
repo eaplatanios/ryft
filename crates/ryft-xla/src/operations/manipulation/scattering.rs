@@ -20,118 +20,42 @@ use crate::operations::reductions::build_reduce_body_region;
 use crate::operations::sharding::constrain_sharding::lower_sharding_constraint;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
-/// Builds the scalar combiner region of a `stablehlo.scatter` for the given [`ScatterReductionKind`], modeled on
-/// [`build_reduce_body_region`]. The region's block takes the existing operand scalar and the update scalar and
-/// returns the combined value: `Overwrite` returns the update directly (no combine op), arithmetic kinds apply the
-/// matching elementwise StableHLO operation, and extrema use [`lower_extremum_to_mlir`].
-fn build_scatter_combiner_region<'c, 't>(
-    kind: ScatterReductionKind,
-    element_type: DataType,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
-    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
-    let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
-    let mut region = context.region();
-    let mut block_ref = region.append_block(block)?;
-    let lhs = block_ref.argument(0)?.as_ref();
-    let rhs = block_ref.argument(1)?.as_ref();
-    let body_value = if element_type == DataType::Zero {
-        lhs
-    } else if matches!(element_type, DataType::I1 | DataType::U1) {
-        // Predicate carriers need bitwise arithmetic modulo two. Signed I1 reverses the extrema order because its
-        // set bit denotes -1, whereas U1's set bit denotes +1.
-        match kind {
-            ScatterReductionKind::Overwrite => rhs,
-            ScatterReductionKind::Add => {
-                block_ref.append_operation(stable_hlo::xor(lhs, rhs, location)?)?.result(0).unwrap().as_ref()
-            }
-            ScatterReductionKind::Mul => {
-                block_ref.append_operation(stable_hlo::and(lhs, rhs, location)?)?.result(0).unwrap().as_ref()
-            }
-            ScatterReductionKind::Min | ScatterReductionKind::Max => {
-                let use_or = (kind == ScatterReductionKind::Min) == (element_type == DataType::I1);
-                if use_or {
-                    block_ref.append_operation(stable_hlo::or(lhs, rhs, location)?)?.result(0).unwrap().as_ref()
-                } else {
-                    block_ref.append_operation(stable_hlo::and(lhs, rhs, location)?)?.result(0).unwrap().as_ref()
-                }
-            }
+impl LowerableOperation for ScatterOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let values = lower_scatter_to_mlir(
+            self,
+            input_values,
+            input_types,
+            output_types,
+            lowerer.collective_state().target_platform(),
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )?;
+        if self.output_sharding().is_some() {
+            lower_sharding_constraint(
+                &values,
+                output_types[0].sharding().unwrap(),
+                lowerer.collective_state().bound_manual_axes(),
+                &mut lowerer.block(),
+                lowerer.location(),
+            )
+        } else {
+            Ok(values)
         }
-    } else {
-        match kind {
-            ScatterReductionKind::Overwrite => rhs,
-            ScatterReductionKind::Add => block_ref
-                .append_operation(stable_hlo::add(lhs, rhs, location)?)?
-                .result(0)
-                .expect("stablehlo.add should return one result")
-                .as_ref(),
-            ScatterReductionKind::Mul => block_ref
-                .append_operation(stable_hlo::multiply(lhs, rhs, location)?)?
-                .result(0)
-                .expect("stablehlo.multiply should return one result")
-                .as_ref(),
-            ScatterReductionKind::Min | ScatterReductionKind::Max => lower_extremum_to_mlir(
-                kind == ScatterReductionKind::Max,
-                element_type,
-                lhs,
-                rhs,
-                FloatExtremumForm::TotalOrder,
-                &mut block_ref,
-                location,
-            )?,
-        }
-    };
-    block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
-    Ok(region)
-}
-
-/// Broadcasts an index bound or mask while retaining the runtime query dimensions of an indices tensor.
-fn lower_index_broadcast<'b, 'c: 'b, 't: 'c>(
-    value: ValueRef<'b, 'c, 't>,
-    output_type: &ArrayType,
-    shape_source: Option<ValueRef<'b, 'c, 't>>,
-    axes: &[usize],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    if let Some(exemplar) = shape_source {
-        let input_type = ArrayType::new(
-            output_type.data_type(),
-            Shape::new(axes.iter().map(|axis| output_type.shape().dimensions()[*axis].clone()).collect()),
-        );
-        let value = lower_physical_bound_value(value, &input_type, 0.0, block, context, location)?;
-        let physical_type = physical_bound_type(output_type)?;
-        let result = block
-            .append_operation(stable_hlo::broadcast(
-                value,
-                lower_tensor_type(&physical_type, context, location)?,
-                axes,
-                location,
-            )?)?
-            .result(0)
-            .unwrap()
-            .as_ref();
-        let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
-        lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)
-    } else {
-        Ok(block
-            .append_operation(stable_hlo::broadcast(
-                value,
-                lower_tensor_type(output_type, context, location)?,
-                axes,
-                location,
-            )?)?
-            .result(0)
-            .unwrap()
-            .as_ref())
     }
 }
 
-/// Lowers scatter by clipping explicit starts or dropping complete out-of-bounds windows. Native scatter already
-/// drops windows outside static allocation bounds; dynamic input bounds require an additional logical-size check.
-pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
+/// Lowers a [`ScatterOperation`] by clipping explicit starts or dropping complete out-of-bounds windows. Native
+/// scatter already drops windows outside static allocation bounds, whereas dynamic input bounds require an additional
+/// check against the logical size.
+fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &ScatterOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
@@ -305,7 +229,7 @@ pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
         && output_types[0].data_type() == DataType::C128
         && operation.kind() == ScatterReductionKind::Add
     {
-        // GPU scatter-add lacks a native complex128 atomic update. Accumulate its independent real components
+        // GPU scatter with addition lacks a native complex128 atomic update. Accumulate its independent real components
         // using floating-point atomics, then reconstruct the complex result.
         let mut components = Vec::with_capacity(2);
         for imaginary in [false, true] {
@@ -346,7 +270,7 @@ pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
         ]);
     }
     let combiner = build_scatter_combiner_region(operation.kind(), output_types[0].data_type(), context, location)?;
-    // Clipping can merge formerly unique indices and change their lexicographic order; masked sentinels likewise
+    // Clipping can merge formerly unique indices and change their lexicographic order, and masked sentinels likewise
     // introduce duplicates. Do not propagate either promise through that normalization.
     let result = block.append_operation(stable_hlo::scatter(
         &[input_values[0]],
@@ -361,35 +285,111 @@ pub(crate) fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
     Ok(vec![result.result(0).unwrap().as_ref()])
 }
 
-impl LowerableOperation for ScatterOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let values = lower_scatter_to_mlir(
-            self,
-            input_values,
-            input_types,
-            output_types,
-            lowerer.collective_state.target_platform(),
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )?;
-        if self.output_sharding().is_some() {
-            lower_sharding_constraint(
-                &values,
-                output_types[0].sharding().unwrap(),
-                &lowerer.collective_state.bound_manual_axes,
-                &mut lowerer.block,
-                lowerer.location,
-            )
-        } else {
-            Ok(values)
+/// Builds the scalar combiner region of a `stablehlo.scatter` for the given [`ScatterReductionKind`], modeled on
+/// [`build_reduce_body_region`]. The region's block takes the existing operand scalar and the update scalar and
+/// returns the combined value. [`ScatterReductionKind::Overwrite`] returns the update directly without a combining
+/// operation, arithmetic kinds apply the matching elementwise StableHLO operation, and extrema use
+/// [`lower_extremum_to_mlir`].
+fn build_scatter_combiner_region<'c, 't>(
+    kind: ScatterReductionKind,
+    element_type: DataType,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ryft_mlir::DetachedRegion<'c, 't>, Error> {
+    let scalar_tensor_type = lower_tensor_type(&ArrayType::scalar(element_type), context, location)?;
+    let block = context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
+    let mut region = context.region();
+    let mut block_ref = region.append_block(block)?;
+    let left = block_ref.argument(0)?.as_ref();
+    let right = block_ref.argument(1)?.as_ref();
+    let body_value = if element_type == DataType::Zero {
+        left
+    } else if matches!(element_type, DataType::I1 | DataType::U1) {
+        // Predicate carriers need bitwise arithmetic modulo two. Signed I1 reverses the extrema order because its
+        // set bit denotes -1, whereas U1's set bit denotes +1.
+        match kind {
+            ScatterReductionKind::Overwrite => right,
+            ScatterReductionKind::Add => {
+                block_ref.append_operation(stable_hlo::xor(left, right, location)?)?.result(0).unwrap().as_ref()
+            }
+            ScatterReductionKind::Mul => {
+                block_ref.append_operation(stable_hlo::and(left, right, location)?)?.result(0).unwrap().as_ref()
+            }
+            ScatterReductionKind::Min | ScatterReductionKind::Max => {
+                let use_or = (kind == ScatterReductionKind::Min) == (element_type == DataType::I1);
+                if use_or {
+                    block_ref.append_operation(stable_hlo::or(left, right, location)?)?.result(0).unwrap().as_ref()
+                } else {
+                    block_ref.append_operation(stable_hlo::and(left, right, location)?)?.result(0).unwrap().as_ref()
+                }
+            }
         }
+    } else {
+        match kind {
+            ScatterReductionKind::Overwrite => right,
+            ScatterReductionKind::Add => {
+                block_ref.append_operation(stable_hlo::add(left, right, location)?)?.result(0).unwrap().as_ref()
+            }
+            ScatterReductionKind::Mul => block_ref
+                .append_operation(stable_hlo::multiply(left, right, location)?)?
+                .result(0)
+                .unwrap()
+                .as_ref(),
+            ScatterReductionKind::Min | ScatterReductionKind::Max => lower_extremum_to_mlir(
+                kind == ScatterReductionKind::Max,
+                element_type,
+                left,
+                right,
+                FloatExtremumForm::TotalOrder,
+                &mut block_ref,
+                location,
+            )?,
+        }
+    };
+    block_ref.append_operation(stable_hlo::r#return(&[body_value], location)?)?;
+    Ok(region)
+}
+
+/// Broadcasts an index bound or mask while retaining the runtime query dimensions of an indices tensor.
+fn lower_index_broadcast<'b, 'c: 'b, 't: 'c>(
+    value: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    shape_source: Option<ValueRef<'b, 'c, 't>>,
+    axes: &[usize],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    if let Some(exemplar) = shape_source {
+        let input_type = ArrayType::new(
+            output_type.data_type(),
+            Shape::new(axes.iter().map(|axis| output_type.shape().dimensions()[*axis].clone()).collect()),
+        );
+        let value = lower_physical_bound_value(value, &input_type, 0.0, block, context, location)?;
+        let physical_type = physical_bound_type(output_type)?;
+        let result = block
+            .append_operation(stable_hlo::broadcast(
+                value,
+                lower_tensor_type(&physical_type, context, location)?,
+                axes,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref();
+        let sources = (0..output_type.rank()).map(|axis| (exemplar, axis)).collect::<Vec<_>>();
+        lower_restore_dynamic_dimensions(result, output_type, &sources, block, context, location)
+    } else {
+        Ok(block
+            .append_operation(stable_hlo::broadcast(
+                value,
+                lower_tensor_type(output_type, context, location)?,
+                axes,
+                location,
+            )?)?
+            .result(0)
+            .unwrap()
+            .as_ref())
     }
 }
 
@@ -421,13 +421,142 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lower_scatter_index_modes() {
+    fn test_scatter_operation_lower() {
+        // Scatter with addition row updates into a [3, 2] operand at the row indices in a [2, 1] index array. Output is
+        // [3, 2], and the Add combiner lowers to a `stablehlo.add` inside the scatter region.
+        let operand_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
+        let indices_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
+        let updates_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Add);
+        let mut builder = ProgramBuilder::new();
+        let operand = builder.add_input(operand_type);
+        let indices = builder.add_input(indices_type);
+        let updates = builder.add_input(updates_type);
+        let output = builder
+            .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<3x2xf32>, %arg1: tensor<2x1xi32>, %arg2: tensor<2x2xf32>) -> tensor<3x2xf32> {
+                    %0 = stablehlo.convert %arg1 : (tensor<2x1xi32>) -> tensor<2x1xi64>
+                    %1 = "stablehlo.scatter"(%arg0, %0, %arg2) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [1], inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}> ({
+                    ^bb0(%arg3: tensor<f32>, %arg4: tensor<f32>):
+                      %2 = stablehlo.add %arg3, %arg4 : tensor<f32>
+                      stablehlo.return %2 : tensor<f32>
+                    }) : (tensor<3x2xf32>, tensor<2x1xi64>, tensor<2x2xf32>) -> tensor<3x2xf32>
+                    return %1 : tensor<3x2xf32>
+                  }
+                }
+            "#},
+        );
+
+        // Complex scatter extrema share the explicit lexicographic combiner used by complex reductions.
+        let operand_type =
+            ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
+        let indices_type =
+            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
+        let updates_type =
+            ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
+        let operation =
+            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Max);
+        let mut builder = ProgramBuilder::new();
+        let operand = builder.add_input(operand_type);
+        let indices = builder.add_input(indices_type);
+        let updates = builder.add_input(updates_type);
+        let output = builder
+            .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<3x2xcomplex<f32>>, %arg1: tensor<2x1xi32>, %arg2: tensor<2x2xcomplex<f32>>) -> tensor<3x2xcomplex<f32>> {
+                    %0 = stablehlo.convert %arg1 : (tensor<2x1xi32>) -> tensor<2x1xi64>
+                    %1 = "stablehlo.scatter"(%arg0, %0, %arg2) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [1], inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}> ({
+                    ^bb0(%arg3: tensor<complex<f32>>, %arg4: tensor<complex<f32>>):
+                      %2 = stablehlo.real %arg3 : (tensor<complex<f32>>) -> tensor<f32>
+                      %3 = stablehlo.real %arg4 : (tensor<complex<f32>>) -> tensor<f32>
+                      %4 = stablehlo.imag %arg3 : (tensor<complex<f32>>) -> tensor<f32>
+                      %5 = stablehlo.imag %arg4 : (tensor<complex<f32>>) -> tensor<f32>
+                      %6 = stablehlo.compare EQ, %2, %3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %7 = stablehlo.compare GT, %2, %3, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %8 = stablehlo.compare GT, %4, %5, FLOAT : (tensor<f32>, tensor<f32>) -> tensor<i1>
+                      %9 = stablehlo.select %6, %8, %7 : tensor<i1>, tensor<i1>
+                      %10 = stablehlo.select %9, %arg3, %arg4 : tensor<i1>, tensor<complex<f32>>
+                      stablehlo.return %10 : tensor<complex<f32>>
+                    }) : (tensor<3x2xcomplex<f32>>, tensor<2x1xi64>, tensor<2x2xcomplex<f32>>) -> tensor<3x2xcomplex<f32>>
+                    return %1 : tensor<3x2xcomplex<f32>>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_scatter_operation_lower_dynamic_window() {
+        let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
+        let indices = builder.add_input(ArrayType::new_static(DataType::I32, [1, 1]));
+        let updates = builder.add_input(ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                CoreDimension::Static(1),
+                CoreDimension::Dynamic(DimensionVariable::new("window", DimensionBounds::new(0, Some(3)).unwrap())),
+            ]),
+        ));
+        let output = builder
+            .add_instruction(
+                ScatterOperation::new(
+                    ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
+                    ScatterReductionKind::Add,
+                ),
+                Vec::new(),
+                vec![input, indices, updates],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason == "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic \
+                   windows are unsupported by XLA",
+        ));
+    }
+
+    #[test]
+    fn test_scatter_operation_lower_index_modes() {
         let client = execution_client();
         for mode in [ScatterMode::Clip, ScatterMode::Drop] {
             for (unsigned, dynamic_input, dynamic_query) in
                 [(false, false, false), (true, false, false), (false, true, false), (false, false, true)]
             {
-                let input_values = [10_i64, 20, 30, 40];
+                let input_values = [10i64, 20, 30, 40];
                 let input_type = if dynamic_input {
                     ArrayType::new(
                         DataType::I64,
@@ -489,21 +618,21 @@ mod tests {
                     (values_to_bytes(&input_values), BufferType::I64, vec![4]),
                     (
                         if unsigned {
-                            values_to_bytes(&[0_u64, u64::MAX, u64::MAX, 1])
+                            values_to_bytes(&[0u64, u64::MAX, u64::MAX, 1])
                         } else {
-                            values_to_bytes(&[-2_i64, -1, 4, 9])
+                            values_to_bytes(&[-2i64, -1, 4, 9])
                         },
                         index_data_type.to_pjrt(),
                         vec![4, 1],
                     ),
-                    (values_to_bytes(&[1_i64, 2, 3, 4]), BufferType::I64, vec![4]),
+                    (values_to_bytes(&[1i64, 2, 3, 4]), BufferType::I64, vec![4]),
                 ];
                 if dynamic_input {
-                    values.push((values_to_bytes(&[2_i32]), BufferType::I32, vec![]));
+                    values.push((values_to_bytes(&[2i32]), BufferType::I32, vec![]));
                 }
                 if dynamic_query {
-                    values.push((values_to_bytes(&[2_i32]), BufferType::I32, vec![]));
-                    values.push((values_to_bytes(&[2_i32]), BufferType::I32, vec![]));
+                    values.push((values_to_bytes(&[2i32]), BufferType::I32, vec![]));
+                    values.push((values_to_bytes(&[2i32]), BufferType::I32, vec![]));
                 }
                 let inputs = values
                     .into_iter()
@@ -533,7 +662,7 @@ mod tests {
                     .remove(0)
                     .outputs;
                 let expected = match (mode, unsigned, dynamic_input, dynamic_query) {
-                    (ScatterMode::Clip, true, _, _) => vec![11_i64, 24, 30, 45],
+                    (ScatterMode::Clip, true, _, _) => vec![11i64, 24, 30, 45],
                     (ScatterMode::Drop, true, _, _) => vec![11, 24, 30, 40],
                     (ScatterMode::Clip, _, true, _) => vec![13, 27],
                     (ScatterMode::Clip, _, _, true) => vec![13, 20, 30, 40],
@@ -549,22 +678,22 @@ mod tests {
                 );
             }
         }
-        // A partially out-of-bounds update is dropped as a whole; Clip moves the complete window into range.
+        // A partially out-of-bounds update is dropped as a whole, whereas `Clip` moves the complete window into range.
         let mut literal_cases = Vec::new();
         for mode in [ScatterMode::Clip, ScatterMode::Drop] {
             literal_cases.push((
-                CoreArray::vector(vec![0_i64; 3]).unwrap(),
-                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [1, 1]), &[2_i64]).unwrap(),
-                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [1, 2]), &[10_i64, 20]).unwrap(),
+                CoreArray::vector(vec![0i64; 3]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [1, 1]), &[2i64]).unwrap(),
+                CoreArray::from_elements(ArrayType::new_static(DataType::I64, [1, 2]), &[10i64, 20]).unwrap(),
                 ScatterOperation::new(
                     ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
                     ScatterReductionKind::Add,
                 )
                 .with_mode(mode),
-                values_to_bytes(if mode == ScatterMode::Clip { &[0_i64, 10, 20] } else { &[0_i64, 0, 0] }),
+                values_to_bytes(if mode == ScatterMode::Clip { &[0i64, 10, 20] } else { &[0i64, 0, 0] }),
             ));
         }
-        // One-bit integers use predicate storage but retain arithmetic modulo two and signed/unsigned extrema.
+        // One-bit integers use predicate storage but retain arithmetic modulo two and signed and unsigned extrema.
         for signed in [false, true] {
             for kind in [
                 ScatterReductionKind::Overwrite,
@@ -584,7 +713,7 @@ mod tests {
                     CoreArray::vector(vec![u1::new(1).unwrap(), u1::new(1).unwrap(), u1::new(0).unwrap()]).unwrap()
                 };
                 let expected = match kind {
-                    ScatterReductionKind::Overwrite => vec![1_u8, 1, 0],
+                    ScatterReductionKind::Overwrite => vec![1u8, 1, 0],
                     ScatterReductionKind::Add => vec![1, 0, 1],
                     ScatterReductionKind::Mul => vec![0, 1, 0],
                     ScatterReductionKind::Min | ScatterReductionKind::Max => {
@@ -593,7 +722,7 @@ mod tests {
                 };
                 literal_cases.push((
                     input,
-                    CoreArray::from_elements(ArrayType::new_static(DataType::I64, [3, 1]), &[0_i64, 1, 2]).unwrap(),
+                    CoreArray::from_elements(ArrayType::new_static(DataType::I64, [3, 1]), &[0i64, 1, 2]).unwrap(),
                     updates,
                     ScatterOperation::new(ScatterDimensionNumbers::new(vec![], vec![0], vec![0]), kind),
                     expected,
@@ -636,12 +765,74 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_scatter_complex_add_on_cuda() {
+    fn test_scatter_operation_lower_complex_add() {
         let client = execution_client();
         let execution_platform = client.platform_name().unwrap();
-        for (data_type, platform, scatter_count) in
-            [(DataType::C128, Some("cuda"), 2), (DataType::C128, Some("cpu"), 1), (DataType::C64, Some("cuda"), 1)]
-        {
+        // CUDA lacks a native complex128 scatter addition, so it accumulates the real and imaginary components with
+        // two floating-point scatters, whereas complex64 and other platforms keep one native complex scatter.
+        for (data_type, platform, expected_module) in [
+            (
+                DataType::C128,
+                Some("cuda"),
+                indoc! {r#"
+                    module {
+                      func.func @main(%arg0: tensor<4xcomplex<f64>>, %arg1: tensor<2x1xi32>, %arg2: tensor<2xcomplex<f64>>) -> tensor<4xcomplex<f64>> {
+                        %0 = stablehlo.convert %arg1 : (tensor<2x1xi32>) -> tensor<2x1xi64>
+                        %1 = stablehlo.real %arg0 : (tensor<4xcomplex<f64>>) -> tensor<4xf64>
+                        %2 = stablehlo.real %arg2 : (tensor<2xcomplex<f64>>) -> tensor<2xf64>
+                        %3 = "stablehlo.scatter"(%1, %0, %2) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}> ({
+                        ^bb0(%arg3: tensor<f64>, %arg4: tensor<f64>):
+                          %8 = stablehlo.add %arg3, %arg4 : tensor<f64>
+                          stablehlo.return %8 : tensor<f64>
+                        }) : (tensor<4xf64>, tensor<2x1xi64>, tensor<2xf64>) -> tensor<4xf64>
+                        %4 = stablehlo.imag %arg0 : (tensor<4xcomplex<f64>>) -> tensor<4xf64>
+                        %5 = stablehlo.imag %arg2 : (tensor<2xcomplex<f64>>) -> tensor<2xf64>
+                        %6 = "stablehlo.scatter"(%4, %0, %5) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}> ({
+                        ^bb0(%arg3: tensor<f64>, %arg4: tensor<f64>):
+                          %8 = stablehlo.add %arg3, %arg4 : tensor<f64>
+                          stablehlo.return %8 : tensor<f64>
+                        }) : (tensor<4xf64>, tensor<2x1xi64>, tensor<2xf64>) -> tensor<4xf64>
+                        %7 = stablehlo.complex %3, %6 : tensor<4xcomplex<f64>>
+                        return %7 : tensor<4xcomplex<f64>>
+                      }
+                    }
+                "#},
+            ),
+            (
+                DataType::C128,
+                Some("cpu"),
+                indoc! {r#"
+                    module {
+                      func.func @main(%arg0: tensor<4xcomplex<f64>>, %arg1: tensor<2x1xi32>, %arg2: tensor<2xcomplex<f64>>) -> tensor<4xcomplex<f64>> {
+                        %0 = stablehlo.convert %arg1 : (tensor<2x1xi32>) -> tensor<2x1xi64>
+                        %1 = "stablehlo.scatter"(%arg0, %0, %arg2) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}> ({
+                        ^bb0(%arg3: tensor<complex<f64>>, %arg4: tensor<complex<f64>>):
+                          %2 = stablehlo.add %arg3, %arg4 : tensor<complex<f64>>
+                          stablehlo.return %2 : tensor<complex<f64>>
+                        }) : (tensor<4xcomplex<f64>>, tensor<2x1xi64>, tensor<2xcomplex<f64>>) -> tensor<4xcomplex<f64>>
+                        return %1 : tensor<4xcomplex<f64>>
+                      }
+                    }
+                "#},
+            ),
+            (
+                DataType::C64,
+                Some("cuda"),
+                indoc! {r#"
+                    module {
+                      func.func @main(%arg0: tensor<4xcomplex<f32>>, %arg1: tensor<2x1xi32>, %arg2: tensor<2xcomplex<f32>>) -> tensor<4xcomplex<f32>> {
+                        %0 = stablehlo.convert %arg1 : (tensor<2x1xi32>) -> tensor<2x1xi64>
+                        %1 = "stablehlo.scatter"(%arg0, %0, %arg2) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<inserted_window_dims = [0], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}> ({
+                        ^bb0(%arg3: tensor<complex<f32>>, %arg4: tensor<complex<f32>>):
+                          %2 = stablehlo.add %arg3, %arg4 : tensor<complex<f32>>
+                          stablehlo.return %2 : tensor<complex<f32>>
+                        }) : (tensor<4xcomplex<f32>>, tensor<2x1xi64>, tensor<2xcomplex<f32>>) -> tensor<4xcomplex<f32>>
+                        return %1 : tensor<4xcomplex<f32>>
+                      }
+                    }
+                "#},
+            ),
+        ] {
             let input_types = vec![
                 ArrayType::new_static(data_type, [4]),
                 ArrayType::new_static(DataType::I32, [2, 1]),
@@ -675,14 +866,10 @@ mod tests {
                 platform,
             )
             .unwrap()
-            .stable_hlo;
-            assert_eq!(
-                module.matches("stablehlo.scatter").count() - module.matches("#stablehlo.scatter").count(),
-                scatter_count,
-            );
-            assert_eq!(module.matches("stablehlo.complex ").count(), usize::from(scatter_count == 2));
+            .into_stable_hlo();
+            assert_eq!(module, expected_module, "{data_type} on {platform:?}");
 
-            // Execute the selected backend's lowering as well as checking its structure. In particular, the CUDA
+            // Execute the selected backend's lowering as well as checking its rendering. In particular, the CUDA
             // double-precision complex path must sum real and imaginary updates through its two scatter kernels.
             if !execution_platform.eq_ignore_ascii_case(platform.unwrap()) {
                 continue;
@@ -693,22 +880,22 @@ mod tests {
             let device = executable.addressable_devices().unwrap().remove(0);
             let (input, updates, expected, buffer_type) = if data_type == DataType::C128 {
                 (
-                    values_to_bytes(&[1_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
-                    values_to_bytes(&[10_f64, -20.0, 30.0, -40.0]),
-                    values_to_bytes(&[1_f64, 2.0, 43.0, -56.0, 5.0, 6.0, 7.0, 8.0]),
+                    values_to_bytes(&[1f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+                    values_to_bytes(&[10f64, -20.0, 30.0, -40.0]),
+                    values_to_bytes(&[1f64, 2.0, 43.0, -56.0, 5.0, 6.0, 7.0, 8.0]),
                     BufferType::C128,
                 )
             } else {
                 (
-                    values_to_bytes(&[1_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
-                    values_to_bytes(&[10_f32, -20.0, 30.0, -40.0]),
-                    values_to_bytes(&[1_f32, 2.0, 43.0, -56.0, 5.0, 6.0, 7.0, 8.0]),
+                    values_to_bytes(&[1f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+                    values_to_bytes(&[10f32, -20.0, 30.0, -40.0]),
+                    values_to_bytes(&[1f32, 2.0, 43.0, -56.0, 5.0, 6.0, 7.0, 8.0]),
                     BufferType::C64,
                 )
             };
             let inputs = [
                 (input, buffer_type, vec![4]),
-                (values_to_bytes(&[1_i32, 1]), BufferType::I32, vec![2, 1]),
+                (values_to_bytes(&[1i32, 1]), BufferType::I32, vec![2, 1]),
                 (updates, buffer_type, vec![2]),
             ]
             .into_iter()
@@ -741,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_scatter_complex_max() {
+    fn test_scatter_operation_lower_complex_max() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -772,114 +959,12 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_scatter_dynamic_window() {
-        let mut builder = CoreProgramBuilder::<CoreArray, ArrayOperation<CoreArray>>::new();
-        let input = builder.add_input(ArrayType::new_static(DataType::F32, [3]));
-        let indices = builder.add_input(ArrayType::new_static(DataType::I32, [1, 1]));
-        let updates = builder.add_input(ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![
-                CoreDimension::Static(1),
-                CoreDimension::Dynamic(DimensionVariable::new("window", DimensionBounds::new(0, Some(3)).unwrap())),
-            ]),
-        ));
-        let output = builder
-            .add_instruction(
-                ScatterOperation::new(
-                    ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
-                    ScatterReductionKind::Add,
-                ),
-                Vec::new(),
-                vec![input, indices, updates],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<CoreArray>, Vec<CoreArray>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
-            .unwrap();
-        assert!(matches!(
-            to_mlir_module_for_plain_program(&program, "main"),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
-                if op == "`scatter` dynamic update window axis 1 must match input axis 0; independently sized dynamic \
-                   windows are unsupported by XLA",
-        ));
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_scatter() {
-        use ryft_core::{
-            Dimension as CoreDimension, ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind, Shape,
-        };
-
-        // Scatter-add row updates into a [3, 2] operand at the row indices in a [2, 1] index array. Output is [3, 2],
-        // and the Add combiner lowers to a `stablehlo.add` inside the scatter region.
-        let operand_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
-        let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
-        let updates_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
-        let operation =
-            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Add);
-        let mut builder = ProgramBuilder::new();
-        let operand = builder.add_input(operand_type);
-        let indices = builder.add_input(indices_type);
-        let updates = builder.add_input(updates_type);
-        let output = builder
-            .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-
-        assert!(stablehlo.contains("stablehlo.scatter"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.add"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.return"), "{stablehlo}");
-        assert!(stablehlo.contains("tensor<3x2xf32>"), "{stablehlo}");
-
-        // Complex scatter extrema share the explicit lexicographic combiner used by complex reductions.
-        let operand_type =
-            ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(3), CoreDimension::Static(2)]));
-        let indices_type =
-            ArrayType::new(DataType::I32, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(1)]));
-        let updates_type =
-            ArrayType::new(DataType::C64, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
-        let operation =
-            ScatterOperation::new(ScatterDimensionNumbers::new(vec![1], vec![0], vec![0]), ScatterReductionKind::Max);
-        let mut builder = ProgramBuilder::new();
-        let operand = builder.add_input(operand_type);
-        let indices = builder.add_input(indices_type);
-        let updates = builder.add_input(updates_type);
-        let output = builder
-            .add_instruction(ArrayOperation::Scatter(operation), Vec::new(), vec![operand, indices, updates], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        assert_eq!(stablehlo.matches("stablehlo.real").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.imag").count(), 2, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.compare").count(), 3, "{stablehlo}");
-        assert_eq!(stablehlo.matches("stablehlo.select").count(), 2, "{stablehlo}");
-    }
-
-    #[test]
-    fn test_compiled_jointly_mapped_scatter_over_possibly_empty_extent() {
+    fn test_scatter_operation_lower_jointly_mapped_over_possibly_empty_extent() {
         // Jointly mapping the input, the indices, and the updates of a scatter over a dynamic extent whose lower bound
-        // is zero stages one scatter with paired batching axes. Its dual gather, built by the scatter-add transpose
-        // and by the extremal JVP coefficient graph, then takes a zero batching window over that extent. This runs the
-        // transformed programs on the CPU PJRT client used by the other tests (the `cutile` feature only enables
-        // compilation of the kernel module) at empty and nonempty mapped extents, through both the primal and its
-        // pullback.
+        // is zero stages one scatter with paired batching axes. Its dual gather, built by the transpose of the additive
+        // scatter and by the extremal JVP coefficient graph, then takes a zero batching window over that extent. This
+        // runs the transformed programs on the test execution client at empty and nonempty mapped extents, through
+        // both the primal and its pullback.
         type DynamicPolicy = ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>;
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
@@ -895,8 +980,8 @@ mod tests {
         ];
         let dimensions = ScatterDimensionNumbers::new(vec![], vec![0], vec![0]);
         // The public `batch` entry runs under the static extent policy, which rejects a dynamic mapped axis before any
-        // operation rule runs, so the joint rule is driven through the dynamic extent policy exactly as the ryft-core
-        // reproduction does, with the mapped extent read from the staged input.
+        // operation rule runs, so the joint rule is driven through the dynamic extent policy directly, with the mapped
+        // extent read from the staged input.
         let stage = |operation: ScatterOperation| -> FlatProgram {
             crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
                 |inputs| {
@@ -970,12 +1055,12 @@ mod tests {
                 &domain,
                 mesh.clone(),
             )
-            .unwrap_or_else(|error| panic!("n={size} native trace: {error}"));
+            .unwrap_or_else(|error| panic!("n={size} compilation: {error}"));
             let bytes = [
                 values_to_bytes(values),
                 values_to_bytes(indices),
                 values_to_bytes(updates),
-                values_to_bytes(&vec![1_f64; size * 4]),
+                values_to_bytes(&vec![1f64; size * 4]),
             ];
             let inputs = input_types
                 .into_iter()
@@ -993,7 +1078,7 @@ mod tests {
             assert_eq!(outputs[2].shape().as_slice(), &[size, 1], "n={size}");
             outputs.iter().map(|output| read_f64s(&client, output)).collect::<Vec<_>>()
         };
-        let all_indices = [1_i32, 3, 0, 2, 3];
+        let all_indices = [1i32, 3, 0, 2, 3];
 
         // The additive scatter is linear, so its pullback is the dual gather over the paired batching axes with the
         // zero window, applied to the cotangent directly.
@@ -1028,8 +1113,8 @@ mod tests {
             "}
             .trim_end(),
         );
-        let all_add_updates = [10_f64, 20., 30., 40., 50.];
-        for size in [0_usize, 4, 5] {
+        let all_add_updates = [10f64, 20., 30., 40., 50.];
+        for size in [0usize, 4, 5] {
             let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
             let indices = &all_indices[..size];
             let updates = &all_add_updates[..size];
@@ -1039,11 +1124,11 @@ mod tests {
             }
             let outputs = execute(&linearization, &pullback, size, &values, indices, updates);
             assert_eq!(outputs[0], expected, "add primal, n={size}");
-            assert_eq!(outputs[1], vec![1_f64; size * 4], "add input gradient, n={size}");
-            assert_eq!(outputs[2], vec![1_f64; size], "add updates gradient, n={size}");
+            assert_eq!(outputs[1], vec![1f64; size * 4], "add input gradient, n={size}");
+            assert_eq!(outputs[2], vec![1f64; size], "add updates gradient, n={size}");
         }
 
-        // The minimum scatter is nonlinear: its JVP coefficient graph reads each update's target back through the
+        // The minimum scatter is nonlinear, and its JVP coefficient graph reads each update's target back through the
         // shared dual gather, so the pullback routes the cotangent to whichever of the input and the update won.
         let minimum = ScatterOperation::new(dimensions, ScatterReductionKind::Min).with_mode(ScatterMode::Clip);
         let program = stage(minimum);
@@ -1063,15 +1148,34 @@ mod tests {
         );
         let linearization = program.linearize_with_respect_to(&[0, 2]).unwrap();
         let pullback = linearization.pullback().unwrap().into_program();
-        assert!(pullback.to_string().contains("slice_sizes=[0, 1]"));
-        let all_min_updates = [-1_f64, 100., -1., 100., -1.];
-        for size in [0_usize, 4, 5] {
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[n, 4], %1:bool[n, 4], %2:bool[n, 1], %3:i32[n, 1, 1], %4:f64[n, 4] .
+                let %5:f64[n, 4] = mul %4 %0
+                    %6:f64[n, 1] = gather [
+                        dimensions=(offset=[], collapsed_slice=[1], start_index_map=[1], batching=[(0, 0)]),
+                        slice_sizes=[0, 1],
+                        mode=clip,
+                    ] %5 %3
+                    %7:f64[n, 1] = zero_like %6
+                    %8:f64[n, 1] = select %2 %6 %7
+                    %9:f64[n, 1] = select %2 %7 %6
+                    %10:f64[n, 4] = zero_like %5
+                    %11:f64[n, 4] = select %1 %5 %10
+                    %12:f64[n, 4] = select %1 %10 %5
+                in (%11, %8)
+            "}
+            .trim_end(),
+        );
+        let all_min_updates = [-1f64, 100., -1., 100., -1.];
+        for size in [0usize, 4, 5] {
             let values = (0..size * 4).map(|value| value as f64).collect::<Vec<_>>();
             let indices = &all_indices[..size];
             let updates = &all_min_updates[..size];
             let mut expected = values.clone();
-            let mut input_gradient = vec![1_f64; size * 4];
-            let mut updates_gradient = vec![0_f64; size];
+            let mut input_gradient = vec![1f64; size * 4];
+            let mut updates_gradient = vec![0f64; size];
             for (row, &index) in indices.iter().enumerate() {
                 let position = row * 4 + index as usize;
                 if updates[row] < values[position] {
@@ -1088,7 +1192,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_scatter_differentiation_duplicate_overwrite() {
+    fn test_scatter_operation_lower_differentiation_duplicate_overwrite() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);

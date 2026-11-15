@@ -9,15 +9,16 @@ impl LowerableOperation for TransposeOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::transpose(
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::transpose(
             input_values[0],
             self.permutation().normalize(self.permutation().len()).map_err(ProgramError::from)?.as_slice(),
-            lowerer.location,
+            lowerer.location(),
         )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.transpose should return one result").as_ref()])
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -38,7 +39,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lower_transpose_executes_dynamic_shape() {
+    fn test_transpose_operation_lower() {
+        // Negative axes normalize against the input rank before they reach `stablehlo.transpose`.
+        let mut builder = ProgramBuilder::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F32, [2, 3, 4]));
+        let output =
+            builder.add_instruction(TransposeOperation::new([-1, 0, 1]), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+            module {
+              func.func @main(%arg0: tensor<2x3x4xf32>) -> tensor<4x2x3xf32> {
+                %0 = stablehlo.transpose %arg0, dims = [2, 0, 1] : (tensor<2x3x4xf32>) -> tensor<4x2x3xf32>
+                return %0 : tensor<4x2x3xf32>
+              }
+            }
+        "#},
+        );
+    }
+
+    #[test]
+    fn test_transpose_operation_lower_dynamic_shape() {
         let shape = Shape::new(vec![dynamic_dimension("size", Some(5)), CoreDimension::Static(2)]);
         let mut builder = ProgramBuilder::new();
         let integer_input = builder.add_input(ArrayType::new(DataType::I64, shape.clone()));
@@ -91,8 +115,8 @@ mod tests {
         // signed zeros detect unintended conjugation or loss of exact complex storage.
         let integers = [i64::MAX, i64::MIN, 9_007_199_254_740_993, -9_007_199_254_740_993, 5, 6, 7, 8];
         let complex_components =
-            [1_f32, -2.0, -0.0, 0.0, 3.0, -4.0, 5.0, -6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0];
-        for extent in [2_i32, 0] {
+            [1f32, -2.0, -0.0, 0.0, 3.0, -4.0, 5.0, -6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0];
+        for extent in [2i32, 0] {
             let inputs = vec![
                 ExecutionInput {
                     buffer: Arc::new(
@@ -170,8 +194,8 @@ mod tests {
                 assert_eq!(&integer_values[..2], &[integers[0], integers[2]]);
                 assert_eq!(&integer_values[4..6], &[integers[1], integers[3]]);
                 let complex_bits = values_from_bytes::<u32>(outputs[1].as_slice());
-                assert_eq!(&complex_bits[..4], &[1_f32, -2.0, 3.0, -4.0].map(f32::to_bits));
-                assert_eq!(&complex_bits[8..12], &[-0_f32, 0.0, 5.0, -6.0].map(f32::to_bits));
+                assert_eq!(&complex_bits[..4], &[1f32, -2.0, 3.0, -4.0].map(f32::to_bits));
+                assert_eq!(&complex_bits[8..12], &[-0f32, 0.0, 5.0, -6.0].map(f32::to_bits));
             }
         }
     }

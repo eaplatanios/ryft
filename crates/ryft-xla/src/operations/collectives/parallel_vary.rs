@@ -18,7 +18,7 @@ impl LowerableOperation for ParallelVaryOperation {
         // Inference guarantees this input mesh and axis exist before the owning binder is checked.
         let inferred = self.infer_output_types(input_types, &[]).map_err(ProgramError::from)?;
         let mesh = input_types[0].sharding().unwrap().mesh();
-        lowerer.collective_state.check_manual_collective(
+        lowerer.collective_state().validate_manual_collective(
             self.name(),
             self.axis_name(),
             mesh.axis_size(self.axis_name()).unwrap(),

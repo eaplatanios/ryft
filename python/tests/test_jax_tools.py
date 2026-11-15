@@ -87,12 +87,12 @@ class JaxToolsTest(unittest.TestCase):
                 "test_to_mlir_module_for_program_renders_reshape_replicated_merge_sharding_propagation",
                 "test_to_mlir_module_for_program_renders_reshape_replicated_split_sharding_propagation",
                 "test_to_mlir_module_for_program_renders_reshape_singleton_axis_sharding_propagation",
-                "test_trace_reshard_then_reshape_renders_mlir",
+                "test_traced_program_to_mlir_module_reshard_then_reshape",
             ],
         )
         self.assertIn(
             "%1 = stablehlo.reshape %0 : (tensor<8xf32>) -> tensor<1x8x1xf32>",
-            expected_mlir["test_trace_reshard_then_reshape_renders_mlir"],
+            expected_mlir["test_traced_program_to_mlir_module_reshard_then_reshape"],
         )
 
 

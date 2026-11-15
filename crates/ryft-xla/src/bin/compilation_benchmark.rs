@@ -1,9 +1,16 @@
 //! Matched lifecycle and execution benchmark for comparison with JAX.
+//!
+//! The workload is `sin(x * x + x)` over an `f32` vector on one CPU device. The benchmark measures the cold staging,
+//! lowering, and compilation times, the enqueue-only and synchronized execution times of the compiled function, the
+//! warm dispatch time of a [`jit`] dispatcher, and, with `--cache-dir`, the time to restore the compiled program from a
+//! persistent cache. It prints one JSON report whose schema is shared with the JAX side of the comparison.
 
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+
+use serde_json::{Value as JsonValue, json};
 
 use ryft_core::{
     ArrayIrType, ArrayType, Compile, CompiledFunction as CoreCompiledFunction, DataType, Device, DeviceMesh,
@@ -12,18 +19,28 @@ use ryft_core::{
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
 use ryft_xla::{Array, CompileTracer, CompiledFunctionDispatcher, Domain, FromPjrt, Options, Session, Value, jit};
-use serde_json::{Value as JsonValue, json};
 
 // TODO(eaplatanios): Review this module.
 
+/// Staged benchmark workload.
 type BenchmarkStagedFunction<'c> = CoreStagedFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
+
+/// Compiled benchmark workload.
 type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
 
+/// Command-line arguments of this benchmark.
 #[derive(Debug)]
 struct Arguments {
+    /// Number of timed warm iterations of each execution measurement.
     iterations: usize,
+
+    /// Number of `f32` elements of the workload input.
     size: usize,
+
+    /// Whether to use small dimensions and assert the cache invariants.
     smoke: bool,
+
+    /// Directory of the persistent cache whose restore time is measured, if any.
     cache_directory: Option<PathBuf>,
 }
 
@@ -33,6 +50,7 @@ impl Default for Arguments {
     }
 }
 
+/// Returns the usage message of this benchmark.
 fn usage() -> &'static str {
     "Usage: compilation_benchmark [OPTIONS]\n\
      \n\
@@ -44,6 +62,7 @@ fn usage() -> &'static str {
        -h, --help         Print this help"
 }
 
+/// Parses the command-line arguments, returning [`None`] when only the usage message was requested.
 fn parse_arguments() -> Result<Option<Arguments>, String> {
     let mut arguments = Arguments::default();
     let mut values = env::args().skip(1);
@@ -56,20 +75,20 @@ fn parse_arguments() -> Result<Option<Arguments>, String> {
             "--iterations" => {
                 arguments.iterations = values
                     .next()
-                    .ok_or("expected a value after --iterations")?
+                    .ok_or("expected a value after `--iterations`")?
                     .parse()
-                    .map_err(|error| format!("invalid --iterations value: {error}"))?;
+                    .map_err(|error| format!("invalid `--iterations` value: {error}"))?;
             }
             "--size" => {
                 arguments.size = values
                     .next()
-                    .ok_or("expected a value after --size")?
+                    .ok_or("expected a value after `--size`")?
                     .parse()
-                    .map_err(|error| format!("invalid --size value: {error}"))?;
+                    .map_err(|error| format!("invalid `--size` value: {error}"))?;
             }
             "--cache-dir" => {
                 arguments.cache_directory =
-                    Some(PathBuf::from(values.next().ok_or("expected a path after --cache-dir")?));
+                    Some(PathBuf::from(values.next().ok_or("expected a path after `--cache-dir`")?));
             }
             "--smoke" => arguments.smoke = true,
             other => return Err(format!("unknown argument `{other}`\n\n{}", usage())),
@@ -80,11 +99,12 @@ fn parse_arguments() -> Result<Option<Arguments>, String> {
         arguments.size = arguments.size.min(1024);
     }
     if arguments.iterations == 0 || arguments.size == 0 {
-        return Err("--iterations and --size must both be greater than zero".into());
+        return Err("`--iterations` and `--size` must both be greater than zero".into());
     }
     Ok(Some(arguments))
 }
 
+/// Returns the trimmed standard output of `program` run with `arguments`, or [`None`] when it fails.
 fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
     Command::new(program)
         .args(arguments)
@@ -95,14 +115,18 @@ fn command_output(program: &str, arguments: &[&str]) -> Option<String> {
         .map(|output| output.trim().to_string())
 }
 
+/// Returns the number of nanoseconds elapsed since `start`.
 fn duration_nanoseconds(start: Instant) -> u64 {
     nanoseconds(start.elapsed())
 }
 
+/// Returns `duration` in nanoseconds, saturating at [`u64::MAX`].
 fn nanoseconds(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
+/// Returns the sample count, the minimum, the 50th, 95th, and 99th percentiles, and the maximum of `samples` as JSON.
+/// Percentiles round their rank up to the next sample.
 fn distribution(samples: &[u64]) -> JsonValue {
     let mut sorted = samples.to_vec();
     sorted.sort_unstable();
@@ -120,6 +144,7 @@ fn distribution(samples: &[u64]) -> JsonValue {
     })
 }
 
+/// Returns the counters and durations of `statistics` as JSON.
 fn dispatcher_statistics(statistics: DispatcherStatistics) -> JsonValue {
     json!({
         "dispatch_hits": statistics.dispatch_hits,
@@ -134,6 +159,7 @@ fn dispatcher_statistics(statistics: DispatcherStatistics) -> JsonValue {
     })
 }
 
+/// Returns the counters and durations of the compilation context of `domain` as JSON.
 fn compilation_statistics(domain: &Domain<'_>) -> JsonValue {
     let statistics = domain.compilation_context().statistics();
     json!({
@@ -149,17 +175,20 @@ fn compilation_statistics(domain: &Domain<'_>) -> JsonValue {
     })
 }
 
+/// Returns a mesh with one auto axis over the first addressable device of `client`.
 fn mesh(client: &Client<'_>) -> Result<DeviceMesh, Box<dyn std::error::Error>> {
     let device = Device::from_pjrt(&client.addressable_devices()?.remove(0))?;
     let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("device", 1, MeshAxisType::Auto)?])?;
     Ok(DeviceMesh::new(logical_mesh, vec![device])?)
 }
 
+/// Returns the type of an `f32` vector of `size` elements that is replicated over `mesh`.
 fn input_type(mesh: &DeviceMesh, size: usize) -> Result<ArrayType, Box<dyn std::error::Error>> {
     Ok(ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(size)]))
         .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))?)
 }
 
+/// Uploads a deterministic input array of type `r#type` with `size` elements to `mesh`.
 fn input_array<'c>(
     domain: &Domain<'c>,
     mesh: &DeviceMesh,
@@ -173,6 +202,7 @@ fn input_array<'c>(
     Ok(Array::from_host_buffer(domain, r#type, mesh.clone(), bytes.as_slice())?)
 }
 
+/// Stages the workload `sin(x * x + x)` for inputs of type `r#type` over `mesh`.
 fn stage_workload<'c>(
     domain: &Domain<'c>,
     mesh: &DeviceMesh,
@@ -188,6 +218,7 @@ fn stage_workload<'c>(
     )?)
 }
 
+/// Executes the compiled workload at `input` and returns its output array.
 fn call_workload<'c>(
     domain: &Domain<'c>,
     compiled: &BenchmarkCompiledFunction<'c>,
@@ -200,6 +231,9 @@ fn call_workload<'c>(
     }
 }
 
+/// Compiles the workload into the persistent cache in `directory` from one session, then measures how long a second
+/// session takes to restore it, and returns the measurement and the compilation statistics of the second session as
+/// JSON.
 fn persistent_restore(
     client: &Client<'_>,
     mesh: &DeviceMesh,
@@ -229,6 +263,7 @@ fn persistent_restore(
     }))
 }
 
+/// Runs the benchmark and prints its JSON report.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(arguments) = parse_arguments().map_err(std::io::Error::other)? else {
         return Ok(());
@@ -243,15 +278,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     input.block_until_ready()?;
     let start = Instant::now();
     let staged = stage_workload(&domain, &mesh, r#type.clone())?;
-    let cold_trace_ns = duration_nanoseconds(start);
+    let cold_staging_nanoseconds = duration_nanoseconds(start);
 
     let start = Instant::now();
     let lowered = staged.lower(&domain)?;
-    let cold_lower_ns = duration_nanoseconds(start);
+    let cold_lowering_nanoseconds = duration_nanoseconds(start);
 
     let start = Instant::now();
     let compiled: BenchmarkCompiledFunction<'_> = lowered.compile(&domain)?;
-    let cold_compile_ns = duration_nanoseconds(start);
+    let cold_compilation_nanoseconds = duration_nanoseconds(start);
 
     let warmup = call_workload(&domain, &compiled, input.clone())?;
     warmup.block_until_ready()?;
@@ -338,9 +373,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "xla_flags": env::var("XLA_FLAGS").unwrap_or_default(),
         },
         "lifecycle": {
-            "cold_trace_ns": cold_trace_ns,
-            "cold_lower_ns": cold_lower_ns,
-            "cold_compile_ns": cold_compile_ns,
+            "cold_trace_ns": cold_staging_nanoseconds,
+            "cold_lower_ns": cold_lowering_nanoseconds,
+            "cold_compile_ns": cold_compilation_nanoseconds,
             "persistent_restore": persistent,
         },
         "execution": {

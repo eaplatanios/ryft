@@ -20,9 +20,9 @@ use crate::operations::jit_call::{JitCallFunctionMap, lower_shared_function_call
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
 /// Returns `true` if lowering `operation` at the provided boundary never reads its attached regions, because it is a
-/// named composite call (refer to [`LowerableOperation::composite_key`]) that a backend implementation
-/// replaces or whose body lowers to a shared function. The
-/// lowering loops skip materializing the regions of such instructions, which would otherwise copy the body per call.
+/// named composite call, which [`LowerableOperation::composite_key`] identifies, that a backend implementation replaces
+/// or whose body lowers to a shared function. The lowering loops skip materializing the regions of such instructions,
+/// which would otherwise copy the body per call.
 pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
     operation: &O,
     input_types: &[ArrayIrType],
@@ -44,8 +44,8 @@ pub(crate) fn lowers_without_regions<O: LowerableOperationFamily>(
 /// implementation replaces lowers its body. Every implementation must validate the attributes of the key and the
 /// boundary that it supports and decline any other call, because its key alone does not fix them.
 pub(crate) enum NamedCompositeImplementation {
-    /// cuDNN fused attention kernels for a call of the forward attention definition (refer to
-    /// [`select_attention_implementation`]).
+    /// cuDNN fused attention kernels for a call of the forward attention definition, which
+    /// [`select_attention_implementation`] selects.
     Attention {
         /// Configuration of the definition.
         configuration: AttentionConfiguration,
@@ -57,8 +57,8 @@ pub(crate) enum NamedCompositeImplementation {
         return_residual: bool,
     },
 
-    /// cuDNN fused attention backward kernels for a call of the backward attention definition (refer to
-    /// [`select_attention_implementation`]).
+    /// cuDNN fused attention backward kernels for a call of the backward attention definition, which
+    /// [`select_attention_implementation`] selects.
     AttentionBackward {
         /// Configuration of the definition.
         configuration: AttentionConfiguration,
@@ -149,9 +149,9 @@ impl NamedCompositeImplementation {
                 input_values,
                 array_types(input_types)?.as_slice(),
                 array_types(output_types)?.as_slice(),
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
+                &mut lowerer.block(),
+                lowerer.context(),
+                lowerer.location(),
             ),
             Self::AttentionBackward { configuration, input_structure } => lower_fused_attention_backward(
                 *configuration,
@@ -159,9 +159,9 @@ impl NamedCompositeImplementation {
                 input_values,
                 array_types(input_types)?.as_slice(),
                 array_types(output_types)?.as_slice(),
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
+                &mut lowerer.block(),
+                lowerer.context(),
+                lowerer.location(),
             ),
             Self::FusedAttentionUnavailable { name, reason } => {
                 Err(Error::Lowering(LoweringError::UnsupportedOperation {
@@ -171,10 +171,10 @@ impl NamedCompositeImplementation {
             }
             #[cfg(test)]
             Self::TestSquare => {
-                let multiply = lowerer.block.append_operation(ryft_mlir::dialects::stable_hlo::multiply(
+                let multiply = lowerer.block().append_operation(ryft_mlir::dialects::stable_hlo::multiply(
                     input_values[0],
                     input_values[0],
-                    lowerer.location,
+                    lowerer.location(),
                 )?)?;
                 Ok(vec![multiply.result(0).unwrap().as_ref()])
             }
@@ -182,12 +182,10 @@ impl NamedCompositeImplementation {
     }
 }
 
-impl<
-    V: Typed<Type: DifferentiableType + Eq + Hash + Into<ArrayIrType>> + Parameter,
-    RegionOperation,
-    S: CustomRuleSource<V, RegionOperation>,
-> LowerableOperation for CompositeOperation<V, RegionOperation, S>
+impl<V: Typed + Parameter, RegionOperation, S: CustomRuleSource<V, RegionOperation>> LowerableOperation
+    for CompositeOperation<V, RegionOperation, S>
 where
+    V::Type: Eq + Hash + DifferentiableType + Into<ArrayIrType>,
     Self: CoreOperation<Type = V::Type>,
 {
     #[inline]
@@ -207,78 +205,81 @@ where
         if let Some(key) = self.key() {
             let input_types = input_types.iter().cloned().map(Into::into).collect::<Vec<ArrayIrType>>();
             let output_types = output_types.iter().cloned().map(Into::into).collect::<Vec<ArrayIrType>>();
-            let target_platform = lowerer.collective_state.target_platform();
+            let target_platform = lowerer.collective_state().target_platform();
             if let Some(backend) =
                 NamedCompositeImplementation::select(key, &input_types, &output_types, target_platform)
             {
                 return backend.lower(lowerer, input_values, &input_types, &output_types);
             }
             let function = lowerer
-                .nested_functions
+                .nested_functions()
                 .as_ref()
                 .and_then(|functions| functions.named(key, &input_types, &output_types));
             if let Some(function) = function {
                 return lower_shared_function_call(
-                    &function.symbol,
-                    &function.output_types,
+                    function.symbol(),
+                    function.output_types(),
                     input_values,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
+                    &mut lowerer.block(),
+                    lowerer.context(),
+                    lowerer.location(),
                 );
             }
 
             // Calls whose key and boundary are shared by calls with another body are not indexed, so they find their
-            // shared function by their own body instead (refer to `JitCallFunctionMap::named`).
-            let function =
-                lowerer.nested_functions.as_ref().zip(lowerer.regions.first()).and_then(|(functions, primal)| {
-                    functions.get(primal).filter(|function| function.input_types.len() == input_values.len())
-                });
+            // shared function by their own body instead, as `JitCallFunctionMap::named` explains.
+            let function = lowerer.nested_functions().zip(lowerer.regions().first()).and_then(|(functions, primal)| {
+                functions.get(primal).filter(|function| function.input_types().len() == input_values.len())
+            });
             if let Some(function) = function {
                 return lower_shared_function_call(
-                    &function.symbol,
-                    &function.output_types,
+                    function.symbol(),
+                    function.output_types(),
                     input_values,
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
+                    &mut lowerer.block(),
+                    lowerer.context(),
+                    lowerer.location(),
                 );
             }
         }
 
-        let [primal, ..] = lowerer.regions.as_slice() else {
+        let [_, ..] = lowerer.regions() else {
             return Err(Error::from(ProgramError::MalformedProgram(format!(
-                "{COMPOSITE_OPERATION_NAME} expected a primal region but got no regions"
+                "`{COMPOSITE_OPERATION_NAME}` expected a primal region but got no regions"
             ))));
         };
-        if lowerer.regions.len() != self.region_slots().len() {
+        if lowerer.regions().len() != self.region_slots().len() {
             return Err(Error::from(ProgramError::MalformedProgram(format!(
-                "{} expected {} attached regions but got {}",
+                "`{}` expected {} attached regions but got {}",
                 COMPOSITE_OPERATION_NAME,
                 self.region_slots().len(),
-                lowerer.regions.len(),
+                lowerer.regions().len(),
             ))));
         }
-        // Composite call regions are traced through fresh-root contexts whose local capture tables are discarded, so
-        // they can never legally reference the enclosing function's captures (the trace boundary rejects bodies that
-        // register captures). Lowering the primal region with an empty capture namespace turns any capture-referencing
-        // constant that still sneaks in into a loud `MissingCapturedConstant` error instead of silently aliasing
-        // whatever value occupies the referenced slot of the enclosing capture prefix. Runtime arrays that such a body
-        // refers to are session constants instead, whose module-scoped values the empty namespace keeps reachable.
-        // Only the primal region is lowered: attached rule regions are dormant under lowering, and retained rules are
-        // callbacks rather than regions. Nested-traced regions (`while`/`scan`/`condition`/`linear_call`) share the
-        // enclosing capture scope and keep inheriting it.
+        // Composite call regions are traced through contexts with fresh roots whose local capture tables are
+        // discarded, so they can never legally reference the enclosing function's captures, because the trace boundary
+        // rejects bodies that register captures. Lowering the primal region with an empty capture namespace turns any
+        // constant that references a capture and still sneaks in into a loud `MissingCapturedConstant` error instead of
+        // silently aliasing whatever value occupies the referenced slot of the enclosing capture prefix. Runtime arrays
+        // that such a body refers to are session constants instead, whose values are scoped to the module, so the
+        // empty namespace keeps them reachable. Only the primal region is lowered, because attached rule regions are
+        // dormant under lowering and retained rules are callbacks rather than regions. Regions traced as nested
+        // programs (i.e., those of `while`, `scan`, `condition`, and `linear_call`) share the enclosing capture scope
+        // and keep inheriting it.
+        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
+            lowerer.split_effect_tokens();
         lower_nested_program_inline(
-            primal,
+            &regions[0],
             input_values,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-            lowerer.collective_state.session_values(lowerer.captured_values.as_slice()),
+            &mut block,
+            context,
+            location,
+            collective_state.session_values(captured_values),
             &RematerializationOptimizationBarrier::None,
-            lowerer.nested_functions.as_ref(),
-            &lowerer.collective_state,
-            &mut lowerer.effect_tokens,
+            nested_functions,
+            collective_state,
+            effect_tokens,
         )
     }
 }
@@ -289,11 +290,12 @@ where
 {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        _input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[Self::Type],
-        _output_types: &[Self::Type],
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[Self::Type],
+        output_types: &[Self::Type],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (lowerer, input_values, input_types, output_types);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "a `{COMPOSITE_TRANSPOSE_OPERATION_NAME}` has no forward program and cannot be lowered to \
@@ -311,27 +313,125 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrType, ArrayType, BatchAxis, BatchingLevelExtent, CompositeJvpRule, CompositeKey,
-        CompositeOperation, CompositeTransposeOperation, CustomRuleDefinition, CustomRuleRegistration, DataType,
-        DimensionValue, DomainTracer, MulOperation, NamedComposite, Placeholder, PrintOperation,
-        Program as CoreProgram, ProgramError, ProjectedContext, batch, composite, differentiate_at,
+        AddOperation, ArrayOperation, BatchAxis, BatchingLevelExtent, CompositeJvpRule, CustomRuleDefinition,
+        CustomRuleRegistration, DataType, DimensionValue, DomainTracer, MulOperation, NamedComposite, PrintOperation,
+        Program as CoreProgram, ProjectedContext, batch, composite, differentiate_at,
     };
+    use ryft_mlir::{Block, Context as MlirContext, Location};
 
     use crate::domains::tests::domain_mesh;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::test_vector_type;
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
-    use crate::{Array, Constant, Domain, Error, Session, to_mlir_module_for_program};
+    use crate::{Array, Constant, Domain, Session, to_mlir_module_for_program};
+
+    use super::*;
 
     // Value that composite rules see when a composite executes through the projection of the eager domain onto arrays.
     type ArrayTracer<'c> = DomainTracer<ProjectedContext<Domain<'c>, ArrayType>>;
 
+    /// Returns a program that applies `calls` named composite calls of `rules` to the same input, each attaching the
+    /// interned `body`, and returns their outputs.
+    fn named_calls_program(
+        rules: &CustomRuleRegistration<Constant, Operation>,
+        body: &Arc<CoreProgram<Constant, Operation, Vec<Constant>, Vec<Constant>>>,
+        calls: usize,
+    ) -> FlatProgram {
+        let vector_type = test_vector_type(4);
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(vector_type.clone().into());
+        let outputs = (0..calls)
+            .map(|_| {
+                let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
+                let regions = vec![builder.intern_callee(body, None).unwrap()];
+                builder.add_instruction(operation, regions, vec![input], None).unwrap()[0]
+            })
+            .collect::<Vec<_>>();
+        builder
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; calls])
+            .unwrap()
+    }
+
+    /// Returns a named composite definition `x ↦ x + x` with the provided key name and version.
+    fn named_rules_with_version(key: &str, version: u32) -> CustomRuleRegistration<Constant, Operation> {
+        let key = CompositeKey::new(key.to_string(), version);
+        let output_types = |types: &[ArrayIrType]| Ok(types.to_vec());
+        let named = NamedComposite::new(key, output_types, |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]));
+        CustomRuleRegistration::new(CustomRuleDefinition::new("doubled").with_named_composite(named))
+    }
+
+    /// Returns the program `x ↦ x + x` over the test vector type, shared as a named composite body.
+    fn doubled_body() -> Arc<CoreProgram<Constant, Operation, Vec<Constant>, Vec<Constant>>> {
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(test_vector_type(4).into());
+        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+        Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
+    }
+
+    /// Lowers `program`, whose outputs all have the test vector type, for `target_platform`.
+    fn lower_named_calls(program: &FlatProgram, target_platform: Option<&str>) -> Result<String, Error> {
+        let input_types = vec![test_vector_type(4)];
+        let output_types = vec![test_vector_type(4); program.output_ids().len()];
+        lower_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None, target_platform)
+            .map(|module| module.into_stable_hlo())
+    }
+
     #[test]
-    fn test_composite_lowering_inlines_only_the_primal_program() {
+    fn test_lowers_without_regions() {
+        // Only a named composite call that a backend implementation replaces, or whose body lowers to a shared
+        // function, lowers without reading its regions.
+        let types = vec![ArrayIrType::Array(test_vector_type(4))];
+        let rules = named_rules_with_version("ryft.tests.xla_named_square", 1);
+        let named = Operation::Composite(CompositeOperation::new(rules.reference()));
+        assert!(lowers_without_regions(&named, &types, &types, None, Some("cuda")));
+        assert!(!lowers_without_regions(&named, &types, &types, None, None));
+        let unnamed = Operation::Array(ArrayOperation::Add(AddOperation::new()));
+        assert!(!lowers_without_regions(&unnamed, &types, &types, None, Some("cuda")));
+    }
+
+    #[test]
+    fn test_named_composite_implementation_body_substitution_error() {
+        // An implementation that the call explicitly requests rejects substituting the portable body, while other
+        // implementations accept it.
+        let unavailable = NamedCompositeImplementation::FusedAttentionUnavailable {
+            name: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+            reason: "the inputs are not `bf16`".to_string(),
+        };
+        assert!(matches!(
+            unavailable.body_substitution_error(),
+            Some(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME
+                    && reason == "the fused attention implementation is unavailable because the inputs are not `bf16`",
+        ));
+        assert!(matches!(NamedCompositeImplementation::TestSquare.body_substitution_error(), None));
+    }
+
+    #[test]
+    fn test_named_composite_implementation_lower() {
+        // An unavailable fused attention implementation reports why instead of emitting anything.
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let block = context.block_with_no_arguments();
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let unavailable = NamedCompositeImplementation::FusedAttentionUnavailable {
+            name: DOT_PRODUCT_ATTENTION_COMPOSITE_NAME,
+            reason: "the inputs are not `bf16`".to_string(),
+        };
+        assert!(matches!(
+            unavailable.lower(&mut lowerer, &[], &[], &[]),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME
+                    && reason == "the fused attention implementation is unavailable because the inputs are not `bf16`",
+        ));
+        assert!(block.as_ref().is_empty());
+    }
+
+    #[test]
+    fn test_composite_operation_lower_inlines_only_the_primal_program() {
         // A retained `composite` call lowers only its primal program and threads its effects onto the enclosing
-        // ordered-I/O chain, for every rule layout. Nothing from the user-supplied rule programs (marked here by the
-        // multiplies on the tangent and cotangent sides) reaches the emitted module.
+        // ordered I/O chain, for every rule layout. Nothing from the rule programs that the user supplies, which the
+        // multiplies on the tangent and cotangent sides mark here, reaches the emitted module.
         let vector_type = test_vector_type(4);
         let primal = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -422,7 +522,35 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_lowering_executes_batching_rule() {
+    fn test_composite_operation_lower_rejects_malformed_instructions() {
+        // A call without a key lowers its primal region, so it needs the primal region and one region per rule slot.
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let block = context.block_with_no_arguments();
+        let operation = CompositeOperation::<Constant, Operation>::from_rule_regions(CompositeJvpRule::Explicit, false);
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        assert!(matches!(
+            operation.lower(&mut lowerer, &[], &[], &[]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message == "`composite` expected a primal region but got no regions",
+            ),
+        ));
+        let mut lowerer =
+            Lowerer::new(block.as_ref(), &context, location).with_regions(vec![doubled_body().as_ref().clone()]);
+        assert!(matches!(
+            operation.lower(&mut lowerer, &[], &[], &[]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message == "`composite` expected 2 attached regions but got 1",
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_composite_operation_lower_executes_batching_rule() {
         // A composite with a custom batching rule executes through the projection of the eager domain onto arrays,
         // which lifts the regions of the calls that it binds. Its unbatched derivative differentiates the primal `x²`,
         // while batching it, before or after differentiating it, applies the rule, which computes `2x²` so that its use
@@ -459,10 +587,11 @@ mod tests {
     }
 
     #[test]
-    fn test_composite_lowering_executes_broadcast_sensitive_batching_rule() {
-        // A broadcast-sensitive batching rule depends on the batch axes of its inputs (`2xy` when both inputs are
-        // mapped and `3xy` otherwise). Batching the derivative with a replicated `y` whose tangent is mapped yields the
-        // exact per-item tangents `3(ẋy + xẏ)`, which requires taking a diagonal on device.
+    fn test_composite_operation_lower_executes_broadcast_sensitive_batching_rule() {
+        // A batching rule that is sensitive to broadcasting depends on the batch axes of its inputs (i.e., it computes
+        // `2xy` when both inputs are mapped and `3xy` otherwise). Batching the derivative with a replicated `y` whose
+        // tangent is mapped yields the exact tangents `3(ẋy + xẏ)` of each batch item, which requires taking a
+        // diagonal on device.
         let client = execution_client();
         let domain = Session::new(&client).domain();
         let mesh = domain_mesh(&client, "x", 1);
@@ -498,8 +627,9 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_rule_lowering_inlines_only_the_primal_program() {
-        // A custom rule call lowers only its primal program: its derivative rules are retained callbacks, not regions.
+    fn test_composite_operation_lower_custom_rule_inlines_only_the_primal_program() {
+        // A custom rule call lowers only its primal program, because its derivative rules are retained callbacks, not
+        // regions.
         let vector_type = test_vector_type(4);
         let rules = CustomRuleRegistration::new(CustomRuleDefinition::<Constant, Operation>::new("doubled"));
         let primal = {
@@ -537,139 +667,13 @@ mod tests {
                 }
             "#},
         );
-
-        // An unresolved reverse-mode carrier has no forward program to lower.
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(vector_type.clone().into());
-        let carrier = CompositeTransposeOperation::new(
-            rules.reference(),
-            0,
-            vec![vector_type.clone().into()],
-            vec![vector_type.clone().into()],
-        );
-        let output = builder
-            .add_instruction(Operation::CompositeTranspose(carrier), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None)
-                .unwrap_err()
-                .to_string(),
-            "a `composite_transpose` has no forward program and cannot be lowered to StableHLO; transpose it \
-             before lowering",
-        );
     }
 
     #[test]
-    fn test_composite_transpose_lowering_is_rejected() {
-        // A composite transpose with an attached backward rule is reverse-mode-only and must be transposed away before
-        // lowering, so lowering it is rejected.
-        let vector_type = test_vector_type(4);
-        let backward = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let residual = builder.add_input(vector_type.clone().into());
-            let cotangent = builder.add_input(vector_type.clone().into());
-            let output =
-                builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, cotangent], None).unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let operation = CompositeTransposeOperation::<Constant, Operation>::from_backward_region(
-            1,
-            vec![ArrayIrType::Array(vector_type.clone())],
-            vec![ArrayIrType::Array(vector_type.clone())],
-        );
-        let mut builder = ArrayIrProgramBuilder::new();
-        let backward_region = builder.import_region(backward.entry_region_ref());
-        let tangent = builder.add_input(vector_type.clone().into());
-        let residual = builder.add_input(vector_type.clone().into());
-        let output = builder
-            .add_instruction(
-                Operation::CompositeTranspose(operation),
-                vec![backward_region],
-                vec![tangent, residual],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-        let input_types = vec![vector_type.clone(), vector_type.clone()];
-        let output_types = vec![vector_type];
-
-        assert!(matches!(
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
-            Err(Error::Core(core_error)) if matches!(
-                core_error.as_ref(),
-                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
-                    if *message == "a `composite_transpose` has no forward program and cannot be lowered to \
-                        StableHLO; transpose it before lowering",
-            ),
-        ));
-    }
-
-    /// Returns a program that applies `calls` named composite calls of `rules` to the same input, each attaching the
-    /// interned `body`, and returns their outputs.
-    fn named_calls_program(
-        rules: &CustomRuleRegistration<Constant, Operation>,
-        body: &Arc<CoreProgram<Constant, Operation, Vec<Constant>, Vec<Constant>>>,
-        calls: usize,
-    ) -> FlatProgram {
-        let vector_type = test_vector_type(4);
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(vector_type.clone().into());
-        let outputs = (0..calls)
-            .map(|_| {
-                let operation = Operation::Composite(CompositeOperation::new(rules.reference()));
-                let regions = vec![builder.intern_callee(body, None).unwrap()];
-                builder.add_instruction(operation, regions, vec![input], None).unwrap()[0]
-            })
-            .collect::<Vec<_>>();
-        builder
-            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; calls])
-            .unwrap()
-    }
-
-    /// Returns a registration of a named composite with the provided key, whose body doubles its input.
-    fn named_rules(key: &str) -> CustomRuleRegistration<Constant, Operation> {
-        named_rules_with_version(key, 1)
-    }
-
-    /// Returns a named composite definition `x ↦ x + x` with the provided key name and version.
-    fn named_rules_with_version(key: &str, version: u32) -> CustomRuleRegistration<Constant, Operation> {
-        let key = CompositeKey::new(key.to_string(), version);
-        let output_types = |types: &[ArrayIrType]| Ok(types.to_vec());
-        let named = NamedComposite::new(key, output_types, |inputs| Ok(vec![inputs[0].clone() + inputs[0].clone()]));
-        CustomRuleRegistration::new(CustomRuleDefinition::new("doubled").with_named_composite(named))
-    }
-
-    /// Returns the program `x ↦ x + x` over the test vector type, shared as a named composite body.
-    fn doubled_body() -> Arc<CoreProgram<Constant, Operation, Vec<Constant>, Vec<Constant>>> {
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(test_vector_type(4).into());
-        let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
-        Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
-    }
-
-    /// Lowers `program`, whose outputs all have the test vector type, for `target_platform`.
-    fn lower_named_calls(
-        program: &crate::operations::FlatProgram,
-        target_platform: Option<&str>,
-    ) -> Result<String, Error> {
-        let input_types = vec![test_vector_type(4)];
-        let output_types = vec![test_vector_type(4); program.output_ids().len()];
-        lower_mlir_module_for_program(program, &[], &input_types, &output_types, "main", None, None, target_platform)
-            .map(|module| module.stable_hlo)
-    }
-
-    #[test]
-    fn test_named_composite_lowering_shares_one_function_per_specialization() {
+    fn test_composite_operation_lower_named_composite_shares_one_function_per_specialization() {
         // Repeated named composite calls with one body specialization lower to calls of one shared private function
         // named after the definition, while a single call inlines its body.
-        let rules = named_rules("ryft.tests.xla_named_shared");
+        let rules = named_rules_with_version("ryft.tests.xla_named_shared", 1);
         let body = doubled_body();
         assert_eq!(
             lower_named_calls(&named_calls_program(&rules, &body, 2), None).unwrap(),
@@ -701,10 +705,10 @@ mod tests {
     }
 
     #[test]
-    fn test_named_composite_lowering_selects_backend_implementations() {
+    fn test_composite_operation_lower_named_composite_selects_backend_implementations() {
         // A backend implementation replaces the calls on its target, which then need no shared function, and calls
         // lower their body elsewhere.
-        let rules = named_rules("ryft.tests.xla_named_square");
+        let rules = named_rules_with_version("ryft.tests.xla_named_square", 1);
         let body = doubled_body();
         let program = named_calls_program(&rules, &body, 2);
         assert_eq!(
@@ -737,7 +741,7 @@ mod tests {
         );
 
         // Calls of definitions that no backend implementation recognizes lower their body on every target.
-        let rules = named_rules("ryft.tests.xla_named_unrecognized");
+        let rules = named_rules_with_version("ryft.tests.xla_named_unrecognized", 1);
         let program = named_calls_program(&rules, &body, 1);
         assert_eq!(
             lower_named_calls(&program, Some("cuda")).unwrap(),
@@ -753,11 +757,11 @@ mod tests {
     }
 
     #[test]
-    fn test_named_composite_lowering_separates_conflicting_bodies() {
+    fn test_composite_operation_lower_named_composite_separates_conflicting_bodies() {
         // Two separately registered definitions share one key and boundary but carry different bodies (e.g., because
         // their named axes differ). Each call must still lower to the shared function of its own body.
-        let first = named_rules("ryft.tests.xla_named_conflict");
-        let second = named_rules("ryft.tests.xla_named_conflict");
+        let first = named_rules_with_version("ryft.tests.xla_named_conflict", 1);
+        let second = named_rules_with_version("ryft.tests.xla_named_conflict", 1);
         let doubled = doubled_body();
         let squared = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -803,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn test_named_composite_lowering_separates_bodies_calling_different_versions() {
+    fn test_composite_operation_lower_named_composite_separates_bodies_calling_different_versions() {
         // Two definitions with one key have bodies that differ only in the version of the named composite that they
         // call. Their renderings include that version, so their bodies are not merged and each keeps its own call. The
         // nested calls of both versions have structurally equal bodies, which share one function named after the first.
@@ -820,8 +824,8 @@ mod tests {
         let (_first_inner, first_body) = outer_body(1);
         let (_second_inner, second_body) = outer_body(2);
         assert_ne!(first_body.to_string(), second_body.to_string());
-        let first = named_rules("ryft.tests.xla_named_outer");
-        let second = named_rules("ryft.tests.xla_named_outer");
+        let first = named_rules_with_version("ryft.tests.xla_named_outer", 1);
+        let second = named_rules_with_version("ryft.tests.xla_named_outer", 1);
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(test_vector_type(4).into());
         let outputs = [(&first, &first_body), (&second, &second_body), (&first, &first_body), (&second, &second_body)]
@@ -864,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn test_named_composite_lowering_selects_backends_per_key_of_a_shared_body() {
+    fn test_composite_operation_lower_named_composite_selects_backends_per_key_of_a_shared_body() {
         // Calls of two versions share one interned body region, but only the first version has a backend implementation
         // on CUDA. The second version's calls must still share a function of their own instead of following the first
         // version's selection.
@@ -904,11 +908,11 @@ mod tests {
     }
 
     #[test]
-    fn test_named_composite_lowering_separates_bodies_that_cannot_be_shared() {
+    fn test_composite_operation_lower_named_composite_separates_bodies_that_cannot_be_shared() {
         // Two definitions share one key and boundary, and the body of the first holds a constant, which structural
         // deduplication cannot key. Its calls must inline their own body instead of calling the second body's function.
-        let first = named_rules("ryft.tests.xla_named_unshareable");
-        let second = named_rules("ryft.tests.xla_named_unshareable");
+        let first = named_rules_with_version("ryft.tests.xla_named_unshareable", 1);
+        let second = named_rules_with_version("ryft.tests.xla_named_unshareable", 1);
         let unshareable = {
             let mut builder = ArrayIrProgramBuilder::new();
             let input = builder.add_input(test_vector_type(4).into());
@@ -948,5 +952,54 @@ mod tests {
                 }
             "#},
         );
+    }
+
+    #[test]
+    fn test_composite_transpose_operation_lower() {
+        // A composite transpose with an attached backward rule exists only in reverse mode and must be transposed away
+        // before lowering, so lowering it is rejected.
+        let vector_type = test_vector_type(4);
+        let backward = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let residual = builder.add_input(vector_type.clone().into());
+            let cotangent = builder.add_input(vector_type.clone().into());
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, cotangent], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let operation = CompositeTransposeOperation::<Constant, Operation>::from_backward_region(
+            1,
+            vec![ArrayIrType::Array(vector_type.clone())],
+            vec![ArrayIrType::Array(vector_type.clone())],
+        );
+        let mut builder = ArrayIrProgramBuilder::new();
+        let backward_region = builder.import_region(backward.entry_region_ref());
+        let tangent = builder.add_input(vector_type.clone().into());
+        let residual = builder.add_input(vector_type.clone().into());
+        let output = builder
+            .add_instruction(
+                Operation::CompositeTranspose(operation),
+                vec![backward_region],
+                vec![tangent, residual],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![vector_type.clone(), vector_type.clone()];
+        let output_types = vec![vector_type];
+
+        assert!(matches!(
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "a `composite_transpose` has no forward program and cannot be lowered to \
+                        StableHLO; transpose it before lowering",
+            ),
+        ));
     }
 }

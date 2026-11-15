@@ -38,7 +38,7 @@ use super::{SCHEMA, collective_compilation_options, f32_values_from_bytes};
 #[serde(deny_unknown_fields)]
 pub(super) struct DistributedCollectiveCase {
     /// Stable observation identifier.
-    pub(super) id: String,
+    id: String,
 
     /// Collective primitive to execute.
     operation: String,
@@ -73,126 +73,68 @@ pub(super) struct DistributedCollectiveCase {
     receive_sizes: Vec<Vec<u64>>,
 }
 
-/// Reads the shared manifest and rejects invalid or locally degenerate distributed experiments.
-pub(super) fn registry() -> Result<Vec<DistributedCollectiveCase>, Box<dyn Error>> {
-    let cases: Vec<DistributedCollectiveCase> =
-        serde_json::from_str(include_str!("distributed_collective_cases.json"))?;
-    for (index, case) in cases.iter().enumerate() {
-        if cases[..index].iter().any(|previous| previous.id == case.id)
-            || case.participants != 2
-            || case.local_shape.is_empty()
-            || case.output_shape.is_empty()
-            || case.local_shape.contains(&0)
-            || case.output_shape.contains(&0)
-            || !matches!(case.operation.as_str(), "sum" | "all_gather" | "all_to_all" | "ragged_all_to_all")
-        {
-            return Err(format!("invalid distributed collective descriptor `{}`", case.id).into());
-        }
-        if case.operation == "ragged_all_to_all" {
-            if !matches!(case.metadata_type.as_deref(), Some("i32" | "u64"))
-                || case.local_shape[1..] != case.output_shape[1..]
-                || [&case.input_offsets, &case.send_sizes, &case.output_offsets, &case.receive_sizes]
-                    .iter()
-                    .any(|metadata| metadata.len() != 2 || metadata.iter().any(|values| values.len() != 2))
+impl DistributedCollectiveCase {
+    /// Reads the shared manifest and rejects invalid or locally degenerate distributed experiments.
+    pub(super) fn registry() -> Result<Vec<Self>, Box<dyn Error>> {
+        let cases: Vec<Self> = serde_json::from_str(include_str!("distributed_collective_cases.json"))?;
+        for (index, case) in cases.iter().enumerate() {
+            if cases[..index].iter().any(|previous| previous.id == case.id)
+                || case.participants != 2
+                || case.local_shape.is_empty()
+                || case.output_shape.is_empty()
+                || case.local_shape.contains(&0)
+                || case.output_shape.contains(&0)
+                || !matches!(case.operation.as_str(), "sum" | "all_gather" | "all_to_all" | "ragged_all_to_all")
             {
-                return Err(format!("invalid distributed ragged metadata in `{}`", case.id).into());
+                return Err(format!("invalid distributed collective descriptor `{}`", case.id).into());
             }
-            // Metadata retain the sender's destination indexing. Validate both ranks together so destination bounds,
-            // transposed receive sizes, and disjoint writes are established before launching accelerator work.
-            for sender in 0..2 {
+            if case.operation == "ragged_all_to_all" {
+                if !matches!(case.metadata_type.as_deref(), Some("i32" | "u64"))
+                    || case.local_shape[1..] != case.output_shape[1..]
+                    || [&case.input_offsets, &case.send_sizes, &case.output_offsets, &case.receive_sizes]
+                        .iter()
+                        .any(|metadata| metadata.len() != 2 || metadata.iter().any(|values| values.len() != 2))
+                {
+                    return Err(format!("invalid distributed ragged metadata in `{}`", case.id).into());
+                }
+                // Metadata retain the sender's destination indexing. Validate both ranks together so destination
+                // bounds, transposed receive sizes, and disjoint writes are established before launching accelerator
+                // work.
+                for sender in 0..2 {
+                    for receiver in 0..2 {
+                        let size = case.send_sizes[sender][receiver];
+                        if size != case.receive_sizes[receiver][sender]
+                            || case.input_offsets[sender][receiver]
+                                .checked_add(size)
+                                .is_none_or(|end| end > case.local_shape[0] as u64)
+                            || case.output_offsets[sender][receiver]
+                                .checked_add(size)
+                                .is_none_or(|end| end > case.output_shape[0] as u64)
+                        {
+                            return Err(format!("invalid distributed ragged transfer in `{}`", case.id).into());
+                        }
+                    }
+                }
                 for receiver in 0..2 {
-                    let size = case.send_sizes[sender][receiver];
-                    if size != case.receive_sizes[receiver][sender]
-                        || case.input_offsets[sender][receiver]
-                            .checked_add(size)
-                            .is_none_or(|end| end > case.local_shape[0] as u64)
-                        || case.output_offsets[sender][receiver]
-                            .checked_add(size)
-                            .is_none_or(|end| end > case.output_shape[0] as u64)
+                    let first = case.output_offsets[0][receiver];
+                    let second = case.output_offsets[1][receiver];
+                    if case.send_sizes[0][receiver] > 0
+                        && case.send_sizes[1][receiver] > 0
+                        && first < second + case.send_sizes[1][receiver]
+                        && second < first + case.send_sizes[0][receiver]
                     {
-                        return Err(format!("invalid distributed ragged transfer in `{}`", case.id).into());
+                        return Err(format!("overlapping distributed ragged receives in `{}`", case.id).into());
                     }
                 }
             }
-            for receiver in 0..2 {
-                let first = case.output_offsets[0][receiver];
-                let second = case.output_offsets[1][receiver];
-                if case.send_sizes[0][receiver] > 0
-                    && case.send_sizes[1][receiver] > 0
-                    && first < second + case.send_sizes[1][receiver]
-                    && second < first + case.send_sizes[0][receiver]
-                {
-                    return Err(format!("overlapping distributed ragged receives in `{}`", case.id).into());
-                }
-            }
         }
+        Ok(cases)
     }
-    Ok(cases)
-}
 
-impl DistributedCollectiveCase {
-    /// Lowers one global SPMD module identically on both ranks, preserving runtime ragged metadata inputs.
-    #[cfg(any(test, feature = "cuda-13"))]
-    fn stage(&self) -> Result<String, Box<dyn Error>> {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual)?])?;
-        let sharding = |shape: &[usize]| -> Result<Sharding, Box<dyn Error>> {
-            let mut dimensions = vec![ShardingDimension::replicated(); shape.len()];
-            dimensions[0] = ShardingDimension::sharded(["x"]);
-            Ok(Sharding::new(mesh.clone(), dimensions)?)
-        };
-        let mut shapes = vec![self.local_shape.clone()];
-        if self.operation == "ragged_all_to_all" {
-            shapes.push(self.output_shape.clone());
-            shapes.extend(vec![vec![2]; 4]);
-        }
-        let types = shapes
-            .iter()
-            .enumerate()
-            .map(|(index, shape)| {
-                let data_type = if index < 2 {
-                    DataType::F32
-                } else if self.metadata_type.as_deref() == Some("u64") {
-                    DataType::U64
-                } else {
-                    DataType::I32
-                };
-                let mut global_shape = shape.clone();
-                global_shape[0] *= 2;
-                ArrayType::new_static(data_type, global_shape)
-            })
-            .collect::<Vec<_>>();
-        let input_shardings = shapes.iter().map(|shape| sharding(shape)).collect::<Result<Vec<_>, _>>()?;
-        let output_sharding = sharding(&self.output_shape)?;
-        let traced: TracedProgram<Vec<ArrayType>, ArrayType> = trace(
-            |inputs: Vec<ArrayTracer>| {
-                shard_map(
-                    |inputs: Vec<ArrayTracer>| match self.operation.as_str() {
-                        "sum" => inputs[0].parallel_reduce(ReductionKind::Sum, "x"),
-                        "all_gather" => inputs[0].parallel_all_gather_with_options(
-                            "x",
-                            0,
-                            CollectiveOptions::tiled(),
-                            ParallelAllGatherOutputVariance::Varying,
-                        ),
-                        "all_to_all" => {
-                            inputs[0].parallel_all_to_all_with_options("x", 0, 1, CollectiveOptions::tiled())
-                        }
-                        "ragged_all_to_all" => inputs[0].parallel_ragged_all_to_all(
-                            "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
-                        ),
-                        _ => unreachable!(),
-                    },
-                    inputs,
-                    mesh.clone(),
-                    input_shardings.clone(),
-                    output_sharding.clone(),
-                    ShardMapOptions::new(),
-                )
-                .unwrap()
-            },
-            types,
-        )?;
-        Ok(traced.to_mlir_module("main")?)
+    /// Returns the stable observation identifier.
+    #[inline]
+    pub(super) fn id(&self) -> &str {
+        &self.id
     }
 
     /// Compiles with two global partitions, but supplies only this process's one addressable CUDA buffer family.
@@ -257,6 +199,7 @@ impl DistributedCollectiveCase {
                 Some(file!()),
                 None,
                 None,
+                &[],
             )?
             .block_until_ready()?;
         if outputs.len() != 1 || outputs[0].outputs.len() != 1 {
@@ -279,9 +222,73 @@ impl DistributedCollectiveCase {
             stablehlo: Some(stablehlo),
         })
     }
+
+    /// Lowers one global SPMD module identically on both ranks, preserving runtime ragged metadata inputs.
+    #[cfg(any(test, feature = "cuda-13"))]
+    fn stage(&self) -> Result<String, Box<dyn Error>> {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Manual)?])?;
+        let sharding = |shape: &[usize]| -> Result<Sharding, Box<dyn Error>> {
+            let mut dimensions = vec![ShardingDimension::replicated(); shape.len()];
+            dimensions[0] = ShardingDimension::sharded(["x"]);
+            Ok(Sharding::new(mesh.clone(), dimensions)?)
+        };
+        let mut shapes = vec![self.local_shape.clone()];
+        if self.operation == "ragged_all_to_all" {
+            shapes.push(self.output_shape.clone());
+            shapes.extend(vec![vec![2]; 4]);
+        }
+        let types = shapes
+            .iter()
+            .enumerate()
+            .map(|(index, shape)| {
+                let data_type = if index < 2 {
+                    DataType::F32
+                } else if self.metadata_type.as_deref() == Some("u64") {
+                    DataType::U64
+                } else {
+                    DataType::I32
+                };
+                let mut global_shape = shape.clone();
+                global_shape[0] *= 2;
+                ArrayType::new_static(data_type, global_shape)
+            })
+            .collect::<Vec<_>>();
+        let input_shardings = shapes.iter().map(|shape| sharding(shape)).collect::<Result<Vec<_>, _>>()?;
+        let output_sharding = sharding(&self.output_shape)?;
+        let traced: TracedProgram<Vec<ArrayType>, ArrayType> = trace(
+            |inputs: Vec<ArrayTracer>| {
+                shard_map(
+                    |inputs: Vec<ArrayTracer>| match self.operation.as_str() {
+                        "sum" => inputs[0].parallel_reduce(ReductionKind::Sum, "x"),
+                        "all_gather" => inputs[0].parallel_all_gather_with_options(
+                            "x",
+                            0,
+                            CollectiveOptions::tiled(),
+                            ParallelAllGatherOutputVariance::Varying,
+                        ),
+                        "all_to_all" => {
+                            inputs[0].parallel_all_to_all_with_options("x", 0, 1, CollectiveOptions::tiled())
+                        }
+                        "ragged_all_to_all" => inputs[0].parallel_ragged_all_to_all(
+                            "x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5],
+                        ),
+                        _ => unreachable!(),
+                    },
+                    inputs,
+                    mesh.clone(),
+                    input_shardings.clone(),
+                    output_sharding.clone(),
+                    ShardMapOptions::new(),
+                )
+                .unwrap()
+            },
+            types,
+        )?;
+        Ok(traced.to_mlir_module("main")?)
+    }
 }
 
-/// Runs all selected experiments in one bounded distributed-runtime lifetime and returns only this rank's records.
+/// Runs all selected experiments in one bounded distributed runtime lifetime and returns only this rank's records.
 pub(super) fn run_worker(
     rank: usize,
     coordinator: &str,
@@ -293,7 +300,7 @@ pub(super) fn run_worker(
     if coordinator.is_empty() {
         return Err("distributed workers require a coordinator address".into());
     }
-    let cases = registry()?;
+    let cases = DistributedCollectiveCase::registry()?;
     let selected = if case_ids.is_empty() {
         cases.iter().collect::<Vec<_>>()
     } else {
@@ -340,7 +347,7 @@ pub(super) fn run_worker(
                 ..Default::default()
             },
         )?;
-        // The PJRT client borrows the runtime's key-value store. Drop all executable/device buffers and the client
+        // The PJRT client borrows the runtime's key-value store. Drop all executables, device buffers, and the client
         // before collectively shutting down the coordination client, keeping rank zero's service alive throughout.
         let records = {
             let client = runtime.create_client(
@@ -390,13 +397,14 @@ pub(super) fn run_worker(
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use super::*;
 
     #[test]
-    fn test_registry() {
-        let cases = registry().unwrap();
+    fn test_distributed_collective_case_registry() {
+        let cases = DistributedCollectiveCase::registry().unwrap();
         assert!(cases.iter().all(|case| case.participants == 2));
         for operation in ["sum", "all_gather", "all_to_all", "ragged_all_to_all"] {
             assert!(cases.iter().any(|case| case.operation == operation));
@@ -405,7 +413,32 @@ mod tests {
 
     #[test]
     fn test_distributed_collective_case_stage() {
-        for case in registry().unwrap() {
+        let cases = DistributedCollectiveCase::registry().unwrap();
+        let case = cases.iter().find(|case| case.id == "cuda_distributed_sum").unwrap();
+        assert_eq!(
+            case.stage().unwrap(),
+            indoc! {"
+            module {
+              sdy.mesh @mesh = <[\"x\"=2]>
+              func.func @main(%arg0: tensor<8xf32>) -> (tensor<8xf32> {sdy.sharding = #sdy.sharding<@mesh, \
+                  [{\"x\"}]>}) {
+                %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [{\"x\"}]>] out_shardings=[<@mesh, \
+                    [{\"x\"}]>] manual_axes={\"x\"} (%arg1: tensor<4xf32>) {
+                  %1 = \"stablehlo.all_reduce\"(%arg1) <{channel_handle = #stablehlo.channel_handle<handle = 1, type \
+                      = 1>, replica_groups = dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
+                  ^bb0(%arg2: tensor<f32>, %arg3: tensor<f32>):
+                    %2 = stablehlo.add %arg2, %arg3 : tensor<f32>
+                    stablehlo.return %2 : tensor<f32>
+                  }) : (tensor<4xf32>) -> tensor<4xf32>
+                  sdy.return %1 : tensor<4xf32>
+                } : (tensor<8xf32>) -> tensor<8xf32>
+                return %0 : tensor<8xf32>
+              }
+            }
+            "},
+        );
+        // Every other case stages the collective that its manifest operation selects over the same two-device mesh.
+        for case in cases {
             let module = case.stage().unwrap();
             assert!(module.contains("sdy.mesh @mesh = <[\"x\"=2]>"), "{}", case.id);
             assert!(

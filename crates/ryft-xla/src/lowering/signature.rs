@@ -4,13 +4,15 @@ use ryft_core::{ArrayType, DataType, Dimension as CoreDimension, Shape, Sharding
 
 // TODO(eaplatanios): Review this module.
 
-/// Logical-to-physical argument and result mapping of one XLA executable boundary.
+/// Mapping from the logical arguments and results of one XLA executable boundary to its physical arguments and
+/// results.
 ///
 /// Ryft retains every logical leaf in its staged and compiled function metadata. Statically shaped
-/// [`DataType::Zero`] leaves carry no runtime payload and are omitted from the StableHLO/PJRT signature; each mapping
-/// stores the corresponding physical ordinal for materialized leaves and `None` for erased leaves. Dynamically shaped
-/// zero-space leaves deliberately retain private `i1` carriers because the current executable ABI has no independent
-/// shape transport. Current XLA compilation may impose stricter limits on dynamic tensors than this projection layer.
+/// [`DataType::Zero`] leaves carry no runtime payload and are omitted from the StableHLO/PJRT signature, and each
+/// mapping stores the corresponding physical ordinal for materialized leaves and `None` for erased leaves. Dynamically
+/// shaped [`DataType::Zero`] leaves deliberately retain private `i1` carriers because the current executable ABI has no
+/// independent shape transport. Current XLA compilation may impose stricter limits on dynamic tensors than this
+/// projection layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExecutableSignature {
     /// Physical argument ordinal for each logical flattened input.
@@ -25,19 +27,20 @@ pub(crate) struct ExecutableSignature {
     /// Hidden scalar results that report bounded dynamic logical output extents.
     output_dimensions: Arc<[OutputDimension]>,
 
-    /// Whether the executable carries the ordered-I/O boundary token, i.e., whether the program contains
-    /// `OrderedIo` or `DeviceOrderedIo` effects.
-    pub(crate) ordered_io: bool,
+    /// Whether the executable carries the ordered I/O boundary token (i.e., whether the program contains
+    /// [`OrderedIo`](ryft_core::EffectClass::OrderedIo) or [`DeviceOrderedIo`](ryft_core::EffectClass::DeviceOrderedIo)
+    /// effects).
+    ordered_io: bool,
 
-    /// Whether every ordered-I/O occurrence is `DeviceOrderedIo`, so the boundary token only needs per-device
-    /// ordering and the executable may run on several devices.
+    /// Whether every ordered I/O occurrence is `DeviceOrderedIo`, so the boundary token only needs per-device ordering
+    /// and the executable may run on several devices.
     device_ordered_io: bool,
 
     /// Whether the executable contains unordered I/O.
     unordered_io: bool,
 
     /// Whether lowering emitted a runtime assertion, including synthesized checks.
-    pub(crate) requires_assertion_handler: bool,
+    requires_assertion_handler: bool,
 }
 
 /// One bounded dynamic input axis transported as a hidden scalar executable argument.
@@ -158,7 +161,7 @@ impl ExecutableSignature {
         }
     }
 
-    /// Attaches the compile-time effect metadata, also used when restoring persistent executable metadata.
+    /// Attaches the effect metadata known at compilation time, also used when restoring persistent executable metadata.
     /// `device_ordered_io` is only meaningful together with `ordered_io` and is cleared otherwise.
     pub(crate) fn with_effects(
         mut self,
@@ -174,12 +177,12 @@ impl ExecutableSignature {
         self
     }
 
-    /// Returns whether this executable carries an ordered-I/O boundary token.
+    /// Returns whether this executable carries an ordered I/O boundary token.
     pub(crate) fn has_ordered_io(&self) -> bool {
         self.ordered_io
     }
 
-    /// Returns whether every ordered-I/O occurrence is `DeviceOrderedIo`, permitting multi-device execution with
+    /// Returns whether every ordered I/O occurrence is `DeviceOrderedIo`, permitting execution on several devices with
     /// per-device ordering.
     pub(crate) fn has_device_ordered_io(&self) -> bool {
         self.device_ordered_io
@@ -190,40 +193,47 @@ impl ExecutableSignature {
         self.unordered_io
     }
 
-    /// Returns whether execution participates in the effect barrier.
+    /// Returns whether lowering emitted a runtime assertion, including synthesized checks.
+    #[inline]
+    pub(crate) fn requires_assertion_handler(&self) -> bool {
+        self.requires_assertion_handler
+    }
+
+    /// Returns whether execution participates in the effect barrier, which is the case for executables with ordered or
+    /// unordered I/O and for executables that require the runtime assertion handler.
     pub(crate) fn has_effects(&self) -> bool {
         self.ordered_io || self.unordered_io || self.requires_assertion_handler
     }
 
-    /// Returns the hidden ordered-I/O token argument ordinal, after every array and extent argument.
+    /// Returns the ordinal of the hidden ordered I/O token argument, which follows every array and extent argument.
     pub(crate) fn ordered_io_input_index(&self) -> Option<usize> {
         self.ordered_io.then(|| self.input_mapping.iter().flatten().count() + self.input_dimensions.len())
     }
 
-    /// Returns the hidden ordered-I/O token result ordinal, after every array and extent result.
+    /// Returns the ordinal of the hidden ordered I/O token result, which follows every array and extent result.
     pub(crate) fn ordered_io_output_index(&self) -> Option<usize> {
         self.ordered_io.then(|| self.output_mapping.iter().flatten().count() + self.output_dimensions.len())
     }
 
-    /// Returns the per-logical-input physical argument mapping.
+    /// Returns the physical argument ordinal of each logical input, or `None` for an erased input.
     #[inline]
     pub(crate) fn input_mapping(&self) -> &[Option<usize>] {
         &self.input_mapping
     }
 
-    /// Returns the per-logical-output physical result mapping.
+    /// Returns the physical result ordinal of each logical output, or `None` for an erased output.
     #[inline]
     pub(crate) fn output_mapping(&self) -> &[Option<usize>] {
         &self.output_mapping
     }
 
-    /// Returns hidden bounded-dimension scalar arguments in physical executable order.
+    /// Returns the hidden scalar arguments of bounded dynamic input dimensions in physical executable order.
     #[inline]
     pub(crate) fn input_dimensions(&self) -> &[InputDimension] {
         &self.input_dimensions
     }
 
-    /// Returns hidden bounded dynamic-output extent results in physical executable order.
+    /// Returns the hidden extent results of bounded dynamic output dimensions in physical executable order.
     #[inline]
     pub(crate) fn output_dimensions(&self) -> &[OutputDimension] {
         &self.output_dimensions
@@ -239,13 +249,13 @@ impl ExecutableSignature {
         self.output_mapping.iter().flatten().count() + self.output_dimensions.len()
     }
 
-    /// Returns the total number of physical executable arguments.
+    /// Returns the total number of physical executable arguments, including the hidden ordered I/O token.
     #[inline]
     pub(crate) fn physical_input_count(&self) -> usize {
         self.input_mapping.iter().flatten().count() + self.input_dimensions.len() + usize::from(self.ordered_io)
     }
 
-    /// Returns the total number of physical executable results, including the hidden ordered-I/O token.
+    /// Returns the total number of physical executable results, including the hidden ordered I/O token.
     pub(crate) fn physical_output_count(&self) -> usize {
         self.array_output_count() + usize::from(self.ordered_io)
     }
@@ -277,9 +287,9 @@ impl ExecutableSignature {
                 .dimensions()
                 .iter()
                 .map(|dimension| {
-                    // Dimension bounds validate an exclusive upper above a non-negative lower, so a bounded dynamic
-                    // axis always yields a static bound here; only an unbounded axis stays dynamic, and bounded-input
-                    // materialization rejects it as having no static upper shape.
+                    // Dimension bounds validate an exclusive upper bound above a non-negative lower bound, so a bounded
+                    // dynamic axis always yields a static bound here. Only an unbounded axis stays dynamic, and the
+                    // materialization of bounded inputs rejects it as having no static upper shape.
                     dimension
                         .upper_bound()
                         .and_then(|upper| upper.checked_sub(1))
@@ -292,7 +302,7 @@ impl ExecutableSignature {
         physical
     }
 
-    /// Projects logical outputs and appends hidden output-extent scalar types, excluding native effect tokens.
+    /// Projects logical outputs and appends the scalar types of hidden output extents, excluding native effect tokens.
     pub(crate) fn physical_output_types(&self, outputs: &[ArrayType]) -> Vec<ArrayType> {
         let mut physical = Self::project(&self.output_mapping, outputs);
         physical.extend(self.output_dimensions.iter().map(|_| ArrayType::scalar(DataType::I64)));
@@ -335,6 +345,12 @@ impl ExecutableSignature {
         physical
     }
 
+    /// Records that lowering emitted a runtime assertion, so that executions need the runtime assertion handler.
+    #[inline]
+    pub(crate) fn require_assertion_handler(&mut self) {
+        self.requires_assertion_handler = true;
+    }
+
     /// Projects one logical sequence according to `mapping`.
     fn project<T: Clone>(mapping: &[Option<usize>], values: &[T]) -> Vec<T> {
         assert_eq!(mapping.len(), values.len());
@@ -353,18 +369,14 @@ fn extent_sharding(owner_sharding: &Sharding) -> Sharding {
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
     use pretty_assertions::assert_eq;
-    use ryft_core::Placeholder;
 
-    use crate::lowering::tests::dynamic_dimension;
-    use crate::lowering::to_mlir_module_for_program;
-    use crate::operations::{FlatProgram, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::lowering::tests::{dynamic_dimension, test_manual_mesh};
 
     use super::*;
 
     #[test]
-    fn test_executable_signature_erases_only_static_zero_space_leaves() {
+    fn test_executable_signature_new() {
         let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
         let dynamic_zero = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("dynamic_zero", Some(3))]));
         let boolean = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(3)]));
@@ -389,108 +401,123 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_erases_static_zero_space_boundary() {
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(zero_type.clone().into());
-        let program: FlatProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+    fn test_executable_signature_with_effects() {
+        let scalar = ArrayType::scalar(DataType::F32);
+        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("count", Some(3))]));
+        let signature = ExecutableSignature::new(&[scalar.clone(), dynamic.clone()], &[dynamic, scalar]);
 
-        let stablehlo = to_mlir_module_for_program(&program, &[], &zero_type, &zero_type, "main", None, None).unwrap();
+        // Without effects, the boundary has no token and does not participate in the effect barrier.
+        assert!(!signature.has_ordered_io());
+        assert!(!signature.has_device_ordered_io());
+        assert!(!signature.has_unordered_io());
+        assert!(!signature.requires_assertion_handler());
+        assert!(!signature.has_effects());
+        assert_eq!(signature.ordered_io_input_index(), None);
+        assert_eq!(signature.ordered_io_output_index(), None);
+        assert_eq!(signature.array_input_count(), 3);
+        assert_eq!(signature.array_output_count(), 3);
+        assert_eq!(signature.physical_input_count(), 3);
+        assert_eq!(signature.physical_output_count(), 3);
 
+        // Ordered I/O appends one token after every array and hidden extent argument and result.
+        let ordered = signature.clone().with_effects(true, false, false, true);
+        assert!(ordered.has_ordered_io());
+        assert!(ordered.has_device_ordered_io());
+        assert!(!ordered.has_unordered_io());
+        assert!(ordered.has_effects());
+        assert_eq!(ordered.ordered_io_input_index(), Some(3));
+        assert_eq!(ordered.ordered_io_output_index(), Some(3));
+        assert_eq!(ordered.array_input_count(), 3);
+        assert_eq!(ordered.array_output_count(), 3);
+        assert_eq!(ordered.physical_input_count(), 4);
+        assert_eq!(ordered.physical_output_count(), 4);
+
+        // Device ordering only applies together with ordered I/O, while unordered I/O and runtime assertions still
+        // participate in the effect barrier.
+        let unordered = signature.clone().with_effects(false, true, false, true);
+        assert!(!unordered.has_device_ordered_io());
+        assert!(unordered.has_unordered_io());
+        assert!(unordered.has_effects());
+        assert_eq!(unordered.physical_input_count(), 3);
+        let asserting = signature.with_effects(false, false, true, false);
+        assert!(asserting.requires_assertion_handler());
+        assert!(asserting.has_effects());
+    }
+
+    #[test]
+    fn test_executable_signature_physical_input_types() {
+        // Every bounded dynamic axis of a materialized input becomes its physical bound, and each one appends a hidden
+        // `i32` extent argument, while static zero-sized inputs are erased.
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let dynamic = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![dynamic_dimension("rows", Some(3)), dynamic_dimension("columns", Some(5))]),
+        );
+        let signature = ExecutableSignature::new(&[static_zero.clone(), dynamic.clone()], &[]);
         assert_eq!(
-            stablehlo,
-            indoc! {r#"
-                module {
-                  func.func @main() {
-                    %c = stablehlo.constant dense<false> : tensor<i1>
-                    %0 = stablehlo.broadcast_in_dim %c, dims = [] : (tensor<i1>) -> tensor<3xi1>
-                    return
-                  }
-                }
-            "#},
+            signature.physical_input_types(&[static_zero, dynamic]),
+            vec![
+                ArrayType::new_static(DataType::F32, [2, 4]),
+                ArrayType::scalar(DataType::I32),
+                ArrayType::scalar(DataType::I32),
+            ],
         );
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_preserves_effects_that_produce_an_erased_output() {
-        use ryft_core::PrintOperation;
-
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(zero_type.clone().into());
-        let output = builder
-            .add_instruction(PrintOperation::<ArrayType>::new("zero"), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let program: FlatProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-
-        let stablehlo = to_mlir_module_for_program(&program, &[], &zero_type, &zero_type, "main", None, None).unwrap();
-
-        assert!(stablehlo.contains("stablehlo.custom_call @ryft.print"), "{stablehlo}");
-        assert!(stablehlo.contains("has_side_effect = true"), "{stablehlo}");
-        assert!(stablehlo.contains("return\n"), "{stablehlo}");
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_program_preserves_dynamic_zero_space_shape_carrier() {
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("zero", Some(3))]));
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(zero_type.clone().into());
-        let program: FlatProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-
-        let stablehlo = to_mlir_module_for_program(&program, &[], &zero_type, &zero_type, "main", None, None).unwrap();
-
+    fn test_executable_signature_physical_output_types() {
+        // Dynamic outputs keep their logical types and each bounded dynamic axis appends a hidden `i64` extent result.
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
+        let signature = ExecutableSignature::new(&[], &[dynamic.clone(), static_zero.clone()]);
         assert_eq!(
-            stablehlo,
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2xi1>, %arg1: tensor<i32>) -> (tensor<?xi1, #stablehlo.bounds<2>>, tensor<i64>) {
-                    %0 = stablehlo.set_dimension_size %arg0, %arg1, dim = 0 : (tensor<2xi1>, tensor<i32>) -> tensor<?xi1, #stablehlo.bounds<2>>
-                    %1 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xi1, #stablehlo.bounds<2>>) -> tensor<i32>
-                    %2 = stablehlo.convert %1 : (tensor<i32>) -> tensor<i64>
-                    return %0, %2 : tensor<?xi1, #stablehlo.bounds<2>>, tensor<i64>
-                  }
-                }
-            "#},
+            signature.physical_output_types(&[dynamic.clone(), static_zero]),
+            vec![dynamic, ArrayType::scalar(DataType::I64)],
         );
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_isolates_bounded_dynamic_results_behind_one_barrier() {
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("count", Some(4))]));
-        let static_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]));
-        let mut builder = ArrayIrProgramBuilder::new();
-        let dynamic = builder.add_input(dynamic_type.clone().into());
-        let r#static = builder.add_input(static_type.clone().into());
-        let program: FlatProgram =
-            builder.build(vec![dynamic, r#static, dynamic], vec![Placeholder; 2], vec![Placeholder; 3]).unwrap();
-
-        let stablehlo = to_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![dynamic_type.clone(), static_type.clone()],
-            &vec![dynamic_type.clone(), static_type, dynamic_type],
-            "main",
-            None,
-            None,
-        )
-        .unwrap();
-
-        // Both dynamic results pass through the barrier, while the static result and the hidden extents bypass it.
+    fn test_executable_signature_physical_input_shardings() {
+        // Each hidden extent argument is a replicated scalar on the mesh of the input that owns the extent, and it
+        // stays unannotated when that input is unannotated.
+        let mesh = test_manual_mesh("x", 2);
+        let static_zero = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]));
+        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
+        let signature = ExecutableSignature::new(&[static_zero, dynamic.clone(), dynamic], &[]);
+        let vector_sharding = Sharding::replicated(mesh.clone(), 1);
+        let scalar_sharding = Sharding::replicated(mesh, 0);
         assert_eq!(
-            stablehlo,
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<3xf32>, %arg1: tensor<2xf32>, %arg2: tensor<i32>) -> (tensor<?xf32, #stablehlo.bounds<3>>, tensor<2xf32>, tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>, tensor<i64>) {
-                    %0 = stablehlo.set_dimension_size %arg0, %arg2, dim = 0 : (tensor<3xf32>, tensor<i32>) -> tensor<?xf32, #stablehlo.bounds<3>>
-                    %1:2 = stablehlo.optimization_barrier %0, %0 : tensor<?xf32, #stablehlo.bounds<3>>, tensor<?xf32, #stablehlo.bounds<3>>
-                    %2 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<3>>) -> tensor<i32>
-                    %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
-                    %4 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xf32, #stablehlo.bounds<3>>) -> tensor<i32>
-                    %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
-                    return %1#0, %arg1, %1#1, %3, %5 : tensor<?xf32, #stablehlo.bounds<3>>, tensor<2xf32>, tensor<?xf32, #stablehlo.bounds<3>>, tensor<i64>, tensor<i64>
-                  }
-                }
-            "#},
+            signature.physical_input_shardings(&[
+                vector_sharding.clone(),
+                vector_sharding.clone(),
+                vector_sharding.clone(),
+            ]),
+            vec![vector_sharding.clone(), vector_sharding.clone(), scalar_sharding.clone(), scalar_sharding.clone()],
         );
+        assert_eq!(
+            signature.physical_optional_input_shardings(&[None, Some(vector_sharding.clone()), None]),
+            vec![Some(vector_sharding), None, Some(scalar_sharding), None],
+        );
+    }
+
+    #[test]
+    fn test_executable_signature_physical_optional_output_shardings() {
+        let mesh = test_manual_mesh("x", 2);
+        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![dynamic_dimension("rows", Some(3))]));
+        let signature = ExecutableSignature::new(&[], &[dynamic.clone(), dynamic]);
+        let vector_sharding = Sharding::replicated(mesh.clone(), 1);
+        assert_eq!(
+            signature.physical_optional_output_shardings(&[Some(vector_sharding.clone()), None]),
+            vec![Some(vector_sharding), None, Some(Sharding::replicated(mesh, 0)), None],
+        );
+    }
+
+    #[test]
+    fn test_executable_signature_require_assertion_handler() {
+        let mut signature = ExecutableSignature::new(&[], &[]);
+        assert!(!signature.requires_assertion_handler());
+        signature.require_assertion_handler();
+        assert!(signature.requires_assertion_handler());
+        assert!(signature.has_effects());
     }
 }

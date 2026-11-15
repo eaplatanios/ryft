@@ -65,11 +65,11 @@ impl KernelTarget for Target {
         let capability = match self {
             Target::Cuda { major, minor } => {
                 if !matches!((*major, *minor), (8, 0) | (12, 1))
-                    || !facts.platform_name.eq_ignore_ascii_case("cuda")
-                    || facts.platform_version != "cuda 13020"
-                    || facts.pjrt_version != ryft_pjrt::VERSION
-                    || !facts.has_ffi_extension
-                    || facts.devices.is_empty()
+                    || !facts.platform_name().eq_ignore_ascii_case("cuda")
+                    || facts.platform_version() != "cuda 13020"
+                    || facts.pjrt_version() != ryft_pjrt::VERSION
+                    || !facts.has_ffi_extension()
+                    || facts.devices().is_empty()
                 {
                     return Err(KernelEmbeddingError::Invalid {
                         message: "triton requires a qualified CUDA target and the pinned CUDA 13.2 PJRT FFI platform"
@@ -79,16 +79,18 @@ impl KernelTarget for Target {
                 format!("{major}.{minor}")
             }
             Target::Rocm { architecture } => {
-                // The pinned StreamExecutor client exposes runtime major/minor/patch as this decimal encoding;
-                // MakeComputeCapabilityAttributeString returns gfx_version(), excluding xnack/sramecc suffixes.
+                // The pinned StreamExecutor client exposes the runtime major, minor, and patch versions as this decimal
+                // encoding. `MakeComputeCapabilityAttributeString` returns `gfx_version()`, excluding `xnack` and
+                // `sramecc` suffixes.
                 // The concrete HIP launcher checks those ELF feature requirements against actual device properties.
-                let version = facts.platform_version.strip_prefix("rocm ").and_then(|value| value.parse::<u32>().ok());
+                let version =
+                    facts.platform_version().strip_prefix("rocm ").and_then(|value| value.parse::<u32>().ok());
                 if !matches!(architecture.as_str(), "gfx908" | "gfx90a" | "gfx942")
-                    || !facts.platform_name.eq_ignore_ascii_case("rocm")
+                    || !facts.platform_name().eq_ignore_ascii_case("rocm")
                     || version.is_none_or(|version| !(71_300_000..71_400_000).contains(&version))
-                    || facts.pjrt_version != ryft_pjrt::VERSION
-                    || !facts.has_ffi_extension
-                    || facts.devices.is_empty()
+                    || facts.pjrt_version() != ryft_pjrt::VERSION
+                    || !facts.has_ffi_extension()
+                    || facts.devices().is_empty()
                 {
                     return Err(KernelEmbeddingError::Invalid {
                         message: "triton requires a supported AMD target and the HIP 7.13 PJRT FFI platform".into(),
@@ -97,8 +99,8 @@ impl KernelTarget for Target {
                 architecture.clone()
             }
         };
-        if facts.devices.iter().any(|device| {
-            device.attributes.get("compute_capability") != Some(&ryft_pjrt::Value::String(capability.clone()))
+        if facts.devices().iter().any(|device| {
+            device.attributes().get("compute_capability") != Some(&ryft_pjrt::Value::String(capability.clone()))
         }) {
             return Err(KernelEmbeddingError::Invalid {
                 message: format!("triton requires exact device compute capability `{capability}`"),
@@ -113,6 +115,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use pretty_assertions::assert_eq;
+    use ryft_core::{ArrayType, CustomCallAttribute, DataType};
+    use ryft_kernels::{KernelCompiler, KernelSchedule};
+    use ryft_triton::kernels::{Compiler, Options};
 
     use crate::kernels::staging::KernelDeviceFacts;
 
@@ -139,10 +144,6 @@ mod tests {
 
     #[test]
     fn test_triton_embedding_custom_call() {
-        use ryft_core::{ArrayType, CustomCallAttribute, DataType};
-        use ryft_kernels::{KernelCompiler, KernelSchedule};
-        use ryft_triton::kernels::{Compiler, Options};
-
         if std::env::var("RYFT_RUN_TRITON_COMPILER_TESTS").ok().as_deref() != Some("1") {
             return;
         }
@@ -161,10 +162,16 @@ mod tests {
                 compiler.compile(&verified, &target, &Options::default(), &KernelSchedule::default()).unwrap();
             let operation = TritonEmbedding.custom_call(&verified, &compiled).unwrap();
             assert_eq!(operation.target_name(), expected_target);
-            assert!(operation.attributes().contains(&(
-                "ryft.triton.schema".into(),
-                CustomCallAttribute::I64(i64::from(COMPILER_SCHEMA_VERSION)),
-            )));
+            assert_eq!(
+                &operation.attributes()[operation.attributes().len() - 2..],
+                &[
+                    ("ryft.triton.schema".to_owned(), CustomCallAttribute::I64(i64::from(COMPILER_SCHEMA_VERSION))),
+                    (
+                        "ryft.triton.configuration".to_owned(),
+                        CustomCallAttribute::String(hex::encode(Sha256::digest(compiled.configuration_key()))),
+                    ),
+                ],
+            );
             match target {
                 Target::Cuda { .. } => {
                     CudaKernelEmbedding::from_custom_call(&verified, &operation).unwrap();
@@ -181,49 +188,50 @@ mod tests {
 
     #[test]
     fn test_target_admit_execution() {
-        let mut facts = KernelExecutionFacts {
-            platform_name: "CUDA".into(),
-            platform_version: "cuda 13020".into(),
-            pjrt_version: ryft_pjrt::VERSION,
-            has_ffi_extension: true,
-            attributes: BTreeMap::new(),
-            devices: vec![KernelDeviceFacts {
-                kind: "GB10".into(),
-                attributes: BTreeMap::from([("compute_capability".into(), ryft_pjrt::Value::String("12.1".into()))]),
-            }],
+        let facts = |has_ffi_extension: bool| {
+            KernelExecutionFacts::new(
+                "CUDA",
+                "cuda 13020",
+                ryft_pjrt::VERSION,
+                has_ffi_extension,
+                BTreeMap::new(),
+                vec![KernelDeviceFacts::new(
+                    "GB10",
+                    BTreeMap::from([("compute_capability".into(), ryft_pjrt::Value::String("12.1".into()))]),
+                )],
+            )
         };
         let target = Target::Cuda { major: 12, minor: 1 };
-        assert!(target.admit_execution(&facts).is_ok());
-        let result = Target::Cuda { major: 8, minor: 0 }.admit_execution(&facts);
+        target.admit_execution(&facts(true)).unwrap();
+        let result = Target::Cuda { major: 8, minor: 0 }.admit_execution(&facts(true));
         assert!(matches!(result, Err(KernelEmbeddingError::Invalid { message })
             if message == "triton requires exact device compute capability `8.0`"));
-        facts.has_ffi_extension = false;
-        assert!(matches!(target.admit_execution(&facts), Err(KernelEmbeddingError::Invalid { message })
+        assert!(matches!(target.admit_execution(&facts(false)), Err(KernelEmbeddingError::Invalid { message })
             if message == "triton requires a qualified CUDA target and the pinned CUDA 13.2 PJRT FFI platform"));
     }
 
     #[test]
     fn test_target_admit_execution_rocm() {
-        let mut facts = KernelExecutionFacts {
-            platform_name: "ROCM".into(),
-            platform_version: "rocm 71300000".into(),
-            pjrt_version: ryft_pjrt::VERSION,
-            has_ffi_extension: true,
-            attributes: BTreeMap::new(),
-            devices: vec![KernelDeviceFacts {
-                kind: "AMD Instinct MI300X".into(),
-                attributes: BTreeMap::from([("compute_capability".into(), ryft_pjrt::Value::String("gfx942".into()))]),
-            }],
+        let facts = |platform_version: &str, architecture: &str| {
+            KernelExecutionFacts::new(
+                "ROCM",
+                platform_version,
+                ryft_pjrt::VERSION,
+                true,
+                BTreeMap::new(),
+                vec![KernelDeviceFacts::new(
+                    "AMD Instinct MI300X",
+                    BTreeMap::from([("compute_capability".into(), ryft_pjrt::Value::String(architecture.into()))]),
+                )],
+            )
         };
         let target = Target::Rocm { architecture: "gfx942".into() };
-        assert!(target.admit_execution(&facts).is_ok());
-        facts.devices[0]
-            .attributes
-            .insert("compute_capability".into(), ryft_pjrt::Value::String("gfx90a".into()));
-        assert!(matches!(target.admit_execution(&facts), Err(KernelEmbeddingError::Invalid { message })
+        target.admit_execution(&facts("rocm 71300000", "gfx942")).unwrap();
+        let result = target.admit_execution(&facts("rocm 71300000", "gfx90a"));
+        assert!(matches!(result, Err(KernelEmbeddingError::Invalid { message })
             if message == "triton requires exact device compute capability `gfx942`"));
-        facts.platform_version = "rocm 71400000".into();
-        assert!(matches!(target.admit_execution(&facts), Err(KernelEmbeddingError::Invalid { message })
+        let result = target.admit_execution(&facts("rocm 71400000", "gfx90a"));
+        assert!(matches!(result, Err(KernelEmbeddingError::Invalid { message })
             if message == "triton requires a supported AMD target and the HIP 7.13 PJRT FFI platform"));
     }
 }

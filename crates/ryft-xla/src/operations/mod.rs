@@ -1,3 +1,13 @@
+//! XLA backend operation family and the StableHLO lowering of its operations.
+//!
+//! [`Operation`] is the universe of staged operations that the XLA backend owns. It flattens the core array operation
+//! payloads of [`ArrayIrOperation`] into one family, together with backend operations such as
+//! [`jit_call`](JitCallOperation) and portable kernel instructions, so that the regions of higher-order instructions
+//! can contain backend operations. [`Program`], [`ProgramBuilder`], and [`FlatProgram`] specialize the core program
+//! types to this family. Each submodule implements [`LowerableOperation`](crate::LowerableOperation) for one group of
+//! operations, and this module also provides the elementwise operand normalization and the result accuracy conversion
+//! that those lowerings share.
+
 use ryft_core::macros::check_count;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, ArgMaxOperation, ArgMinOperation, Array as CoreArray, ArrayIrOperation,
@@ -46,48 +56,49 @@ use crate::{Constant, Error, LoweringError};
 
 /// StableHLO lowering of arithmetic operations.
 pub(crate) mod arithmetic;
-/// Runtime assertions: their StableHLO lowering to the `ryft.assert` XLA FFI custom call and the host-side handler that
-/// reports failed assertions.
+/// Runtime assertions, including their StableHLO lowering to the `ryft.assert` XLA FFI custom call and the handler
+/// that reports failed assertions on the host.
 pub(crate) mod assertions;
-/// StableHLO lowering of dot-product attention operations.
+/// StableHLO lowering of dot product attention operations.
 pub(crate) mod attention;
 /// StableHLO lowering of collective operations.
 pub(crate) mod collectives;
 /// StableHLO lowering of comparison operations.
 pub(crate) mod comparisons;
-/// StableHLO lowering of complex-number operations.
+/// StableHLO lowering of complex number operations.
 pub(crate) mod complex;
-/// StableHLO lowering of Ryft composites: composite calls inline only their primal program, and composite transposes
-/// are rejected because transposition must replace them before lowering.
+/// StableHLO lowering of Ryft composites. A named composite call lowers to the backend implementation that replaces it
+/// or to a call of the shared function that implements its body, any other composite call inlines only its primal
+/// program, and composite transposes are rejected because transposition must replace them before lowering.
 pub(crate) mod composites;
 /// StableHLO lowering of constant and constructor operations (e.g., `zero`, `one`, `iota`, and literal constants).
 ///
 /// Eager evaluation and staging allow unbounded dimensions, but executable zero, one, iota, and like constructors need
-/// finite allocation bounds. Their dynamic extents must fit signed 32-bit size carriers: a bound reserves storage,
+/// finite allocation bounds. Their dynamic extents must fit signed 32-bit size carriers. A bound reserves storage,
 /// while the explicit dimension inputs or exemplar sizes determine the runtime shape. Explicit constructor layouts
-/// support dense minor-to-major axis permutations; byte-strided layouts and physical tiles are rejected.
+/// support dense minor-to-major axis permutations, and byte-strided layouts and physical tiles are rejected.
 pub(crate) mod constants;
 /// StableHLO lowering of control flow operations.
 pub(crate) mod control_flow;
-/// StableHLO lowering of cumulative (prefix-scan) operations.
+/// StableHLO lowering of cumulative operations (i.e., prefix scans).
 pub(crate) mod cumulative;
 /// StableHLO lowering of custom calls.
 pub(crate) mod custom_call;
-/// Host-callback debugging support: the StableHLO lowering of `print` to the `ryft.print` XLA FFI custom call, its
-/// handler, and its capturable print sink.
+/// Debugging support through host callbacks, including the StableHLO lowering of `print` to the `ryft.print` XLA FFI
+/// custom call, its handler, and its capturable print sink.
 pub mod debugging;
-/// StableHLO lowering of differentiation-specific operations (e.g., `rematerialize` and `linear_call`).
+/// StableHLO lowering of operations specific to differentiation (e.g., `rematerialize` and `linear_call`).
 pub(crate) mod differentiation;
 /// StableHLO lowering of first-class dimension operations.
 pub(crate) mod dimensions;
-/// StableHLO lowering of generalized dot products, including grouped (ragged) dots.
+/// StableHLO lowering of generalized dot products, including grouped dots (i.e., ragged dots).
 pub mod dot;
 /// StableHLO lowering of exponential and logarithmic operations.
 pub(crate) mod exponential;
-/// StableHLO lowering of extrema operations (`min`, `max`, and `clamp`).
+/// StableHLO lowering of extrema operations (i.e., `min`, `max`, and `clamp`).
 pub(crate) mod extrema;
-/// Backend-owned `jit_call` operation: lowering of staged calls to staged XLA programs, including call-site
-/// deduplication.
+/// The `jit_call` operation that the backend owns, which calls staged XLA programs, and its lowering, including the
+/// deduplication of call sites.
 pub mod jit_call;
 /// StableHLO lowering of logical operations.
 pub(crate) mod logical;
@@ -114,19 +125,20 @@ pub(crate) mod tagging;
 /// StableHLO lowering of trigonometric and hyperbolic operations.
 pub(crate) mod trigonometric;
 
-/// Ordinary staged-operation universe owned by the XLA backend.
+/// Ordinary universe of staged operations that the XLA backend owns.
 ///
-/// This enum flattens the core array operation payloads directly into the backend-owned operation family. Higher-order
-/// instructions attach their nested computations as regions of the containing XLA program, so those regions can
-/// contain backend-specific operations such as [`jit_call`](JitCallOperation) and
+/// This enum flattens the core array operation payloads directly into the operation family that the backend owns.
+/// Higher-order instructions attach their nested computations as regions of the containing XLA program, so those
+/// regions can contain operations specific to the backend such as [`jit_call`](JitCallOperation) and
 /// [`shard_map`](ShardMapOperation).
 ///
-/// The [`CoreOperation`](ryft_core::Operation) contract, the interpretation and partial-evaluation dispatchers, the
-/// forward-mode and transposition dispatchers, the member operation-family projections, and the payload conversions are
-/// all derived. The variant classes mirror [`ArrayIrOperation`] exactly for the payloads the two families share, so
-/// both dispatchers report identical semantics for every shared member and mixed payload. Only the backend-owned
-/// surfaces stay handwritten: the normalizing conversions that select between a member and a mixed carrier, the zero
-/// and residual-zero providers, the canonical core-operation view used by lowering, and the MLIR lowering dispatch.
+/// The [`CoreOperation`](ryft_core::Operation) contract, the interpretation and partial evaluation dispatchers, the
+/// forward mode and transposition dispatchers, the projections onto the member operation families, and the payload
+/// conversions are all derived. The variant classes mirror [`ArrayIrOperation`] exactly for the payloads the two
+/// families share, so both dispatchers report identical semantics for every shared member and mixed payload. Only the
+/// surfaces that the backend owns stay handwritten, namely the normalizing conversions that select between a member
+/// and a mixed carrier, the providers of zeros and residual zeros, the canonical view as a core operation that lowering
+/// uses, and the MLIR lowering dispatch.
 #[derive(Clone, Debug, ryft_macros::Operation)]
 #[ryft(
     crate = "ryft_core",
@@ -144,15 +156,15 @@ where
 
     /// Mixed zero constructor whose explicit first-class dimension operands provide its dynamic result extents.
     /// This variant cannot be represented by the homogeneous array member because its signature crosses member
-    /// kinds: it consumes dimension members and produces an array member.
+    /// kinds, since it consumes dimension members and produces an array member.
     #[ryft(mixed(structural), skip_from)]
     Zero(ZeroOperation<ArrayType>),
 
-    /// Mixed one constructor with explicit dynamic-extent operands.
+    /// Mixed one constructor whose explicit operands provide its dynamic result extents.
     #[ryft(mixed(structural), skip_from)]
     DynamicOne(OneOperation<ArrayType>),
 
-    /// Mixed iota constructor with explicit dynamic-extent operands.
+    /// Mixed iota constructor whose explicit operands provide its dynamic result extents.
     #[ryft(mixed(structural), skip_from)]
     DynamicIota(IotaOperation<ArrayType>),
 
@@ -161,7 +173,7 @@ where
     #[ryft(projected(ArrayType), collective, lockstep, skip_from)]
     Array(ArrayOperation<<Payload as ValueProjection<ArrayType>>::Projected>),
 
-    /// Homogeneous first-class-dimension operation.
+    /// Homogeneous first-class dimension operation.
     #[ryft(projected(DimensionType, structural))]
     Dimension(DimensionOperation<DimensionValue>),
 
@@ -181,13 +193,14 @@ where
     /// Reads an array extent as a first-class dimension.
     DimensionSize(DimensionSizeOperation),
 
-    /// Unresolved whole-array reference allocation retained until reference discharge.
+    /// Unresolved allocation of a reference to a whole array, retained until reference discharge.
     ReferenceNew(ReferenceNewOperation<ArrayType, ArrayIrType>),
 
     /// Unresolved read through an optional folded transform path retained until reference discharge.
     ReferenceRead(ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Unresolved write-only replacement through an optional folded transform path retained until reference discharge.
+    /// Unresolved replacement that only writes, through an optional folded transform path, retained until reference
+    /// discharge.
     ReferenceWrite(ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
     /// Unresolved replacement through an optional folded transform path retained until reference discharge.
@@ -199,7 +212,7 @@ where
     /// Unresolved atomic additive update retained until sequential reference discharge or a supporting kernel lowering.
     ReferenceAtomicAddUpdate(ReferenceAtomicAddUpdateOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>),
 
-    /// Unresolved consuming whole-array reference freeze retained until reference discharge.
+    /// Unresolved consuming freeze of a reference to a whole array, retained until reference discharge.
     ReferenceFreeze(ReferenceFreezeOperation<ArrayType, ArrayIrType>),
 
     /// Converts scalar array data into a checked first-class dimension.
@@ -242,46 +255,46 @@ where
     #[ryft(mixed, collective, lockstep)]
     ParallelAllToAll(ParallelAllToAllOperation),
 
-    /// Exchanges variable-length leading-axis slices through an XLA FFI custom call.
+    /// Exchanges slices of variable length along the leading axis through an XLA FFI custom call.
     #[ryft(mixed, collective, lockstep)]
     ParallelRaggedAllToAll(ParallelRaggedAllToAllOperation),
 
-    /// Backend-owned condition whose attached branch regions can contain XLA operations.
+    /// Condition owned by the backend, whose attached branch regions can contain XLA operations.
     #[ryft(lockstep)]
     Condition(ConditionOperation<ArrayIrType>),
 
-    /// Backend-owned loop whose attached condition and body regions can contain XLA operations.
+    /// Loop owned by the backend, whose attached condition and body regions can contain XLA operations.
     #[ryft(lockstep)]
     While(WhileOperation<ArrayIrType>),
 
-    /// Backend-owned scan whose attached body region can contain XLA operations.
+    /// Scan owned by the backend, whose attached body region can contain XLA operations.
     #[ryft(lockstep)]
     Scan(ScanOperation<ArrayIrType>),
 
-    /// Backend-owned composite call whose primal region can contain XLA operations, with either attached rule regions
-    /// that can contain XLA operations or retained rules registered in this family, which are traced lazily. Its
-    /// retained rules can communicate along mesh axes that no instruction of the call names, which the call reports
+    /// Composite call owned by the backend, whose primal region can contain XLA operations, with either attached rule
+    /// regions that can contain XLA operations or retained rules registered in this family, which are traced lazily.
+    /// Its retained rules can communicate along mesh axes that no instruction of the call names, which the call reports
     /// as hidden axes, so this variant delegates the collective metadata of the family to it.
     #[ryft(collective, lockstep)]
     Composite(CompositeOperation<Payload, Operation<Payload>>),
 
-    /// Reverse-mode carrier of a [`Composite`](Self::Composite) call, which transposition replaces with the call's
+    /// Reverse mode carrier of a [`Composite`](Self::Composite) call, which transposition replaces with the call's
     /// backward rule.
     #[ryft(collective)]
     CompositeTranspose(CompositeTransposeOperation<Payload, Operation<Payload>>),
 
-    /// Differentiation-owned call to an explicitly transposable linear map with ordinary trailing residual operands,
+    /// Call owned by differentiation to an explicitly transposable linear map with ordinary trailing residual operands,
     /// which lowers by inlining its forward region.
     #[ryft(lockstep)]
     LinearCall(LinearCallOperation<ArrayIrType>),
 
-    /// Backend-owned rematerialized call whose body can contain XLA operations.
+    /// Rematerialized call owned by the backend, whose body can contain XLA operations.
     #[ryft(lockstep)]
     Rematerialize(RematerializeOperation<ArrayIrType>),
 
     /// Composite call whose retained rules are registered in the [`ArrayOperation`] member family, promoted from its
-    /// member payload. Its derivative rules are specialized by the member definition and converted into this family
-    /// (refer to [`LiftedCustomRules`]). Conversions never produce such a call with attached rules, which follow their
+    /// member payload. Its derivative rules are specialized by the member definition and converted into this family as
+    /// [`LiftedCustomRules`]. Conversions never produce such a call with attached rules, which follow their
     /// call into the [`Composite`](Self::Composite) variant instead.
     #[ryft(collective, lockstep)]
     LiftedComposite(
@@ -295,7 +308,7 @@ where
         >,
     ),
 
-    /// Reverse-mode carrier of a [`LiftedComposite`](Self::LiftedComposite) call, whose backward rule is specialized by
+    /// Reverse mode carrier of a [`LiftedComposite`](Self::LiftedComposite) call, whose backward rule is specialized by
     /// the member definition and converted into this family.
     #[ryft(collective)]
     LiftedCompositeTranspose(
@@ -312,7 +325,7 @@ where
     /// Call to a flat staged XLA program.
     JitCall(JitCallOperation<ArrayIrType>),
 
-    /// Core `shard_map` operation (refer to [`ShardMapOperation`]), which lowering emits as a Shardy
+    /// Core `shard_map` operation, i.e., a [`ShardMapOperation`], which lowering emits as a Shardy
     /// `sdy.manual_computation` through its dedicated path rather than through the core array IR lowering.
     ShardMap(Box<ShardMapOperation>),
 }
@@ -403,8 +416,8 @@ where
 {
     #[inline]
     fn from(operation: ArrayOperation<Payload::Projected>) -> Self {
-        // Delegating to the array IR family's conversion keeps constructor normalization and member control-flow
-        // promotion identical across both families: `Condition`, `While`, and `Scan` must become array IR carriers
+        // Delegating to the array IR family's conversion keeps constructor normalization and member control flow
+        // promotion identical across both families. `Condition`, `While`, and `Scan` must become array IR carriers
         // because the projected `Array` variant cannot own array IR regions.
         ArrayIrOperation::<Payload::Projected>::from(operation).into()
     }
@@ -446,7 +459,7 @@ where
             ArrayIrOperation::ParallelSumScatter(operation) => Self::ParallelSumScatter(operation),
             ArrayIrOperation::ParallelAllToAll(operation) => Self::ParallelAllToAll(operation),
             ArrayIrOperation::ParallelRaggedAllToAll(operation) => Self::ParallelRaggedAllToAll(operation),
-            ArrayIrOperation::Condition(_) => Self::Condition(ConditionOperation::new()),
+            ArrayIrOperation::Condition(operation) => Self::Condition(operation),
             ArrayIrOperation::While(operation) => Self::While(operation),
             ArrayIrOperation::Scan(operation) => Self::Scan(operation),
             ArrayIrOperation::LinearCall(operation) => Self::LinearCall(operation),
@@ -493,146 +506,138 @@ where
 }
 
 macro_rules! impl_array_ir_operation_conversion {
-    // Generates the array IR operation conversions the derive cannot generate directly: the canonical constructors
-    // whose lift selects between the homogeneous member carrier and the mixed dimension-operand carrier, and the
-    // homogeneous-array payload forms of mixed operations whose canonical array IR payload is type-promoted.
-    ($($operation:ty),+ $(,)?) => {
-        $(
-            impl<Payload> From<$operation> for Operation<Payload>
-            where
-                Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
-            {
-                #[inline]
-                fn from(operation: $operation) -> Self {
-                    ArrayIrOperation::<Payload::Projected>::from(operation).into()
-                }
+    // Generates the array IR operation conversions that the derive cannot generate directly, namely the canonical
+    // constructors whose lift selects between the homogeneous member carrier and the mixed carrier with dimension
+    // operands, and the homogeneous array payload forms of mixed operations whose canonical array IR payload has a
+    // promoted type.
+    ($operation:ty) => {
+        impl<Payload> From<$operation> for Operation<Payload>
+        where
+            Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+        {
+            #[inline]
+            fn from(operation: $operation) -> Self {
+                ArrayIrOperation::<Payload::Projected>::from(operation).into()
             }
-        )+
+        }
     };
 }
 
 // Every first-class dimension arithmetic operation lifts directly, mirroring the array IR family, so that generic
-// staging code can bound `From<DimensionMulOperation>`-style conversions without naming this family's dimension member.
-impl_array_ir_operation_conversion!(
-    DimensionAddOperation,
-    DimensionSubOperation,
-    SaturatingSubOperation<DimensionType>,
-    DimensionMulOperation,
-    DimensionPowOperation,
-    DimensionDivOperation,
-    DimensionRemOperation,
-    DimensionMinOperation,
-    DimensionMaxOperation,
-);
+// staging code can bound conversions such as `From<DimensionMulOperation>` without naming this family's dimension
+// member.
+impl_array_ir_operation_conversion!(DimensionAddOperation);
+impl_array_ir_operation_conversion!(DimensionSubOperation);
+impl_array_ir_operation_conversion!(SaturatingSubOperation<DimensionType>);
+impl_array_ir_operation_conversion!(DimensionMulOperation);
+impl_array_ir_operation_conversion!(DimensionPowOperation);
+impl_array_ir_operation_conversion!(DimensionDivOperation);
+impl_array_ir_operation_conversion!(DimensionRemOperation);
+impl_array_ir_operation_conversion!(DimensionMinOperation);
+impl_array_ir_operation_conversion!(DimensionMaxOperation);
 
-impl_array_ir_operation_conversion!(
-    ZeroLikeOperation<ArrayIrType>,
-    OneLikeOperation<ArrayIrType>,
-    FillLikeOperation<ArrayIrType>,
-    IotaLikeOperation<ArrayIrType>,
-    ZeroOperation<ArrayType>,
-    OneOperation<ArrayType>,
-    IotaOperation<ArrayType>,
-    ConcatenateOperation<ArrayType>,
-    PadOperation<ArrayType>,
-);
+impl_array_ir_operation_conversion!(ZeroLikeOperation<ArrayIrType>);
+impl_array_ir_operation_conversion!(OneLikeOperation<ArrayIrType>);
+impl_array_ir_operation_conversion!(FillLikeOperation<ArrayIrType>);
+impl_array_ir_operation_conversion!(IotaLikeOperation<ArrayIrType>);
+impl_array_ir_operation_conversion!(ZeroOperation<ArrayType>);
+impl_array_ir_operation_conversion!(OneOperation<ArrayType>);
+impl_array_ir_operation_conversion!(IotaOperation<ArrayType>);
+impl_array_ir_operation_conversion!(ConcatenateOperation<ArrayType>);
+impl_array_ir_operation_conversion!(PadOperation<ArrayType>);
 
 macro_rules! impl_array_operation_conversion {
-    // Generates homogeneous array-operation conversions through the canonical projected member family.
-    ($($operation:ty),+ $(,)?) => {
-        $(
-            impl<Payload> From<$operation> for Operation<Payload>
-            where
-                Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
-            {
-                #[inline]
-                fn from(operation: $operation) -> Self {
-                    ArrayOperation::<Payload::Projected>::from(operation).into()
-                }
+    // Generates the conversions of homogeneous array operations through the canonical projected member family.
+    ($operation:ty) => {
+        impl<Payload> From<$operation> for Operation<Payload>
+        where
+            Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+        {
+            #[inline]
+            fn from(operation: $operation) -> Self {
+                ArrayOperation::<Payload::Projected>::from(operation).into()
             }
-        )+
+        }
     };
 }
 
-impl_array_operation_conversion!(
-    ZeroLikeOperation<ArrayType>,
-    OneLikeOperation<ArrayType>,
-    ConstantOperation<CoreArray>,
-    FillLikeOperation<ArrayType>,
-    IotaLikeOperation<ArrayType>,
-    AbsOperation<ArrayType>,
-    NegOperation<ArrayType>,
-    AddOperation<ArrayType>,
-    SubOperation<ArrayType>,
-    SaturatingSubOperation<ArrayType>,
-    MulOperation<ArrayType>,
-    DivOperation<ArrayType>,
-    SinOperation<ArrayType>,
-    CosOperation<ArrayType>,
-    TanOperation<ArrayType>,
-    Atan2Operation<ArrayType>,
-    ExpOperation<ArrayType>,
-    ExpM1Operation<ArrayType>,
-    LogOperation<ArrayType>,
-    Ln1pOperation<ArrayType>,
-    LogAddExpOperation<ArrayType>,
-    SqrtOperation<ArrayType>,
-    RsqrtOperation<ArrayType>,
-    TanhOperation<ArrayType>,
-    LogisticOperation<ArrayType>,
-    ErfOperation<ArrayType>,
-    PowOperation<ArrayType>,
-    SignOperation<ArrayType>,
-    FloorOperation<ArrayType>,
-    CeilOperation<ArrayType>,
-    RoundOperation<ArrayType>,
-    MaxOperation<ArrayType>,
-    MinOperation<ArrayType>,
-    ClampOperation<ArrayType>,
-    RemOperation<ArrayType>,
-    NotOperation<ArrayType>,
-    AndOperation<ArrayType>,
-    OrOperation<ArrayType>,
-    XorOperation<ArrayType>,
-    ComplexOperation<ArrayType>,
-    ConjugateOperation<ArrayType>,
-    RealOperation<ArrayType>,
-    ImaginaryOperation<ArrayType>,
-    DotOperation,
-    RaggedDotOperation,
-    ScaledDotOperation,
-    ReduceOperation,
-    ArgMaxOperation,
-    ArgMinOperation,
-    CumulativeOperation,
-    SortOperation,
-    ParallelReduceOperation,
-    ParallelVaryOperation,
-    ParallelCastOperation,
-    ParallelPermuteOperation,
-    ParallelBroadcastOperation,
-    AxisIndexOperation,
-    TransposeOperation,
-    ReshapeOperation,
-    BroadcastOperation,
-    BroadcastLikeOperation,
-    GatherOperation,
-    ScatterOperation,
-    SliceOperation,
-    UpdateSliceOperation,
-    DynamicSliceOperation,
-    DynamicUpdateSliceOperation,
-    SelectOperation<ArrayType>,
-    ConvertElementTypeOperation<ArrayType>,
-    ReducePrecisionOperation<ArrayType>,
-    TransferToMemoryOperation,
-    ReshardOperation,
-    ConstrainShardingOperation,
-    StopGradientOperation<ArrayType>,
-    TagOperation<ArrayType>,
-    DropoutOperation,
-    PrintOperation<ArrayType>,
-);
+impl_array_operation_conversion!(ZeroLikeOperation<ArrayType>);
+impl_array_operation_conversion!(OneLikeOperation<ArrayType>);
+impl_array_operation_conversion!(ConstantOperation<CoreArray>);
+impl_array_operation_conversion!(FillLikeOperation<ArrayType>);
+impl_array_operation_conversion!(IotaLikeOperation<ArrayType>);
+impl_array_operation_conversion!(AbsOperation<ArrayType>);
+impl_array_operation_conversion!(NegOperation<ArrayType>);
+impl_array_operation_conversion!(AddOperation<ArrayType>);
+impl_array_operation_conversion!(SubOperation<ArrayType>);
+impl_array_operation_conversion!(SaturatingSubOperation<ArrayType>);
+impl_array_operation_conversion!(MulOperation<ArrayType>);
+impl_array_operation_conversion!(DivOperation<ArrayType>);
+impl_array_operation_conversion!(SinOperation<ArrayType>);
+impl_array_operation_conversion!(CosOperation<ArrayType>);
+impl_array_operation_conversion!(TanOperation<ArrayType>);
+impl_array_operation_conversion!(Atan2Operation<ArrayType>);
+impl_array_operation_conversion!(ExpOperation<ArrayType>);
+impl_array_operation_conversion!(ExpM1Operation<ArrayType>);
+impl_array_operation_conversion!(LogOperation<ArrayType>);
+impl_array_operation_conversion!(Ln1pOperation<ArrayType>);
+impl_array_operation_conversion!(LogAddExpOperation<ArrayType>);
+impl_array_operation_conversion!(SqrtOperation<ArrayType>);
+impl_array_operation_conversion!(RsqrtOperation<ArrayType>);
+impl_array_operation_conversion!(TanhOperation<ArrayType>);
+impl_array_operation_conversion!(LogisticOperation<ArrayType>);
+impl_array_operation_conversion!(ErfOperation<ArrayType>);
+impl_array_operation_conversion!(PowOperation<ArrayType>);
+impl_array_operation_conversion!(SignOperation<ArrayType>);
+impl_array_operation_conversion!(FloorOperation<ArrayType>);
+impl_array_operation_conversion!(CeilOperation<ArrayType>);
+impl_array_operation_conversion!(RoundOperation<ArrayType>);
+impl_array_operation_conversion!(MaxOperation<ArrayType>);
+impl_array_operation_conversion!(MinOperation<ArrayType>);
+impl_array_operation_conversion!(ClampOperation<ArrayType>);
+impl_array_operation_conversion!(RemOperation<ArrayType>);
+impl_array_operation_conversion!(NotOperation<ArrayType>);
+impl_array_operation_conversion!(AndOperation<ArrayType>);
+impl_array_operation_conversion!(OrOperation<ArrayType>);
+impl_array_operation_conversion!(XorOperation<ArrayType>);
+impl_array_operation_conversion!(ComplexOperation<ArrayType>);
+impl_array_operation_conversion!(ConjugateOperation<ArrayType>);
+impl_array_operation_conversion!(RealOperation<ArrayType>);
+impl_array_operation_conversion!(ImaginaryOperation<ArrayType>);
+impl_array_operation_conversion!(DotOperation);
+impl_array_operation_conversion!(RaggedDotOperation);
+impl_array_operation_conversion!(ScaledDotOperation);
+impl_array_operation_conversion!(ReduceOperation);
+impl_array_operation_conversion!(ArgMaxOperation);
+impl_array_operation_conversion!(ArgMinOperation);
+impl_array_operation_conversion!(CumulativeOperation);
+impl_array_operation_conversion!(SortOperation);
+impl_array_operation_conversion!(ParallelReduceOperation);
+impl_array_operation_conversion!(ParallelVaryOperation);
+impl_array_operation_conversion!(ParallelCastOperation);
+impl_array_operation_conversion!(ParallelPermuteOperation);
+impl_array_operation_conversion!(ParallelBroadcastOperation);
+impl_array_operation_conversion!(AxisIndexOperation);
+impl_array_operation_conversion!(TransposeOperation);
+impl_array_operation_conversion!(ReshapeOperation);
+impl_array_operation_conversion!(BroadcastOperation);
+impl_array_operation_conversion!(BroadcastLikeOperation);
+impl_array_operation_conversion!(GatherOperation);
+impl_array_operation_conversion!(ScatterOperation);
+impl_array_operation_conversion!(SliceOperation);
+impl_array_operation_conversion!(UpdateSliceOperation);
+impl_array_operation_conversion!(DynamicSliceOperation);
+impl_array_operation_conversion!(DynamicUpdateSliceOperation);
+impl_array_operation_conversion!(SelectOperation<ArrayType>);
+impl_array_operation_conversion!(ConvertElementTypeOperation<ArrayType>);
+impl_array_operation_conversion!(ReducePrecisionOperation<ArrayType>);
+impl_array_operation_conversion!(TransferToMemoryOperation);
+impl_array_operation_conversion!(ReshardOperation);
+impl_array_operation_conversion!(ConstrainShardingOperation);
+impl_array_operation_conversion!(StopGradientOperation<ArrayType>);
+impl_array_operation_conversion!(TagOperation<ArrayType>);
+impl_array_operation_conversion!(DropoutOperation);
+impl_array_operation_conversion!(PrintOperation<ArrayType>);
 
 impl_array_operation_conversion!(AssertOperation<ArrayType>);
 impl_array_operation_conversion!(GuardOperation<ArrayType>);
@@ -675,54 +680,20 @@ where
 
 // Array IR operations whose generic capabilities bind them through any context lift into the array member exactly as
 // they do in the core array IR family.
-impl<Payload> From<SelectOperation<ArrayIrType>> for Operation<Payload>
-where
-    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: SelectOperation<ArrayIrType>) -> Self {
-        ArrayIrOperation::<Payload::Projected>::from(operation).into()
-    }
-}
+impl_array_ir_operation_conversion!(SelectOperation<ArrayIrType>);
+impl_array_ir_operation_conversion!(StopGradientOperation<ArrayIrType>);
+impl_array_ir_operation_conversion!(TagOperation<ArrayIrType>);
+impl_array_ir_operation_conversion!(PrintOperation<ArrayIrType>);
 
-impl<Payload> From<StopGradientOperation<ArrayIrType>> for Operation<Payload>
-where
-    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: StopGradientOperation<ArrayIrType>) -> Self {
-        ArrayIrOperation::<Payload::Projected>::from(operation).into()
-    }
-}
-
-impl<Payload> From<TagOperation<ArrayIrType>> for Operation<Payload>
-where
-    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: TagOperation<ArrayIrType>) -> Self {
-        ArrayIrOperation::<Payload::Projected>::from(operation).into()
-    }
-}
-
-impl<Payload> From<PrintOperation<ArrayIrType>> for Operation<Payload>
-where
-    Payload: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
-{
-    #[inline]
-    fn from(operation: PrintOperation<ArrayIrType>) -> Self {
-        ArrayIrOperation::<Payload::Projected>::from(operation).into()
-    }
-}
-
-/// Staged XLA program over an operation family `O`, which defaults to the backend-owned XLA operation universe.
+/// Staged XLA program over an operation family `O`, which defaults to the universe of XLA operations that the backend
+/// owns.
 pub type Program<Input, Output, O = Operation> = CoreProgram<Constant, O, Input, Output>;
 
-/// Program builder specialized to the backend-owned XLA op universe.
+/// Program builder specialized to the universe of XLA operations that the backend owns.
 pub type ProgramBuilder = CoreProgramBuilder<Constant, Operation>;
 
-/// Flat XLA program over an operation family `O`, which defaults to the backend-owned XLA operation universe, used for
-/// materialized regions and shared callees.
+/// Flat XLA program over an operation family `O`, which defaults to the universe of XLA operations that the backend
+/// owns, used for materialized regions and shared callees.
 pub type FlatProgram<O = Operation> = Program<Vec<Constant>, Vec<Constant>, O>;
 
 /// Converts and broadcasts one implicitly compatible elementwise operand to the exact StableHLO result tensor type.
@@ -751,7 +722,7 @@ where
         let dimensions = input_tensor_type.dimensions().collect::<Vec<_>>();
         let converted_type = context.tensor_type(output_element_type, dimensions.as_slice(), None, location)?;
         let converted = block.append_operation(stable_hlo::convert(input, converted_type, location)?)?;
-        input = converted.result(0).expect("stablehlo.convert should return one result").as_ref();
+        input = converted.result(0).unwrap().as_ref();
     }
     if input_tensor_type.dimensions().ne(output_tensor_type.dimensions()) {
         let output_rank = output_tensor_type.rank();
@@ -769,7 +740,7 @@ where
             dimensions.as_slice(),
             location,
         )?)?;
-        input = broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
+        input = broadcast.result(0).unwrap().as_ref();
     }
     Ok(input)
 }
@@ -818,10 +789,11 @@ where
             && input_tensor_type.is_some_and(|r#type| r#type.rank() == 0)
             && peer_tensor_type.is_some_and(|r#type| r#type.dimensions().eq(output_tensor_type.dimensions()))
         {
-            // Native broadcast accepts at most one bounded dynamic result axis. For scalar arithmetic over
-            // e.g. `[rows, columns]`, broadcast to physical capacity and restore both logical extents from the
-            // array input. The scalar itself cannot supply these sizes, and inventing the maximum sizes would
-            // incorrectly make padding observable. Other broadcasting cases use the ordinary path below.
+            // Native broadcast accepts at most one bounded dynamic result axis. For scalar arithmetic over an array
+            // with several dynamic axes (e.g., `[rows, columns]`), broadcast to physical capacity and restore both
+            // logical extents from the array input. The scalar itself cannot supply these sizes, and inventing the
+            // maximum sizes would incorrectly make padding observable. Other broadcasting cases use the ordinary path
+            // below.
             let scalar = normalize_elementwise_operand(
                 input_values[index],
                 &ArrayType::scalar(output_type.data_type()),
@@ -863,22 +835,26 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Abs, AddOperation, AndOperation, Array as CoreArray, ArrayIrOperation, ArrayIrOperations, ArrayIrType,
-        ArrayOperation, ArrayOperations, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, Assert,
-        AssertOperation, Atan2, Atan2Operation, CaptureReference, CapturingContext, Compare, CompareOperation,
-        ComparisonDirection, CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation,
-        Context, Cos, DataType, DifferentiableType, Dimension as CoreDimension, DimensionBounds,
-        DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, DivOperation,
-        DomainTracingContext, DynamicBroadcastOperation, EffectClass, EffectClasses, ErasedOperation, Exp,
-        ExternalReferenceBinding, Log, MaybeZero, Memory, MulOperation, Operation as CoreOperation,
+        Abs, AddOperation, AndOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation,
+        ArrayIrOperations, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayOperations, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArrayType, Assert, AssertOperation, Atan2, Atan2Operation, BatchableOperation,
+        BatchingContext, CaptureReference, CapturingContext, Compare, CompareOperation, ComparisonDirection,
+        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context, Cos,
+        CustomRuleDefinition, CustomRuleRegistration, DataType, DifferentiableType, Dimension as CoreDimension,
+        DimensionBounds, DimensionDivOperation, DimensionFromScalarOperation, DimensionOperation, DimensionType,
+        DimensionValue, DimensionVariable, DivOperation, DomainTracingContext, DotsSavable,
+        DotsWithNoBatchDimensionsSavable, DynamicBroadcastOperation, EffectClass, EffectClasses, EmptyRegionDriver,
+        ErasedOperation, EverythingSavable, Exp, ExternalReferenceBinding, LiftedCustomRules, Log, MaybeZero, Memory,
+        MulOperation, NothingSavable, OffloadDotsWithNoBatchDimensions, Operation as CoreOperation,
         OperationPayloadProjection, OrOperation, PartialValue, Placeholder, Pow, ProgramBuilder as CoreProgramBuilder,
         ProgramError, ReferenceAddUpdateOperation, ReferenceAtomicAddUpdateOperation, ReferenceDischargeResult,
         ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, Rem,
-        RematerializationOptimizationBarrier, RematerializeOperation, ResidualZeroProvider, Rsqrt, ScanOperation,
-        SelectOperation, Shape, Sign, Sin, SinOperation, Sqrt, StagingContext, TagOperation, Tanh,
+        RematerializationOptimizationBarrier, RematerializeOperation, ResidualPolicy, ResidualPolicyReference,
+        ResidualZeroProvider, Rsqrt, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies, SaveOnlyTheseNames,
+        ScanOperation, SelectOperation, Shape, Sign, Sin, SinOperation, Sqrt, StagingContext, TagOperation, Tanh,
         Tracer as CoreTracer, TracingContext, TransferToMemoryOperation, TransposedProgramCotangent, Typed,
-        TypedProgram, ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation,
+        TypedProgram, ValueProjection, ValueResolution, WhileOperation, XorOperation, ZeroOperation, rematerialize,
     };
 
     use crate::domains::Tracer;
@@ -938,174 +914,41 @@ mod tests {
             .unwrap()
     }
 
+    /// Asserts that `stablehlo` is the module that lowering the [`elementwise_normalization_program`] produces, in
+    /// which every operand is converted and broadcast to the exact result type of its operation.
     fn assert_elementwise_operands_are_normalized(stablehlo: &str) {
-        for operation in ["divide", "atan2", "compare", "select", "and", "or", "xor"] {
-            assert!(stablehlo.contains(&format!("stablehlo.{operation}")), "{stablehlo}");
-        }
-        assert!(stablehlo.contains("tensor<3x4xf64>"), "{stablehlo}");
-        assert!(stablehlo.contains("tensor<3x4xi1>"), "{stablehlo}");
-        assert!(stablehlo.matches("stablehlo.convert").count() >= 4, "{stablehlo}");
-        assert!(stablehlo.matches("stablehlo.broadcast_in_dim").count() >= 8, "{stablehlo}");
-    }
-
-    #[test]
-    fn test_plain_elementwise_lowering_normalizes_all_implicit_operands() {
-        let program = elementwise_normalization_program();
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        assert_elementwise_operands_are_normalized(&stablehlo);
-    }
-
-    #[test]
-    fn test_traced_elementwise_lowering_normalizes_all_implicit_operands() {
-        let plain_program = elementwise_normalization_program();
-        let input_types = plain_program.input_types().into_owned();
-        let output_types = plain_program.output_types().into_owned();
-        let program = plain_program.into_unprojected::<Constant, Operation>().unwrap();
-        let stablehlo =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
-        assert_elementwise_operands_are_normalized(&stablehlo);
-    }
-
-    #[test]
-    fn test_elementwise_lowering_normalizes_zero_sized_operands() {
-        let mut builder = PlainProgramBuilder::new();
-        let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
-        let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(0)])));
-        let output = builder.add_instruction(DivOperation::new(), Vec::new(), vec![scalar, empty], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
-                vec![output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
-        assert!(stablehlo.contains("stablehlo.convert"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.broadcast_in_dim"), "{stablehlo}");
-        assert!(stablehlo.contains("stablehlo.divide"), "{stablehlo}");
-        assert!(stablehlo.contains("tensor<0xf64>"), "{stablehlo}");
-    }
-
-    #[test]
-    fn test_elementwise_lowering_matches_reference_backend() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        let left_values = [0.5f32, 1.25, 2.0, 3.75];
-        let right_values = [4.0f32, 0.25, -1.5, 2.5];
-        let left = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&left_values));
-        let right = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&right_values));
-        let reference_left = CoreArray::vector(left_values.to_vec()).unwrap();
-        let reference_right = CoreArray::vector(right_values.to_vec()).unwrap();
-
-        // Each of these operations lowers to a single StableHLO operation, so agreement with the reference backend
-        // pins the operation that the lowering selects. Both backends compute in `f32` and may round transcendental
-        // functions differently in the last unit of precision, so results are compared within a relative tolerance.
-        let cases = [
-            ("abs", right.abs().unwrap(), reference_right.abs().unwrap()),
-            ("sign", right.sign().unwrap(), reference_right.sign().unwrap()),
-            ("sin", left.sin().unwrap(), reference_left.sin().unwrap()),
-            ("cos", left.cos().unwrap(), reference_left.cos().unwrap()),
-            ("tanh", left.tanh().unwrap(), reference_left.tanh().unwrap()),
-            ("exp", left.exp().unwrap(), reference_left.exp().unwrap()),
-            ("log", left.log().unwrap(), reference_left.log().unwrap()),
-            ("sqrt", left.sqrt().unwrap(), reference_left.sqrt().unwrap()),
-            ("rsqrt", left.rsqrt().unwrap(), reference_left.rsqrt().unwrap()),
-            ("atan2", left.atan2(&right).unwrap(), reference_left.atan2(&reference_right).unwrap()),
-            ("pow", left.pow(&right).unwrap(), reference_left.pow(&reference_right).unwrap()),
-            ("rem", left.rem(&right).unwrap(), reference_left.rem(&reference_right).unwrap()),
-        ];
-        for (name, output, reference) in cases {
-            let values = values_from_bytes::<f32>(&output.copy_to_host().unwrap());
-            let expected = reference.elements::<f32>().unwrap();
-            assert_eq!(values.len(), expected.len(), "`{name}`");
-            for (&value, &expected) in values.iter().zip(&expected) {
-                assert!(
-                    f32::abs(value - expected) <= 1e-5 * f32::abs(expected).max(1.0),
-                    "`{name}` computed {value} but the reference backend computed {expected}",
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_to_mlir_module_for_plain_program_lowers_result_accuracies() {
-        // The default accuracy keeps the default StableHLO result accuracy, while other accuracies request theirs.
         assert_eq!(
-            lowered_unary_module(ArrayOperation::Sin(SinOperation::new()), DataType::F32, vec![2]).unwrap(),
-            indoc! {r#"
+            stablehlo,
+            indoc! {"
                 module {
-                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
-                    %0 = stablehlo.sine %arg0 : tensor<2xf32>
-                    return %0 : tensor<2xf32>
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<3x1xf32>, %arg2: tensor<1x4xf64>, %arg3: tensor<i1>, %arg4: tensor<4xi1>) -> (tensor<3x4xf64>, tensor<3x4xf64>, tensor<3x4xi1>, tensor<1x4xf64>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>) {
+                    %0 = stablehlo.convert %arg1 : (tensor<3x1xf32>) -> tensor<3x1xf64>
+                    %1 = stablehlo.broadcast_in_dim %0, dims = [0, 1] : (tensor<3x1xf64>) -> tensor<3x4xf64>
+                    %2 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<1x4xf64>) -> tensor<3x4xf64>
+                    %3 = stablehlo.divide %1, %2 : tensor<3x4xf64>
+                    %4 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<1x4xf64>) -> tensor<3x4xf64>
+                    %5 = stablehlo.convert %arg1 : (tensor<3x1xf32>) -> tensor<3x1xf64>
+                    %6 = stablehlo.broadcast_in_dim %5, dims = [0, 1] : (tensor<3x1xf64>) -> tensor<3x4xf64>
+                    %7 = stablehlo.atan2 %4, %6 : tensor<3x4xf64>
+                    %8 = stablehlo.convert %arg1 : (tensor<3x1xf32>) -> tensor<3x1xf64>
+                    %9 = stablehlo.broadcast_in_dim %8, dims = [0, 1] : (tensor<3x1xf64>) -> tensor<3x4xf64>
+                    %10 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<1x4xf64>) -> tensor<3x4xf64>
+                    %11 = stablehlo.compare GT, %9, %10, FLOAT : (tensor<3x4xf64>, tensor<3x4xf64>) -> tensor<3x4xi1>
+                    %12 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<1x4xi1>
+                    %13 = stablehlo.convert %arg0 : (tensor<f32>) -> tensor<f64>
+                    %14 = stablehlo.broadcast_in_dim %13, dims = [] : (tensor<f64>) -> tensor<1x4xf64>
+                    %15 = stablehlo.select %12, %14, %arg2 : tensor<1x4xi1>, tensor<1x4xf64>
+                    %16 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<4xi1>
+                    %17 = stablehlo.and %16, %arg4 : tensor<4xi1>
+                    %18 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<4xi1>
+                    %19 = stablehlo.or %arg4, %18 : tensor<4xi1>
+                    %20 = stablehlo.broadcast_in_dim %arg3, dims = [] : (tensor<i1>) -> tensor<4xi1>
+                    %21 = stablehlo.xor %20, %arg4 : tensor<4xi1>
+                    return %3, %7, %11, %15, %17, %19, %21 : tensor<3x4xf64>, tensor<3x4xf64>, tensor<3x4xi1>, tensor<1x4xf64>, tensor<4xi1>, tensor<4xi1>, tensor<4xi1>
                   }
                 }
-            "#},
+            "},
         );
-        assert_eq!(
-            lowered_unary_module(
-                ArrayOperation::Tanh(ryft_core::TanhOperation::new().with_accuracy(ryft_core::Accuracy::Highest)),
-                DataType::F32,
-                vec![2],
-            )
-            .unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
-                    %0 = stablehlo.tanh %arg0 {result_accuracy = #stablehlo.result_accuracy<mode = #stablehlo.result_accuracy_mode<HIGHEST>>} : tensor<2xf32>
-                    return %0 : tensor<2xf32>
-                  }
-                }
-            "#},
-        );
-        let tolerance = ryft_core::Tolerance::new(1e-6, 0.0, 2).unwrap();
-        assert_eq!(
-            lowered_unary_module(
-                ArrayOperation::Exp(
-                    ryft_core::ExpOperation::new().with_accuracy(ryft_core::Accuracy::Tolerance(tolerance)),
-                ),
-                DataType::F32,
-                vec![2],
-            )
-            .unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
-                    %0 = stablehlo.exponential %arg0 {result_accuracy = #stablehlo.result_accuracy<atol = 9.9999999999999995E-7, ulps = 2, mode = #stablehlo.result_accuracy_mode<TOLERANCE>>} : tensor<2xf32>
-                    return %0 : tensor<2xf32>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_lower_accuracy_execution() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-        let values = [0.5f32, -1.0, 2.0];
-        let input = replicated_array(&domain, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
-        let reference = CoreArray::vector(values.to_vec()).unwrap();
-        let expected_sine = reference.sin().unwrap().elements::<f32>().unwrap();
-        let expected_tanh = reference.tanh().unwrap().elements::<f32>().unwrap();
-
-        // XLA compiles every requested result accuracy. Each one only bounds the error of the implementation XLA
-        // selects, so results are compared with the reference within that bound.
-        let tolerance = ryft_core::Accuracy::Tolerance(ryft_core::Tolerance::new(1e-6, 0.0, 0).unwrap());
-        for accuracy in [ryft_core::Accuracy::Highest, tolerance] {
-            let sine = values_from_bytes::<f32>(&input.sin_with_accuracy(accuracy).unwrap().copy_to_host().unwrap());
-            assert_eq!(sine.len(), expected_sine.len());
-            for (sine, expected) in sine.iter().zip(&expected_sine) {
-                assert!((sine - expected).abs() <= 1e-6, "{accuracy:?}: {sine} vs {expected}");
-            }
-            let tanh = values_from_bytes::<f32>(&input.tanh_with_accuracy(accuracy).unwrap().copy_to_host().unwrap());
-            assert_eq!(tanh.len(), expected_tanh.len());
-            for (tanh, expected) in tanh.iter().zip(&expected_tanh) {
-                assert!((tanh - expected).abs() <= 1e-6, "{accuracy:?}: {tanh} vs {expected}");
-            }
-        }
     }
 
     #[test]
@@ -1208,14 +1051,9 @@ mod tests {
 
     #[test]
     fn test_operation_batch_dimension_member() {
-        use ryft_core::{
-            ArrayIrBatch, ArrayIrBatchingPolicy, BatchableOperation, BatchingContext, DimensionDivOperation,
-            DimensionOperation, EmptyRegionDriver,
-        };
-
-        // The first-class-dimension member family has no batching rules of its own, so the derived dispatcher binds a
+        // The first-class dimension member family has no batching rules of its own, so the derived dispatcher binds a
         // checked dimension division once in the parent trace under the replicated dimension policy. The staged
-        // division keeps its replicated inputs and its ordered zero-divisor assertion.
+        // division keeps its replicated inputs and its ordered assertion that the divisor is nonzero.
         let dividend_type = DimensionType::new("dividend", DimensionBounds::new(0, Some(9)).unwrap());
         let divisor_type = DimensionType::new("divisor", DimensionBounds::new(0, Some(5)).unwrap());
         let (_, program) = TracingContext::<Constant, Operation>::trace(
@@ -1250,6 +1088,24 @@ mod tests {
     }
 
     #[test]
+    fn test_operation_reference_access_descriptor() {
+        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
+        let operation = Operation::<Constant>::ReferenceRead(
+            ReferenceReadOperation::new().with_transforms(vec![transform.clone()]),
+        );
+        let descriptor = operation.reference_access_descriptor(0).unwrap();
+        assert_eq!(descriptor.transforms(), &[transform]);
+        assert_eq!(descriptor.bindings(), 1..2);
+        assert_eq!(operation.reference_access_descriptor(1), None);
+        let root = ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])).into();
+        let index = ArrayType::scalar(DataType::I64).into();
+        assert_eq!(
+            operation.infer_output_types(&[root, index], &[]),
+            Ok(vec![ArrayType::new_static(DataType::F32, [2]).into()])
+        );
+    }
+
+    #[test]
     fn test_core_reference_operations_promote_to_reference_operations() {
         let write: Operation<Constant> =
             ArrayIrOperation::<ArrayConstant>::ReferenceWrite(ReferenceWriteOperation::new()).into();
@@ -1277,7 +1133,7 @@ mod tests {
     fn test_reference_discharge_rewrites_the_flat_reference_language() {
         // The backend operation family participates in reference discharge through its generated `discharge`
         // dispatcher, so a flat backend program rewrites into explicit immutable state with its external root
-        // entering at its own boundary position and publishing one hidden final-state output.
+        // entering at its own boundary position and publishing its final state as one hidden output.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let mut builder = ProgramBuilder::new();
         let external = builder.add_input(ArrayIrType::Reference(ReferenceType::new(scalar_type.clone())));
@@ -1357,8 +1213,8 @@ mod tests {
         assert!(matches!(zero, Operation::Zero(_)));
 
         // Member control flow must also promote to the array IR carriers when it enters through the member family
-        // conversion: the projected `Array` variant cannot own array IR regions, so landing there would make the
-        // staged regions unprojectable.
+        // conversion, because the projected `Array` variant cannot own array IR regions, so landing there would make
+        // the staged regions unprojectable.
         let condition: Operation<Constant> =
             ArrayOperation::<ArrayConstant>::Condition(ConditionOperation::new()).into();
         assert!(matches!(condition, Operation::Condition(_)));
@@ -1377,31 +1233,11 @@ mod tests {
     }
 
     #[test]
-    fn test_operation_reference_access_descriptor() {
-        let transform = ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Dynamic };
-        let operation = Operation::<Constant>::ReferenceRead(
-            ReferenceReadOperation::new().with_transforms(vec![transform.clone()]),
-        );
-        let descriptor = operation.reference_access_descriptor(0).unwrap();
-        assert_eq!(descriptor.transforms(), &[transform]);
-        assert_eq!(descriptor.bindings(), 1..2);
-        assert_eq!(operation.reference_access_descriptor(1), None);
-        let root = ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])).into();
-        let index = ArrayType::scalar(DataType::I64).into();
-        assert_eq!(
-            operation.infer_output_types(&[root, index], &[]),
-            Ok(vec![ArrayType::new_static(DataType::F32, [2]).into()])
-        );
-    }
-
-    #[test]
     fn test_core_composite_and_rematerialization_promotions_preserve_metadata() {
-        use ryft_core::{DotsSavable, ResidualPolicyReference};
-
-        // These payloads are promoted by move rather than reconstructed, so their complete stored surface must survive:
-        // the rule layout and the non-differentiated operand split of composite calls, and the policy and flags of
-        // rematerialized calls. The promoted carrier must also keep contributing the payload's own operation name and
-        // region slots, because the attached regions are matched against those slots by name.
+        // These payloads are promoted by move rather than reconstructed, so their complete stored surface must survive,
+        // including the rule layout and the non-differentiated operand split of composite calls, and the policy and
+        // flags of rematerialized calls. The promoted carrier must also keep contributing the payload's own operation
+        // name and region slots, because the attached regions are matched against those slots by name.
         for (jvp_rule, has_vjp_rule, non_differentiated_count) in [
             (CompositeJvpRule::Explicit, false, 2),
             (CompositeJvpRule::Absent, true, 3),
@@ -1467,8 +1303,6 @@ mod tests {
 
     #[test]
     fn test_core_composite_retained_rule_promotions() {
-        use ryft_core::{ArrayIrValue, CustomRuleDefinition, CustomRuleRegistration, LiftedCustomRules};
-
         // Converted member calls and carriers keep their member definition, which specializes their rules for this
         // family on demand.
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -1527,11 +1361,10 @@ mod tests {
 
     #[test]
     fn test_rematerialize_recomputes_known_jit_calls_in_its_body() {
-        use ryft_core::{NothingSavable, rematerialize};
-
-        // A rematerialized body squares its input inside a `jit_call` operation and squares the result of the call outside of
-        // it. Linearizing it with the default policy, which saves nothing, saves only the input. Its pure all-known
-        // primal call keeps its boundary, and the residual body replays that call to recompute the multiplication.
+        // A rematerialized body squares its input inside a `jit_call` operation and squares the result of the call
+        // outside of it. Linearizing it with the default policy, which saves nothing, saves only the input. Its pure
+        // primal call, whose inputs are all known, keeps its boundary, and the residual body replays that call to
+        // recompute the multiplication.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F64));
         let callee = {
             let mut builder = ProgramBuilder::new();
@@ -1597,12 +1430,10 @@ mod tests {
 
     #[test]
     fn test_rematerialize_rejects_captures_registered_in_its_body() {
-        use ryft_core::rematerialize;
-
         // This guards an unowned capture reference rather than a legitimate closed-over array, which enters the body as
         // a session constant through `ThroughSession` instead. The rematerialized body is traced through a fresh root
         // context whose capture table is discarded, so a body that registers a capture is rejected at trace time
-        // rather than leaving a reference that a later capture-owning scope would resolve against an unrelated value.
+        // rather than leaving a reference that a later scope owning captures would resolve against an unrelated value.
         // Refer to `TracingContext::trace_with_named_axes` for the full rationale.
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
         let captured_value = Constant::Captured(CaptureReference::new(0, scalar_type.clone()));
@@ -1655,8 +1486,9 @@ mod tests {
         let context = TracingContext::<Constant, Operation>::new();
         let primal = context.input(ArrayIrType::Array(primal_type));
 
-        // The shared array-IR blanket captures the named extent even when the source's element representation differs
-        // from the dynamic tangent zero's. The XLA family uses the same identity-directed rule as the core family.
+        // The shared array IR blanket implementation captures the named extent even when the source's element
+        // representation differs from the dynamic tangent zero's. The XLA family uses the same identity-directed rule
+        // as the core family.
         let zero = Operation::<Constant>::materialize_zero_from_residual_sources(
             &context,
             MaybeZero::Zero(ArrayIrType::Array(tangent_type.clone())),
@@ -1694,10 +1526,10 @@ mod tests {
             context.input(ArrayIrType::Dimension(DimensionType::from(columns))),
         ];
 
-        // No single source has the zero's type, so its shape is assembled per declared residual: the statically shaped
+        // No single source has the zero's type, so its shape is assembled per declared residual. The statically shaped
         // candidate names neither identity and is skipped without staging anything, the dynamic array supplies the row
         // extent through a `dimension_size` read, and the first-class dimension supplies the column extent as itself.
-        // The shared array-IR implementation emits XLA operations directly for the selected sources.
+        // The shared array IR implementation emits XLA operations directly for the selected sources.
         let zero = Operation::<Constant>::materialize_zero_from_residual_sources(
             &context,
             MaybeZero::Zero(ArrayIrType::Array(zero_type.clone())),
@@ -1844,9 +1676,9 @@ mod tests {
         let targets = program.reference_discharge_targets(1).unwrap();
         assert_eq!(targets, vec![ReferenceDischargeTarget::External(ReferenceSource::Capture { index: 0 })],);
 
-        // The partial capture-aware entry point resolves the body's capture constant even when its allocation is
-        // preserved. The scan retains its reference access and gains a reference-typed carry that binds the rebuilt
-        // body's capture without turning it into state.
+        // The partial discharge entry point that handles captures resolves the body's capture constant even when its
+        // allocation is preserved. The scan retains its reference access and gains a carry of reference type that binds
+        // the rebuilt body's capture without turning it into state.
         let preserved = program.clone().partially_discharge_references_in_capture_lifted_program(1, &[]).unwrap();
         assert!(preserved.external_reference_bindings().is_empty());
         assert!(preserved.program().entry_region_ref().contains_references_in_closure());
@@ -1855,8 +1687,9 @@ mod tests {
         };
         assert_eq!(scan.carry_count(), 2);
 
-        // Selecting the captured allocation through the partial entry point agrees exactly with full capture-aware
-        // discharge. Threading its state widens the carry list while preserving the scan's direction and unroll factor.
+        // Selecting the captured allocation through the partial entry point agrees exactly with full discharge that
+        // handles captures. Threading its state widens the carry list while preserving the scan's direction and unroll
+        // factor.
         let selected = ReferenceDischargeResult::try_from(
             program
                 .clone()
@@ -1881,16 +1714,10 @@ mod tests {
 
     #[test]
     fn test_rematerialization_policies_are_available_for_the_operation_family() {
-        use ryft_core::{
-            DotsSavable, DotsWithNoBatchDimensionsSavable, EverythingSavable, Memory, NothingSavable,
-            OffloadDotsWithNoBatchDimensions, ResidualPolicy, SaveAndOffloadOnlyTheseNames, SaveFromBothPolicies,
-            SaveOnlyTheseNames,
-        };
-
         // The built-in rematerialization policies, including the offloading ones, classify candidates of the
-        // `ArrayIrType` universe of `Operation`, whose producers they recognize through the derive-generated
-        // payload projection. This is a compile-time capability check: the assertions below fail to compile if a
-        // policy is not available for the universe.
+        // `ArrayIrType` universe of `Operation`, whose producers they recognize through the payload projection that
+        // the derive generates. This is a compile-time capability check, because the assertions below fail to compile
+        // if a policy is not available for the universe.
         fn assert_policy<P: ResidualPolicy<ArrayIrType>>(_policy: P) {}
         assert_policy(NothingSavable);
         assert_policy(EverythingSavable);
@@ -1900,5 +1727,200 @@ mod tests {
         assert_policy(SaveAndOffloadOnlyTheseNames::new(["u"], ["v"], Memory::Host { pinned: true }).unwrap());
         assert_policy(OffloadDotsWithNoBatchDimensions::new(Memory::Host { pinned: true }));
         assert_policy(SaveFromBothPolicies::new(DotsSavable, SaveOnlyTheseNames::new(["u"])));
+    }
+
+    #[test]
+    fn test_normalize_elementwise_operand_in_plain_programs() {
+        let program = elementwise_normalization_program();
+        let stablehlo = to_mlir_module_for_plain_program(&program, "main").unwrap();
+        assert_elementwise_operands_are_normalized(&stablehlo);
+    }
+
+    #[test]
+    fn test_normalize_elementwise_operand_in_traced_programs() {
+        let plain_program = elementwise_normalization_program();
+        let input_types = plain_program.input_types().into_owned();
+        let output_types = plain_program.output_types().into_owned();
+        let program = plain_program.into_unprojected::<Constant, Operation>().unwrap();
+        let stablehlo =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        assert_elementwise_operands_are_normalized(&stablehlo);
+    }
+
+    #[test]
+    fn test_normalize_elementwise_operand_zero_sized_operands() {
+        let mut builder = PlainProgramBuilder::new();
+        let scalar = builder.add_input(ArrayType::scalar(DataType::F32));
+        let empty = builder.add_input(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(0)])));
+        let output = builder.add_instruction(DivOperation::new(), Vec::new(), vec![scalar, empty], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                vec![output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<f32>, %arg1: tensor<0xf64>) -> tensor<0xf64> {
+                    %0 = stablehlo.convert %arg0 : (tensor<f32>) -> tensor<f64>
+                    %1 = stablehlo.broadcast_in_dim %0, dims = [] : (tensor<f64>) -> tensor<0xf64>
+                    %2 = stablehlo.divide %1, %arg1 : tensor<0xf64>
+                    return %2 : tensor<0xf64>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_normalize_elementwise_operand_rejects_incompatible_operands() {
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let token_type = context.stable_hlo_token_type().unwrap();
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let vector_type = ArrayType::new_static(DataType::F32, [3]);
+        let block = context.block(&[
+            (token_type.as_ref(), location),
+            (lower_tensor_type(&matrix_type, &context, location).unwrap().as_ref(), location),
+        ]);
+        let token = block.as_ref().argument(0).unwrap().as_ref();
+        let matrix = block.as_ref().argument(1).unwrap().as_ref();
+        assert!(matches!(
+            normalize_elementwise_operand(token, &vector_type, &mut block.as_ref(), &context, location),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "normalize_elementwise_operand"
+                    && reason == "elementwise operand has non-tensor MLIR type `!stablehlo.token`",
+        ));
+        assert!(matches!(
+            normalize_elementwise_operand(matrix, &vector_type, &mut block.as_ref(), &context, location),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "normalize_elementwise_operand"
+                    && reason == "cannot broadcast rank-2 elementwise operand to rank-1 output",
+        ));
+    }
+
+    #[test]
+    fn test_elementwise_lowering_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let left_values = [0.5f32, 1.25, 2.0, 3.75];
+        let right_values = [4.0f32, 0.25, -1.5, 2.5];
+        let left = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&left_values));
+        let right = replicated_array(&domain, &mesh, DataType::F32, &[4], &values_to_bytes(&right_values));
+        let reference_left = CoreArray::vector(left_values.to_vec()).unwrap();
+        let reference_right = CoreArray::vector(right_values.to_vec()).unwrap();
+
+        // Each of these operations lowers to a single StableHLO operation, so agreement with the reference backend
+        // pins the operation that the lowering selects. Both backends compute in `f32` and may round transcendental
+        // functions differently in the last unit of precision, so results are compared within a relative tolerance.
+        let cases = [
+            ("abs", right.abs().unwrap(), reference_right.abs().unwrap()),
+            ("sign", right.sign().unwrap(), reference_right.sign().unwrap()),
+            ("sin", left.sin().unwrap(), reference_left.sin().unwrap()),
+            ("cos", left.cos().unwrap(), reference_left.cos().unwrap()),
+            ("tanh", left.tanh().unwrap(), reference_left.tanh().unwrap()),
+            ("exp", left.exp().unwrap(), reference_left.exp().unwrap()),
+            ("log", left.log().unwrap(), reference_left.log().unwrap()),
+            ("sqrt", left.sqrt().unwrap(), reference_left.sqrt().unwrap()),
+            ("rsqrt", left.rsqrt().unwrap(), reference_left.rsqrt().unwrap()),
+            ("atan2", left.atan2(&right).unwrap(), reference_left.atan2(&reference_right).unwrap()),
+            ("pow", left.pow(&right).unwrap(), reference_left.pow(&reference_right).unwrap()),
+            ("rem", left.rem(&right).unwrap(), reference_left.rem(&reference_right).unwrap()),
+        ];
+        for (name, output, reference) in cases {
+            let values = values_from_bytes::<f32>(&output.copy_to_host().unwrap());
+            let expected = reference.elements::<f32>().unwrap();
+            assert_eq!(values.len(), expected.len(), "`{name}`");
+            for (&value, &expected) in values.iter().zip(&expected) {
+                assert!(
+                    (value - expected).abs() <= 1e-5 * expected.abs().max(1.0),
+                    "`{name}` computed {value} but the reference backend computed {expected}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_lower_accuracy() {
+        // The default accuracy keeps the default StableHLO result accuracy, while other accuracies request theirs.
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Sin(SinOperation::new()), DataType::F32, vec![2]).unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.sine %arg0 : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#},
+        );
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::Tanh(ryft_core::TanhOperation::new().with_accuracy(ryft_core::Accuracy::Highest)),
+                DataType::F32,
+                vec![2],
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.tanh %arg0 {result_accuracy = #stablehlo.result_accuracy<mode = #stablehlo.result_accuracy_mode<HIGHEST>>} : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#},
+        );
+        let tolerance = ryft_core::Tolerance::new(1e-6, 0.0, 2).unwrap();
+        assert_eq!(
+            lowered_unary_module(
+                ArrayOperation::Exp(
+                    ryft_core::ExpOperation::new().with_accuracy(ryft_core::Accuracy::Tolerance(tolerance)),
+                ),
+                DataType::F32,
+                vec![2],
+            )
+            .unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {
+                    %0 = stablehlo.exponential %arg0 {result_accuracy = #stablehlo.result_accuracy<atol = 9.9999999999999995E-7, ulps = 2, mode = #stablehlo.result_accuracy_mode<TOLERANCE>>} : tensor<2xf32>
+                    return %0 : tensor<2xf32>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_lower_accuracy_matches_reference_backend() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let values = [0.5f32, -1.0, 2.0];
+        let input = replicated_array(&domain, &mesh, DataType::F32, &[values.len()], &values_to_bytes(&values));
+        let reference = CoreArray::vector(values.to_vec()).unwrap();
+        let expected_sine = reference.sin().unwrap().elements::<f32>().unwrap();
+        let expected_tanh = reference.tanh().unwrap().elements::<f32>().unwrap();
+
+        // XLA compiles every requested result accuracy. Each one only bounds the error of the implementation XLA
+        // selects, so results are compared with the reference within that bound.
+        let tolerance = ryft_core::Accuracy::Tolerance(ryft_core::Tolerance::new(1e-6, 0.0, 0).unwrap());
+        for accuracy in [ryft_core::Accuracy::Highest, tolerance] {
+            let sine = values_from_bytes::<f32>(&input.sin_with_accuracy(accuracy).unwrap().copy_to_host().unwrap());
+            assert_eq!(sine.len(), expected_sine.len());
+            for (sine, expected) in sine.iter().zip(&expected_sine) {
+                assert!((sine - expected).abs() <= 1e-6, "{accuracy:?}: {sine} vs {expected}");
+            }
+            let tanh = values_from_bytes::<f32>(&input.tanh_with_accuracy(accuracy).unwrap().copy_to_host().unwrap());
+            assert_eq!(tanh.len(), expected_tanh.len());
+            for (tanh, expected) in tanh.iter().zip(&expected_tanh) {
+                assert!((tanh - expected).abs() <= 1e-6, "{accuracy:?}: {tanh} vs {expected}");
+            }
+        }
     }
 }

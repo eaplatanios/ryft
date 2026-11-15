@@ -1,4 +1,6 @@
-//! Placement of whole trees of host values and arrays on devices, following `jax.device_put`.
+//! Placement of whole trees of host values and arrays on devices through [`Domain::device_put`], following
+//! `jax.device_put`. [`DevicePutOptions`] holds the tree prefixes of the per-leaf options, and [`DevicePutLeaf`]
+//! places one leaf, which is either an [`Array`] or a host value that is uploaded as one dense array.
 
 use half::{bf16, f16};
 use ryft_core::{
@@ -13,8 +15,8 @@ use crate::{Domain, Error, FromPjrt};
 
 /// Options of [`Domain::device_put`].
 ///
-/// Each field follows JAX's tree-prefix semantics: when a field is present, its structure is
-/// broadcast over the input tree and applied leafwise.
+/// Each field follows JAX's tree prefix semantics, so when a field is present, its structure is broadcast over the
+/// input tree and applied leafwise.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DevicePutOptions<
     DeviceTarget = DevicePutTarget,
@@ -22,19 +24,19 @@ pub struct DevicePutOptions<
     Donate = bool,
     MayAlias = Option<bool>,
 > {
-    /// Destination placement tree prefix. When absent, host leaves are committed to the default
-    /// local device and [`Array`] leaves preserve their current placement.
+    /// Destination placement tree prefix. When absent, host leaves are committed to the default local device and
+    /// [`Array`] leaves preserve their current placement.
     device: Option<DeviceTarget>,
 
-    /// Source placement tree prefix. This is validated for [`Array`] leaves and ignored for host
-    /// leaves, which do not carry runtime placement metadata before upload.
+    /// Source placement tree prefix. This is validated for [`Array`] leaves and ignored for host leaves, which do not
+    /// carry runtime placement metadata before upload.
     source: Option<SourceTarget>,
 
     /// Donation tree prefix. A donated [`Array`] leaf lets a compiled reshard reuse its buffers for the result. The
     /// donation only takes effect when the leaf is the only handle of its buffers, and host leaves ignore it.
     donate: Option<Donate>,
 
-    /// May-alias tree prefix. With `Some(false)`, a resulting array shares no buffer with any other array, which
+    /// Aliasing tree prefix. With `Some(false)`, a resulting array shares no buffer with any other array, which
     /// copies the buffers that it would otherwise share.
     may_alias: Option<MayAlias>,
 }
@@ -49,6 +51,12 @@ impl<DeviceTarget, SourceTarget, Donate, MayAlias> DevicePutOptions<DeviceTarget
         may_alias: Option<MayAlias>,
     ) -> Self {
         Self { device, source, donate, may_alias }
+    }
+
+    /// Creates a new [`DevicePutOptions`] with all fields unset.
+    #[inline]
+    pub fn empty() -> Self {
+        Self::new(None, None, None, None)
     }
 
     /// Returns the destination placement tree prefix, if one was provided.
@@ -69,21 +77,15 @@ impl<DeviceTarget, SourceTarget, Donate, MayAlias> DevicePutOptions<DeviceTarget
         self.donate.as_ref()
     }
 
-    /// Returns the may-alias tree prefix, if one was provided.
+    /// Returns the aliasing tree prefix, if one was provided.
     #[inline]
     pub fn may_alias(&self) -> Option<&MayAlias> {
         self.may_alias.as_ref()
     }
 
-    /// Returns the destination, source, donation, and may-alias tree prefixes of these options.
+    /// Returns the destination, source, donation, and aliasing tree prefixes of these options.
     pub(crate) fn into_parts(self) -> (Option<DeviceTarget>, Option<SourceTarget>, Option<Donate>, Option<MayAlias>) {
         (self.device, self.source, self.donate, self.may_alias)
-    }
-
-    /// Creates a new [`DevicePutOptions`] with all fields unset.
-    #[inline]
-    pub fn empty() -> Self {
-        Self::new(None, None, None, None)
     }
 }
 
@@ -105,16 +107,16 @@ impl DevicePutOptions<DevicePutTarget, DevicePutTarget, bool, Option<bool>> {
 
 /// Leaf types accepted by [`Domain::device_put`].
 ///
-/// A [`DevicePutLeaf`] consumes one input leaf and materializes one runtime [`Array`] leaf. `ryft`
-/// currently provides implementations for runtime [`Array`] leaves, primitive scalar host values,
-/// and owned `ndarray::Array`s when the `ndarray` feature is enabled.
+/// A [`DevicePutLeaf`] consumes one input leaf and materializes one runtime [`Array`] leaf. `ryft` currently provides
+/// implementations for runtime [`Array`] leaves, primitive scalar host values, and owned `ndarray::Array`s when the
+/// `ndarray` feature is enabled.
 pub trait DevicePutLeaf<'c>: Parameter {
     /// Converts `self` into one runtime [`Array`] using the provided leafwise placement options.
     ///
     /// # Parameters
     ///
-    ///   - `domain`: [`Domain`] wrapping the PJRT client used to materialize any needed
-    ///     destination buffers and to cache any compiled reshard executables.
+    ///   - `domain`: [`Domain`] that provides the PJRT client used to materialize any needed destination buffers and
+    ///     the cache of any compiled reshard executables.
     ///   - `device`: Destination placement for this leaf, if one was specified.
     ///   - `source`: Source placement for this leaf, if one was specified.
     ///   - `donate`: Whether a compiled reshard may reuse the buffers of this leaf for the result.
@@ -207,9 +209,9 @@ impl<'c> Domain<'c> {
     /// Places `x` on devices. This is the `ryft` analogue of JAX's
     /// [`jax.device_put`](https://docs.jax.dev/en/latest/_autosummary/jax.device_put.html).
     ///
-    /// The input `x` may be one supported leaf or a `Parameterized` tree of supported leaves. Any
-    /// provided `device`, `source`, `donate`, and `may_alias` options follow tree-prefix broadcasting
-    /// semantics over `x`.
+    /// The input `x` may be one supported leaf or a [`Parameterized`] tree of supported leaves (i.e., of
+    /// [`DevicePutLeaf`]s). Any provided `device`, `source`, `donate`, and `may_alias` options follow tree prefix
+    /// broadcasting semantics over `x`.
     ///
     /// Host leaves are committed to the default local device when `options.device()` is absent. Existing
     /// [`Array`] leaves preserve their current placement when `options.device()` is absent.
@@ -284,36 +286,26 @@ impl<'c> Domain<'c> {
         let mut donate_values = donate_values.into_iter();
         let mut may_alias_values = may_alias_values.into_iter();
         for parameter in x.into_parameters() {
-            output_parameters.push(
-                parameter.device_put_leaf(
-                    self,
-                    device_values
-                        .next()
-                        .expect("device tree-prefix broadcasting should produce one placement per input leaf"),
-                    source_values
-                        .next()
-                        .expect("source tree-prefix broadcasting should produce one placement per input leaf"),
-                    donate_values
-                        .next()
-                        .expect("donate tree-prefix broadcasting should produce one flag per input leaf"),
-                    may_alias_values
-                        .next()
-                        .expect("may_alias tree-prefix broadcasting should produce one flag per input leaf"),
-                )?,
-            );
+            output_parameters.push(parameter.device_put_leaf(
+                self,
+                device_values.next().unwrap(),
+                source_values.next().unwrap(),
+                donate_values.next().unwrap(),
+                may_alias_values.next().unwrap(),
+            )?);
         }
         Input::To::<Array<'c>>::from_parameters(structure, output_parameters).map_err(Into::into)
     }
 }
 
 /// Host value that [`Domain::device_put`] uploads as one dense array.
-pub(crate) trait DenseHostDevicePutLeaf {
+trait DenseHostDevicePutLeaf {
     /// Returns the shape, the data type, and the row-major bytes in native byte order of this value.
     fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>);
 }
 
 /// Element of a dense host value that [`Domain::device_put`] uploads.
-pub(crate) trait DenseHostElement {
+trait DenseHostElement {
     /// [`DataType`] of the uploaded elements.
     const DATA_TYPE: DataType;
 
@@ -322,6 +314,7 @@ pub(crate) trait DenseHostElement {
 }
 
 macro_rules! impl_dense_host_element {
+    // Implements `DenseHostElement` for the primitive type `$ty`, whose native-endian bytes encode `$data_type`.
     ($ty:ty, $data_type:expr) => {
         impl DenseHostElement for $ty {
             const DATA_TYPE: DataType = $data_type;
@@ -369,6 +362,7 @@ impl_dense_host_element!(f32, DataType::F32);
 impl_dense_host_element!(f64, DataType::F64);
 
 macro_rules! impl_scalar_dense_host_leaf {
+    // Implements `DenseHostDevicePutLeaf` for the scalar `DenseHostElement` type `$ty` as a rank-0 host array.
     ($ty:ty) => {
         impl DenseHostDevicePutLeaf for $ty {
             fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>) {
@@ -414,19 +408,77 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension, Typed};
-    use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::BufferType;
 
     use crate::Session;
-    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::domains::tests::domain_mesh;
+    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
 
     use super::*;
 
+    // Returns the `f32` values that the devices of `array` hold, in the device order of its mesh.
+    fn shard_values(array: &Array<'_>) -> Vec<Vec<f32>> {
+        array
+            .shards()
+            .iter()
+            .map(|shard| values_from_bytes::<f32>(&shard.copy_to_host().unwrap()))
+            .collect()
+    }
+
     #[test]
-    fn test_device_put_broadcasts_root_placement_over_array_tuple() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+    fn test_device_put_options_new() {
+        let target = DevicePutTarget::Device(Device::new(3, 0));
+        let options =
+            DevicePutOptions::new(Some(target.clone()), Option::<DevicePutTarget>::None, Some(true), Some(Some(false)));
+        assert_eq!(options.device(), Some(&target));
+        assert_eq!(options.source(), None);
+        assert_eq!(options.donate(), Some(&true));
+        assert_eq!(options.may_alias(), Some(&Some(false)));
+        assert_eq!(options.into_parts(), (Some(target), None, Some(true), Some(Some(false))));
+    }
+
+    #[test]
+    fn test_device_put_options_empty() {
+        let options = DevicePutOptions::<DevicePutTarget, DevicePutTarget, bool, Option<bool>>::empty();
+        assert_eq!(options.into_parts(), (None, None, None, None));
+        assert_eq!(DevicePutOptions::defaults(), DevicePutOptions::empty());
+        assert_eq!(DevicePutOptions::default(), DevicePutOptions::defaults());
+    }
+
+    #[test]
+    fn test_domain_device_put_uploads_host_leaves() {
+        let client = cpu_client(2);
+        let domain = Session::new(&client).domain();
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[1]).unwrap();
+
+        // Without a destination, a host leaf is committed to the first local device.
+        let scalar = domain.device_put(2.5f32, DevicePutOptions::defaults()).unwrap();
+        let flag = domain.device_put(true, DevicePutOptions::defaults()).unwrap();
+        assert_eq!(scalar.r#type().into_owned().with_sharding(None).unwrap(), ArrayType::scalar(DataType::F32));
+        assert_eq!(scalar.mesh().devices(), [Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap()]);
+        assert_eq!(values_from_bytes::<f32>(&scalar.copy_to_host().unwrap()), vec![2.5]);
+        assert_eq!(flag.data_type(), DataType::Boolean);
+        assert_eq!(flag.copy_to_host().unwrap(), vec![1u8]);
+
+        // A destination device places the leaf on that device.
+        let placed = domain
+            .device_put(
+                bf16::from_f32(1.5),
+                DevicePutOptions::new(
+                    Some(DevicePutTarget::Device(device)),
+                    Option::<DevicePutTarget>::None,
+                    Option::<bool>::None,
+                    Option::<Option<bool>>::None,
+                ),
+            )
             .unwrap();
+        assert_eq!(placed.mesh().devices(), [device]);
+        assert_eq!(placed.copy_to_host().unwrap(), bf16::from_f32(1.5).to_bits().to_ne_bytes().to_vec());
+    }
+
+    #[test]
+    fn test_domain_device_put_broadcasts_root_placement_over_array_tuple() {
+        let client = cpu_client(2);
         let domain = Session::new(&client).domain();
         let client_devices = client.addressable_devices().unwrap();
         let source_mesh = DeviceMesh::new(
@@ -456,11 +508,7 @@ mod tests {
         )
         .unwrap();
 
-        let target_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
-            client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
-        )
-        .unwrap();
+        let target_mesh = domain_mesh(&client, "x", 2);
         let target_sharding =
             Sharding::new(target_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
 
@@ -496,38 +544,13 @@ mod tests {
             .trim_end()
             .to_string()
         );
-        let first_moved_shard_bytes = moved_arrays
-            .0
-            .device_shard(client_devices[1].id().unwrap())
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        assert_eq!(first_moved_shard_bytes.as_slice().len() % size_of::<f32>(), 0);
-        assert_eq!(values_from_bytes::<f32>(first_moved_shard_bytes.as_slice()), vec![2.0, 3.0]);
-        let second_moved_shard_bytes = moved_arrays
-            .1
-            .device_shard(client_devices[0].id().unwrap())
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        assert_eq!(second_moved_shard_bytes.as_slice().len() % size_of::<f32>(), 0);
-        assert_eq!(values_from_bytes::<f32>(second_moved_shard_bytes.as_slice()), vec![10.0, 11.0]);
+        assert_eq!(shard_values(&moved_arrays.0), vec![vec![0.0, 1.0], vec![2.0, 3.0]]);
+        assert_eq!(shard_values(&moved_arrays.1), vec![vec![10.0, 11.0], vec![12.0, 13.0]]);
     }
 
     #[test]
-    fn test_device_put_donation_and_aliasing() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
-            .unwrap();
+    fn test_domain_device_put_donation_and_aliasing() {
+        let client = cpu_client(2);
         let domain = Session::new(&client).domain();
         let devices = client
             .addressable_devices()
@@ -554,16 +577,6 @@ mod tests {
             values_to_bytes(&[1f32, 2., 3., 4.]),
         )
         .unwrap();
-        let device_values = |array: &Array<'_>| {
-            array
-                .shards()
-                .iter()
-                .map(|shard| {
-                    let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
-                    values_from_bytes::<f32>(bytes.as_slice())
-                })
-                .collect::<Vec<_>>()
-        };
         let shares_source_buffer = |array: &Array<'_>| {
             array
                 .shards()
@@ -582,32 +595,29 @@ mod tests {
         assert_eq!(copied.r#type(), source.r#type());
         assert_eq!(copied.mesh(), source.mesh());
         assert_eq!(shares_source_buffer(&copied), vec![false]);
-        assert_eq!(device_values(&copied), vec![vec![1., 2., 3., 4.]]);
+        assert_eq!(shard_values(&copied), vec![vec![1., 2., 3., 4.]]);
 
         // A shard that stays on its device shares its buffer unless aliasing is forbidden.
         let target = DevicePutTarget::placement(mesh.clone(), replicated).unwrap();
         let placed = domain.device_put(source.clone(), options(Some(target.clone()), false, None)).unwrap();
         assert_eq!(shares_source_buffer(&placed), vec![true, false]);
-        assert_eq!(device_values(&placed), vec![vec![1., 2., 3., 4.]; 2]);
+        assert_eq!(shard_values(&placed), vec![vec![1., 2., 3., 4.]; 2]);
         let placed = domain.device_put(source.clone(), options(Some(target), false, Some(false))).unwrap();
         assert_eq!(shares_source_buffer(&placed), vec![false, false]);
-        assert_eq!(device_values(&placed), vec![vec![1., 2., 3., 4.]; 2]);
+        assert_eq!(shard_values(&placed), vec![vec![1., 2., 3., 4.]; 2]);
 
         // A donated leaf is consumed. This one shares its buffers with `source`, so the donation does not take effect
         // and `source` stays readable.
         let target = DevicePutTarget::placement(mesh, sharded.clone()).unwrap();
         let donated = domain.device_put(source.clone(), options(Some(target), true, None)).unwrap();
         assert_eq!(donated.sharding(), &sharded);
-        assert_eq!(device_values(&donated), vec![vec![1., 2.], vec![3., 4.]]);
-        assert_eq!(device_values(&source), vec![vec![1., 2., 3., 4.]]);
+        assert_eq!(shard_values(&donated), vec![vec![1., 2.], vec![3., 4.]]);
+        assert_eq!(shard_values(&source), vec![vec![1., 2., 3., 4.]]);
     }
 
     #[test]
-    fn test_device_put_preserves_partially_addressable_array_when_device_is_absent() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+    fn test_domain_device_put_preserves_partially_addressable_array_when_device_is_absent() {
+        let client = cpu_client(1);
         let domain = Session::new(&client).domain();
         let local_device = client.addressable_devices().unwrap().remove(0);
         let local_device_id = local_device.id().unwrap();
@@ -637,34 +647,17 @@ mod tests {
 
         assert_eq!(copied_array.addressable_shards().count(), 1);
         assert_eq!(copied_array.sharding().visualize().unwrap().render(false), expected_visualization);
-        let copied_shard_bytes = copied_array
-            .device_shard(local_device_id)
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        assert_eq!(copied_shard_bytes.as_slice().len() % size_of::<f32>(), 0);
+        let copied_shard_bytes = copied_array.device_shard(local_device_id).unwrap().copy_to_host().unwrap();
         assert_eq!(values_from_bytes::<f32>(copied_shard_bytes.as_slice()), vec![0.0, 1.0]);
         assert!(copied_array.device_shard(remote_device_id).unwrap().buffer().is_none());
     }
 
     #[test]
-    fn test_device_put_rejects_mismatched_source_for_array_leaf() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
+    fn test_domain_device_put_rejects_mismatched_source_for_array_leaf() {
+        let client = cpu_client(1);
         let domain = Session::new(&client).domain();
-        let client_device = client.addressable_devices().unwrap().remove(0);
-        let source_device = Device::from_pjrt(client_device).unwrap();
-        let source_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
-            vec![source_device],
-        )
-        .unwrap();
+        let source_mesh = domain_mesh(&client, "x", 1);
+        let source_device = source_mesh.devices()[0];
         let source_sharding = Sharding::replicated(source_mesh.logical_mesh().clone(), 1);
         let source_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(2)]))
             .with_sharding(source_sharding.clone())
@@ -679,8 +672,8 @@ mod tests {
         let expected_source = DevicePutTarget::device(Device::new(source_device.id() + 1, 0)).resolve(1).unwrap();
         let actual_source = (source_mesh, source_sharding);
 
-        assert!(matches!(
-            domain.device_put(
+        let error = domain
+            .device_put(
                 source_array,
                 DevicePutOptions::new(
                     Option::<DevicePutTarget>::None,
@@ -688,8 +681,19 @@ mod tests {
                     Option::<bool>::None,
                     Option::<Option<bool>>::None,
                 ),
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "`device_put` source mesh `{:?}` with sharding `{:?}` does not match the array's current mesh `{:?}` \
+                 with sharding `{:?}`",
+                expected_source.0, expected_source.1, actual_source.0, actual_source.1,
             ),
-            Err(Error::Array(error)) if matches!(error.as_ref(),
+        );
+        assert!(matches!(
+            &error,
+            Error::Array(error) if matches!(error.as_ref(),
                 ArrayError::SourcePlacementMismatch {
                     expected_mesh: reported_expected_mesh,
                     expected_sharding: reported_expected_sharding,

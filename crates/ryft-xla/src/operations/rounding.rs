@@ -9,11 +9,12 @@ impl LowerableOperation for FloorOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::floor(input_values[0], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.floor should return one result").as_ref()])
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::floor(input_values[0], lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -22,11 +23,12 @@ impl LowerableOperation for CeilOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::ceil(input_values[0], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.ceil should return one result").as_ref()])
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::ceil(input_values[0], lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -35,13 +37,14 @@ impl LowerableOperation for RoundOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (input_types, output_types);
         let result = lowerer
-            .block
-            .append_operation(stable_hlo::round_with_nearest_even_tie_break(input_values[0], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.round_nearest_even should return one result").as_ref()])
+            .block()
+            .append_operation(stable_hlo::round_with_nearest_even_tie_break(input_values[0], lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -72,7 +75,8 @@ mod tests {
             [-0f32, 0.0, -1.0, 0.0, -1.0, 0.0, 1.0, 2.0].map(f32::to_bits),
         );
 
-        // Exponent-only floats cannot represent zero, so rounding down to zero produces NaN instead of failing.
+        // Floats with only exponent bits cannot represent zero, so rounding down to zero produces NaN instead of
+        // failing.
         let input = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[4], &F8E8M0FNU_INPUTS);
         assert_eq!(input.floor().unwrap().copy_to_host().unwrap(), [255, 255, 127, 255]);
     }
@@ -88,7 +92,7 @@ mod tests {
             [-0f32, 0.0, -0.0, 1.0, -0.0, 1.0, 2.0, 3.0].map(f32::to_bits),
         );
 
-        // Rounding up stays representable in the exponent-only format, while NaN remains NaN.
+        // Rounding up stays representable in the format with only exponent bits, while NaN remains NaN.
         let input = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[4], &F8E8M0FNU_INPUTS);
         assert_eq!(input.ceil().unwrap().copy_to_host().unwrap(), [127, 127, 127, 255]);
     }
@@ -104,7 +108,7 @@ mod tests {
             [-0f32, 0.0, -0.0, 0.0, -0.0, 0.0, 2.0, 2.0].map(f32::to_bits),
         );
 
-        // Exponent-only floats cannot represent zero, so rounding to zero produces NaN instead of failing.
+        // Floats with only exponent bits cannot represent zero, so rounding to zero produces NaN instead of failing.
         let input = replicated_array(&domain, &mesh, DataType::F8E8M0FNU, &[4], &F8E8M0FNU_INPUTS);
         assert_eq!(input.round().unwrap().copy_to_host().unwrap(), [255, 255, 127, 255]);
     }

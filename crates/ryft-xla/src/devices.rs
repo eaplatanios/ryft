@@ -1,3 +1,6 @@
+//! Conversion of PJRT devices into `ryft-core` [`Device`]s, which identify a device by its identifier and the index
+//! of the process that owns it.
+
 use ryft_core::Device;
 use ryft_pjrt::Device as PjrtDevice;
 

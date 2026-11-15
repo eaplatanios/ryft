@@ -1,3 +1,18 @@
+//! Execution of compiled XLA programs through PJRT.
+//!
+//! Every [`CompiledProgram`] carries an `ExecutionPlan` that is derived once when the program is compiled or loaded.
+//! The plan records the physical input types, the default donation requests, the addressable devices, and, when every
+//! output has a static type and a fixed placement, the output layouts, so that each execution only reads it.
+//!
+//! Programs without external reference state execute through `Domain::execute_compiled_async`, which validates the
+//! inputs, materializes their physical form (i.e., pads bounded dynamic inputs, allocates carriers for inputs of the
+//! zero data type, reshards them, and converts their layouts), submits them to PJRT, and reconstructs the logical
+//! outputs from the returned buffers. Programs with external reference state execute through
+//! [`StatefulCompilationDomain::execute_statefully`], which locks the bound references in ascending identity order,
+//! submits the execution with snapshots of their states, and commits the hidden final state outputs as reference
+//! replacements. [`ExecutionArguments`] groups physical input buffers by device, and [`ExecutionError`] describes the
+//! failures of this lifecycle, including those of ordered effects.
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -30,7 +45,7 @@ use crate::{Array, ArrayError, ArrayShard, CompilationError, Domain, Error, From
 
 // TODO(eaplatanios): Review this module.
 
-/// XLA invocation, runtime capability, completion, and effect-recovery failures.
+/// XLA invocation, runtime capability, completion, and effect recovery failures.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum ExecutionError {
     /// The executable belongs to a different live PJRT client.
@@ -57,7 +72,7 @@ pub enum ExecutionError {
     #[error("compiled runtime assertions are not supported on XLA platform `{platform}`")]
     UnsupportedAssertionPlatform { platform: String },
 
-    /// The selected platform has no qualified native ordered-I/O token transport.
+    /// The selected platform has no qualified native token transport for ordered I/O.
     #[error("native ordered I/O transport is not yet verified on platform `{platform}`")]
     UnsupportedEffectPlatform { platform: String },
 
@@ -65,7 +80,7 @@ pub enum ExecutionError {
     #[error("ordered I/O requires a fixed fully addressable single-process device assignment")]
     UnsupportedEffectDeviceAssignment,
 
-    /// Multi-device ordered I/O was declared without the required device-ordering contract.
+    /// Multi-device ordered I/O was declared without the required device ordering contract.
     #[error("multi-device ordered I/O requires every ordered occurrence to declare `DeviceOrderedIo`")]
     MissingDeviceOrderedEffect,
 
@@ -101,53 +116,7 @@ pub enum ExecutionError {
     PrematureAcknowledgment,
 }
 
-/// Backend-neutral completion adapter for one submitted PJRT execution.
-struct ReferenceCompletion {
-    /// Whole-execution fence joining every addressable device event.
-    fence: ExecutionFence,
-}
-
-impl ReferenceCompletionBackend for ReferenceCompletion {
-    fn r#await(&self) -> Result<(), Arc<str>> {
-        self.fence.block_until_ready().map_err(|error| Arc::from(error.to_string()))
-    }
-
-    fn is_ready(&self) -> Result<bool, Arc<str>> {
-        self.fence.is_ready().map_err(|error| Arc::from(error.to_string()))
-    }
-}
-
-/// Fully materialized physical arguments and logical refinements prepared before PJRT submission.
-struct PreparedExecution<'c> {
-    /// Fully materialized physical arrays in executable argument order.
-    inputs: Vec<Array<'c>>,
-
-    /// Addressable devices in executable order.
-    addressable_device_ids: Arc<[DeviceId]>,
-
-    /// Effective physical donation request for every input.
-    donation_flags: Vec<bool>,
-
-    /// Runtime refinements established from the unmaterialized logical inputs.
-    input_refinements: <ArrayType as Type>::Refinements,
-
-    /// Physical result count expected from every addressable device.
-    physical_output_count: usize,
-}
-
-impl<'c> PreparedExecution<'c> {
-    /// Consumes the materialized arrays into device-major PJRT arguments.
-    fn into_arguments(self) -> Result<(ExecutionArguments<'c>, <ArrayType as Type>::Refinements, usize), Error> {
-        let arguments = ExecutionArguments::from_arrays_with_donation(
-            self.inputs,
-            self.addressable_device_ids,
-            self.donation_flags.as_slice(),
-        )?;
-        Ok((arguments, self.input_refinements, self.physical_output_count))
-    }
-}
-
-/// Execution metadata of an [`CompiledProgram`] that does not depend on the values that it is called with. It is
+/// Execution metadata of a [`CompiledProgram`] that does not depend on the values that it is called with. It is
 /// computed once when the program is compiled or loaded, so that each execution only reads it instead of re-deriving
 /// physical types, device assignments, donation requests, and output placements, and instead of querying PJRT.
 pub(super) struct ExecutionPlan {
@@ -166,12 +135,13 @@ pub(super) struct ExecutionPlan {
     /// Whether every logical input type has a static shape. Refining such inputs reduces to comparing types.
     static_inputs: bool,
 
-    /// Whether any physical array input has the zero-space data type and thus needs a materialized carrier.
+    /// Whether any physical array input has the zero data type (i.e., [`DataType::Zero`]) and thus needs a
+    /// materialized carrier.
     zero_space_inputs: bool,
 
     /// Placement of every logical output, present when every output has a static type, every output without a
-    /// physical result is zero-space, and the program runs on a single device or declares a sharding without
-    /// `Unconstrained` dimensions for every output (which XLA must then honor). The outputs of such programs are built
+    /// physical result has the zero data type, and the program runs on a single device or declares a sharding without
+    /// `Unconstrained` dimensions for every output, which XLA must then honor. The outputs of such programs are built
     /// directly from the returned buffers.
     output_layouts: Option<Vec<ArrayOutputLayout>>,
 }
@@ -296,6 +266,8 @@ impl ExecutionPlan {
     }
 }
 
+/// Physical input buffers of one PJRT execution, grouped by addressable device in the order in which
+/// [`LoadedExecutable::execute`] consumes them.
 pub struct ExecutionArguments<'o> {
     /// Addressable devices in the same order as [`Self::inputs_by_device`].
     addressable_device_ids: Arc<[DeviceId]>,
@@ -315,8 +287,8 @@ impl<'o> ExecutionArguments<'o> {
 
     /// Creates execution arguments from `arrays`, honoring `donation_flags` only for arrays whose shard buffers are
     /// uniquely owned. A requested donation is silently downgraded to a non-donating input when any shard buffer is
-    /// shared (for example, by another clone of the array or by a retained materialization cache); callers that need
-    /// to observe the effective decision can inspect [`ExecutionInput::donatable`] on the result.
+    /// shared (e.g., by another clone of the array or by a retained materialization cache). Callers that need to
+    /// observe the effective decision can inspect [`ExecutionInput::donatable`] on the result.
     pub fn from_arrays_with_donation(
         arrays: Vec<Array<'o>>,
         addressable_device_ids: Arc<[DeviceId]>,
@@ -375,14 +347,14 @@ impl<'o> ExecutionArguments<'o> {
         self.inputs_by_device.as_slice()
     }
 
-    /// Creates PJRT `ExecutionDeviceInputs` in the same device order as [`Self::addressable_device_ids`].
+    /// Creates PJRT [`ExecutionDeviceInputs`] in the same device order as [`Self::addressable_device_ids`].
     pub fn as_execution_device_inputs<'l>(&'l self) -> Vec<ExecutionDeviceInputs<'o, 'l>> {
         self.inputs_by_device.iter().map(|inputs| ExecutionDeviceInputs::from(inputs.as_slice())).collect()
     }
 
     /// Appends one non-donatable hidden input per addressable device. The execution boundary validates the device
-    /// assignment before calling this function; hidden tokens never pass through numerical array construction.
-    pub(crate) fn push_input_buffers(&mut self, buffers: Vec<Arc<Buffer<'o>>>) {
+    /// assignment before calling this function, and hidden tokens never pass through numerical array construction.
+    fn push_input_buffers(&mut self, buffers: Vec<Arc<Buffer<'o>>>) {
         assert_eq!(buffers.len(), self.inputs_by_device.len());
         for (inputs, buffer) in self.inputs_by_device.iter_mut().zip(buffers) {
             inputs.push(ExecutionInput::from(buffer));
@@ -419,31 +391,31 @@ impl<'c> Domain<'c> {
         }
     }
 
-    /// Enqueues a stateless `program` and returns its possibly still pending flat outputs together with a
-    /// whole-execution fence. Programs with external reference state must flow through the stateful call surface
-    /// instead, which owns the reference transaction and the hidden final-state outputs.
+    /// Enqueues a stateless `program` and returns its possibly still pending flat outputs together with the fence of
+    /// the whole execution. Programs with external reference state must flow through the stateful call surface
+    /// instead, which owns the reference transaction and the hidden outputs that carry final reference states.
     ///
     /// The backend may execute inline or return pending arrays and a completion fence. This function adds no wait
-    /// solely because public outputs are empty. Bounded-dynamic boundaries can introduce additional waits:
-    /// below-bound inputs perform device-to-host copies and bound-shaped uploads before launch, and each dynamic
-    /// output reads its hidden extent scalar before constructing the logical output type. Erased zero-space inputs
-    /// await producer completion before launch because they have no physical buffer to carry that dependency.
+    /// solely because public outputs are empty. Bounded dynamic boundaries can introduce additional waits. Inputs
+    /// below their bounds perform device-to-host copies and uploads padded to those bounds before launch, and each
+    /// dynamic output reads its hidden extent scalar before constructing the logical output type. Erased inputs of the
+    /// zero data type await producer completion before launch because they have no physical buffer to carry that
+    /// dependency.
     pub(crate) fn execute_compiled_async(
         &self,
         program: &CompiledProgram<'c>,
         inputs: Vec<Array<'c>>,
     ) -> Result<Execution<Vec<Array<'c>>>, Error> {
-        // Public call surfaces screen stateful programs out before reaching this entry point: only the stateful call
-        // path owns holder leases and pending generations, so a stateful program arriving here must already carry
-        // state values as plain arrays (as ABI-level tests do), and its hidden final-state outputs are returned
-        // verbatim.
+        // Public call surfaces screen stateful programs out before reaching this entry point, because only the
+        // stateful call path owns holder leases and pending generations. A stateful program arriving here must
+        // therefore already carry state values as plain arrays (e.g., as ABI tests do), and its hidden outputs that
+        // carry final reference states are returned verbatim.
         let prepared = self.prepare_compiled_execution(program, inputs, &[])?;
         let (arguments, input_refinements, physical_output_count) = prepared.into_arguments()?;
         let execution = self.execute_pjrt_buffers(program, arguments, physical_output_count, |_| {})?;
         let (physical_outputs, fence) = execution.into_parts();
         let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
-        let outputs = reconstruct_compiled_outputs(
-            self,
+        let outputs = self.reconstruct_compiled_outputs(
             program,
             &mut physical_outputs,
             fence.clone(),
@@ -460,6 +432,65 @@ impl<'c> Domain<'c> {
             );
         }
         Ok(Execution::new(outputs, fence))
+    }
+
+    /// Executes a compiled program without external reference state on flat `inputs`, which implements
+    /// [`CompilationDomain::execute`](ryft_core::CompilationDomain::execute), and returns its public outputs together
+    /// with the completion fence of the whole execution.
+    ///
+    /// The returned output arrays already carry the fence individually, so `CompilationDomain::execute` drops the
+    /// returned fence. The stateful asynchronous surface threads it into a completion instead, so that awaiting a
+    /// reference-free invocation still observes asynchronous execution errors. When the program has no outputs, the
+    /// effect scope retains effectful completion. Only pure calls without outputs explicitly wait.
+    pub(super) fn execute_stateless(
+        &self,
+        program: &CompiledProgram<'c>,
+        inputs: Vec<Value<'c>>,
+    ) -> Result<(Vec<Value<'c>>, ExecutionFence), Error> {
+        if program.requires_stateful_call() {
+            return Err(Error::Execution(ExecutionError::StatefulInvocationRequired));
+        }
+        check_count!("input", inputs, program.input_types().len(), ProgramError);
+        for (declared, input) in program.input_types().iter().zip(&inputs) {
+            // Array inputs borrow their types, while the array IR type of other inputs is built only to report them.
+            match input {
+                Value::Array(array) => validate_input_type(declared, &array.r#type())?,
+                input => validate_input_type(
+                    declared,
+                    <&ArrayType>::try_from(input.r#type().as_ref()).map_err(ProgramError::from)?,
+                )?,
+            }
+        }
+        let inputs = inputs
+            .into_iter()
+            .map(ValueProjection::<ArrayType>::into_projected)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ProgramError::from)?;
+        let execution = self.execute_compiled_async(program, inputs)?;
+        if execution.output().is_empty() && !program.signature().has_effects() {
+            execution.fence().block_until_ready()?;
+        }
+        let (outputs, fence) = execution.into_parts();
+        validate_runtime_outputs(program.output_types(), &outputs)?;
+        Ok((outputs.into_iter().map(Value::Array).collect(), fence))
+    }
+
+    /// Executes a program with array inputs. Output arrays retain completion, while an execution without outputs or
+    /// effects waits here so failures remain observable.
+    pub(crate) fn execute_program(
+        &self,
+        program: &CompiledProgram<'c>,
+        inputs: Vec<Array<'c>>,
+    ) -> Result<Vec<Array<'c>>, Error> {
+        let execution = self.execute_compiled_async(program, inputs)?;
+        if execution.output().is_empty() && !program.signature().has_effects() {
+            // No output array carries the execution fence out of this call, so an asynchronous execution error would
+            // otherwise be unobservable. Block here so this synchronous entry point still reports it.
+            let (outputs, fence) = execution.into_parts();
+            fence.block_until_ready()?;
+            return Ok(outputs);
+        }
+        Ok(execution.into_output())
     }
 
     /// Materializes and validates physical execution arguments without submitting device work.
@@ -516,7 +547,7 @@ impl<'c> Domain<'c> {
             (input_refinements, Some(actual_input_types))
         };
 
-        // Erased zero-space inputs have no buffers through which PJRT could order consumer work after their
+        // Erased inputs of the zero data type have no buffers through which PJRT could order consumer work after their
         // producers. Observe completion before dropping those inputs, including before any consumer effects run.
         for (input, physical_index) in inputs.iter().zip(program.signature().input_mapping()) {
             if physical_index.is_none() {
@@ -524,8 +555,8 @@ impl<'c> Domain<'c> {
             }
         }
 
-        // Without hidden extent scalars, physical inputs are a projection of the logical inputs (which is the identity
-        // for most programs); bounded-dynamic inputs are padded to their physical bounds instead.
+        // Without hidden extent scalars, physical inputs are a projection of the logical inputs, which is the identity
+        // for most programs. Bounded dynamic inputs are padded to their physical bounds instead.
         let inputs = if program.signature().input_dimensions().is_empty() {
             if plan.physical_input_logical_indices.iter().copied().eq(0..inputs.len()) {
                 inputs
@@ -547,24 +578,27 @@ impl<'c> Domain<'c> {
             .into_inputs()
         };
         let inputs = if plan.zero_space_inputs {
-            materialize_zero_space_carriers(self, plan.physical_input_types.as_slice(), inputs)?
+            self.materialize_zero_space_carriers(plan.physical_input_types.as_slice(), inputs)?
         } else {
             inputs
         };
-        let mut inputs = reshard_inputs_if_needed(self, program.mesh(), program.expected_argument_shardings(), inputs)?;
+        let mut inputs =
+            self.reshard_inputs_if_needed(program.mesh(), program.expected_argument_shardings(), inputs)?;
         // A logical input without a layout constraint admits any physical representation. Match the compiled
         // signature before handing buffers to PJRT, which otherwise reads their storage in its expected order.
         // Known layouts convert on device through the existing capability. Unknown layouts require observing the
-        // shard buffers; only a mismatch takes the dense host fallback, which also handles differently laid-out shards.
+        // shard buffers. Only a mismatch takes the dense host fallback, which also handles shards with differing
+        // layouts.
         for (input, physical_type) in inputs.iter_mut().zip(&plan.physical_input_types) {
             if input.data_type().is_zero() {
                 continue;
             }
-            let expected = physical_type.layout().expect("the execution plan records every physical input layout");
+            let expected = physical_type.layout().unwrap();
             if let Some(actual) = input.layout() {
                 if actual != expected {
                     // A representation adapter owns its small compilation signature, so do not inherit a caller's
-                    // low-level parameter/result shape overrides. Keep the same session, mesh and effect scope.
+                    // low-level overrides of parameter and result shapes. Keep the same session, mesh, and effect
+                    // scope.
                     let conversion_domain = self.with_compilation_options(CompilationOptions::default());
                     let source = input.clone().associate(&conversion_domain)?;
                     *input = source.cast(source.r#type().into_owned().with_layout(expected.clone()), &[])?;
@@ -626,48 +660,6 @@ impl<'c> Domain<'c> {
         })
     }
 
-    /// Executes a compiled program without external reference state on flat `inputs` (refer to
-    /// [`CompilationDomain::execute`](ryft_core::CompilationDomain::execute)) and returns its public outputs together
-    /// with the whole-execution completion fence.
-    ///
-    /// The returned output arrays already carry the fence individually, so
-    /// [`CompilationDomain::execute`](ryft_core::CompilationDomain::execute) drops the returned fence; the stateful
-    /// asynchronous surface threads it into a completion instead so that awaiting a reference-free invocation still
-    /// observes asynchronous execution errors. When the program has no outputs, the effect scope retains effectful
-    /// completion. Only pure zero-output calls explicitly wait.
-    pub(super) fn execute_stateless(
-        &self,
-        program: &CompiledProgram<'c>,
-        inputs: Vec<Value<'c>>,
-    ) -> Result<(Vec<Value<'c>>, ExecutionFence), Error> {
-        if program.requires_stateful_call() {
-            return Err(Error::Execution(ExecutionError::StatefulInvocationRequired));
-        }
-        check_count!("input", inputs, program.input_types().len(), ProgramError);
-        for (declared, input) in program.input_types().iter().zip(&inputs) {
-            // Array inputs borrow their types, while the array IR type of other inputs is built only to report them.
-            match input {
-                Value::Array(array) => validate_input_type(declared, &array.r#type())?,
-                input => validate_input_type(
-                    declared,
-                    <&ArrayType>::try_from(input.r#type().as_ref()).map_err(ProgramError::from)?,
-                )?,
-            }
-        }
-        let inputs = inputs
-            .into_iter()
-            .map(ValueProjection::<ArrayType>::into_projected)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(ProgramError::from)?;
-        let execution = self.execute_compiled_async(program, inputs)?;
-        if execution.output().is_empty() && !program.signature().has_effects() {
-            execution.fence().block_until_ready()?;
-        }
-        let (outputs, fence) = execution.into_parts();
-        validate_runtime_outputs(program.output_types(), &outputs)?;
-        Ok((outputs.into_iter().map(Value::Array).collect(), fence))
-    }
-
     /// Locks one stateful reference while preserving reference lifecycle errors through [`Error::Core`].
     fn lock_stateful_reference<'g>(
         reference: &'g ArrayReference<Array<'c>>,
@@ -681,9 +673,9 @@ impl<'c> Domain<'c> {
         })
     }
 
-    /// Submits a stateful execution of a compiled program on flat `inputs` (refer to
-    /// [`StatefulCompilationDomain::execute_statefully`]), publishes its dependencies, and commits hidden final
-    /// states without waiting for device completion when the logical boundary is static.
+    /// Submits a stateful execution of a compiled program on flat `inputs`, which implements
+    /// [`StatefulCompilationDomain::execute_statefully`], publishes its dependencies, and commits hidden final states
+    /// without waiting for device completion when the logical boundary is static.
     fn execute_stateful_async(
         &self,
         program: &CompiledProgram<'c>,
@@ -694,7 +686,8 @@ impl<'c> Domain<'c> {
         }
         if program.reference_states().is_empty() {
             // A reference-free invocation binds no holders, but the completion contract still promises that awaiting
-            // the result observes whole-invocation completion, so the execution fence rides along as the completion.
+            // the result observes completion of the whole invocation, so the execution fence rides along as the
+            // completion.
             return match self.execute_stateless(program, inputs) {
                 Ok((output, fence)) => StatefulExecution::pending(
                     Ok(output),
@@ -713,8 +706,8 @@ impl<'c> Domain<'c> {
                 .collect::<Result<Vec<_>, _>>()?;
 
             // Discharge retains each reference's position but replaces its type with the referent's array type.
-            // The compiled binding table restores that distinction without a caller-supplied signature. Its indices
-            // are validated in increasing order during lowering and persistent executable restoration.
+            // The compiled binding table restores that distinction without a signature supplied by the caller. Its
+            // indices are validated in increasing order during lowering and persistent executable restoration.
             for (index, (declared, input)) in program.input_types().iter().zip(&inputs).enumerate() {
                 let expects_reference = reference_state_input_indices.binary_search(&index).is_ok();
                 match (expects_reference, input) {
@@ -788,9 +781,10 @@ impl<'c> Domain<'c> {
                 }
                 bindings.push((reference.id(), reference.clone()));
             }
-            // Every in-repo multi-holder path acquires guards in ascending identity order. This ordering is the
-            // deadlock-prevention invariant for overlapping stateful calls and must be preserved while guards remain
-            // held from submission through hidden-state replacement commit below.
+            // Every path in this repository that locks multiple holders acquires their guards in ascending identity
+            // order. This ordering is the invariant that prevents deadlocks between overlapping stateful calls, and it
+            // must be preserved while guards remain held from submission through the commit of hidden state
+            // replacements below.
             bindings.sort_by_key(|(id, _)| *id);
             let guard_indices =
                 bindings.iter().enumerate().map(|(index, (id, _))| (*id, index)).collect::<BTreeMap<_, _>>();
@@ -886,8 +880,8 @@ impl<'c> Domain<'c> {
                 }
 
                 // Current observations still describe these snapshots. A pending observation may have become ready at
-                // the same generation; retaining its now-completed dependency is harmless and keeps one coherent
-                // value-generation-dependency tuple throughout the retry attempt.
+                // the same generation. Retaining its dependency, which has now completed, is harmless and keeps the
+                // value, generation, and dependency of each observation coherent throughout the retry attempt.
                 let dependencies =
                     observations.iter().filter_map(|observation| observation.dependency().cloned()).collect::<Vec<_>>();
                 // Observation validation under the ordered guards commits this attempt. Dropping the original logical
@@ -959,8 +953,7 @@ impl<'c> Domain<'c> {
                         "injected failure before hidden state replacement commit".to_string(),
                     )));
                 }
-                let hidden_outputs = reconstruct_compiled_outputs(
-                    self,
+                let hidden_outputs = self.reconstruct_compiled_outputs(
                     program,
                     &mut physical_outputs,
                     fence.clone(),
@@ -1026,10 +1019,10 @@ impl<'c> Domain<'c> {
             }
             let committed_replacement_guards =
                 validated_replacements.into_iter().map(|replacement| replacement.commit()).collect::<Vec<_>>();
-            // Mutated hidden outputs are statically shaped under the current ABI, so neither buffer logical-shape
-            // queries nor runtime-extent materialization can wait for device execution during replacement commit.
-            // Release every reference guard before public reconstruction, where dynamic outputs may require either
-            // wait.
+            // Mutated hidden outputs are statically shaped under the current ABI, so neither queries of logical buffer
+            // shapes nor materialization of runtime extents can wait for device execution during the replacement
+            // commit. Release every reference guard before public reconstruction, where dynamic outputs may require
+            // either wait.
             drop(committed_replacement_guards);
             drop(read_only_guards);
 
@@ -1040,8 +1033,7 @@ impl<'c> Domain<'c> {
                         "injected failure before public output reconstruction".to_string(),
                     )));
                 }
-                let public_outputs = reconstruct_compiled_outputs(
-                    self,
+                let public_outputs = self.reconstruct_compiled_outputs(
                     program,
                     &mut physical_outputs,
                     fence,
@@ -1071,289 +1063,19 @@ impl<'c> Domain<'c> {
             Err(error) => StatefulExecution::ready(Err(error)),
         }
     }
-}
 
-impl<'c> StatefulCompilationDomain for Domain<'c> {
-    fn execute_statefully(
-        &self,
-        program: &CompiledProgram<'c>,
-        inputs: Vec<Value<'c>>,
-    ) -> StatefulExecution<Vec<Value<'c>>, Self::Error> {
-        self.execute_stateful_async(program, inputs)
-    }
-}
-
-impl<'c> Domain<'c> {
-    /// Executes a program with array inputs. Output arrays retain completion, while an execution without outputs or
-    /// effects waits here so failures remain observable.
-    pub(crate) fn execute_program(
-        &self,
-        program: &CompiledProgram<'c>,
-        inputs: Vec<Array<'c>>,
-    ) -> Result<Vec<Array<'c>>, Error> {
-        let execution = self.execute_compiled_async(program, inputs)?;
-        if execution.output().is_empty() && !program.signature().has_effects() {
-            // No output array carries the execution fence out of this call, so an asynchronous execution error would
-            // otherwise be unobservable. Block here so this synchronous entry point still reports it.
-            let (outputs, fence) = execution.into_parts();
-            fence.block_until_ready()?;
-            return Ok(outputs);
-        }
-        Ok(execution.into_output())
-    }
-}
-
-/// Returns device IDs in replica-major, then computation-partition-major order.
-pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment) -> Result<Vec<u64>, Error> {
-    let mut devices = Vec::with_capacity(assignment.replica_count() * assignment.computation_count());
-    for replica in 0..assignment.replica_count() {
-        for partition in 0..assignment.computation_count() {
-            devices.push(assignment.device_id(replica, partition)? as u64);
-        }
-    }
-    Ok(devices)
-}
-
-/// Validates runtime refinement of a declared logical input type, excluding sharding because placement is resolved
-/// separately at the call boundary.
-pub(crate) fn validate_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), Error> {
-    // Calls of a specialization ordinarily pass inputs of exactly its declared types, which refine them trivially.
-    if declared == actual {
-        return Ok(());
-    }
-    let declared_without_sharding = declared.clone().with_sharding(None)?;
-    let actual_without_sharding = actual.clone().with_sharding(None)?;
-    if declared_without_sharding.is_refined_by(&actual_without_sharding) {
-        Ok(())
-    } else {
-        Err(ProgramError::InvalidArgument {
-            message: format!("runtime input type {actual} does not refine declared type {declared}"),
-        }
-        .into())
-    }
-}
-
-/// Validates output arity and refinement of the declared logical output types, including sharding.
-pub(crate) fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[Array<'_>]) -> Result<(), Error> {
-    if declared.len() != outputs.len() {
-        return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: outputs.len() }.into());
-    }
-    for (declared, actual) in declared.iter().zip(outputs.iter().map(Typed::r#type)) {
-        if declared != actual.as_ref() && !declared.is_refined_by(actual.as_ref()) {
-            return Err(ProgramError::InvalidArgument {
-                message: format!("runtime output type {actual} does not refine declared type {declared}"),
-            }
-            .into());
-        }
-    }
-    Ok(())
-}
-
-/// Reshards `inputs` to match `expected_shardings` at the call boundary. Inputs that already
-/// match skip the reshard entirely; the implicit-reshard path is the cold path.
-fn reshard_inputs_if_needed<'c>(
-    domain: &Domain<'c>,
-    mesh: &DeviceMesh,
-    expected_shardings: &[Sharding],
-    inputs: Vec<Array<'c>>,
-) -> Result<Vec<Array<'c>>, Error> {
-    let needs_reshard = inputs.iter().zip(expected_shardings).any(|(array, expected)| array.sharding() != expected);
-    if !needs_reshard {
-        return Ok(inputs);
-    }
-    inputs
-        .into_iter()
-        .zip(expected_shardings)
-        .map(|(array, expected)| {
-            if array.sharding() == expected {
-                Ok(array)
-            } else {
-                array.reshard_on_devices(domain, mesh, expected, false)
-            }
-        })
-        .collect()
-}
-
-/// Materializes private false-predicate carriers for zero-space inputs that remain in the physical executable
-/// signature, currently because their declared type contains dynamic dimensions. Static zero-space inputs are erased
-/// before this point and never allocate a carrier.
-///
-/// Each carrier is allocated at the input's *physical* (bound-shaped) type from `physical_input_types`, not at the
-/// value's runtime type: the compiled module declares the bound-shaped `i1` argument, and the hidden extent scalar
-/// transports the logical size, so a below-bound zero-space input must still hand PJRT a bound-shaped buffer.
-fn materialize_zero_space_carriers<'c>(
-    domain: &Domain<'c>,
-    physical_input_types: &[ArrayType],
-    inputs: Vec<Array<'c>>,
-) -> Result<Vec<Array<'c>>, Error> {
-    assert_eq!(physical_input_types.len(), inputs.len());
-    physical_input_types
-        .iter()
-        .zip(inputs)
-        .map(|(physical_type, input)| {
-            if !physical_type.data_type().is_zero() {
-                return Ok(input);
-            }
-            input.block_until_ready()?;
-            let carrier_type = physical_type.clone().with_data_type(DataType::Boolean);
-            let element_count =
-                carrier_type.element_count()?.expect("physical bounded input types should only have static shapes");
-            Ok(Array::from_host_buffer(domain, carrier_type, input.mesh().clone(), vec![0u8; element_count])?)
-        })
-        .collect()
-}
-
-/// Reconstructs selected logical outputs from one submitted execution's physical buffers.
-fn reconstruct_compiled_outputs<'c>(
-    domain: &Domain<'c>,
-    program: &CompiledProgram<'c>,
-    physical_outputs: &mut [Option<Vec<Buffer<'c>>>],
-    fence: ryft_pjrt::ExecutionFence,
-    logical_indices: impl IntoIterator<Item = usize>,
-) -> Result<Vec<Array<'c>>, Error> {
-    // Programs with only static outputs build each output directly from its planned layout, without querying the
-    // returned buffers or re-deriving their placement.
-    if let Some(layouts) = &program.plan().output_layouts {
-        return logical_indices
-            .into_iter()
-            .map(|logical_index| {
-                let buffers = match program.signature().output_mapping()[logical_index] {
-                    Some(physical_index) => {
-                        physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
-                                "physical output {physical_index} for logical output {logical_index} is missing or \
-                                 was claimed twice",
-                            ))
-                        })?
-                    }
-                    None => Vec::new(),
-                };
-                Ok(Array::from_execution_output(domain, &layouts[logical_index], buffers, fence.clone()))
-            })
-            .collect();
-    }
-    let logical_indices = logical_indices.into_iter().collect::<Vec<_>>();
-    let scalar_type = ArrayType::scalar(DataType::I64).replicated(program.mesh())?;
-    let mut output_extents = BTreeMap::new();
-    for output_dimension in program
-        .signature()
-        .output_dimensions()
-        .iter()
-        .filter(|dimension| logical_indices.contains(&dimension.logical_output_index()))
-    {
-        let physical_output_index = output_dimension.physical_output_index();
-        let physical_output =
-            physical_outputs.get_mut(physical_output_index).and_then(Option::take).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "physical output {physical_output_index} for runtime extent of output {} axis {} is missing or was \
-                     claimed twice",
-                    output_dimension.logical_output_index(),
-                    output_dimension.axis(),
-                ))
-            })?;
-        let scalar = Array::from_canonical_addressable_buffers(
-            domain,
-            scalar_type.clone(),
-            None,
-            program.mesh().clone(),
-            physical_output,
-        )?
-        .with_execution_fence(fence.clone());
-        let bytes = scalar.copy_to_host()?;
-        let extent = bytes
-            .get(..size_of::<i64>())
-            .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
-            .and_then(|extent| usize::try_from(extent).ok())
-            .ok_or_else(|| ProgramError::InvalidArgument {
-                message: format!(
-                    "runtime extent for output {} axis {} is negative, missing, or exceeds usize",
-                    output_dimension.logical_output_index(),
-                    output_dimension.axis(),
-                ),
-            })?;
-        output_extents.insert((output_dimension.logical_output_index(), output_dimension.axis()), extent);
-    }
-
-    logical_indices
-        .into_iter()
-        .map(|logical_index| {
-            let output_type = &program.all_output_types()[logical_index];
-            match program.signature().output_mapping()[logical_index] {
-                Some(physical_index) => {
-                    let dimensions = output_type
-                        .shape()
-                        .dimensions()
-                        .iter()
-                        .enumerate()
-                        .map(|(axis, dimension)| {
-                            dimension
-                                .value()
-                                .or_else(|| output_extents.get(&(logical_index, axis)).copied())
-                                .map_or_else(
-                                    || {
-                                        Err(ProgramError::MalformedProgram(format!(
-                                            "executable omitted runtime extent for output {logical_index} axis {axis}",
-                                        )))
-                                    },
-                                    |extent| Ok(CoreDimension::Static(extent)),
-                                )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let output_type = output_type.clone().with_shape(Shape::new(dimensions));
-                    Ok(Array::from_canonical_addressable_buffers(
-                        domain,
-                        output_type,
-                        Some(program.output_shardings()[logical_index].clone()),
-                        program.mesh().clone(),
-                        physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
-                                "physical output {physical_index} for logical output {logical_index} is missing or was \
-                                 claimed twice",
-                            ))
-                        })?,
-                    )?
-                    .with_execution_fence(fence.clone()))
-                }
-                None => Ok(Array::from_zero_space(
-                    domain,
-                    output_type.clone(),
-                    Some(program.output_shardings()[logical_index].clone()),
-                    program.mesh().clone(),
-                )?
-                .with_execution_fence(fence.clone())),
-            }
-        })
-        .collect()
-}
-
-/// Validates reconstructed logical outputs against the runtime input refinements.
-fn validate_compiled_output_refinements(
-    program: &CompiledProgram<'_>,
-    input_refinements: &<ArrayType as Type>::Refinements,
-    declared_output_types: &[ArrayType],
-    outputs: &[Array<'_>],
-) -> Result<(), Error> {
-    let mut closed_identities = Vec::new();
-    for (_, identity) in
-        program.input_types().iter().chain(program.all_output_types().iter()).flat_map(Type::identities)
-    {
-        if !closed_identities.contains(identity) {
-            closed_identities.push(identity.clone());
-        }
-    }
-    input_refinements
-        .validate_refinement(
-            declared_output_types.iter(),
-            outputs.iter().map(|output| output.r#type().into_owned()),
-            closed_identities.as_slice(),
-        )
-        .map_err(ProgramError::from)
-        .map_err(Into::into)
-}
-
-impl<'c> Domain<'c> {
     /// Submits at the common physical boundary and transposes array results, retaining hidden effect tokens in the
     /// active scope. No scope lock is held across PJRT, which may execute callbacks inline on this thread.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Compiled program to execute.
+    ///   - `arguments`: Physical array inputs grouped by device, to which this function appends the hidden effect
+    ///     tokens of ordered programs.
+    ///   - `array_output_count`: Number of physical array outputs that every device returns.
+    ///   - `after_submission`: Callback that runs synchronously on this thread, exactly once, with the fence of the
+    ///     whole execution right after PJRT accepts the submission and before the results are checked. It does not
+    ///     run when submission fails.
     fn execute_pjrt_buffers(
         &self,
         program: &CompiledProgram<'c>,
@@ -1399,7 +1121,7 @@ impl<'c> Domain<'c> {
                                 selected.default_memory()?,
                             )?;
                             let token = manager.retrieve_buffer(0)?;
-                            // Only initial zero-byte token creation is awaited. Predecessor carriers remain pending
+                            // Only the initial creation of empty tokens is awaited. Predecessor carriers remain pending
                             // inputs.
                             manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true)?.r#await()?;
                             tokens.push(Arc::new(token));
@@ -1446,7 +1168,9 @@ impl<'c> Domain<'c> {
             if let Some(actual) = invalid_count {
                 let reason: Arc<str> =
                     Arc::from(format!("expected {output_count} output(s) per device, but got {actual}"));
-                // Retain completion until the submitted work is done, then report the boundary failure.
+                // Retain completion until the submitted work is done, then report the boundary failure. The fence
+                // callback owns the published completion and the reason, because it may run later on whichever thread
+                // completes the last device event, or inline here when the fence is already ready.
                 let completion = reservation.publish(Err(Arc::clone(&reason)));
                 fence.on_ready(move |_| completion.complete(Err(reason)));
             } else {
@@ -1463,6 +1187,7 @@ impl<'c> Domain<'c> {
                     None
                 };
                 let completion = reservation.publish(Ok(carrier));
+                // As above, the fence callback owns the published completion for its whole asynchronous lifetime.
                 fence.on_ready(move |result| completion.complete(result.map_err(|error| Arc::from(error.to_string()))));
             }
             reservation.commit();
@@ -1488,163 +1213,424 @@ impl<'c> Domain<'c> {
         }
         Ok(Execution::new(per_output_buffers, fence))
     }
+
+    /// Places `inputs` on `mesh` according to `expected_shardings` at the call boundary. Inputs that already match skip
+    /// the placement entirely, and the implicit placement is the cold path. An input matches only if it is also on
+    /// `mesh`, because the same sharding assigns its shards to other devices on another device mesh (e.g., one that
+    /// lists the same devices in another order).
+    fn reshard_inputs_if_needed(
+        &self,
+        mesh: &DeviceMesh,
+        expected_shardings: &[Sharding],
+        inputs: Vec<Array<'c>>,
+    ) -> Result<Vec<Array<'c>>, Error> {
+        let matches = |array: &Array<'c>, expected: &Sharding| array.sharding() == expected && array.mesh() == mesh;
+        if inputs.iter().zip(expected_shardings).all(|(array, expected)| matches(array, expected)) {
+            return Ok(inputs);
+        }
+        inputs
+            .into_iter()
+            .zip(expected_shardings)
+            .map(|(array, expected)| {
+                if matches(&array, expected) {
+                    Ok(array)
+                } else {
+                    array.reshard_on_devices(self, mesh, expected, false)
+                }
+            })
+            .collect()
+    }
+
+    /// Materializes private carriers of false predicates for inputs of the zero data type that remain in the physical
+    /// executable signature, currently because their declared type contains dynamic dimensions. Static inputs of the
+    /// zero data type are erased before this point and never allocate a carrier.
+    ///
+    /// Each carrier is allocated at the *physical* type of the input (i.e., its type padded to its bounds) from
+    /// `physical_input_types`, not at the runtime type of the value. The compiled module declares the `i1` argument at
+    /// the bounds and the hidden extent scalar transports the logical size, so an input of the zero data type that is
+    /// smaller than its bounds must still hand PJRT a buffer of the bounded shape.
+    fn materialize_zero_space_carriers(
+        &self,
+        physical_input_types: &[ArrayType],
+        inputs: Vec<Array<'c>>,
+    ) -> Result<Vec<Array<'c>>, Error> {
+        assert_eq!(physical_input_types.len(), inputs.len());
+        physical_input_types
+            .iter()
+            .zip(inputs)
+            .map(|(physical_type, input)| {
+                if !physical_type.data_type().is_zero() {
+                    return Ok(input);
+                }
+                input.block_until_ready()?;
+                let carrier_type = physical_type.clone().with_data_type(DataType::Boolean);
+                let element_count = carrier_type.element_count()?.unwrap();
+                Ok(Array::from_host_buffer(self, carrier_type, input.mesh().clone(), vec![0u8; element_count])?)
+            })
+            .collect()
+    }
+
+    /// Reconstructs selected logical outputs from one submitted execution's physical buffers.
+    fn reconstruct_compiled_outputs(
+        &self,
+        program: &CompiledProgram<'c>,
+        physical_outputs: &mut [Option<Vec<Buffer<'c>>>],
+        fence: ExecutionFence,
+        logical_indices: impl IntoIterator<Item = usize>,
+    ) -> Result<Vec<Array<'c>>, Error> {
+        // Programs with only static outputs build each output directly from its planned layout, without querying the
+        // returned buffers or re-deriving their placement.
+        if let Some(layouts) = &program.plan().output_layouts {
+            return logical_indices
+                .into_iter()
+                .map(|logical_index| {
+                    let buffers = match program.signature().output_mapping()[logical_index] {
+                        Some(physical_index) => {
+                            physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
+                                ProgramError::MalformedProgram(format!(
+                                    "physical output {physical_index} for logical output {logical_index} is missing or \
+                                     was claimed twice",
+                                ))
+                            })?
+                        }
+                        None => Vec::new(),
+                    };
+                    Ok(Array::from_execution_output(self, &layouts[logical_index], buffers, fence.clone()))
+                })
+                .collect();
+        }
+        let logical_indices = logical_indices.into_iter().collect::<Vec<_>>();
+        let scalar_type = ArrayType::scalar(DataType::I64).replicated(program.mesh())?;
+        let mut output_extents = BTreeMap::new();
+        for output_dimension in program
+            .signature()
+            .output_dimensions()
+            .iter()
+            .filter(|dimension| logical_indices.contains(&dimension.logical_output_index()))
+        {
+            let physical_output_index = output_dimension.physical_output_index();
+            let physical_output =
+                physical_outputs.get_mut(physical_output_index).and_then(Option::take).ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "physical output {physical_output_index} for runtime extent of output {} axis {} is missing \
+                         or was claimed twice",
+                        output_dimension.logical_output_index(),
+                        output_dimension.axis(),
+                    ))
+                })?;
+            let scalar = Array::from_canonical_addressable_buffers(
+                self,
+                scalar_type.clone(),
+                None,
+                program.mesh().clone(),
+                physical_output,
+            )?
+            .with_execution_fence(fence.clone());
+            let bytes = scalar.copy_to_host()?;
+            let extent = bytes
+                .get(..size_of::<i64>())
+                .map(|bytes| i64::from_ne_bytes(bytes.try_into().unwrap()))
+                .and_then(|extent| usize::try_from(extent).ok())
+                .ok_or_else(|| ProgramError::InvalidArgument {
+                    message: format!(
+                        "runtime extent for output {} axis {} is negative, missing, or exceeds `usize`",
+                        output_dimension.logical_output_index(),
+                        output_dimension.axis(),
+                    ),
+                })?;
+            output_extents.insert((output_dimension.logical_output_index(), output_dimension.axis()), extent);
+        }
+
+        logical_indices
+            .into_iter()
+            .map(|logical_index| {
+                let output_type = &program.all_output_types()[logical_index];
+                match program.signature().output_mapping()[logical_index] {
+                    Some(physical_index) => {
+                        let dimensions = output_type
+                            .shape()
+                            .dimensions()
+                            .iter()
+                            .enumerate()
+                            .map(|(axis, dimension)| {
+                                dimension
+                                    .value()
+                                    .or_else(|| output_extents.get(&(logical_index, axis)).copied())
+                                    .map_or_else(
+                                        || {
+                                            Err(ProgramError::MalformedProgram(format!(
+                                                "executable omitted runtime extent for output {logical_index} \
+                                                 axis {axis}",
+                                            )))
+                                        },
+                                        |extent| Ok(CoreDimension::Static(extent)),
+                                    )
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let output_type = output_type.clone().with_shape(Shape::new(dimensions));
+                        Ok(Array::from_canonical_addressable_buffers(
+                            self,
+                            output_type,
+                            Some(program.output_shardings()[logical_index].clone()),
+                            program.mesh().clone(),
+                            physical_outputs.get_mut(physical_index).and_then(Option::take).ok_or_else(|| {
+                                ProgramError::MalformedProgram(format!(
+                                    "physical output {physical_index} for logical output {logical_index} is \
+                                     missing or was claimed twice",
+                                ))
+                            })?,
+                        )?
+                        .with_execution_fence(fence.clone()))
+                    }
+                    None => Ok(Array::from_zero_space(
+                        self,
+                        output_type.clone(),
+                        Some(program.output_shardings()[logical_index].clone()),
+                        program.mesh().clone(),
+                    )?
+                    .with_execution_fence(fence.clone())),
+                }
+            })
+            .collect()
+    }
+}
+
+impl<'c> StatefulCompilationDomain for Domain<'c> {
+    fn execute_statefully(
+        &self,
+        program: &CompiledProgram<'c>,
+        inputs: Vec<Value<'c>>,
+    ) -> StatefulExecution<Vec<Value<'c>>, Self::Error> {
+        self.execute_stateful_async(program, inputs)
+    }
+}
+
+/// Returns the device IDs of `assignment` ordered by replica first and by computation partition second.
+pub(super) fn flatten_device_assignment(assignment: &ryft_pjrt::DeviceAssignment) -> Result<Vec<u64>, Error> {
+    let mut devices = Vec::with_capacity(assignment.replica_count() * assignment.computation_count());
+    for replica in 0..assignment.replica_count() {
+        for partition in 0..assignment.computation_count() {
+            devices.push(assignment.device_id(replica, partition)? as u64);
+        }
+    }
+    Ok(devices)
+}
+
+/// Validates runtime refinement of a declared logical input type, excluding sharding because placement is resolved
+/// separately at the call boundary.
+pub(crate) fn validate_input_type(declared: &ArrayType, actual: &ArrayType) -> Result<(), Error> {
+    // Calls of a specialization ordinarily pass inputs of exactly its declared types, which refine them trivially.
+    if declared == actual {
+        return Ok(());
+    }
+    let declared_without_sharding = declared.clone().with_sharding(None)?;
+    let actual_without_sharding = actual.clone().with_sharding(None)?;
+    if declared_without_sharding.is_refined_by(&actual_without_sharding) {
+        Ok(())
+    } else {
+        Err(ProgramError::InvalidArgument {
+            message: format!("runtime input type `{actual}` does not refine declared type `{declared}`"),
+        }
+        .into())
+    }
+}
+
+/// Validates output arity and refinement of the declared logical output types, including sharding.
+pub(crate) fn validate_runtime_outputs(declared: &[ArrayType], outputs: &[Array<'_>]) -> Result<(), Error> {
+    if declared.len() != outputs.len() {
+        return Err(ProgramError::InvalidOutputCount { expected: declared.len(), actual: outputs.len() }.into());
+    }
+    for (declared, actual) in declared.iter().zip(outputs.iter().map(Typed::r#type)) {
+        if declared != actual.as_ref() && !declared.is_refined_by(actual.as_ref()) {
+            return Err(ProgramError::InvalidArgument {
+                message: format!("runtime output type `{actual}` does not refine declared type `{declared}`"),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Completion adapter for one submitted PJRT execution that implements the backend neutral
+/// [`ReferenceCompletionBackend`].
+struct ReferenceCompletion {
+    /// Fence of the whole execution, which joins every addressable device event.
+    fence: ExecutionFence,
+}
+
+impl ReferenceCompletionBackend for ReferenceCompletion {
+    fn r#await(&self) -> Result<(), Arc<str>> {
+        self.fence.block_until_ready().map_err(|error| Arc::from(error.to_string()))
+    }
+
+    fn is_ready(&self) -> Result<bool, Arc<str>> {
+        self.fence.is_ready().map_err(|error| Arc::from(error.to_string()))
+    }
+}
+
+/// Fully materialized physical arguments and logical refinements prepared before PJRT submission.
+struct PreparedExecution<'c> {
+    /// Fully materialized physical arrays in executable argument order.
+    inputs: Vec<Array<'c>>,
+
+    /// Addressable devices in executable order.
+    addressable_device_ids: Arc<[DeviceId]>,
+
+    /// Effective physical donation request for every input.
+    donation_flags: Vec<bool>,
+
+    /// Runtime refinements established from the unmaterialized logical inputs.
+    input_refinements: <ArrayType as Type>::Refinements,
+
+    /// Physical result count expected from every addressable device.
+    physical_output_count: usize,
+}
+
+impl<'c> PreparedExecution<'c> {
+    /// Consumes the materialized arrays into PJRT arguments grouped by device.
+    fn into_arguments(self) -> Result<(ExecutionArguments<'c>, <ArrayType as Type>::Refinements, usize), Error> {
+        let arguments = ExecutionArguments::from_arrays_with_donation(
+            self.inputs,
+            self.addressable_device_ids,
+            self.donation_flags.as_slice(),
+        )?;
+        Ok((arguments, self.input_refinements, self.physical_output_count))
+    }
+}
+
+/// Validates reconstructed logical outputs against the runtime input refinements.
+fn validate_compiled_output_refinements(
+    program: &CompiledProgram<'_>,
+    input_refinements: &<ArrayType as Type>::Refinements,
+    declared_output_types: &[ArrayType],
+    outputs: &[Array<'_>],
+) -> Result<(), Error> {
+    let mut closed_identities = Vec::new();
+    for (_, identity) in
+        program.input_types().iter().chain(program.all_output_types().iter()).flat_map(Type::identities)
+    {
+        if !closed_identities.contains(identity) {
+            closed_identities.push(identity.clone());
+        }
+    }
+    input_refinements
+        .validate_refinement(
+            declared_output_types.iter(),
+            outputs.iter().map(|output| output.r#type().into_owned()),
+            closed_identities.as_slice(),
+        )
+        .map_err(ProgramError::from)
+        .map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier, Condvar, Mutex, mpsc};
+    use std::time::Duration;
 
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AndOperation, ArrayIrBatch, ArrayIrType, ArrayType, Assert, AssertOperation, BatchAxis, BatchableOperation,
-        BatchingContext, CompareOperation, ComparisonDirection, CompilationCacheDomain, Context,
-        ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension, DimensionBounds,
-        DimensionDivOperation, DimensionFromScalarOperation, DimensionOperation, DimensionRemOperation,
-        DimensionSubOperation, DimensionToScalarOperation, DimensionType, DimensionValue, DimensionVariable,
-        DynamicBroadcastOperation, DynamicSliceOperation, EmptyRegionDriver, Error as CoreError, IotaOperation,
-        LogicalMesh, MeshAxis, MeshAxisType, Operation as CoreOperation, Placeholder, ReduceOperation, ReductionKind,
-        ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType, Reshape, Shape, Sharding,
-        ShardingDimension, ShardingError, StagedFunction as CoreStagedFunction, StagingContext, StaticShape,
-        TiledLayout, TracingContext, Typed, batch,
+        ArrayIrType, ArrayReferenceTransform, ArrayReferenceTransformIndex, ArrayType, CastOperation,
+        CompilationCacheDomain, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension as CoreDimension,
+        DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DynamicSliceOperation,
+        Error as CoreError, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ReduceOperation, ReductionKind,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceError, ReferenceRead, ReferenceReadOperation,
+        ReferenceType, Shape, ShardMapBoundary, Sharding, ShardingDimension, ShardingError,
+        StagedFunction as CoreStagedFunction, StaticShape, TiledLayout, Typed,
     };
-    use ryft_mlir::Block;
+    use ryft_mlir::{Block, Context as MlirContext};
     use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
     use ryft_pjrt::{BufferType, ClientOptions, CpuClientOptions, Program, load_cpu_plugin};
 
-    use crate::compilation::domains::jit_compilation_options;
-    use crate::domains::tests::*;
+    use crate::domains::tests::{
+        boolean_vector, domain_mesh, f32_scalar, f32_vector, inject_stateful_completion, inject_stateful_failure,
+        program_array, read_f32s, read_sharded_f32_array, replicated_scalar_type, replicated_vector_type,
+        two_device_mesh,
+    };
     use crate::execution::ExecutionArguments;
+    use crate::lowering::tests::{static_sharded_array_type, test_spmd_compilation_options};
     use crate::operations::{FlatProgram, ProgramBuilder};
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, Constant, Error, ExecutionError, Operation, Options, Session, ToMlir, Value};
+    use crate::tests::{cpu_client, execution_client, values_from_bytes, values_to_bytes};
+    use crate::{
+        Array, Constant, Error, ExecutionError, Options, Reference, Session, ToMlir, Value, compile_statefully,
+        compile_statefully_with_captures,
+    };
 
     use super::*;
 
-    #[test]
-    fn test_compiled_zero_space_identity_preserves_logical_type_and_canonical_value() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
-            .unwrap();
-        let staged =
-            crate::stage::<_, ArrayType, ArrayType>(|input| input, input_type.clone(), Options::new(mesh.clone()))
-                .unwrap()
-                .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        assert_eq!(compiled.compiled_program().output_types(), std::slice::from_ref(&input_type));
+    /// Deterministic completion gate used by stateful asynchronous integration tests.
+    #[derive(Clone)]
+    struct ControlledReferenceCompletion {
+        /// Shared terminal result and wait notification.
+        state: Arc<(Mutex<ControlledReferenceCompletionState>, Condvar)>,
+    }
 
-        let donated_staged: CoreStagedFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            crate::stage::<_, ArrayType, ArrayType>(
-                |input| input,
-                input_type.clone(),
-                Options { donation_flags: Some(vec![true]), ..Options::new(mesh.clone()) },
-            )
-            .unwrap()
-            .into_inner();
-        let donated_lowered = donated_staged.lower(&domain).unwrap();
-        assert_eq!(donated_lowered.lowered_program().donation_flags(), &[false]);
-        assert_eq!(
-            domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
-            domain.compilation_key(donated_lowered.lowered_program()).unwrap(),
-        );
+    /// Mutable state of one [`ControlledReferenceCompletion`].
+    struct ControlledReferenceCompletionState {
+        /// Terminal result, absent while the completion is pending.
+        result: Option<Result<(), Arc<str>>>,
 
-        // Boolean values retain physical `i1` arguments/results while the zero-space identity has an empty physical
-        // signature. Their retained logical metadata also keeps their compilation identities distinct.
-        let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
-        let boolean_staged: CoreStagedFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            crate::stage::<_, ArrayType, ArrayType>(|input| input, boolean_type, Options::new(mesh.clone()))
-                .unwrap()
-                .into_inner();
-        let boolean_lowered = boolean_staged.lower(&domain).unwrap();
-        assert_ne!(
-            domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
-            domain.compilation_key(boolean_lowered.lowered_program()).unwrap(),
-        );
+        /// Optional single notification emitted when a caller starts waiting, carrying this gate's label so that
+        /// tests sharing one channel across several gates can pin which gate was awaited first.
+        await_started: Option<(&'static str, mpsc::Sender<&'static str>)>,
+    }
 
-        let input = Array::from_host_buffer(&domain, input_type, mesh, []).unwrap();
-        let output = compiled.executable().execute(&domain, Value::Array(input)).unwrap();
-        let Value::Array(output) = output else {
-            panic!("array-only compiled function returned a first-class dimension");
-        };
-        assert_eq!(output.data_type(), DataType::Zero);
-        assert!(output.addressable_shards().next().unwrap().buffer().is_none());
+    impl ControlledReferenceCompletion {
+        /// Creates a pending completion gate.
+        fn new() -> Self {
+            Self {
+                state: Arc::new((
+                    Mutex::new(ControlledReferenceCompletionState { result: None, await_started: None }),
+                    Condvar::new(),
+                )),
+            }
+        }
+
+        /// Creates a pending completion that reports `label` when its blocking wait begins.
+        fn with_await_notification(label: &'static str, await_started: mpsc::Sender<&'static str>) -> Self {
+            Self {
+                state: Arc::new((
+                    Mutex::new(ControlledReferenceCompletionState {
+                        result: None,
+                        await_started: Some((label, await_started)),
+                    }),
+                    Condvar::new(),
+                )),
+            }
+        }
+
+        /// Completes this gate exactly once and wakes blocking waiters.
+        fn complete(&self, result: Result<(), Arc<str>>) {
+            let (state, ready) = &*self.state;
+            let mut state = state.lock().unwrap();
+            assert!(state.result.is_none());
+            state.result = Some(result);
+            ready.notify_all();
+        }
+    }
+
+    impl ReferenceCompletionBackend for ControlledReferenceCompletion {
+        fn r#await(&self) -> Result<(), Arc<str>> {
+            let (state, ready) = &*self.state;
+            let mut state = state.lock().unwrap();
+            if let Some((label, await_started)) = state.await_started.take() {
+                await_started.send(label).unwrap();
+            }
+            while state.result.is_none() {
+                state = ready.wait(state).unwrap();
+            }
+            state.result.clone().unwrap()
+        }
+
+        fn is_ready(&self) -> Result<bool, Arc<str>> {
+            let state = self.state.0.lock().unwrap();
+            state.result.clone().map_or(Ok(false), |result| result.map(|_| true))
+        }
     }
 
     #[test]
-    fn test_compiled_mixed_zero_space_signature_projects_and_reconstructs_logical_values() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)]))
-            .with_sharding(sharding.clone())
-            .unwrap();
-        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
-            .with_sharding(sharding)
-            .unwrap();
-        let options = Options { donation_flags: Some(vec![false, true]), ..Options::new(mesh.clone()) };
-        let staged = crate::stage::<_, (ArrayType, ArrayType), (ArrayType, ArrayType)>(
-            |(value, zero)| (zero, value),
-            (value_type.clone(), zero_type.clone()),
-            options,
-        )
-        .unwrap()
-        .into_inner();
-        let lowered = staged.lower(&domain).unwrap();
-        assert!(lowered.lowered_program().stable_hlo().contains("func.func @main(%arg0: tensor<3xf32>"));
-        let compiled: ryft_core::compilation::CompiledFunction<
-            Domain<'_>,
-            (ArrayIrType, ArrayIrType),
-            (ArrayIrType, ArrayIrType),
-        > = lowered.compile(&domain).unwrap();
-        let value = Array::from_host_buffer(
-            &domain,
-            value_type.clone(),
-            mesh.clone(),
-            values_to_bytes::<f32>(&[1.0, 2.0, 3.0]),
-        )
-        .unwrap();
-        let zero = Array::from_host_buffer(&domain, zero_type.clone(), mesh, []).unwrap();
-
-        let (zero_output, value_output) =
-            compiled.executable().execute(&domain, (Value::Array(value), Value::Array(zero))).unwrap();
-        let Value::Array(zero_output) = zero_output else {
-            panic!("array-only compiled function returned a first-class dimension");
-        };
-        let Value::Array(value_output) = value_output else {
-            panic!("array-only compiled function returned a first-class dimension");
-        };
-
-        assert_eq!(zero_output.r#type().as_ref(), &zero_type);
-        assert!(zero_output.addressable_shards().next().unwrap().buffer().is_none());
-        assert_eq!(value_output.r#type().as_ref(), &value_type);
-        let value_bytes = value_output
-            .addressable_shards()
-            .next()
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        assert_eq!(values_from_bytes::<f32>(value_bytes.as_slice()), vec![1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn test_execution_plan_rejects_compilation_options_with_conflicting_layouts() {
-        use ryft_core::CastOperation;
-
+    fn test_execution_plan_new_rejects_compilation_options_with_conflicting_layouts() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain();
@@ -1717,89 +1703,420 @@ mod tests {
     }
 
     #[test]
-    fn test_materialize_zero_space_carriers_allocate_the_bounded_physical_shape() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        // The compiled module declares the bound-shaped `[3]` argument, so a below-bound `[2]` runtime value must
-        // still produce a `[3]` carrier; the hidden extent scalar transports the logical size.
-        let physical_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
-            .with_sharding(sharding.clone())
-            .unwrap();
-        let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
-            .with_sharding(sharding)
-            .unwrap();
-        let zero = Array::from_host_buffer(&domain, runtime_zero_type, mesh, []).unwrap();
-
-        let carriers = materialize_zero_space_carriers(&domain, &[physical_zero_type], vec![zero]).unwrap();
-
-        assert_eq!(carriers.len(), 1);
-        assert_eq!(carriers[0].data_type(), DataType::Boolean);
-        assert_eq!(carriers[0].shape().as_slice(), &[3]);
-        let carrier_bytes = carriers[0]
-            .addressable_shards()
-            .next()
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        assert_eq!(carrier_bytes.as_slice(), &[0, 0, 0]);
-    }
-
-    #[test]
-    fn test_below_bound_zero_space_inputs_skip_the_padding_tiers_and_carry_the_bounded_shape() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let declared_type = ArrayType::new(
-            DataType::Zero,
-            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::non_negative(Some(4)).unwrap()).into()]),
+    fn test_execution_plan_new_plans_static_output_layouts_on_multiple_cpu_devices() {
+        let client = cpu_client(4);
+        let mesh = domain_mesh(&client, "x", 4);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        // Types record no placement over auto mesh axes, so the placements are input and output sharding overrides.
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            input_type.clone(),
+            Options::new(mesh.clone())
+                .with_input_shardings(vec![sharding.clone()])
+                .with_output_shardings(vec![sharding.clone()]),
         )
-        .with_sharding(sharding.clone())
-        .unwrap();
-        let signature = ExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
-        let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
-            .with_sharding(sharding)
-            .unwrap();
-        let zero = Array::from_host_buffer(&domain, actual_type.clone(), mesh, []).unwrap();
+        .unwrap()
+        .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), Some(1));
 
-        // The below-bound zero-space input must bypass the retained-cache and byte-pad tiers (its dense host copy is
-        // empty) and rely on the carrier materialization to synthesize the bound-shaped predicate argument.
-        let materialized = materialize_bounded_dynamic_inputs(
+        // Outputs are built from the program's planned layouts, which place every shard like the validating
+        // constructors do and are shared by the outputs of every execution.
+        let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
+        let input = Array::from_host_buffer_with_sharding(
             &domain,
-            &signature,
-            std::slice::from_ref(&declared_type),
-            std::slice::from_ref(&actual_type),
-            vec![zero],
+            input_type,
+            sharding.clone(),
+            mesh.clone(),
+            values_to_bytes(values.as_slice()).as_slice(),
         )
         .unwrap();
-        let inputs = materialized.into_inputs();
-        assert_eq!(inputs.len(), 2);
-
-        let physical_types = signature.physical_input_types(std::slice::from_ref(&declared_type));
-        let carriers = materialize_zero_space_carriers(&domain, &physical_types, inputs).unwrap();
-        assert_eq!(carriers[0].data_type(), DataType::Boolean);
-        assert_eq!(carriers[0].shape().as_slice(), &[3]);
-        assert_eq!(carriers[1].data_type(), DataType::I32);
+        let call = || {
+            let output = compiled.executable().execute(&domain, Value::Array(input.clone())).unwrap();
+            let Value::Array(output) = output else {
+                panic!("array-only compiled function returned a first-class dimension");
+            };
+            output
+        };
+        let output = call();
+        let other_output = call();
+        output.block_until_ready().unwrap();
+        assert_eq!(output.r#type(), input.r#type());
+        assert_eq!(output.sharding(), &sharding);
+        assert_eq!(output.mesh(), &mesh);
+        assert_eq!(
+            output.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
+            input.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            other_output.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
+            output.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
+        );
+        let shards = output
+            .shards()
+            .iter()
+            .map(|shard| {
+                values_from_bytes::<f32>(
+                    shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap().as_slice(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(shards, vec![vec![0.0, 2.0], vec![4.0, 6.0], vec![8.0, 10.0], vec![12.0, 14.0]]);
     }
 
     #[test]
-    fn test_reference_transaction_donation_respects_effective_buffer_ownership() {
+    fn test_execution_plan_new_plans_no_output_layouts_without_declared_placement() {
+        let client = cpu_client(4);
+        let mesh = domain_mesh(&client, "x", 4);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let unconstrained_sharding =
+            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::unconstrained()]).unwrap();
+        let unconstrained_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
+            .with_sharding(unconstrained_sharding)
+            .unwrap();
+        let unsharded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
+
+        // XLA chooses the placement of outputs with open (i.e., `Unconstrained`) dimensions and of outputs without
+        // declared shardings, so their programs plan no trusted output layouts and validate the returned buffers
+        // instead.
+        for input_type in [unconstrained_type, unsharded_type] {
+            let staged = crate::stage::<_, ArrayType, ArrayType>(
+                |input| input.clone() + input,
+                input_type,
+                Options::new(mesh.clone()),
+            )
+            .unwrap()
+            .into_inner();
+            let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+                staged.lower(&domain).unwrap().compile(&domain).unwrap();
+            assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), None);
+
+            // Without planned layouts, the outputs are built from the returned buffers by the validating constructor.
+            let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
+            let input = f32_vector(&domain, &mesh, values.as_slice());
+            let Value::Array(output) = compiled.executable().execute(&domain, Value::Array(input)).unwrap() else {
+                panic!("array-only compiled function returned a first-class dimension");
+            };
+            assert_eq!(output.mesh(), &mesh);
+            assert_eq!(
+                values_from_bytes::<f32>(&output.copy_to_host().unwrap()),
+                values.iter().map(|value| value * 2.0).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    fn test_execution_arguments_from_arrays() {
+        // Use the same 8-device CPU setup as `ryft_pjrt` tests.
+        let client = cpu_client(8);
+        let domain = Session::new(&client).domain();
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 8);
+
+        // Build the mesh used for runtime arrays. Just-in-time compilation derives StableHLO Shardy annotations
+        // directly from these arrays.
+        let mesh = domain_mesh(&client, "x", 8);
+
+        let left_sharding = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let right_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
+
+        // The global left-hand side input matrix is 8x4 and split by rows across 8 devices, so each shard is 1x4.
+        // Row i is [i, i+1, i+2, i+3].
+        let left_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(row_index, device)| {
+                let row = row_index as f32;
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&[row, row + 1.0, row + 2.0, row + 3.0]).as_slice(),
+                        BufferType::F32,
+                        [1u64, 4u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        // The global right-hand side input matrix is replicated on each device.
+        // [[1, 2], [0, 1], [1, 0], [2, 1]]
+        let right_values = [1.0f32, 2.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0];
+        let right_buffers = client_devices
+            .iter()
+            .map(|device| {
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(right_values.as_slice()).as_slice(),
+                        BufferType::F32,
+                        [4u64, 2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let left_array_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(4)]));
+        let right_array_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(2)]));
+        let left_array = Array::from_addressable_buffers_with_sharding(
+            &domain,
+            left_array_type,
+            left_sharding,
+            mesh.clone(),
+            left_buffers,
+        )
+        .unwrap();
+        let right_array = Array::from_addressable_buffers_with_sharding(
+            &domain,
+            right_array_type,
+            right_sharding,
+            mesh.clone(),
+            right_buffers,
+        )
+        .unwrap();
+
+        assert_eq!(left_array.data_type(), DataType::F32);
+        assert_eq!(right_array.data_type(), DataType::F32);
+        assert_eq!(left_array.addressable_shards().count(), 8);
+        assert!(left_array.shards().iter().all(|shard| shard.buffer().is_some()));
+
+        // Derive Shardy attributes from runtime arrays, as just-in-time compilation does.
+        let context = ryft_mlir::Context::new();
+        let mesh_module = context.module(context.unknown_location()).unwrap();
+        let mesh_operation = mesh_module
+            .body()
+            .unwrap()
+            .append_operation(left_array.sharding().mesh().to_mlir(context.unknown_location()).unwrap())
+            .unwrap()
+            .to_string();
+        let left_sharding_attribute = left_array.to_shardy_tensor_sharding_attribute().unwrap();
+        let right_sharding_attribute = right_array.to_shardy_tensor_sharding_attribute().unwrap();
+        let output_sharding_attribute = left_array.to_shardy_tensor_sharding_attribute().unwrap();
+
+        assert_eq!(mesh_operation, "sdy.mesh @mesh = <[\"x\"=8]>");
+        assert_eq!(left_sharding_attribute, "#sdy.sharding<@mesh, [{\"x\"}, {}]>");
+        assert_eq!(right_sharding_attribute, "#sdy.sharding<@mesh, [{}, {}]>");
+
+        let mlir_program = format!(
+            r#"
+                    module {{
+                        {mesh_operation}
+                        func.func @main(
+                            %arg0: tensor<8x4xf32> {{sdy.sharding = {left_sharding_attribute}}},
+                            %arg1: tensor<4x2xf32> {{sdy.sharding = {right_sharding_attribute}}}
+                        ) -> (tensor<8x2xf32> {{sdy.sharding = {output_sharding_attribute}}}) {{
+                            %0 = stablehlo.dot_general %arg0, %arg1, batching_dims = [] x [], contracting_dims = [1] x [0]
+                                : (tensor<8x4xf32>, tensor<4x2xf32>) -> tensor<8x2xf32>
+                            return %0 : tensor<8x2xf32>
+                        }}
+                    }}
+                "#
+        );
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let compilation_options = CompilationOptions {
+            argument_layouts: Vec::new(),
+            parameter_is_tupled_arguments: false,
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: 8,
+                use_spmd_partitioning: true,
+                use_shardy_partitioner: true,
+                ..Default::default()
+            }),
+            compile_portable_executable: false,
+            profile_version: 0,
+            individually_defined_output_indices: Vec::new(),
+            serialized_multi_slice_configuration: Vec::new(),
+            environment_option_overrides: HashMap::new(),
+            target_config: None,
+            allow_in_place_mlir_modification: false,
+            matrix_unit_operand_precision: Precision::Default as i32,
+            ..Default::default()
+        };
+        let executable = client.compile(&program, &compilation_options).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 8);
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+        let row_start_by_device = execution_device_ids
+            .iter()
+            .map(|device_id| {
+                let row_start = left_array.device_shard(*device_id).unwrap().slice()[0].start;
+                (*device_id, row_start)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let execute_arguments =
+            ExecutionArguments::from_arrays(vec![left_array, right_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(
+                execute_arguments.as_execution_device_inputs(),
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .block_until_ready()
+            .unwrap();
+
+        // Validate each output shard, whose row r should be [4r + 8, 4r + 4].
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            let row = *row_start_by_device.get(&device_id).unwrap() as f32;
+            assert_eq!(values[0], 4.0 * row + 8.0);
+            assert_eq!(values[1], 4.0 * row + 4.0);
+        }
+    }
+
+    #[test]
+    fn test_execution_arguments_from_arrays_executes_manual_computation_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .expect("failed to create 4-device CPU client");
+        let domain = Session::new(&client).domain();
+        let client_devices = client.addressable_devices().unwrap();
+        assert_eq!(client_devices.len(), 4);
+
+        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
+        let device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap(),
+            devices,
+        )
+        .unwrap();
+
+        let sharding =
+            Sharding::new(device_mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let boundary = ShardMapBoundary::new(
+            device_mesh.logical_mesh().clone(),
+            vec![sharding.clone()],
+            vec![sharding.clone()],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(
+            boundary.local_input_type(0, &ArrayType::new_static(DataType::F32, [8])).unwrap().shape(),
+            &Shape::new(vec![CoreDimension::Static(2)]),
+        );
+
+        let context = MlirContext::new();
+        let input_sharding = boundary.input_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
+        let output_sharding = boundary.output_shardings()[0].to_mlir(context.unknown_location()).unwrap().to_string();
+        let manual_computation_attributes =
+            r#"in_shardings=[<@mesh, [{"x"}]>] out_shardings=[<@mesh, [{"x"}]>] manual_axes={"x"}"#;
+        let mesh_module = context.module(context.unknown_location()).unwrap();
+        let mesh_operation = mesh_module
+            .body()
+            .unwrap()
+            .append_operation(boundary.mesh().to_mlir(context.unknown_location()).unwrap())
+            .unwrap()
+            .to_string();
+
+        let mlir_program = format!(
+            r#"
+                module {{
+                    {mesh_operation}
+                    func.func @main(
+                        %arg0: tensor<8xf32> {{sdy.sharding = {input_sharding}}}
+                    ) -> (tensor<8xf32> {{sdy.sharding = {output_sharding}}}) {{
+                        %0 = sdy.manual_computation(%arg0) {manual_computation_attributes} (%arg1: tensor<2xf32>) {{
+                            %1 = stablehlo.add %arg1, %arg1 : tensor<2xf32>
+                            sdy.return %1 : tensor<2xf32>
+                        }} : (tensor<8xf32>) -> tensor<8xf32>
+                        return %0 : tensor<8xf32>
+                    }}
+                }}
+            "#,
+        );
+
+        let input_buffers = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                let shard_values = [device_index as f32 * 2.0 + 1.0, device_index as f32 * 2.0 + 2.0];
+                client
+                    .buffer(
+                        values_to_bytes::<f32>(&shard_values).as_slice(),
+                        BufferType::F32,
+                        [2u64],
+                        None,
+                        device.clone(),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        let input_array = Array::from_addressable_buffers(
+            &domain,
+            static_sharded_array_type(DataType::F32, &[8], sharding),
+            device_mesh,
+            input_buffers,
+        )
+        .unwrap();
+        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
+        let executable = client.compile(&program, &test_spmd_compilation_options(4)).unwrap();
+
+        let execution_devices = executable.addressable_devices().unwrap();
+        assert_eq!(execution_devices.len(), 4);
+        let expected_values_by_device = client_devices
+            .iter()
+            .enumerate()
+            .map(|(device_index, device)| {
+                (device.id().unwrap(), [device_index as f32 * 4.0 + 2.0, device_index as f32 * 4.0 + 4.0])
+            })
+            .collect::<HashMap<_, _>>();
+        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
+
+        let execute_arguments =
+            ExecutionArguments::from_arrays(vec![input_array], execution_device_ids.as_slice()).unwrap();
+        let outputs = executable
+            .execute(
+                execute_arguments.as_execution_device_inputs(),
+                Vec::new(),
+                0,
+                None,
+                Some(file!()),
+                None,
+                None,
+                &[],
+            )
+            .unwrap()
+            .block_until_ready()
             .unwrap();
+
+        assert_eq!(outputs.len(), execution_device_ids.len());
+        for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
+            assert_eq!(output.outputs.len(), 1);
+            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
+            assert_eq!(values, *expected_values_by_device.get(&device_id).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_execution_arguments_from_arrays_with_donation_respects_buffer_ownership() {
+        let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain();
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
@@ -1829,11 +2146,602 @@ mod tests {
     }
 
     #[test]
-    fn test_stateful_compilation_domain_execute_uses_compiled_input_types() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+    fn test_execution_arguments_from_arrays_with_donation_rejects_flag_count() {
+        assert!(matches!(
+            ExecutionArguments::from_arrays_with_donation(Vec::new(), Arc::from([]), &[true]),
+            Err(Error::Execution(ExecutionError::DonationFlagCountMismatch { expected_count: 0, actual_count: 1 })),
+        ));
+    }
+
+    #[test]
+    fn test_execution_arguments_from_arrays_with_donation_rejects_duplicate_devices() {
+        assert!(matches!(
+            ExecutionArguments::from_arrays_with_donation(Vec::new(), Arc::from([7, 7]), &[]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                CoreError::Sharding(ShardingError::DuplicateDeviceId { id: 7 }),
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_domain_execute_stateless_zero_identity_preserves_logical_type_and_canonical_value() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
             .unwrap();
+        let staged =
+            crate::stage::<_, ArrayType, ArrayType>(|input| input, input_type.clone(), Options::new(mesh.clone()))
+                .unwrap()
+                .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        assert_eq!(compiled.compiled_program().output_types(), std::slice::from_ref(&input_type));
+
+        let donated_staged: CoreStagedFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            crate::stage::<_, ArrayType, ArrayType>(
+                |input| input,
+                input_type.clone(),
+                Options::new(mesh.clone()).with_donate(true),
+            )
+            .unwrap()
+            .into_inner();
+        let donated_lowered = donated_staged.lower(&domain).unwrap();
+        assert_eq!(donated_lowered.lowered_program().donation_flags(), &[false]);
+        assert_eq!(
+            domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
+            domain.compilation_key(donated_lowered.lowered_program()).unwrap(),
+        );
+
+        // Boolean values retain physical `i1` arguments and results while the identity over the zero data type has an
+        // empty physical signature. Their retained logical metadata also keeps their compilation identities distinct.
+        let boolean_type = input_type.clone().with_data_type(DataType::Boolean);
+        let boolean_staged: CoreStagedFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            crate::stage::<_, ArrayType, ArrayType>(|input| input, boolean_type, Options::new(mesh.clone()))
+                .unwrap()
+                .into_inner();
+        let boolean_lowered = boolean_staged.lower(&domain).unwrap();
+        assert_ne!(
+            domain.compilation_key(compiled.lowered().lowered_program()).unwrap(),
+            domain.compilation_key(boolean_lowered.lowered_program()).unwrap(),
+        );
+
+        let input = Array::from_host_buffer(&domain, input_type, mesh, []).unwrap();
+        let output = compiled.executable().execute(&domain, Value::Array(input)).unwrap();
+        let Value::Array(output) = output else {
+            panic!("array-only compiled function returned a first-class dimension");
+        };
+        assert_eq!(output.data_type(), DataType::Zero);
+        assert!(output.addressable_shards().next().unwrap().buffer().is_none());
+    }
+
+    #[test]
+    fn test_domain_execute_stateless_projects_and_reconstructs_mixed_zero_signatures() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(3)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
+            .with_sharding(sharding)
+            .unwrap();
+        let options = Options::new(mesh.clone()).with_donate((false, true));
+        let staged = crate::stage::<_, (ArrayType, ArrayType), (ArrayType, ArrayType)>(
+            |(value, zero)| (zero, value),
+            (value_type.clone(), zero_type.clone()),
+            options,
+        )
+        .unwrap()
+        .into_inner();
+        let lowered = staged.lower(&domain).unwrap();
+        assert!(lowered.lowered_program().stable_hlo().contains("func.func @main(%arg0: tensor<3xf32>"));
+        let compiled: ryft_core::compilation::CompiledFunction<
+            Domain<'_>,
+            (ArrayIrType, ArrayIrType),
+            (ArrayIrType, ArrayIrType),
+        > = lowered.compile(&domain).unwrap();
+        let value = Array::from_host_buffer(
+            &domain,
+            value_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0]),
+        )
+        .unwrap();
+        let zero = Array::from_host_buffer(&domain, zero_type.clone(), mesh, []).unwrap();
+
+        let (zero_output, value_output) =
+            compiled.executable().execute(&domain, (Value::Array(value), Value::Array(zero))).unwrap();
+        let Value::Array(zero_output) = zero_output else {
+            panic!("array-only compiled function returned a first-class dimension");
+        };
+        let Value::Array(value_output) = value_output else {
+            panic!("array-only compiled function returned a first-class dimension");
+        };
+
+        assert_eq!(zero_output.r#type().as_ref(), &zero_type);
+        assert!(zero_output.addressable_shards().next().unwrap().buffer().is_none());
+        assert_eq!(value_output.r#type().as_ref(), &value_type);
+        let value_bytes = value_output
+            .addressable_shards()
+            .next()
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(values_from_bytes::<f32>(value_bytes.as_slice()), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_domain_execute_program_bounded_dynamic_program_on_multiple_cpu_devices() {
+        let client = cpu_client(4);
+        let mesh = domain_mesh(&client, "x", 4);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 4);
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
+        let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(5)).unwrap());
+        let depth = DimensionVariable::new("depth", DimensionBounds::new(4, Some(7)).unwrap());
+        let declared_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![
+                CoreDimension::Static(4),
+                CoreDimension::Dynamic(rows),
+                CoreDimension::Dynamic(columns),
+                CoreDimension::Dynamic(depth),
+            ]),
+        )
+        .with_sharding(sharding.clone())
+        .unwrap();
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            declared_type,
+            Options::new(mesh.clone()),
+        )
+        .unwrap()
+        .into_inner();
+        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
+            staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let executable_options =
+            compiled.compiled_program().compilation_options().executable_build_options.as_ref().unwrap();
+        assert_eq!(executable_options.replica_count, 4);
+        assert_eq!(executable_options.partition_count, 1);
+        assert!(!executable_options.use_spmd_partitioning);
+        assert!(!executable_options.use_shardy_partitioner);
+        assert_eq!(compiled.compiled_program().plan().output_layouts.as_ref().map(Vec::len), None);
+
+        for shape in [[4usize, 2, 3, 5], [4, 3, 4, 6]] {
+            let actual_type =
+                ArrayType::new(DataType::F32, Shape::new(shape.into_iter().map(CoreDimension::Static).collect()))
+                    .with_sharding(sharding.clone())
+                    .unwrap();
+            let values = (0..shape.iter().product()).map(|value| value as f32).collect::<Vec<_>>();
+            let input = Array::from_host_buffer(
+                &domain,
+                actual_type,
+                mesh.clone(),
+                values_to_bytes(values.as_slice()).as_slice(),
+            )
+            .unwrap();
+            let output = compiled.executable().execute(&domain, Value::Array(input)).unwrap();
+            let Value::Array(output) = output else {
+                panic!("array-only compiled function returned a first-class dimension");
+            };
+            output.block_until_ready().unwrap();
+
+            assert_eq!(output.shape().as_slice(), shape.as_slice());
+            assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
+        }
+        assert_eq!(domain.program_count(), 1);
+
+        // Dynamic tensor partitioning remains an explicit backend limitation rather than silently changing a user's
+        // requested placement to replication. Types record no placement over auto mesh axes, so that placement is an
+        // input sharding override.
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Dynamic(extent)]));
+        let sharded = Sharding::new(
+            mesh.logical_mesh().clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let staged = crate::stage::<_, ArrayType, ArrayType>(
+            |input| input.clone() + input,
+            dynamic_type,
+            Options::new(mesh).with_input_shardings(vec![sharded]),
+        )
+        .unwrap()
+        .into_inner();
+        let Err(error) = staged.lower(&domain) else {
+            panic!("bounded-dynamic sharded program unexpectedly lowered");
+        };
+        assert_eq!(
+            error.to_string(),
+            "invalid compilation options: bounded-dynamic multi-device programs currently require fully replicated \
+             shardings because Shardy rejects dynamic tensors",
+        );
+    }
+
+    #[test]
+    fn test_domain_execute_program_data_derived_prefix_slice_at_multiple_extents() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_sharding(input_sharding.clone())
+            .unwrap();
+        let values_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_sharding(input_sharding)
+            .unwrap();
+        let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5)).unwrap());
+
+        // The mask determines a count on the device, the checked gateway turns that count into a bounded dimension, and
+        // the slice returns that many leading values without a host readback.
+        let mut builder = ProgramBuilder::new();
+        let mask = builder.add_input(mask_type.into());
+        let values = builder.add_input(values_type.into());
+        let mask = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::I64, false),
+                Vec::new(),
+                vec![mask],
+                None,
+            )
+            .unwrap()[0];
+        let count = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask], None)
+            .unwrap()[0];
+        let count = builder
+            .add_instruction(DimensionFromScalarOperation::new(count_variable.into()), Vec::new(), vec![count], None)
+            .unwrap()[0];
+        let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(0).unwrap()));
+        let output = builder
+            .add_instruction(
+                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                Vec::new(),
+                vec![values, start, count],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let values = || f32_vector(&domain, &mesh, &[10.0, 20.0, 30.0, 40.0]);
+        let execute = |mask: &[bool]| {
+            domain.execute_program(&compiled, vec![boolean_vector(&domain, &mesh, mask), values()]).unwrap()
+        };
+
+        let two = execute(&[true, false, true, false]);
+        assert_eq!(two[0].shape(), StaticShape::new(vec![2]));
+        assert_eq!(read_f32s(&client, &two[0]), vec![10.0, 20.0]);
+        let four = execute(&[true, true, true, true]);
+        assert_eq!(four[0].shape(), StaticShape::new(vec![4]));
+        assert_eq!(read_f32s(&client, &four[0]), vec![10.0, 20.0, 30.0, 40.0]);
+    }
+
+    #[test]
+    fn test_domain_execute_program_data_derived_prefix_slice_with_duplicate_and_equal_outputs() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_sharding(input_sharding.clone())
+            .unwrap();
+        let values_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_sharding(input_sharding)
+            .unwrap();
+        let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5)).unwrap());
+
+        // XLA merges bounded dynamic results that it proves equal and, on CPU, fills the duplicate result with a plain
+        // copy that leaves its runtime size trailer at zero, while CUDA preserves the trailer. The program returns the
+        // same prefix slice twice and then an equal slice built separately, which covers duplicate entry results and
+        // results merged by XLA's CSE.
+        let mut builder = ProgramBuilder::new();
+        let mask = builder.add_input(mask_type.into());
+        let values = builder.add_input(values_type.into());
+        let mask = builder
+            .add_instruction(
+                ConvertElementTypeOperation::<ArrayType>::new(DataType::I64, false),
+                Vec::new(),
+                vec![mask],
+                None,
+            )
+            .unwrap()[0];
+        let count = builder
+            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask], None)
+            .unwrap()[0];
+        let count = builder
+            .add_instruction(DimensionFromScalarOperation::new(count_variable.into()), Vec::new(), vec![count], None)
+            .unwrap()[0];
+        let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(0).unwrap()));
+        let mut prefix = || {
+            builder
+                .add_instruction(
+                    DynamicSliceOperation::<ArrayIrType>::from_rank(1),
+                    Vec::new(),
+                    vec![values, start, count],
+                    None,
+                )
+                .unwrap()[0]
+        };
+        let output = prefix();
+        let equal_output = prefix();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![output, output, equal_output],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+        let compiled = domain.compile_program(&lowered).unwrap();
+        let values = || f32_vector(&domain, &mesh, &[10.0, 20.0, 30.0, 40.0]);
+        let execute = |mask: &[bool]| {
+            domain.execute_program(&compiled, vec![boolean_vector(&domain, &mesh, mask), values()]).unwrap()
+        };
+
+        let two = execute(&[true, false, true, false]);
+        assert_eq!(two.len(), 3);
+        for output in &two {
+            assert_eq!(output.shape(), StaticShape::new(vec![2]));
+            assert_eq!(read_f32s(&client, output), vec![10.0, 20.0]);
+        }
+        let four = execute(&[true, true, true, true]);
+        assert_eq!(four.len(), 3);
+        for output in &four {
+            assert_eq!(output.shape(), StaticShape::new(vec![4]));
+            assert_eq!(read_f32s(&client, output), vec![10.0, 20.0, 30.0, 40.0]);
+        }
+    }
+
+    #[test]
+    fn test_domain_prepare_compiled_execution_validates_kernel_participants() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "device", 1);
+        let domain = Session::new(&client).domain();
+        let input = f32_vector(&domain, &mesh, &[2.0, 5.0]);
+        let mut builder = ProgramBuilder::new();
+        let argument = builder.add_input(input.r#type().into_owned().into());
+        let source = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![argument], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
+        let program = domain.compile_program(&lowered).unwrap();
+        // Attach the same validated marker carried by executables with native kernels. The identity program isolates
+        // submission admission from any backend-specific kernel compiler or custom-call handler.
+        let program = program.with_kernel_execution_facts(Some(
+            crate::kernels::KernelExecutionFacts::from_target(domain.target().unwrap(), &mesh)
+                .unwrap()
+                .configuration_key()
+                .unwrap(),
+        ));
+        let execution = domain.execute_compiled_async(&program, vec![input.clone()]).unwrap();
+        execution.fence().block_until_ready().unwrap();
+        assert_eq!(read_f32s(&client, &execution.output()[0]), vec![2.0, 5.0]);
+        let program = program.with_mesh(
+            DeviceMesh::new(
+                mesh.logical_mesh().clone(),
+                vec![Device::new(mesh.devices()[0].id(), client.process_index().unwrap() + 1)],
+            )
+            .unwrap(),
+        );
+        // A topology change cannot reach resharding, donation, or PJRT execution, and the retained input stays
+        // readable.
+        assert!(matches!(
+            domain.prepare_compiled_execution(&program, vec![input.clone()], &[]),
+            Err(error)
+                if matches!(error.downcast_custom::<crate::kernels::KernelEmbeddingError>(),
+                    Some(crate::kernels::KernelEmbeddingError::Invalid { message })
+                        if message == "cross-process kernel execution requires a qualified collective ordering and \
+                                       completion contract"),
+        ));
+        assert_eq!(read_f32s(&client, &input), vec![2.0, 5.0]);
+    }
+
+    #[test]
+    fn test_domain_prepare_compiled_execution_preserves_erased_input_producer_completion() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let zero_type = ArrayType::new_static(DataType::Zero, [2]);
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
+        // Exercise both the ordinary input projection and the branch that materializes bounded inputs. The failed
+        // producer belongs to an erased input of the zero data type, so no physical input buffer can carry its failure.
+        for value_type in
+            [ArrayType::new_static(DataType::F32, [2]), ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))]
+        {
+            let mut builder = ProgramBuilder::new();
+            let zero_input = builder.add_input(zero_type.clone().into());
+            let value_input = builder.add_input(value_type.into());
+            let program = builder
+                .build::<Vec<Constant>, Vec<Constant>>(
+                    vec![zero_input, value_input],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap();
+            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
+            assert_eq!(lowered.signature().input_mapping(), &[None, Some(0)]);
+            let compiled = domain.compile_program(&lowered).unwrap();
+            let (event, promise) = client.event(()).unwrap();
+            promise.set(Some(ryft_pjrt::Error::invalid_argument("erased producer failed"))).unwrap();
+            let zero = Array::from_host_buffer(&domain, zero_type.clone(), mesh.clone(), [])
+                .unwrap()
+                .with_execution_fence(ExecutionFence::new(vec![event]));
+            let value = Array::from_host_buffer(
+                &domain,
+                ArrayType::new_static(DataType::F32, [2]),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[1.0, 2.0]),
+            )
+            .unwrap();
+            assert!(matches!(
+                domain.execute_compiled_async(&compiled, vec![zero, value]),
+                Err(Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }))
+                    if message == "erased producer failed",
+            ));
+        }
+    }
+
+    #[test]
+    fn test_domain_reshard_inputs_if_needed() {
+        let client = cpu_client(4);
+        let mesh = domain_mesh(&client, "x", 4);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let device_values = |array: &Array<'_>| {
+            array
+                .shards()
+                .iter()
+                .map(|shard| {
+                    let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
+                    values_from_bytes::<f32>(bytes.as_slice())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // An input that already has the expected sharding passes through.
+        let input = f32_vector(&domain, &mesh, &[1., 2., 3., 4.]);
+        let inputs = domain.reshard_inputs_if_needed(&mesh, &[replicated.clone()], vec![input.clone()]).unwrap();
+        assert_eq!(inputs, vec![input.clone()]);
+
+        // An input on one device of the mesh is placed on every device by copying its shard, which compiles nothing.
+        let single_device_mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
+            vec![mesh.devices()[0]],
+        )
+        .unwrap();
+        let single_device_input = f32_vector(&domain, &single_device_mesh, &[1., 2., 3., 4.]);
+        let inputs = domain
+            .reshard_inputs_if_needed(
+                &mesh,
+                &[replicated.clone(), replicated],
+                vec![input.clone(), single_device_input.clone()],
+            )
+            .unwrap();
+        assert_eq!(inputs[0], input);
+        assert_eq!(inputs[1].r#type(), input.r#type());
+        assert_eq!(inputs[1].mesh(), &mesh);
+        assert!(Arc::ptr_eq(
+            inputs[1].shards()[0].buffer().unwrap(),
+            single_device_input.shards()[0].buffer().unwrap(),
+        ));
+        assert_eq!(device_values(&inputs[1]), vec![vec![1., 2., 3., 4.]; 4]);
+        assert_eq!(domain.program_count(), 0);
+
+        // An input whose shards have to be sliced goes through a compiled reshard.
+        let inputs = domain.reshard_inputs_if_needed(&mesh, &[sharded.clone()], vec![input]).unwrap();
+        assert_eq!(inputs[0].sharding(), &sharded);
+        assert_eq!(device_values(&inputs[0]), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
+        assert_eq!(domain.program_count(), 1);
+
+        // An input with the expected sharding on a mesh that lists the devices in another order holds each slice on
+        // another device, so its shards are moved to the devices that the program expects them on.
+        let reversed_mesh =
+            DeviceMesh::new(mesh.logical_mesh().clone(), mesh.devices().iter().rev().copied().collect()).unwrap();
+        let reversed_input = Array::from_host_buffer_with_sharding(
+            &domain,
+            ArrayType::new_static(DataType::F32, [4]),
+            sharded.clone(),
+            reversed_mesh.clone(),
+            values_to_bytes(&[1f32, 2., 3., 4.]),
+        )
+        .unwrap();
+        assert_eq!(reversed_input.sharding(), &sharded);
+        let inputs = domain.reshard_inputs_if_needed(&mesh, &[sharded.clone()], vec![reversed_input]).unwrap();
+        assert_eq!(inputs[0].mesh(), &mesh);
+        assert_eq!(device_values(&inputs[0]), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
+        assert_eq!(domain.program_count(), 1);
+    }
+
+    #[test]
+    fn test_domain_materialize_zero_space_carriers() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        // The compiled module declares the `[3]` argument at its bounds, so a `[2]` runtime value below those bounds
+        // must still produce a `[3]` carrier. The hidden extent scalar transports the logical size.
+        let physical_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(3)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let runtime_zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
+            .with_sharding(sharding)
+            .unwrap();
+        let zero = Array::from_host_buffer(&domain, runtime_zero_type, mesh, []).unwrap();
+
+        let carriers = domain.materialize_zero_space_carriers(&[physical_zero_type], vec![zero]).unwrap();
+
+        assert_eq!(carriers.len(), 1);
+        assert_eq!(carriers[0].data_type(), DataType::Boolean);
+        assert_eq!(carriers[0].shape().as_slice(), &[3]);
+        let carrier_bytes = carriers[0]
+            .addressable_shards()
+            .next()
+            .unwrap()
+            .buffer()
+            .unwrap()
+            .copy_to_host(None)
+            .unwrap()
+            .r#await()
+            .unwrap();
+        assert_eq!(carrier_bytes.as_slice(), &[0, 0, 0]);
+    }
+
+    #[test]
+    fn test_domain_materialize_zero_space_carriers_for_inputs_below_their_bounds() {
+        let client = cpu_client(1);
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let declared_type = ArrayType::new(
+            DataType::Zero,
+            Shape::new(vec![DimensionVariable::new("extent", DimensionBounds::non_negative(Some(4)).unwrap()).into()]),
+        )
+        .with_sharding(sharding.clone())
+        .unwrap();
+        let signature = ExecutableSignature::new(std::slice::from_ref(&declared_type), &[]);
+        let actual_type = ArrayType::new(DataType::Zero, Shape::new(vec![CoreDimension::Static(2)]))
+            .with_sharding(sharding)
+            .unwrap();
+        let zero = Array::from_host_buffer(&domain, actual_type.clone(), mesh, []).unwrap();
+
+        // The input of the zero data type below its bounds must bypass the retained cache and byte padding tiers,
+        // because its dense host copy is empty, and rely on the carrier materialization to synthesize the predicate
+        // argument at its bounds.
+        let materialized = materialize_bounded_dynamic_inputs(
+            &domain,
+            &signature,
+            std::slice::from_ref(&declared_type),
+            std::slice::from_ref(&actual_type),
+            vec![zero],
+        )
+        .unwrap();
+        let inputs = materialized.into_inputs();
+        assert_eq!(inputs.len(), 2);
+
+        let physical_types = signature.physical_input_types(std::slice::from_ref(&declared_type));
+        let carriers = domain.materialize_zero_space_carriers(&physical_types, inputs).unwrap();
+        assert_eq!(carriers[0].data_type(), DataType::Boolean);
+        assert_eq!(carriers[0].shape().as_slice(), &[3]);
+        assert_eq!(carriers[1].data_type(), DataType::I32);
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_uses_compiled_input_types() {
+        let client = cpu_client(1);
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain();
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -1901,1722 +2809,748 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_compiled_execution_kernel_participants() {
+    fn test_domain_execute_statefully_rejects_non_root_views() {
         let client = execution_client();
-        let mesh = domain_mesh(&client, "device", 1);
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain();
-        let input = f32_vector(&domain, &mesh, &[2.0, 5.0]);
-        let mut builder = ProgramBuilder::new();
-        let argument = builder.add_input(input.r#type().into_owned().into());
-        let source = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![argument], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let lowered = domain.lower_program(&source, 0, &Options::new(mesh.clone())).unwrap();
-        let program = domain.compile_program(&lowered).unwrap();
-        // Attach the same validated marker carried by native-kernel executables. The identity program isolates
-        // submission admission from any backend-specific kernel compiler or custom-call handler.
-        let program = program.with_kernel_execution_facts(Some(
-            crate::kernels::KernelExecutionFacts::from_target(domain.target().unwrap(), &mesh)
-                .unwrap()
-                .configuration_key()
+        let vector_type = replicated_vector_type(&mesh, 2);
+        let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
+        let compiled = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |reference| reference.read().map_err(Into::into),
+            ArrayIrType::Reference(ReferenceType::new(scalar_type)),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let root = ArrayReference::new(
+            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
                 .unwrap(),
+        );
+        let view = root
+            .with_transform(ArrayReferenceTransform::Index { axis: 0, index: ArrayReferenceTransformIndex::Static(1) })
+            .unwrap();
+        assert!(matches!(
+            compiled.execute_statefully_and_wait(&domain, Value::Reference(Reference::new(view, domain.clone()))),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })
+                    if *reason
+                        == "external state input 0 must be a root reference handle that uses its allocation's stored \
+                            type identities",
+            ),
         ));
-        let execution = domain.execute_compiled_async(&program, vec![input.clone()]).unwrap();
-        execution.fence().block_until_ready().unwrap();
-        assert_eq!(read_f32s(&client, &execution.output()[0]), vec![2.0, 5.0]);
-        let program = program.with_mesh(
-            DeviceMesh::new(
-                mesh.logical_mesh().clone(),
-                vec![Device::new(mesh.devices()[0].id(), client.process_index().unwrap() + 1)],
+        assert_eq!(read_f32s(&client, &root.read().unwrap()), vec![4.0, 9.0]);
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_validates_holder_sharding() {
+        let client = execution_client();
+        // Types record placement over explicit mesh axes only, so the alternate static sharding uses an explicit axis.
+        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
+        let mesh = DeviceMesh::new(
+            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Explicit).unwrap()]).unwrap(),
+            vec![device],
+        )
+        .unwrap();
+        let domain = Session::new(&client).domain();
+        let shape = Shape::new(vec![CoreDimension::Static(2)]);
+        let replicated_type = ArrayType::new(DataType::F32, shape.clone())
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
+            .unwrap();
+        let alternate_type = ArrayType::new(DataType::F32, shape)
+            .with_sharding(Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap())
+            .unwrap();
+        let sharded = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |reference| reference.read().map_err(Into::into),
+            ArrayIrType::Reference(ReferenceType::new(alternate_type.clone())),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(
+                &domain,
+                alternate_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[1.0, 2.0]).as_slice(),
             )
             .unwrap(),
         );
-        // A topology change cannot reach resharding, donation, or PJRT execution; the retained input stays readable.
-        assert!(matches!(
-            domain.prepare_compiled_execution(&program, vec![input.clone()], &[]),
-            Err(error)
-                if matches!(error.downcast_custom::<crate::kernels::KernelEmbeddingError>(),
-                    Some(crate::kernels::KernelEmbeddingError::Invalid { message })
-                        if message == "cross-process kernel execution requires a qualified collective ordering and \
-                                       completion contract"),
-        ));
-        assert_eq!(read_f32s(&client, &input), vec![2.0, 5.0]);
-    }
-
-    #[test]
-    fn test_prepare_compiled_execution_preserves_erased_input_producer_completion() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let zero_type = ArrayType::new_static(DataType::Zero, [2]);
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(0, Some(5)).unwrap());
-        // Exercise both the ordinary input projection and the branch that materializes bounded inputs. The failed
-        // producer belongs to an erased zero-space input, so no physical input buffer can carry its failure.
-        for value_type in
-            [ArrayType::new_static(DataType::F32, [2]), ArrayType::new(DataType::F32, Shape::new(vec![extent.into()]))]
-        {
-            let mut builder = ProgramBuilder::new();
-            let zero_input = builder.add_input(zero_type.clone().into());
-            let value_input = builder.add_input(value_type.into());
-            let program = builder
-                .build::<Vec<Constant>, Vec<Constant>>(
-                    vec![zero_input, value_input],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
-                .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            assert_eq!(lowered.signature().input_mapping(), &[None, Some(0)]);
-            let compiled = domain.compile_program(&lowered).unwrap();
-            let (event, promise) = client.event(()).unwrap();
-            promise.set(Some(ryft_pjrt::Error::invalid_argument("erased producer failed"))).unwrap();
-            let zero = Array::from_host_buffer(&domain, zero_type.clone(), mesh.clone(), [])
-                .unwrap()
-                .with_execution_fence(ExecutionFence::new(vec![event]));
-            let value = Array::from_host_buffer(
-                &domain,
-                ArrayType::new_static(DataType::F32, [2]),
-                mesh.clone(),
-                values_to_bytes::<f32>(&[1.0, 2.0]),
-            )
-            .unwrap();
-            assert!(matches!(
-                domain.execute_compiled_async(&compiled, vec![zero, value]),
-                Err(Error::Pjrt(ryft_pjrt::Error::InvalidArgument { message, .. }))
-                    if message == "erased producer failed",
-            ));
-        }
-    }
-
-    #[test]
-    fn test_reshard_inputs_if_needed() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 4);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let device_values = |array: &Array<'_>| {
-            array
-                .shards()
-                .iter()
-                .map(|shard| {
-                    let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
-                    values_from_bytes::<f32>(bytes.as_slice())
-                })
-                .collect::<Vec<_>>()
-        };
-
-        // An input that already has the expected sharding passes through.
-        let input = f32_vector(&domain, &mesh, &[1., 2., 3., 4.]);
-        let inputs = reshard_inputs_if_needed(&domain, &mesh, &[replicated.clone()], vec![input.clone()]).unwrap();
-        assert_eq!(inputs, vec![input.clone()]);
-
-        // An input on one device of the mesh is placed on every device by copying its shard, which compiles nothing.
-        let single_device_mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
-            vec![mesh.devices()[0]],
-        )
-        .unwrap();
-        let single_device_input = f32_vector(&domain, &single_device_mesh, &[1., 2., 3., 4.]);
-        let inputs = reshard_inputs_if_needed(
-            &domain,
-            &mesh,
-            &[replicated.clone(), replicated],
-            vec![input.clone(), single_device_input.clone()],
-        )
-        .unwrap();
-        assert_eq!(inputs[0], input);
-        assert_eq!(inputs[1].r#type(), input.r#type());
-        assert_eq!(inputs[1].mesh(), &mesh);
-        assert!(Arc::ptr_eq(
-            inputs[1].shards()[0].buffer().unwrap(),
-            single_device_input.shards()[0].buffer().unwrap(),
-        ));
-        assert_eq!(device_values(&inputs[1]), vec![vec![1., 2., 3., 4.]; 4]);
-        assert_eq!(domain.program_count(), 0);
-
-        // An input whose shards have to be sliced goes through a compiled reshard.
-        let inputs = reshard_inputs_if_needed(&domain, &mesh, &[sharded.clone()], vec![input]).unwrap();
-        assert_eq!(inputs[0].sharding(), &sharded);
-        assert_eq!(device_values(&inputs[0]), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
-        assert_eq!(domain.program_count(), 1);
-    }
-
-    #[test]
-    fn test_static_program_outputs_take_their_planned_layouts_on_multiple_cpu_devices() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 4);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        // Types record no placement over auto mesh axes, so the placements are input and output sharding overrides.
-        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
-        let staged = crate::stage::<_, ArrayType, ArrayType>(
-            |input| input.clone() + input,
-            input_type.clone(),
-            Options::new(mesh.clone())
-                .with_input_shardings(vec![sharding.clone()])
-                .with_output_shardings(vec![sharding.clone()]),
-        )
-        .unwrap()
-        .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        assert!(compiled.compiled_program().plan().output_layouts.is_some());
-
-        // Outputs are built from the program's planned layouts, which place every shard like the validating
-        // constructors do and are shared by the outputs of every execution.
-        let values = (0..8).map(|value| value as f32).collect::<Vec<_>>();
-        let input = Array::from_host_buffer_with_sharding(
-            &domain,
-            input_type,
-            sharding.clone(),
-            mesh.clone(),
-            values_to_bytes(values.as_slice()).as_slice(),
-        )
-        .unwrap();
-        let call = || {
-            let output = compiled.executable().execute(&domain, Value::Array(input.clone())).unwrap();
-            let Value::Array(output) = output else {
-                panic!("array-only compiled function returned a first-class dimension");
-            };
-            output
-        };
-        let output = call();
-        let other_output = call();
-        output.block_until_ready().unwrap();
-        assert_eq!(output.r#type(), input.r#type());
-        assert_eq!(output.sharding(), &sharding);
-        assert_eq!(output.mesh(), &mesh);
-        assert_eq!(
-            output.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
-            input.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
-        );
-        assert_eq!(
-            other_output.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
-            output.shards().iter().map(|shard| shard.descriptor()).collect::<Vec<_>>(),
-        );
-        let shards = output
-            .shards()
-            .iter()
-            .map(|shard| {
-                values_from_bytes::<f32>(
-                    shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap().as_slice(),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(shards, vec![vec![0.0, 2.0], vec![4.0, 6.0], vec![8.0, 10.0], vec![12.0, 14.0]]);
-    }
-
-    #[test]
-    fn test_static_program_outputs_without_declared_placement_are_validated_on_multiple_cpu_devices() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 4);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let unconstrained_sharding =
-            Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::unconstrained()]).unwrap();
-        let unconstrained_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]))
-            .with_sharding(unconstrained_sharding)
-            .unwrap();
-        let unsharded_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8)]));
-
-        // XLA chooses the placement of outputs with open (`Unconstrained`) dimensions and of outputs without declared
-        // shardings, so their programs plan no trusted output layouts and validate the returned buffers instead.
-        for input_type in [unconstrained_type, unsharded_type] {
-            let staged = crate::stage::<_, ArrayType, ArrayType>(
-                |input| input.clone() + input,
-                input_type,
-                Options::new(mesh.clone()),
-            )
+        let Value::Array(output) = sharded
+            .execute_statefully_and_wait(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
             .unwrap()
-            .into_inner();
-            let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-                staged.lower(&domain).unwrap().compile(&domain).unwrap();
-            assert!(compiled.compiled_program().plan().output_layouts.is_none());
-        }
-    }
-
-    #[test]
-    fn test_internal_dynamic_tensor_behind_a_static_boundary_takes_the_replica_path() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 4);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let size_type = replicated_scalar_type(&mesh, DataType::I64);
-        let value_type = replicated_scalar_type(&mesh, DataType::F32);
-
-        // The boundary of this program is fully static, but its interior derives a dynamic extent from a runtime
-        // scalar, broadcasts to it, and reduces back to a scalar.
-        let mut builder = ProgramBuilder::new();
-        let size = builder.add_input(size_type.clone().into());
-        let value = builder.add_input(value_type.clone().into());
-        let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![size], None)
-            .unwrap()[0];
-        let broadcast = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
-            .unwrap()[0];
-        let output = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![broadcast], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let executable_options = lowered.compilation_options().executable_build_options.as_ref().unwrap();
-        assert_eq!(executable_options.replica_count, 4);
-        assert_eq!(executable_options.partition_count, 1);
-        assert!(!executable_options.use_spmd_partitioning);
-        assert!(!executable_options.use_shardy_partitioner);
-        assert!(!lowered.stable_hlo().contains("sdy."), "{}", lowered.stable_hlo());
-
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let size =
-            Array::from_host_buffer(&domain, size_type.clone(), mesh.clone(), 3i64.to_ne_bytes().as_slice()).unwrap();
-        let value = Array::from_host_buffer(
-            &domain,
-            value_type.clone(),
-            mesh.clone(),
-            values_to_bytes::<f32>(&[2.0]).as_slice(),
-        )
-        .unwrap();
-        let outputs = domain.execute_program(&compiled, vec![size, value]).unwrap();
-        assert_eq!(read_f32s(&client, &outputs[0]), vec![6.0]);
-
-        // The replica path is a hard requirement rather than a preference: annotating the very same program for
-        // Shardy and compiling it with the Shardy partitioner enabled fails on the internal dynamic tensor, even
-        // though every boundary type is static.
-        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 0);
-        let annotated = crate::lowering::lower_mlir_module_for_program(
-            &program,
-            &[],
-            &vec![size_type, value_type.clone()],
-            &vec![value_type],
-            "main",
-            Some(&[replicated.clone(), replicated.clone()]),
-            Some(std::slice::from_ref(&replicated)),
-            None,
-        )
-        .unwrap();
-        let shardy_lowered = lowered
-            .clone()
-            .with_stable_hlo(annotated.into_parts().0)
-            .with_compilation_options(jit_compilation_options(domain.compilation_options(), 4, true, None));
-        let Err(error) = domain.compile_program(&shardy_lowered) else {
-            panic!("Shardy unexpectedly accepted a module containing an internal dynamic tensor");
+        else {
+            panic!("stateful read output must be an array")
         };
-        assert!(error.to_string().contains("only supports ranked tensors with a static shape"), "{error}");
-    }
-
-    #[test]
-    fn test_bounded_dynamic_program_executes_on_multiple_cpu_devices() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 4);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 4);
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(4)).unwrap());
-        let columns = DimensionVariable::new("columns", DimensionBounds::new(2, Some(5)).unwrap());
-        let depth = DimensionVariable::new("depth", DimensionBounds::new(4, Some(7)).unwrap());
-        let declared_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![
-                CoreDimension::Static(4),
-                CoreDimension::Dynamic(rows),
-                CoreDimension::Dynamic(columns),
-                CoreDimension::Dynamic(depth),
-            ]),
-        )
-        .with_sharding(sharding.clone())
-        .unwrap();
-        let staged = crate::stage::<_, ArrayType, ArrayType>(
-            |input| input.clone() + input,
-            declared_type,
-            Options::new(mesh.clone()),
-        )
-        .unwrap()
-        .into_inner();
-        let compiled: ryft_core::compilation::CompiledFunction<Domain<'_>, ArrayIrType, ArrayIrType> =
-            staged.lower(&domain).unwrap().compile(&domain).unwrap();
-        let executable_options =
-            compiled.compiled_program().compilation_options().executable_build_options.as_ref().unwrap();
-        assert_eq!(executable_options.replica_count, 4);
-        assert_eq!(executable_options.partition_count, 1);
-        assert!(!executable_options.use_spmd_partitioning);
-        assert!(!executable_options.use_shardy_partitioner);
-        assert!(compiled.compiled_program().plan().output_layouts.is_none());
-
-        for shape in [[4usize, 2, 3, 5], [4, 3, 4, 6]] {
-            let actual_type =
-                ArrayType::new(DataType::F32, Shape::new(shape.into_iter().map(CoreDimension::Static).collect()))
-                    .with_sharding(sharding.clone())
-                    .unwrap();
-            let values = (0..shape.iter().product()).map(|value| value as f32).collect::<Vec<_>>();
-            let input = Array::from_host_buffer(
-                &domain,
-                actual_type,
-                mesh.clone(),
-                values_to_bytes(values.as_slice()).as_slice(),
-            )
-            .unwrap();
-            let output = compiled.executable().execute(&domain, Value::Array(input)).unwrap();
-            let Value::Array(output) = output else {
-                panic!("array-only compiled function returned a first-class dimension");
-            };
-            output.block_until_ready().unwrap();
-
-            assert_eq!(output.shape().as_slice(), shape.as_slice());
-            assert_eq!(read_f32s(&client, &output), values.iter().map(|value| value * 2.0).collect::<Vec<_>>());
-        }
-        assert_eq!(domain.program_count(), 1);
-
-        // Dynamic tensor partitioning remains an explicit backend limitation rather than silently changing a user's
-        // requested placement to replication. Types record no placement over auto mesh axes, so that placement is an
-        // input sharding override.
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
-        let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Dynamic(extent)]));
-        let sharded = Sharding::new(
-            mesh.logical_mesh().clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-        )
-        .unwrap();
-        let staged = crate::stage::<_, ArrayType, ArrayType>(
-            |input| input.clone() + input,
-            dynamic_type,
-            Options::new(mesh).with_input_shardings(vec![sharded]),
-        )
-        .unwrap()
-        .into_inner();
-        let Err(error) = staged.lower(&domain) else {
-            panic!("bounded-dynamic sharded program unexpectedly lowered");
-        };
-        assert_eq!(
-            error.to_string(),
-            "invalid compilation options: bounded-dynamic multi-device programs currently require fully replicated \
-             shardings because Shardy rejects dynamic tensors",
-        );
-    }
-
-    #[test]
-    fn test_data_derived_prefix_slice_executes_at_multiple_extents() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(input_sharding.clone())
-            .unwrap();
-        let values_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(input_sharding)
-            .unwrap();
-        let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5)).unwrap());
-
-        // This is the compiled counterpart of the Phase 4 prefix-take fixture: the mask determines a device-side
-        // count, the checked gateway turns that count into a bounded dimension, and the slice returns that many
-        // leading values without a host readback.
-        let mut builder = ProgramBuilder::new();
-        let mask = builder.add_input(mask_type.into());
-        let values = builder.add_input(values_type.into());
-        let mask = builder
-            .add_instruction(
-                ConvertElementTypeOperation::<ArrayType>::new(DataType::I64, false),
-                Vec::new(),
-                vec![mask],
-                None,
-            )
-            .unwrap()[0];
-        let count = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask], None)
-            .unwrap()[0];
-        let count = builder
-            .add_instruction(DimensionFromScalarOperation::new(count_variable.into()), Vec::new(), vec![count], None)
-            .unwrap()[0];
-        let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(0).unwrap()));
-        let output = builder
-            .add_instruction(
-                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
-                Vec::new(),
-                vec![values, start, count],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let values = || f32_vector(&domain, &mesh, &[10.0, 20.0, 30.0, 40.0]);
-        let execute = |mask: &[bool]| {
-            domain.execute_program(&compiled, vec![boolean_vector(&domain, &mesh, mask), values()]).unwrap()
-        };
-
-        let two = execute(&[true, false, true, false]);
-        assert_eq!(two[0].shape(), StaticShape::new(vec![2]));
-        assert_eq!(read_f32s(&client, &two[0]), vec![10.0, 20.0]);
-        let four = execute(&[true, true, true, true]);
-        assert_eq!(four[0].shape(), StaticShape::new(vec![4]));
-        assert_eq!(read_f32s(&client, &four[0]), vec![10.0, 20.0, 30.0, 40.0]);
-    }
-
-    #[test]
-    fn test_data_derived_prefix_slice_executes_with_duplicate_and_equal_outputs() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
-        let mask_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(input_sharding.clone())
-            .unwrap();
-        let values_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(input_sharding)
-            .unwrap();
-        let count_variable = DimensionVariable::new("count", DimensionBounds::new(0, Some(5)).unwrap());
-
-        // XLA merges bounded dynamic results that it proves equal and, on CPU, fills the duplicate result with a plain
-        // copy that leaves its runtime-size trailer at zero (CUDA preserves the trailer). The program returns the same
-        // prefix slice twice and then an equal slice staged separately, which covers duplicate entry results and
-        // results merged by XLA's CSE.
-        let mut builder = ProgramBuilder::new();
-        let mask = builder.add_input(mask_type.into());
-        let values = builder.add_input(values_type.into());
-        let mask = builder
-            .add_instruction(
-                ConvertElementTypeOperation::<ArrayType>::new(DataType::I64, false),
-                Vec::new(),
-                vec![mask],
-                None,
-            )
-            .unwrap()[0];
-        let count = builder
-            .add_instruction(ReduceOperation::new(vec![0], ReductionKind::Sum), Vec::new(), vec![mask], None)
-            .unwrap()[0];
-        let count = builder
-            .add_instruction(DimensionFromScalarOperation::new(count_variable.into()), Vec::new(), vec![count], None)
-            .unwrap()[0];
-        let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(0).unwrap()));
-        let mut prefix = || {
-            builder
-                .add_instruction(
-                    DynamicSliceOperation::<ArrayIrType>::from_rank(1),
-                    Vec::new(),
-                    vec![values, start, count],
-                    None,
-                )
-                .unwrap()[0]
-        };
-        let output = prefix();
-        let equal_output = prefix();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(
-                vec![output, output, equal_output],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder; 3],
-            )
-            .unwrap();
-
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let values = || f32_vector(&domain, &mesh, &[10.0, 20.0, 30.0, 40.0]);
-        let execute = |mask: &[bool]| {
-            domain.execute_program(&compiled, vec![boolean_vector(&domain, &mesh, mask), values()]).unwrap()
-        };
-
-        let two = execute(&[true, false, true, false]);
-        assert_eq!(two.len(), 3);
-        for output in &two {
-            assert_eq!(output.shape(), StaticShape::new(vec![2]));
-            assert_eq!(read_f32s(&client, output), vec![10.0, 20.0]);
-        }
-        let four = execute(&[true, true, true, true]);
-        assert_eq!(four.len(), 3);
-        for output in &four {
-            assert_eq!(output.shape(), StaticShape::new(vec![4]));
-            assert_eq!(read_f32s(&client, output), vec![10.0, 20.0, 30.0, 40.0]);
-        }
-    }
-
-    #[test]
-    fn test_bounded_dynamic_bitcast_element_type_preserves_prefix_extents() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let declared_type = ArrayType::new(
-            DataType::F32,
-            Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
-                "count",
-                DimensionBounds::new(0, Some(5)).unwrap(),
-            ))]),
-        )
-        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
-        .unwrap();
-        let mut builder = ProgramBuilder::new();
-        let values = builder.add_input(declared_type.into());
-        let halves = builder
-            .add_instruction(
-                ConvertElementTypeOperation::<ArrayType>::new(DataType::U16, true),
-                Vec::new(),
-                vec![values],
-                None,
-            )
-            .unwrap()[0];
-        let restored = builder
-            .add_instruction(
-                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true),
-                Vec::new(),
-                vec![halves],
-                None,
-            )
-            .unwrap()[0];
-        let bits = builder
-            .add_instruction(
-                ConvertElementTypeOperation::<ArrayType>::new(DataType::I1, true),
-                Vec::new(),
-                vec![values],
-                None,
-            )
-            .unwrap()[0];
-        let restored_bits = builder
-            .add_instruction(
-                ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true),
-                Vec::new(),
-                vec![bits],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(
-                vec![halves, restored, bits, restored_bits],
-                vec![Placeholder],
-                vec![Placeholder; 4],
-            )
-            .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        // Splitting and joining the static bit-width axis preserves an independent dynamic prefix and its live bytes.
-        for count in [2usize, 4] {
-            let outputs =
-                domain.execute_program(&compiled, vec![f32_vector(&domain, &mesh, &vec![1.0; count])]).unwrap();
-            assert_eq!(outputs[0].shape(), StaticShape::new(vec![count, 2]));
-            assert_eq!(outputs[1].shape(), StaticShape::new(vec![count]));
-            assert_eq!(read_f32s(&client, &outputs[1]), vec![1.0; count]);
-            assert_eq!(outputs[2].shape(), StaticShape::new(vec![count, 32]));
-            assert_eq!(outputs[3].shape(), StaticShape::new(vec![count]));
-            assert_eq!(read_f32s(&client, &outputs[3]), vec![1.0; count]);
-            let bytes = outputs[0]
-                .addressable_shards()
-                .next()
-                .unwrap()
-                .buffer()
-                .unwrap()
-                .copy_to_host(None)
-                .unwrap()
-                .r#await()
-                .unwrap();
-            assert_eq!(bytes, values_to_bytes(&vec![1.0f32; count]));
-        }
-    }
-
-    #[test]
-    fn test_data_derived_dynamic_slice_checks_runtime_input_and_result_extents() {
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let size_type = replicated_scalar_type(&mesh, DataType::I64);
-        let value_type = replicated_scalar_type(&mesh, DataType::F32);
-        let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let result_extent = DimensionVariable::new("result_extent", DimensionBounds::new(0, Some(5)).unwrap());
-
-        // The result extent is independent of the input extent at the type level. Lowering uses their finite physical
-        // bounds for one specialization and preserves the eager `result_extent <= input_extent` contract with an
-        // ordered runtime assertion.
-        let mut builder = ProgramBuilder::new();
-        let input_size = builder.add_input(size_type.clone().into());
-        let result_size = builder.add_input(size_type.clone().into());
-        let value = builder.add_input(value_type.clone().into());
-        let input_dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(input_extent.into()), Vec::new(), vec![input_size], None)
-            .unwrap()[0];
-        let result_dimension = builder
-            .add_instruction(
-                DimensionFromScalarOperation::new(result_extent.into()),
-                Vec::new(),
-                vec![result_size],
-                None,
-            )
-            .unwrap()[0];
-        let input = builder
-            .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, input_dimension], None)
-            .unwrap()[0];
-        let start = builder.add_constant(Constant::Dimension(DimensionValue::constant(0).unwrap()));
-        let output = builder
-            .add_instruction(
-                DynamicSliceOperation::<ArrayIrType>::from_rank(1),
-                Vec::new(),
-                vec![input, start, result_dimension],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(
-                vec![output],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        assert!(lowered.stable_hlo().contains("@ryft.assert"));
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let scalar =
-            |r#type: ArrayType, bytes: &[u8]| Array::from_host_buffer(&domain, r#type, mesh.clone(), bytes).unwrap();
-        let inputs = |input_size: i64, result_size: i64| {
-            vec![
-                scalar(size_type.clone(), input_size.to_ne_bytes().as_slice()),
-                scalar(size_type.clone(), result_size.to_ne_bytes().as_slice()),
-                scalar(value_type.clone(), 7.0f32.to_ne_bytes().as_slice()),
-            ]
-        };
-
-        let eager = program
-            .interpret_in_context(&domain, inputs(4, 2).into_iter().map(Value::Array).collect::<Vec<_>>())
-            .unwrap();
-        let compiled_valid = domain.execute_program(&compiled, inputs(4, 2)).unwrap();
-        assert_eq!(read_f32s(&client, program_array(&eager[0])), vec![7.0, 7.0]);
-        assert_eq!(read_f32s(&client, &compiled_valid[0]), read_f32s(&client, program_array(&eager[0])));
-
-        let error = match domain.execute_program(&compiled, inputs(2, 4)) {
-            Ok(invalid) => invalid[0].block_until_ready().unwrap_err().to_string(),
-            Err(error) => error.to_string(),
-        };
-        assert_eq!(error, "`dynamic_slice` limit 4 exceeds input axis 0 extent 2");
-    }
-
-    #[test]
-    fn test_compiled_dimension_from_scalar_reports_observed_bounds_failure_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input_type = replicated_scalar_type(&mesh, DataType::I64);
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
-
-        let mut builder = ProgramBuilder::new();
-        let input = builder.add_input(input_type.clone().into());
-        let dimension = builder
-            .add_instruction(DimensionFromScalarOperation::new(extent.into()), Vec::new(), vec![input], None)
-            .unwrap()[0];
-        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 1, "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
-        assert!(compiled.requires_assertion_handler());
-        // Some PJRT plugins do not serialize executables containing host callbacks. When serialization is available,
-        // exercise the cache-hit path and prove its runtime-feature metadata survives restoration.
-        let compiled = match domain.serialize_program(&compiled).unwrap() {
-            Some(bytes) => domain.deserialize_program(bytes.as_slice()).unwrap().unwrap(),
-            None => compiled,
-        };
-        assert!(compiled.requires_assertion_handler());
-
-        let valid =
-            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 4i64.to_ne_bytes().as_slice()).unwrap();
-        let valid = domain.execute_program(&compiled, vec![valid]).unwrap();
-        assert_eq!(read_i64s(&client, &valid[0]), vec![4]);
-
-        let invalid = Array::from_host_buffer(&domain, input_type, mesh, 9i64.to_ne_bytes().as_slice()).unwrap();
-        let error = domain.execute_program(&compiled, vec![invalid]).unwrap_err();
-        assert!(
-            error.to_string().contains(
-                "`dimension_from_scalar` failed: input dimension `extent` = 9 is outside its declared bounds [1, 9)"
-            ),
-            "{error}",
-        );
-    }
-
-    #[test]
-    fn test_compiled_assertions_report_the_first_same_class_failure_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input_type = replicated_scalar_type(&mesh, DataType::I64);
-        let bounds = DimensionBounds::new(0, Some(10)).unwrap();
-        let first_type = DimensionType::new("first", bounds);
-        let second_type = DimensionType::new("second", bounds);
-        let third_type = DimensionType::new("third", bounds);
-
-        let mut builder = ProgramBuilder::new();
-        let first_input = builder.add_input(input_type.clone().into());
-        let second_input = builder.add_input(input_type.clone().into());
-        let third_input = builder.add_input(input_type.clone().into());
-        let first = builder
-            .add_instruction(DimensionFromScalarOperation::new(first_type.clone()), Vec::new(), vec![first_input], None)
-            .unwrap()[0];
-        let second = builder
-            .add_instruction(
-                DimensionFromScalarOperation::new(second_type.clone()),
-                Vec::new(),
-                vec![second_input],
-                None,
-            )
-            .unwrap()[0];
-        let third = builder
-            .add_instruction(DimensionFromScalarOperation::new(third_type.clone()), Vec::new(), vec![third_input], None)
-            .unwrap()[0];
-        let predicate = builder
-            .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
-                Vec::new(),
-                vec![first, second],
-                None,
-            )
-            .unwrap()[0];
-        builder
-            .add_instruction(
-                AssertOperation::<ArrayIrType>::new("`first` <= `second`")
-                    .with_labels(vec!["first".to_owned(), "second".to_owned()]),
-                Vec::new(),
-                vec![predicate, first, second],
-                None,
-            )
-            .unwrap();
-        let predicate = builder
-            .add_instruction(
-                CompareOperation::<ArrayIrType>::new(ComparisonDirection::LessThanOrEqual),
-                Vec::new(),
-                vec![second, third],
-                None,
-            )
-            .unwrap()[0];
-        builder
-            .add_instruction(
-                AssertOperation::<ArrayIrType>::new("`second` <= `third`")
-                    .with_labels(vec!["second".to_owned(), "third".to_owned()]),
-                Vec::new(),
-                vec![predicate, second, third],
-                None,
-            )
-            .unwrap();
-        let output = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![third], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(
-                vec![output],
-                vec![Placeholder, Placeholder, Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 5, "{}", lowered.stable_hlo());
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let input = |value: i64| {
-            Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
-        };
-
-        let error = domain.execute_program(&compiled, vec![input(4), input(3), input(2)]).unwrap_err();
-        assert!(error.to_string().contains("assertion failed: `first` <= `second`; first=4, second=3"), "{error}",);
-        assert!(!error.to_string().contains("`second` <= `third`"), "{error}");
-    }
-
-    #[test]
-    fn test_compiled_assertions_preserve_diagnostics_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input_type = replicated_scalar_type(&mesh, DataType::I64);
-        let bounds = DimensionBounds::new(0, Some(20)).unwrap();
-        let left_type = DimensionType::new("left", bounds);
-        let right_type = DimensionType::new("right", bounds);
-        for (left_value, right_value, divisible) in [(3i64, 4i64, false), (7, 3, true), (7, 0, true)] {
-            let mut builder = ProgramBuilder::new();
-            let left_input = builder.add_input(input_type.clone().into());
-            let right_input = builder.add_input(input_type.clone().into());
-            let left = builder
-                .add_instruction(
-                    DimensionFromScalarOperation::new(left_type.clone()),
-                    Vec::new(),
-                    vec![left_input],
-                    None,
-                )
-                .unwrap()[0];
-            let right = builder
-                .add_instruction(
-                    DimensionFromScalarOperation::new(right_type.clone()),
-                    Vec::new(),
-                    vec![right_input],
-                    None,
-                )
-                .unwrap()[0];
-            let mut output = right;
-            let (predicate, message) = if divisible {
-                let zero = builder.add_constant(Constant::Dimension(DimensionValue::constant(0).unwrap()));
-                let one = builder.add_constant(Constant::Dimension(DimensionValue::constant(1).unwrap()));
-                let positive = builder
-                    .add_instruction(
-                        CompareOperation::<ArrayIrType>::new(ComparisonDirection::GreaterThan),
-                        Vec::new(),
-                        vec![right, zero],
-                        None,
-                    )
-                    .unwrap()[0];
-                builder
-                    .add_instruction(
-                        AssertOperation::<ArrayIrType>::new("divisor must be positive")
-                            .with_labels(vec!["right".to_owned()]),
-                        Vec::new(),
-                        vec![positive, right],
-                        None,
-                    )
-                    .unwrap();
-                let one_type = DimensionValue::constant(1).unwrap().r#type().into_owned();
-                let maximum = ryft_core::DimensionMaxOperation::new(&right_type, &one_type).unwrap();
-                let safe_type = maximum.infer_output_types(&[right_type.clone(), one_type], &[]).unwrap().remove(0);
-                let safe = builder
-                    .add_instruction(ryft_core::DimensionOperation::Max(maximum), Vec::new(), vec![right, one], None)
-                    .unwrap()[0];
-                let remainder = builder
-                    .add_instruction(
-                        ryft_core::DimensionOperation::Rem(DimensionRemOperation::new(&left_type, &safe_type).unwrap()),
-                        Vec::new(),
-                        vec![left, safe],
-                        None,
-                    )
-                    .unwrap()[0];
-                output = builder
-                    .add_instruction(
-                        ryft_core::DimensionOperation::Div(DimensionDivOperation::new(&left_type, &safe_type).unwrap()),
-                        Vec::new(),
-                        vec![left, safe],
-                        None,
-                    )
-                    .unwrap()[0];
-                (
-                    builder
-                        .add_instruction(
-                            CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
-                            Vec::new(),
-                            vec![remainder, zero],
-                            None,
-                        )
-                        .unwrap()[0],
-                    "`left` must be divisible by `right`",
-                )
-            } else {
-                (
-                    builder
-                        .add_instruction(
-                            CompareOperation::<ArrayIrType>::new(ComparisonDirection::Equal),
-                            Vec::new(),
-                            vec![left, right],
-                            None,
-                        )
-                        .unwrap()[0],
-                    "dimensions must agree",
-                )
-            };
-            builder
-                .add_instruction(
-                    AssertOperation::<ArrayIrType>::new(message)
-                        .with_labels(vec!["left".to_owned(), "right".to_owned()]),
-                    Vec::new(),
-                    vec![predicate, left, right],
-                    None,
-                )
-                .unwrap();
-            let output =
-                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![output], None).unwrap()[0];
-            let program = builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-                .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
-            let input = |value: i64| {
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
-                    .unwrap()
-            };
-            let error = domain.execute_program(&compiled, vec![input(left_value), input(right_value)]).unwrap_err();
-            let expected = if right_value == 0 {
-                ryft_core::AssertionError::Failed {
-                    message: "divisor must be positive".to_owned(),
-                    observations: vec![("right".to_owned(), "0".to_owned())],
-                }
-            } else {
-                ryft_core::AssertionError::Failed {
-                    message: message.to_owned(),
-                    observations: vec![
-                        ("left".to_owned(), left_value.to_string()),
-                        ("right".to_owned(), right_value.to_string()),
-                    ],
-                }
-            };
-            assert!(error.to_string().contains(&expected.to_string()), "{error}");
-        }
-    }
-
-    #[test]
-    fn test_compiled_per_element_validation_on_cpu() {
-        use ryft_core::Compare;
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let values = f32_vector(&domain, &mesh, &[1., -2., 3., -4.]);
-        let limits = f32_vector(&domain, &mesh, &[0., 0., 0., 0.]);
-        let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
-            |inputs| vec![inputs[0].greater_than(&inputs[1]).unwrap()],
-            vec![values.r#type().into_owned(), limits.r#type().into_owned()],
-            Options::new(mesh.clone()),
-        )
-        .unwrap()
-        .into_inner();
-        let lowered = domain.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        assert!(!compiled.requires_assertion_handler());
-        let outputs = domain.execute_program(&compiled, vec![values, limits]).unwrap();
-        assert_eq!(
-            outputs[0]
-                .addressable_shards()
-                .next()
-                .unwrap()
-                .buffer()
-                .unwrap()
-                .copy_to_host(None)
-                .unwrap()
-                .r#await()
-                .unwrap(),
-            vec![1, 0, 1, 0]
-        );
-    }
-
-    #[test]
-    fn test_compiled_assertion_bounded_elements_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        for mode in [0, 1, 2] {
-            let predicates = boolean_vector(&domain, &mesh, &[true, false, false, false]);
-            let observations = f32_vector(&domain, &mesh, &[10., 20., 30., 40.]);
-            let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
-                |inputs| {
-                    if mode == 1 {
-                        batch(
-                            |(predicate, observation)| {
-                                predicate.assert_with_limit(
-                                    "bounded check",
-                                    &[("value", observation)],
-                                    std::num::NonZeroUsize::new(2).unwrap(),
-                                )
-                            },
-                            (inputs[0].clone(), inputs[1].clone()),
-                            (BatchAxis::new(0), BatchAxis::new(0)),
-                            (),
-                            None,
-                        )
-                        .unwrap();
-                    } else {
-                        let predicate = if mode == 2 { inputs[0].reshape([2, 2]).unwrap() } else { inputs[0].clone() };
-                        let observation =
-                            if mode == 2 { inputs[1].reshape([2, 2]).unwrap() } else { inputs[1].clone() };
-                        predicate
-                            .assert_with_limit(
-                                "bounded check",
-                                &[("value", observation)],
-                                std::num::NonZeroUsize::new(2).unwrap(),
-                            )
-                            .unwrap();
-                    }
-                    vec![]
-                },
-                vec![predicates.r#type().into_owned(), observations.r#type().into_owned()],
-                Options::new(mesh.clone()),
-            )
-            .unwrap()
-            .into_inner();
-            let lowered =
-                domain.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
-            let error = domain.execute_program(&compiled, vec![predicates, observations.clone()]).unwrap_err();
-            let expected = ryft_core::AssertionError::FailedElements {
-                message: "bounded check".to_owned(),
-                failures: vec![
-                    ryft_core::AssertionFailure {
-                        index: if mode == 2 { vec![0, 1] } else { vec![1] },
-                        observations: vec![("value".to_owned(), "20".to_owned())],
-                    },
-                    ryft_core::AssertionFailure {
-                        index: if mode == 2 { vec![1, 0] } else { vec![2] },
-                        observations: vec![("value".to_owned(), "30".to_owned())],
-                    },
-                ],
-                omitted: 1,
-            };
-            assert!(error.to_string().contains(&expected.to_string()), "{error}");
-            let predicates = boolean_vector(&domain, &mesh, &[true; 4]);
-            assert!(domain.execute_program(&compiled, vec![predicates, observations]).unwrap().is_empty());
-        }
-    }
-
-    #[test]
-    fn test_compiled_assertion_bounded_sub_byte_observations_on_cpu() {
-        use ryft_core::ConvertElementType;
-
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        for (data_type, values) in [
-            (DataType::I1, [0., -1., 0., -1.]),
-            (DataType::U1, [0., 1., 0., 1.]),
-            (DataType::I2, [0., -2., -1., 1.]),
-            (DataType::U2, [0., 1., 2., 3.]),
-            (DataType::I4, [0., -8., -1., 7.]),
-            (DataType::U4, [0., 1., 8., 15.]),
-        ] {
-            let predicates = boolean_vector(&domain, &mesh, &[false; 4]);
-            let observations = f32_vector(&domain, &mesh, &values);
-            let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
-                |inputs| {
-                    let observation = inputs[1].convert_element_type(data_type).unwrap();
-                    inputs[0]
-                        .assert_with_limit(
-                            "narrow values",
-                            &[("value", observation)],
-                            std::num::NonZeroUsize::new(3).unwrap(),
-                        )
-                        .unwrap();
-                    vec![]
-                },
-                vec![predicates.r#type().into_owned(), observations.r#type().into_owned()],
-                Options::new(mesh.clone()),
-            )
-            .unwrap()
-            .into_inner();
-            let lowered =
-                domain.lower_program(staged.source_program().program(), 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
-            let error = domain.execute_program(&compiled, vec![predicates, observations]).unwrap_err();
-            let expected = ryft_core::AssertionError::FailedElements {
-                message: "narrow values".to_owned(),
-                failures: values
-                    .iter()
-                    .take(3)
-                    .enumerate()
-                    .map(|(index, value)| ryft_core::AssertionFailure {
-                        index: vec![index],
-                        observations: vec![("value".to_owned(), value.to_string())],
-                    })
-                    .collect(),
-                omitted: 1,
-            };
-            assert!(error.to_string().contains(&expected.to_string()), "{data_type}: {error}");
-        }
-    }
-
-    #[test]
-    fn test_compiled_assertion_scalar_observations_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let predicate_type = replicated_scalar_type(&mesh, DataType::Boolean);
-        for observations in [
-            vec![],
-            vec![
-                ("unsigned", DataType::U64, u64::MAX.to_ne_bytes().to_vec(), u64::MAX.to_string()),
-                ("signed", DataType::I64, i64::MIN.to_ne_bytes().to_vec(), i64::MIN.to_string()),
-                ("float", DataType::F32, (-0.5f32).to_ne_bytes().to_vec(), "-0.5".to_owned()),
-                ("boolean", DataType::Boolean, vec![1], "true".to_owned()),
-            ],
-        ] {
-            let mut builder = ProgramBuilder::new();
-            let predicate = builder.add_input(predicate_type.clone().into());
-            let predicate =
-                builder.add_instruction(AndOperation::new(), vec![], vec![predicate, predicate], None).unwrap()[0];
-            let mut inputs = vec![predicate];
-            for (_, data_type, _, _) in &observations {
-                inputs.push(builder.add_input(replicated_scalar_type(&mesh, *data_type).into()));
-            }
-            builder
-                .add_instruction(
-                    AssertOperation::<ArrayIrType>::new("scalar check")
-                        .with_labels(observations.iter().map(|(label, _, _, _)| (*label).to_owned()).collect()),
-                    Vec::new(),
-                    inputs,
-                    None,
-                )
-                .unwrap();
-            let program = builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder; observations.len() + 1], vec![])
-                .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
-            for passed in [true, false] {
-                let mut inputs = vec![
-                    Array::from_host_buffer(&domain, predicate_type.clone(), mesh.clone(), &[u8::from(passed)])
-                        .unwrap(),
-                ];
-                for (_, data_type, bytes, _) in &observations {
-                    inputs.push(
-                        Array::from_host_buffer(
-                            &domain,
-                            replicated_scalar_type(&mesh, *data_type),
-                            mesh.clone(),
-                            bytes,
-                        )
-                        .unwrap(),
-                    );
-                }
-                let output = domain.execute_program(&compiled, inputs);
-                if passed {
-                    assert!(output.unwrap().is_empty());
-                } else {
-                    let expected = ryft_core::AssertionError::Failed {
-                        message: "scalar check".to_owned(),
-                        observations: observations
-                            .iter()
-                            .map(|(label, _, _, rendered)| ((*label).to_owned(), rendered.clone()))
-                            .collect(),
-                    };
-                    let error = output.unwrap_err();
-                    assert!(error.to_string().contains(&expected.to_string()), "{error}");
-                }
-            }
-        }
-
-        let predicates = boolean_vector(&domain, &mesh, &[true, false, false]);
-        let observations = f32_vector(&domain, &mesh, &[10., 20., 30.]);
-        let staged = crate::stage::<_, Vec<ArrayType>, Vec<ArrayType>>(
-            |inputs| {
-                batch(
-                    |(predicate, observation)| predicate.assert("mapped check", &[("value", observation)]),
-                    (inputs[0].clone(), inputs[1].clone()),
-                    (BatchAxis::new(0), BatchAxis::new(0)),
-                    (),
-                    None,
-                )
-                .unwrap();
-                vec![]
+        assert_eq!(read_f32s(&client, &output), vec![1.0, 2.0]);
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(reference, update)| {
+                reference.add_update(&update)?;
+                reference.read().map_err(Into::into)
             },
-            vec![predicates.r#type().into_owned(), observations.r#type().into_owned()],
+            (
+                ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
+                ArrayIrType::Array(replicated_type.clone()),
+            ),
+            &domain,
             Options::new(mesh.clone()),
         )
-        .unwrap()
-        .into_inner();
-        let program = staged.source_program().program();
-        let lowered = domain.lower_program(program, 0, &Options::new(mesh.clone())).unwrap();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let error = domain.execute_program(&compiled, vec![predicates, observations]).unwrap_err();
-        let expected = ryft_core::AssertionError::Failed {
-            message: "mapped check".to_owned(),
-            observations: vec![("value".to_owned(), "20".to_owned()), ("batch_index".to_owned(), "1".to_owned())],
-        };
-        assert!(error.to_string().contains(&expected.to_string()), "{error}");
-    }
-
-    #[test]
-    fn test_compiled_assertion_dynamic_batching_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input_type = replicated_scalar_type(&mesh, DataType::I64);
-        for bounded in [false, true] {
-            let extent = DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap());
-            let context = TracingContext::<Constant, Operation>::new();
-            let size = context.input(input_type.clone().into());
-            let limit = context.input(input_type.clone().into());
-            let dimension = context
-                .bind(DimensionFromScalarOperation::new(extent.clone().into()), Vec::new(), &[size])
-                .unwrap()
-                .remove(0);
-            let indices = context
-                .bind(
-                    IotaOperation::new(ArrayType::new(DataType::I64, Shape::new(vec![extent.into()])), 0).unwrap(),
-                    Vec::new(),
-                    std::slice::from_ref(&dimension),
-                )
-                .unwrap()
-                .remove(0);
-            let limits = context
-                .bind(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), &[limit, dimension.clone()])
-                .unwrap()
-                .remove(0);
-            let predicates = context
-                .bind(
-                    Operation::Array(ryft_core::ArrayOperation::Compare(CompareOperation::new(
-                        ComparisonDirection::LessThan,
-                    ))),
-                    Vec::new(),
-                    &[indices.clone(), limits],
-                )
-                .unwrap()
-                .remove(0);
-            let batching = BatchingContext::new(context.clone(), dimension);
-            let operation = AssertOperation::new("dynamic mapped check").with_labels(vec!["value".to_owned()]);
-            let operation =
-                if bounded { operation.with_failure_limit(std::num::NonZeroUsize::new(2).unwrap()) } else { operation };
-            operation
-                .batch(
-                    &batching,
-                    &EmptyRegionDriver,
-                    &[ArrayIrBatch::new(predicates, 0).unwrap(), ArrayIrBatch::new(indices, 0).unwrap()],
-                )
-                .unwrap();
-            let program = context
-                .builder()
-                .borrow()
-                .clone()
-                .build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder; 2], vec![])
-                .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
-            for (size, limit) in [(0i64, 0i64), (1, 1), (3, 3)] {
-                let inputs = [size, limit]
-                    .into_iter()
-                    .map(|value| {
-                        Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &value.to_ne_bytes())
-                            .unwrap()
-                    })
-                    .collect::<Vec<_>>();
-                assert!(domain.execute_program(&compiled, inputs).unwrap().is_empty());
-            }
-            let inputs = [3i64, 1i64]
-                .into_iter()
-                .map(|value| {
-                    Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &value.to_ne_bytes()).unwrap()
-                })
-                .collect::<Vec<_>>();
-            let error = domain.execute_program(&compiled, inputs).unwrap_err();
-            let expected = if bounded {
-                ryft_core::AssertionError::FailedElements {
-                    message: "dynamic mapped check".to_owned(),
-                    failures: vec![
-                        ryft_core::AssertionFailure {
-                            index: vec![1],
-                            observations: vec![("value".to_owned(), "1".to_owned())],
-                        },
-                        ryft_core::AssertionFailure {
-                            index: vec![2],
-                            observations: vec![("value".to_owned(), "2".to_owned())],
-                        },
-                    ],
-                    omitted: 0,
-                }
-            } else {
-                ryft_core::AssertionError::Failed {
-                    message: "dynamic mapped check".to_owned(),
-                    observations: vec![
-                        ("value".to_owned(), "1".to_owned()),
-                        ("batch_index".to_owned(), "1".to_owned()),
-                    ],
-                }
-            };
-            assert!(error.to_string().contains(&expected.to_string()), "{error}");
-        }
-    }
-
-    #[test]
-    fn test_compiled_assertion_dynamic_replicated_batching_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input_type = replicated_scalar_type(&mesh, DataType::I64);
-        for bounded in [false, true] {
-            let context = TracingContext::<Constant, Operation>::new();
-            let size = context.input(input_type.clone().into());
-            let dimension = context
-                .bind(
-                    DimensionFromScalarOperation::new(
-                        DimensionVariable::new("batch", DimensionBounds::new(0, Some(5)).unwrap()).into(),
-                    ),
-                    Vec::new(),
-                    std::slice::from_ref(&size),
-                )
-                .unwrap()
-                .remove(0);
-            let condition = context.lift(Constant::Boolean(false)).unwrap();
-            let batching = BatchingContext::new(context.clone(), dimension);
-            let operation = AssertOperation::new("dynamic replicated check").with_labels(vec!["size".to_owned()]);
-            let operation =
-                if bounded { operation.with_failure_limit(std::num::NonZeroUsize::new(2).unwrap()) } else { operation };
-            operation
-                .batch(
-                    &batching,
-                    &EmptyRegionDriver,
-                    &[ArrayIrBatch::replicated(condition), ArrayIrBatch::replicated(size)],
-                )
-                .unwrap();
-            let program = context
-                .builder()
-                .borrow()
-                .clone()
-                .build::<Vec<Constant>, Vec<Constant>>(vec![], vec![Placeholder], vec![])
-                .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            let compiled = domain.compile_program(&lowered).unwrap();
-            let empty =
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &0i64.to_ne_bytes()).unwrap();
-            assert!(domain.execute_program(&compiled, vec![empty]).unwrap().is_empty());
-            let nonempty =
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &3i64.to_ne_bytes()).unwrap();
-            let error = domain.execute_program(&compiled, vec![nonempty]).unwrap_err();
-            let expected = if bounded {
-                ryft_core::AssertionError::FailedElements {
-                    message: "dynamic replicated check".to_owned(),
-                    failures: vec![
-                        ryft_core::AssertionFailure {
-                            index: vec![0],
-                            observations: vec![("size".to_owned(), "3".to_owned())],
-                        },
-                        ryft_core::AssertionFailure {
-                            index: vec![1],
-                            observations: vec![("size".to_owned(), "3".to_owned())],
-                        },
-                    ],
-                    omitted: 1,
-                }
-            } else {
-                ryft_core::AssertionError::Failed {
-                    message: "dynamic replicated check".to_owned(),
-                    observations: vec![("size".to_owned(), "3".to_owned())],
-                }
-            };
-            assert!(error.to_string().contains(&expected.to_string()), "{error}");
-        }
-    }
-
-    #[test]
-    fn test_compiled_dimension_arithmetic_preserves_checked_host_diagnostics_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let input_type = replicated_scalar_type(&mesh, DataType::I64);
-        let bounds = DimensionBounds::new(0, Some(10)).unwrap();
-        let left_type = DimensionType::new("left", bounds);
-        let right_type = DimensionType::new("right", bounds);
-        let check = |operation: DimensionOperation<DimensionValue>,
-                     valid_operands: (i64, i64),
-                     expected_output: i64,
-                     invalid_operands: (i64, i64),
-                     expected_error: &str| {
-            let mut builder = ProgramBuilder::new();
-            let left_input = builder.add_input(input_type.clone().into());
-            let right_input = builder.add_input(input_type.clone().into());
-            let left = builder
-                .add_instruction(
-                    DimensionFromScalarOperation::new(left_type.clone()),
-                    Vec::new(),
-                    vec![left_input],
-                    None,
-                )
-                .unwrap()[0];
-            let right = builder
-                .add_instruction(
-                    DimensionFromScalarOperation::new(right_type.clone()),
-                    Vec::new(),
-                    vec![right_input],
-                    None,
-                )
-                .unwrap()[0];
-            let result = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
-            let output =
-                builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![result], None).unwrap()[0];
-            let program = builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
-                .unwrap();
-            let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-            assert_eq!(lowered.stable_hlo().matches("@ryft.assert").count(), 3, "{}", lowered.stable_hlo());
-            let compiled = domain.compile_program(&lowered).unwrap();
-            let input = |value: i64| {
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
-                    .unwrap()
-            };
-
-            let output =
-                domain.execute_program(&compiled, vec![input(valid_operands.0), input(valid_operands.1)]).unwrap();
-            assert_eq!(read_i64s(&client, &output[0]), vec![expected_output]);
-            let error = domain
-                .execute_program(&compiled, vec![input(invalid_operands.0), input(invalid_operands.1)])
-                .unwrap_err();
-            assert!(error.to_string().contains(expected_error), "{error}");
-        };
-
-        check(
-            DimensionOperation::Sub(DimensionSubOperation::new(&left_type, &right_type).unwrap()),
-            (5, 2),
-            3,
-            (2, 5),
-            "`dimension_sub` requires left >= right; got left=2, right=5",
-        );
-        check(
-            DimensionOperation::Div(DimensionDivOperation::new(&left_type, &right_type).unwrap()),
-            (7, 3),
-            2,
-            (7, 0),
-            "`dimension_div` requires right > 0; got left=7, right=0",
-        );
-        check(
-            DimensionOperation::Rem(DimensionRemOperation::new(&left_type, &right_type).unwrap()),
-            (7, 3),
-            1,
-            (7, 0),
-            "`dimension_rem` requires right > 0; got left=7, right=0",
-        );
-    }
-
-    #[test]
-    fn test_execute_arguments_from_arrays_with_donation_rejects_flag_count() {
+        .unwrap();
+        let update = Array::from_host_buffer(
+            &domain,
+            replicated_type.clone(),
+            mesh,
+            values_to_bytes::<f32>(&[3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
         assert!(matches!(
-            ExecutionArguments::from_arrays_with_donation(Vec::new(), Arc::from([]), &[true]),
-            Err(Error::Execution(ExecutionError::DonationFlagCountMismatch { expected_count: 0, actual_count: 1 })),
-        ));
-    }
-
-    #[test]
-    fn test_execute_arguments_from_arrays_with_donation_reuses_duplicate_device_error() {
-        assert!(matches!(
-            ExecutionArguments::from_arrays_with_donation(Vec::new(), Arc::from([7, 7]), &[]),
+            compiled.execute_statefully_and_wait(
+                &domain,
+                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+            ),
             Err(Error::Core(core_error)) if matches!(
                 core_error.as_ref(),
-                CoreError::Sharding(ShardingError::DuplicateDeviceId { id: 7 }),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })
+                    if *reason == format!(
+                        "external state input 0 reference type `{alternate_type}` does not refine effective \
+                         compiled state type `{replicated_type}`",
+                    ),
             ),
         ));
-    }
-
-    fn test_spmd_compilation_options(partition_count: usize) -> CompilationOptions {
-        CompilationOptions {
-            argument_layouts: Vec::new(),
-            parameter_is_tupled_arguments: false,
-            executable_build_options: Some(ExecutableCompilationOptions {
-                device_ordinal: -1,
-                replica_count: 1,
-                partition_count: partition_count as i64,
-                use_spmd_partitioning: true,
-                use_shardy_partitioner: true,
-                ..Default::default()
-            }),
-            compile_portable_executable: false,
-            profile_version: 0,
-            individually_defined_output_indices: Vec::new(),
-            serialized_multi_slice_configuration: Vec::new(),
-            environment_option_overrides: HashMap::new(),
-            target_config: None,
-            allow_in_place_mlir_modification: false,
-            matrix_unit_operand_precision: Precision::Default as i32,
-            compiler_variant: None,
-        }
+        assert_eq!(read_f32s(&client, &reference.read().unwrap()), vec![1.0, 2.0]);
     }
 
     #[test]
-    fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
-        // Use the same 8-device CPU setup as `ryft_pjrt` tests.
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
-            .expect("failed to create 8-device CPU client");
+    fn test_domain_execute_statefully_updates_sharded_holder() {
+        let client = cpu_client(2);
+        // Types record placement over explicit mesh axes only, so the statically sharded state uses an explicit axis.
+        let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
         let domain = Session::new(&client).domain();
-        let client_devices = client.addressable_devices().unwrap();
-        assert_eq!(client_devices.len(), 8);
-
-        // Build mesh used for runtime arrays. In a JIT setting, we derive StableHLO Shardy
-        // annotations directly from these arrays.
-        let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 8, MeshAxisType::Auto).unwrap()]).unwrap(),
-            devices,
-        )
-        .unwrap();
-
-        let lhs_sharding = Sharding::new(
-            mesh.logical_mesh().clone(),
-            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
-        )
-        .unwrap();
-        let rhs_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 2);
-
-        // Global lhs matrix is 8x4, split by rows across 8 devices (each shard is 1x4).
-        // Row i is [i, i+1, i+2, i+3].
-        let lhs_buffers = client_devices
-            .iter()
-            .enumerate()
-            .map(|(row_index, device)| {
-                let row = row_index as f32;
-                client
-                    .buffer(
-                        values_to_bytes::<f32>(&[row, row + 1.0, row + 2.0, row + 3.0]).as_slice(),
-                        BufferType::F32,
-                        [1u64, 4u64],
-                        None,
-                        device.clone(),
-                        None,
-                    )
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-
-        // Global rhs matrix is replicated on each device.
-        // [[1, 2], [0, 1], [1, 0], [2, 1]]
-        let rhs_values = [1.0f32, 2.0, 0.0, 1.0, 1.0, 0.0, 2.0, 1.0];
-        let rhs_buffers = client_devices
-            .iter()
-            .map(|device| {
-                client
-                    .buffer(
-                        values_to_bytes::<f32>(rhs_values.as_slice()).as_slice(),
-                        BufferType::F32,
-                        [4u64, 2u64],
-                        None,
-                        device.clone(),
-                        None,
-                    )
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-
-        let lhs_array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(8), CoreDimension::Static(4)]));
-        let rhs_array_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(2)]));
-        let lhs_array = Array::from_addressable_buffers_with_sharding(
+        let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_sharding(sharding)
+            .unwrap();
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(reference, update)| {
+                reference.add_update(&update)?;
+                reference.read().map_err(Into::into)
+            },
+            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
             &domain,
-            lhs_array_type,
-            lhs_sharding,
-            mesh.clone(),
-            lhs_buffers,
+            Options::new(mesh.clone()),
         )
         .unwrap();
-        let rhs_array = Array::from_addressable_buffers_with_sharding(
-            &domain,
-            rhs_array_type,
-            rhs_sharding,
-            mesh.clone(),
-            rhs_buffers,
-        )
-        .unwrap();
-
-        assert_eq!(lhs_array.data_type(), DataType::F32);
-        assert_eq!(rhs_array.data_type(), DataType::F32);
-        assert_eq!(lhs_array.addressable_shards().count(), 8);
-        assert!(lhs_array.shards().iter().all(|shard| shard.buffer().is_some()));
-
-        // Derive Shardy attributes from runtime arrays (JIT-style).
-        let context = ryft_mlir::Context::new();
-        let mesh_module = context.module(context.unknown_location()).unwrap();
-        let mesh_operation = mesh_module
-            .body()
-            .unwrap()
-            .append_operation(lhs_array.sharding().mesh().to_mlir(context.unknown_location()).unwrap())
-            .unwrap()
-            .to_string();
-        let lhs_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute().unwrap();
-        let rhs_sharding_attribute = rhs_array.to_shardy_tensor_sharding_attribute().unwrap();
-        let output_sharding_attribute = lhs_array.to_shardy_tensor_sharding_attribute().unwrap();
-
-        assert_eq!(mesh_operation, "sdy.mesh @mesh = <[\"x\"=8]>");
-        assert_eq!(lhs_sharding_attribute, "#sdy.sharding<@mesh, [{\"x\"}, {}]>");
-        assert_eq!(rhs_sharding_attribute, "#sdy.sharding<@mesh, [{}, {}]>");
-
-        let mlir_program = format!(
-            r#"
-                    module {{
-                        {mesh_operation}
-                        func.func @main(
-                            %arg0: tensor<8x4xf32> {{sdy.sharding = {lhs_sharding_attribute}}},
-                            %arg1: tensor<4x2xf32> {{sdy.sharding = {rhs_sharding_attribute}}}
-                        ) -> (tensor<8x2xf32> {{sdy.sharding = {output_sharding_attribute}}}) {{
-                            %0 = stablehlo.dot_general %arg0, %arg1, batching_dims = [] x [], contracting_dims = [1] x [0]
-                                : (tensor<8x4xf32>, tensor<4x2xf32>) -> tensor<8x2xf32>
-                            return %0 : tensor<8x2xf32>
-                        }}
-                    }}
-                "#
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(
+                &domain,
+                array_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+            )
+            .unwrap(),
         );
-        let program = Program::Mlir { bytecode: mlir_program.into_bytes() };
-        let executable = client.compile(&program, &test_spmd_compilation_options(8)).unwrap();
+        let update = Array::from_host_buffer(
+            &domain,
+            array_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
+        )
+        .unwrap();
 
-        let execution_devices = executable.addressable_devices().unwrap();
-        assert_eq!(execution_devices.len(), 8);
-        let execution_device_ids = execution_devices.iter().map(|device| device.id().unwrap()).collect::<Vec<_>>();
-        let row_start_by_device = execution_device_ids
-            .iter()
-            .map(|device_id| {
-                let row_start = lhs_array.device_shard(*device_id).unwrap().slice()[0].start;
-                (*device_id, row_start)
-            })
-            .collect::<HashMap<_, _>>();
-
-        let execute_arguments =
-            ExecutionArguments::from_arrays(vec![lhs_array, rhs_array], execution_device_ids.as_slice()).unwrap();
-        let outputs = executable
-            .execute(
-                execute_arguments.as_execution_device_inputs(),
-                Vec::new(),
-                0,
-                None,
-                Some(file!()),
-                None,
-                None,
-                &[],
+        let Value::Array(output) = compiled
+            .execute_statefully_and_wait(
+                &domain,
+                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
             )
             .unwrap()
-            .block_until_ready()
-            .unwrap();
+        else {
+            panic!("stateful sharded output must be an array")
+        };
+        let expected = vec![11.0, 22.0, 33.0, 44.0];
+        assert_eq!(read_sharded_f32_array(&output), expected);
+        assert_eq!(read_sharded_f32_array(&reference.read().unwrap()), expected);
 
-        // Validate each output shard: row r should be [4r + 8, 4r + 4].
-        assert_eq!(outputs.len(), execution_device_ids.len());
-        for (output, device_id) in outputs.into_iter().zip(execution_device_ids.iter().copied()) {
-            assert_eq!(output.outputs.len(), 1);
-            let output_bytes = output.outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
-            let values: [f32; 2] = values_from_bytes::<f32>(output_bytes.as_slice()).try_into().unwrap();
-            let row = *row_start_by_device.get(&device_id).unwrap() as f32;
-            assert_eq!(values[0], 4.0 * row + 8.0);
-            assert_eq!(values[1], 4.0 * row + 4.0);
+        let reversed_mesh =
+            DeviceMesh::new(mesh.logical_mesh().clone(), mesh.devices().iter().rev().cloned().collect()).unwrap();
+        let reversed_reference = ArrayReference::new(
+            Array::from_host_buffer(
+                &domain,
+                array_type.clone(),
+                reversed_mesh,
+                values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+            )
+            .unwrap(),
+        );
+        let update = Array::from_host_buffer(
+            &domain,
+            array_type,
+            mesh,
+            values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.execute_statefully_and_wait(
+                &domain,
+                (
+                    Value::Reference(Reference::new(reversed_reference.clone(), domain.clone())),
+                    Value::Array(update),
+                ),
+            ),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message: reason })
+                    if *reason == "external state input 0 reference mesh does not match the compiled device mesh",
+            ),
+        ));
+        assert_eq!(read_sharded_f32_array(&reversed_reference.read().unwrap()), vec![1.0, 2.0, 3.0, 4.0],);
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_rejects_capture_aliasing_input() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let array_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type, mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
+        );
+        let compiled = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
+            |captures, public_reference| {
+                let update = public_reference.read()?;
+                captures[0].add_update(&update)?;
+                captures[0].read().map_err(Into::into)
+            },
+            vec![Value::Reference(Reference::new(reference.clone(), domain.clone()))],
+            reference_type.clone(),
+            &domain,
+            Options::new(mesh),
+        )
+        .unwrap();
+        let error = compiled
+            .execute_statefully_and_wait(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())))
+            .err();
+        assert!(
+            matches!(
+                &error,
+                Some(Error::Core(core_error)) if matches!(
+                    core_error.as_ref(),
+                    ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                        if *message == "capture 0 and input 0 bind the same reference allocation",
+                ),
+            ),
+            "{error:?}",
+        );
+        assert_eq!(read_f32s(&client, &reference.read().unwrap()), vec![1.0]);
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_commits_references_in_reverse_identity_order() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let array_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), (ArrayIrType, ArrayIrType)>(
+            |(first, second, update)| {
+                first.add_update(&update)?;
+                second.add_update(&update)?;
+                Ok((first.read()?, second.read()?))
+            },
+            (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let first = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let second = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let (lower_reference, higher_reference) =
+            if first.id() < second.id() { (first, second) } else { (second, first) };
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+
+        let (higher_output, lower_output) = compiled
+            .execute_statefully_and_wait(
+                &domain,
+                (
+                    Value::Reference(Reference::new(higher_reference.clone(), domain.clone())),
+                    Value::Reference(Reference::new(lower_reference.clone(), domain.clone())),
+                    Value::Array(update),
+                ),
+            )
+            .unwrap();
+        let Value::Array(higher_output) = higher_output else {
+            panic!("first stateful public output must be an array")
+        };
+        let Value::Array(lower_output) = lower_output else { panic!("second stateful public output must be an array") };
+        assert_eq!(read_f32s(&client, &higher_output), vec![3.0]);
+        assert_eq!(read_f32s(&client, &lower_output), vec![3.0]);
+        assert_eq!(read_f32s(&client, &higher_reference.read().unwrap()), vec![3.0]);
+        assert_eq!(read_f32s(&client, &lower_reference.read().unwrap()), vec![3.0]);
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_locks_shared_holders_in_identity_order() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let array_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ()>(
+            |(first, second, update)| {
+                first.add_update(&update)?;
+                second.add_update(&update).map_err(Into::into)
+            },
+            (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let first = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let second = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let (lower_reference, higher_reference) =
+            if first.id() < second.id() { (first, second) } else { (second, first) };
+        let higher_first_update =
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        let lower_first_update =
+            Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+
+        // The two calls present the same holders in opposite argument order and start together. Both must finish,
+        // because internal identity ordering serializes their retained guard windows without creating a lock cycle.
+        std::thread::scope(|scope| {
+            let start = Arc::new(Barrier::new(3));
+            let (finished, results) = mpsc::channel();
+            for (first, second, update) in [
+                (higher_reference.clone(), lower_reference.clone(), higher_first_update),
+                (lower_reference.clone(), higher_reference.clone(), lower_first_update),
+            ] {
+                let start = Arc::clone(&start);
+                let finished = finished.clone();
+                let compiled = &compiled;
+                let domain = &domain;
+                scope.spawn(move || {
+                    start.wait();
+                    finished
+                        .send(compiled.execute_statefully_and_wait(
+                            domain,
+                            (
+                                Value::Reference(Reference::new(first, domain.clone())),
+                                Value::Reference(Reference::new(second, domain.clone())),
+                                Value::Array(update),
+                            ),
+                        ))
+                        .unwrap();
+                });
+            }
+            drop(finished);
+            start.wait();
+            for _ in 0..2 {
+                results.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+            }
+        });
+        assert_eq!(read_f32s(&client, &lower_reference.read().unwrap()), vec![5.0]);
+        assert_eq!(read_f32s(&client, &higher_reference.read().unwrap()), vec![5.0]);
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_failure_boundaries() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let array_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(first, second, read_only, update)| {
+                let output = read_only.read()?;
+                first.add_update(&update)?;
+                second.add_update(&update)?;
+                Ok(output)
+            },
+            (reference_type.clone(), reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference_new = |value: f32| {
+            ArrayReference::new(
+                Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice())
+                    .unwrap(),
+            )
+        };
+
+        // Failures during holder validation before execution leave every holder Ready and unchanged.
+        let pre_handoff_first = reference_new(1.0);
+        let pre_handoff_second = reference_new(10.0);
+        let pre_handoff_read_only = reference_new(20.0);
+        let wrong_update_type = replicated_scalar_type(&mesh, DataType::F64);
+        let wrong_update =
+            Array::from_host_buffer(&domain, wrong_update_type, mesh.clone(), 2.0f64.to_ne_bytes().as_slice()).unwrap();
+        let declared_update_type = <&ArrayType>::try_from(&compiled.executable().input_types()[3]).unwrap();
+        let expected_error = format!(
+            "runtime input type `{}` does not refine declared type `{declared_update_type}`",
+            wrong_update.r#type(),
+        );
+        assert!(matches!(
+            compiled.execute_statefully_and_wait(
+                &domain,
+                (
+                    Value::Reference(Reference::new(pre_handoff_first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_handoff_second.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_handoff_read_only.clone(), domain.clone())),
+                    Value::Array(wrong_update),
+                ),
+            ),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidArgument { message })
+                    if *message == expected_error,
+            ),
+        ));
+        assert_eq!(read_f32s(&client, &pre_handoff_first.read().unwrap()), vec![1.0]);
+        assert_eq!(read_f32s(&client, &pre_handoff_second.read().unwrap()), vec![10.0]);
+        assert_eq!(read_f32s(&client, &pre_handoff_read_only.read().unwrap()), vec![20.0]);
+
+        // A fully prepared call that fails before PJRT submission publishes no lease or pending mutation.
+        let pre_submission_first = reference_new(1.0);
+        let pre_submission_second = reference_new(10.0);
+        let pre_submission_read_only = reference_new(20.0);
+        let update =
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        inject_stateful_failure(StatefulFailureInjection::BeforeSubmission);
+        assert!(matches!(
+            compiled.execute_statefully_and_wait(
+                &domain,
+                (
+                    Value::Reference(Reference::new(pre_submission_first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_submission_second.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_submission_read_only.clone(), domain.clone())),
+                    Value::Array(update),
+                ),
+            ),
+            Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
+                if message == "injected failure before execution submission",
+        ));
+        assert_eq!(read_f32s(&client, &pre_submission_first.read().unwrap()), vec![1.0]);
+        assert_eq!(read_f32s(&client, &pre_submission_second.read().unwrap()), vec![10.0]);
+        assert_eq!(read_f32s(&client, &pre_submission_read_only.read().unwrap()), vec![20.0]);
+
+        // Once mutable buffers cross the execution handoff, every mutated holder is poisoned together while a
+        // read-only peer remains Ready.
+        let post_handoff_first = reference_new(1.0);
+        let post_handoff_second = reference_new(10.0);
+        let post_handoff_read_only = reference_new(20.0);
+        let update =
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        inject_stateful_failure(StatefulFailureInjection::AfterHandoff);
+        assert!(matches!(
+            compiled.execute_statefully_and_wait(
+                &domain,
+                (
+                    Value::Reference(Reference::new(post_handoff_first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(post_handoff_second.clone(), domain.clone())),
+                    Value::Reference(Reference::new(post_handoff_read_only.clone(), domain.clone())),
+                    Value::Array(update),
+                ),
+            ),
+            Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
+                if message == "injected failure after execution handoff",
+        ));
+        for reference in [&post_handoff_first, &post_handoff_second] {
+            let Err(error) = reference.read() else { panic!("mutated holder must be poisoned after handoff") };
+            assert_eq!(
+                error.downcast_custom::<ReferenceError>(),
+                Some(&ReferenceError::ExecutionPoisoned {
+                    reason: "injected failure after execution handoff".to_string(),
+                }),
+            );
         }
+        assert_eq!(read_f32s(&client, &post_handoff_read_only.read().unwrap()), vec![20.0]);
+
+        // Every ordinary error after publication but before the boundary that validates and then commits all holders
+        // poisons the complete mutated batch with that exact error. The published read lease on a read-only peer
+        // remains valid and releases normally when the submitted execution completes.
+        let pre_commit_first = reference_new(1.0);
+        let pre_commit_second = reference_new(10.0);
+        let pre_commit_read_only = reference_new(20.0);
+        let update =
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        inject_stateful_failure(StatefulFailureInjection::BeforeHiddenReplacementCommit);
+        assert!(matches!(
+            compiled.execute_statefully_and_wait(
+                &domain,
+                (
+                    Value::Reference(Reference::new(pre_commit_first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_commit_second.clone(), domain.clone())),
+                    Value::Reference(Reference::new(pre_commit_read_only.clone(), domain.clone())),
+                    Value::Array(update),
+                ),
+            ),
+            Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
+                if message == "injected failure before hidden state replacement commit",
+        ));
+        for reference in [&pre_commit_first, &pre_commit_second] {
+            let Err(error) = reference.read() else { panic!("mutated reference must be poisoned before commit") };
+            assert_eq!(
+                error.downcast_custom::<ReferenceError>(),
+                Some(&ReferenceError::ExecutionPoisoned {
+                    reason: "injected failure before hidden state replacement commit".to_string(),
+                }),
+            );
+        }
+        assert_eq!(read_f32s(&client, &pre_commit_read_only.read().unwrap()), vec![20.0]);
+
+        // A failure confined to public reconstruction occurs only after every hidden final state replacement commits.
+        let committed_first = reference_new(1.0);
+        let committed_second = reference_new(10.0);
+        let committed_read_only = reference_new(20.0);
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        inject_stateful_failure(StatefulFailureInjection::BeforePublicReconstruction);
+        assert!(matches!(
+            compiled.execute_statefully_and_wait(
+                &domain,
+                (
+                    Value::Reference(Reference::new(committed_first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(committed_second.clone(), domain.clone())),
+                    Value::Reference(Reference::new(committed_read_only.clone(), domain.clone())),
+                    Value::Array(update),
+                ),
+            ),
+            Err(Error::Pjrt(ryft_pjrt::Error::Internal { message, .. }))
+                if message == "injected failure before public output reconstruction",
+        ));
+        assert_eq!(read_f32s(&client, &committed_first.read().unwrap()), vec![3.0]);
+        assert_eq!(read_f32s(&client, &committed_second.read().unwrap()), vec![12.0]);
+        assert_eq!(read_f32s(&client, &committed_read_only.read().unwrap()), vec![20.0]);
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_validation_failure_leaves_peer_unchanged() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let array_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(first, second, update)| {
+                first.add_update(&update)?;
+                second.add_update(&update)?;
+                first.read().map_err(Into::into)
+            },
+            (reference_type.clone(), reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let first = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let frozen = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        frozen.freeze().unwrap();
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 3.0f32.to_ne_bytes().as_slice()).unwrap();
+        assert!(matches!(
+            compiled.execute_statefully_and_wait(
+                &domain,
+                (
+                    Value::Reference(Reference::new(first.clone(), domain.clone())),
+                    Value::Reference(Reference::new(frozen, domain.clone())),
+                    Value::Array(update),
+                ),
+            ),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Reference(ReferenceError::Frozen),
+            ),
+        ));
+        assert_eq!(read_f32s(&client, &first.read().unwrap()), vec![1.0]);
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_read_leases_overlap_and_block_mutation() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let array_type = replicated_scalar_type(&mesh, DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let read = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |reference| reference.read().map_err(Into::into),
+            reference_type.clone(),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let mutate = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+            |(reference, update)| reference.add_update(&update).map_err(Into::into),
+            (reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        // Both gates report into one labelled channel, so the assertions below pin which read lease the mutation
+        // blocks on first instead of silently depending on the order the transaction awaits its leases.
+        let (await_started, await_observed) = mpsc::channel();
+        let first_gate = ControlledReferenceCompletion::with_await_notification("first read", await_started.clone());
+        inject_stateful_completion(CoreReferenceCompletion::new(first_gate.clone()));
+        let first_read =
+            read.execute_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
+        let second_gate = ControlledReferenceCompletion::with_await_notification("second read", await_started);
+        inject_stateful_completion(CoreReferenceCompletion::new(second_gate.clone()));
+        let second_read =
+            read.execute_statefully(&domain, Value::Reference(Reference::new(reference.clone(), domain.clone())));
+
+        std::thread::scope(|scope| {
+            let (mutation_finished, mutation_result) = mpsc::channel();
+            let mutation_reference = reference.clone();
+            let domain = &domain;
+            let mutate = &mutate;
+            scope.spawn(move || {
+                let update =
+                    Array::from_host_buffer(domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+                mutation_finished
+                    .send(mutate.execute_statefully_and_wait(
+                        domain,
+                        (Value::Reference(Reference::new(mutation_reference, domain.clone())), Value::Array(update)),
+                    ))
+                    .unwrap();
+            });
+
+            assert_eq!(await_observed.recv_timeout(Duration::from_secs(5)).unwrap(), "first read");
+            assert!(matches!(mutation_result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            first_gate.complete(Ok(()));
+            assert_eq!(await_observed.recv_timeout(Duration::from_secs(5)).unwrap(), "second read");
+            assert!(matches!(mutation_result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            second_gate.complete(Ok(()));
+            mutation_result.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        });
+        first_read.r#await().unwrap();
+        second_read.r#await().unwrap();
+        assert_eq!(read_f32s(&client, &reference.read().unwrap()), vec![3.0]);
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_without_public_outputs_waits_for_commit() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let array_type = replicated_scalar_type(&mesh, DataType::F32);
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+            |(reference, update)| reference.add_update(&update).map_err(Into::into),
+            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        compiled
+            .execute_statefully(
+                &domain,
+                (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+            )
+            .r#await()
+            .unwrap();
+        assert_eq!(read_f32s(&client, &reference.read().unwrap()), vec![3.0]);
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_chains_unawaited_mutations_and_preserves_prior_failure() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let array_type = replicated_scalar_type(&mesh, DataType::F32);
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+            |(reference, update)| reference.add_update(&update).map_err(Into::into),
+            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let predecessor = ControlledReferenceCompletion::new();
+        inject_stateful_completion(CoreReferenceCompletion::new(predecessor.clone()));
+        let first_update =
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 2.0f32.to_ne_bytes().as_slice())
+                .unwrap();
+        let first = compiled.execute_statefully(
+            &domain,
+            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(first_update)),
+        );
+        let second_update =
+            Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        let second = compiled.execute_statefully(
+            &domain,
+            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(second_update)),
+        );
+
+        predecessor.complete(Err(Arc::from("injected predecessor failure")));
+        for execution in [first, second] {
+            assert!(matches!(
+                execution.r#await(),
+                Err(Error::Execution(ExecutionError::AsynchronousFailure { reason }))
+                    if reason.as_ref() == "injected predecessor failure",
+            ));
+        }
+        let error = reference.read().unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<ReferenceError>(),
+            Some(&ReferenceError::ExecutionPoisoned { reason: "injected predecessor failure".to_string() }),
+        );
+    }
+
+    #[test]
+    fn test_domain_execute_statefully_drop_reconciles_pending_holder_on_access() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = Session::new(&client).domain();
+        let array_type = replicated_scalar_type(&mesh, DataType::F32);
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ()>(
+            |(reference, update)| reference.add_update(&update).map_err(Into::into),
+            (ArrayIrType::Reference(ReferenceType::new(array_type.clone())), ArrayIrType::Array(array_type.clone())),
+            &domain,
+            Options::new(mesh.clone()),
+        )
+        .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&domain, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
+        );
+        let completion = ControlledReferenceCompletion::new();
+        inject_stateful_completion(CoreReferenceCompletion::new(completion.clone()));
+        let update = Array::from_host_buffer(&domain, array_type, mesh, 2.0f32.to_ne_bytes().as_slice()).unwrap();
+        drop(compiled.execute_statefully(
+            &domain,
+            (Value::Reference(Reference::new(reference.clone(), domain.clone())), Value::Array(update)),
+        ));
+
+        completion.complete(Ok(()));
+        assert_eq!(read_f32s(&client, &reference.read().unwrap()), vec![3.0]);
     }
 }

@@ -1,3 +1,6 @@
+//! Conversions between `ryft` types and their PJRT representations. [`ToPjrt`] and [`FromPjrt`] are implemented
+//! for the data types and layouts in [`crate::types`] and for devices in [`crate::devices`].
+
 /// Represents types that can be converted to a PJRT representation (e.g., a PJRT buffer type or layout).
 pub trait ToPjrt {
     /// PJRT type that instances of this type can be converted to.

@@ -1,7 +1,7 @@
 """Dump the StableHLO JAX emits for memory-kind transfers inside `jit`.
 
 This is the JAX side of the parity check for ryft's `TransferToMemoryOperation` lowering: the
-program below mirrors `test_transfer_to_memory_lowers_to_device_placement_annotations` in
+program below mirrors `test_transfer_to_memory_operation_lower` in
 `crates/ryft-xla/src/operations/manipulation/memory.rs`, and the `annotate_device_placement`
 custom calls it prints are asserted byte-for-byte in that test.
 

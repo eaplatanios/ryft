@@ -9,15 +9,16 @@ impl LowerableOperation for ReshardOperation {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (input_types, output_types);
         lower_sharding_constraint(
             input_values,
             self.sharding(),
-            &lowerer.collective_state.bound_manual_axes,
-            &mut lowerer.block,
-            lowerer.location,
+            lowerer.collective_state().bound_manual_axes(),
+            &mut lowerer.block(),
+            lowerer.location(),
         )
     }
 }
@@ -27,17 +28,26 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, ArrayType, Cos, DataType, Device, DeviceMesh, DomainTracer, LogicalMesh, MeshAxis, MeshAxisType, Mul,
-        ProjectedValue, Reduce, ShardMapOptions, Sharding, ShardingDimension, Sin, Typed, ValueProjection, auto_axes,
-        differentiate_at, explicit_axes, shard_map,
+        Add, ArrayType, Cos, DataType, Device, DeviceMesh, Dimension as CoreDimension, DomainTracer, LogicalMesh,
+        MeshAxis, MeshAxisType, Mul, ProjectedValue, Reduce, Reshard, Shape, ShardMapOptions, Sharding,
+        ShardingDimension, Sin, Typed, ValueProjection, auto_axes, differentiate_at, explicit_axes, shard_map,
     };
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_pjrt::Client;
 
-    use crate::tests::{values_from_bytes, values_to_bytes};
+    use crate::domains::tests::{read_f32s, two_device_mesh};
+    use crate::operations::sharding::shard_map::tests::read_device_f32s;
+    use crate::tests::{cpu_client, values_from_bytes, values_to_bytes};
     use crate::tracing::{ArrayTracer, TracedProgram, trace};
     use crate::{
         Array, CompileTracer, CompiledFunction, Domain, FromPjrt, Options, Session, compile, compile_with_options,
     };
+
+    /// Returns `logical_mesh` over the addressable devices of `client`.
+    fn device_mesh(client: &Client<'_>, logical_mesh: LogicalMesh) -> DeviceMesh {
+        let devices = client.addressable_devices().unwrap();
+        DeviceMesh::new(logical_mesh, devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect())
+            .unwrap()
+    }
 
     /// Four-device mesh whose axes `x` and `y` are both explicit.
     fn explicit_mesh() -> LogicalMesh {
@@ -58,19 +68,8 @@ mod tests {
         Sharding::new(mesh.clone(), dimensions).unwrap()
     }
 
-    /// Returns the elements of the buffer that every addressable device holds for `array`, in device order.
-    fn read_device_f32s(array: &Array<'_>) -> Vec<Vec<f32>> {
-        array
-            .addressable_shards()
-            .map(|shard| {
-                let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
-                values_from_bytes::<f32>(bytes.as_slice())
-            })
-            .collect()
-    }
-
     #[test]
-    fn test_reshard_lowering_opens_dimensions_over_auto_axes() {
+    fn test_reshard_operation_lower() {
         let mesh = explicit_mesh();
         let input_type = ArrayType::new_static(DataType::F32, [4, 2])
             .with_sharding(sharding(&mesh, &[Some("x"), Some("y")]))
@@ -145,19 +144,61 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_axes_executes_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .unwrap();
-        let domain = Session::new(&client).domain();
-        let logical_mesh = explicit_mesh();
-        let devices = client.addressable_devices().unwrap();
-        let mesh = DeviceMesh::new(
-            logical_mesh.clone(),
-            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
+    fn test_reshard_operation_lower_chains_into_one_program() {
+        // Multiple staged reshards inside one `compile` body compile into a single MLIR program with chained
+        // `sdy.sharding_constraint` operations, which yields exactly one cache entry and exactly one PJRT execution per
+        // call. In this asynchronously pipelined regime, PJRT runs the whole compiled program at once without a host
+        // synchronization per reshard. The mesh axis is explicit, so each reshard is a tracked transition and the final
+        // replicated sharding governs the output buffer.
+        let client = cpu_client(2);
+        let mesh = two_device_mesh(&client, MeshAxisType::Explicit);
+        let engine = Session::new(&client).domain();
+
+        let shape = Shape::new(vec![CoreDimension::Static(4)]);
+        let sharded = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(mesh.logical_mesh().clone(), 1);
+        let input_type = ArrayType::new(DataType::F32, shape.clone()).with_sharding(sharded.clone()).unwrap();
+        let constraint_a = replicated.clone();
+        let constraint_b = sharded.clone();
+        let constraint_c = replicated;
+
+        // Three staged reshards compose inside one closure. Each emits a `sdy.sharding_constraint` op into
+        // the same MLIR program. After staging and compilation, the executable runs all three in one PJRT dispatch.
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+            move |x| {
+                let a = x.reshard(&constraint_a).unwrap();
+                let b = a.sin().unwrap().reshard(&constraint_b).unwrap();
+                b.sin().unwrap().reshard(&constraint_c).unwrap()
+            },
+            input_type.clone(),
+            &engine,
+            mesh.clone(),
         )
         .unwrap();
+
+        // One compile means one cache entry for the whole pipeline.
+        assert_eq!(engine.program_count(), 1, "three staged reshards should compile into one program");
+
+        let values = [0.1f32, 0.2, 0.3, 0.4];
+        let source =
+            Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                .unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
+
+        // The last constraint replicates the final output, so every device sees the full vector.
+        let observed = read_f32s(&client, &output);
+        for (got, &input) in observed.iter().zip(values.iter()) {
+            let expected = input.sin().sin();
+            assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
+        }
+    }
+
+    #[test]
+    fn test_auto_axes_executes_on_cpu() {
+        let client = cpu_client(4);
+        let domain = Session::new(&client).domain();
+        let logical_mesh = explicit_mesh();
+        let mesh = device_mesh(&client, logical_mesh.clone());
         let input_type = ArrayType::new_static(DataType::F32, [4, 2])
             .with_sharding(sharding(&logical_mesh, &[Some("x"), Some("y")]))
             .unwrap();
@@ -220,18 +261,10 @@ mod tests {
 
     #[test]
     fn test_explicit_axes_executes_on_cpu() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .unwrap();
+        let client = cpu_client(4);
         let domain = Session::new(&client).domain();
         let logical_mesh = explicit_mesh().with_axis_types(["x", "y"], MeshAxisType::Auto).unwrap();
-        let devices = client.addressable_devices().unwrap();
-        let mesh = DeviceMesh::new(
-            logical_mesh.clone(),
-            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
-        )
-        .unwrap();
+        let mesh = device_mesh(&client, logical_mesh.clone());
         let input_type = ArrayType::new_static(DataType::F32, [4, 2])
             .with_sharding(Sharding::replicated(logical_mesh.clone(), 2))
             .unwrap();
@@ -249,9 +282,7 @@ mod tests {
         // or executed eagerly. Its type is replicated, because types record no placement over auto mesh axes, while
         // the compiler chooses its runtime placement over them.
         let expected = vec![1.5403022766113281f32, -1.4061393737792969, -0.36998140811920166, 1.7140724658966064];
-        let read = |array: &Array<'_>| {
-            values_from_bytes::<f32>(&array.copy_to_host().unwrap())
-        };
+        let read = |array: &Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             {
                 let input_sharding = input_sharding.clone();
@@ -284,19 +315,11 @@ mod tests {
     fn test_auto_axes_of_shard_map_outputs_executes_on_cpu() {
         // An eager `shard_map` over the mesh with `x` manual returns its output typed over the explicit mesh of its
         // input, as JAX's `shard_map` types its outputs over its context mesh, so `auto_axes` switches it directly.
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .unwrap();
+        let client = cpu_client(4);
         let domain = Session::new(&client).domain();
         let logical_mesh = explicit_mesh();
         let map_mesh = logical_mesh.with_axis_types(["x"], MeshAxisType::Manual).unwrap();
-        let devices = client.addressable_devices().unwrap();
-        let mesh = DeviceMesh::new(
-            logical_mesh.clone(),
-            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
-        )
-        .unwrap();
+        let mesh = device_mesh(&client, logical_mesh.clone());
         let input_sharding = sharding(&logical_mesh, &[Some("x"), Some("y")]);
         let map_sharding = sharding(&map_mesh, &[Some("x"), Some("y")]);
         let input_type = ArrayType::new_static(DataType::F32, [4, 2]).with_sharding(input_sharding.clone()).unwrap();
@@ -340,18 +363,10 @@ mod tests {
         // A concrete input is placed along the auto axes `x` and `y`, which its type does not record, so the compiled
         // function takes that placement as an input sharding override. The gradient through `explicit_axes` keeps the
         // input's placement, with the values of the JAX oracle `grad explicit_axes`.
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
-            .unwrap();
+        let client = cpu_client(4);
         let domain = Session::new(&client).domain();
         let logical_mesh = explicit_mesh().with_axis_types(["x", "y"], MeshAxisType::Auto).unwrap();
-        let devices = client.addressable_devices().unwrap();
-        let mesh = DeviceMesh::new(
-            logical_mesh.clone(),
-            devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect(),
-        )
-        .unwrap();
+        let mesh = device_mesh(&client, logical_mesh.clone());
         let input_placement = sharding(&logical_mesh, &[Some("x"), Some("y")]);
         let input_type = ArrayType::new_static(DataType::F32, [4, 2]);
         let input = Array::from_host_buffer_with_sharding(

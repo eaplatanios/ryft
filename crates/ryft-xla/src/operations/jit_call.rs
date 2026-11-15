@@ -42,143 +42,77 @@ use crate::{Constant, Domain, Error, LowerableOperation, LowerableOperationFamil
 /// Structural identity of a flat callee program attached behind a `jit_call`, used to deduplicate repeated nested
 /// programs into shared private `func.func`s at lowering time.
 ///
-/// Eligible programs (see [`supports_structural_dedup`]) are keyed by their canonical rendering plus their complete
-/// flat input/output signature: type inference is deterministic and attached regions (control-flow bodies, composite
-/// programs, and nested `jit_call` callees) render contextually inside their instructions, so two programs that render
-/// identically with equal boundary types compute the same function and may share one emitted function — even when they
-/// are distinct staged programs produced by separate transform passes (for example the per-block primal and pullback
-/// programs of `grad(jit(f))` over repeated blocks).
+/// Eligible programs (refer to [`supports_structural_deduplication`]) are keyed by their canonical rendering plus their
+/// complete flat input/output signature. Type inference is deterministic and attached regions (i.e., control-flow
+/// bodies, composite programs, and nested `jit_call` callees) render contextually inside their instructions, so two
+/// programs that render identically with equal boundary types compute the same function and may share one emitted
+/// function. This holds even when they are distinct staged programs produced by separate transform passes (e.g., the
+/// per-block primal and pullback programs of `grad(jit(f))` over repeated blocks).
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct JitCallProgramKey {
-    /// Canonical [`Program`](ryft_core::Program) rendering (operation names, all bracketed attributes, and attached
-    /// region bodies).
+    /// Canonical [`Program`](ryft_core::Program) rendering (i.e., operation names, all bracketed attributes, and
+    /// attached region bodies).
     rendered: String,
 
     /// Flat input types, which together with the rendering pin the full callee signature.
-    pub(crate) input_types: Vec<ArrayIrType>,
+    input_types: Vec<ArrayIrType>,
 
     /// Flat output types, completing the callee signature when output-only placement metadata is not visible
     /// in the rendered body.
-    pub(crate) output_types: Vec<ArrayIrType>,
-}
-
-/// Returns whether `program` may be deduplicated by structural identity.
-///
-/// A program is eligible only when the canonical rendering captures the full semantics needed to safely share a private
-/// function. Although immediate constant payloads are rendered, a [`CaptureReference`](ryft_core::CaptureReference)
-/// identifies a slot and type rather than the runtime value in the surrounding capture table, so programs with
-/// constants remain ineligible. `shard_map` also remains outside this deduplication path because its lowering owns a
-/// separate outlined boundary.
-fn supports_structural_dedup<O: LowerableOperationFamily>(program: &FlatProgram<O>) -> bool {
-    program.regions().iter().all(|region| {
-        region.atoms().iter().all(|atom| !atom.is_constant())
-            && region
-                .instructions()
-                .iter()
-                .all(|instruction| instruction.operation().projected_payload::<ShardMapOperation>().is_none())
-    })
-}
-
-/// Returns whether a borrowed rooted region may be deduplicated by structural identity.
-fn supports_structural_dedup_region<O: LowerableOperationFamily>(region: RegionRef<'_, Constant, O>) -> bool {
-    fn walk<O: LowerableOperationFamily>(region: RegionRef<'_, Constant, O>, visited: &mut HashSet<RegionId>) -> bool {
-        if !visited.insert(region.id()) {
-            return true;
-        }
-        region.atoms().iter().all(|atom| !atom.is_constant())
-            && region.instructions().iter().all(|instruction| {
-                instruction.operation().projected_payload::<ShardMapOperation>().is_none()
-                    && instruction
-                        .regions()
-                        .iter()
-                        .copied()
-                        .all(|nested| RegionRef::new(region.arena(), nested).is_ok_and(|nested| walk(nested, visited)))
-            })
-    }
-
-    walk(region, &mut HashSet::new())
-}
-
-/// Computes the deduplication key for a flat callee program, or [`None`] for programs that are not eligible for
-/// structural deduplication (see [`supports_structural_dedup`]) and therefore always inline. The key is generic over
-/// the program's constant universe so that lookups from the value-generic lowering path type-check; the map itself is
-/// only ever populated from the staged [`Constant`]-keyed pipeline.
-fn jit_call_program_key<O: LowerableOperationFamily>(program: &FlatProgram<O>) -> Option<JitCallProgramKey> {
-    supports_structural_dedup(program).then(|| JitCallProgramKey {
-        rendered: program.to_string(),
-        input_types: program.input_types().into_owned(),
-        output_types: program.output_types().into_owned(),
-    })
-}
-
-/// Computes the deduplication key for a borrowed callee region, materializing only after borrowed eligibility checks.
-fn jit_call_region_key<O: LowerableOperationFamily>(region: RegionRef<'_, Constant, O>) -> Option<JitCallProgramKey> {
-    supports_structural_dedup_region(region).then(|| {
-        let program = region.to_program();
-        JitCallProgramKey {
-            rendered: program.to_string(),
-            input_types: program.input_types().into_owned(),
-            output_types: program.output_types().into_owned(),
-        }
-    })
+    output_types: Vec<ArrayIrType>,
 }
 
 /// One deduplicated callee emitted as a shared private `func.func`.
 pub(crate) struct JitCallFunction<O = Operation> {
     /// Symbol name of the emitted private function.
-    pub(crate) symbol: String,
+    symbol: String,
 
     /// Representative callee program for this key (materialized from its callee region), lowered once as the
     /// function body.
-    pub(crate) program: FlatProgram<O>,
+    program: FlatProgram<O>,
 
     /// Flat input types of the callee, also the emitted function's argument types.
-    pub(crate) input_types: Vec<ArrayIrType>,
+    input_types: Vec<ArrayIrType>,
 
     /// Flat output types of the callee, also the emitted function's result types.
-    pub(crate) output_types: Vec<ArrayIrType>,
+    output_types: Vec<ArrayIrType>,
+}
+
+impl<O> JitCallFunction<O> {
+    /// Returns the symbol name of the emitted private function.
+    #[inline]
+    pub(crate) fn symbol(&self) -> &str {
+        &self.symbol
+    }
+
+    /// Returns the flat input types of the callee, also the emitted function's argument types.
+    #[inline]
+    pub(crate) fn input_types(&self) -> &[ArrayIrType] {
+        &self.input_types
+    }
+
+    /// Returns the flat output types of the callee, also the emitted function's result types.
+    #[inline]
+    pub(crate) fn output_types(&self) -> &[ArrayIrType] {
+        &self.output_types
+    }
 }
 
 /// Shared private functions emitted for `jit_call` callees that occur more than once in a module.
 ///
 /// Built once by [`collect_jit_call_functions`] before a module is lowered and threaded read-only through the
 /// lowering pass. At each `jit_call` lowering site, a callee whose key is present is emitted as a `func.call` to the
-/// shared function instead of being inlined; absent callees inline as before.
+/// shared function instead of being inlined, and absent callees inline.
 pub(crate) struct JitCallFunctionMap<O = Operation> {
     /// Shared functions keyed by callee identity.
-    pub(crate) functions: HashMap<JitCallProgramKey, JitCallFunction<O>>,
+    functions: HashMap<JitCallProgramKey, JitCallFunction<O>>,
 
     /// Keys in first-occurrence order, so emitted symbol names and module layout are deterministic.
-    pub(crate) order: Vec<JitCallProgramKey>,
+    order: Vec<JitCallProgramKey>,
 
     /// Shared functions that implement the bodies of named composite calls, indexed by the calls' semantic identity
     /// and then by their boundary, so that lowering a call finds its function without rendering or hashing its body.
     named: HashMap<CompositeKey, Vec<NamedFunction>>,
-}
-
-/// Shared function that implements the body of the named composite calls with one boundary.
-pub(crate) struct NamedFunction {
-    /// Input types of the calls.
-    input_types: Vec<ArrayIrType>,
-
-    /// Output types of the calls, which are also the results of the function.
-    pub(crate) output_types: Vec<ArrayIrType>,
-
-    /// Symbol of the function.
-    pub(crate) symbol: String,
-}
-
-/// Semantic identity and boundary of the named composite calls that one shared function implements.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct NamedFunctionKey {
-    /// Semantic identity of the calls.
-    key: CompositeKey,
-
-    /// Input types of the calls.
-    input_types: Vec<ArrayIrType>,
-
-    /// Output types of the calls.
-    output_types: Vec<ArrayIrType>,
 }
 
 impl<O> Default for JitCallFunctionMap<O> {
@@ -199,8 +133,8 @@ impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
     /// The index assumes that named composite calls with equal keys and equal boundaries carry equal bodies, which
     /// the contract of [`NamedComposite`](ryft_core::NamedComposite) requires but cannot verify (and which does not
     /// hold across definitions with equal keys under different named axes, or in different operation families).
-    /// [`collect_jit_call_functions`] enforces it: a key and boundary whose calls carry different bodies is left out
-    /// of the index, so its calls look up their shared function by their own body (refer to [`Self::get`]).
+    /// [`collect_jit_call_functions`] enforces it by leaving out of the index any key and boundary whose calls carry
+    /// different bodies, so those calls look up their shared function by their own body (refer to [`Self::get`]).
     pub(crate) fn named(
         &self,
         key: &CompositeKey,
@@ -212,12 +146,1665 @@ impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
             .iter()
             .find(|function| function.input_types == input_types && function.output_types == output_types)
     }
+
+    /// Returns the shared functions keyed by callee identity.
+    #[inline]
+    pub(crate) fn functions(&self) -> &HashMap<JitCallProgramKey, JitCallFunction<O>> {
+        &self.functions
+    }
+
+    /// Returns the keys in first-occurrence order, so emitted symbol names and module layout are deterministic.
+    #[inline]
+    pub(crate) fn order(&self) -> &[JitCallProgramKey] {
+        &self.order
+    }
 }
 
-/// Counts `jit_call` callee occurrences in `program`, covering nested computations at every depth: attached regions
-/// (control-flow bodies, composite programs, and callee bodies) all live in the program's one canonical region arena,
-/// so the walk descends region edges without materializing nested programs. Shard-map body regions are intentionally
-/// skipped: their `jit_call`s lower with shard-local types and always inline.
+/// Shared function that implements the body of the named composite calls with one boundary.
+pub(crate) struct NamedFunction {
+    /// Input types of the calls.
+    input_types: Vec<ArrayIrType>,
+
+    /// Output types of the calls, which are also the results of the function.
+    output_types: Vec<ArrayIrType>,
+
+    /// Symbol of the function.
+    symbol: String,
+}
+
+impl NamedFunction {
+    /// Returns the output types of the calls, which are also the results of the function.
+    #[inline]
+    pub(crate) fn output_types(&self) -> &[ArrayIrType] {
+        &self.output_types
+    }
+
+    /// Returns the symbol of the function.
+    #[inline]
+    pub(crate) fn symbol(&self) -> &str {
+        &self.symbol
+    }
+}
+
+/// Builds the [`JitCallFunctionMap`] for a module by emitting a shared private function for every `jit_call` callee
+/// that occurs at least twice (per [`JitCallProgramKey`] identity), and for every named composite body that no
+/// backend implementation replaces on `target_platform` and that occurs at least twice. Single-occurrence callees are
+/// left to inline, so modules without repeated calls lower exactly as before. A shared function that named composite
+/// calls reach is named after the name and version of the first such definition (e.g., `ryft.example.v1`, with a
+/// numeric suffix for other specializations), even when a `jit_call` also reaches it, and no `jit_call` or
+/// named-composition function name can match such a name. A named composite boundary is indexed only when it equals
+/// the boundary of its shared function, so that the emitted call signature matches the function.
+///
+/// # Errors
+///
+/// Returns an error when the effects that lowering a callee introduces cannot be determined (refer to
+/// [`lowered_effect_classes`]).
+pub(crate) fn collect_jit_call_functions<Input, Output, O: LowerableOperationFamily>(
+    program: &Program<Input, Output, O>,
+    target_platform: Option<&str>,
+) -> Result<JitCallFunctionMap<O>, Error>
+where
+    Input: Parameterized<Constant>,
+    Output: Parameterized<Constant>,
+{
+    let mut counts: HashMap<JitCallProgramKey, (usize, FlatProgram<O>)> = HashMap::new();
+    let mut order: Vec<JitCallProgramKey> = Vec::new();
+    let mut memo: HashMap<RegionId, Option<JitCallProgramKey>> = HashMap::new();
+    let mut named = HashMap::new();
+    let mut names = HashMap::new();
+    count_jit_calls(program, target_platform, &mut counts, &mut order, &mut memo, &mut named, &mut names)?;
+
+    let mut map = JitCallFunctionMap::default();
+    let mut name_counts = HashMap::<String, usize>::new();
+    for key in order {
+        let (count, program) = counts.remove(&key).unwrap();
+        // Effectful callees always inline (even when repeated) so their effectful instructions chain onto the
+        // caller's effect token in program order, which a shared token-free function could not preserve. That
+        // includes the entry guards that lowering synthesizes for the callee's nested control flow. Callees that
+        // reference session constants also inline, because only the entry function receives their hidden arguments.
+        if count < 2 || !lowered_effect_classes(&program)?.is_empty() || !collect_session_constants(&program).is_empty()
+        {
+            continue;
+        }
+        let symbol = match names.get(&key) {
+            Some(name) => {
+                let count = name_counts.entry(name.clone()).or_default();
+                *count += 1;
+                if *count == 1 { name.clone() } else { format!("{name}_{}", *count - 1) }
+            }
+            None => format!("jit_call_{}", map.order.len()),
+        };
+        let input_types = program.input_types().into_owned();
+        let output_types = program.output_types().into_owned();
+        map.functions.insert(key.clone(), JitCallFunction { symbol, program, input_types, output_types });
+        map.order.push(key);
+    }
+    for (named_key, key) in named {
+        let Some(function) = key.and_then(|key| map.functions.get(&key)) else {
+            continue;
+        };
+        if function.input_types != named_key.input_types || function.output_types != named_key.output_types {
+            continue;
+        }
+        let NamedFunctionKey { key: composite_key, input_types, output_types } = named_key;
+        let symbol = function.symbol.clone();
+        map.named
+            .entry(composite_key)
+            .or_default()
+            .push(NamedFunction { input_types, output_types, symbol });
+    }
+    Ok(map)
+}
+
+/// Emits the shared private `func.func` for one deduplicated callee into `module_block`.
+///
+/// The body is lowered with `nested_functions` in scope so that any repeated `jit_call`s inside this callee also
+/// lower to `func.call`s. Calls between shared functions are resolved by symbol, so emission order does not matter. The
+/// body is also lowered with the module's `collective_state`, so module-scoped lowering state (i.e., the shared channel
+/// id counter and the target platform that gates platform-specific fast paths such as fused attention) reaches the
+/// callee body exactly like it reaches inlined callees. The mesh and manual region state intentionally resets per
+/// function.
+pub(crate) fn emit_jit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    module_block: &mut BlockRef<'b, 'c, 't>,
+    function: &JitCallFunction<O>,
+    nested_functions: &Rc<JitCallFunctionMap<O>>,
+    collective_state: &CollectiveLoweringState,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<(), Error> {
+    let argument_tensor_types = function
+        .input_types
+        .iter()
+        .map(|r#type| lower_array_ir_type(r#type, context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result_tensor_types = function
+        .output_types
+        .iter()
+        .map(|r#type| lower_array_ir_type(r#type, context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let function_block = context.block(
+        argument_tensor_types
+            .iter()
+            .map(|tensor_type| (*tensor_type, location))
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    {
+        let mut function_block_ref = function_block.as_ref();
+        let input_values = (0..function.input_types.len())
+            .map(|index| function_block.argument(index).expect("shared function block arguments should exist").as_ref())
+            .collect::<Vec<_>>();
+        // Deduplicated callees are pure by construction (`collect_jit_call_functions` skips programs whose lowering
+        // has effects, including synthesized entry guards), so the shared function body never creates an effect token.
+        let mut effect_tokens = EffectTokens::default();
+        let outputs = lower_nested_program_inline(
+            &function.program,
+            input_values.as_slice(),
+            &mut function_block_ref,
+            context,
+            location,
+            &[],
+            &RematerializationOptimizationBarrier::None,
+            Some(nested_functions),
+            collective_state,
+            &mut effect_tokens,
+        )?;
+        function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
+    }
+    let mut function_region = context.region();
+    function_region.append_block(function_block)?;
+    module_block.append_operation(func::func(
+        function.symbol.as_str(),
+        func::FuncAttributes {
+            arguments: argument_tensor_types
+                .iter()
+                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                .collect(),
+            results: result_tensor_types
+                .iter()
+                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                .collect(),
+            visibility: SymbolVisibility::Private,
+            ..Default::default()
+        },
+        function_region,
+        location,
+    )?)?;
+    Ok(())
+}
+
+/// Calls the shared private `func.func` named `symbol` with the provided operands, which must match its inputs, and
+/// returns its results, typed by `output_types`.
+pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
+    symbol: &str,
+    output_types: &[ArrayIrType],
+    input_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    let result_tensor_types = output_types
+        .iter()
+        .map(|r#type| lower_array_ir_type(r#type, context, location))
+        .collect::<Result<Vec<_>, _>>()?;
+    let operation = block.append_operation(func::call(
+        symbol,
+        func::CallProperties {
+            arguments: input_values
+                .iter()
+                .map(|value| ValueAndAttributes { value: *value, attributes: None })
+                .collect(),
+            results: result_tensor_types
+                .iter()
+                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
+                .collect(),
+            no_inline: false,
+        },
+        location,
+    )?)?;
+    Ok((0..output_types.len()).map(|index| operation.result(index).unwrap().as_ref()).collect())
+}
+
+/// Canonical operation name for [`JitCallOperation`].
+pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
+
+/// Staged call to a flat XLA program. The callee program is not part of this payload. It is a shared callee root
+/// [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the operation (the
+/// single `["callee"]` slot), interned by [`Arc`] identity when the call is staged through the
+/// [`AttachedRegions`] passed to [`Context::bind`], so repeated calls staged from one
+/// function handle share one callee root and remain identity-comparable for call-site deduplication at lowering. The
+/// `T` parameter fixes the callee boundary's type universe, allowing the reusable homogeneous-array batching form and
+/// the executable array IR form to remain distinct payload types with one [`CoreOperation`](ryft_core::Operation)
+/// contract each. The retained `capture_count` names the callee's exact leading lifted-capture input prefix. It
+/// participates in operation equality and callee deduplication identity and scopes reference capture resolution during
+/// analysis.
+///
+/// [`CoreOperation::region_data_flow`](ryft_core::Operation::region_data_flow) declares ordinary callee data flow, in
+/// which callee inputs receive instruction inputs positionally and instruction outputs originate from the corresponding
+/// callee outputs. Capture-prefix retention remains an independent boundary-pruning requirement.
+///
+/// Declare callee-local result identities through [`with_callee_type_signature`](Self::with_callee_type_signature)
+/// before binding the call. The operation allocates caller-owned result names once, so repeated inference retains them
+/// while separate calls receive independent local result identities.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct JitCallOperation<T: Type> {
+    /// Number of leading callee inputs that form its lifted lexical capture prefix.
+    capture_count: usize,
+
+    /// Type universe of the callee boundary.
+    marker: PhantomData<fn() -> T>,
+
+    /// Caller-owned result identities and the formal input scope used to instantiate forwarded names.
+    output_types: Option<CallTypeBindings<T>>,
+}
+
+impl<T: Type> JitCallOperation<T> {
+    /// Creates a staged `jit_call` operation. The flat callee program is supplied as a shared region attachment to
+    /// [`Context::bind`], and `capture_count` identifies its exact leading lifted-capture prefix.
+    #[inline]
+    pub(crate) fn new(capture_count: usize) -> Self {
+        Self { capture_count, marker: PhantomData, output_types: None }
+    }
+
+    /// Instantiates every callee-local result identity freshly for this call. Input identities continue to name the
+    /// forwarded quantities. Call this after constructing the callee and before binding a call with local results.
+    /// Repeated inference allocates no identities and returns the same result types.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error for an oversized capture prefix or a type that cannot rename its local identities.
+    pub fn with_callee_type_signature(mut self, input_types: &[T], output_types: &[T]) -> Result<Self, TypeError> {
+        self.validate_capture_prefix(input_types.len())?;
+        self.output_types = CallTypeBindings::fresh(input_types, output_types)?;
+        Ok(self)
+    }
+
+    /// Instantiates a sealed callee's result names, using its cached signature to recognize identity-free boundaries
+    /// without cloning their input and output types. An identity-bearing callee follows the ordinary signature path.
+    fn with_callee_region<V: CoreValue<Type = T>, O: CoreOperation<Type = T>>(
+        mut self,
+        callee: RegionRef<'_, V, O>,
+    ) -> Result<Self, TypeError> {
+        self.validate_capture_prefix(callee.input_ids().len())?;
+        if callee.type_identity_signature().identities().is_empty() {
+            // A closed signature without identities proves that `CallTypeBindings::fresh` would return `None` before
+            // attempting any renaming. Preserve that exact payload, including when replacing an older signature.
+            self.output_types = None;
+            return Ok(self);
+        }
+        self.with_callee_type_signature(&callee.input_types(), &callee.output_types())
+    }
+
+    /// Retains caller-owned result identities after a callee boundary rewrite, including reference discharge.
+    fn with_result_type_signature(
+        mut self,
+        input_types: &[T],
+        callee_outputs: &[T],
+        outputs: Vec<T>,
+    ) -> Result<Self, TypeError> {
+        self.output_types = CallTypeBindings::with_outputs(input_types, callee_outputs, outputs)?;
+        Ok(self)
+    }
+
+    /// Returns the exact number of leading callee inputs that form the lifted-capture prefix.
+    #[inline]
+    pub(crate) fn capture_count(&self) -> usize {
+        self.capture_count
+    }
+
+    /// Checks that the lexical capture namespace is a valid prefix of this callee's actual boundary.
+    fn validate_capture_prefix(&self, input_count: usize) -> Result<(), TypeError> {
+        if self.capture_count > input_count {
+            return Err(TypeError::invalid(format!(
+                "`jit_call` lifted capture prefix {} exceeds its {input_count} callee inputs",
+                self.capture_count,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Rebinds forwarded result names from the retained formal input scope to this callee instantiation.
+    fn instantiated_output_types(&self, inputs: &[T]) -> Result<Option<Vec<T>>, TypeError> {
+        self.output_types.as_ref().map(|types| types.instantiated(inputs)).transpose()
+    }
+
+    /// Validates exact local-result instantiation and returns the callee-to-caller result correspondence.
+    fn output_renaming(
+        &self,
+        inputs: &[T],
+        callee_outputs: &[T],
+    ) -> Result<TypeIdentityRenaming<T::Identity>, TypeError> {
+        if let Some(types) = &self.output_types {
+            return types.renaming(inputs, callee_outputs);
+        }
+        if callee_outputs
+            .iter()
+            .flat_map(Type::identities)
+            .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+        {
+            return Err(TypeError::invalid(
+                "`jit_call` with callee-local result identities requires `with_callee_type_signature`",
+            ));
+        }
+        Ok(TypeIdentityRenaming::new())
+    }
+}
+
+impl StagedCallOperation<Constant> for Operation {
+    #[inline]
+    fn staged_call(capture_count: usize) -> Self {
+        Self::JitCall(JitCallOperation::new(capture_count))
+    }
+
+    fn staged_call_with_types(
+        capture_count: usize,
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
+    ) -> Result<Self, TypeError> {
+        Ok(Self::JitCall(JitCallOperation::new(capture_count).with_callee_type_signature(input_types, output_types)?))
+    }
+}
+
+impl<T: Type> CoreOperation for JitCallOperation<T> {
+    type Type = T;
+
+    #[inline]
+    fn name(&self) -> &'static str {
+        JIT_CALL_OPERATION_NAME
+    }
+
+    fn defined_type_identities(&self) -> Cow<'_, [T::Identity]> {
+        self.output_types.as_ref().map_or(Cow::Borrowed(&[]), |types| Cow::Owned(types.definitions()))
+    }
+
+    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        let mut renamed = self.clone();
+        renamed.output_types = self.output_types.as_ref().map(|types| types.renamed(renaming)).transpose()?;
+        Ok(renamed)
+    }
+
+    #[inline]
+    fn region_slots(&self) -> &'static [RegionSlot] {
+        const { &[RegionSlot::computation("callee")] }
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[T],
+        region_interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<T>, TypeError> {
+        if region_interfaces.len() != 1 {
+            return Err(TypeError::invalid(format!(
+                "`{JIT_CALL_OPERATION_NAME}` expects 1 attached callee region but got {}",
+                region_interfaces.len(),
+            )));
+        }
+        let callee_interface = &region_interfaces[0];
+        self.validate_capture_prefix(callee_interface.input_types().len())?;
+        validate_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
+        self.output_renaming(callee_interface.input_types(), callee_interface.output_types())?;
+        Ok(self
+            .instantiated_output_types(callee_interface.input_types())?
+            .unwrap_or_else(|| callee_interface.output_types().to_vec()))
+    }
+
+    fn infer_region_input_types(
+        &self,
+        input_types: &[T],
+        interfaces: &[RegionInterface<T>],
+    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
+        check_count!("region", interfaces, 1, TypeError);
+        let declared = interfaces[0].input_types();
+        if declared == input_types {
+            return Ok(vec![None]);
+        }
+        let renaming = T::derive_identity_renaming(declared, input_types)?;
+        let renamed =
+            declared.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
+        validate_call_input_types(self.name(), &renamed, input_types)?;
+        Ok(vec![Some(input_types.to_vec())])
+    }
+
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
+        if region_index == 0 {
+            InputRegionProvenance::Input { index: input_index }
+        } else {
+            InputRegionProvenance::None
+        }
+    }
+
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        vec![OutputRegionProvenance { region_index: 0, output_index }]
+    }
+
+    fn region_data_flow(&self) -> RegionDataFlow<'_> {
+        RegionDataFlow::Provenance
+    }
+
+    fn prune_boundary(
+        &self,
+        input_types: &[Self::Type],
+        used_outputs: &[bool],
+        regions: &mut dyn RegionLiveness,
+    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
+        // Operands map onto the callee inputs one for one, so the operands that the callee does not use are dropped
+        // together with its unused outputs (as in JAX's `dce_jaxpr_pjit_rule`). The lifted capture prefix is always
+        // kept, because the captures in the callee refer to it by absolute position.
+        let mut kept_inputs = regions.used_region_inputs(0, used_outputs)?;
+        kept_inputs.iter_mut().take(self.capture_count).for_each(|kept| *kept = true);
+        check_count!("input", kept_inputs, input_types.len(), ProgramError);
+        let mut operation = self.clone();
+        operation.output_types =
+            self.output_types.as_ref().map(|types| types.pruned(&kept_inputs, used_outputs)).transpose()?;
+        Ok(Some(OperationBoundaryPruning { operation, kept_inputs, kept_outputs: used_outputs.to_vec() }))
+    }
+
+    #[inline]
+    fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
+        (region_index == 0).then_some(self.capture_count)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        let operation = OperationFormatter::new(formatter, indentation, JIT_CALL_OPERATION_NAME)?;
+        if self.capture_count == 0 && self.output_types.is_none() {
+            Ok(())
+        } else {
+            operation.bracketed(|operation| {
+                if self.capture_count != 0 {
+                    operation.field("capture_count", self.capture_count)?;
+                }
+                if let Some(outputs) = &self.output_types {
+                    operation.list("output_types", outputs.outputs())?;
+                }
+                Ok(())
+            })
+        }
+    }
+}
+
+// A `jit_call` operation forwards its operands onto its callee's inputs one for one and reports the callee's outputs as
+// its own, which is the positionally forwarding shape the shared structured rewrite serves with no leading operands.
+// The callee's lifted capture prefix is unaffected, because threaded state is appended after every declared operand,
+// so the prefix keeps its positions. Instantiated result types belong to the source callee signature, which discharge
+// changes by turning discharged references into arrays and appending state inputs and outputs. The rebuilt call
+// therefore keeps the same caller-owned result identities but derives its result metadata from the rebuilt callee
+// signature.
+impl<T, C, P> ReferenceDischargeableOperation<C, P> for JitCallOperation<T>
+where
+    T: Type + From<P::Referent>,
+    C: Context<Type = T, Operation: From<JitCallOperation<T>>>,
+    P: ReferenceDischargePolicy<C>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        let result_renaming = match &self.output_types {
+            Some(_) => {
+                let callee = driver.region(0)?;
+                Some(self.output_renaming(&callee.input_types(), &callee.output_types())?)
+            }
+            None => None,
+        };
+        context.discharge_positional_region_operation(self, driver, inputs, 0, |_, regions| {
+            let Some(result_renaming) = result_renaming else { return Ok(self.clone()) };
+            check_count!("region", regions, 1, TypeError);
+            let input_types = regions[0].input_types();
+            let callee_outputs = regions[0].output_types();
+            let outputs = callee_outputs
+                .iter()
+                .map(|r#type| r#type.rename_identities(&result_renaming))
+                .collect::<Result<Vec<_>, _>>()?;
+            let operation = Self { output_types: None, ..self.clone() };
+            Ok(operation.with_result_type_signature(&input_types, &callee_outputs, outputs)?)
+        })
+    }
+}
+
+// Online partial evaluation rule for a staged `jit_call` operation, which is ryft's analogue of JAX's call partial
+// evaluation rules. It splits the callee against the caller's knownness while preserving the `jit_call` boundary on
+// both sides.
+//
+// The split fires whenever the knownness of the call inputs is mixed (i.e., some inputs are known and some are not).
+// All-known and all-unknown calls preserve the original boundary, and their callee is bound as a shared program (an
+// interned callee, or a copy retained by the region transform cache of the callee), so that repeated calls of one
+// callee keep sharing one region on either side. Under a residual policy, the outputs of a pure all-known call that
+// only forward call inputs resolve to those inputs, and a residual planner that demands an output of such a call whose
+// callee saves interior values asks this operation to split the call on residual demand (refer to
+// `PartiallyEvaluatableOperation::split_on_residual_demand`). That split binds a known call that also returns those
+// values and a replay call that recomputes the demanded outputs from them, as JAX's `_pjit_partial_eval_custom` does.
+// Whether the mixed call's known inputs are concrete values of an eager known-side context or tracers into a live
+// outer trace does not matter, as in JAX's call partial evaluation rules, which always bind the known call. The known
+// side is bound through the default fold-or-residualize policy, which compiles and executes it under an eager context
+// (e.g., [`Domain`](crate::Domain)) and stages it into the outer program under a staging context. The `shard_map` rule
+// follows the same policy.
+//
+// When a split fires, the callee is split through the shared
+// [`PartitionedProgram`](ryft_core::partial::PartitionedProgram) machinery. The known side is bound into the
+// enclosing known-side context as a `jit_call` over the known call inputs that it uses, and the residual side is
+// emitted as the residual `jit_call` over the surviving unknown call inputs plus the known-side call's residual-edge
+// outputs. Residual edges that would merely repeat a known call input or a known call output are
+// [forwarded](ryft_core::partial::PartitionedProgram::forward_residuals), so the residual call consumes that input or
+// output directly and the known-side call does not return the same value twice. For a pure callee (i.e., one without
+// effects, references, captures, or nominal type identities), both kinds of split are retained by the region transform
+// cache of the callee and bound as shared regions (refer to `split_jit_call`), as JAX caches its call partial
+// evaluation per callee, knownness, and policy, so repeated and nested calls of one callee reuse one split instead of
+// partitioning and copying the callee at every call site. A callee with references or captures keeps its boundary,
+// and a callee with nominal type identities is split per call when its inputs are mixed. Effectful mixed calls also
+// share their splits, keyed by the driver's repeated-residual mode because that mode determines effect placement.
+// Effectful and identity-bearing all-known calls remain whole on residual demand.
+impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation<ArrayIrType>
+where
+    V: PartialEq
+        + CoreValue<Type = ArrayIrType>
+        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
+        + CaptureConstant
+        + Concretizable<bool>,
+    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>>,
+{
+    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
+        let all_known = inputs.iter().all(PartialEvaluationValue::is_known);
+        let callee = driver.region(0)?;
+        if all_known || inputs.iter().all(PartialEvaluationValue::is_unknown) {
+            let outputs = fold_or_residualize_jit_call(self, context, driver, inputs)?;
+            if all_known && context.residual_policy().is_some() && !keeps_jit_call_boundary(callee, inputs) {
+                return Ok(forward_jit_call_inputs(callee, inputs, outputs));
+            }
+            return Ok(outputs);
+        }
+        // Retain mixed splits without references, captures, or nominal identities. Unlike all-known replay,
+        // partitioning a mixed effectful call preserves its effects and shares only the structural split.
+        if can_cache_jit_call_split(callee, inputs) {
+            let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
+            let partition =
+                |callee: RegionRef<'_, V, Operation<V>>| driver.partition_program(context, callee, &input_known);
+            let kind = JitCallSplitKind::Knownness(input_known.clone());
+            return split_jit_call(self, context, driver, inputs, kind, &partition);
+        }
+
+        // Split the callee of any other mixed call per call through the shared online boundary machinery, bind the
+        // known side into the enclosing known-side context wrapped in a fresh `jit_call` over the original known call
+        // inputs, emit the residual side as the residual `jit_call`, and reassemble the original output order. These
+        // splits are not retained because the identity-bearing boundary needs call-local type identities.
+        //
+        // A reference operand, a reference output, or a reference access anywhere in the callee closure keeps the call
+        // whole. Splitting would spread the accesses to one root across two compiled calls whose known side runs
+        // first, and a known reference-typed feeder of the residual side would then mean that both sides access the
+        // same root, the same reordering hazard that keeps a `scan` body whole. The default rule preserves effect order
+        // by placing the whole call on one side instead. An allocation that nothing accesses is dead intrinsic state
+        // that neither side retains, so it does not pin the boundary, but an allocation that escapes through a
+        // reference output is live state whose later accesses are unknown to the callee, so it does.
+        let accesses_references = inputs.iter().any(|input| input.r#type().is_reference())
+            || callee.output_types().iter().any(Type::is_reference)
+            || callee
+                .instructions_in_closure()
+                .any(|(_, instruction)| instruction.operation().effects().has_accesses());
+        if accesses_references {
+            return fold_or_residualize_jit_call(self, context, driver, inputs);
+        }
+        // Partitioning does not remap the absolute indices of capture constants retained in attached regions, so a
+        // split boundary would leave them naming a compacted or absent capture prefix, which fails lowering at best and
+        // silently aliases an unrelated leading operand at worst. Preserve the original call boundary for any callee
+        // whose closure still holds a capture constant.
+        if callee.contains_atom_in_closure(|atom| {
+            atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
+        }) {
+            return fold_or_residualize_jit_call(self, context, driver, inputs);
+        }
+        let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
+        let partition = driver.partition_program(context, callee, input_known.as_slice())?;
+        // A trivial partition, whose known program contains no instructions, hoists no work because its known side
+        // can only forward known inputs as residual edges. Keep the original boundary and let the default materialize
+        // those knowns directly as residual feeders.
+        if partition.known_program().instructions().is_empty() {
+            return fold_or_residualize_jit_call(self, context, driver, inputs);
+        }
+        // Feed the residual call directly from the known call inputs and known call outputs that residual edges would
+        // merely repeat (JAX's `in_fwd` and `out_fwd`), so that the known-side call returns each value once.
+        let partition = partition.forward_residuals()?;
+        // Known inputs keep callee source order, so the known-side callee's leading inputs are exactly the known
+        // members of the original lifted-capture prefix that it still uses. The residual callee's inputs are call
+        // inputs, known call outputs, and residual edges, which never form a capture prefix. The guard above already
+        // preserved the boundary of any callee retaining attached region capture constants, so neither derived callee
+        // can hold one.
+        let known_capture_count =
+            partition.known_input_indices().iter().filter(|index| **index < self.capture_count()).count();
+        let known_call = JitCallOperation::new(known_capture_count).with_callee_type_signature(
+            &partition.known_program().input_types(),
+            &partition.known_program().output_types(),
+        )?;
+        let residual_call = JitCallOperation::new(0).with_callee_type_signature(
+            &partition.residual_program().input_types(),
+            &partition.residual_program().output_types(),
+        )?;
+        context.inline_partitioned_program(
+            partition,
+            Some(callee),
+            inputs,
+            |known_program| (Operation::JitCall(known_call), vec![known_program]),
+            |residual_program| (Operation::JitCall(residual_call), vec![residual_program]),
+        )
+    }
+
+    fn split_on_residual_demand<D: PartialEvaluationDriver<C>>(
+        &self,
+        context: &PartialEvaluationContext<C>,
+        driver: &D,
+        inputs: &[PartialEvaluationValue<C::Value>],
+        demanded_outputs: &[bool],
+    ) -> Result<Option<ResidualDemandSplit<C::Value>>, ProgramError>
+    where
+        C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
+    {
+        let callee = driver.region(0)?;
+        if !inputs.iter().all(PartialEvaluationValue::is_known)
+            || context.residual_policy().is_none()
+            || keeps_jit_call_boundary(callee, inputs)
+        {
+            return Ok(None);
+        }
+        let partition =
+            |callee: RegionRef<'_, V, Operation<V>>| context.partition_residual_demand(callee, demanded_outputs);
+        let kind = JitCallSplitKind::ResidualDemand(demanded_outputs.to_vec());
+        let mut outputs = split_jit_call(self, context, driver, inputs, kind, &partition)?;
+        let replayed_outputs = outputs.split_off(callee.output_types().len());
+        Ok(Some(ResidualDemandSplit::new(outputs, replayed_outputs)?))
+    }
+}
+
+// Batching rule for [`JitCallOperation`]. The callee region is rebatched over the mapped input axes through
+// [`BatchingDriver::batch_program`], and the batched call is bound through `context.parent()` with the batched callee
+// attached again. An eager client-backed parent (e.g., [`Domain`](crate::Domain)) compiles and executes the batched
+// call immediately, a staging parent stages it into the enclosing program, and a differentiation parent dispatches it
+// through its own `jit_call` JVP rule, which is what serves `vmap` nested inside `gradient` and `linearize` closures.
+impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for JitCallOperation<ArrayIrType>
+where
+    C: Context<Type = ArrayIrType>,
+    C::Operation: From<Self>,
+{
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
+        driver: &D,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
+        let axes = inputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
+        // Only an all-replicated call at an anonymous level can bind its original callee unchanged. A named level must
+        // rebatch the callee even then, because the callee may read that level by name (e.g., through `axis_index`),
+        // and binding it unchanged would let that read escape the level that binds it.
+        if axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
+            return Ok(context
+                .parent()
+                .bind(
+                    self.clone(),
+                    vec![driver.region(0)?.to_program()],
+                    &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .map(ArrayIrBatch::replicated)
+                .collect::<Vec<_>>());
+        }
+        // The canonical array IR transform threads one leading dimension through the callee as its first input and
+        // first output. Treat the input as an additional explicit capture, so that the original capture order remains,
+        // and drop the bookkeeping output from the callee itself rather than after the call. The output only forwards
+        // the extent input, and an eager parent compiles the call as a standalone program, whose results must be
+        // arrays.
+        let (callee, axes) = driver
+            .batch_program(context, driver.region(0)?, &axes, ProgramBatchingOutputAxesPolicy::Natural)?
+            .into_parts();
+        let kept_outputs = (1..callee.output_count()).collect::<Vec<_>>();
+        let callee = callee.with_outputs(&kept_outputs)?;
+        let mut values = vec![context.axis_extent().clone()];
+        values.extend(inputs.iter().map(|input| input.value().clone()));
+        let operation = Self::new(self.capture_count() + 1).with_callee_region(callee.entry_region_ref())?;
+        let outputs = context.parent().bind(operation, vec![callee], &values)?;
+        check_count!("output", outputs, axes.len(), ProgramError);
+        Ok(outputs
+            .into_iter()
+            .zip(axes)
+            .map(|(value, axis)| ArrayIrBatch::new(value, axis))
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+impl<C> BatchableOperation<C, ArrayBatchingPolicy> for JitCallOperation<ArrayType>
+where
+    C: Context<Type = ArrayType>,
+    C::Operation: From<JitCallOperation<ArrayType>>,
+{
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
+        driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
+        let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
+        // Rebatch the callee when inputs are mapped or when it can address the batching level by name. Only an
+        // all-replicated call at an anonymous level can bind its original callee unchanged.
+        //
+        // Unlike the forward mode and transpose rules below, this rebatching is deliberately not served from the
+        // callee region's retained transform cache. The batched program depends on live `BatchingContext` state (i.e.,
+        // the batch extent, the axis name, and the surrounding nesting), so caching it against the callee region and
+        // its input axes alone would risk exactly the unsound key reuse that the cache is designed to avoid. Caching it
+        // needs a complete key and a measured benefit, which `.tasks/plan_compilation_transform_composition.md` gates
+        // (refer to its gate G8), through a batching policy hook returning `Option<key>` where `None` keeps a policy
+        // uncached, so that soundness stays opt-in per policy.
+        let batch_callee = ArrayBatch::common_batch_size(inputs)?.is_some() || context.axis_name().is_some();
+        let (batched_callee, output_axes) = if batch_callee {
+            let input_batch_axes = inputs
+                .iter()
+                .map(|input| BatchAxis::from_optional_position(input.batch_axis_position()))
+                .collect::<Vec<_>>();
+            let (batched_callee, output_axes) = driver
+                .batch_program(
+                    context,
+                    driver.region(0)?,
+                    input_batch_axes.as_slice(),
+                    ProgramBatchingOutputAxesPolicy::Natural,
+                )?
+                .into_parts();
+            // The core program batching pass returns canonical nonnegative physical positions.
+            let output_axes = output_axes
+                .iter()
+                .map(|axis| axis.axis().map(|axis| usize::try_from(axis.value()).unwrap()))
+                .collect::<Vec<_>>();
+            (batched_callee.into_simplified()?, output_axes)
+        } else {
+            let callee = driver.region(0)?;
+            let output_axes = vec![None; callee.output_types().len()];
+            (callee.to_program(), output_axes)
+        };
+        let operation = Self::new(self.capture_count()).with_callee_region(batched_callee.entry_region_ref())?;
+        let outputs = context.parent().bind(
+            operation,
+            AttachedRegions::Callees(&[Arc::new(batched_callee)]),
+            &physical_inputs,
+        )?;
+        Ok(outputs
+            .into_iter()
+            .zip(output_axes)
+            .map(|(output, axis)| ArrayBatch::new(output, BatchAxis::from_optional_position(axis)))
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+// Capture-free forward mode rule (i.e., JVP rule) for [`JitCallOperation`]. When the primal and tangent contexts are
+// shared (e.g., for `jvp` and for the fused program that a `rematerialize` rule partitions), the rule binds one fused
+// `jit_call` over the callee's forward mode program, projected onto the primal outputs and the live output tangents,
+// as JAX's `_pjit_jvp` does. An enclosing partial evaluation then splits that call with its own residual policy.
+// Otherwise, it binds a primal `jit_call` and a tangent `jit_call` as ordinary XLA [`Operation`] values through the
+// active context. A staging context stages both calls over its shared builder, while an eager context (e.g., a
+// client-backed [`Domain`](crate::Domain)) compiles and executes them immediately.
+//
+// Both forms realize the identity `jvp(jit(f)) = jit(jvp f)`. Rather than capturing the primal inputs as residual
+// factors and staging a linear `jit_call`, the separate form keeps the compilation boundary and threads every residual
+// as a plain primal operand edge between two `jit_call`s, so no symbolic capture is ever introduced. The enclosing
+// partial evaluation split then discovers the residual operand edges structurally, exactly as it does for the
+// condition and rematerialize rules.
+//
+// For separate contexts, the rule linearizes the callee program capture-free through
+// [`Program::linearize`](ryft_core::Program::linearize) under the operands' activity mask (an operand with a live
+// tangent is active, while the capture prefix, an operand with a structurally zero tangent, and a plumbing reference
+// operand that receives no tangent reference are not, as under JAX's `which_nz`), giving a primal sub-program
+// `inputs -> [outputs..., residuals...]` and a tangent sub-program
+// `[active_input_tangents..., residuals...] -> [output_tangents...]` together with the residual count. Tangents for
+// zero differential spaces are omitted from both compact boundaries, and the tangent sub-program is projected onto the
+// output tangents that depend on an active input tangent (refer to
+// [`Program::output_dependence`](ryft_core::Program::output_dependence) and
+// [`Program::with_outputs`](ryft_core::Program::with_outputs)), since every other output tangent is a structural zero
+// (JAX's `which_nz_out`). When no output tangent is live and the projected tangent sub-program has no observable
+// effects, the rule binds only the source call and pairs every output with a structurally zero tangent. Otherwise, it:
+//
+//   1. Wraps the primal sub-program in a fresh `jit_call` and stages it over the operand primals, recovering the
+//      primal outputs followed by the residual values (program variables produced by the staged primal call).
+//   2. Wraps the projected tangent sub-program in a fresh `jit_call` and stages it over the active operand tangents
+//      followed by those residual values, recovering the live output tangents.
+//   3. Pairs each primal output tracer with its live tangent output tracer, or with a structural zero for an output
+//      without a live tangent, into a [`DifferentiationDual`].
+//
+// The callee program is materialized from the instruction's callee region in the context's constant universe `V`
+// (concretely [`Constant`] for staged XLA programs), so the split halves ride the fresh primal and tangent calls
+// as shared callee regions. Preserving both `jit_call` boundaries keeps the callee body out of the caller's program,
+// so forward mode over a `jit_call` operation stays compiled rather than inlined.
+//
+// # Parameters
+//
+//   - `context`: Active evaluation or staging context used to bind the differentiated calls.
+//   - `driver`: Call-scoped access to the attached callee region.
+//   - `inputs`: Primal and tangent values for the call operands.
+impl<C, V> DifferentiableOperation<C> for JitCallOperation<ArrayIrType>
+where
+    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>> + Zero<C::Value>,
+    V: PartialEq
+        + CoreValue<Type = ArrayIrType>
+        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
+        + CaptureConstant
+        + Concretizable<bool>,
+{
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let callee = driver.region(0)?;
+        let input_types = callee.input_types();
+        let output_types = callee.output_types();
+        let output_count = output_types.len();
+        check_count!("input", inputs, input_types.len(), ProgramError);
+
+        // Linearize the callee through the instruction-scoped driver under the call's activity mask. The callee's
+        // leading lifted-capture inputs are inactive, numeric and reference alike, because a capture is
+        // nondifferentiated plumbing that receives no tangent input. The remaining inputs take the operand duals'
+        // activity. An operand with a live tangent is active, while an operand with a structurally zero tangent is
+        // inactive like a missing one (i.e., JAX's `which_nz`), so it gets no tangent callee slot instead of being
+        // materialized as a zero operand. A plumbing reference operand, whose structurally zero tangent is a missing
+        // tangent reference, is therefore inactive too. The primal sub-program produces `[outputs..., residuals...]`
+        // and the tangent sub-program consumes `[active(input_tangents)..., residuals...]`. The residual count is the
+        // number of trailing outputs of the primal sub-program beyond the original callee outputs.
+        let capture_count = self.capture_count();
+        let activity = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| index >= capture_count && input.is_tangent_active() && !input.tangent().is_zero())
+            .collect::<Vec<_>>();
+        let input_indices = activity
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &active)| active.then_some(index))
+            .collect::<Vec<_>>();
+        // A shared primal/tangent destination binds one fused call over the callee's forward mode program, projected
+        // onto its primal outputs and live output tangents (JAX's `_pjit_jvp`). An enclosing partial evaluation then
+        // splits that call with its own residual policy, instead of reusing a linearization boundary chosen here.
+        if std::ptr::eq(context.primal(), context.tangent()) {
+            self.validate_capture_prefix(input_types.len())?;
+            let activity = TangentActivity::new(driver, callee, &activity)?;
+            let output_activity = activity.output_tangent_liveness();
+            let live_tangent_slots = activity.live_tangent_slots(output_activity);
+            let program = activity.jvp_program();
+            let mut operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            if live_tangent_slots.is_empty() && !program.effects().is_retained_when_unused() {
+                let callee = shared_jit_call_callee(callee)?;
+                return context
+                    .primal()
+                    .bind(Operation::JitCall(self.clone()), AttachedRegions::Callees(&[callee]), &operands)?
+                    .into_iter()
+                    .map(DifferentiationDual::new_with_zero_tangent)
+                    .collect();
+            }
+            let outputs = (0..output_count).chain(live_tangent_slots.iter().map(|&slot| output_count + slot));
+            let program = if outputs.clone().eq(0..program.output_count()) {
+                program.clone()
+            } else {
+                Arc::new(program.as_ref().clone().with_outputs(&outputs.collect::<Vec<_>>())?)
+            };
+            operands.extend(
+                activity.input_indices().iter().map(|&index| inputs[index].tangent().as_value().unwrap().clone()),
+            );
+
+            // The primal operands come first, so the lifted-capture prefix of the source call carries over unchanged.
+            let operation = Operation::JitCall(
+                JitCallOperation::new(capture_count).with_callee_region(program.entry_region_ref())?,
+            );
+            let mut outputs = context.primal().bind(operation, AttachedRegions::Callees(&[program]), &operands)?;
+            check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
+            let mut tangents = outputs.split_off(output_count).into_iter();
+            return Ok(outputs
+                .into_iter()
+                .zip(output_activity)
+                .map(|(primal, &live)| match live {
+                    true => DifferentiationDual::new(primal, tangents.next().unwrap()),
+                    false => DifferentiationDual::new_with_zero_tangent(primal),
+                })
+                .collect::<Result<Vec<_>, _>>()?);
+        }
+        let linearization = driver.linearize_program(callee, &input_indices, Some(&[]))?;
+
+        // An output tangent that depends on no active input tangent (e.g., the tangent of a constant output or of an
+        // output computed only from inactive inputs) is a structural zero (JAX's `which_nz_out`), so the tangent callee
+        // is projected onto the live output tangents, and every other output is paired with a structurally zero
+        // tangent. When no output tangent is live and the tangent callee has no observable effects, no tangent call is
+        // bound, and the source callee is bound as the primal call, since nothing would consume its residuals.
+        //
+        // The tangent program's leading inputs are compact active tangents, not the original primal input indices,
+        // and its trailing residual inputs are held independent during dependence analysis. Linearization has
+        // validated both boundaries, so subtracting the residual count cannot underflow.
+        let tangent_program = linearization.tangent();
+        let tangent_input_count = tangent_program.input_count() - linearization.residual_count();
+        let tangent_slots = linearization.tangent_output_slots().to_vec();
+        let mut dependence =
+            tangent_program.output_dependence(&(0..tangent_input_count).collect::<Vec<_>>())?.into_iter();
+
+        // Map compact tangent output dependence back to the original callee's output order. Outputs without tangent
+        // slots consume no dependence entry, and trailing primal residual outputs are outside this boundary entirely.
+        let output_activity = tangent_slots[..output_count]
+            .iter()
+            .map(|&slot| slot && dependence.next().unwrap())
+            .collect::<Vec<_>>();
+        let live_tangent_slots = (0..output_count)
+            .filter(|&index| tangent_slots[index])
+            .enumerate()
+            .filter_map(|(slot, index)| output_activity[index].then_some(slot))
+            .collect::<Vec<_>>();
+
+        // Output projection retains the complete tangent/residual input boundary and observable effects. Keep the
+        // shared callee handle when every slot is live, preserving the `Arc` identity used for callee interning.
+        let tangent_program = if live_tangent_slots.len() == tangent_program.output_count() {
+            tangent_program.clone()
+        } else {
+            Arc::new(tangent_program.as_ref().clone().with_outputs(&live_tangent_slots)?)
+        };
+        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        if !output_activity.contains(&true) && !tangent_program.effects().is_retained_when_unused() {
+            let callee = shared_jit_call_callee(callee)?;
+            return context
+                .primal()
+                .bind(Operation::JitCall(self.clone()), AttachedRegions::Callees(&[callee]), &primal_operands)?
+                .into_iter()
+                .map(DifferentiationDual::new_with_zero_tangent)
+                .collect();
+        }
+        let (primal_program, ..) = linearization.into_parts();
+
+        // Wrap the primal sub-program in a fresh `jit_call` and bind it over the operand primals, recovering the
+        // primal outputs followed by the residual values. The shared sub-program handles are attached directly, so
+        // repeated binds of one derived callee intern by `Arc` identity instead of copying it again.
+        // The primal sub-program preserves the callee's inputs in order, so the original lifted-capture prefix
+        // survives verbatim and its length carries over.
+        let primal_call = Operation::JitCall(
+            JitCallOperation::new(self.capture_count()).with_callee_region(primal_program.entry_region_ref())?,
+        );
+        let mut primal_call_outputs =
+            context.primal().bind(primal_call, AttachedRegions::Callees(&[primal_program]), &primal_operands)?;
+        if primal_call_outputs.len() < output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "`jit_call` primal program produced {} outputs which is fewer than its {output_count} primal \
+                 output(s)",
+                primal_call_outputs.len(),
+            ))
+            .into());
+        }
+        let residuals = primal_call_outputs.split_off(output_count);
+        let primal_outputs = primal_call_outputs;
+
+        // Wrap the tangent sub-program in a fresh `jit_call` and bind it over only the active operand tangents followed
+        // by the residual values. Structurally zero tangents are inactive, so every active operand tangent is a live
+        // value and materializing it only unwraps it, while inactive operands (the capture prefix, structurally zero
+        // tangents, zero-space operands, and plumbing references) have no compact callee boundary slot.
+        let mut tangent_operands = inputs
+            .iter()
+            .zip(&activity)
+            .filter(|(_, active)| **active)
+            .map(|(input, _)| input.tangent().clone().materialize(context.tangent()))
+            .collect::<Result<Vec<_>, _>>()?;
+        tangent_operands.extend(
+            residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?,
+        );
+        // The tangent callee's inputs are live input tangents followed by residuals and never a lifted-capture prefix.
+        // Attached region capture constants cannot appear in it because fresh-root region traces reject bodies that
+        // register captures (`ProgramError::DiscardedCaptures`), and a stale reference that slipped in anyway would
+        // fail lowering loudly against the tangent callee's empty capture prefix instead of aliasing an unrelated
+        // value.
+        let tangent_call =
+            Operation::JitCall(JitCallOperation::new(0).with_callee_region(tangent_program.entry_region_ref())?);
+        let tangent_outputs =
+            context
+                .tangent()
+                .bind(tangent_call, AttachedRegions::Callees(&[tangent_program]), &tangent_operands)?;
+        let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
+        check_count!("output", tangent_outputs, tangent_output_count, ProgramError);
+
+        let mut tangent_outputs = tangent_outputs.into_iter();
+        Ok(primal_outputs
+            .into_iter()
+            .zip(output_activity)
+            .map(|(primal, active)| {
+                if !active {
+                    DifferentiationDual::new_with_zero_tangent(primal)
+                } else {
+                    DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+/// Transposes a tangent [`JitCallOperation`] while retaining its compilation boundary.
+///
+/// The [`TranspositionDriver`] transposes the attached callee under the operands' linearity and cotangent-destination
+/// masks and the structural zeros of its output cotangents. Known operands supply residual or captured values and may
+/// appear anywhere in the input boundary. The transposed call consumes the ordinary output cotangents that are not
+/// structural zeros, live cotangent references, and known operands, in that order. A structural zero output cotangent
+/// seeds nothing, so it has no input in the transposed call and is not materialized at the call boundary, although a
+/// dense backward rule inside the callee may still materialize the zero that it consumes. Reference outputs forward
+/// input roots and therefore have no separate output cotangent slot.
+///
+/// Returned cotangents follow the original input order. Linear value inputs receive call results, reference inputs
+/// accumulate into their supplied cotangent destinations, and known or ignored inputs receive structural zeros.
+///
+/// # Parameters
+///
+///   - `operation`: Primal tangent `jit_call` staged into the tangent program.
+///   - `context`: Active transpose tracing context the pullback is staged into.
+///   - `driver`: Instruction-scoped access to the attached callee region and its recursive transposition machinery.
+///   - `inputs`: Per-operand [`PartialValue`] knowledge, mirroring the callee's inputs one to one. The
+///     [`Unknown`](PartialValue::Unknown) entries are the input tangents, and the [`Known`](PartialValue::Known)
+///     entries carry the residual and captured-constant-tangent tracers the pullback reads.
+///   - `outputs`: Symbolic cotangents for the tangent call's outputs, one per callee output. A
+///     [`Zero`](MaybeZero::Zero) entry has no input in the transposed call.
+///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
+///     [`TranspositionContext::cotangent_destinations`]). The callee is transposed with their destination kinds, so a
+///     live (`Reference`-kind) reference operand's cotangent reference is an operand of the transposed call, which
+///     accumulates into it in place and returns it by identity, while a dead (`Ignore`-kind) reference operand has no
+///     slot in the transposed callee at all.
+pub fn transpose_primal_jit_call<
+    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+    D: TranspositionDriver<V, Operation<V>>,
+>(
+    _operation: &JitCallOperation<ArrayIrType>,
+    context: &mut TracingContext<V, Operation<V>>,
+    driver: &D,
+    inputs: &[PartialValue<CoreTracer<TracingContext<V, Operation<V>>>>],
+    outputs: &[MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>],
+    cotangents: &CotangentDestinations<CoreTracer<TracingContext<V, Operation<V>>>>,
+) -> Result<Vec<MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>>, ProgramError> {
+    // A `jit_call` operation with no live output cotangents and no live reference operand is a zero linear map, so
+    // every operand cotangent is zero. A live reference operand keeps the call live, because its accumulated state
+    // cotangent flows through the transposed callee even when no ordinary output cotangent does. A callee with deferred
+    // work or observable rule effects also keeps it live.
+    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
+    if outputs.iter().all(MaybeZero::is_zero)
+        && !cotangents.has_reference_state_destinations()
+        && !driver.region(0)?.must_transpose()
+    {
+        return inputs
+            .iter()
+            .map(|input| input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from))
+            .collect();
+    }
+
+    // Each operand maps to one callee input, independently linear (an input tangent) or known (a residual value or a
+    // captured-constant tangent). The linear operands need not lead, because a captured compiled function threads its
+    // captured prefix as known leading operands. The dispatch guarantees a `Known` operand carries its pullback value,
+    // so each known tracer is read directly in callee-input order.
+    let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
+    let callee = driver.region(0)?;
+    check_count!("input", operand_linear, callee.input_types().len(), ProgramError);
+
+    // Transpose the callee with respect to its linear inputs and with its structural zero output cotangents flagged,
+    // through the region's retained transform cache so that a callee shared by several outer programs is transposed
+    // once per linearity and seed mask. A live reference-typed linear input is transposed with a `Reference`
+    // destination and a dead one with an `Ignore` destination, so the transposed callee maps
+    // `[live_non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
+    // `[linear_input_cotangents...]`, in callee-input order, where a live reference input's cotangent is its cotangent
+    // reference itself and a dead reference input has no cotangent slot. The flags follow the callee's complete output
+    // order, and flags of reference outputs are normalized away because those outputs never own a cotangent slot.
+    let (input_indices, destination_kinds): (Vec<_>, Vec<_>) = operand_linear
+        .iter()
+        .zip(cotangents.kinds())
+        .enumerate()
+        .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
+        .unzip();
+    let output_types = callee.output_types();
+    check_count!("output", outputs, output_types.len(), ProgramError);
+    let zero_output_cotangents = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
+    let transposed_callee = driver.transpose_program_with_zero_seeds(
+        callee,
+        &input_indices,
+        &[],
+        &zero_output_cotangents,
+        &destination_kinds,
+    )?;
+
+    // Stage a fresh `jit_call` over the transposed callee on `[live_outputs..., cotangent_references...,
+    // known_input_values...]`. Its outputs are the linear-input cotangents. A reference output forwards a callee input
+    // root whose state cotangent lives in that operand's cotangent reference, so it owns no cotangent slot.
+    let mut operands = Vec::with_capacity(output_types.len() + inputs.len());
+    operands.extend(
+        outputs
+            .iter()
+            .zip(output_types.iter())
+            .filter(|(_, output_type)| !output_type.is_reference())
+            .filter_map(|(cotangent, _)| cotangent.as_value())
+            .cloned(),
+    );
+    operands.extend(cotangents.references().iter().cloned());
+    operands.extend(inputs.iter().filter_map(PartialValue::as_known).cloned());
+    // The transposed callee's inputs are live output cotangents, cotangent references, and known input values, and
+    // never a lifted-capture prefix. Attached region capture constants cannot appear in it because region bodies are
+    // traced through fresh-root contexts.
+    let transposed_call = Operation::JitCall(
+        JitCallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?,
+    );
+    let input_cotangents = context.bind(
+        transposed_call,
+        AttachedRegions::Callees(&[transposed_callee.program().clone()]),
+        operands.as_slice(),
+    )?;
+    let cotangent_types = input_indices
+        .iter()
+        .map(|&index| inputs[index].r#type().cotangent().map_err(ProgramError::from))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut input_cotangents = transposed_callee.assemble_cotangents(&cotangent_types, input_cotangents)?.into_iter();
+
+    // Reassemble selected cotangents from the call's compact output boundary. Known and ignored inputs carry
+    // structural zeros. Reference-state outputs only thread the caller-owned destination, so they do not contribute
+    // a value cotangent to the enclosing context.
+    inputs
+        .iter()
+        .map(|input| {
+            let cotangent = if input.is_unknown() { input_cotangents.next().unwrap() } else { None };
+            if !input.r#type().is_reference() {
+                if let Some(cotangent) = cotangent {
+                    return Ok(cotangent);
+                }
+            }
+            input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
+        })
+        .collect()
+}
+
+// Transpose rule for a primal tangent [`JitCallOperation`], forwarding to [`transpose_primal_jit_call`] with the
+// cotangent references of its linear reference-typed operands resolved (and allocated on first use) through the
+// enclosing [`TranspositionContext`]. The callee transposition happens on the concretely [`Constant`]-keyed
+// [`FlatProgram`], so the recursion is resolved once at definition time and instantiating this implementation
+// introduces no recursive [`TransposableOperation`] obligation on [`Operation`].
+impl<V> TransposableOperation<V, Operation<V>> for JitCallOperation<ArrayIrType>
+where
+    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
+{
+    fn transpose<D: TranspositionDriver<V, Operation<V>>>(
+        &self,
+        context: &mut TranspositionContext<V, Operation<V>>,
+        driver: &D,
+        inputs: &[PartialValue<CoreTracer<TracingContext<V, Operation<V>>>>],
+        outputs: &[MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>],
+        accumulators: &[ryft_core::CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("output", outputs, driver.region(0)?.output_types().len(), ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+        let contributions =
+            (|| -> Result<Vec<MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>>, DifferentiationError> {
+                let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
+                transpose_primal_jit_call(self, context, driver, inputs, outputs, &cotangents)
+                    .map_err(DifferentiationError::from)
+            })()?;
+        check_count!("input", contributions, accumulators.len(), ProgramError);
+        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+            accumulator.accumulate(context, contribution)?;
+        }
+        Ok(())
+    }
+}
+
+// Eager interpretation of a staged `jit_call` operation over concrete [`Array`](crate::Array)s. Top-level flat programs
+// containing `jit_call` instructions (e.g., the pullbacks produced by eager `vjp` and `grad`) replay through
+// [`Program::interpret_in_context`](ryft_core::Program::interpret_in_context), whose bind channel hands the callee
+// region to [`Context::bind`] so the call is compiled whole through this domain's dispatch cache and executed on its
+// PJRT client. This mirrors JAX dispatching a `jit`-compiled function called from eager code straight to the compiled
+// executable. This rule covers the remaining path, a `jit_call` nested inside another region being interpreted, by
+// entering the active interpreter again on the callee region, which dispatches the callee's operations one by one
+// through this same domain.
+impl<'c> InterpretableOperation<Domain<'c>> for JitCallOperation<ArrayIrType> {
+    fn interpret<D: InterpretationDriver<Domain<'c>>>(
+        &self,
+        context: &Domain<'c>,
+        driver: &D,
+        inputs: &[Value<'c>],
+    ) -> Result<Vec<Value<'c>>, ProgramError> {
+        let callee = driver.region(0)?;
+        let renaming = self.output_renaming(&callee.input_types(), &callee.output_types())?;
+        driver
+            .interpret_region(context, 0, inputs.to_vec())?
+            .iter()
+            .map(|value| value.rename_type_identities(&renaming).map_err(Into::into))
+            .collect()
+    }
+}
+
+impl LowerableOperation for JitCallOperation<ArrayIrType> {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (input_types, output_types);
+        self.validate_region_count(lowerer.regions().len())?;
+        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
+            lowerer.split_effect_tokens();
+        let [callee] = regions else { unreachable!("validated jit_call region count") };
+        lower_jit_call(
+            callee,
+            self.capture_count(),
+            input_values,
+            captured_values,
+            &mut block,
+            context,
+            location,
+            nested_functions,
+            collective_state,
+            effect_tokens,
+        )
+    }
+}
+
+/// Semantic identity and boundary of the named composite calls that one shared function implements.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct NamedFunctionKey {
+    /// Semantic identity of the calls.
+    key: CompositeKey,
+
+    /// Input types of the calls.
+    input_types: Vec<ArrayIrType>,
+
+    /// Output types of the calls.
+    output_types: Vec<ArrayIrType>,
+}
+
+/// Named composite calls found by [`count_jit_calls`], grouped by the interned body region, the key, and the boundary
+/// that they share.
+#[derive(Default)]
+struct NamedRegionCalls {
+    /// Positions in [`Self::calls`] of the groups of each body region, one per key and boundary that call it.
+    index: HashMap<RegionId, Vec<usize>>,
+
+    /// Body regions in first-occurrence order.
+    calls: Vec<NamedRegionCall>,
+}
+
+/// Named composite calls that share one interned body region, one key, and one boundary.
+struct NamedRegionCall {
+    /// Body region of the calls.
+    region: RegionId,
+
+    /// Semantic identity of the calls.
+    composite: CompositeKey,
+
+    /// Input types of the calls.
+    input_types: Vec<ArrayIrType>,
+
+    /// Output types of the calls.
+    output_types: Vec<ArrayIrType>,
+
+    /// Number of calls.
+    count: usize,
+}
+
+/// Formal callee input types and caller result types that bind [`TypeIdentity`](ryft_core::TypeIdentity)s across one
+/// sealed call boundary. The bindings are encoded in these two type signatures, and the stored metadata contains no
+/// runtime values.
+///
+/// An output identity present in the callee inputs is forwarded from the corresponding caller input. An identity
+/// defined inside the callee receives one fresh caller identity shared by every corresponding result occurrence.
+/// Separate calls receive independent local identities, because their results can have different extents even when
+/// their input shapes agree. [`Self::fresh`] allocates those identities once during call construction, before
+/// interpretation, so repeated type inference returns the same identities. Calls whose results only forward input
+/// identities retain no instance of this metadata.
+///
+/// The formal input types allow [`Self::instantiated`] to specialize forwarded dimensions to actual inputs without
+/// replacing the call's local result identities. When a transformation already owns the caller result names,
+/// [`Self::with_outputs`] preserves them and validates their correspondence to the callee's output types.
+/// [`Self::renaming`] recovers that correspondence from the current callee output types to the stored caller types.
+///
+/// For example, suppose a callee accepts a dimension with identity `n` and returns three dimensions with identities
+/// `n`, `m`, and `m`, where `m` is defined inside the callee. The first result forwards `n`, and the other two share
+/// one fresh caller identity. Another call receives a different identity for `m`, even though its diagnostic name can
+/// remain `m`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CallTypeBindings<T: Type> {
+    /// Formal input namespace used when instantiating forwarded result identities.
+    inputs: Arc<[T]>,
+
+    /// Caller result types, with callee-local identities already freshly bound.
+    outputs: Arc<[T]>,
+}
+
+impl<T: Type> CallTypeBindings<T> {
+    /// Freshens callee-local result identities, returning no metadata when all result identities are forwarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error when a result type cannot preserve its structure under identity renaming.
+    fn fresh(inputs: &[T], outputs: &[T]) -> Result<Option<Self>, TypeError> {
+        if !outputs
+            .iter()
+            .flat_map(Type::identities)
+            .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+        {
+            return Ok(None);
+        }
+        let mut unavailable = inputs
+            .iter()
+            .chain(outputs)
+            .flat_map(Type::identities)
+            .map(|(_, identity)| identity.clone())
+            .collect::<Vec<_>>();
+        let mut renaming = TypeIdentityRenaming::new();
+        for (_, identity) in outputs.iter().flat_map(Type::identities) {
+            if renaming.target(identity).is_none()
+                && !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity)
+            {
+                unavailable.push(renaming.insert_fresh(identity.clone(), &unavailable)?);
+            }
+        }
+        let outputs =
+            outputs.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(Self { inputs: inputs.into(), outputs: outputs.into() }))
+    }
+
+    /// Records caller result types whose local identities have already been chosen, validating their exact
+    /// correspondence to the callee's output types. Unlike [`Self::fresh`], this function allocates no identities.
+    /// Forwarded identities must stay unchanged, and callee-local identities must have fresh caller counterparts.
+    /// Returns no metadata when both output signatures agree and only forward input identities.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: Callee input types. Both output signatures use this input scope for forwarded identities.
+    ///   - `callee_outputs`: Output types of the attached callee, using its local result identities.
+    ///   - `outputs`: Result types retained by the caller, using the existing caller-owned result identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error for changed result structure, captured local names, or renamed forwarded identities.
+    fn with_outputs(inputs: &[T], callee_outputs: &[T], outputs: Vec<T>) -> Result<Option<Self>, TypeError> {
+        if callee_outputs == outputs {
+            if callee_outputs
+                .iter()
+                .flat_map(Type::identities)
+                .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
+            {
+                return Err(TypeError::invalid("call local result declarations must use fresh identities"));
+            }
+            return Ok(None);
+        }
+        let signature = Self { inputs: inputs.into(), outputs: outputs.into() };
+        signature.renaming(inputs, callee_outputs)?;
+        Ok(Some(signature))
+    }
+
+    /// Returns the formal result types retained by the caller.
+    fn outputs(&self) -> &[T] {
+        &self.outputs
+    }
+
+    /// Returns the caller-owned identities defined by this call, once each in result occurrence order.
+    fn definitions(&self) -> Vec<T::Identity> {
+        let mut definitions = Vec::new();
+        for (_, identity) in self.outputs.iter().flat_map(Type::identities) {
+            if !self.inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity)
+                && !definitions.contains(identity)
+            {
+                definitions.push(identity.clone());
+            }
+        }
+        definitions
+    }
+
+    /// Returns caller result types with forwarded names and ordinary shape refinements instantiated at `inputs`.
+    /// Local result identities remain symbolic even when the input facts determine an exact extent.
+    ///
+    /// # Errors
+    ///
+    /// Returns the input-scope correspondence or type-renaming error when the call signature is incompatible.
+    fn instantiated(&self, inputs: &[T]) -> Result<Vec<T>, TypeError> {
+        if self.inputs.as_ref() == inputs {
+            return Ok(self.outputs.to_vec());
+        }
+        let renaming = T::derive_identity_renaming(self.inputs.as_ref(), inputs)?;
+        let refinements = T::Refinements::from_local_declarations(self.inputs.iter(), inputs)?;
+        let local = self.definitions();
+        self.outputs
+            .iter()
+            .map(|r#type| refinements.refine_declared(r#type, &local)?.rename_identities(&renaming))
+            .collect()
+    }
+
+    /// Returns the validated renaming from the current callee output types to this call's instantiated result types.
+    /// The source types are supplied in `callee_outputs`, and the target types come from [`Self::instantiated`]. For
+    /// the type-level example, this maps the callee's local `m` to the caller's fresh identity while preserving
+    /// forwarded `n`. Caller result types alone cannot recover the callee's original local identities.
+    ///
+    /// # Parameters
+    ///
+    ///   - `inputs`: Input types of the current callee instantiation, used to instantiate forwarded result identities.
+    ///   - `callee_outputs`: Output types of that callee instantiation, before renaming its local identities into the
+    ///     caller's scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error when local names are not fresh, forwarded names change, or result structure differs.
+    fn renaming(&self, inputs: &[T], callee_outputs: &[T]) -> Result<TypeIdentityRenaming<T::Identity>, TypeError> {
+        let outputs = self.instantiated(inputs)?;
+        let renaming = T::derive_identity_renaming(callee_outputs, &outputs)?;
+        for (_, identity) in callee_outputs.iter().flat_map(Type::identities) {
+            let target = renaming.target(identity).unwrap_or(identity);
+            let forwarded = inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity);
+            if forwarded && target != identity {
+                return Err(TypeError::invalid("call result declarations must preserve forwarded input identities"));
+            }
+            if !forwarded
+                && (target == identity
+                    || inputs
+                        .iter()
+                        .chain(callee_outputs)
+                        .flat_map(Type::identities)
+                        .any(|(_, original)| original == target))
+            {
+                return Err(TypeError::invalid("call local result declarations must use fresh identities"));
+            }
+        }
+        Ok(renaming)
+    }
+
+    /// Renames caller-owned definitions while retaining the callee's formal input namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an identity conflict or type-renaming error.
+    fn renamed(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
+        let mut owned = TypeIdentityRenaming::new();
+        for (source, target) in renaming.replacements() {
+            if !self.inputs.iter().flat_map(Type::identities).any(|(_, input)| input == source) {
+                owned.insert(source.clone(), target.clone())?;
+            }
+        }
+        let outputs =
+            self.outputs.iter().map(|r#type| r#type.rename_identities(&owned)).collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { inputs: self.inputs.clone(), outputs: outputs.into() })
+    }
+
+    /// Retains the indicated input and result positions after ordinary call-boundary pruning.
+    ///
+    /// # Errors
+    ///
+    /// Returns a type error when a positional mask has the wrong arity.
+    fn pruned(&self, inputs: &[bool], outputs: &[bool]) -> Result<Self, TypeError> {
+        if inputs.len() != self.inputs.len() || outputs.len() != self.outputs.len() {
+            return Err(TypeError::invalid("call result declaration pruning masks have incompatible arity"));
+        }
+        Ok(Self {
+            inputs: self
+                .inputs
+                .iter()
+                .zip(inputs)
+                .filter_map(|(r#type, kept)| kept.then_some(r#type.clone()))
+                .collect(),
+            outputs: self
+                .outputs
+                .iter()
+                .zip(outputs)
+                .filter_map(|(r#type, kept)| kept.then_some(r#type.clone()))
+                .collect(),
+        })
+    }
+}
+
+/// [`Region`](CoreRegion) [`Transform`] marker for the shared copy of a `jit_call` callee that
+/// [`shared_jit_call_callee`] retains for a callee region that is not interned as a shared region (e.g., the entry
+/// region of a shared callee program that a rule binds directly, such as the primal or tangent callee of a linearized
+/// call). Binding that copy instead of a fresh copy of the region lets every call of one callee share one region.
+struct JitCallCalleeTransform;
+
+impl<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>> Transform<CoreRegion<V, O>>
+    for JitCallCalleeTransform
+{
+    type Arguments = ();
+    type Artifact = TransformArtifact<V, O, ()>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = 1;
+}
+
+/// [`Region`](CoreRegion) [`Transform`] marker for the splits of a `jit_call` callee that [`split_jit_call`] binds.
+/// Such a split partitions the callee in fresh traces, where every input is a fresh known or unknown input, so it
+/// depends on no value of a live context and is a structural function of the callee and of its
+/// [`JitCallSplitArguments`]. Every call of one callee with the same arguments therefore shares one split, as JAX's
+/// call partial evaluation rules share one split per callee, knownness, and policy through their caches.
+struct JitCallSplitTransform;
+
+impl<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>> Transform<CoreRegion<V, O>>
+    for JitCallSplitTransform
+{
+    type Arguments = JitCallSplitArguments;
+    type Artifact = TransformArtifact<V, O, Arc<JitCallSplit>>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = 8;
+}
+
+/// Kind of a retained [`JitCallSplitTransform`] split.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum JitCallSplitKind {
+    /// Split of a call whose inputs are partially known, marked in input order (refer to
+    /// [`PartialEvaluationDriver::partition_program`]).
+    Knownness(Vec<bool>),
+
+    /// Split of an all-known call on residual demand for the outputs of the callee that the residual planner demands,
+    /// marked in output order (refer to [`PartialEvaluationContext::partition_residual_demand`]).
+    ResidualDemand(Vec<bool>),
+}
+
+/// Argument key for one retained [`JitCallSplitTransform`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct JitCallSplitArguments {
+    /// Kind of the split.
+    kind: JitCallSplitKind,
+
+    /// Residual policy that places the residuals of the split and of the splits nested within it, compared by
+    /// definition identity, or [`None`] when partial evaluation has no residual policy.
+    policy: Option<ResidualPolicyReference<ArrayIrType>>,
+
+    /// Type of the rounding with which the placement of the residuals of the split also rounds the values that the
+    /// known callee saves (refer to [`PartialEvaluationContext::residual_rounding_type`]), which stages rounding
+    /// operations in the known callee, or [`None`] when the placement keeps those values unrounded.
+    residual_rounding_type: Option<TypeId>,
+
+    /// Whether effectful operations with known inputs may fold into the known callee (refer to
+    /// [`PartialEvaluationContext::allow_effect_folding`]).
+    allow_effect_folding: bool,
+
+    /// Whether recursive partitioning analyzes repeated residual invocations, which changes effect placement (refer
+    /// to [`PartialEvaluationDriver::partitions_for_repeated_residual_calls`]). Pure and residual-demand splits use
+    /// `false` because their partitions do not depend on this mode.
+    repeated_residual: bool,
+}
+
+/// Boundary wiring of a retained [`JitCallSplitTransform`] artifact, whose programs are the known callee and the
+/// residual callee, in that order. The known callee returns the known outputs of the original callee followed by the
+/// residual edges that the residual callee reads from it, and the residual callee returns the remaining outputs (i.e.,
+/// the demanded outputs for a split on residual demand). Refer to [`PartitionedProgram`]
+/// for more information on this layout.
+#[derive(Clone, Debug, PartialEq)]
+struct JitCallSplit {
+    /// Index of the call input feeding each input of the known callee, in order.
+    known_input_indices: Vec<usize>,
+
+    /// Source of each input of the residual callee, which is a call input, an output of the known callee, or a
+    /// residual edge.
+    residual_inputs: Vec<ResidualInputSource>,
+
+    /// Source of each output of the call, in output order, which is a known output of the known callee or an output of
+    /// the residual callee.
+    outputs: Vec<PartialEvaluationOutput<usize>>,
+}
+
+/// Returns whether `program` may be deduplicated by structural identity.
+///
+/// A program is eligible only when the canonical rendering captures the full semantics needed to safely share a private
+/// function. Although immediate constant payloads are rendered, a [`CaptureReference`](ryft_core::CaptureReference)
+/// identifies a slot and type rather than the runtime value in the surrounding capture table, so programs with
+/// constants remain ineligible. `shard_map` also remains outside this deduplication path because its lowering owns a
+/// separate outlined boundary.
+fn supports_structural_deduplication<O: LowerableOperationFamily>(program: &FlatProgram<O>) -> bool {
+    program.regions().iter().all(|region| {
+        region.atoms().iter().all(|atom| !atom.is_constant())
+            && region
+                .instructions()
+                .iter()
+                .all(|instruction| instruction.operation().projected_payload::<ShardMapOperation>().is_none())
+    })
+}
+
+/// Returns whether a borrowed rooted region may be deduplicated by structural identity.
+fn supports_structural_deduplication_of_region<O: LowerableOperationFamily>(
+    region: RegionRef<'_, Constant, O>,
+) -> bool {
+    fn walk<O: LowerableOperationFamily>(region: RegionRef<'_, Constant, O>, visited: &mut HashSet<RegionId>) -> bool {
+        if !visited.insert(region.id()) {
+            return true;
+        }
+        region.atoms().iter().all(|atom| !atom.is_constant())
+            && region.instructions().iter().all(|instruction| {
+                instruction.operation().projected_payload::<ShardMapOperation>().is_none()
+                    && instruction
+                        .regions()
+                        .iter()
+                        .copied()
+                        .all(|nested| RegionRef::new(region.arena(), nested).is_ok_and(|nested| walk(nested, visited)))
+            })
+    }
+
+    walk(region, &mut HashSet::new())
+}
+
+/// Computes the deduplication key for a flat callee program, or [`None`] for programs that are not eligible for
+/// structural deduplication (refer to [`supports_structural_deduplication`]) and therefore always inline. The key is
+/// generic over the program's constant universe so that lookups from the value-generic lowering path type-check,
+/// although the map itself is only ever populated from the staged [`Constant`]-keyed pipeline.
+fn jit_call_program_key<O: LowerableOperationFamily>(program: &FlatProgram<O>) -> Option<JitCallProgramKey> {
+    supports_structural_deduplication(program).then(|| JitCallProgramKey {
+        rendered: program.to_string(),
+        input_types: program.input_types().into_owned(),
+        output_types: program.output_types().into_owned(),
+    })
+}
+
+/// Computes the deduplication key for a borrowed callee region, materializing only after borrowed eligibility checks.
+fn jit_call_region_key<O: LowerableOperationFamily>(region: RegionRef<'_, Constant, O>) -> Option<JitCallProgramKey> {
+    supports_structural_deduplication_of_region(region).then(|| {
+        let program = region.to_program();
+        JitCallProgramKey {
+            rendered: program.to_string(),
+            input_types: program.input_types().into_owned(),
+            output_types: program.output_types().into_owned(),
+        }
+    })
+}
+
+/// Counts `jit_call` callee occurrences in `program`, covering nested computations at every depth. Attached regions
+/// (i.e., control-flow bodies, composite programs, and callee bodies) all live in the program's one canonical region
+/// arena, so the walk descends region edges without materializing nested programs. `shard_map` body regions are
+/// intentionally skipped, because their `jit_call`s lower with shard-local types and always inline.
 ///
 /// The bodies of named composite calls count like callees (refer to
 /// [`NamedComposite`](ryft_core::NamedComposite)), unless a backend implementation replaces the call on
@@ -227,7 +1814,7 @@ impl<O: LowerableOperationFamily> JitCallFunctionMap<O> {
 ///
 /// `counts` accumulates the occurrence count and a representative materialized program per identity, `order` records
 /// keys in first-occurrence order, and `memo` caches the (possibly expensive) key computation per callee root
-/// [`RegionId`] — interned shared callees repeat their root region id, so each shared callee is rendered once.
+/// [`RegionId`]. Interned shared callees repeat their root region id, so each shared callee is rendered once.
 fn count_jit_calls<Input, Output, O: LowerableOperationFamily>(
     program: &Program<Input, Output, O>,
     target_platform: Option<&str>,
@@ -256,12 +1843,12 @@ where
         Input: Parameterized<Constant>,
         Output: Parameterized<Constant>,
     {
-        // Interned shared callees repeat their root region id; each region's instructions are walked once while
+        // Interned shared callees repeat their root region id. Each region's instructions are walked once while
         // every referencing `jit_call` instruction still contributes one occurrence to the counts below.
         if !visited.insert(region) {
             return Ok(());
         }
-        let region_ref = program.region_ref(region).expect("region ids in the arena are valid by construction");
+        let region_ref = program.region_ref(region).unwrap();
         for instruction in region_ref.instructions() {
             if instruction.operation().projected_payload::<ShardMapOperation>().is_some() {
                 continue;
@@ -340,9 +1927,7 @@ where
                 let key = memo
                     .entry(callee_region)
                     .or_insert_with(|| {
-                        let callee = program
-                            .region_ref(callee_region)
-                            .expect("jit_call callee regions are validated at build time");
+                        let callee = program.region_ref(callee_region).unwrap();
                         jit_call_region_key(callee)
                     })
                     .clone();
@@ -351,13 +1936,7 @@ where
                 };
                 let entry = counts.entry(key.clone()).or_insert_with(|| {
                     order.push(key.clone());
-                    (
-                        0,
-                        program
-                            .region_ref(callee_region)
-                            .expect("jit_call callee regions are validated at build time")
-                            .to_program(),
-                    )
+                    (0, program.region_ref(callee_region).unwrap().to_program())
                 });
                 entry.0 += 1;
             }
@@ -374,11 +1953,7 @@ where
             NamedFunctionKey { key: call.composite, input_types: call.input_types, output_types: call.output_types };
         let key = memo
             .entry(call.region)
-            .or_insert_with(|| {
-                jit_call_region_key(
-                    program.region_ref(call.region).expect("composite regions are validated at build time"),
-                )
-            })
+            .or_insert_with(|| jit_call_region_key(program.region_ref(call.region).unwrap()))
             .clone();
         // A body that structural deduplication cannot key (e.g., one with constants) has no shared function, and it
         // marks its key and boundary as conflicting, so that its calls never resolve to another body's function.
@@ -388,7 +1963,7 @@ where
         };
         let entry = counts.entry(key.clone()).or_insert_with(|| {
             order.push(key.clone());
-            (0, program.region_ref(call.region).expect("composite regions are validated at build time").to_program())
+            (0, program.region_ref(call.region).unwrap().to_program())
         });
         entry.0 += call.count;
         names
@@ -412,636 +1987,9 @@ where
     Ok(())
 }
 
-/// Named composite calls found by [`count_jit_calls`], grouped by the interned body region, the key, and the boundary
-/// that they share.
-#[derive(Default)]
-struct NamedRegionCalls {
-    /// Positions in [`Self::calls`] of the groups of each body region, one per key and boundary that call it.
-    index: HashMap<RegionId, Vec<usize>>,
-
-    /// Body regions in first-occurrence order.
-    calls: Vec<NamedRegionCall>,
-}
-
-/// Named composite calls that share one interned body region, one key, and one boundary.
-struct NamedRegionCall {
-    /// Body region of the calls.
-    region: RegionId,
-
-    /// Semantic identity of the calls.
-    composite: CompositeKey,
-
-    /// Input types of the calls.
-    input_types: Vec<ArrayIrType>,
-
-    /// Output types of the calls.
-    output_types: Vec<ArrayIrType>,
-
-    /// Number of calls.
-    count: usize,
-}
-
-/// Builds the [`JitCallFunctionMap`] for a module by emitting a shared private function for every `jit_call` callee
-/// that occurs at least twice (per [`JitCallProgramKey`] identity), and for every named composite body that no
-/// backend implementation replaces on `target_platform` and that occurs at least twice. Single-occurrence callees are
-/// left to inline, so modules without repeated calls lower exactly as before. A shared function that named composite
-/// calls reach is named after the name and version of the first such definition (e.g., `ryft.example.v1`, with a
-/// numeric suffix for other specializations), even when a `jit_call` also reaches it, and no `jit_call` or
-/// named-composition function name can match such a name. A named composite boundary is indexed only when it equals
-/// the boundary of its shared function, so that the emitted call signature matches the function.
-///
-/// # Errors
-///
-/// Returns an error when the effects that lowering a callee introduces cannot be determined (refer to
-/// [`lowered_effect_classes`]).
-pub(crate) fn collect_jit_call_functions<Input, Output, O: LowerableOperationFamily>(
-    program: &Program<Input, Output, O>,
-    target_platform: Option<&str>,
-) -> Result<JitCallFunctionMap<O>, Error>
-where
-    Input: Parameterized<Constant>,
-    Output: Parameterized<Constant>,
-{
-    let mut counts: HashMap<JitCallProgramKey, (usize, FlatProgram<O>)> = HashMap::new();
-    let mut order: Vec<JitCallProgramKey> = Vec::new();
-    let mut memo: HashMap<RegionId, Option<JitCallProgramKey>> = HashMap::new();
-    let mut named = HashMap::new();
-    let mut names = HashMap::new();
-    count_jit_calls(program, target_platform, &mut counts, &mut order, &mut memo, &mut named, &mut names)?;
-
-    let mut map = JitCallFunctionMap::default();
-    let mut name_counts = HashMap::<String, usize>::new();
-    for key in order {
-        let (count, program) = counts.remove(&key).expect("every ordered key was counted");
-        // Effectful callees always inline (even when repeated) so their effectful instructions chain onto the
-        // caller's effect token in program order; a shared token-free function could not preserve that ordering. That
-        // includes the entry guards that lowering synthesizes for the callee's nested control flow. Callees that
-        // reference session constants also inline, because only the entry function receives their hidden arguments.
-        if count < 2 || !lowered_effect_classes(&program)?.is_empty() || !collect_session_constants(&program).is_empty()
-        {
-            continue;
-        }
-        let symbol = match names.get(&key) {
-            Some(name) => {
-                let count = name_counts.entry(name.clone()).or_default();
-                *count += 1;
-                if *count == 1 { name.clone() } else { format!("{name}_{}", *count - 1) }
-            }
-            None => format!("jit_call_{}", map.order.len()),
-        };
-        let input_types = program.input_types().into_owned();
-        let output_types = program.output_types().into_owned();
-        map.functions.insert(key.clone(), JitCallFunction { symbol, program, input_types, output_types });
-        map.order.push(key);
-    }
-    for (named_key, key) in named {
-        let Some(function) = key.and_then(|key| map.functions.get(&key)) else {
-            continue;
-        };
-        if function.input_types != named_key.input_types || function.output_types != named_key.output_types {
-            continue;
-        }
-        let NamedFunctionKey { key: composite_key, input_types, output_types } = named_key;
-        let symbol = function.symbol.clone();
-        map.named
-            .entry(composite_key)
-            .or_default()
-            .push(NamedFunction { input_types, output_types, symbol });
-    }
-    Ok(map)
-}
-
-/// Emits the shared private `func.func` for one deduplicated callee into `module_block`.
-///
-/// The body is lowered with `nested_functions` in scope so that any repeated `jit_call`s inside this callee also
-/// lower to `func.call`s (calls between shared functions are resolved by symbol, so emission order does not matter),
-/// and with the module's `collective_state` so module-scoped lowering state — the shared channel-id counter and the
-/// target platform that gates platform-specific fast paths such as fused attention — reaches the
-/// callee body exactly like inlined callees (the mesh/manual-region state intentionally resets per function).
-pub(crate) fn emit_jit_call_function<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    module_block: &mut BlockRef<'b, 'c, 't>,
-    function: &JitCallFunction<O>,
-    nested_functions: &Rc<JitCallFunctionMap<O>>,
-    collective_state: &CollectiveLoweringState,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<(), Error> {
-    let argument_tensor_types = function
-        .input_types
-        .iter()
-        .map(|r#type| lower_array_ir_type(r#type, context, location))
-        .collect::<Result<Vec<_>, _>>()?;
-    let result_tensor_types = function
-        .output_types
-        .iter()
-        .map(|r#type| lower_array_ir_type(r#type, context, location))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let function_block = context.block(
-        argument_tensor_types
-            .iter()
-            .map(|tensor_type| (*tensor_type, location))
-            .collect::<Vec<_>>()
-            .as_slice(),
-    );
-    {
-        let mut function_block_ref = function_block.as_ref();
-        let input_values = (0..function.input_types.len())
-            .map(|index| function_block.argument(index).expect("shared function block arguments should exist").as_ref())
-            .collect::<Vec<_>>();
-        // Deduplicated callees are pure by construction (`collect_jit_call_functions` skips programs whose lowering
-        // has effects, including synthesized entry guards), so the shared function body never creates an effect token.
-        let mut effect_tokens = EffectTokens::default();
-        let outputs = lower_nested_program_inline(
-            &function.program,
-            input_values.as_slice(),
-            &mut function_block_ref,
-            context,
-            location,
-            &[],
-            &RematerializationOptimizationBarrier::None,
-            Some(nested_functions),
-            collective_state,
-            &mut effect_tokens,
-        )?;
-        function_block_ref.append_operation(func::r#return(outputs.as_slice(), location)?)?;
-    }
-    let mut function_region = context.region();
-    function_region.append_block(function_block)?;
-    module_block.append_operation(func::func(
-        function.symbol.as_str(),
-        func::FuncAttributes {
-            arguments: argument_tensor_types
-                .iter()
-                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
-                .collect(),
-            results: result_tensor_types
-                .iter()
-                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
-                .collect(),
-            visibility: SymbolVisibility::Private,
-            ..Default::default()
-        },
-        function_region,
-        location,
-    )?)?;
-    Ok(())
-}
-
-/// Lowers one `jit_call` to either a `func.call` of a shared private function (when its callee was deduplicated) or
-/// an inlined copy of the callee body (otherwise).
-///
-/// `input_values` are the lowered call operands in callee-input order. `capture_count` is the operation payload's
-/// exact leading lifted-capture prefix length; deriving it from capture-constant indices instead would conflate the
-/// independent capture namespaces of nested calls inside the callee arena. `caller_captured_values` are the captured
-/// values of the calling scope, whose session-constant suffix the inlined callee inherits (refer to
-/// [`CollectiveLoweringState::session_values`]).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    program: &FlatProgram<O>,
-    capture_count: usize,
-    input_values: &[ValueRef<'b, 'c, 't>],
-    caller_captured_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
-    collective_state: &CollectiveLoweringState,
-    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    // Only pure callees are ever deduplicated (`collect_jit_call_functions` skips effectful programs), so the
-    // shared-function path below never interacts with the caller's effect tokens; effectful callees always take the
-    // inline path, which threads the caller's per-class tokens through the callee body in program order.
-    if let Some(map) = nested_functions {
-        if let Some(function) = map.get(program) {
-            // The `jit_call` operation's type inference already pins its operands to the callee input types, so a
-            // matching arity is the only guard needed before emitting the symbol call; anything else inlines.
-            if input_values.len() == function.input_types.len() {
-                return lower_shared_function_call(
-                    &function.symbol,
-                    &function.output_types,
-                    input_values,
-                    block,
-                    context,
-                    location,
-                );
-            }
-        }
-    }
-    if input_values.len() < capture_count {
-        return Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: capture_count.saturating_sub(1) }));
-    }
-    // The callee's capture references name its own leading inputs, while session constants remain module-scoped.
-    let mut captured_values = input_values[..capture_count].to_vec();
-    captured_values.extend_from_slice(collective_state.session_values(caller_captured_values));
-    lower_nested_program_inline(
-        program,
-        input_values,
-        block,
-        context,
-        location,
-        captured_values.as_slice(),
-        &RematerializationOptimizationBarrier::None,
-        nested_functions,
-        collective_state,
-        effect_tokens,
-    )
-}
-
-/// Calls the shared private `func.func` emitted for `function` with the provided operands, which must match its inputs.
-pub(crate) fn lower_shared_function_call<'b, 'c: 'b, 't: 'c>(
-    symbol: &str,
-    output_types: &[ArrayIrType],
-    input_values: &[ValueRef<'b, 'c, 't>],
-    block: &mut BlockRef<'b, 'c, 't>,
-    context: &'c MlirContext<'t>,
-    location: LocationRef<'c, 't>,
-) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-    let result_tensor_types = output_types
-        .iter()
-        .map(|r#type| lower_array_ir_type(r#type, context, location))
-        .collect::<Result<Vec<_>, _>>()?;
-    let operation = block.append_operation(func::call(
-        symbol,
-        func::CallProperties {
-            arguments: input_values
-                .iter()
-                .map(|value| ValueAndAttributes { value: *value, attributes: None })
-                .collect(),
-            results: result_tensor_types
-                .iter()
-                .map(|tensor_type| TypeAndAttributes { r#type: tensor_type.as_ref(), attributes: None })
-                .collect(),
-            no_inline: false,
-        },
-        location,
-    )?)?;
-    Ok((0..output_types.len())
-        .map(|index| operation.result(index).expect("func.call should return one result per output").as_ref())
-        .collect())
-}
-
-/// Canonical operation name for [`JitCallOperation`].
-pub const JIT_CALL_OPERATION_NAME: &str = "jit_call";
-
-/// Staged call to a flat XLA program. The callee program is not part of this payload: it is a shared callee root
-/// [`Region`](ryft_core::Region) attached to the [`Instruction`](ryft_core::Instruction) applying the operation (the
-/// single `["callee"]` slot), interned by [`Arc`] identity when the call is staged through the
-/// [`AttachedRegions`](ryft_core::AttachedRegions) passed to [`Context::bind`], so repeated calls staged from one
-/// function handle share one callee root and remain identity-comparable for call-site deduplication at lowering. The
-/// `T` parameter fixes the callee boundary's type universe, allowing the reusable homogeneous-array batching form and
-/// the executable array IR form to remain distinct payload types with one [`CoreOperation`](ryft_core::Operation)
-/// contract each. The retained `capture_count` names the callee's exact leading lifted-capture input prefix; it
-/// participates in operation equality and callee-deduplication identity and scopes reference-capture resolution during
-/// analysis.
-///
-/// [`CoreOperation::region_data_flow`](ryft_core::Operation::region_data_flow) declares ordinary callee data flow:
-/// callee inputs receive instruction inputs positionally and instruction outputs originate from the corresponding
-/// callee outputs. Capture-prefix retention remains an independent boundary-pruning requirement.
-///
-/// Declare callee-local result identities through [`with_callee_type_signature`](Self::with_callee_type_signature)
-/// before binding the call. The operation allocates caller-owned result names once, so repeated inference retains them
-/// while separate calls receive independent local result identities.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct JitCallOperation<T: Type> {
-    /// Number of leading callee inputs that form its lifted lexical capture prefix.
-    capture_count: usize,
-
-    /// Type universe of the callee boundary.
-    marker: PhantomData<fn() -> T>,
-
-    /// Caller-owned result identities and the formal input scope used to instantiate forwarded names.
-    output_types: Option<CallTypeBindings<T>>,
-}
-
-impl<T: Type> JitCallOperation<T> {
-    /// Creates a staged `jit_call` operation. The flat callee program is supplied as a shared region attachment to
-    /// [`Context::bind`], and `capture_count` identifies its exact leading lifted-capture prefix.
-    #[inline]
-    pub(crate) fn new(capture_count: usize) -> Self {
-        Self { capture_count, marker: PhantomData, output_types: None }
-    }
-
-    /// Instantiates every callee-local result identity freshly for this call. Input identities continue to name the
-    /// forwarded quantities. Call this after constructing the callee and before binding a call with local results;
-    /// repeated inference allocates no identities and returns the same result types.
-    ///
-    /// # Errors
-    ///
-    /// Returns a type error for an oversized capture prefix or a type that cannot rename its local identities.
-    pub fn with_callee_type_signature(mut self, input_types: &[T], output_types: &[T]) -> Result<Self, TypeError> {
-        self.validate_capture_prefix(input_types.len())?;
-        self.output_types = CallTypeBindings::fresh(input_types, output_types)?;
-        Ok(self)
-    }
-
-    /// Instantiates a sealed callee's result names, using its cached signature to recognize identity-free boundaries
-    /// without cloning their input and output types. An identity-bearing callee follows the ordinary signature path.
-    fn with_callee_region<V: CoreValue<Type = T>, O: CoreOperation<Type = T>>(
-        mut self,
-        callee: RegionRef<'_, V, O>,
-    ) -> Result<Self, TypeError> {
-        self.validate_capture_prefix(callee.input_ids().len())?;
-        if callee.type_identity_signature().identities().is_empty() {
-            // A closed signature without identities proves that `CallTypeBindings::fresh` would return `None` before
-            // attempting any renaming. Preserve that exact payload, including when replacing an older signature.
-            self.output_types = None;
-            return Ok(self);
-        }
-        self.with_callee_type_signature(&callee.input_types(), &callee.output_types())
-    }
-
-    /// Retains caller-owned result identities after a callee boundary rewrite, including reference discharge.
-    pub(crate) fn with_result_type_signature(
-        mut self,
-        input_types: &[T],
-        callee_outputs: &[T],
-        outputs: Vec<T>,
-    ) -> Result<Self, TypeError> {
-        self.output_types = CallTypeBindings::with_outputs(input_types, callee_outputs, outputs)?;
-        Ok(self)
-    }
-
-    /// Checks that the lexical capture namespace is a valid prefix of this callee's actual boundary.
-    fn validate_capture_prefix(&self, input_count: usize) -> Result<(), TypeError> {
-        if self.capture_count > input_count {
-            return Err(TypeError::invalid(format!(
-                "`jit_call` lifted capture prefix {} exceeds its {input_count} callee inputs",
-                self.capture_count,
-            )));
-        }
-        Ok(())
-    }
-
-    /// Rebinds forwarded result names from the retained formal input scope to this callee instantiation.
-    fn instantiated_output_types(&self, inputs: &[T]) -> Result<Option<Vec<T>>, TypeError> {
-        self.output_types.as_ref().map(|types| types.instantiated(inputs)).transpose()
-    }
-
-    /// Validates exact local-result instantiation and returns the callee-to-caller result correspondence.
-    fn output_renaming(
-        &self,
-        inputs: &[T],
-        callee_outputs: &[T],
-    ) -> Result<TypeIdentityRenaming<T::Identity>, TypeError> {
-        if let Some(types) = &self.output_types {
-            return types.renaming(inputs, callee_outputs);
-        }
-        if callee_outputs
-            .iter()
-            .flat_map(Type::identities)
-            .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
-        {
-            return Err(TypeError::invalid(
-                "`jit_call` with callee-local result identities requires `with_callee_type_signature`",
-            ));
-        }
-        Ok(TypeIdentityRenaming::new())
-    }
-
-    /// Returns the exact number of leading callee inputs that form the lifted-capture prefix.
-    #[inline]
-    pub(crate) fn capture_count(&self) -> usize {
-        self.capture_count
-    }
-}
-
-/// Formal callee input types and caller result types that bind [`TypeIdentity`](ryft_core::TypeIdentity)s across one
-/// sealed call boundary. The bindings are encoded in these two type signatures; the stored metadata contains no runtime
-/// values.
-///
-/// An output identity present in the callee inputs is forwarded from the corresponding caller input. An identity
-/// defined inside the callee receives one fresh caller identity shared by every corresponding result occurrence.
-/// Separate calls receive independent local identities, because their results can have different extents even when
-/// their input shapes agree. [`Self::fresh`] allocates those identities once during call construction, before
-/// interpretation, so repeated type inference returns the same identities. Calls whose results only forward input
-/// identities retain no instance of this metadata.
-///
-/// The formal input types allow [`Self::instantiated`] to specialize forwarded dimensions to actual inputs without
-/// replacing the call's local result identities. When a transformation already owns the caller result names,
-/// [`Self::with_outputs`] preserves them and validates their correspondence to the callee's output types.
-/// [`Self::renaming`] recovers that correspondence from the current callee output types to the stored caller types.
-///
-/// For example, suppose a callee accepts a dimension with identity `n` and returns three dimensions with identities
-/// `n`, `m`, and `m`, where `m` is defined inside the callee. The first result forwards `n`; the other two share one
-/// fresh caller identity. Another call receives a different identity for `m`, even though its diagnostic name can
-/// remain `m`.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct CallTypeBindings<T: Type> {
-    /// Formal input namespace used when instantiating forwarded result identities.
-    inputs: Arc<[T]>,
-
-    /// Caller result types, with callee-local identities already freshly bound.
-    outputs: Arc<[T]>,
-}
-
-impl<T: Type> CallTypeBindings<T> {
-    /// Freshens callee-local result identities, returning no metadata when all result identities are forwarded.
-    ///
-    /// # Errors
-    ///
-    /// Returns a type error when a result type cannot preserve its structure under identity renaming.
-    fn fresh(inputs: &[T], outputs: &[T]) -> Result<Option<Self>, TypeError> {
-        if !outputs
-            .iter()
-            .flat_map(Type::identities)
-            .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
-        {
-            return Ok(None);
-        }
-        let mut unavailable = inputs
-            .iter()
-            .chain(outputs)
-            .flat_map(Type::identities)
-            .map(|(_, identity)| identity.clone())
-            .collect::<Vec<_>>();
-        let mut renaming = TypeIdentityRenaming::new();
-        for (_, identity) in outputs.iter().flat_map(Type::identities) {
-            if renaming.target(identity).is_none()
-                && !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity)
-            {
-                unavailable.push(renaming.insert_fresh(identity.clone(), &unavailable)?);
-            }
-        }
-        let outputs =
-            outputs.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
-        Ok(Some(Self { inputs: inputs.into(), outputs: outputs.into() }))
-    }
-
-    /// Records caller result types whose local identities have already been chosen, validating their exact
-    /// correspondence to the callee's output types. Unlike [`Self::fresh`], this function allocates no identities.
-    /// Forwarded identities must stay unchanged, and callee-local identities must have fresh caller counterparts.
-    /// Returns no metadata when both output signatures agree and only forward input identities.
-    ///
-    /// # Parameters
-    ///
-    ///   - `inputs`: Callee input types. Both output signatures use this input scope for forwarded identities.
-    ///   - `callee_outputs`: Output types of the attached callee, using its local result identities.
-    ///   - `outputs`: Result types retained by the caller, using the existing caller-owned result identities.
-    ///
-    /// # Errors
-    ///
-    /// Returns a type error for changed result structure, captured local names, or renamed forwarded identities.
-    fn with_outputs(inputs: &[T], callee_outputs: &[T], outputs: Vec<T>) -> Result<Option<Self>, TypeError> {
-        if callee_outputs == outputs {
-            if callee_outputs
-                .iter()
-                .flat_map(Type::identities)
-                .any(|(_, identity)| !inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity))
-            {
-                return Err(TypeError::invalid("call local result declarations must use fresh identities"));
-            }
-            return Ok(None);
-        }
-        let signature = Self { inputs: inputs.into(), outputs: outputs.into() };
-        signature.renaming(inputs, callee_outputs)?;
-        Ok(Some(signature))
-    }
-
-    /// Returns caller result types with forwarded names and ordinary shape refinements instantiated at `inputs`.
-    /// Local result identities remain symbolic even when the input facts determine an exact extent.
-    ///
-    /// # Errors
-    ///
-    /// Returns the input-scope correspondence or type-renaming error when the call signature is incompatible.
-    fn instantiated(&self, inputs: &[T]) -> Result<Vec<T>, TypeError> {
-        if self.inputs.as_ref() == inputs {
-            return Ok(self.outputs.to_vec());
-        }
-        let renaming = T::derive_identity_renaming(self.inputs.as_ref(), inputs)?;
-        let refinements = T::Refinements::from_local_declarations(self.inputs.iter(), inputs)?;
-        let local = self.definitions();
-        self.outputs
-            .iter()
-            .map(|r#type| refinements.refine_declared(r#type, &local)?.rename_identities(&renaming))
-            .collect()
-    }
-
-    /// Returns the validated renaming from the current callee output types to this call's instantiated result types.
-    /// The source types are supplied in `callee_outputs`; the target types come from [`Self::instantiated`]. For the
-    /// type-level example, this maps the callee's local `m` to the caller's fresh identity while preserving forwarded
-    /// `n`. Caller result types alone cannot recover the callee's original local identities.
-    ///
-    /// # Parameters
-    ///
-    ///   - `inputs`: Input types of the current callee instantiation, used to instantiate forwarded result identities.
-    ///   - `callee_outputs`: Output types of that callee instantiation, before renaming its local identities into the
-    ///     caller's scope.
-    ///
-    /// # Errors
-    ///
-    /// Returns a type error when local names are not fresh, forwarded names change, or result structure differs.
-    fn renaming(&self, inputs: &[T], callee_outputs: &[T]) -> Result<TypeIdentityRenaming<T::Identity>, TypeError> {
-        let outputs = self.instantiated(inputs)?;
-        let renaming = T::derive_identity_renaming(callee_outputs, &outputs)?;
-        for (_, identity) in callee_outputs.iter().flat_map(Type::identities) {
-            let target = renaming.target(identity).unwrap_or(identity);
-            let forwarded = inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity);
-            if forwarded && target != identity {
-                return Err(TypeError::invalid("call result declarations must preserve forwarded input identities"));
-            }
-            if !forwarded
-                && (target == identity
-                    || inputs
-                        .iter()
-                        .chain(callee_outputs)
-                        .flat_map(Type::identities)
-                        .any(|(_, original)| original == target))
-            {
-                return Err(TypeError::invalid("call local result declarations must use fresh identities"));
-            }
-        }
-        Ok(renaming)
-    }
-
-    /// Returns the formal result types retained by the caller.
-    fn outputs(&self) -> &[T] {
-        &self.outputs
-    }
-
-    /// Returns the caller-owned identities defined by this call, once each in result occurrence order.
-    fn definitions(&self) -> Vec<T::Identity> {
-        let mut definitions = Vec::new();
-        for (_, identity) in self.outputs.iter().flat_map(Type::identities) {
-            if !self.inputs.iter().flat_map(Type::identities).any(|(_, input)| input == identity)
-                && !definitions.contains(identity)
-            {
-                definitions.push(identity.clone());
-            }
-        }
-        definitions
-    }
-
-    /// Renames caller-owned definitions while retaining the callee's formal input namespace.
-    ///
-    /// # Errors
-    ///
-    /// Returns an identity conflict or type-renaming error.
-    fn renamed(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
-        let mut owned = TypeIdentityRenaming::new();
-        for (source, target) in renaming.replacements() {
-            if !self.inputs.iter().flat_map(Type::identities).any(|(_, input)| input == source) {
-                owned.insert(source.clone(), target.clone())?;
-            }
-        }
-        let outputs =
-            self.outputs.iter().map(|r#type| r#type.rename_identities(&owned)).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { inputs: self.inputs.clone(), outputs: outputs.into() })
-    }
-
-    /// Retains the indicated input and result positions after ordinary call-boundary pruning.
-    ///
-    /// # Errors
-    ///
-    /// Returns a type error when a positional mask has the wrong arity.
-    fn pruned(&self, inputs: &[bool], outputs: &[bool]) -> Result<Self, TypeError> {
-        if inputs.len() != self.inputs.len() || outputs.len() != self.outputs.len() {
-            return Err(TypeError::invalid("call result declaration pruning masks have incompatible arity"));
-        }
-        Ok(Self {
-            inputs: self
-                .inputs
-                .iter()
-                .zip(inputs)
-                .filter_map(|(r#type, kept)| kept.then_some(r#type.clone()))
-                .collect(),
-            outputs: self
-                .outputs
-                .iter()
-                .zip(outputs)
-                .filter_map(|(r#type, kept)| kept.then_some(r#type.clone()))
-                .collect(),
-        })
-    }
-}
-
-impl StagedCallOperation<Constant> for Operation {
-    #[inline]
-    fn staged_call(capture_count: usize) -> Self {
-        Self::JitCall(JitCallOperation::new(capture_count))
-    }
-
-    fn staged_call_with_types(
-        capture_count: usize,
-        input_types: &[ArrayIrType],
-        output_types: &[ArrayIrType],
-    ) -> Result<Self, TypeError> {
-        Ok(Self::JitCall(JitCallOperation::new(capture_count).with_callee_type_signature(input_types, output_types)?))
-    }
-}
-
-/// Bridges canonical internal physical positions to the public batching declaration.
-fn batch_axis_from_position(axis: Option<usize>) -> BatchAxis {
-    BatchAxis::from_optional_position(axis)
-}
-
-/// Recovers a canonical physical position returned by the core program batching pass.
-fn batch_axis_position(axis: &BatchAxis) -> Option<usize> {
-    axis.axis()
-        .map(|axis| usize::try_from(axis.value()).expect("program batching returns canonical nonnegative axes"))
-}
-
-fn ensure_call_input_types<T: Type>(
+/// Validates that `input_types` match `expected_types` exactly, in count and position, and reports the first mismatch
+/// as a type error naming `operation_name`.
+fn validate_call_input_types<T: Type>(
     operation_name: &'static str,
     expected_types: &[T],
     input_types: &[T],
@@ -1061,979 +2009,6 @@ fn ensure_call_input_types<T: Type>(
         }
     }
     Ok(())
-}
-
-impl<T: Type> CoreOperation for JitCallOperation<T> {
-    type Type = T;
-
-    #[inline]
-    fn name(&self) -> &'static str {
-        JIT_CALL_OPERATION_NAME
-    }
-
-    fn defined_type_identities(&self) -> Cow<'_, [T::Identity]> {
-        self.output_types.as_ref().map_or(Cow::Borrowed(&[]), |types| Cow::Owned(types.definitions()))
-    }
-
-    fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
-        let mut renamed = self.clone();
-        renamed.output_types = self.output_types.as_ref().map(|types| types.renamed(renaming)).transpose()?;
-        Ok(renamed)
-    }
-
-    #[inline]
-    fn region_slots(&self) -> &'static [RegionSlot] {
-        const { &[RegionSlot::computation("callee")] }
-    }
-
-    fn infer_output_types(
-        &self,
-        input_types: &[T],
-        region_interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<T>, TypeError> {
-        if region_interfaces.len() != 1 {
-            return Err(TypeError::invalid(format!(
-                "{} expects 1 attached callee region but got {}",
-                JIT_CALL_OPERATION_NAME,
-                region_interfaces.len()
-            )));
-        }
-        let callee_interface = &region_interfaces[0];
-        self.validate_capture_prefix(callee_interface.input_types().len())?;
-        ensure_call_input_types(self.name(), callee_interface.input_types(), input_types)?;
-        self.output_renaming(callee_interface.input_types(), callee_interface.output_types())?;
-        Ok(self
-            .instantiated_output_types(callee_interface.input_types())?
-            .unwrap_or_else(|| callee_interface.output_types().to_vec()))
-    }
-
-    fn infer_region_input_types(
-        &self,
-        input_types: &[T],
-        interfaces: &[RegionInterface<T>],
-    ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
-        check_count!("region", interfaces, 1, TypeError);
-        let declared = interfaces[0].input_types();
-        if declared == input_types {
-            return Ok(vec![None]);
-        }
-        let renaming = T::derive_identity_renaming(declared, input_types)?;
-        let renamed =
-            declared.iter().map(|r#type| r#type.rename_identities(&renaming)).collect::<Result<Vec<_>, _>>()?;
-        ensure_call_input_types(self.name(), &renamed, input_types)?;
-        Ok(vec![Some(input_types.to_vec())])
-    }
-
-    #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> InputRegionProvenance {
-        if region_index == 0 {
-            InputRegionProvenance::Input { index: input_index }
-        } else {
-            InputRegionProvenance::None
-        }
-    }
-
-    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-        vec![OutputRegionProvenance { region_index: 0, output_index }]
-    }
-
-    fn region_data_flow(&self) -> RegionDataFlow<'_> {
-        RegionDataFlow::Provenance
-    }
-
-    fn prune_boundary(
-        &self,
-        input_types: &[Self::Type],
-        used_outputs: &[bool],
-        regions: &mut dyn RegionLiveness,
-    ) -> Result<Option<OperationBoundaryPruning<Self>>, ProgramError> {
-        // Operands map onto the callee inputs one for one, so the operands that the callee does not use are dropped
-        // together with its unused outputs (as in JAX's `dce_jaxpr_pjit_rule`). The lifted capture prefix is always
-        // kept, because the captures in the callee refer to it by absolute position.
-        let mut kept_inputs = regions.used_region_inputs(0, used_outputs)?;
-        kept_inputs.iter_mut().take(self.capture_count).for_each(|kept| *kept = true);
-        check_count!("input", kept_inputs, input_types.len(), ProgramError);
-        let mut operation = self.clone();
-        operation.output_types =
-            self.output_types.as_ref().map(|types| types.pruned(&kept_inputs, used_outputs)).transpose()?;
-        Ok(Some(OperationBoundaryPruning { operation, kept_inputs, kept_outputs: used_outputs.to_vec() }))
-    }
-
-    #[inline]
-    fn region_capture_input_count(&self, region_index: usize) -> Option<usize> {
-        (region_index == 0).then_some(self.capture_count)
-    }
-
-    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
-        let operation = OperationFormatter::new(formatter, indentation, JIT_CALL_OPERATION_NAME)?;
-        if self.capture_count == 0 && self.output_types.is_none() {
-            Ok(())
-        } else {
-            operation.bracketed(|operation| {
-                if self.capture_count != 0 {
-                    operation.field("capture_count", self.capture_count)?;
-                }
-                if let Some(outputs) = &self.output_types {
-                    operation.list("output_types", outputs.outputs())?;
-                }
-                Ok(())
-            })
-        }
-    }
-}
-
-// A `jit_call` operation forwards its operands onto its callee's inputs one for one and reports the callee's outputs as its
-// own, which is the positionally forwarding shape the shared structured rewrite serves with no leading operands. The
-// callee's lifted capture prefix is unaffected: threaded state is appended after every declared operand, so the prefix
-// keeps its positions. Instantiated result types belong to the source callee signature, which discharge changes by
-// turning discharged references into arrays and appending state inputs and outputs. The rebuilt call therefore keeps
-// the same caller-owned result identities but derives its result metadata from the rebuilt callee signature.
-impl<T, C, P> ReferenceDischargeableOperation<C, P> for JitCallOperation<T>
-where
-    T: Type + From<P::Referent>,
-    C: Context<Type = T, Operation: From<JitCallOperation<T>>>,
-    P: ReferenceDischargePolicy<C>,
-{
-    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        driver: &D,
-        inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        let result_renaming = match &self.output_types {
-            Some(_) => {
-                let callee = driver.region(0)?;
-                Some(self.output_renaming(&callee.input_types(), &callee.output_types())?)
-            }
-            None => None,
-        };
-        context.discharge_positional_region_operation(self, driver, inputs, 0, |_, regions| {
-            let Some(result_renaming) = result_renaming else { return Ok(self.clone()) };
-            check_count!("region", regions, 1, TypeError);
-            let input_types = regions[0].input_types();
-            let callee_outputs = regions[0].output_types();
-            let outputs = callee_outputs
-                .iter()
-                .map(|r#type| r#type.rename_identities(&result_renaming))
-                .collect::<Result<Vec<_>, _>>()?;
-            let operation = Self { output_types: None, ..self.clone() };
-            Ok(operation.with_result_type_signature(&input_types, &callee_outputs, outputs)?)
-        })
-    }
-}
-
-// Online partial-evaluation rule for a staged `jit_call` operation — ryft's analogue of JAX's call partial-evaluation
-// rules: it splits the callee against the caller's known-ness while preserving the `jit_call` boundary on both
-// sides.
-//
-// The split fires whenever the known-ness of the call inputs is mixed (i.e., some inputs are known and some are not).
-// All-known and all-unknown calls preserve the original boundary, and their callee is bound as a shared program (an
-// interned callee, or a copy retained by the region transform cache of the callee), so that repeated calls of one
-// callee keep sharing one region on either side. Under a residual policy, the outputs of a pure all-known call that
-// only forward call inputs resolve to those inputs, and a residual planner that demands an output of such a call whose
-// callee saves interior values asks this operation to split the call on residual demand (refer to
-// `PartiallyEvaluatableOperation::split_on_residual_demand`). That split binds a known call that also returns those
-// values and a replay call that recomputes the demanded outputs from them, as JAX's `_pjit_partial_eval_custom` does.
-// Whether the mixed call's known inputs are concrete values of an eager known-side context or tracers into a live
-// outer trace does not matter, as in JAX's call partial-evaluation rules, which always bind the known call: the known
-// side is bound through the default fold-or-residualize policy, which compiles and executes it under an eager context
-// (e.g., [`Domain`](crate::Domain)) and stages it into the outer program under a staging context. The `shard_map` rule
-// follows the same policy.
-//
-// When a split fires, the callee is split through the shared
-// [`PartitionedProgram`](ryft_core::partial::PartitionedProgram) machinery: the known side is bound into the
-// enclosing known-side context as a `jit_call` over the known call inputs that it uses, and the residual side is
-// emitted as the residual `jit_call` over the surviving unknown call inputs plus the known-side call's residual-edge
-// outputs. Residual edges that would merely repeat a known call input or a known call output are
-// [forwarded](ryft_core::partial::PartitionedProgram::forward_residuals), so the residual call consumes that input or
-// output directly and the known-side call does not return the same value twice. For a pure callee (i.e., one without
-// effects, references, captures, or nominal type identities), both kinds of split are retained by the region transform
-// cache of the callee and bound as shared regions (refer to `split_jit_call`), as JAX caches its call partial
-// evaluation per callee, knownness, and policy, so repeated and nested calls of one callee reuse one split instead of
-// partitioning and copying the callee at every call site. A callee with references or captures keeps its boundary,
-// and a callee with nominal type identities is split per call when its inputs are mixed. Effectful mixed calls also
-// share their splits, keyed by the driver's repeated-residual mode because that mode determines effect placement.
-// Effectful and identity-bearing all-known calls remain whole on residual demand.
-impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation<ArrayIrType>
-where
-    V: PartialEq
-        + CoreValue<Type = ArrayIrType>
-        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
-        + CaptureConstant
-        + Concretizable<bool>,
-    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>>,
-{
-    fn partially_evaluate<D: PartialEvaluationDriver<C>>(
-        &self,
-        context: &PartialEvaluationContext<C>,
-        driver: &D,
-        inputs: &[PartialEvaluationValue<C::Value>],
-    ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
-        let all_known = inputs.iter().all(PartialEvaluationValue::is_known);
-        let callee = driver.region(0)?;
-        if all_known || inputs.iter().all(PartialEvaluationValue::is_unknown) {
-            let outputs = fold_or_residualize_jit_call(self, context, driver, inputs)?;
-            if all_known && context.residual_policy().is_some() && !keeps_jit_call_boundary(callee, inputs) {
-                return Ok(forward_jit_call_inputs(callee, inputs, outputs));
-            }
-            return Ok(outputs);
-        }
-        // Retain mixed splits without references, captures, or nominal identities. Unlike all-known replay,
-        // partitioning a mixed effectful call preserves its effects and shares only the structural split.
-        if can_cache_jit_call_split(callee, inputs) {
-            let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
-            let partition =
-                |callee: RegionRef<'_, V, Operation<V>>| driver.partition_program(context, callee, &input_known);
-            let kind = JitCallSplitKind::Knownness(input_known.clone());
-            return split_jit_call(self, context, driver, inputs, kind, &partition);
-        }
-
-        // Split the callee of any other mixed call per call through the shared online boundary machinery, bind the
-        // known side into the enclosing known-side context wrapped in a fresh `jit_call` over the original known call
-        // inputs, emit the residual side as the residual `jit_call`, and reassemble the original output order. These
-        // splits are not retained because the identity-bearing boundary needs call-local type identities.
-        //
-        // A reference operand, a reference output, or a reference access anywhere in the callee closure keeps the call
-        // whole. Splitting would spread the accesses to one root across two compiled calls whose known side runs
-        // first, and a known reference-typed feeder of the residual side would then mean that both sides access the
-        // same root, the same reordering hazard that keeps a `scan` body whole. The default
-        // rule preserves effect order by placing the whole call on one side instead. An allocation that nothing
-        // accesses is dead intrinsic state
-        // that neither side retains, so it does not pin the boundary, but an allocation that escapes through a
-        // reference output is live state whose later accesses are unknown to the callee, so it does.
-        let accesses_references = inputs.iter().any(|input| input.r#type().is_reference())
-            || callee.output_types().iter().any(Type::is_reference)
-            || callee
-                .instructions_in_closure()
-                .any(|(_, instruction)| instruction.operation().effects().has_accesses());
-        if accesses_references {
-            return fold_or_residualize_jit_call(self, context, driver, inputs);
-        }
-        // Partitioning does not remap the absolute indices of capture constants retained in attached regions, so a
-        // split boundary would leave them naming a compacted or absent capture prefix — failing lowering at best and
-        // silently aliasing an unrelated leading operand at worst. Preserve the original call boundary for any callee
-        // whose closure still holds a capture constant.
-        if callee.contains_atom_in_closure(|atom| {
-            atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())
-        }) {
-            return fold_or_residualize_jit_call(self, context, driver, inputs);
-        }
-        let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
-        let partition = driver.partition_program(context, callee, input_known.as_slice())?;
-        // A trivial partition — one whose known program contains no instructions — hoists no work (its known side
-        // can only forward known inputs as residual edges), so keep the original boundary and let the default
-        // materialize those knowns directly as residual feeders.
-        if partition.known_program().instructions().is_empty() {
-            return fold_or_residualize_jit_call(self, context, driver, inputs);
-        }
-        // Feed the residual call directly from the known call inputs and known call outputs that residual edges would
-        // merely repeat (JAX's `in_fwd` and `out_fwd`), so that the known-side call returns each value once.
-        let partition = partition.forward_residuals()?;
-        // Known inputs keep callee source order, so the known-side callee's leading inputs are exactly the known
-        // members of the original lifted-capture prefix that it still uses; the residual callee's inputs are call
-        // inputs, known call outputs, and residual edges, which never form a capture prefix. The guard above already
-        // preserved the boundary of any callee retaining attached-region capture constants, so neither derived callee
-        // can hold one.
-        let known_capture_count =
-            partition.known_input_indices().iter().filter(|index| **index < self.capture_count()).count();
-        let known_call = JitCallOperation::new(known_capture_count).with_callee_type_signature(
-            &partition.known_program().input_types(),
-            &partition.known_program().output_types(),
-        )?;
-        let residual_call = JitCallOperation::new(0).with_callee_type_signature(
-            &partition.residual_program().input_types(),
-            &partition.residual_program().output_types(),
-        )?;
-        context.inline_partitioned_program(
-            partition,
-            Some(callee),
-            inputs,
-            |known_program| (Operation::JitCall(known_call), vec![known_program]),
-            |residual_program| (Operation::JitCall(residual_call), vec![residual_program]),
-        )
-    }
-
-    fn split_on_residual_demand<D: PartialEvaluationDriver<C>>(
-        &self,
-        context: &PartialEvaluationContext<C>,
-        driver: &D,
-        inputs: &[PartialEvaluationValue<C::Value>],
-        demanded_outputs: &[bool],
-    ) -> Result<Option<ResidualDemandSplit<C::Value>>, ProgramError>
-    where
-        C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>,
-    {
-        let callee = driver.region(0)?;
-        if !inputs.iter().all(PartialEvaluationValue::is_known)
-            || context.residual_policy().is_none()
-            || keeps_jit_call_boundary(callee, inputs)
-        {
-            return Ok(None);
-        }
-        let partition =
-            |callee: RegionRef<'_, V, Operation<V>>| context.partition_residual_demand(callee, demanded_outputs);
-        let kind = JitCallSplitKind::ResidualDemand(demanded_outputs.to_vec());
-        let mut outputs = split_jit_call(self, context, driver, inputs, kind, &partition)?;
-        let replayed_outputs = outputs.split_off(callee.output_types().len());
-        Ok(Some(ResidualDemandSplit::new(outputs, replayed_outputs)?))
-    }
-}
-
-// Batching rule for [`JitCallOperation`]: the callee region is rebatched over the mapped input axes (via
-// [`BatchingDriver::batch_program`]) and the batched call is bound through `context.parent()` with the
-// batched callee re-attached. An eager
-// client-backed parent (e.g., [`Domain`](crate::Domain)) compiles and executes the batched call immediately, a
-// staging parent stages it into the enclosing trace, and a differentiation parent dispatches it through its own
-// `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
-impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for JitCallOperation<ArrayIrType>
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<Self>,
-{
-    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
-        &self,
-        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        driver: &D,
-        inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError> {
-        let axes = inputs.iter().map(ArrayIrBatch::batch_axis).collect::<Vec<_>>();
-        // Only an all-replicated call at an anonymous level can bind its original callee unchanged. A named level must
-        // rebatch the callee even then, because the callee may read that level by name (e.g., through `axis_index`),
-        // and binding it unchanged would let that read escape the level that binds it.
-        if axes.iter().all(BatchAxis::is_replicated) && context.axis_name().is_none() {
-            return Ok(context
-                .parent()
-                .bind(
-                    self.clone(),
-                    vec![driver.region(0)?.to_program()],
-                    &inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>(),
-                )?
-                .into_iter()
-                .map(ArrayIrBatch::replicated)
-                .collect::<Vec<_>>());
-        }
-        // The canonical array IR transform threads one leading dimension through the callee as its first input and
-        // first output. Treat the input as an additional explicit capture, so that the original capture order remains,
-        // and drop the bookkeeping output from the callee itself rather than after the call. The output only forwards
-        // the extent input, and an eager parent compiles the call as a standalone program, whose results must be
-        // arrays.
-        let (callee, axes) = driver
-            .batch_program(context, driver.region(0)?, &axes, ProgramBatchingOutputAxesPolicy::Natural)?
-            .into_parts();
-        let kept_outputs = (1..callee.output_count()).collect::<Vec<_>>();
-        let callee = callee.with_outputs(&kept_outputs)?;
-        let mut values = vec![context.axis_extent().clone()];
-        values.extend(inputs.iter().map(|input| input.value().clone()));
-        let operation = Self::new(self.capture_count() + 1).with_callee_region(callee.entry_region_ref())?;
-        let outputs = context.parent().bind(operation, vec![callee], &values)?;
-        check_count!("output", outputs, axes.len(), ProgramError);
-        Ok(outputs
-            .into_iter()
-            .zip(axes)
-            .map(|(value, axis)| ArrayIrBatch::new(value, axis))
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-}
-
-impl<C> BatchableOperation<C, ArrayBatchingPolicy> for JitCallOperation<ArrayType>
-where
-    C: Context<Type = ArrayType>,
-    C::Operation: From<JitCallOperation<ArrayType>>,
-{
-    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
-        &self,
-        context: &BatchingContext<C, ArrayBatchingPolicy>,
-        driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
-        let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
-        // Rebatch the callee when inputs are mapped or when it can address the batching level by name. Only an
-        // all-replicated call at an anonymous level can bind its original callee unchanged.
-        //
-        // Unlike the forward mode and transpose rules below, this rebatching is deliberately not served from the
-        // callee region's retained transform cache. The batched program depends on live `BatchingContext` state (i.e.,
-        // the batch extent, the axis name, and the surrounding nesting), so caching it against the callee region and
-        // its input axes alone would risk exactly the unsound key reuse that the cache is designed to avoid. Caching it
-        // needs a complete key and a measured benefit, which `.tasks/plan_compilation_transform_composition.md` gates
-        // (refer to its gate G8), through a batching-policy hook returning `Option<key>` where `None` keeps a policy
-        // uncached, so that soundness stays opt-in per policy.
-        let batch_callee = ArrayBatch::common_batch_size(inputs)?.is_some() || context.axis_name().is_some();
-        let (batched_callee, output_axes) = if batch_callee {
-            let input_batch_axes =
-                inputs.iter().map(|input| batch_axis_from_position(input.batch_axis_position())).collect::<Vec<_>>();
-            let (batched_callee, output_axes) = driver
-                .batch_program(
-                    context,
-                    driver.region(0)?,
-                    input_batch_axes.as_slice(),
-                    ProgramBatchingOutputAxesPolicy::Natural,
-                )?
-                .into_parts();
-            let output_axes = output_axes.iter().map(batch_axis_position).collect::<Vec<_>>();
-            (batched_callee.into_simplified()?, output_axes)
-        } else {
-            let callee = driver.region(0)?;
-            let output_axes = vec![None; callee.output_types().len()];
-            (callee.to_program(), output_axes)
-        };
-        let operation = Self::new(self.capture_count()).with_callee_region(batched_callee.entry_region_ref())?;
-        let outputs = context.parent().bind(
-            operation,
-            AttachedRegions::Callees(&[Arc::new(batched_callee)]),
-            &physical_inputs,
-        )?;
-        Ok(outputs
-            .into_iter()
-            .zip(output_axes)
-            .map(|(output, axis)| ArrayBatch::new(output, batch_axis_from_position(axis)))
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-}
-
-// Capture-free forward-mode (JVP) rule for [`JitCallOperation`]. When the primal and tangent contexts are shared
-// (e.g., for `jvp` and for the fused program that a `rematerialize` rule partitions), the rule binds one fused
-// `jit_call` over the callee's forward mode program, projected onto the primal outputs and the live output tangents,
-// as JAX's `_pjit_jvp` does. An enclosing partial evaluation then splits that call with its own residual policy.
-// Otherwise, it binds a primal `jit_call` and a tangent `jit_call` as ordinary XLA-enum operations through the active
-// context: a staging context stages both calls over its shared builder, while an eager context (e.g. a client-backed
-// [`Domain`](crate::Domain)) compiles and executes them immediately.
-//
-// Both forms realize the identity `jvp(jit(f)) = jit(jvp f)`: rather than capturing the primal inputs as residual
-// factors and staging a linear `jit_call`, the separate form keeps the compilation boundary and threads every residual
-// as a plain primal operand edge between two `jit_call`s, so no symbolic capture is ever introduced. The enclosing
-// partial-evaluation split then discovers the residual operand edges structurally, exactly as it does for the
-// condition and rematerialize rules.
-//
-// For separate contexts, the rule linearizes the callee program capture-free through
-// [`Program::linearize`](ryft_core::Program::linearize) under the operands' activity mask (an operand with a live
-// tangent is active, while the capture prefix, an operand with a structurally zero tangent, and a plumbing reference
-// operand that receives no tangent reference are not, as under JAX's `which_nz`), giving a primal sub-program
-// `inputs -> [outputs..., residuals...]` and a tangent sub-program
-// `[active_input_tangents..., residuals...] -> [output_tangents...]` together with the residual count. Tangents for
-// zero differential spaces are omitted from both compact boundaries, and the tangent sub-program is projected onto the
-// output tangents that depend on an active input tangent (refer to
-// [`Program::output_dependence`](ryft_core::Program::output_dependence) and
-// [`Program::with_outputs`](ryft_core::Program::with_outputs)), since every other output tangent is a structural zero
-// (JAX's `which_nz_out`). When no output tangent is live and the projected tangent sub-program has no observable
-// effects, the rule binds only the source call and pairs every output with a structurally zero tangent. Otherwise, it:
-//
-//   1. Wraps the primal sub-program in a fresh `jit_call` and stages it over the operand primals, recovering the
-//      primal outputs followed by the residual values (program variables produced by the staged primal call).
-//   2. Wraps the projected tangent sub-program in a fresh `jit_call` and stages it over the active operand tangents
-//      followed by those residual values, recovering the live output tangents.
-//   3. Pairs each primal output tracer with its live tangent output tracer, or with a structural zero for an output
-//      without a live tangent, into a [`DifferentiationDual`].
-//
-// The callee program is materialized from the instruction's callee region in the context's constant universe `V`
-// (concretely [`Constant`] for staged XLA programs), so the split halves ride the fresh primal and tangent calls
-// as shared callee regions. Preserving both `jit_call` boundaries keeps the callee body out of the caller's program,
-// so forward mode over a `jit_call` operation stays compiled rather than inlined.
-//
-// # Parameters
-//
-//   - `context`: Active evaluation or staging context used to bind the differentiated calls.
-//   - `driver`: Call-scoped access to the attached callee region.
-//   - `inputs`: Primal and tangent values for the call operands.
-impl<C, V> DifferentiableOperation<C> for JitCallOperation<ArrayIrType>
-where
-    C: Context<Type = ArrayIrType, Constant = V, Operation = Operation<V>> + Zero<C::Value>,
-    V: PartialEq
-        + CoreValue<Type = ArrayIrType>
-        + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>
-        + CaptureConstant
-        + Concretizable<bool>,
-{
-    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
-        &self,
-        context: &DifferentiationContext<C, P>,
-        driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let callee = driver.region(0)?;
-        let input_types = callee.input_types();
-        let output_types = callee.output_types();
-        let output_count = output_types.len();
-        check_count!("input", inputs, input_types.len(), ProgramError);
-
-        // Linearize the callee through the instruction-scoped driver under the call's activity mask. The callee's
-        // leading lifted-capture inputs are inactive, numeric and reference alike, because a capture is
-        // nondifferentiated plumbing that receives no tangent input; the remaining inputs take the operand duals'
-        // activity: an operand with a live tangent is active, while an operand with a structurally zero tangent is
-        // inactive like a missing one (JAX's `which_nz`), so it gets no tangent callee slot instead of being
-        // materialized as a zero operand. A plumbing reference operand (whose structurally zero tangent is a missing
-        // tangent reference) is therefore inactive too. The primal sub-program produces `[outputs..., residuals...]`
-        // and the tangent sub-program consumes `[active(input_tangents)..., residuals...]`; the residual count is the
-        // number of trailing outputs of the primal sub-program beyond the original callee outputs.
-        let capture_count = self.capture_count();
-        let activity = inputs
-            .iter()
-            .enumerate()
-            .map(|(index, input)| index >= capture_count && input.is_tangent_active() && !input.tangent().is_zero())
-            .collect::<Vec<_>>();
-        let input_indices = activity
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &active)| active.then_some(index))
-            .collect::<Vec<_>>();
-        // A shared primal/tangent destination binds one fused call over the callee's forward mode program, projected
-        // onto its primal outputs and live output tangents (JAX's `_pjit_jvp`). An enclosing partial evaluation then
-        // splits that call with its own residual policy, instead of reusing a linearization boundary chosen here.
-        if std::ptr::eq(context.primal(), context.tangent()) {
-            self.validate_capture_prefix(input_types.len())?;
-            let activity = TangentActivity::new(driver, callee, &activity)?;
-            let output_activity = activity.output_tangent_liveness();
-            let live_tangent_slots = activity.live_tangent_slots(output_activity);
-            let program = activity.jvp_program();
-            let mut operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            if live_tangent_slots.is_empty() && !program.effects().is_retained_when_unused() {
-                let callee = shared_jit_call_callee(callee)?;
-                return context
-                    .primal()
-                    .bind(Operation::JitCall(self.clone()), AttachedRegions::Callees(&[callee]), &operands)?
-                    .into_iter()
-                    .map(DifferentiationDual::new_with_zero_tangent)
-                    .collect();
-            }
-            let outputs = (0..output_count).chain(live_tangent_slots.iter().map(|&slot| output_count + slot));
-            let program = if outputs.clone().eq(0..program.output_count()) {
-                program.clone()
-            } else {
-                Arc::new(program.as_ref().clone().with_outputs(&outputs.collect::<Vec<_>>())?)
-            };
-            operands.extend(
-                activity.input_indices().iter().map(|&index| inputs[index].tangent().as_value().unwrap().clone()),
-            );
-
-            // The primal operands come first, so the lifted-capture prefix of the source call carries over unchanged.
-            let operation = Operation::JitCall(
-                JitCallOperation::new(capture_count).with_callee_region(program.entry_region_ref())?,
-            );
-            let mut outputs = context.primal().bind(operation, AttachedRegions::Callees(&[program]), &operands)?;
-            check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
-            let mut tangents = outputs.split_off(output_count).into_iter();
-            return Ok(outputs
-                .into_iter()
-                .zip(output_activity)
-                .map(|(primal, &live)| match live {
-                    true => DifferentiationDual::new(primal, tangents.next().unwrap()),
-                    false => DifferentiationDual::new_with_zero_tangent(primal),
-                })
-                .collect::<Result<Vec<_>, _>>()?);
-        }
-        let linearization = driver.linearize_program(callee, &input_indices, Some(&[]))?;
-
-        // An output tangent that depends on no active input tangent (e.g., the tangent of a constant output or of an
-        // output computed only from inactive inputs) is a structural zero (JAX's `which_nz_out`), so the tangent callee
-        // is projected onto the live output tangents, and every other output is paired with a structurally zero
-        // tangent. When no output tangent is live and the tangent callee has no observable effects, no tangent call is
-        // bound, and the source callee is bound as the primal call, since nothing would consume its residuals.
-        //
-        // The tangent program's leading inputs are compact active tangents, not the original primal input indices;
-        // trailing residual inputs are held independent during dependence analysis. Linearization has validated both
-        // boundaries, so subtracting the residual count cannot underflow.
-        let tangent_program = linearization.tangent();
-        let tangent_input_count = tangent_program.input_count() - linearization.residual_count();
-        let tangent_slots = linearization.tangent_output_slots().to_vec();
-        let mut dependence =
-            tangent_program.output_dependence(&(0..tangent_input_count).collect::<Vec<_>>())?.into_iter();
-
-        // Map compact tangent output dependence back to the original callee's output order. Outputs without tangent
-        // slots consume no dependence entry; trailing primal residual outputs are outside this boundary entirely.
-        let output_activity = tangent_slots[..output_count]
-            .iter()
-            .map(|&slot| slot && dependence.next().unwrap())
-            .collect::<Vec<_>>();
-        let live_tangent_slots = (0..output_count)
-            .filter(|&index| tangent_slots[index])
-            .enumerate()
-            .filter_map(|(slot, index)| output_activity[index].then_some(slot))
-            .collect::<Vec<_>>();
-
-        // Output projection retains the complete tangent/residual input boundary and observable effects. Keep the
-        // shared callee handle when every slot is live, preserving the `Arc` identity used for callee interning.
-        let tangent_program = if live_tangent_slots.len() == tangent_program.output_count() {
-            tangent_program.clone()
-        } else {
-            Arc::new(tangent_program.as_ref().clone().with_outputs(&live_tangent_slots)?)
-        };
-        let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        if !output_activity.contains(&true) && !tangent_program.effects().is_retained_when_unused() {
-            let callee = shared_jit_call_callee(callee)?;
-            return context
-                .primal()
-                .bind(Operation::JitCall(self.clone()), AttachedRegions::Callees(&[callee]), &primal_operands)?
-                .into_iter()
-                .map(DifferentiationDual::new_with_zero_tangent)
-                .collect();
-        }
-        let (primal_program, ..) = linearization.into_parts();
-
-        // Wrap the primal sub-program in a fresh `jit_call` and bind it over the operand primals, recovering the
-        // primal outputs followed by the residual values. The shared sub-program handles are attached directly, so
-        // repeated binds of one derived callee intern by `Arc` identity instead of copying it again.
-        // The primal sub-program preserves the callee's inputs in order, so the original lifted-capture prefix
-        // survives verbatim and its length carries over.
-        let primal_call = Operation::JitCall(
-            JitCallOperation::new(self.capture_count()).with_callee_region(primal_program.entry_region_ref())?,
-        );
-        let mut primal_call_outputs =
-            context.primal().bind(primal_call, AttachedRegions::Callees(&[primal_program]), &primal_operands)?;
-        if primal_call_outputs.len() < output_count {
-            return Err(ProgramError::MalformedProgram(format!(
-                "jit_call primal program produced {} outputs which is fewer than its {output_count} primal \
-                 output(s)",
-                primal_call_outputs.len(),
-            ))
-            .into());
-        }
-        let residuals = primal_call_outputs.split_off(output_count);
-        let primal_outputs = primal_call_outputs;
-
-        // Wrap the tangent sub-program in a fresh `jit_call` and bind it over only the active operand tangents followed
-        // by the residual values. Structurally zero tangents are inactive, so every active operand tangent is a live
-        // value and materializing it only unwraps it, while inactive operands (the capture prefix, structurally zero
-        // tangents, zero-space operands, and plumbing references) have no compact callee boundary slot.
-        let mut tangent_operands = inputs
-            .iter()
-            .zip(&activity)
-            .filter(|(_, active)| **active)
-            .map(|(input, _)| input.tangent().clone().materialize(context.tangent()))
-            .collect::<Result<Vec<_>, _>>()?;
-        tangent_operands.extend(
-            residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?,
-        );
-        // The tangent callee's inputs are live input tangents followed by residuals — never a lifted-capture prefix.
-        // Attached-region capture constants cannot appear in it because fresh-root region traces reject bodies that
-        // register captures (`ProgramError::DiscardedCaptures`), and a stale reference that slipped in anyway would
-        // fail lowering loudly against the tangent callee's empty capture prefix instead of aliasing an unrelated
-        // value.
-        let tangent_call =
-            Operation::JitCall(JitCallOperation::new(0).with_callee_region(tangent_program.entry_region_ref())?);
-        let tangent_outputs =
-            context
-                .tangent()
-                .bind(tangent_call, AttachedRegions::Callees(&[tangent_program]), &tangent_operands)?;
-        let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
-        check_count!("output", tangent_outputs, tangent_output_count, ProgramError);
-
-        let mut tangent_outputs = tangent_outputs.into_iter();
-        Ok(primal_outputs
-            .into_iter()
-            .zip(output_activity)
-            .map(|(primal, active)| {
-                if !active {
-                    DifferentiationDual::new_with_zero_tangent(primal)
-                } else {
-                    DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-}
-
-/// Transposes a tangent [`JitCallOperation`] while retaining its compilation boundary.
-///
-/// The [`TranspositionDriver`] transposes the attached callee under the operands' linearity and cotangent-destination
-/// masks and the structural zeros of its output cotangents. Known operands supply residual or captured values and may
-/// appear anywhere in the input boundary. The transposed call consumes the ordinary output cotangents that are not
-/// structural zeros, live cotangent references, and known operands, in that order. A structural-zero output cotangent
-/// seeds nothing, so it has no input in the transposed call and is not materialized at the call boundary (a dense
-/// backward rule inside the callee may still materialize the zero that it consumes). Reference outputs forward input
-/// roots and therefore have no separate output-cotangent slot.
-///
-/// Returned cotangents follow the original input order: linear value inputs receive call results, reference inputs
-/// accumulate into their supplied cotangent destinations, and known or ignored inputs receive structural zeros.
-///
-/// # Parameters
-///
-///   - `operation`: Primal tangent `jit_call` staged into the tangent program.
-///   - `context`: Active transpose tracing context the pullback is staged into.
-///   - `driver`: Instruction-scoped access to the attached callee region and its recursive transposition machinery.
-///   - `inputs`: Per-operand [`PartialValue`] knowledge, mirroring the callee's inputs one-to-one. The
-///     [`Unknown`](PartialValue::Unknown) entries are the input tangents; the [`Known`](PartialValue::Known) entries
-///     carry the residual and captured-constant-tangent tracers the pullback reads.
-///   - `outputs`: Symbolic cotangents for the tangent call's outputs, one per callee output. A
-///     [`Zero`](MaybeZero::Zero) entry has no input in the transposed call.
-///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
-///     [`TranspositionContext::cotangent_destinations`]). The callee is transposed with their destination kinds, so a
-///     live (`Reference`-kind) reference operand's cotangent reference is an operand of the transposed call, which
-///     accumulates into it in place and returns it by identity, while a dead (`Ignore`-kind) reference operand has no
-///     slot in the transposed callee at all.
-pub fn transpose_primal_jit_call<
-    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
-    D: TranspositionDriver<V, Operation<V>>,
->(
-    _operation: &JitCallOperation<ArrayIrType>,
-    context: &mut TracingContext<V, Operation<V>>,
-    driver: &D,
-    inputs: &[PartialValue<CoreTracer<TracingContext<V, Operation<V>>>>],
-    outputs: &[MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>],
-    cotangents: &CotangentDestinations<CoreTracer<TracingContext<V, Operation<V>>>>,
-) -> Result<Vec<MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>>, ProgramError> {
-    // A `jit_call` operation with no live output cotangents and no live reference operand is a zero linear map, so every
-    // operand cotangent is zero. A live reference operand keeps the call live, because its accumulated state cotangent
-    // flows through the transposed callee even when no ordinary output cotangent does. A callee with deferred work or
-    // observable rule effects also keeps it live.
-    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
-    if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.must_transpose()
-    {
-        return inputs
-            .iter()
-            .map(|input| input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from))
-            .collect();
-    }
-
-    // Each operand maps to one callee input, independently linear (an input tangent) or known (a residual value or a
-    // captured-constant tangent). The linear operands need not lead: a captured compiled function threads its captured
-    // prefix as known leading operands. The dispatch guarantees a `Known` operand carries its pullback value, so each
-    // known tracer is read directly in callee-input order.
-    let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
-    let callee = driver.region(0)?;
-    check_count!("input", operand_linear, callee.input_types().len(), ProgramError);
-
-    // Transpose the callee with respect to its linear inputs and with its structural-zero output cotangents flagged,
-    // through the region's retained transform cache so that a callee shared by several outer programs is transposed
-    // once per linearity and seed mask. A live reference-typed linear input is transposed with a `Reference`
-    // destination and a dead one with an `Ignore` destination, so the transposed callee maps
-    // `[live_non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
-    // `[linear_input_cotangents...]`, in callee-input order, where a live reference input's cotangent is its cotangent
-    // reference itself and a dead reference input has no cotangent slot. The flags follow the callee's complete output
-    // order; flags of reference outputs are normalized away because those outputs never own a cotangent slot.
-    let (input_indices, destination_kinds): (Vec<_>, Vec<_>) = operand_linear
-        .iter()
-        .zip(cotangents.kinds())
-        .enumerate()
-        .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
-        .unzip();
-    let output_types = callee.output_types();
-    check_count!("output", outputs, output_types.len(), ProgramError);
-    let zero_output_cotangents = outputs.iter().map(MaybeZero::is_zero).collect::<Vec<_>>();
-    let transposed_callee = driver.transpose_program_with_zero_seeds(
-        callee,
-        &input_indices,
-        &[],
-        &zero_output_cotangents,
-        &destination_kinds,
-    )?;
-
-    // Stage a fresh `jit_call` over the transposed callee on `[live_outputs..., cotangent_references...,
-    // known_input_values...]`. Its outputs are the linear-input cotangents. A reference output forwards a callee input
-    // root whose state cotangent lives in that operand's cotangent reference, so it owns no cotangent slot.
-    let mut operands = Vec::with_capacity(output_types.len() + inputs.len());
-    operands.extend(
-        outputs
-            .iter()
-            .zip(output_types.iter())
-            .filter(|(_, output_type)| !output_type.is_reference())
-            .filter_map(|(cotangent, _)| cotangent.as_value())
-            .cloned(),
-    );
-    operands.extend(cotangents.references().iter().cloned());
-    operands.extend(inputs.iter().filter_map(PartialValue::as_known).cloned());
-    // The transposed callee's inputs are live output cotangents, cotangent references, and known input values — never
-    // a lifted-capture prefix. Attached-region capture constants cannot appear in it because region bodies are traced
-    // through fresh-root contexts.
-    let transposed_call = Operation::JitCall(
-        JitCallOperation::new(0).with_callee_region(transposed_callee.program().entry_region_ref())?,
-    );
-    let input_cotangents = context.bind(
-        transposed_call,
-        AttachedRegions::Callees(&[transposed_callee.program().clone()]),
-        operands.as_slice(),
-    )?;
-    let cotangent_types = input_indices
-        .iter()
-        .map(|&index| inputs[index].r#type().cotangent().map_err(ProgramError::from))
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut input_cotangents = transposed_callee.assemble_cotangents(&cotangent_types, input_cotangents)?.into_iter();
-
-    // Reassemble selected cotangents from the call's compact output boundary. Known and ignored inputs carry
-    // structural zeros. Reference-state outputs only thread the caller-owned destination, so they do not contribute
-    // a value cotangent to the enclosing context.
-    inputs
-        .iter()
-        .map(|input| {
-            let cotangent = if input.is_unknown() { input_cotangents.next().unwrap() } else { None };
-            if !input.r#type().is_reference() {
-                if let Some(cotangent) = cotangent {
-                    return Ok(cotangent);
-                }
-            }
-            input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
-        })
-        .collect()
-}
-
-// Transpose rule for a primal tangent [`JitCallOperation`], forwarding to [`transpose_primal_jit_call`] with the
-// cotangent references of its linear reference-typed operands resolved (and allocated on first use) through the
-// enclosing [`TranspositionContext`]. The callee transposition happens on the concretely [`Constant`]-keyed
-// [`FlatProgram`], so the recursion is resolved once at definition time and instantiating this implementation
-// introduces no recursive [`TransposableOperation`] obligation on [`Operation`].
-impl<V> TransposableOperation<V, Operation<V>> for JitCallOperation<ArrayIrType>
-where
-    V: CoreValue<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: CoreValue<Type = ArrayType>>,
-{
-    fn transpose<D: TranspositionDriver<V, Operation<V>>>(
-        &self,
-        context: &mut TranspositionContext<V, Operation<V>>,
-        driver: &D,
-        inputs: &[PartialValue<CoreTracer<TracingContext<V, Operation<V>>>>],
-        outputs: &[MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>],
-        accumulators: &[ryft_core::CotangentAccumulator],
-    ) -> Result<(), DifferentiationError> {
-        check_count!("output", outputs, driver.region(0)?.output_types().len(), ProgramError);
-        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-        let contributions =
-            (|| -> Result<Vec<MaybeZero<CoreTracer<TracingContext<V, Operation<V>>>>>, DifferentiationError> {
-                let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
-                transpose_primal_jit_call(self, context, driver, inputs, outputs, &cotangents)
-                    .map_err(DifferentiationError::from)
-            })()?;
-        check_count!("input", contributions, accumulators.len(), ProgramError);
-        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-            accumulator.accumulate(context, contribution)?;
-        }
-        Ok(())
-    }
-}
-
-// Eager interpretation of a staged `jit_call` operation over concrete [`Array`]s. Top-level flat programs containing
-// `jit_call` instructions (for example the pullbacks produced by eager `vjp`/`grad`) replay through
-// [`Program::interpret_in_context`](ryft_core::Program::interpret_in_context), whose bind channel hands the callee
-// region to [`Context::bind`] so the call is compiled whole through this domain's dispatch cache and executed on its
-// PJRT client — mirroring JAX dispatching a JIT-compiled function called from eager code straight to the compiled
-// executable. This rule covers the remaining path — a `jit_call` nested inside another region being interpreted —
-// by re-entering the active interpreter on the callee region, which dispatches the callee's operations one by one
-// through this same domain.
-impl<'c> InterpretableOperation<Domain<'c>> for JitCallOperation<ArrayIrType> {
-    fn interpret<D: InterpretationDriver<Domain<'c>>>(
-        &self,
-        context: &Domain<'c>,
-        driver: &D,
-        inputs: &[Value<'c>],
-    ) -> Result<Vec<Value<'c>>, ProgramError> {
-        let callee = driver.region(0)?;
-        let renaming = self.output_renaming(&callee.input_types(), &callee.output_types())?;
-        driver
-            .interpret_region(context, 0, inputs.to_vec())?
-            .iter()
-            .map(|value| value.rename_type_identities(&renaming).map_err(Into::into))
-            .collect()
-    }
-}
-
-impl LowerableOperation for JitCallOperation<ArrayIrType> {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayIrType],
-        _output_types: &[ArrayIrType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        self.validate_region_count(lowerer.regions.len())?;
-        let [callee] = lowerer.regions.as_slice() else { unreachable!("validated jit_call region count") };
-        lower_jit_call(
-            callee,
-            self.capture_count(),
-            input_values,
-            lowerer.captured_values.as_slice(),
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-            lowerer.nested_functions.as_ref(),
-            &lowerer.collective_state,
-            &mut lowerer.effect_tokens,
-        )
-    }
-}
-
-/// [`Region`](CoreRegion) [`Transform`] marker for the shared copy of a `jit_call` callee that
-/// [`shared_jit_call_callee`] retains for a callee region that is not interned as a shared region (e.g., the entry
-/// region of a shared callee program that a rule binds directly, such as the primal or tangent callee of a linearized
-/// call). Binding that copy instead of a fresh copy of the region lets every call of one callee share one region.
-struct JitCallCalleeTransform;
-
-impl<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>> Transform<CoreRegion<V, O>>
-    for JitCallCalleeTransform
-{
-    type Arguments = ();
-    type Artifact = TransformArtifact<V, O, ()>;
-
-    const DEFAULT_CACHE_CAPACITY: usize = 1;
-}
-
-/// [`Region`](CoreRegion) [`Transform`] marker for the splits of a `jit_call` callee that [`split_jit_call`] binds.
-/// Such a split partitions the callee in fresh traces, where every input is a fresh known or unknown input, so it
-/// depends on no value of a live context and is a structural function of the callee and of its
-/// [`JitCallSplitArguments`]. Every call of one callee with the same arguments therefore shares one split, as JAX's
-/// call partial evaluation rules share one split per callee, knownness, and policy through their caches.
-struct JitCallSplitTransform;
-
-impl<V: CoreValue<Type = ArrayIrType>, O: CoreOperation<Type = ArrayIrType>> Transform<CoreRegion<V, O>>
-    for JitCallSplitTransform
-{
-    type Arguments = JitCallSplitArguments;
-    type Artifact = TransformArtifact<V, O, Arc<JitCallSplit>>;
-
-    const DEFAULT_CACHE_CAPACITY: usize = 8;
-}
-
-/// Kind of a retained [`JitCallSplitTransform`] split.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum JitCallSplitKind {
-    /// Split of a call whose inputs are partially known, marked in input order (refer to
-    /// [`PartialEvaluationDriver::partition_program`]).
-    Knownness(Vec<bool>),
-
-    /// Split of an all-known call on residual demand for the outputs of the callee that the residual planner demands,
-    /// marked in output order (refer to [`PartialEvaluationContext::partition_residual_demand`]).
-    ResidualDemand(Vec<bool>),
-}
-
-/// Argument key for one retained [`JitCallSplitTransform`].
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct JitCallSplitArguments {
-    /// Kind of the split.
-    kind: JitCallSplitKind,
-
-    /// Residual policy that places the residuals of the split and of the splits nested within it, compared by
-    /// definition identity, or [`None`] when partial evaluation has no residual policy.
-    policy: Option<ResidualPolicyReference<ArrayIrType>>,
-
-    /// Type of the rounding with which the placement of the residuals of the split also rounds the values that the
-    /// known callee saves (refer to [`PartialEvaluationContext::residual_rounding_type`]), which stages rounding
-    /// operations in the known callee, or [`None`] when the placement keeps those values unrounded.
-    residual_rounding_type: Option<TypeId>,
-
-    /// Whether effectful operations with known inputs may fold into the known callee (refer to
-    /// [`PartialEvaluationContext::allow_effect_folding`]).
-    allow_effect_folding: bool,
-
-    /// Whether recursive partitioning analyzes repeated residual invocations, which changes effect placement (refer
-    /// to [`PartialEvaluationDriver::partitions_for_repeated_residual_calls`]). Pure and residual-demand splits use
-    /// `false` because their partitions do not depend on this mode.
-    repeated_residual: bool,
-}
-
-/// Boundary wiring of a retained [`JitCallSplitTransform`] artifact, whose programs are the known callee and the
-/// residual callee, in that order. The known callee returns the known outputs of the original callee followed by the
-/// residual edges that the residual callee reads from it, and the residual callee returns the remaining outputs (i.e.,
-/// the demanded outputs for a split on residual demand). Refer to [`PartitionedProgram`](ryft_core::PartitionedProgram)
-/// for more information on this layout.
-#[derive(Clone, Debug, PartialEq)]
-struct JitCallSplit {
-    /// Index of the call input feeding each input of the known callee, in order.
-    known_input_indices: Vec<usize>,
-
-    /// Source of each input of the residual callee, which is a call input, an output of the known callee, or a
-    /// residual edge.
-    residual_inputs: Vec<ResidualInputSource>,
-
-    /// Source of each output of the call, in output order, which is a known output of the known callee or an output of
-    /// the residual callee.
-    outputs: Vec<PartialEvaluationOutput<usize>>,
 }
 
 /// Returns the callee of a `jit_call` bound over `callee` as a shared program, which is the program that `callee` was
@@ -2252,34 +2227,101 @@ where
         .collect())
 }
 
+/// Lowers one `jit_call` to either a `func.call` of a shared private function (when its callee was deduplicated) or
+/// an inlined copy of the callee body (otherwise).
+///
+/// `input_values` are the lowered call operands in callee-input order. `capture_count` is the operation payload's
+/// exact leading lifted-capture prefix length. Deriving it from capture-constant indices instead would conflate the
+/// independent capture namespaces of nested calls inside the callee arena. `caller_captured_values` are the captured
+/// values of the calling scope, whose session-constant suffix the inlined callee inherits (refer to
+/// [`CollectiveLoweringState::session_values`]).
+#[allow(clippy::too_many_arguments)]
+fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    program: &FlatProgram<O>,
+    capture_count: usize,
+    input_values: &[ValueRef<'b, 'c, 't>],
+    caller_captured_values: &[ValueRef<'b, 'c, 't>],
+    block: &mut BlockRef<'b, 'c, 't>,
+    context: &'c MlirContext<'t>,
+    location: LocationRef<'c, 't>,
+    nested_functions: Option<&Rc<JitCallFunctionMap<O>>>,
+    collective_state: &CollectiveLoweringState,
+    effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+    // Only pure callees are ever deduplicated (`collect_jit_call_functions` skips effectful programs), so the shared
+    // function path below never interacts with the caller's effect tokens. Effectful callees always take the inline
+    // path, which threads the caller's per-class tokens through the callee body in program order.
+    if let Some(map) = nested_functions {
+        if let Some(function) = map.get(program) {
+            // The `jit_call` operation's type inference already pins its operands to the callee input types, so a
+            // matching arity is the only guard needed before emitting the symbol call. Anything else inlines.
+            if input_values.len() == function.input_types.len() {
+                return lower_shared_function_call(
+                    &function.symbol,
+                    &function.output_types,
+                    input_values,
+                    block,
+                    context,
+                    location,
+                );
+            }
+        }
+    }
+    if input_values.len() < capture_count {
+        // The provided inputs cover the leading captures, so the first capture without a value is the next one.
+        return Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: input_values.len() }));
+    }
+    // The callee's capture references name its own leading inputs, while session constants remain module-scoped.
+    let mut captured_values = input_values[..capture_count].to_vec();
+    captured_values.extend_from_slice(collective_state.session_values(caller_captured_values));
+    lower_nested_program_inline(
+        program,
+        input_values,
+        block,
+        context,
+        location,
+        captured_values.as_slice(),
+        &RematerializationOptimizationBarrier::None,
+        nested_functions,
+        collective_state,
+        effect_tokens,
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, AssertOperation, AtomId,
-        AxisIndexOperation, BroadcastOperation, CaptureReference, CompareOperation, ComparisonDirection,
-        CompositeJvpRule, CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context,
-        ConvertElementTypeOperation, CosOperation, CotangentDestinationKind, CotangentDestinations,
-        CustomCallOperation, DataType, DifferentiableType, DifferentiationError, Dimension as CoreDimension,
-        DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable,
-        DotDimensionNumbers, DotOperation, DotsSavable, DynamicBroadcastOperation, EffectClass, EffectClasses,
-        InputRegionProvenance, IotaOperation, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, NoStorage,
-        NothingSavable, Operation as CoreOperation, OutputRegionProvenance, PartialValue, Placeholder, PrintOperation,
-        ProgramBuilder as CoreProgramBuilder, ProgramError, RecursiveBatchingDriver, ReferenceAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
-        ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver, RegionInterface, RegionRef,
-        RematerializeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyReference,
-        ResidualRejection, SaveOnlyTheseNames, ScanOperation, Shape, Sharding, ShardingDimension, SinOperation,
-        StagingContext, TagOperation, Tracer as CoreTracer, TracingContext, TransposeOperation, TransposedProgram,
-        TransposedProgramCotangent, TranspositionDriver, TypeError, TypeIdentity, Typed, TypedProgram,
-        Value as CoreValue, ZeroLikeOperation, ZeroOperation,
+        AddOperation, Array as CoreArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayOperation, ArrayType,
+        AssertOperation, AtomId, AttachedRegions, AxisIndexOperation, BatchableOperation, BatchingContext,
+        BroadcastOperation, CaptureReference, CompareOperation, ComparisonDirection, CompositeJvpRule,
+        CompositeOperation, CompositeTransposeOperation, ConditionOperation, Context, ConvertElementTypeOperation,
+        CosOperation, CotangentDestinationKind, CotangentDestinations, CustomCallOperation, CustomRuleDefinition,
+        CustomRuleRegistration, DataType, DifferentiableType, DifferentiationError, Dimension as CoreDimension,
+        DimensionBounds, DimensionFromScalarOperation, DimensionToScalarOperation, DimensionType, DimensionValue,
+        DimensionVariable, DotDimensionNumbers, DotOperation, DotsSavable, DynamicBroadcastOperation, EffectClass,
+        EffectClasses, InputRegionProvenance, IotaOperation, Linearization, LogicalMesh, MaybeZero, MeshAxis,
+        MeshAxisType, MulOperation, NamedComposite, NoStorage, NothingSavable, Operation as CoreOperation,
+        OutputRegionProvenance, PartialEvaluationContext, PartialEvaluationInput, PartialEvaluationOutput,
+        PartialValue, Placeholder, PrintOperation, ProgramBuilder as CoreProgramBuilder, ProgramError,
+        RecursiveBatchingDriver, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, RegionDataFlow, RegionDriver,
+        RegionInterface, RegionRef, RematerializationPolicyFn, RematerializeOperation, ResidualCandidate,
+        ResidualDecision, ResidualPolicy, ResidualPolicyError, ResidualPolicyReference, ResidualRejection,
+        SaveOnlyTheseNames, ScanOperation, Shape, Sharding, ShardingDimension, Sin, SinOperation, StagingContext,
+        TagOperation, Tracer as CoreTracer, TracingContext, TransposeOperation, TransposedProgram,
+        TransposedProgramCotangent, TranspositionDriver, TypeError, TypeIdentity, Typed, TypedProgram, ValueProjection,
+        ZeroLikeOperation, ZeroOperation,
     };
     use ryft_macros::Operation;
+    use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
+    use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::domains::runtimes::builtin_requirement;
+    use crate::domains::tests::{domain_mesh, read_f32s};
     use crate::domains::with_runtime_requirements;
     use crate::lowering::lower_mlir_module_for_program;
     use crate::lowering::tests::{
@@ -2290,13 +2332,16 @@ mod tests {
     use crate::operations::{Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, values_from_bytes, values_to_bytes, vector_type};
     use crate::values::ArrayConstant;
-    use crate::{Array, Constant, ToPjrt, to_mlir_module_for_program};
+    use crate::{
+        Array, CompiledFunction, Constant, Options, Session, StagedFunction, ToPjrt, Value, compile, stage,
+        to_mlir_module_for_program,
+    };
 
     use super::*;
 
     /// Test-only driver that exposes one source callee and returns a predetermined transpose for it.
     struct TestTranspositionDriver {
-        /// Source callee exposed to the JIT-call transpose rule.
+        /// Source callee exposed to the `jit_call` transpose rule.
         source: Program<Vec<Constant>, Vec<Constant>>,
 
         /// Predetermined transposed callee returned by the recursive request.
@@ -2318,13 +2363,14 @@ mod tests {
             &self,
             region: RegionRef<'_, Constant, Operation>,
             input_indices: &[usize],
-            _materialize_zeros: &[bool],
+            materialize_zeros: &[bool],
             destination_kinds: &[CotangentDestinationKind],
         ) -> Result<TransposedProgram<Constant, Operation>, DifferentiationError> {
-            // The predetermined program must have the boundary of the requested region's transposition: one input per
-            // non-reference output, per `Reference` destination, and per known input. The default zero-seed request
-            // projects the region onto its unflagged outputs before calling this function, so this also pins the
-            // structural-zero seed mask that the rule requests.
+            let _ = materialize_zeros;
+            // The predetermined program must have the boundary of the requested region's transposition, with one input
+            // per non-reference output, per `Reference` destination, and per known input. The default zero-seed
+            // request projects the region onto its unflagged outputs before calling this function, so this also pins
+            // the structural zero seed mask that the rule requests.
             let input_types = region.input_types();
             let output_count = region.output_types().iter().filter(|r#type| !r#type.is_reference()).count();
             let reference_count =
@@ -2368,7 +2414,7 @@ mod tests {
             .collect()
     }
 
-    /// Builds a mixed-call fixture with one print in each partition: `known = print(k * k)` and
+    /// Builds a mixed-call fixture with one print in each partition, i.e., `known = print(k * k)` and
     /// `residual = print(x * known)`. Its two scalar inputs are the known coefficient and the unknown value.
     fn effectful_mixed_callee(effect_class: EffectClass) -> Arc<FlatProgram> {
         let mut builder = ArrayIrProgramBuilder::new();
@@ -2408,11 +2454,6 @@ mod tests {
         program: &Program<Vec<Constant>, Vec<Constant>>,
         values: Vec<Vec<u8>>,
     ) -> Vec<Vec<u8>> {
-        use ryft_pjrt::protos::{CompilationOptions, ExecutableCompilationOptions};
-        use ryft_pjrt::{ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
-
-        use crate::to_mlir_module_for_program;
-
         let array_type = |r#type: &ArrayIrType| match r#type {
             ArrayIrType::Array(r#type) => r#type.clone(),
             _ => panic!("expected an array signature"),
@@ -2614,62 +2655,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_jit_call_capture_prefix_ignores_nested_call_capture_namespaces() {
-        // The inner callee establishes its own two-slot capture namespace: its first two inputs are its lifted
-        // captures, and its body resolves the constant `Captured(1)` against that prefix. Deriving the OUTER call's
-        // capture prefix from capture-constant indices anywhere in the callee arena would conflate the namespaces
-        // and reject this program with a false missing-capture error; the operation payload is authoritative.
-        let array_type = test_vector_type(4);
-        let inner = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let first_capture = builder.add_input(array_type.clone().into());
-            let _second_capture = builder.add_input(array_type.clone().into());
-            let second = builder.add_constant(Constant::Captured(CaptureReference::new(1, array_type.clone().into())));
-            let output =
-                builder.add_instruction(AddOperation::new(), Vec::new(), vec![first_capture, second], None).unwrap()[0];
-            Arc::new(
-                builder
-                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                    .unwrap(),
-            )
-        };
-        let outer = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let input = builder.add_input(array_type.clone().into());
-            let callee_region = builder.intern_callee(&inner, None).unwrap();
-            let output = builder
-                .add_instruction(
-                    Operation::JitCall(JitCallOperation::new(2)),
-                    vec![callee_region],
-                    vec![input, input],
-                    None,
-                )
-                .unwrap()[0];
-            Arc::new(
-                builder
-                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                    .unwrap(),
-            )
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(array_type.clone().into());
-        let callee_region = builder.intern_callee(&outer, None).unwrap();
-        let output = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let input_types = vec![array_type.clone()];
-        let output_types = vec![array_type];
-        let stablehlo =
-            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
-        assert_eq!(stablehlo.matches("stablehlo.add").count(), 1, "{stablehlo}");
-    }
-
-    /// Builds the flat callee `f(x) = x + x` over a vector type, returned behind an [`Rc`] so callers control
-    /// whether `jit_call` sites share one program (pointer identity) or use structurally-identical distinct programs.
+    /// Builds the flat callee `f(x) = x + x` over a vector type, returned behind an [`Arc`] so callers control
+    /// whether `jit_call` sites share one program (i.e., by pointer identity) or use structurally identical distinct
+    /// programs.
     fn add_self_callee(input_type: ArrayType) -> Arc<FlatProgram> {
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(input_type.into());
@@ -2677,9 +2665,9 @@ mod tests {
         Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
 
-    /// Lowers an outer program that calls `callees` (one `jit_call` each) and sums the results, returning the
-    /// module text. Each callee is `f(x) = x + x`; the outer function is `g(x) = sum_i callee_i(x)`.
-    fn lower_two_jit_call_module(callees: Vec<Arc<FlatProgram>>) -> String {
+    /// Lowers an outer program that calls each of `callees` through one `jit_call` and sums the results, returning
+    /// the module text. Each callee is `f(x) = x + x`, and the outer function is `g(x) = sum_i callee_i(x)`.
+    fn lower_jit_call_sum_module(callees: Vec<Arc<FlatProgram>>) -> String {
         let array_type = test_vector_type(4);
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(array_type.clone().into());
@@ -2694,21 +2682,38 @@ mod tests {
             });
         }
         let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(
-                vec![accumulator.expect("at least one callee")],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
+            .build::<Vec<Constant>, Vec<Constant>>(vec![accumulator.unwrap()], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let input_types = vec![array_type.clone()];
         let output_types = vec![array_type];
         to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap()
     }
 
+    /// Builds the flat callee `f(p, x) = if p { -x } else { x }`, whose body contains a `condition` instruction. Its
+    /// nested branch bodies render contextually into the callee's canonical program text, so separately constructed
+    /// copies of this callee remain eligible for structural `jit_call` deduplication.
+    fn condition_callee() -> Arc<FlatProgram> {
+        let vector_type = test_vector_type(4);
+        let mut builder = ArrayIrProgramBuilder::new();
+        let true_region = builder.import_program(unproject_plain_program(neg_branch(vector_type.clone())));
+        let false_region = builder.import_program(unproject_plain_program(identity_branch(vector_type.clone())));
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(vector_type.into());
+        let output = builder
+            .add_instruction(
+                Operation::Condition(ConditionOperation::new()),
+                vec![true_region, false_region],
+                vec![predicate, input],
+                None,
+            )
+            .unwrap()[0];
+        Arc::new(builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap())
+    }
+
     #[test]
-    fn test_repeated_jit_call_sharing_one_program_emits_one_shared_function() {
+    fn test_collect_jit_call_functions() {
         let callee = add_self_callee(test_vector_type(4));
-        let module = lower_two_jit_call_module(vec![callee.clone(), callee]);
+        let module = lower_jit_call_sum_module(vec![callee.clone(), callee]);
 
         // Both calls of the one shared program collapse to a single private `func.func` plus two `func.call`s.
         assert_eq!(
@@ -2731,12 +2736,12 @@ mod tests {
     }
 
     #[test]
-    fn test_structurally_identical_jit_calls_share_one_function() {
-        // Two distinct programs (separate `Rc`s) with identical structure — the shape produced when a transform such
-        // as `grad` linearizes each of several identical blocks into its own staged program — must still deduplicate
-        // into the same single shared function as the pointer-identical case above.
+    fn test_collect_jit_call_functions_shares_structurally_identical_programs() {
+        // Two distinct programs (i.e., separate `Arc`s) with identical structure must still deduplicate into the same
+        // single shared function as the pointer-identical case above. This is the shape produced when a transform
+        // such as `grad` linearizes each of several identical blocks into its own staged program.
         let module =
-            lower_two_jit_call_module(vec![add_self_callee(test_vector_type(4)), add_self_callee(test_vector_type(4))]);
+            lower_jit_call_sum_module(vec![add_self_callee(test_vector_type(4)), add_self_callee(test_vector_type(4))]);
 
         assert_eq!(
             module,
@@ -2758,10 +2763,10 @@ mod tests {
     }
 
     #[test]
-    fn test_single_jit_call_is_inlined() {
+    fn test_collect_jit_call_functions_inlines_single_calls() {
         // A single-occurrence callee stays below the dedup threshold and inlines, so no shared function is emitted
         // and the callee body appears directly in `@main`.
-        let module = lower_two_jit_call_module(vec![add_self_callee(test_vector_type(4))]);
+        let module = lower_jit_call_sum_module(vec![add_self_callee(test_vector_type(4))]);
 
         assert_eq!(
             module,
@@ -2777,9 +2782,7 @@ mod tests {
     }
 
     #[test]
-    fn test_runtime_requirements_include_shared_callees_but_exclude_dormant_rules() {
-        use ryft_core::{CustomRuleDefinition, CustomRuleRegistration, NamedComposite};
-
+    fn test_collect_jit_call_functions_excludes_dormant_regions() {
         let array_type = test_vector_type(4);
         let callee = |identifier| {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -2852,12 +2855,26 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(lowered.runtime_requirements.as_ref(), &[builtin_requirement("test.active")]);
-        assert!(lowered.stable_hlo.contains("func.func private @jit_call_0"));
-        assert_eq!(lowered.stable_hlo.matches("call @jit_call_0").count(), 2);
-        assert!(!lowered.stable_hlo.contains("test.dormant"));
+        assert_eq!(lowered.runtime_requirements().as_ref(), &[builtin_requirement("test.active")]);
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                module {
+                  func.func private @jit_call_0(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.custom_call @test.active(%arg0) {api_version = 4 : i32, backend_config = {}, operand_layouts = [dense<0> : tensor<1xindex>], result_layouts = [dense<0> : tensor<1xindex>]} : (tensor<4xf32>) -> tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = call @jit_call_0(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %1 = call @jit_call_0(%arg0) : (tensor<4xf32>) -> tensor<4xf32>
+                    %2 = stablehlo.add %0, %1 : tensor<4xf32>
+                    return %2 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
 
-        // Backend replacement also makes a source region dormant: helper discovery must not emit its callees.
+        // Backend replacement also makes a source region dormant, so helper discovery must not emit its callees.
         let named = NamedComposite::new(
             CompositeKey::new("ryft.tests.xla_named_square", 1),
             |types: &[ArrayIrType]| Ok(types.to_vec()),
@@ -2891,17 +2908,25 @@ mod tests {
         )
         .unwrap();
 
-        assert!(lowered.runtime_requirements.is_empty());
-        assert!(lowered.stable_hlo.contains("stablehlo.multiply"));
-        assert!(!lowered.stable_hlo.contains("test.active"));
-        assert!(!lowered.stable_hlo.contains("func.func private"));
+        assert!(lowered.runtime_requirements().is_empty());
+        assert_eq!(
+            lowered.stable_hlo(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.multiply %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_jit_call_dedup_does_not_traverse_shard_map_bodies() {
-        // Phase 0 boundary pin for the first-class-program-regions plan: `count_jit_calls` intentionally skips
-        // shard-map bodies, so a callee that occurs twice inside a `shard_map` body never gets a shared
-        // `func.func private @jit_call_*` and both occurrences inline into the `sdy.manual_computation` region.
+    fn test_collect_jit_call_functions_skips_shard_map_bodies() {
+        // `count_jit_calls` intentionally skips `shard_map` bodies, so a callee that occurs twice inside a `shard_map`
+        // body never gets a shared `func.func private @jit_call_*` and both occurrences inline into the
+        // `sdy.manual_computation` region.
         let vector_type = test_vector_type(4);
         let callee = add_self_callee(vector_type.clone());
         let body_program = {
@@ -2936,34 +2961,12 @@ mod tests {
         );
     }
 
-    /// Builds a flat callee whose body contains a `condition` instruction (`f(p, x) = if p { -x } else { x }`),
-    /// making it ineligible for structural `jit_call` deduplication because its nested branch bodies do not render
-    /// into the callee's canonical program text.
-    fn condition_callee() -> Arc<FlatProgram> {
-        let vector_type = test_vector_type(4);
-        let mut builder = ArrayIrProgramBuilder::new();
-        let true_region = builder.import_program(unproject_plain_program(neg_branch(vector_type.clone())));
-        let false_region = builder.import_program(unproject_plain_program(identity_branch(vector_type.clone())));
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let input = builder.add_input(vector_type.into());
-        let output = builder
-            .add_instruction(
-                Operation::Condition(ConditionOperation::new()),
-                vec![true_region, false_region],
-                vec![predicate, input],
-                None,
-            )
-            .unwrap()[0];
-        Arc::new(builder.build(vec![output], vec![Placeholder, Placeholder], vec![Placeholder]).unwrap())
-    }
-
     #[test]
-    fn test_structurally_identical_jit_calls_with_nested_bodies_merge() {
+    fn test_collect_jit_call_functions_shares_programs_with_nested_bodies() {
         // With nested computations attached as regions, a callee's `condition` bodies render contextually inside its
         // canonical rendering, so two structurally identical but separately constructed callees share one structural
-        // identity and merge into a single emitted function — exactly like the body-free callees of
-        // `test_structurally_identical_jit_calls_share_one_function`. (Before first-class regions, nested bodies were
-        // payloads hidden from rendering and such callees deduplicated only by pointer identity.)
+        // identity and merge into a single emitted function, exactly like the body-free callees of
+        // `test_collect_jit_call_functions_shares_structurally_identical_programs`.
         let first = condition_callee();
         let second = condition_callee();
         let vector_type = test_vector_type(4);
@@ -3021,10 +3024,10 @@ mod tests {
     }
 
     #[test]
-    fn test_repeated_effectful_jit_call_callees_inline_and_chain_prints() {
+    fn test_collect_jit_call_functions_inlines_effectful_callees() {
         // A repeated `jit_call` callee that prints is excluded from function deduplication and inlines at every
-        // call site, so both inlined prints chain onto the caller's ordered-I/O token in program order (a shared
-        // token-free `func.func` could not preserve that ordering).
+        // call site, so both inlined prints chain onto the caller's ordered I/O token in program order, which a shared
+        // token-free `func.func` could not preserve.
         let array_type = test_vector_type(4);
         let mut callee_builder = ProgramBuilder::new();
         let callee_input = callee_builder.add_input(array_type.clone());
@@ -3037,7 +3040,7 @@ mod tests {
         let callee = Arc::new(unproject_plain_program(
             callee_builder.build(vec![callee_output], vec![Placeholder], vec![Placeholder]).unwrap(),
         ));
-        let module = lower_two_jit_call_module(vec![callee.clone(), callee]);
+        let module = lower_jit_call_sum_module(vec![callee.clone(), callee]);
 
         assert_eq!(
             module,
@@ -3058,7 +3061,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repeated_jit_call_callees_with_synthesized_guards_inline_and_order_later_io() {
+    fn test_collect_jit_call_functions_inlines_callees_with_synthesized_guards() {
         // The repeated callee is pure in the source program, but its inner conditional's mixed entry (a symbolic
         // `dimension<m>` and an exact `f64[2]` entering `[dimension<n>, f64[n]]`) gains an entry guard during lowering.
         // A shared token-free function could not order that guard, so the callee inlines at both call sites, and the
@@ -3119,21 +3122,63 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!module.contains("func.func private"), "{module}");
-        assert_eq!(module.matches("@ryft.assert").count(), 2, "{module}");
-        let print = module.lines().find(|line| line.contains("@ryft.print")).unwrap();
-        let print_token =
-            print.split_once("@ryft.print(").unwrap().1.split_once(')').unwrap().0.rsplit_once(", ").unwrap().1;
-        let definition = module.lines().find(|line| line.trim().starts_with(&format!("{print_token} = "))).unwrap();
-        assert!(!definition.contains("stablehlo.after_all  :"), "{module}");
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i1>, %arg1: tensor<i64>, %arg2: tensor<2xf64>) -> tensor<2xf64> {
+                    %c = stablehlo.constant dense<2> : tensor<i32>
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %0 = stablehlo.pad %arg2, %cst, low = [0], high = [5], interior = [0] : (tensor<2xf64>, tensor<f64>) -> tensor<7xf64>
+                    %1 = stablehlo.set_dimension_size %0, %c, dim = 0 : (tensor<7xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<7>>
+                    %c_0 = stablehlo.constant dense<2> : tensor<i64>
+                    %2 = stablehlo.compare EQ, %c_0, %arg1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %3 = stablehlo.after_all  : !stablehlo.token
+                    %4 = stablehlo.custom_call @ryft.assert(%2, %arg1, %c_0, %3) {api_version = 4 : i32, backend_config = {actor = "guard", kind = "generic", label_0 = "expected", label_1 = "actual", label_count = "2", message = "input dimension `n` must have one extent at the entry of `condition`"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                    %5 = "stablehlo.if"(%arg0) ({
+                      %c_4 = stablehlo.constant dense<7> : tensor<i32>
+                      %13 = stablehlo.set_dimension_size %1, %c_4, dim = 0 : (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
+                      %14 = stablehlo.slice %13 [0:2] : (tensor<7xf64>) -> tensor<2xf64>
+                      stablehlo.return %14 : tensor<2xf64>
+                    }, {
+                      %c_4 = stablehlo.constant dense<7> : tensor<i32>
+                      %13 = stablehlo.set_dimension_size %1, %c_4, dim = 0 : (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
+                      %14 = stablehlo.slice %13 [0:2] : (tensor<7xf64>) -> tensor<2xf64>
+                      stablehlo.return %14 : tensor<2xf64>
+                    }) : (tensor<i1>) -> tensor<2xf64>
+                    %c_1 = stablehlo.constant dense<2> : tensor<i32>
+                    %cst_2 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %6 = stablehlo.pad %arg2, %cst_2, low = [0], high = [5], interior = [0] : (tensor<2xf64>, tensor<f64>) -> tensor<7xf64>
+                    %7 = stablehlo.set_dimension_size %6, %c_1, dim = 0 : (tensor<7xf64>, tensor<i32>) -> tensor<?xf64, #stablehlo.bounds<7>>
+                    %c_3 = stablehlo.constant dense<2> : tensor<i64>
+                    %8 = stablehlo.compare EQ, %c_3, %arg1, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %9 = stablehlo.custom_call @ryft.assert(%8, %arg1, %c_3, %4) {api_version = 4 : i32, backend_config = {actor = "guard", kind = "generic", label_0 = "expected", label_1 = "actual", label_count = "2", message = "input dimension `n` must have one extent at the entry of `condition`"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                    %10 = stablehlo.after_all %4, %9 : !stablehlo.token
+                    %11 = "stablehlo.if"(%arg0) ({
+                      %c_4 = stablehlo.constant dense<7> : tensor<i32>
+                      %13 = stablehlo.set_dimension_size %7, %c_4, dim = 0 : (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
+                      %14 = stablehlo.slice %13 [0:2] : (tensor<7xf64>) -> tensor<2xf64>
+                      stablehlo.return %14 : tensor<2xf64>
+                    }, {
+                      %c_4 = stablehlo.constant dense<7> : tensor<i32>
+                      %13 = stablehlo.set_dimension_size %7, %c_4, dim = 0 : (tensor<?xf64, #stablehlo.bounds<7>>, tensor<i32>) -> tensor<7xf64>
+                      %14 = stablehlo.slice %13 [0:2] : (tensor<7xf64>) -> tensor<2xf64>
+                      stablehlo.return %14 : tensor<2xf64>
+                    }) : (tensor<i1>) -> tensor<2xf64>
+                    %12 = stablehlo.custom_call @ryft.print(%11, %10) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true} : (tensor<2xf64>, !stablehlo.token) -> !stablehlo.token
+                    return %11 : tensor<2xf64>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_repeated_jit_call_callees_with_extent_validations_inline_and_order_later_assertions() {
+    fn test_collect_jit_call_functions_inlines_callees_with_extent_validations() {
         // The repeated callee is pure in the source program, but its `zero[n, n]` constructor consumes a symbolic
-        // `dimension<n>` and an exact `dimension<2>`, so type inference refines it to `f64[2, 2]` and lowering validates
-        // that `n = 2` at runtime. A shared token-free function could not order those validations, so the callee inlines
-        // at both call sites, and the explicit assertion after them continues their assertion chain.
+        // `dimension<n>` and an exact `dimension<2>`, so type inference refines it to `f64[2, 2]` and lowering
+        // validates that `n = 2` at runtime. A shared token-free function could not order those validations, so the
+        // callee inlines at both call sites, and the explicit assertion after them continues their assertion chain.
         let n = DimensionType::new("n", DimensionBounds::positive(Some(8)).unwrap());
         let callee = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -3180,27 +3225,220 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!module.contains("func.func private"), "{module}");
-        assert_eq!(module.matches("@ryft.assert").count(), 3, "{module}");
-        let assertion = module.lines().find(|line| line.contains("required predicate")).unwrap();
-        let assertion_token = assertion
-            .split_once("@ryft.assert(")
-            .unwrap()
-            .1
-            .split_once(')')
-            .unwrap()
-            .0
-            .rsplit_once(", ")
-            .unwrap()
-            .1;
-        let definition = module.lines().find(|line| line.trim().starts_with(&format!("{assertion_token} = "))).unwrap();
-        assert!(definition.contains("@ryft.assert"), "{module}");
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<i64>, %arg1: tensor<i64>, %arg2: tensor<i1>) -> tensor<2x2xf64> {
+                    %c = stablehlo.constant dense<2> : tensor<i64>
+                    %0 = stablehlo.compare EQ, %arg0, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %1 = stablehlo.after_all  : !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.assert(%0, %arg0, %1) {api_version = 4 : i32, backend_config = {actor = "zero", kind = "generic", label_0 = "n", label_count = "1", message = "input dimension `n` expected 2"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                    %cst = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %3 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f64>) -> tensor<2x2xf64>
+                    %c_0 = stablehlo.constant dense<2> : tensor<i64>
+                    %4 = stablehlo.compare EQ, %arg0, %c_0, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                    %5 = stablehlo.custom_call @ryft.assert(%4, %arg0, %2) {api_version = 4 : i32, backend_config = {actor = "zero", kind = "generic", label_0 = "n", label_count = "1", message = "input dimension `n` expected 2"}, has_side_effect = true} : (tensor<i1>, tensor<i64>, !stablehlo.token) -> !stablehlo.token
+                    %cst_1 = stablehlo.constant dense<0.000000e+00> : tensor<f64>
+                    %6 = stablehlo.broadcast_in_dim %cst_1, dims = [] : (tensor<f64>) -> tensor<2x2xf64>
+                    %7 = stablehlo.custom_call @ryft.assert(%arg2, %5) {api_version = 4 : i32, backend_config = {actor = "assert", kind = "generic", label_count = "0", message = "required predicate"}, has_side_effect = true} : (tensor<i1>, !stablehlo.token) -> !stablehlo.token
+                    return %6 : tensor<2x2xf64>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_jit_call_reference_provenance_is_positional() {
-        // A `jit_call` operation forwards its operands to the callee positionally, so region provenance, capture counts, and
-        // output provenance are all index-preserving for the single callee region and absent for any other region.
+    fn test_jit_call_operation_with_callee_region() {
+        let input_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(input_type.clone());
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let callee = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![sine], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let operation = JitCallOperation::new(1).with_callee_region(callee.entry_region_ref()).unwrap();
+        assert_eq!(
+            operation,
+            JitCallOperation::new(1)
+                .with_callee_type_signature(&callee.input_types(), &callee.output_types())
+                .unwrap(),
+        );
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee_region = builder.import_region(callee.entry_region_ref());
+        let input = builder.add_input(input_type);
+        let output = builder
+            .add_instruction(Operation::JitCall(operation), vec![callee_region], vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = jit_call [capture_count=1] %0 [
+                    callee={
+                        lambda %0:f32[] .
+                        let %1:f32[] = sin %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
+        );
+        assert_eq!(
+            JitCallOperation::new(2).with_callee_region(callee.entry_region_ref()),
+            Err(TypeError::invalid("`jit_call` lifted capture prefix 2 exceeds its 1 callee inputs")),
+        );
+
+        // Generated callees can introduce local identities even when the source that was transformed had none.
+        // The sealed signature records those definitions, so each new call still receives a fresh caller result.
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let local = DimensionType::new("local", DimensionBounds::non_negative(Some(8)).unwrap());
+        let output = builder
+            .add_instruction(DimensionFromScalarOperation::new(local), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let identity_callee = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let first = JitCallOperation::new(0).with_callee_region(identity_callee.entry_region_ref()).unwrap();
+        let second = JitCallOperation::new(0).with_callee_region(identity_callee.entry_region_ref()).unwrap();
+        let original = JitCallOperation::new(0)
+            .with_callee_type_signature(&identity_callee.input_types(), &identity_callee.output_types())
+            .unwrap();
+        assert_eq!(first.defined_type_identities().len(), 1);
+        assert_ne!(first.defined_type_identities(), second.defined_type_identities());
+        assert_ne!(
+            first.defined_type_identities().as_ref(),
+            identity_callee.type_identity_signature().internal_identities()
+        );
+        let interface = identity_callee.entry_region_ref().interface();
+        let first_outputs =
+            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(interface)).unwrap();
+        let repeated_outputs =
+            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(interface)).unwrap();
+        assert_eq!(first_outputs, repeated_outputs);
+        assert_ne!(first_outputs, identity_callee.output_types().into_owned());
+        assert_eq!(
+            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(interface)).unwrap()[0]
+                .to_string(),
+            original
+                .infer_output_types(&identity_callee.input_types(), std::slice::from_ref(identity_callee.interface()))
+                .unwrap()[0]
+                .to_string(),
+        );
+        // Replacing a previous identity-bearing declaration with an identity-free callee clears that declaration,
+        // exactly as the public signature constructor does.
+        assert_eq!(
+            first.with_callee_region(callee.entry_region_ref()).unwrap(),
+            JitCallOperation::new(0)
+                .with_callee_type_signature(&callee.input_types(), &callee.output_types())
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_jit_call_operation_dense_result_bindings() {
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        let input = DimensionType::new("input", bounds);
+        let local = DimensionType::new("local", bounds);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![input.dimension().clone()]));
+        let output_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![input.dimension().clone(), local.dimension().clone()]));
+        let output_types = vec![output_type.clone(), output_type];
+        let operation = JitCallOperation::<ArrayType>::new(0)
+            .with_callee_type_signature(std::slice::from_ref(&input_type), &output_types)
+            .unwrap();
+        let other = JitCallOperation::<ArrayType>::new(0)
+            .with_callee_type_signature(std::slice::from_ref(&input_type), &output_types)
+            .unwrap();
+        let interface = RegionInterface::new(vec![input_type.clone()], output_types.clone(), EffectClasses::NONE);
+        let outputs = operation
+            .infer_output_types(std::slice::from_ref(&input_type), std::slice::from_ref(&interface))
+            .unwrap();
+        assert_eq!(outputs[0], outputs[1]);
+        assert_ne!(outputs, output_types);
+        assert_eq!(
+            operation
+                .infer_output_types(std::slice::from_ref(&input_type), std::slice::from_ref(&interface))
+                .unwrap(),
+            outputs
+        );
+        assert_ne!(other.infer_output_types(&[input_type.clone()], &[interface]).unwrap(), outputs);
+        let actual = ArrayType::new_static(DataType::F32, [2]);
+        let callee_outputs = output_types
+            .iter()
+            .map(|output| {
+                ArrayType::new(DataType::F32, Shape::new(vec![2usize.into(), output.shape().dimensions()[1].clone()]))
+            })
+            .collect::<Vec<_>>();
+        let actual_interface = RegionInterface::new(vec![actual.clone()], callee_outputs, EffectClasses::NONE);
+        let instantiated = operation.infer_output_types(&[actual], &[actual_interface]).unwrap();
+        assert_eq!(instantiated[0].shape().dimensions()[0], 2usize.into());
+        assert_eq!(instantiated[0].shape().dimensions()[1], outputs[0].shape().dimensions()[1]);
+        assert_eq!(instantiated[0], instantiated[1]);
+        assert_eq!(operation.defined_type_identities().len(), 1);
+        let retained = JitCallOperation::<ArrayType>::new(0)
+            .with_result_type_signature(std::slice::from_ref(&input_type), &output_types, outputs.clone())
+            .unwrap();
+        assert_eq!(retained.instantiated_output_types(&[input_type]).unwrap(), Some(outputs));
+    }
+
+    #[test]
+    fn test_jit_call_supports_array_ir_region_boundaries() {
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
+        let array_type = ArrayIrType::Array(vector_type());
+        let interface = RegionInterface::new(
+            vec![dimension_type.clone()],
+            vec![array_type.clone(), dimension_type.clone()],
+            EffectClasses::NONE,
+        );
+        let operation = JitCallOperation::new(0);
+
+        assert_eq!(operation.name(), JIT_CALL_OPERATION_NAME);
+        assert_eq!(
+            operation.infer_output_types(&[], &[]),
+            Err(TypeError::invalid("`jit_call` expects 1 attached callee region but got 0")),
+        );
+        assert_eq!(
+            operation
+                .infer_output_types(std::slice::from_ref(&dimension_type), std::slice::from_ref(&interface))
+                .unwrap(),
+            vec![array_type.clone(), dimension_type.clone()],
+        );
+
+        // The call operands must match the callee boundary, which must cover the lifted capture prefix.
+        assert_eq!(
+            JitCallOperation::new(2).infer_output_types(std::slice::from_ref(&dimension_type), &[interface.clone()]),
+            Err(TypeError::invalid("`jit_call` lifted capture prefix 2 exceeds its 1 callee inputs")),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[], std::slice::from_ref(&interface)),
+            Err(TypeError::invalid("`jit_call` expected 1 input(s) but got 0")),
+        );
+        assert_eq!(
+            operation.infer_output_types(std::slice::from_ref(&array_type), std::slice::from_ref(&interface)),
+            Err(TypeError::invalid(format!("`jit_call` input #0 expected {dimension_type} but got {array_type}"))),
+        );
+
+        // A callee that defines its own result identities needs caller-owned result names.
+        let local_interface = RegionInterface::new(Vec::new(), vec![dimension_type], EffectClasses::NONE);
+        assert_eq!(
+            operation.infer_output_types(&[], &[local_interface]),
+            Err(TypeError::invalid(
+                "`jit_call` with callee-local result identities requires `with_callee_type_signature`",
+            )),
+        );
+    }
+
+    #[test]
+    fn test_jit_call_operation_region_provenance() {
+        // A `jit_call` operation forwards its operands to the callee positionally, so region provenance, capture
+        // counts, and output provenance are all index-preserving for the single callee region and absent for any other
+        // region.
         let operation = JitCallOperation::<ArrayIrType>::new(2);
         assert_eq!(operation.input_region_provenance(0, 3), InputRegionProvenance::Input { index: 3 });
         assert_eq!(operation.input_region_provenance(1, 3), InputRegionProvenance::None);
@@ -3217,7 +3455,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_region_data_flow() {
+    fn test_jit_call_operation_region_data_flow() {
         let operation = JitCallOperation::<ArrayIrType>::new(2);
         assert!(matches!(operation.region_data_flow(), RegionDataFlow::Provenance));
         let dispatched = Operation::<Constant>::from(operation);
@@ -3225,7 +3463,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_boundary_pruning() {
+    fn test_jit_call_operation_prune_boundary() {
         // The callee maps its lifted capture `c` and its operands `(x, y)` to `(cos(x), c * y)`. Using only the first
         // output drops the operand `y` and the second output, while the capture prefix is kept although nothing uses
         // it.
@@ -3271,11 +3509,348 @@ mod tests {
     }
 
     #[test]
+    fn test_jit_call_reference_discharge_threads_nested_callee_state_into_the_caller() {
+        // Two nested call levels each swap a distinct reference. Discharge must lift both states to the caller's
+        // boundary in public-input order, mark both as mutated with their own final-state output slot, and leave no
+        // reference-typed atom anywhere in the resulting program.
+        let reference_type = ReferenceType::new(vector_type());
+        let inner_callee = {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            let replacement = builder.add_input(vector_type().into());
+            let snapshot = builder
+                .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let inner_callee = builder.import_region(inner_callee.entry_region_ref());
+            let first_reference = builder.add_input(reference_type.clone().into());
+            let first_replacement = builder.add_input(vector_type().into());
+            let second_reference = builder.add_input(reference_type.clone().into());
+            let second_replacement = builder.add_input(vector_type().into());
+            let first_snapshot = builder
+                .add_instruction(
+                    Operation::JitCall(JitCallOperation::new(0)),
+                    vec![inner_callee],
+                    vec![first_reference, first_replacement],
+                    None,
+                )
+                .unwrap()[0];
+            let second_snapshot = builder
+                .add_instruction(
+                    Operation::JitCall(JitCallOperation::new(0)),
+                    vec![inner_callee],
+                    vec![second_reference, second_replacement],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(
+                    vec![first_snapshot, second_snapshot],
+                    vec![Placeholder; 4],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let first_reference = builder.add_input(reference_type.clone().into());
+        let first_replacement = builder.add_input(vector_type().into());
+        let second_reference = builder.add_input(reference_type.into());
+        let second_replacement = builder.add_input(vector_type().into());
+        let snapshots = builder
+            .add_instruction(
+                Operation::JitCall(JitCallOperation::new(0)),
+                vec![callee],
+                vec![first_reference, first_replacement, second_reference, second_replacement],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(snapshots, vec![Placeholder; 4], vec![Placeholder; 2])
+            .unwrap();
+
+        let discharged = program.discharge_references(0).unwrap();
+        assert_eq!(discharged.output_count(), 2);
+        assert_eq!(discharged.program().output_count(), 4);
+        assert_eq!(discharged.external_reference_bindings().len(), 2);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
+        assert!(discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(2));
+        assert_eq!(discharged.external_reference_bindings()[1].source(), ReferenceSource::Input { index: 2 });
+        assert!(discharged.external_reference_bindings()[1].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[1].output_index(), Some(3));
+    }
+
+    #[test]
+    fn test_jit_call_reference_discharge_resolves_nested_callee_lexical_capture_scope() {
+        // A branch region inside the callee reaches its reference through a capture constant, which must resolve
+        // against the callee's own capture scope rather than the entry program's lifted prefix. The accessed root is
+        // the caller's second public input, and only that mutated state gains a final-state output.
+        let reference_type = ReferenceType::new(vector_type());
+        let branch = {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let replacement = builder.add_input(vector_type().into());
+            let reference = builder.add_constant(Constant::Captured(CaptureReference::new(
+                0,
+                ArrayIrType::Reference(reference_type.clone()),
+            )));
+            let snapshot = builder
+                .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+            let branch = builder.import_region(branch.entry_region_ref());
+            builder.add_input(reference_type.clone().into());
+            let replacement = builder.add_input(vector_type().into());
+            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+            let snapshot = builder
+                .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, replacement], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        builder.add_input(reference_type.clone().into());
+        let reference = builder.add_input(reference_type.into());
+        let replacement = builder.add_input(vector_type().into());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let snapshot = builder
+            .add_instruction(
+                Operation::JitCall(JitCallOperation::new(1)),
+                vec![callee],
+                vec![reference, replacement, predicate],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+
+        let discharged = program.discharge_references_in_capture_lifted_program(0).unwrap();
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(discharged.program().output_count(), 2);
+        assert_eq!(discharged.external_reference_bindings().len(), 2);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
+        assert_eq!(discharged.external_reference_bindings()[1].source(), ReferenceSource::Input { index: 1 });
+        assert!(discharged.external_reference_bindings()[1].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[1].output_index(), Some(1));
+    }
+
+    #[test]
+    fn test_jit_call_reference_discharge_preserves_forwarded_root_identity() {
+        let reference_type = ReferenceType::new(vector_type());
+        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let reference = callee_builder.add_input(reference_type.clone().into());
+        let callee = callee_builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let forwarded = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference], None)
+            .unwrap()[0];
+        let value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![forwarded], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The callee only forwards its reference input, so discharge must keep the forwarded value bound to the same
+        // root as the caller's public reference input instead of synthesizing a second state slot for it. Reading
+        // through the forwarded result is not a mutation, so no final-state output is appended.
+        let discharged = program.discharge_references(0).unwrap();
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(discharged.program().output_count(), 1);
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
+    }
+
+    #[test]
+    fn test_jit_call_reference_discharge_widens_its_callee_with_the_final_state() {
+        // `jit_call` forwards its operands onto its callee one for one and reports the callee's outputs as its own, so
+        // the shared positional rewrite threads state through it. The callee gains the entering state after its
+        // declared inputs and publishes the final state after its declared outputs, while the call site keeps its own
+        // operand and output contract. The callee mutates the root and returns only the previous snapshot, so the
+        // final state is exactly what the call site would otherwise have lost.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let callee_reference = callee_builder.add_input(reference_type.into());
+        let callee_update = callee_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let previous = callee_builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![callee_reference, callee_update], None)
+            .unwrap()[0];
+        let callee = callee_builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let callee = builder.import_program(callee);
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let previous = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![root, update], None)
+            .unwrap()[0];
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![previous, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // The callee's local root is allocated, mutated, and consumed inside the call, so widening the boundary
+        // leaves no external state behind and the rewritten call is the entry region's only instruction.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(discharged.program().output_types().len(), 2);
+        assert_eq!(discharged.program().entry_region_ref().instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_jit_call_reference_discharge_instantiates_callee_local_results() {
+        // The callee mutates a reference and returns a dimension that it defines itself, so the call instantiates a
+        // fresh result identity. Discharge widens the callee with the reference state, which must not leave the
+        // call's result metadata pinned to the narrower pre-discharge callee signature.
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let logical_mesh = mesh.logical_mesh().clone();
+        let domain = Session::new(&client).domain();
+        let value_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(logical_mesh.clone(), 0));
+        let value_type = value_type.unwrap();
+        let extent_type = ArrayType::scalar(DataType::I64).with_sharding(Sharding::replicated(logical_mesh, 0));
+        let extent_type = extent_type.unwrap();
+        let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
+
+        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let reference = callee_builder.add_input(ReferenceType::new(value_type.clone()).into());
+        let update = callee_builder.add_input(value_type.clone().into());
+        let extent = callee_builder.add_input(extent_type.clone().into());
+        let previous = callee_builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap()[0];
+        let dimension = callee_builder
+            .add_instruction(DimensionFromScalarOperation::new(rows.clone()), Vec::new(), vec![extent], None)
+            .unwrap()[0];
+        let callee = callee_builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![previous, dimension],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let operation = JitCallOperation::new(0)
+            .with_callee_type_signature(&callee.input_types(), &callee.output_types())
+            .unwrap();
+
+        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let callee = builder.import_program(callee);
+        let initial = builder.add_input(value_type.clone().into());
+        let update = builder.add_input(value_type.clone().into());
+        let extent = builder.add_input(extent_type.clone().into());
+        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let outputs = builder
+            .add_instruction(Operation::JitCall(operation), vec![callee], vec![root, update, extent], None)
+            .unwrap()
+            .to_vec();
+        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
+        let extent =
+            builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![outputs[1]], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<Constant>, Vec<Constant>>(
+                vec![outputs[0], extent, frozen],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let program = source.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
+        assert_eq!(
+            program.to_string(),
+            formatdoc! {"
+                lambda %0:{value_type}, %1:{value_type}, %2:{extent_type} .
+                let %3:{value_type}, %4:dimension<rows ∈ [0, 8)>, %5:{value_type} = jit_call [
+                    output_types=[{value_type}, dimension<rows ∈ [0, 8)>, {value_type}],
+                ] %0 %1 %2 [
+                    callee={{
+                        lambda %0:{value_type}, %1:{value_type}, %2:{extent_type} .
+                        let %3:dimension<rows ∈ [0, 8)> = dimension_from_scalar [bounds=[0, 8)] %2
+                        in (%0, %3, %1)
+                    }},
+                ]
+                    %6:i64[] = dimension_to_scalar %4
+                in (%3, %6, %5)"},
+        );
+        // The call owns a fresh result identity, distinct from the callee-local identity it instantiates.
+        let call = &program.entry_region_ref().instructions()[0];
+        assert_ne!(program.atoms()[call.outputs()[1].index()].r#type().as_ref(), &ArrayIrType::Dimension(rows));
+
+        // Execute the discharged program on CPU, with the call staged inside one compiled function.
+        let compiled: CompiledFunction<'_, (ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> =
+            crate::compile(
+                |(initial, update, extent)| {
+                    let initial = initial.into_value();
+                    let inputs = vec![initial.clone(), update.into_value(), extent.into_value()];
+                    let outputs = program.interpret_in_context(initial.context(), inputs).unwrap();
+                    let mut outputs =
+                        outputs.into_iter().map(|output| ValueProjection::<ArrayType>::into_projected(output).unwrap());
+                    (outputs.next().unwrap(), outputs.next().unwrap(), outputs.next().unwrap())
+                },
+                (value_type.clone(), value_type.clone(), extent_type.clone()),
+                &domain,
+                mesh.clone(),
+            )
+            .unwrap();
+        let array = |r#type: &ArrayType, bytes: Vec<u8>| {
+            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), bytes).unwrap()
+        };
+        let (previous, extent, state) = compiled
+            .executable()
+            .execute(
+                &domain,
+                (
+                    array(&value_type, values_to_bytes(&[3f32])),
+                    array(&value_type, values_to_bytes(&[4f32])),
+                    array(&extent_type, values_to_bytes(&[5i64])),
+                ),
+            )
+            .unwrap();
+        let read = |array: &Array<'_>| {
+            array
+                .addressable_shards()
+                .next()
+                .unwrap()
+                .buffer()
+                .unwrap()
+                .copy_to_host(None)
+                .unwrap()
+                .r#await()
+                .unwrap()
+        };
+        assert_eq!(values_from_bytes::<f32>(&read(&previous)), vec![3f32]);
+        assert_eq!(values_from_bytes::<i64>(&read(&extent)), vec![5i64]);
+        assert_eq!(values_from_bytes::<f32>(&read(&state)), vec![4f32]);
+    }
+
+    #[test]
     fn test_jit_call_residual_candidates_classify_through_callee_provenance() {
-        use std::sync::{Arc, Mutex};
-
-        use ryft_core::RematerializationPolicyFn;
-
         // `jit_call` reports positional output-region provenance, so a residual produced by a computed callee output
         // is classified through the callee to that output's own producer instead of to the opaque `jit_call`. The
         // program squares its known input `x` inside the callee and multiplies the result of the call by its unknown
@@ -3317,552 +3892,10 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_supports_array_ir_region_boundaries() {
-        let dimension_type =
-            ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
-        let array_type = ArrayIrType::Array(vector_type());
-        let interface = RegionInterface::new(
-            vec![dimension_type.clone()],
-            vec![array_type.clone(), dimension_type.clone()],
-            EffectClasses::NONE,
-        );
-        let operation = JitCallOperation::new(0);
-
-        assert_eq!(operation.name(), JIT_CALL_OPERATION_NAME);
-        assert_eq!(
-            operation.infer_output_types(&[], &[]),
-            Err(TypeError::invalid(format!("{} expects 1 attached callee region but got 0", JIT_CALL_OPERATION_NAME,))),
-        );
-        assert_eq!(
-            operation
-                .infer_output_types(std::slice::from_ref(&dimension_type), std::slice::from_ref(&interface))
-                .unwrap(),
-            vec![array_type, dimension_type],
-        );
-    }
-
-    #[test]
-    fn test_jit_call_operation_batch_homogeneous_named_axis() {
-        /// Array-only family for exercising the homogeneous JIT batching rule without array IR carriers.
-        #[derive(Clone, Debug, Operation)]
-        #[ryft(crate = "ryft_core", type(ArrayType), constant(CoreArray), dispatch(batching))]
-        enum NamedAxisCallOperation {
-            AxisIndex(AxisIndexOperation),
-            Iota(IotaOperation<ArrayType>),
-            Broadcast(BroadcastOperation),
-            Transpose(TransposeOperation),
-            Zero(ZeroOperation<ArrayType>),
-            Call(JitCallOperation<ArrayType>),
-        }
-
-        for replicated in [false, true] {
-            let mut builder = CoreProgramBuilder::<CoreArray, NamedAxisCallOperation>::new();
-            let input = replicated.then(|| builder.add_input(ArrayType::scalar(DataType::F32)));
-            let index =
-                builder.add_instruction(AxisIndexOperation::new("items".to_owned()), vec![], vec![], None).unwrap()[0];
-            let outputs = std::iter::once(index).chain(input).collect::<Vec<_>>();
-            let callee = builder
-                .build::<Vec<CoreArray>, Vec<CoreArray>>(
-                    outputs,
-                    vec![Placeholder; usize::from(replicated)],
-                    vec![Placeholder; 1 + usize::from(replicated)],
-                )
-                .unwrap();
-            let callees = [Arc::new(callee)];
-            let regions = AttachedRegions::Callees(&callees);
-            let driver = RecursiveBatchingDriver::new(&regions);
-            let (_, program) = TracingContext::<CoreArray, NamedAxisCallOperation>::trace_with_context_and_named_axes(
-                |parent, inputs: Vec<CoreTracer<TracingContext<CoreArray, NamedAxisCallOperation>>>| {
-                    let context = BatchingContext::<_, ArrayBatchingPolicy>::new(parent.clone(), 3)
-                        .with_axis_name("items".to_owned());
-                    let inputs = inputs.into_iter().map(ArrayBatch::replicated).collect::<Vec<_>>();
-                    let outputs = JitCallOperation::<ArrayType>::new(0).batch(&context, &driver, &inputs)?;
-                    assert_eq!(outputs[0].batch_axis_position(), Some(0));
-                    if replicated {
-                        assert_eq!(outputs[1].batch_axis_position(), None);
-                    }
-                    Ok::<_, ProgramError>(outputs.into_iter().map(ArrayBatch::into_value).collect::<Vec<_>>())
-                },
-                vec![ArrayType::scalar(DataType::F32); usize::from(replicated)],
-                vec![],
-            )
-            .unwrap();
-            let expected = if replicated {
-                indoc! {"
-                    lambda %0:f32[] .
-                    let %1:u64[3], %2:f32[] = jit_call %0 [
-                        callee={
-                            lambda %0:f32[] .
-                            let %1:u64[3] = iota [type=u64[3], dimension=0]
-                            in (%1, %0)
-                        },
-                    ]
-                    in (%1, %2)"}
-            } else {
-                indoc! {"
-                    lambda  .
-                    let %0:u64[3] = jit_call [
-                        callee={
-                            lambda  .
-                            let %0:u64[3] = iota [type=u64[3], dimension=0]
-                            in (%0)
-                        },
-                    ]
-                    in (%0)"}
-            };
-            assert_eq!(program.to_string(), expected);
-            assert_eq!(program.output_types()[0], ArrayType::new_static(DataType::U64, [3]));
-        }
-    }
-
-    #[test]
-    fn test_jit_call_operation_batch() {
-        use ryft_core::{
-            ArrayIrBatch, ArrayIrBatchingPolicy, AttachedRegions, BatchableOperation, BatchingContext,
-            RecursiveBatchingDriver,
-        };
-
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let callee = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let callees = [Arc::new(callee)];
-        let regions = AttachedRegions::Callees(&callees);
-        let driver = RecursiveBatchingDriver::new(&regions);
-        let vector = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
-        let (_, program) = TracingContext::<Constant, Operation>::trace(
-            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
-                let parent = inputs[0].context();
-                let extent = parent.constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
-                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
-                let outputs = JitCallOperation::<ArrayIrType>::new(0).batch(
-                    &context,
-                    &driver,
-                    &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?],
-                )?;
-                Ok::<_, ProgramError>(outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>())
-            },
-            vec![vector.clone()],
-        )
-        .unwrap();
-        assert_eq!(program.input_types(), vec![vector.clone()]);
-        assert_eq!(program.output_types(), vec![vector]);
-        let Operation::JitCall(call) = program.instructions()[0].operation() else {
-            panic!("expected jit_call");
-        };
-        assert_eq!(call.capture_count(), 1);
-
-        // The batched callee receives the extent as its leading input, and it does not return the extent, because that
-        // bookkeeping output would only forward the input and an eager parent cannot return it from a compiled call.
-        let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
-        assert_eq!(body.input_types().len(), 2);
-        assert_eq!(body.output_ids(), &[body.input_ids()[1]]);
-    }
-
-    #[test]
-    fn test_jit_call_jvp_omits_zero_space_boundary_tangents() {
-        let dimension_type =
-            ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
-        let array_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-
-        let mut callee_builder = ArrayIrProgramBuilder::new();
-        let dimension = callee_builder.add_input(dimension_type.clone());
-        let array = callee_builder.add_input(array_type.clone());
-        let callee = callee_builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![dimension, array], vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-
-        let mut builder = ArrayIrProgramBuilder::new();
-        let dimension = builder.add_input(dimension_type.clone());
-        let array = builder.add_input(array_type.clone());
-        let callee = builder.import_region(callee.entry_region_ref());
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![dimension, array], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-
-        let jvp = program.jvp().unwrap();
-        assert_eq!(jvp.input_types(), vec![dimension_type.clone(), array_type.clone(), array_type.clone()]);
-        assert_eq!(jvp.output_types(), vec![dimension_type, array_type.clone(), array_type]);
-    }
-
-    #[test]
-    fn test_jit_call_jvp_keeps_capture_prefix_inactive() {
-        // The callee's leading input is its lifted capture (`capture_count = 1`). The call's activity mask starts
-        // inactive over that prefix, numeric captures included, so the fused callee consumes the primal operands,
-        // capture prefix first, followed only by the live operand tangent.
-        let r#type = ArrayIrType::Array(vector_type());
-        let callee = {
-            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-            let captured = builder.add_input(r#type.clone());
-            let input = builder.add_input(r#type.clone());
-            let product =
-                builder.add_instruction(MulOperation::new(), Vec::new(), vec![captured, input], None).unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let captured = builder.add_input(r#type.clone());
-        let input = builder.add_input(r#type);
-        let output = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(1)), vec![callee], vec![captured, input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        let jvp = program.jvp().unwrap();
-        let calls = jvp
-            .instructions()
-            .iter()
-            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
-            .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 1);
-        assert!(matches!(calls[0].operation(), Operation::JitCall(operation) if operation.capture_count() == 1));
-        let inputs = jvp.input_ids();
-        assert_eq!(calls[0].inputs(), &[inputs[0], inputs[1], inputs[3]]);
-        assert_eq!(calls[0].outputs().len(), 2);
-    }
-
-    #[test]
-    fn test_jit_call_jvp_threads_plumbing_and_active_references() {
-        // The callee reads a captured plumbing reference and mutates an active reference operand:
-        // `f(captured, r, x) = { r += x; read(r) * read(captured) }` behind `jit_call[capture_count=1]`.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let captured = builder.add_input(reference_type.clone());
-            let reference = builder.add_input(reference_type.clone());
-            let update = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(
-                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
-                    Vec::new(),
-                    vec![reference, update],
-                    None,
-                )
-                .unwrap();
-            let state = builder
-                .add_instruction(
-                    Operation::ReferenceRead(ReferenceReadOperation::new()),
-                    Vec::new(),
-                    vec![reference],
-                    None,
-                )
-                .unwrap()[0];
-            let scale = builder
-                .add_instruction(
-                    Operation::ReferenceRead(ReferenceReadOperation::new()),
-                    Vec::new(),
-                    vec![captured],
-                    None,
-                )
-                .unwrap()[0];
-            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, scale], None).unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let captured = builder.add_input(reference_type.clone());
-        let reference = builder.add_input(reference_type.clone());
-        let update = builder.add_input(scalar_type.clone());
-        let output = builder
-            .add_instruction(
-                Operation::JitCall(JitCallOperation::new(1)),
-                vec![callee],
-                vec![captured, reference, update],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
-            .unwrap();
-
-        // The plumbing capture is inactive and the active reference receives a tangent reference input, so the fused
-        // program and its one fused call consume `[captured, r, x, ṫr, ẋ]`, keeping the capture prefix verbatim.
-        let jvp = program.entry_region_ref().jvp(&[1, 2]).unwrap();
-        assert_eq!(
-            jvp.input_types(),
-            vec![
-                reference_type.clone(),
-                reference_type.clone(),
-                scalar_type.clone(),
-                reference_type.clone(),
-                scalar_type.clone(),
-            ],
-        );
-        assert_eq!(jvp.output_types(), vec![scalar_type.clone(), scalar_type.clone()]);
-        let calls = jvp
-            .instructions()
-            .iter()
-            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
-            .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 1);
-        assert!(matches!(calls[0].operation(), Operation::JitCall(operation) if operation.capture_count() == 1));
-        assert_eq!(calls[0].inputs(), jvp.input_ids());
-        assert_eq!(jvp.input_types(), jvp.region_ref(calls[0].regions()[0]).unwrap().input_types());
-    }
-
-    #[test]
-    fn test_jit_call_jvp_omits_inactive_reference_output_tangents() {
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let mut callee_builder = ArrayIrProgramBuilder::new();
-        let reference = callee_builder.add_input(reference_type.clone());
-        let value = callee_builder.add_input(scalar_type.clone());
-        let doubled =
-            callee_builder.add_instruction(AddOperation::new(), Vec::new(), vec![value, value], None).unwrap()[0];
-        let callee = callee_builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![reference, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
-        let reference = builder.add_input(reference_type.clone());
-        let value = builder.add_input(scalar_type.clone());
-        let callee = builder.import_region(callee.entry_region_ref());
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(1)), vec![callee], vec![reference, value], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-        let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
-        assert_eq!(jvp.input_types(), vec![reference_type.clone(), scalar_type.clone(), scalar_type.clone()]);
-        assert_eq!(jvp.output_types(), vec![reference_type, scalar_type.clone(), scalar_type]);
-        let calls = jvp
-            .instructions()
-            .iter()
-            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
-            .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(jvp.region_ref(calls[0].regions()[0]).unwrap().output_types().len(), 3);
-    }
-
-    #[test]
-    fn test_jit_call_jvp_treats_structurally_zero_tangents_as_inactive() {
-        // `f(x, y) = (sin(x), cos(y))` differentiated with respect to `x` only: the structurally zero tangent of `y`
-        // gets no fused callee slot, and the tangent of `cos(y)`, which then depends on no tangent input, is a
-        // structural zero that the fused call does not return.
-        let r#type = ArrayIrType::Array(vector_type());
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let x = builder.add_input(r#type.clone());
-            let y = builder.add_input(r#type.clone());
-            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
-            let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![y], None).unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![sine, cosine], vec![Placeholder; 2], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], inputs, None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-        assert_eq!(
-            program.entry_region_ref().jvp(&[0]).unwrap().to_string(),
-            indoc! {"
-                lambda %0:f64[4], %1:f64[4], %2:f64[4] .
-                let %3:f64[4], %4:f64[4], %5:f64[4] = jit_call %0 %1 %2 [
-                    callee={
-                        lambda %0:f64[4], %1:f64[4], %2:f64[4] .
-                        let %3:f64[4] = sin %0
-                            %4:f64[4] = cos %1
-                            %5:f64[4] = cos %0
-                            %6:f64[4] = mul %5 %2
-                        in (%3, %4, %6)
-                    },
-                ]
-                    %6:f64[4] = zero [type=f64[4]]
-                in (%3, %4, %5, %6)"},
-        );
-    }
-
-    #[test]
-    fn test_jit_call_jvp_omits_independent_output_tangents() {
-        // `f(x) = (sin(x), 0)`: the tangent of the constant output depends on no tangent input, so it is a structural
-        // zero that the fused call does not return.
-        let r#type = ArrayIrType::Array(vector_type());
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let x = builder.add_input(r#type.clone());
-            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
-            let zero =
-                builder.add_instruction(ZeroOperation::new(vector_type()), Vec::new(), Vec::new(), None).unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![sine, zero], vec![Placeholder], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let input = builder.add_input(r#type);
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
-            .unwrap();
-        assert_eq!(
-            program.jvp().unwrap().to_string(),
-            indoc! {"
-                lambda %0:f64[4], %1:f64[4] .
-                let %2:f64[4], %3:f64[4], %4:f64[4] = jit_call %0 %1 [
-                    callee={
-                        lambda %0:f64[4], %1:f64[4] .
-                        let %2:f64[4] = sin %0
-                            %3:f64[4] = zero [type=f64[4]]
-                            %4:f64[4] = cos %0
-                            %5:f64[4] = mul %4 %1
-                        in (%2, %3, %5)
-                    },
-                ]
-                    %5:f64[4] = zero [type=f64[4]]
-                in (%2, %3, %4, %5)"},
-        );
-    }
-
-    #[test]
-    fn test_jit_call_jvp_preserves_live_outputs_around_inactive_tangent() {
-        // `f(x) = (sin(x), 0, x)` has an inactive middle tangent slot. Projecting that slot must leave both live
-        // tangents aligned with their original primal outputs rather than pairing the final tangent with the zero.
-        let r#type = ArrayIrType::Array(vector_type());
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let input = builder.add_input(r#type.clone());
-            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-            let zero =
-                builder.add_instruction(ZeroOperation::new(vector_type()), Vec::new(), Vec::new(), None).unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![sine, zero, input], vec![Placeholder], vec![Placeholder; 3])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let input = builder.add_input(r#type.clone());
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 3])
-            .unwrap();
-
-        let jvp = program.jvp().unwrap();
-        assert_eq!(jvp.output_types(), vec![r#type; 6]);
-        let calls = jvp
-            .instructions()
-            .iter()
-            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
-            .collect::<Vec<_>>();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].outputs().len(), 5);
-        assert_eq!(jvp.output_ids()[3], calls[0].outputs()[3]);
-        assert_eq!(jvp.output_ids()[5], calls[0].outputs()[4]);
-        assert!(jvp.instructions().iter().any(|instruction| {
-            instruction.outputs().contains(&jvp.output_ids()[4]) && instruction.operation().is_zero(0)
-        }));
-    }
-
-    #[test]
-    fn test_jit_call_jvp_skips_tangent_calls_without_live_output_tangents() {
-        // `f(x, y) = sin(x)` differentiated with respect to `y` only: no output tangent depends on the tangent of `y`
-        // and the tangent callee has no effects, so only the source call is bound and the output tangent is a
-        // structural zero.
-        let r#type = ArrayIrType::Array(vector_type());
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let x = builder.add_input(r#type.clone());
-            builder.add_input(r#type.clone());
-            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![sine], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
-        let output = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], inputs, None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            program.entry_region_ref().jvp(&[1]).unwrap().to_string(),
-            indoc! {"
-                lambda %0:f64[4], %1:f64[4], %2:f64[4] .
-                let %3:f64[4] = jit_call %0 %1 [
-                    callee={
-                        lambda %0:f64[4], %1:f64[4] .
-                        let %2:f64[4] = sin %0
-                        in (%2)
-                    },
-                ]
-                    %4:f64[4] = zero [type=f64[4]]
-                in (%3, %4)"},
-        );
-    }
-
-    #[test]
-    fn test_jit_call_jvp_preserves_local_result_shape_relationships() {
-        // `f(x, size) = broadcast(x, [dimension_from_scalar(size)])` is linear in `x` and returns an array whose extent
-        // the callee defines itself. The JVP rule binds separate primal and tangent calls, so the output tangent shares
-        // the primal output's extent only if that extent reaches the tangent call through a residual.
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let sharding = Sharding::replicated(logical_mesh, 0);
-        let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap());
-        let size_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64).with_sharding(sharding).unwrap());
-        let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let value = builder.add_input(value_type.clone());
-            let size = builder.add_input(size_type.clone());
-            let dimension = builder
-                .add_instruction(DimensionFromScalarOperation::new(rows), Vec::new(), vec![size], None)
-                .unwrap()[0];
-            let broadcast = builder
-                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![broadcast], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let operation = JitCallOperation::new(0)
-            .with_callee_type_signature(&callee.input_types(), &callee.output_types())
-            .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let inputs = vec![builder.add_input(value_type), builder.add_input(size_type)];
-        let output = builder.add_instruction(Operation::JitCall(operation), vec![callee], inputs, None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        let outputs = program.jvp().unwrap().output_types().into_owned();
-        assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[1], outputs[0].tangent().unwrap());
-    }
-
-    #[test]
     fn test_jit_call_partial_evaluation_keeps_reference_bearing_callees_whole() {
-        // The callee reads the reference before and after mutating it: `f(r, x) = { a = read(r); r += x; a * read(r) }`
-        // Splitting it against a known `r` would hoist the first read into the outer trace and leave the mutation and
-        // the second read behind the residual call, so the call stays whole instead.
+        // The callee `f(r, x) = { a = read(r); r += x; a * read(r) }` reads the reference before and after mutating it.
+        // Splitting it against a known `r` would hoist the first read into the outer program and leave the mutation
+        // and the second read behind the residual call, so the call stays whole instead.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let callee = {
@@ -3915,23 +3948,29 @@ mod tests {
         let evaluation = program
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(scalar_type)])
             .unwrap();
-        let residual = evaluation.program();
-        assert_eq!(residual.instructions().len(), 1);
-        assert!(matches!(residual.instructions()[0].operation(), Operation::JitCall(_)));
-        assert_eq!(residual.instructions()[0].inputs().len(), 2);
-        let residual_names = residual
-            .entry_region_ref()
-            .instructions_in_closure()
-            .map(|(_, instruction)| instruction.operation().name())
-            .collect::<Vec<_>>();
-        assert_eq!(residual_names, vec!["jit_call", "reference_read", "reference_add_update", "reference_read", "mul"]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:ref<f32[]> .
+                let %2:f32[] = jit_call %1 %0 [
+                    callee={
+                        lambda %0:ref<f32[]>, %1:f32[] .
+                        let %2:f32[] = reference_read %0
+                            () = reference_add_update %0 %1
+                            %3:f32[] = reference_read %0
+                            %4:f32[] = mul %2 %3
+                        in (%4)
+                    },
+                ]
+                in (%2)"},
+        );
         assert!(outer.builder().borrow().instructions().is_empty());
     }
 
     #[test]
     fn test_jit_call_partial_evaluation_keeps_escaping_allocation_callees_whole() {
-        // The callee allocates a reference from the known input and returns it beside a runtime-dependent product:
-        // `f(k, x) = (reference_new(k), k * x)`. The allocation is computable from known inputs alone, but it escapes
+        // The callee `f(k, x) = (reference_new(k), k * x)` allocates a reference from the known input and returns it
+        // beside a runtime-dependent product. The allocation is computable from known inputs alone, but it escapes
         // through a reference output whose later accesses the callee cannot see, so it is live state rather than dead
         // intrinsic state, and the call stays whole instead of hoisting the allocation into the known side.
         let r#type = ArrayIrType::Array(vector_type());
@@ -3973,869 +4012,34 @@ mod tests {
         let evaluation = program
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)])
             .unwrap();
-        let residual = evaluation.program();
-        assert_eq!(residual.instructions().len(), 1);
-        assert!(matches!(residual.instructions()[0].operation(), Operation::JitCall(_)));
-        let residual_names = residual
-            .entry_region_ref()
-            .instructions_in_closure()
-            .map(|(_, instruction)| instruction.operation().name())
-            .collect::<Vec<_>>();
-        assert_eq!(residual_names, vec!["jit_call", "reference_new", "mul"]);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4] .
+                let %2:ref<f64[4]>, %3:f64[4] = jit_call %1 %0 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:ref<f64[4]> = reference_new %0
+                            %3:f64[4] = mul %0 %1
+                        in (%2, %3)
+                    },
+                ]
+                in (%2, %3)"},
+        );
         assert!(outer.builder().borrow().instructions().is_empty());
     }
 
+    // Online partial evaluation of a mixed `jit_call` against a live outer trace, which is the second recorded consumer
+    // of parent-context-polymorphic partial evaluation. The known half of the callee, including a callee literal that
+    // it consumes, is wrapped again as a known-side `jit_call` staged into the outer program over the symbolic known
+    // input. The unknown half stays behind a residual `jit_call` whose literal is rebuilt inline, and the known→unknown
+    // residual edge flows from the known-side call's outputs into the residual call's inputs.
     #[test]
-    fn test_jit_call_transposition_ignores_dead_reference_operands() {
-        // The linear callee only stores into its reference operand and forwards `x`: `ẏ = { ṫr += ẋ; ẋ }`. Under an
-        // `Ignore` destination for the reference no later instruction accumulated into its root and the callee never
-        // reads it, so the callee is transposed with an `Ignore` destination as well: the transposed call consumes
-        // `[ȳ]` only, returns `x̄` only, and neither it nor its callee stages a cotangent reference.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let reference = builder.add_input(reference_type.clone());
-            let update = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(
-                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
-                    Vec::new(),
-                    vec![reference, update],
-                    None,
-                )
-                .unwrap();
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![update], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee_region = builder.import_region(callee.entry_region_ref());
-        let reference = builder.add_input(reference_type.clone());
-        let update = builder.add_input(scalar_type.clone());
-        let output = builder
-            .add_instruction(
-                Operation::JitCall(JitCallOperation::new(0)),
-                vec![callee_region],
-                vec![reference, update],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let destination_kinds = [CotangentDestinationKind::Ignore, CotangentDestinationKind::Return];
-        let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
-        assert_eq!(transposed.input_types(), vec![scalar_type.clone()]);
-        assert_eq!(transposed.output_types(), vec![scalar_type.clone()]);
-        assert_eq!(transposed.instructions().len(), 1);
-        let call = &transposed.instructions()[0];
-        assert!(matches!(call.operation(), Operation::JitCall(_)));
-        assert_eq!(call.inputs(), transposed.input_ids());
-        assert_eq!(call.outputs(), transposed.output_ids());
-        let transposed_callee = transposed.region_ref(call.regions()[0]).unwrap().to_program();
-        assert_eq!(transposed_callee.input_types(), vec![scalar_type.clone()]);
-        assert_eq!(transposed_callee.output_types(), vec![scalar_type]);
-        assert!(transposed_callee.instructions().is_empty());
-        let transposed_names = transposed
-            .entry_region_ref()
-            .instructions_in_closure()
-            .map(|(_, instruction)| instruction.operation().name())
-            .collect::<Vec<_>>();
-        assert_eq!(transposed_names, vec!["jit_call"]);
-    }
-
-    #[test]
-    fn test_jit_call_transposition_threads_cotangent_references() {
-        // The linear callee accumulates into its reference operand and reads it back: `ẏ = { ṫr += ẋ; read(ṫr) }`.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let reference = builder.add_input(reference_type.clone());
-            let update = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(
-                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
-                    Vec::new(),
-                    vec![reference, update],
-                    None,
-                )
-                .unwrap();
-            let output = builder
-                .add_instruction(
-                    Operation::ReferenceRead(ReferenceReadOperation::new()),
-                    Vec::new(),
-                    vec![reference],
-                    None,
-                )
-                .unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee_region = builder.import_region(callee.entry_region_ref());
-        let reference = builder.add_input(reference_type.clone());
-        let update = builder.add_input(scalar_type.clone());
-        let output = builder
-            .add_instruction(
-                Operation::JitCall(JitCallOperation::new(0)),
-                vec![callee_region],
-                vec![reference, update],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        // Transposed under a `Reference` destination for the reference operand, the pullback consumes `[ȳ, r̄]` and
-        // returns the cotangent reference by identity ahead of `x̄`. The reference operand's cotangent lives in that
-        // destination, which the transposed call accumulates into in place, so the pullback forwards its own
-        // destination input rather than the call's forwarded reference output, while `x̄` is the call's second output.
-        // The transposed callee is exactly the transposition of the inlined callee under the same destinations.
-        let destination_kinds = [CotangentDestinationKind::Reference, CotangentDestinationKind::Return];
-        let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
-        assert_eq!(transposed.input_types(), vec![scalar_type.clone(), reference_type.clone()]);
-        assert_eq!(transposed.output_types(), vec![reference_type.clone(), scalar_type]);
-        assert_eq!(transposed.instructions().len(), 1);
-        let call = &transposed.instructions()[0];
-        assert!(matches!(call.operation(), Operation::JitCall(operation) if operation.capture_count() == 0));
-        assert_eq!(call.inputs(), transposed.input_ids());
-        assert_eq!(call.outputs().len(), 2);
-        assert_eq!(transposed.atoms()[call.outputs()[0].index()].r#type().as_ref(), &reference_type);
-        assert_eq!(transposed.output_ids(), &[transposed.input_ids()[1], call.outputs()[1]]);
-        let transposed_callee = transposed.region_ref(call.regions()[0]).unwrap().to_program();
-        let inlined = callee.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
-        assert_eq!(transposed_callee.to_string(), inlined.to_string());
-    }
-
-    #[test]
-    fn test_jit_call_zero_transpose_uses_cotangent_descriptors() {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::replicated()])
-                    .unwrap()
-                    .with_unreduced_axes(["x"])
-                    .unwrap(),
-            )
-            .unwrap();
-        let expected = ArrayIrType::Array(tangent_type.cotangent().unwrap());
-        let tangent_type = ArrayIrType::Array(tangent_type);
-        // Zero cotangents skip a pure callee only after its effects have been inspected. Supply the real
-        // identity-region boundary rather than an empty driver that cannot answer that query.
-        let mut source_builder = ArrayIrProgramBuilder::new();
-        let input = source_builder.add_input(tangent_type.clone());
-        let source = source_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let mut transpose_builder = ArrayIrProgramBuilder::new();
-        let input = transpose_builder.add_input(expected.clone());
-        let transposed = transpose_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let driver = TestTranspositionDriver { source, transposed };
-        let mut context = TracingContext::<Constant, Operation>::new();
-        let cotangents = transpose_primal_jit_call(
-            &JitCallOperation::new(0),
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(tangent_type.clone())],
-            &[MaybeZero::Zero(tangent_type.clone())],
-            &CotangentDestinations::without_references([true]),
-        )
-        .unwrap();
-        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
-
-        let known = context.input(tangent_type.clone());
-        let cotangents = transpose_primal_jit_call(
-            &JitCallOperation::new(0),
-            &mut context,
-            &driver,
-            &[PartialValue::Known(known)],
-            &[MaybeZero::Zero(tangent_type)],
-            &CotangentDestinations::without_references([true]),
-        )
-        .unwrap();
-        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
-    }
-
-    #[test]
-    fn test_jit_call_transposition_omits_dead_dynamic_seeds() {
-        // The callee `(x, z) ↦ (x, z)` returns both of its dynamically shaped inputs, and only `z` is live. The dead
-        // output's seed is a structural zero of type `f64[dead]`, whose extent no operand of the call defines. The
-        // transposed call has no input for that seed, so it needs no extent for it: it consumes the live seed alone,
-        // `x̄` stays a structural zero, and `z̄` keeps the `live` identity of the caller's cotangent type.
-        let dead = DimensionVariable::new("dead", DimensionBounds::new(1, Some(5)).unwrap());
-        let live = DimensionVariable::new("live", DimensionBounds::new(1, Some(5)).unwrap());
-        let dead_type =
-            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(dead)])));
-        let live_type =
-            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(live)])));
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let dead = builder.add_input(dead_type.clone());
-            let live = builder.add_input(live_type.clone());
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![dead, live], vec![Placeholder; 2], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let dead = builder.add_input(dead_type);
-        let live = builder.add_input(live_type.clone());
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![dead, live], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[1]], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let transposed = program.entry_region_ref().transpose(&[0, 1], &[], &[]).unwrap();
-        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
-        let pullback = transposed.into_program();
-        assert_eq!(pullback.output_types(), vec![live_type]);
-        assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda %0:f64[live] .
-                let %1:f64[live] = jit_call %0 [
-                    callee={
-                        lambda %0:f64[live] .
-                        in (%0)
-                    },
-                ]
-                in (%1)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            execute_mixed_program(
-                &execution_client(),
-                &pullback,
-                &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4])],
-                &[3],
-            )
-            .unwrap(),
-            vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)],
-        );
-    }
-
-    #[test]
-    fn test_jit_call_transposition_omits_dead_seeds_of_repeated_outputs() {
-        // The callee `x ↦ (x, x)` returns its input twice. With only the second output live, the first output's seed
-        // is a structural zero, so the transposed call consumes the second seed alone, which is `x̄`. With both outputs
-        // live, the transposed callee receives both seeds and adds them.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let input = builder.add_input(scalar_type.clone());
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![input, input], vec![Placeholder], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let input = builder.add_input(scalar_type);
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
-            .unwrap();
-        let client = execution_client();
-
-        // Projecting onto the second output keeps the two-output call, so its first seed reaches the call's transpose
-        // rule as a structural zero rather than being pruned away beforehand.
-        let projected = program.clone().with_outputs(&[1]).unwrap();
-        assert_eq!(
-            projected.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[], %2:f64[] = jit_call %0 [
-                    callee={
-                        lambda %0:f64[] .
-                        in (%0, %0)
-                    },
-                ]
-                in (%2)
-            "}
-            .trim_end(),
-        );
-        let transposed = projected.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = jit_call %0 [
-                    callee={
-                        lambda %0:f64[] .
-                        in (%0)
-                    },
-                ]
-                in (%1)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
-            vec![MixedValue::Array(vec![2.0], vec![])],
-        );
-
-        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = jit_call %0 %1 [
-                    callee={
-                        lambda %0:f64[], %1:f64[] .
-                        let %2:f64[] = add %0 %1
-                        in (%2)
-                    },
-                ]
-                in (%2)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            execute_mixed_program(
-                &client,
-                &transposed,
-                &[MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![5.0], vec![])],
-                &[],
-            )
-            .unwrap(),
-            vec![MixedValue::Array(vec![7.0], vec![])],
-        );
-    }
-
-    #[test]
-    fn test_jit_call_transposition_runs_backward_effects_without_live_seeds() {
-        // The callee maps its input through a reverse-mode carrier whose backward rule prints its seed and returns a
-        // zero. With the call's output dead, its only seed is a structural zero, yet the backward effect must still
-        // run: the transposed call has no inputs, and its callee prints a materialized zero seed.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let backward = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let seed = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(PrintOperation::<ArrayType>::new("backward"), Vec::new(), vec![seed], None)
-                .unwrap();
-            let zero = builder
-                .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), Vec::new(), None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![zero], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let backward = builder.import_region(backward.entry_region_ref());
-            let input = builder.add_input(scalar_type.clone());
-            let output = builder
-                .add_instruction(
-                    CompositeTransposeOperation::<Constant, Operation>::from_backward_region(
-                        0,
-                        vec![scalar_type.clone()],
-                        vec![scalar_type.clone()],
-                    ),
-                    vec![backward],
-                    vec![input],
-                    None,
-                )
-                .unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let input = builder.add_input(scalar_type);
-        builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
-            .unwrap();
-        let program = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
-        let transposed = program.entry_region_ref().transpose(&[0], &[], &[]).unwrap();
-        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
-        let pullback = transposed.into_program();
-        assert_eq!(
-            pullback.to_string(),
-            indoc! {"
-                lambda  .
-                let () = jit_call [
-                    callee={
-                        lambda  .
-                        let %0:f64[] = zero [type=f64[]]
-                            %1:f64[] = print [label=backward] %0
-                            %2:f64[] = zero [type=f64[]]
-                        in ()
-                    },
-                ]
-                in ()"},
-        );
-        let client = execution_client();
-        ensure_print_handler_registered(&client).unwrap();
-        let (outputs, lines) = with_captured_prints(|| execute_mixed_program(&client, &pullback, &[], &[]));
-        assert_eq!(outputs.unwrap(), Vec::new(),);
-        assert_eq!(lines, vec!["backward: 0.0"]);
-    }
-
-    #[test]
-    fn test_jit_call_transposition_omits_dead_seeds_beside_cotangent_references() {
-        // The callee accumulates into its reference operand, reads it back, and forwards `x`: `ẏ = { ṫr += ẋ; (read(ṫr),
-        // ẋ) }`. Only the read is live, so the forwarded output's seed is a structural zero. Under a `Reference`
-        // destination the transposed call consumes `[ȳ₀, r̄]` with no input for the dead seed, accumulates into `r̄` in
-        // place, and returns `x̄` read back from it.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let reference = builder.add_input(reference_type.clone());
-            let update = builder.add_input(scalar_type.clone());
-            builder
-                .add_instruction(
-                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
-                    Vec::new(),
-                    vec![reference, update],
-                    None,
-                )
-                .unwrap();
-            let read = builder
-                .add_instruction(
-                    Operation::ReferenceRead(ReferenceReadOperation::new()),
-                    Vec::new(),
-                    vec![reference],
-                    None,
-                )
-                .unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![read, update], vec![Placeholder; 2], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let reference = builder.add_input(reference_type.clone());
-        let update = builder.add_input(scalar_type.clone());
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference, update], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let destination_kinds = [CotangentDestinationKind::Reference, CotangentDestinationKind::Return];
-        let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
-        assert_eq!(transposed.input_types(), vec![scalar_type.clone(), reference_type.clone()]);
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:ref<f64[]> .
-                let %2:ref<f64[]>, %3:f64[] = jit_call %0 %1 [
-                    callee={
-                        lambda %0:f64[], %1:ref<f64[]> .
-                        let () = reference_add_update %1 %0
-                            %2:f64[] = reference_read %1
-                        in (%1, %2)
-                    },
-                ]
-                in (%1, %3)
-            "}
-            .trim_end(),
-        );
-
-        // With both outputs dead, every seed is a structural zero, but the live reference destination keeps the call
-        // live: the transposed call consumes `r̄` alone and returns `x̄` read back from it.
-        let transposed =
-            program.with_outputs(&[]).unwrap().transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:ref<f64[]> .
-                let %1:ref<f64[]>, %2:f64[] = jit_call %0 [
-                    callee={
-                        lambda %0:ref<f64[]> .
-                        let %1:f64[] = reference_read %0
-                        in (%0, %1)
-                    },
-                ]
-                in (%0, %2)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_jit_call_transposition_keeps_dead_seeds_structural_in_nested_scans() {
-        // The callee runs the scan `(c, x) ↦ (c + x, c)` over three items and returns its final carry and its stacked
-        // outputs, of which only the final carry is live. The dead stack's seed reaches the scan inside the callee as a
-        // structural zero, so neither the transposed call nor its reversed scan receives a zero stack.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let stack_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
-        let body = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            builder.add_input(ArrayType::scalar(DataType::I64).into());
-            let carry = builder.add_input(scalar_type.clone());
-            let item = builder.add_input(scalar_type.clone());
-            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, item], None).unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![next, carry], vec![Placeholder; 3], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let body = builder.import_region(body.entry_region_ref());
-            let carry = builder.add_input(scalar_type.clone());
-            let items = builder.add_input(stack_type.clone());
-            let outputs = builder
-                .add_instruction(Operation::Scan(ScanOperation::new(1, 3)), vec![body], vec![carry, items], None)
-                .unwrap()
-                .to_vec();
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let carry = builder.add_input(scalar_type);
-        let items = builder.add_input(stack_type);
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![carry, items], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[], %2:f64[3] = jit_call %0 [
-                    callee={
-                        lambda %0:f64[] .
-                        let %1:f64[], %2:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
-                            body={
-                                lambda %0:i64[], %1:f64[] .
-                                in (%1, %1)
-                            },
-                        ]
-                        in (%1, %2)
-                    },
-                ]
-                in (%1, %2)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            execute_mixed_program(&execution_client(), &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[])
-                .unwrap(),
-            vec![MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![2.0, 2.0, 2.0], vec![3])],
-        );
-    }
-
-    #[test]
-    fn test_jit_call_transposition_keeps_dead_seeds_structural_in_nested_conditions() {
-        // The callee selects on `c > 0` between the branches `x ↦ (x, x + x)` and `x ↦ (x + x, x)` and only the first
-        // output is live. The dead output's seed reaches the condition inside the callee as a structural zero, so each
-        // transposed branch consumes the live seed alone: `x̄ = ȳ₀` when `c > 0` and `x̄ = 2ȳ₀` otherwise.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let branch = |doubled_output: usize| {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let input = builder.add_input(scalar_type.clone());
-            let doubled =
-                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
-            let outputs = if doubled_output == 0 { vec![doubled, input] } else { vec![input, doubled] };
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let callee = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let true_branch = builder.import_region(branch(1).entry_region_ref());
-            let false_branch = builder.import_region(branch(0).entry_region_ref());
-            let selector = builder.add_input(scalar_type.clone());
-            let input = builder.add_input(scalar_type.clone());
-            let zero = builder
-                .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![selector], None)
-                .unwrap()[0];
-            let predicate = builder
-                .add_instruction(
-                    Operation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(
-                        ComparisonDirection::GreaterThan,
-                    ))),
-                    Vec::new(),
-                    vec![selector, zero],
-                    None,
-                )
-                .unwrap()[0];
-            let outputs = builder
-                .add_instruction(
-                    Operation::Condition(ConditionOperation::new()),
-                    vec![true_branch, false_branch],
-                    vec![predicate, input],
-                    None,
-                )
-                .unwrap()
-                .to_vec();
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let selector = builder.add_input(scalar_type.clone());
-        let input = builder.add_input(scalar_type);
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![selector, input], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let transposed = program.transpose_with_respect_to(&[1], &[]).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = jit_call %0 %1 [
-                    callee={
-                        lambda %0:f64[], %1:f64[] .
-                        let %2:f64[] = zero_like %1
-                            %3:bool[] = compare [direction=GreaterThan] %1 %2
-                            %4:f64[] = condition %3 %0 [
-                                true={
-                                    lambda %0:f64[] .
-                                    in (%0)
-                                },
-                                false={
-                                    lambda %0:f64[] .
-                                    let %1:f64[] = add %0 %0
-                                    in (%1)
-                                },
-                            ]
-                        in (%4)
-                    },
-                ]
-                in (%2)
-            "}
-            .trim_end(),
-        );
-        let client = execution_client();
-        for (selector, expected) in [(1.0, 3.0), (-1.0, 6.0)] {
-            assert_eq!(
-                execute_mixed_program(
-                    &client,
-                    &transposed,
-                    &[MixedValue::Array(vec![3.0], vec![]), MixedValue::Array(vec![selector], vec![])],
-                    &[],
-                )
-                .unwrap(),
-                vec![MixedValue::Array(vec![expected], vec![])],
-            );
-        }
-    }
-
-    #[test]
-    fn test_jit_call_transposition_keeps_dead_seeds_structural_across_rematerializations() {
-        // A rematerialization inside a `jit_call` operationee and a `jit_call` operation inside a rematerialization both map `x` to
-        // `(x, x + x)`, and only `x + x` is live. In both nestings the dead output's seed stays a structural zero across
-        // both boundaries: the outer transposed region consumes the live seed alone, the inner one receives it alone,
-        // and `x̄ = ȳ₁ + ȳ₁`.
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
-        let doubling = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let input = builder.add_input(scalar_type.clone());
-            let doubled =
-                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![input, doubled], vec![Placeholder], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let rematerialize = || RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable));
-        let nest = |outer: Operation, inner: Operation| {
-            let inner_program = {
-                let mut builder = ArrayIrProgramBuilder::new();
-                let region = builder.import_region(doubling.entry_region_ref());
-                let input = builder.add_input(scalar_type.clone());
-                let outputs = builder.add_instruction(inner, vec![region], vec![input], None).unwrap().to_vec();
-                builder
-                    .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
-                    .unwrap()
-            };
-            let mut builder = ArrayIrProgramBuilder::new();
-            let region = builder.import_region(inner_program.entry_region_ref());
-            let input = builder.add_input(scalar_type.clone());
-            let outputs = builder.add_instruction(outer, vec![region], vec![input], None).unwrap().to_vec();
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[1]], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let client = execution_client();
-
-        let program = nest(Operation::JitCall(JitCallOperation::new(0)), rematerialize().into());
-        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = jit_call %0 [
-                    callee={
-                        lambda %0:f64[] .
-                        let %1:f64[] = rematerialize %0 [
-                            body={
-                                lambda %0:f64[] .
-                                let %1:f64[] = add %0 %0
-                                in (%1)
-                            },
-                        ]
-                        in (%1)
-                    },
-                ]
-                in (%1)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
-            vec![MixedValue::Array(vec![4.0], vec![])],
-        );
-
-        let program = nest(rematerialize().into(), Operation::JitCall(JitCallOperation::new(0)));
-        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(
-            transposed.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = rematerialize %0 [
-                    body={
-                        lambda %0:f64[] .
-                        let %1:f64[] = jit_call %0 [
-                            callee={
-                                lambda %0:f64[] .
-                                let %1:f64[] = add %0 %0
-                                in (%1)
-                            },
-                        ]
-                        in (%1)
-                    },
-                ]
-                in (%1)
-            "}
-            .trim_end(),
-        );
-        assert_eq!(
-            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
-            vec![MixedValue::Array(vec![4.0], vec![])],
-        );
-    }
-
-    #[test]
-    fn test_jit_call_transpose_omits_disconnected_symbolic_cotangent() {
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let mut callee_builder = ArrayIrProgramBuilder::new();
-        callee_builder.add_input(dynamic_type.clone().into());
-        let live = callee_builder.add_input(scalar_type.clone().into());
-        let callee = callee_builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let mut builder = ArrayIrProgramBuilder::new();
-        let disconnected = builder.add_input(dynamic_type.into());
-        let live = builder.add_input(scalar_type.into());
-        let callee = builder.import_region(callee.entry_region_ref());
-        let outputs = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![disconnected, live], None)
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.residual_count(), 0);
-        let pullback = linearization.pullback().unwrap();
-        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
-        assert_eq!(
-            pullback.program().to_string(),
-            indoc! {"
-            lambda %0:f32[] .
-            let %1:f32[] = jit_call %0 [
-                callee={
-                    lambda %0:f32[] .
-                    in (%0)
-                },
-            ]
-            in (%1)
-        "}
-            .trim_end()
-        );
-    }
-
-    #[test]
-    fn test_jit_call_mixed_output_transpose_omits_zero_space_seeds() {
-        // The predicate output's cotangent is a zero space that arrives as a structural zero, so the transposed callee
-        // has no input for it and the transposed call consumes the value output's seed alone.
-        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
-        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]));
-        let value_program_type = ArrayIrType::Array(value_type.clone());
-        let predicate_program_type = ArrayIrType::Array(predicate_type.clone());
-        let source = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let value = builder.add_input(value_program_type.clone());
-            let predicate =
-                builder.add_constant(Constant::Captured(CaptureReference::new(0, predicate_program_type.clone())));
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![value, predicate], vec![Placeholder], vec![Placeholder; 2])
-                .unwrap()
-        };
-        let transposed = {
-            let mut builder = ArrayIrProgramBuilder::new();
-            let value_cotangent = builder.add_input(value_program_type.clone());
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![value_cotangent], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let driver = TestTranspositionDriver { source, transposed };
-        let mut context = TracingContext::<Constant, Operation>::new();
-        let value_cotangent = context.input(value_program_type.clone());
-
-        let contributions = transpose_primal_jit_call(
-            &JitCallOperation::new(0),
-            &mut context,
-            &driver,
-            &[PartialValue::Unknown(value_program_type.clone())],
-            &[
-                MaybeZero::Value(value_cotangent.clone()),
-                MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
-            ],
-            &CotangentDestinations::without_references([true]),
-        )
-        .unwrap();
-
-        assert!(
-            matches!(&contributions[..], [MaybeZero::Value(value)] if value.r#type().as_ref() == &value_program_type)
-        );
-        let builder = context.builder().borrow();
-        let [call] = builder.instructions() else {
-            panic!("expected the transposed call to be the only staged instruction");
-        };
-        assert!(matches!(call.operation(), Operation::JitCall(_)));
-        assert_eq!(call.inputs(), &[value_cotangent.atom_id().unwrap()]);
-    }
-
-    /// Online partial evaluation of a mixed `jit_call` against a live outer trace — the second recorded consumer of
-    /// parent-context-polymorphic partial evaluation. The known half of the callee (including a callee literal it
-    /// consumes) is rewrapped as a known-side `jit_call` staged into the outer program over the symbolic known
-    /// input; the unknown half stays behind a residual `jit_call` whose literal is rebuilt inline; and the
-    /// known→unknown residual edge flows from the known-side call's outputs into the residual call's inputs.
-    #[test]
-    fn test_jit_call_online_partial_evaluation_splits_callee_against_a_live_outer_trace() {
-        use ryft_core::{PartialEvaluationInput, PartialEvaluationOutput, StagingContext, TracingContext};
-
+    fn test_jit_call_partial_evaluation_splits_callee_against_a_live_outer_trace() {
         let r#type = ArrayIrType::Array(vector_type());
 
         // Callee `f(a, x) = (a + a, x * x, (a + a) * x)` over a known `a` and an unknown `x`. Capture constants are
-        // deliberately absent: a capture-bearing callee preserves its boundary instead of splitting, which
+        // deliberately absent, because a capture-bearing callee preserves its boundary instead of splitting, which
         // `test_jit_call_partial_evaluation_preserves_boundary_for_capture_bearing_callees` pins.
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
@@ -4879,61 +4083,67 @@ mod tests {
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type.clone())])
             .unwrap();
 
-        // The known half landed in the outer program as one known-side `jit_call` over the symbolic known input,
-        // producing the fully known callee output once: the residual edge, which is the same folded value, is fed from
-        // that output.
-        {
-            let outer_builder = outer.builder().borrow();
-            assert_eq!(outer_builder.instructions().len(), 1);
-            let known_instruction = &outer_builder.instructions()[0];
-            assert!(
-                matches!(known_instruction.operation(), Operation::JitCall(_)),
-                "expected the outer program to contain the known-side jit_call",
-            );
-            let known_callee = outer_builder.region_ref(known_instruction.regions()[0]).unwrap().to_program();
-            assert_eq!(known_callee.input_ids().len(), 1);
-            assert_eq!(known_callee.output_ids().len(), 1);
-            assert_eq!(known_callee.instructions().len(), 1);
-            assert!(matches!(known_callee.instructions()[0].operation(), Operation::Array(ArrayOperation::Add(_)),));
-        }
-
-        // The unknown half stayed behind one residual `jit_call` over the unknown input plus the residual edge.
-        assert_eq!(evaluation.program().instructions().len(), 1);
-        let residual_instruction = &evaluation.program().instructions()[0];
-        assert!(
-            matches!(residual_instruction.operation(), Operation::JitCall(_)),
-            "expected the residual program to contain the residual jit_call",
+        // The known half lands in the outer program as one known-side `jit_call` over the symbolic known input, which
+        // produces the fully known callee output once, and the unknown half stays behind one residual `jit_call` over
+        // the unknown input and the residual edge fed from that output.
+        let known_program = outer
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        assert_eq!(
+            known_program.to_string(),
+            indoc! {"
+                lambda %0:f64[4] .
+                let %1:f64[4] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[4] .
+                        let %1:f64[4] = add %0 %0
+                        in (%1)
+                    },
+                ]
+                in ()"},
         );
-        let residual_callee = evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().to_program();
-        assert_eq!(residual_callee.input_ids().len(), 2);
-        assert_eq!(residual_callee.instructions().len(), 2);
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4] .
+                let %2:f64[4], %3:f64[4] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = mul %0 %0
+                            %3:f64[4] = mul %1 %0
+                        in (%2, %3)
+                    },
+                ]
+                in (%2, %3)"},
+        );
 
-        // The boundary descriptors: the unknown enclosing input feeds the residual call, the residual edge is a
+        // In the boundary descriptors, the unknown enclosing input feeds the residual call, the residual edge is a
         // known feeder naming the known-side call's staged output, and the outputs reassemble in original order.
-        assert_eq!(evaluation.inputs().len(), 2);
-        assert!(matches!(&evaluation.inputs()[0], PartialEvaluationInput::Unknown(1)));
-        assert!(matches!(&evaluation.inputs()[1], PartialEvaluationInput::Known(value) if value.atom_id().is_ok()));
-        assert_eq!(evaluation.outputs().len(), 3);
-        assert!(matches!(&evaluation.outputs()[0], PartialEvaluationOutput::Known(value) if value.atom_id().is_ok()));
-        assert!(matches!(&evaluation.outputs()[1], PartialEvaluationOutput::Unknown(0)));
-        assert!(matches!(&evaluation.outputs()[2], PartialEvaluationOutput::Unknown(1)));
+        let known_output = known_program.instructions()[0].outputs()[0];
+        assert!(matches!(
+            evaluation.inputs(),
+            [PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(value)]
+                if value.atom_id().ok() == Some(known_output),
+        ));
+        assert!(matches!(
+            evaluation.outputs(),
+            [PartialEvaluationOutput::Known(value), PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]
+                if value.atom_id().ok() == Some(known_output),
+        ));
     }
 
     #[test]
     fn test_jit_call_partial_evaluation_splits_concrete_known_inputs() {
-        use ryft_core::{Device, DeviceMesh, PartialEvaluationInput, PartialEvaluationOutput};
-
-        use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-        use crate::{FromPjrt, Session, Value};
-
         // Partial evaluation splits a mixed `jit_call` whose known inputs are concrete arrays of the eager XLA domain
-        // exactly as it splits one whose known inputs are symbolic: the known-side call compiles and executes
+        // exactly as it splits one whose known inputs are symbolic. The known-side call compiles and executes
         // immediately, so the output `a + a` is known and concrete, and the residual call keeps only `(a + a) * x`,
         // fed by that known output (JAX's `out_fwd`).
         let client = execution_client();
-        let device = Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let logical_mesh = mesh.logical_mesh().clone();
         let domain = Session::new(&client).domain();
         let array_type = vector_type().with_sharding(Sharding::replicated(logical_mesh, 1)).unwrap();
         let r#type = ArrayIrType::Array(array_type.clone());
@@ -5013,10 +4223,10 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_forwards_known_output_residuals() {
-        // The callee `f(a, x) = (sin(a), sin(a) * x)` partitioned with `a` known and `x` unknown: the residual call
-        // needs `sin(a)`, which is also a known output, so the known call returns it once and the residual call is fed
-        // from that output (JAX's `out_fwd`). The outer partition repeats the known call's output as its own residual
-        // edge, because `Program::partition` keeps one edge per residual feeder.
+        // When the callee `f(a, x) = (sin(a), sin(a) * x)` is partitioned with `a` known and `x` unknown, the residual
+        // call needs `sin(a)`, which is also a known output, so the known call returns it once and the residual call is
+        // fed from that output (JAX's `out_fwd`). The outer partition repeats the known call's output as its own
+        // residual edge, because `Program::partition` keeps one edge per residual feeder.
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
@@ -5119,19 +4329,23 @@ mod tests {
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)])
             .unwrap();
 
-        // No known-side call was hoisted into the outer trace, and the residual program retains the original call
-        // with its callee — capture constant included — intact.
+        // No known-side call is hoisted into the outer program, and the residual program retains the original call
+        // with its callee intact, including its capture constant.
         assert!(outer.builder().borrow().instructions().is_empty());
-        assert_eq!(evaluation.program().instructions().len(), 1);
-        let residual_instruction = &evaluation.program().instructions()[0];
-        assert!(matches!(residual_instruction.operation(), Operation::JitCall(_)));
-        let residual_callee = evaluation.program().region_ref(residual_instruction.regions()[0]).unwrap().to_program();
-        assert_eq!(residual_callee.instructions().len(), 2);
-        assert!(
-            residual_callee
-                .atoms()
-                .iter()
-                .any(|atom| atom.as_constant().is_some_and(|constant| constant.capture_index().is_some())),
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4] .
+                let %2:f64[4], %3:f64[4] = jit_call %1 %0 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = const capture#0:f64[4]
+                            %3:f64[4] = add %0 %2
+                            %4:f64[4] = mul %3 %1
+                        in (%3, %4)
+                    },
+                ]
+                in (%2, %3)"},
         );
     }
 
@@ -5175,36 +4389,46 @@ mod tests {
             .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
-        // The callee partitions like any other: its pure prefix over the known input folds into the known side
-        // (staged into the outer trace) while the runtime-dependent product stays in the residual callee, and the
-        // allocation, which nothing observes, is a dead intrinsic-state operation that neither side retains.
+        // The callee partitions like any other. Its pure prefix over the known input folds into the known side, which
+        // is staged into the outer program, while the runtime-dependent product stays in the residual callee, and the
+        // allocation, which nothing observes, is a dead intrinsic state operation that neither side retains.
         let outer = TracingContext::<Constant, Operation>::new();
         let known = outer.input(r#type.clone());
         let evaluation = program
             .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)])
             .unwrap();
-        let residual_names = evaluation
-            .program()
-            .entry_region_ref()
-            .instructions_in_closure()
-            .map(|(_, instruction)| instruction.operation().name())
-            .collect::<Vec<_>>();
-        assert!(residual_names.contains(&"mul"), "{residual_names:?}");
-        assert!(!residual_names.contains(&"add"), "{residual_names:?}");
-        assert!(!residual_names.contains(&"reference_new"), "{residual_names:?}");
         let known_program = outer
             .builder()
             .borrow()
             .clone()
             .build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new())
             .unwrap();
-        let known_names = known_program
-            .entry_region_ref()
-            .instructions_in_closure()
-            .map(|(_, instruction)| instruction.operation().name())
-            .collect::<Vec<_>>();
-        assert!(known_names.contains(&"add"), "{known_names:?}");
-        assert!(!known_names.contains(&"reference_new"), "{known_names:?}");
+        assert_eq!(
+            known_program.to_string(),
+            indoc! {"
+                lambda %0:f64[4] .
+                let %1:f64[4] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[4] .
+                        let %1:f64[4] = add %0 %0
+                        in (%1)
+                    },
+                ]
+                in ()"},
+        );
+        assert_eq!(
+            evaluation.program().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4] .
+                let %2:f64[4] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
     }
 
     #[test]
@@ -5230,8 +4454,8 @@ mod tests {
         }
 
         // The callee computes `cos(dot(x, x)) * t`. Partitioning the caller with `x` known splits the call, and the
-        // policy then plans the callee partition: the known call returns the dot product instead of its cosine, and
-        // the residual call recomputes the cosine.
+        // policy then plans the callee partition, in which the known call returns the dot product instead of its
+        // cosine and the residual call recomputes the cosine.
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
             let x = builder.add_input(ArrayIrType::Array(vector_type()));
@@ -5302,10 +4526,6 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_places_all_known_callee_intermediates() {
-        use ryft_core::{BroadcastOperation, Linearization, SaveOnlyTheseNames};
-
-        use crate::tests::execution_client;
-
         // Only the expanded activation is needed by the tangent. Its all-known call must expose the compact tagged
         // scale to the policy, saving 4 KiB instead of 256 KiB, so the call is split on residual demand into a known
         // call that also returns the scale and a replay call that recomputes only the broadcast.
@@ -5338,7 +4558,33 @@ mod tests {
         // Ordinary partial evaluation preserves the original compiled-call boundary and expanded residual.
         let ordinary = program.partition(&[false, true]).unwrap();
         assert_eq!(ordinary.known_program().output_types(), vec![ArrayIrType::from(expanded_type.clone())]);
-        assert!(matches!(ordinary.known_program().instructions()[0].operation(), Operation::JitCall(_)));
+        assert_eq!(
+            ordinary.to_string(),
+            indoc! {"
+                partition [
+                    known_inputs=[1],
+                    residual_inputs=[UnknownInput(0), ResidualEdge(0)],
+                    outputs=[Unknown(0)],
+                ]
+                known={
+                    lambda %0:f32[1024] .
+                    let %1:f32[64, 1024] = jit_call %0 [
+                        callee={
+                            lambda %0:f32[1024] .
+                            let %1:f32[1024] = sin %0
+                                %2:f32[1024] = tag [key=scale] %1
+                                %3:f32[64, 1024] = broadcast [output_type=f32[64, 1024], output_axes=[1]] %2
+                            in (%3)
+                        },
+                    ]
+                    in (%1)
+                }
+                residual={
+                    lambda %0:f32[64, 1024], %1:f32[64, 1024] .
+                    let %2:f32[64, 1024] = mul %0 %1
+                    in (%2)
+                }"},
+        );
         assert_eq!(expanded_type.element_count().unwrap().unwrap() * size_of::<f32>(), 262_144);
 
         let policy = ResidualPolicyReference::new(SaveOnlyTheseNames::new(["scale"]));
@@ -5452,8 +4698,6 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_ignores_known_outputs_without_residual_demand() {
-        use ryft_core::{RematerializationPolicyFn, ResidualPolicyError};
-
         let scalar_type = ArrayIrType::from(ArrayType::scalar(DataType::F32));
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(scalar_type.clone());
@@ -5549,8 +4793,6 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_preserves_guarded_known_callees() {
-        use ryft_core::{NothingSavable, PartialEvaluationContext};
-
         let policy = ResidualPolicyReference::new(NothingSavable);
         let check_boundary = |callee: Program<Vec<Constant>, Vec<Constant>>, capture_count: usize| {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -5626,7 +4868,7 @@ mod tests {
         );
 
         // A known value without a staged parent atom must not trigger per-operation replay. The same guard keeps
-        // concrete eager calls whole; using a literal in a live trace makes the retained call directly observable.
+        // concrete eager calls whole. Using a literal in a live trace makes the retained call directly observable.
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(predicate_type);
         let callee = builder
@@ -5636,8 +4878,25 @@ mod tests {
         let context = PartialEvaluationContext::new(outer.clone()).with_residual_policy(&policy);
         let input = context.lift(Constant::Boolean(true)).unwrap();
         context.bind(Operation::JitCall(JitCallOperation::new(0)), vec![callee], &[input]).unwrap();
-        assert_eq!(outer.builder().borrow().instructions().len(), 1);
-        assert!(matches!(outer.builder().borrow().instructions()[0].operation(), Operation::JitCall(_)));
+        let known_program = outer
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Constant>, Vec<Constant>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        assert_eq!(
+            known_program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:bool[] = const true
+                    %1:bool[] = jit_call %0 [
+                        callee={
+                            lambda %0:bool[] .
+                            in (%0)
+                        },
+                    ]
+                in ()"},
+        );
     }
 
     #[test]
@@ -6367,7 +5626,7 @@ mod tests {
 
     #[test]
     fn test_jit_call_partial_evaluation_caches_repeated_residual_modes_separately() {
-        /// Supplies only the source callee and partition mode; the test provides the partition closure directly.
+        /// Supplies only the source callee and partition mode, while the test provides the partition closure directly.
         struct SplitCacheDriver {
             /// Callee shared across both partition modes.
             callee: Arc<FlatProgram>,
@@ -6464,10 +5723,10 @@ mod tests {
                 partitions.set(partitions.get() + 1);
                 if repeated_residual {
                     // Repeated-call partitioning permits known effects in its fresh analysis despite the caller's
-                    // effect-folding restriction; emission still defers those effects through the active context.
+                    // effect folding restriction. Emission still defers those effects through the active context.
                     callee.partition(&[true, false])
                 } else {
-                    // Ordinary specialization inherits that restriction: only the pure square remains known.
+                    // Ordinary specialization inherits that restriction, so only the pure square remains known.
                     PartitionedProgram::from_parts(
                         ordinary_known.clone(),
                         ordinary_residual.clone(),
@@ -6731,489 +5990,1606 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_jit_call_reference_discharge_threads_callee_state_into_the_caller() {
-        // Two nested call levels each swap a distinct reference. Discharge must lift both states to the caller's
-        // boundary in public-input order, mark both as mutated with their own final-state output slot, and leave no
-        // reference-typed atom anywhere in the resulting program.
-        let reference_type = ReferenceType::new(vector_type());
-        let inner_callee = {
-            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-            let reference = builder.add_input(reference_type.clone().into());
-            let replacement = builder.add_input(vector_type().into());
-            let snapshot = builder
-                .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let callee = {
-            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-            let inner_callee = builder.import_region(inner_callee.entry_region_ref());
-            let first_reference = builder.add_input(reference_type.clone().into());
-            let first_replacement = builder.add_input(vector_type().into());
-            let second_reference = builder.add_input(reference_type.clone().into());
-            let second_replacement = builder.add_input(vector_type().into());
-            let first_snapshot = builder
-                .add_instruction(
-                    Operation::JitCall(JitCallOperation::new(0)),
-                    vec![inner_callee],
-                    vec![first_reference, first_replacement],
-                    None,
-                )
-                .unwrap()[0];
-            let second_snapshot = builder
-                .add_instruction(
-                    Operation::JitCall(JitCallOperation::new(0)),
-                    vec![inner_callee],
-                    vec![second_reference, second_replacement],
-                    None,
-                )
-                .unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(
-                    vec![first_snapshot, second_snapshot],
-                    vec![Placeholder; 4],
-                    vec![Placeholder; 2],
-                )
-                .unwrap()
-        };
-
-        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-        let callee = builder.import_region(callee.entry_region_ref());
-        let first_reference = builder.add_input(reference_type.clone().into());
-        let first_replacement = builder.add_input(vector_type().into());
-        let second_reference = builder.add_input(reference_type.into());
-        let second_replacement = builder.add_input(vector_type().into());
-        let snapshots = builder
-            .add_instruction(
-                Operation::JitCall(JitCallOperation::new(0)),
-                vec![callee],
-                vec![first_reference, first_replacement, second_reference, second_replacement],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(snapshots, vec![Placeholder; 4], vec![Placeholder; 2])
+    fn test_jit_call_batching() {
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let callee = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
+        let callees = [Arc::new(callee)];
+        let regions = AttachedRegions::Callees(&callees);
+        let driver = RecursiveBatchingDriver::new(&regions);
+        let vector = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
+        let (_, program) = TracingContext::<Constant, Operation>::trace(
+            |inputs: Vec<CoreTracer<TracingContext<Constant, Operation>>>| {
+                let parent = inputs[0].context();
+                let extent = parent.constant(Constant::Dimension(DimensionValue::constant(3).unwrap()));
+                let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+                let outputs = JitCallOperation::<ArrayIrType>::new(0).batch(
+                    &context,
+                    &driver,
+                    &[ArrayIrBatch::new(inputs[0].clone(), Some(0))?],
+                )?;
+                Ok::<_, ProgramError>(outputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>())
+            },
+            vec![vector.clone()],
+        )
+        .unwrap();
+        assert_eq!(program.input_types(), vec![vector.clone()]);
+        assert_eq!(program.output_types(), vec![vector]);
+        let Operation::JitCall(call) = program.instructions()[0].operation() else {
+            panic!("expected jit_call");
+        };
+        assert_eq!(call.capture_count(), 1);
 
-        let discharged = program.discharge_references(0).unwrap();
-        assert_eq!(discharged.output_count(), 2);
-        assert_eq!(discharged.program().output_count(), 4);
-        assert_eq!(discharged.external_reference_bindings().len(), 2);
-        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
-        assert!(discharged.external_reference_bindings()[0].is_mutated());
-        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(2));
-        assert_eq!(discharged.external_reference_bindings()[1].source(), ReferenceSource::Input { index: 2 });
-        assert!(discharged.external_reference_bindings()[1].is_mutated());
-        assert_eq!(discharged.external_reference_bindings()[1].output_index(), Some(3));
+        // The batched callee receives the extent as its leading input, and it does not return the extent, because that
+        // bookkeeping output would only forward the input and an eager parent cannot return it from a compiled call.
+        let body = program.region_ref(program.instructions()[0].regions()[0]).unwrap();
+        assert_eq!(body.input_types().len(), 2);
+        assert_eq!(body.output_ids(), &[body.input_ids()[1]]);
     }
 
     #[test]
-    fn test_nested_jit_call_reference_discharge_resolves_callee_lexical_capture_scope() {
-        // A branch region inside the callee reaches its reference through a capture constant, which must resolve
-        // against the callee's own capture scope rather than the entry program's lifted prefix: the accessed root is
-        // the caller's second public input, and only that mutated state gains a final-state output.
-        let reference_type = ReferenceType::new(vector_type());
-        let branch = {
-            let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-            let replacement = builder.add_input(vector_type().into());
-            let reference = builder.add_constant(Constant::Captured(CaptureReference::new(
-                0,
-                ArrayIrType::Reference(reference_type.clone()),
-            )));
-            let snapshot = builder
-                .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
+    fn test_jit_call_batching_homogeneous_named_axis() {
+        /// Array-only family for exercising the homogeneous `jit_call` batching rule without array IR carriers.
+        #[derive(Clone, Debug, Operation)]
+        #[ryft(crate = "ryft_core", type(ArrayType), constant(CoreArray), dispatch(batching))]
+        enum NamedAxisCallOperation {
+            AxisIndex(AxisIndexOperation),
+            Iota(IotaOperation<ArrayType>),
+            Broadcast(BroadcastOperation),
+            Transpose(TransposeOperation),
+            Zero(ZeroOperation<ArrayType>),
+            Call(JitCallOperation<ArrayType>),
+        }
+
+        for replicated in [false, true] {
+            let mut builder = CoreProgramBuilder::<CoreArray, NamedAxisCallOperation>::new();
+            let input = replicated.then(|| builder.add_input(ArrayType::scalar(DataType::F32)));
+            let index =
+                builder.add_instruction(AxisIndexOperation::new("items".to_owned()), vec![], vec![], None).unwrap()[0];
+            let outputs = std::iter::once(index).chain(input).collect::<Vec<_>>();
+            let callee = builder
+                .build::<Vec<CoreArray>, Vec<CoreArray>>(
+                    outputs,
+                    vec![Placeholder; usize::from(replicated)],
+                    vec![Placeholder; 1 + usize::from(replicated)],
+                )
+                .unwrap();
+            let callees = [Arc::new(callee)];
+            let regions = AttachedRegions::Callees(&callees);
+            let driver = RecursiveBatchingDriver::new(&regions);
+            let (_, program) = TracingContext::<CoreArray, NamedAxisCallOperation>::trace_with_context_and_named_axes(
+                |parent, inputs: Vec<CoreTracer<TracingContext<CoreArray, NamedAxisCallOperation>>>| {
+                    let context = BatchingContext::<_, ArrayBatchingPolicy>::new(parent.clone(), 3)
+                        .with_axis_name("items".to_owned());
+                    let inputs = inputs.into_iter().map(ArrayBatch::replicated).collect::<Vec<_>>();
+                    let outputs = JitCallOperation::<ArrayType>::new(0).batch(&context, &driver, &inputs)?;
+                    assert_eq!(outputs[0].batch_axis_position(), Some(0));
+                    if replicated {
+                        assert_eq!(outputs[1].batch_axis_position(), None);
+                    }
+                    Ok::<_, ProgramError>(outputs.into_iter().map(ArrayBatch::into_value).collect::<Vec<_>>())
+                },
+                vec![ArrayType::scalar(DataType::F32); usize::from(replicated)],
+                vec![],
+            )
+            .unwrap();
+            let expected = if replicated {
+                indoc! {"
+                    lambda %0:f32[] .
+                    let %1:u64[3], %2:f32[] = jit_call %0 [
+                        callee={
+                            lambda %0:f32[] .
+                            let %1:u64[3] = iota [type=u64[3], dimension=0]
+                            in (%1, %0)
+                        },
+                    ]
+                    in (%1, %2)"}
+            } else {
+                indoc! {"
+                    lambda  .
+                    let %0:u64[3] = jit_call [
+                        callee={
+                            lambda  .
+                            let %0:u64[3] = iota [type=u64[3], dimension=0]
+                            in (%0)
+                        },
+                    ]
+                    in (%0)"}
+            };
+            assert_eq!(program.to_string(), expected);
+            assert_eq!(program.output_types()[0], ArrayType::new_static(DataType::U64, [3]));
+        }
+    }
+
+    #[test]
+    fn test_jit_call_differentiation_omits_zero_space_boundary_tangents() {
+        let dimension_type =
+            ArrayIrType::Dimension(DimensionType::new("size", DimensionBounds::positive(Some(9)).unwrap()));
+        let array_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+
+        let mut callee_builder = ArrayIrProgramBuilder::new();
+        let dimension = callee_builder.add_input(dimension_type.clone());
+        let array = callee_builder.add_input(array_type.clone());
+        let callee = callee_builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![dimension, array], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let mut builder = ArrayIrProgramBuilder::new();
+        let dimension = builder.add_input(dimension_type.clone());
+        let array = builder.add_input(array_type.clone());
+        let callee = builder.import_region(callee.entry_region_ref());
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![dimension, array], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_types(), vec![dimension_type.clone(), array_type.clone(), array_type.clone()]);
+        assert_eq!(jvp.output_types(), vec![dimension_type, array_type.clone(), array_type]);
+    }
+
+    #[test]
+    fn test_jit_call_differentiation_keeps_capture_prefix_inactive() {
+        // The callee's leading input is its lifted capture (`capture_count = 1`). The call's activity mask starts
+        // inactive over that prefix, numeric captures included, so the fused callee consumes the primal operands,
+        // capture prefix first, followed only by the live operand tangent.
+        let r#type = ArrayIrType::Array(vector_type());
         let callee = {
             let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-            let branch = builder.import_region(branch.entry_region_ref());
-            builder.add_input(reference_type.clone().into());
-            let replacement = builder.add_input(vector_type().into());
-            let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-            let snapshot = builder
-                .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, replacement], None)
-                .unwrap()[0];
+            let captured = builder.add_input(r#type.clone());
+            let input = builder.add_input(r#type.clone());
+            let product =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![captured, input], None).unwrap()[0];
             builder
-                .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 3], vec![Placeholder])
+                .build::<Vec<Constant>, Vec<Constant>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-
         let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
         let callee = builder.import_region(callee.entry_region_ref());
-        builder.add_input(reference_type.clone().into());
-        let reference = builder.add_input(reference_type.into());
-        let replacement = builder.add_input(vector_type().into());
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let snapshot = builder
+        let captured = builder.add_input(r#type.clone());
+        let input = builder.add_input(r#type);
+        let output = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(1)), vec![callee], vec![captured, input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4], %2:f64[4], %3:f64[4] .
+                let %4:f64[4], %5:f64[4] = jit_call [capture_count=1] %0 %1 %3 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4], %2:f64[4] .
+                        let %3:f64[4] = mul %0 %1
+                            %4:f64[4] = mul %0 %2
+                        in (%3, %4)
+                    },
+                ]
+                in (%4, %5)"},
+        );
+    }
+
+    #[test]
+    fn test_jit_call_differentiation_threads_plumbing_and_active_references() {
+        // The callee `f(captured, r, x) = { r += x; read(r) * read(captured) }` behind `jit_call[capture_count=1]`
+        // reads a captured plumbing reference and mutates an active reference operand.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let captured = builder.add_input(reference_type.clone());
+            let reference = builder.add_input(reference_type.clone());
+            let update = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(
+                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
+                .unwrap();
+            let state = builder
+                .add_instruction(
+                    Operation::ReferenceRead(ReferenceReadOperation::new()),
+                    Vec::new(),
+                    vec![reference],
+                    None,
+                )
+                .unwrap()[0];
+            let scale = builder
+                .add_instruction(
+                    Operation::ReferenceRead(ReferenceReadOperation::new()),
+                    Vec::new(),
+                    vec![captured],
+                    None,
+                )
+                .unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, scale], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let captured = builder.add_input(reference_type.clone());
+        let reference = builder.add_input(reference_type.clone());
+        let update = builder.add_input(scalar_type.clone());
+        let output = builder
             .add_instruction(
                 Operation::JitCall(JitCallOperation::new(1)),
                 vec![callee],
-                vec![reference, replacement, predicate],
+                vec![captured, reference, update],
                 None,
             )
             .unwrap()[0];
         let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![snapshot], vec![Placeholder; 4], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
 
-        let discharged = program.discharge_references_in_capture_lifted_program(0).unwrap();
-        assert_eq!(discharged.output_count(), 1);
-        assert_eq!(discharged.program().output_count(), 2);
-        assert_eq!(discharged.external_reference_bindings().len(), 2);
-        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
-        assert!(!discharged.external_reference_bindings()[0].is_mutated());
-        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
-        assert_eq!(discharged.external_reference_bindings()[1].source(), ReferenceSource::Input { index: 1 });
-        assert!(discharged.external_reference_bindings()[1].is_mutated());
-        assert_eq!(discharged.external_reference_bindings()[1].output_index(), Some(1));
+        // The plumbing capture is inactive and the active reference receives a tangent reference input, so the fused
+        // program and its one fused call consume `[captured, r, x, ṫr, ẋ]`, keeping the capture prefix verbatim.
+        let jvp = program.entry_region_ref().jvp(&[1, 2]).unwrap();
+        assert_eq!(
+            jvp.input_types(),
+            vec![
+                reference_type.clone(),
+                reference_type.clone(),
+                scalar_type.clone(),
+                reference_type.clone(),
+                scalar_type.clone(),
+            ],
+        );
+        assert_eq!(jvp.output_types(), vec![scalar_type.clone(), scalar_type.clone()]);
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[]>, %1:ref<f32[]>, %2:f32[], %3:ref<f32[]>, %4:f32[] .
+                let %5:f32[], %6:f32[] = jit_call [capture_count=1] %0 %1 %2 %3 %4 [
+                    callee={
+                        lambda %0:ref<f32[]>, %1:ref<f32[]>, %2:f32[], %3:ref<f32[]>, %4:f32[] .
+                        let () = reference_add_update %1 %2
+                            () = reference_add_update %3 %4
+                            %5:f32[] = reference_read %1
+                            %6:f32[] = reference_read %3
+                            %7:f32[] = reference_read %0
+                            %8:f32[] = mul %5 %7
+                            %9:f32[] = mul %7 %6
+                        in (%8, %9)
+                    },
+                ]
+                in (%5, %6)"},
+        );
     }
 
     #[test]
-    fn test_jit_call_reference_discharge_preserves_forwarded_root_identity() {
-        let reference_type = ReferenceType::new(vector_type());
-        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
-        let reference = callee_builder.add_input(reference_type.clone().into());
+    fn test_jit_call_differentiation_omits_inactive_reference_output_tangents() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut callee_builder = ArrayIrProgramBuilder::new();
+        let reference = callee_builder.add_input(reference_type.clone());
+        let value = callee_builder.add_input(scalar_type.clone());
+        let doubled =
+            callee_builder.add_instruction(AddOperation::new(), Vec::new(), vec![value, value], None).unwrap()[0];
         let callee = callee_builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(vec![reference, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
-
-        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let reference = builder.add_input(reference_type.clone());
+        let value = builder.add_input(scalar_type.clone());
         let callee = builder.import_region(callee.entry_region_ref());
-        let reference = builder.add_input(reference_type.into());
-        let forwarded = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference], None)
-            .unwrap()[0];
-        let value =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![forwarded], None).unwrap()[0];
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(1)), vec![callee], vec![reference, value], None)
+            .unwrap()
+            .to_vec();
         let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
-
-        // The callee only forwards its reference input, so discharge must keep the forwarded value bound to the same
-        // root as the caller's public reference input instead of synthesizing a second state slot for it. Reading
-        // through the forwarded result is not a mutation, so no final-state output is appended.
-        let discharged = program.discharge_references(0).unwrap();
-        assert_eq!(discharged.output_count(), 1);
-        assert_eq!(discharged.program().output_count(), 1);
-        assert_eq!(discharged.external_reference_bindings().len(), 1);
-        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
-        assert!(!discharged.external_reference_bindings()[0].is_mutated());
-        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
+        let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
+        assert_eq!(jvp.input_types(), vec![reference_type.clone(), scalar_type.clone(), scalar_type.clone()]);
+        assert_eq!(jvp.output_types(), vec![reference_type, scalar_type.clone(), scalar_type]);
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[]>, %1:f32[], %2:f32[] .
+                let %3:ref<f32[]>, %4:f32[], %5:f32[] = jit_call [capture_count=1] %0 %1 %2 [
+                    callee={
+                        lambda %0:ref<f32[]>, %1:f32[], %2:f32[] .
+                        let %3:f32[] = add %1 %1
+                            %4:f32[] = add %2 %2
+                        in (%0, %3, %4)
+                    },
+                ]
+                in (%3, %4, %5)"},
+        );
     }
 
     #[test]
-    fn test_jit_call_reference_discharge_widens_its_callee_with_the_final_state() {
-        // `jit_call` forwards its operands onto its callee one for one and reports the callee's outputs as its own, so
-        // the shared positional rewrite threads state through it: the callee gains the entering state after its
-        // declared inputs and publishes the final state after its declared outputs, while the call site keeps its own
-        // operand and output contract. The callee mutates the root and returns only the previous snapshot, so the
-        // final state is exactly what the call site would otherwise have lost.
-        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
-        let callee_reference = callee_builder.add_input(reference_type.into());
-        let callee_update = callee_builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let previous = callee_builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![callee_reference, callee_update], None)
-            .unwrap()[0];
-        let callee = callee_builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-        let callee = builder.import_program(callee);
-        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let previous = builder
-            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![root, update], None)
-            .unwrap()[0];
-        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
-        let source = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![previous, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-
-        // The callee's local root is allocated, mutated, and consumed inside the call, so widening the boundary
-        // leaves no external state behind and the rewritten call is the entry region's only instruction.
-        let discharged = source.discharge_references(0).unwrap();
-        assert_eq!(discharged.external_reference_bindings(), &[]);
-        assert_eq!(discharged.program().output_types().len(), 2);
-        assert_eq!(discharged.program().entry_region_ref().instructions().len(), 1);
-    }
-
-    #[test]
-    fn test_jit_call_reference_discharge_instantiates_callee_local_results() {
-        use ryft_core::{
-            Device, DeviceMesh, DimensionFromScalarOperation, DimensionToScalarOperation, ValueProjection,
+    fn test_jit_call_differentiation_treats_structurally_zero_tangents_as_inactive() {
+        // When `f(x, y) = (sin(x), cos(y))` is differentiated with respect to `x` only, the structurally zero tangent
+        // of `y` gets no fused callee slot, and the tangent of `cos(y)`, which then depends on no tangent input, is a
+        // structural zero that the fused call does not return.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let x = builder.add_input(r#type.clone());
+            let y = builder.add_input(r#type.clone());
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+            let cosine = builder.add_instruction(CosOperation::new(), Vec::new(), vec![y], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sine, cosine], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
         };
-
-        use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-        use crate::{CompiledFunction, FromPjrt, Session};
-
-        // The callee mutates a reference and returns a dimension that it defines itself, so the call instantiates a
-        // fresh result identity. Discharge widens the callee with the reference state, which must not leave the
-        // call's result metadata pinned to the narrower pre-discharge callee signature.
-        let client = execution_client();
-        let device = Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh.clone(), vec![device]).unwrap();
-        let domain = Session::new(&client).domain();
-        let value_type = ArrayType::scalar(DataType::F32).with_sharding(Sharding::replicated(logical_mesh.clone(), 0));
-        let value_type = value_type.unwrap();
-        let extent_type = ArrayType::scalar(DataType::I64).with_sharding(Sharding::replicated(logical_mesh, 0));
-        let extent_type = extent_type.unwrap();
-        let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
-
-        let mut callee_builder = CoreProgramBuilder::<Constant, Operation>::new();
-        let reference = callee_builder.add_input(ReferenceType::new(value_type.clone()).into());
-        let update = callee_builder.add_input(value_type.clone().into());
-        let extent = callee_builder.add_input(extent_type.clone().into());
-        let previous = callee_builder
-            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, update], None)
-            .unwrap()[0];
-        let dimension = callee_builder
-            .add_instruction(DimensionFromScalarOperation::new(rows.clone()), Vec::new(), vec![extent], None)
-            .unwrap()[0];
-        let callee = callee_builder
-            .build::<Vec<Constant>, Vec<Constant>>(
-                vec![previous, dimension],
-                vec![Placeholder; 3],
-                vec![Placeholder; 2],
-            )
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], inputs, None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
+        assert_eq!(
+            program.entry_region_ref().jvp(&[0]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4], %2:f64[4] .
+                let %3:f64[4], %4:f64[4], %5:f64[4] = jit_call %0 %1 %2 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4], %2:f64[4] .
+                        let %3:f64[4] = sin %0
+                            %4:f64[4] = cos %1
+                            %5:f64[4] = cos %0
+                            %6:f64[4] = mul %5 %2
+                        in (%3, %4, %6)
+                    },
+                ]
+                    %6:f64[4] = zero [type=f64[4]]
+                in (%3, %4, %5, %6)"},
+        );
+    }
+
+    #[test]
+    fn test_jit_call_differentiation_omits_independent_output_tangents() {
+        // In `f(x) = (sin(x), 0)`, the tangent of the constant output depends on no tangent input, so it is a
+        // structural zero that the fused call does not return.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let x = builder.add_input(r#type.clone());
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+            let zero =
+                builder.add_instruction(ZeroOperation::new(vector_type()), Vec::new(), Vec::new(), None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sine, zero], vec![Placeholder], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let input = builder.add_input(r#type);
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4] .
+                let %2:f64[4], %3:f64[4], %4:f64[4] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = sin %0
+                            %3:f64[4] = zero [type=f64[4]]
+                            %4:f64[4] = cos %0
+                            %5:f64[4] = mul %4 %1
+                        in (%2, %3, %5)
+                    },
+                ]
+                    %5:f64[4] = zero [type=f64[4]]
+                in (%2, %3, %4, %5)"},
+        );
+    }
+
+    #[test]
+    fn test_jit_call_differentiation_preserves_live_outputs_around_inactive_tangent() {
+        // `f(x) = (sin(x), 0, x)` has an inactive middle tangent slot. Projecting that slot must leave both live
+        // tangents aligned with their original primal outputs rather than pairing the final tangent with the zero.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(r#type.clone());
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            let zero =
+                builder.add_instruction(ZeroOperation::new(vector_type()), Vec::new(), Vec::new(), None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sine, zero, input], vec![Placeholder], vec![Placeholder; 3])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let input = builder.add_input(r#type.clone());
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 3])
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.output_types(), vec![r#type; 6]);
+        assert_eq!(
+            jvp.to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4] .
+                let %2:f64[4], %3:f64[4], %4:f64[4], %5:f64[4], %6:f64[4] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = sin %0
+                            %3:f64[4] = zero [type=f64[4]]
+                            %4:f64[4] = cos %0
+                            %5:f64[4] = mul %4 %1
+                        in (%2, %3, %0, %5, %1)
+                    },
+                ]
+                    %7:f64[4] = zero [type=f64[4]]
+                in (%2, %3, %4, %5, %7, %6)"},
+        );
+    }
+
+    #[test]
+    fn test_jit_call_differentiation_skips_tangent_calls_without_live_output_tangents() {
+        // When `f(x, y) = sin(x)` is differentiated with respect to `y` only, no output tangent depends on the tangent
+        // of `y` and the tangent callee has no effects, so only the source call is bound and the output tangent is a
+        // structural zero.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let x = builder.add_input(r#type.clone());
+            builder.add_input(r#type.clone());
+            let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![x], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![sine], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let inputs = (0..2).map(|_| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+        let output = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], inputs, None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.entry_region_ref().jvp(&[1]).unwrap().to_string(),
+            indoc! {"
+                lambda %0:f64[4], %1:f64[4], %2:f64[4] .
+                let %3:f64[4] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[4], %1:f64[4] .
+                        let %2:f64[4] = sin %0
+                        in (%2)
+                    },
+                ]
+                    %4:f64[4] = zero [type=f64[4]]
+                in (%3, %4)"},
+        );
+    }
+
+    #[test]
+    fn test_jit_call_differentiation_preserves_local_result_shape_relationships() {
+        // `f(x, size) = broadcast(x, [dimension_from_scalar(size)])` is linear in `x` and returns an array whose extent
+        // the callee defines itself. The JVP rule binds separate primal and tangent calls, so the output tangent shares
+        // the primal output's extent only if that extent reaches the tangent call through a residual.
+        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
+        let sharding = Sharding::replicated(logical_mesh, 0);
+        let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32).with_sharding(sharding.clone()).unwrap());
+        let size_type = ArrayIrType::Array(ArrayType::scalar(DataType::I64).with_sharding(sharding).unwrap());
+        let rows = DimensionType::from(DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap()));
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let value = builder.add_input(value_type.clone());
+            let size = builder.add_input(size_type.clone());
+            let dimension = builder
+                .add_instruction(DimensionFromScalarOperation::new(rows), Vec::new(), vec![size], None)
+                .unwrap()[0];
+            let broadcast = builder
+                .add_instruction(DynamicBroadcastOperation::new(Vec::new()), Vec::new(), vec![value, dimension], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![broadcast], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
         let operation = JitCallOperation::new(0)
             .with_callee_type_signature(&callee.input_types(), &callee.output_types())
             .unwrap();
-
-        let mut builder = CoreProgramBuilder::<Constant, Operation>::new();
-        let callee = builder.import_program(callee);
-        let initial = builder.add_input(value_type.clone().into());
-        let update = builder.add_input(value_type.clone().into());
-        let extent = builder.add_input(extent_type.clone().into());
-        let root = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let outputs = builder
-            .add_instruction(Operation::JitCall(operation), vec![callee], vec![root, update, extent], None)
-            .unwrap()
-            .to_vec();
-        let frozen = builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![root], None).unwrap()[0];
-        let extent =
-            builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![outputs[1]], None).unwrap()[0];
-        let source = builder
-            .build::<Vec<Constant>, Vec<Constant>>(
-                vec![outputs[0], extent, frozen],
-                vec![Placeholder; 3],
-                vec![Placeholder; 3],
-            )
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let inputs = vec![builder.add_input(value_type), builder.add_input(size_type)];
+        let output = builder.add_instruction(Operation::JitCall(operation), vec![callee], inputs, None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let program = source.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
-        assert_eq!(
-            program.to_string(),
-            formatdoc! {"
-                lambda %0:{value_type}, %1:{value_type}, %2:{extent_type} .
-                let %3:{value_type}, %4:dimension<rows ∈ [0, 8)>, %5:{value_type} = jit_call [
-                    output_types=[{value_type}, dimension<rows ∈ [0, 8)>, {value_type}],
-                ] %0 %1 %2 [
-                    callee={{
-                        lambda %0:{value_type}, %1:{value_type}, %2:{extent_type} .
-                        let %3:dimension<rows ∈ [0, 8)> = dimension_from_scalar [bounds=[0, 8)] %2
-                        in (%0, %3, %1)
-                    }},
-                ]
-                    %6:i64[] = dimension_to_scalar %4
-                in (%3, %6, %5)"},
-        );
-        // The call owns a fresh result identity, distinct from the callee-local identity it instantiates.
-        let call = &program.entry_region_ref().instructions()[0];
-        assert_ne!(program.atoms()[call.outputs()[1].index()].r#type().as_ref(), &ArrayIrType::Dimension(rows));
-
-        // Execute the discharged program on CPU, with the call staged inside one compiled function.
-        let compiled: CompiledFunction<'_, (ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> =
-            crate::compile(
-                |(initial, update, extent)| {
-                    let initial = initial.into_value();
-                    let inputs = vec![initial.clone(), update.into_value(), extent.into_value()];
-                    let outputs = program.interpret_in_context(initial.context(), inputs).unwrap();
-                    let mut outputs =
-                        outputs.into_iter().map(|output| ValueProjection::<ArrayType>::into_projected(output).unwrap());
-                    (outputs.next().unwrap(), outputs.next().unwrap(), outputs.next().unwrap())
-                },
-                (value_type.clone(), value_type.clone(), extent_type.clone()),
-                &domain,
-                mesh.clone(),
-            )
-            .unwrap();
-        let array = |r#type: &ArrayType, bytes: Vec<u8>| {
-            Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), bytes).unwrap()
-        };
-        let (previous, extent, state) = compiled
-            .executable()
-            .execute(
-                &domain,
-                (
-                    array(&value_type, values_to_bytes(&[3f32])),
-                    array(&value_type, values_to_bytes(&[4f32])),
-                    array(&extent_type, values_to_bytes(&[5i64])),
-                ),
-            )
-            .unwrap();
-        let read = |array: &Array<'_>| {
-            array
-                .addressable_shards()
-                .next()
-                .unwrap()
-                .buffer()
-                .unwrap()
-                .copy_to_host(None)
-                .unwrap()
-                .r#await()
-                .unwrap()
-        };
-        assert_eq!(values_from_bytes::<f32>(&read(&previous)), vec![3f32]);
-        assert_eq!(values_from_bytes::<i64>(&read(&extent)), vec![5i64]);
-        assert_eq!(values_from_bytes::<f32>(&read(&state)), vec![4f32]);
+        let outputs = program.jvp().unwrap().output_types().into_owned();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[1], outputs[0].tangent().unwrap());
     }
 
     #[test]
-    fn test_jit_call_operation_with_callee_region() {
-        let input_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-        let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(input_type.clone());
-        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let callee = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![sine], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let operation = JitCallOperation::new(1).with_callee_region(callee.entry_region_ref()).unwrap();
+    fn test_jit_call_operation_linearize_preserves_call_boundaries() {
+        // Driving a `jit_call` program through the forward path without captures (i.e., `Program::linearize`, which
+        // dispatches the `jvp` rule of `JitCallOperation`) realizes `jvp(jit(f)) = jit(jvp f)`, because the split keeps
+        // both compilation boundaries instead of inlining the callee.
+        //
+        // For `f = |x| x.sin()` wrapped in an outer `jit_call`, the primal half of the split is itself a single
+        // `jit_call` that produces the primal output plus one residual, and its tangent half is a single `jit_call`
+        // that consumes that residual. Neither half inlines `Sin` or `Cos`. Rewrapping the two halves as a compiled
+        // `(x, dx) -> (primal, tangent)` function reproduces the result of `CompiledFunction::jvp`, which is
+        // `(sin(x), cos(x) * dx)`, within `1e-5`.
+
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let engine = Session::new(&client).domain();
+
+        let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 0);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new())).with_sharding(sharding).unwrap();
+
+        // Inner `jit(sin)` staged as one `jit_call` inside an outer program, so the outer source program holds exactly
+        // one `jit_call` instruction for the replay to differentiate.
+        let inner: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.sin().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+        let inner_for_outer = inner.clone();
+        let outer: StagedFunction<'_, ArrayType, ArrayType> =
+            stage(move |x| inner_for_outer.call(x).unwrap(), input_type.clone(), Options::new(mesh.clone())).unwrap();
+        let outer_program = outer.source_program().program();
         assert_eq!(
-            operation,
-            JitCallOperation::new(1)
-                .with_callee_type_signature(&callee.input_types(), &callee.output_types())
-                .unwrap(),
-        );
-        let mut builder = ArrayIrProgramBuilder::new();
-        let callee_region = builder.import_region(callee.entry_region_ref());
-        let input = builder.add_input(input_type);
-        let output = builder
-            .add_instruction(Operation::JitCall(operation), vec![callee_region], vec![input], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            program.to_string(),
+            outer_program.to_string(),
             indoc! {"
-                lambda %0:f32[] .
-                let %1:f32[] = jit_call [capture_count=1] %0 [
+                lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                let %1:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 [
                     callee={
-                        lambda %0:f32[] .
-                        let %1:f32[] = sin %0
+                        lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                        let %1:f32[][sharding={mesh<['x'=1:auto]>, []}] = sin %0
                         in (%1)
                     },
                 ]
                 in (%1)"},
         );
+
+        // Linearize the outer `jit_call` program, flattened first because `Program::linearize` is defined on the
+        // canonical flat form. This drives the replay through the `jvp` rule of `JitCallOperation`, which rewraps the
+        // split callee into a primal `jit_call` (outputs followed by residuals) and a tangent `jit_call` (input
+        // tangents followed by residuals).
+        let linearization = outer_program.to_flat_program().linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1, "the pushforward of `sin` saves `cos(x)` as its only residual");
+
+        // Both halves must keep the callee behind a `jit_call` boundary rather than inlining `sin`/`cos`.
         assert_eq!(
-            JitCallOperation::new(2).with_callee_region(callee.entry_region_ref()),
-            Err(TypeError::invalid("`jit_call` lifted capture prefix 2 exceeds its 1 callee inputs")),
+            linearization.primal().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                let %1:f32[][sharding={mesh<['x'=1:auto]>, []}], %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 [
+                    callee={
+                        lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                        let %1:f32[][sharding={mesh<['x'=1:auto]>, []}] = sin %0
+                            %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = cos %0
+                        in (%1, %2)
+                    },
+                ]
+                in (%1, %2)"},
+        );
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f32[][sharding={mesh<['x'=1:auto]>, []}], %1:f32[][sharding={mesh<['x'=1:auto]>, []}] .
+                        let %2:f32[][sharding={mesh<['x'=1:auto]>, []}] = mul %1 %0
+                        in (%2)
+                    },
+                ]
+                in (%2)"},
+        );
+        assert_eq!(
+            linearization.primal().output_types().len(),
+            1 + linearization.residual_count(),
+            "primal half should produce the primal output followed by the residuals",
+        );
+        assert_eq!(
+            linearization.tangent().input_types().len(),
+            1 + linearization.residual_count(),
+            "tangent half should consume the input tangent followed by the residuals",
         );
 
-        // Generated callees can introduce local identities even when the source that was transformed had none.
-        // The sealed signature records those definitions, so each new call still receives a fresh caller result.
+        // Rewrap the two halves as a compiled `(x, dx) -> (primal, tangent)` function, which exercises the real XLA
+        // lowering and execution of both `jit_call` boundaries.
+        let (primal_half, tangent_half, residual_count, _) = linearization.into_parts();
+        let jvp_compiled: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+            move |(primal_input, tangent_input)| {
+                let context = primal_input.value().context().clone();
+                let mut primal_outputs = context
+                    .stage_operation(
+                        Operation::JitCall(JitCallOperation::new(0)),
+                        AttachedRegions::Callees(&[primal_half.clone()]),
+                        &[primal_input.into_value()],
+                    )
+                    .unwrap();
+                let residuals = primal_outputs.split_off(1);
+                assert_eq!(residuals.len(), residual_count, "primal half residual count should match linearization");
+                let primal_output = primal_outputs.remove(0);
+                let mut tangent_inputs = vec![tangent_input.into_value()];
+                tangent_inputs.extend(residuals);
+                let tangent_output = context
+                    .stage_operation(
+                        Operation::JitCall(JitCallOperation::new(0)),
+                        AttachedRegions::Callees(&[tangent_half.clone()]),
+                        tangent_inputs.as_slice(),
+                    )
+                    .unwrap()
+                    .remove(0);
+                (
+                    ValueProjection::<ArrayType>::into_projected(primal_output).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(tangent_output).unwrap(),
+                )
+            },
+            (input_type.clone(), input_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+
+        for &(primal, tangent) in &[(0.0f32, 1.0f32), (0.25, 2.0), (0.5, -0.5), (1.0, 0.7)] {
+            let primal_array = Array::from_host_buffer(
+                &engine,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>([primal].as_slice()).as_slice(),
+            )
+            .unwrap();
+            let tangent_array = Array::from_host_buffer(
+                &engine,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>([tangent].as_slice()).as_slice(),
+            )
+            .unwrap();
+            let (jvp_primal, jvp_tangent) =
+                jvp_compiled.executable().execute(&engine, (primal_array.clone(), tangent_array.clone())).unwrap();
+            let jvp_primal_value = read_f32s(&client, &jvp_primal)[0];
+            let jvp_tangent_value = read_f32s(&client, &jvp_tangent)[0];
+            let expected_primal = primal.sin();
+            let expected_tangent = primal.cos() * tangent;
+
+            assert!(
+                (jvp_primal_value - expected_primal).abs() < 1e-5,
+                "primal at (primal={primal}, tangent={tangent}): expected ~{expected_primal}, \
+                 got {jvp_primal_value}",
+            );
+            assert!(
+                (jvp_tangent_value - expected_tangent).abs() < 1e-5,
+                "tangent at (primal={primal}, tangent={tangent}): expected ~{expected_tangent}, \
+                 got {jvp_tangent_value}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_jit_call_transposition_ignores_dead_reference_operands() {
+        // The linear callee `ẏ = { ṫr += ẋ; ẋ }` only stores into its reference operand and forwards `x`. Under an
+        // `Ignore` destination for the reference no later instruction accumulated into its root and the callee never
+        // reads it, so the callee is transposed with an `Ignore` destination as well. The transposed call consumes
+        // `[ȳ]` only, returns `x̄` only, and neither it nor its callee stages a cotangent reference.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone());
+            let update = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(
+                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
+                .unwrap();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![update], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
         let mut builder = ArrayIrProgramBuilder::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let local = DimensionType::new("local", DimensionBounds::non_negative(Some(8)).unwrap());
+        let callee_region = builder.import_region(callee.entry_region_ref());
+        let reference = builder.add_input(reference_type.clone());
+        let update = builder.add_input(scalar_type.clone());
         let output = builder
-            .add_instruction(DimensionFromScalarOperation::new(local), Vec::new(), vec![input], None)
+            .add_instruction(
+                Operation::JitCall(JitCallOperation::new(0)),
+                vec![callee_region],
+                vec![reference, update],
+                None,
+            )
             .unwrap()[0];
-        let identity_callee = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let first = JitCallOperation::new(0).with_callee_region(identity_callee.entry_region_ref()).unwrap();
-        let second = JitCallOperation::new(0).with_callee_region(identity_callee.entry_region_ref()).unwrap();
-        let original = JitCallOperation::new(0)
-            .with_callee_type_signature(&identity_callee.input_types(), &identity_callee.output_types())
-            .unwrap();
-        assert_eq!(first.defined_type_identities().len(), 1);
-        assert_ne!(first.defined_type_identities(), second.defined_type_identities());
-        assert_ne!(
-            first.defined_type_identities().as_ref(),
-            identity_callee.type_identity_signature().internal_identities()
-        );
-        let interface = identity_callee.entry_region_ref().interface();
-        let first_outputs =
-            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(interface)).unwrap();
-        let repeated_outputs =
-            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(interface)).unwrap();
-        assert_eq!(first_outputs, repeated_outputs);
-        assert_ne!(first_outputs, identity_callee.output_types().into_owned());
+        let destination_kinds = [CotangentDestinationKind::Ignore, CotangentDestinationKind::Return];
+        let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
+        assert_eq!(transposed.input_types(), vec![scalar_type.clone()]);
+        assert_eq!(transposed.output_types(), vec![scalar_type.clone()]);
         assert_eq!(
-            first.infer_output_types(&identity_callee.input_types(), std::slice::from_ref(interface)).unwrap()[0]
-                .to_string(),
-            original
-                .infer_output_types(&identity_callee.input_types(), std::slice::from_ref(identity_callee.interface()))
-                .unwrap()[0]
-                .to_string(),
-        );
-        // Replacing a previous identity-bearing declaration with an identity-free callee clears that declaration,
-        // exactly as the public signature constructor does.
-        assert_eq!(
-            first.with_callee_region(callee.entry_region_ref()).unwrap(),
-            JitCallOperation::new(0)
-                .with_callee_type_signature(&callee.input_types(), &callee.output_types())
-                .unwrap(),
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = jit_call %0 [
+                    callee={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)"},
         );
     }
 
     #[test]
-    fn test_jit_call_operation_dense_result_bindings() {
-        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
-        let input = DimensionType::new("input", bounds);
-        let local = DimensionType::new("local", bounds);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![input.dimension().clone()]));
-        let output_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![input.dimension().clone(), local.dimension().clone()]));
-        let output_types = vec![output_type.clone(), output_type];
-        let operation = JitCallOperation::<ArrayType>::new(0)
-            .with_callee_type_signature(std::slice::from_ref(&input_type), &output_types)
+    fn test_jit_call_transposition_threads_cotangent_references() {
+        // The linear callee `ẏ = { ṫr += ẋ; read(ṫr) }` accumulates into its reference operand and reads it back.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone());
+            let update = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(
+                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
+                .unwrap();
+            let output = builder
+                .add_instruction(
+                    Operation::ReferenceRead(ReferenceReadOperation::new()),
+                    Vec::new(),
+                    vec![reference],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee_region = builder.import_region(callee.entry_region_ref());
+        let reference = builder.add_input(reference_type.clone());
+        let update = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                Operation::JitCall(JitCallOperation::new(0)),
+                vec![callee_region],
+                vec![reference, update],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let other = JitCallOperation::<ArrayType>::new(0)
-            .with_callee_type_signature(std::slice::from_ref(&input_type), &output_types)
-            .unwrap();
-        let interface = RegionInterface::new(vec![input_type.clone()], output_types.clone(), EffectClasses::NONE);
-        let outputs = operation
-            .infer_output_types(std::slice::from_ref(&input_type), std::slice::from_ref(&interface))
-            .unwrap();
-        assert_eq!(outputs[0], outputs[1]);
-        assert_ne!(outputs, output_types);
+
+        // Transposed under a `Reference` destination for the reference operand, the pullback consumes `[ȳ, r̄]` and
+        // returns the cotangent reference by identity ahead of `x̄`. The reference operand's cotangent lives in that
+        // destination, which the transposed call accumulates into in place, so the pullback forwards its own
+        // destination input rather than the call's forwarded reference output, while `x̄` is the call's second output.
+        // The transposed callee is exactly the transposition of the inlined callee under the same destinations.
+        let destination_kinds = [CotangentDestinationKind::Reference, CotangentDestinationKind::Return];
+        let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
+        assert_eq!(transposed.input_types(), vec![scalar_type.clone(), reference_type.clone()]);
+        assert_eq!(transposed.output_types(), vec![reference_type.clone(), scalar_type]);
         assert_eq!(
-            operation
-                .infer_output_types(std::slice::from_ref(&input_type), std::slice::from_ref(&interface))
-                .unwrap(),
-            outputs
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:ref<f32[]> .
+                let %2:ref<f32[]>, %3:f32[] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f32[], %1:ref<f32[]> .
+                        let () = reference_add_update %1 %0
+                            %2:f32[] = reference_read %1
+                        in (%1, %2)
+                    },
+                ]
+                in (%1, %3)"},
         );
-        assert_ne!(other.infer_output_types(&[input_type.clone()], &[interface]).unwrap(), outputs);
-        let actual = ArrayType::new_static(DataType::F32, [2]);
-        let callee_outputs = output_types
-            .iter()
-            .map(|output| {
-                ArrayType::new(DataType::F32, Shape::new(vec![2usize.into(), output.shape().dimensions()[1].clone()]))
-            })
-            .collect::<Vec<_>>();
-        let actual_interface = RegionInterface::new(vec![actual.clone()], callee_outputs, EffectClasses::NONE);
-        let instantiated = operation.infer_output_types(&[actual], &[actual_interface]).unwrap();
-        assert_eq!(instantiated[0].shape().dimensions()[0], 2usize.into());
-        assert_eq!(instantiated[0].shape().dimensions()[1], outputs[0].shape().dimensions()[1]);
-        assert_eq!(instantiated[0], instantiated[1]);
-        assert_eq!(operation.defined_type_identities().len(), 1);
-        let retained = JitCallOperation::<ArrayType>::new(0)
-            .with_result_type_signature(std::slice::from_ref(&input_type), &output_types, outputs.clone())
+        let call = &transposed.instructions()[0];
+        let transposed_callee = transposed.region_ref(call.regions()[0]).unwrap().to_program();
+        let inlined = callee.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
+        assert_eq!(transposed_callee.to_string(), inlined.to_string());
+    }
+
+    #[test]
+    fn test_jit_call_transposition_uses_cotangent_descriptors_for_zero_cotangents() {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let tangent_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]))
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_unreduced_axes(["x"])
+                    .unwrap(),
+            )
             .unwrap();
-        assert_eq!(retained.instantiated_output_types(&[input_type]).unwrap(), Some(outputs));
+        let expected = ArrayIrType::Array(tangent_type.cotangent().unwrap());
+        let tangent_type = ArrayIrType::Array(tangent_type);
+        // Zero cotangents skip a pure callee only after its effects have been inspected. Supply the real
+        // identity-region boundary rather than an empty driver that cannot answer that query.
+        let mut source_builder = ArrayIrProgramBuilder::new();
+        let input = source_builder.add_input(tangent_type.clone());
+        let source = source_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut transpose_builder = ArrayIrProgramBuilder::new();
+        let input = transpose_builder.add_input(expected.clone());
+        let transposed = transpose_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let driver = TestTranspositionDriver { source, transposed };
+        let mut context = TracingContext::<Constant, Operation>::new();
+        let cotangents = transpose_primal_jit_call(
+            &JitCallOperation::new(0),
+            &mut context,
+            &driver,
+            &[PartialValue::Unknown(tangent_type.clone())],
+            &[MaybeZero::Zero(tangent_type.clone())],
+            &CotangentDestinations::without_references([true]),
+        )
+        .unwrap();
+        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
+
+        let known = context.input(tangent_type.clone());
+        let cotangents = transpose_primal_jit_call(
+            &JitCallOperation::new(0),
+            &mut context,
+            &driver,
+            &[PartialValue::Known(known)],
+            &[MaybeZero::Zero(tangent_type)],
+            &CotangentDestinations::without_references([true]),
+        )
+        .unwrap();
+        assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
+    }
+
+    #[test]
+    fn test_jit_call_transposition_omits_dead_dynamic_seeds() {
+        // The callee `(x, z) ↦ (x, z)` returns both of its dynamically shaped inputs, and only `z` is live. The dead
+        // output's seed is a structural zero of type `f64[dead]`, whose extent no operand of the call defines. The
+        // transposed call has no input for that seed, so it needs no extent for it. It consumes the live seed alone,
+        // `x̄` stays a structural zero, and `z̄` keeps the `live` identity of the caller's cotangent type.
+        let dead = DimensionVariable::new("dead", DimensionBounds::new(1, Some(5)).unwrap());
+        let live = DimensionVariable::new("live", DimensionBounds::new(1, Some(5)).unwrap());
+        let dead_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(dead)])));
+        let live_type =
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Dynamic(live)])));
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let dead = builder.add_input(dead_type.clone());
+            let live = builder.add_input(live_type.clone());
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![dead, live], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let dead = builder.add_input(dead_type);
+        let live = builder.add_input(live_type.clone());
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![dead, live], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[1]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.entry_region_ref().transpose(&[0, 1], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        let pullback = transposed.into_program();
+        assert_eq!(pullback.output_types(), vec![live_type]);
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda %0:f64[live] .
+                let %1:f64[live] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[live] .
+                        in (%0)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &execution_client(),
+                &pullback,
+                &[MixedValue::Array(vec![1.0, 2.0, 3.0, 0.0], vec![4])],
+                &[3],
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![1.0, 2.0, 3.0], vec![3]), MixedValue::Dimension(3)],
+        );
+    }
+
+    #[test]
+    fn test_jit_call_transposition_omits_dead_seeds_of_repeated_outputs() {
+        // The callee `x ↦ (x, x)` returns its input twice. With only the second output live, the first output's seed
+        // is a structural zero, so the transposed call consumes the second seed alone, which is `x̄`. With both outputs
+        // live, the transposed callee receives both seeds and adds them.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![input, input], vec![Placeholder], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let input = builder.add_input(scalar_type);
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let client = execution_client();
+
+        // Projecting onto the second output keeps the two-output call, so its first seed reaches the call's transpose
+        // rule as a structural zero rather than being pruned away beforehand.
+        let projected = program.clone().with_outputs(&[1]).unwrap();
+        assert_eq!(
+            projected.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[], %2:f64[] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        in (%0, %0)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let transposed = projected.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        in (%0)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            vec![MixedValue::Array(vec![2.0], vec![])],
+        );
+
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = add %0 %1
+                        in (%2)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &transposed,
+                &[MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![5.0], vec![])],
+                &[],
+            )
+            .unwrap(),
+            vec![MixedValue::Array(vec![7.0], vec![])],
+        );
+    }
+
+    #[test]
+    fn test_jit_call_transposition_runs_backward_effects_without_live_seeds() {
+        // The callee maps its input through a reverse mode carrier whose backward rule prints its seed and returns a
+        // zero. With the call's output dead, its only seed is a structural zero, yet the backward effect must still
+        // run. The transposed call has no inputs, and its callee prints a materialized zero seed.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let backward = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let seed = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(PrintOperation::<ArrayType>::new("backward"), Vec::new(), vec![seed], None)
+                .unwrap();
+            let zero = builder
+                .add_instruction(ZeroOperation::new(ArrayType::scalar(DataType::F64)), Vec::new(), Vec::new(), None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![zero], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let backward = builder.import_region(backward.entry_region_ref());
+            let input = builder.add_input(scalar_type.clone());
+            let output = builder
+                .add_instruction(
+                    CompositeTransposeOperation::<Constant, Operation>::from_backward_region(
+                        0,
+                        vec![scalar_type.clone()],
+                        vec![scalar_type.clone()],
+                    ),
+                    vec![backward],
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let input = builder.add_input(scalar_type);
+        builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![input], None)
+            .unwrap();
+        let program = builder.build::<Vec<Constant>, Vec<Constant>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let transposed = program.entry_region_ref().transpose(&[0], &[], &[]).unwrap();
+        assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
+        let pullback = transposed.into_program();
+        assert_eq!(
+            pullback.to_string(),
+            indoc! {"
+                lambda  .
+                let () = jit_call [
+                    callee={
+                        lambda  .
+                        let %0:f64[] = zero [type=f64[]]
+                            %1:f64[] = print [label=backward] %0
+                            %2:f64[] = zero [type=f64[]]
+                        in ()
+                    },
+                ]
+                in ()"},
+        );
+        let client = execution_client();
+        ensure_print_handler_registered(&client).unwrap();
+        let (outputs, lines) = with_captured_prints(|| execute_mixed_program(&client, &pullback, &[], &[]));
+        assert_eq!(outputs.unwrap(), Vec::new(),);
+        assert_eq!(lines, vec!["backward: 0.0"]);
+    }
+
+    #[test]
+    fn test_jit_call_transposition_omits_dead_seeds_beside_cotangent_references() {
+        // The callee `ẏ = { ṫr += ẋ; (read(ṫr), ẋ) }` accumulates into its reference operand, reads it back, and
+        // forwards `x`. Only the read is live, so the forwarded output's seed is a structural zero. Under a `Reference`
+        // destination the transposed call consumes `[ȳ₀, r̄]` with no input for the dead seed, accumulates into `r̄` in
+        // place, and returns `x̄` read back from it.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F64)));
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone());
+            let update = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(
+                    Operation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
+                .unwrap();
+            let read = builder
+                .add_instruction(
+                    Operation::ReferenceRead(ReferenceReadOperation::new()),
+                    Vec::new(),
+                    vec![reference],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![read, update], vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let reference = builder.add_input(reference_type.clone());
+        let update = builder.add_input(scalar_type.clone());
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![reference, update], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let destination_kinds = [CotangentDestinationKind::Reference, CotangentDestinationKind::Return];
+        let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
+        assert_eq!(transposed.input_types(), vec![scalar_type.clone(), reference_type.clone()]);
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:ref<f64[]> .
+                let %2:ref<f64[]>, %3:f64[] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[], %1:ref<f64[]> .
+                        let () = reference_add_update %1 %0
+                            %2:f64[] = reference_read %1
+                        in (%1, %2)
+                    },
+                ]
+                in (%1, %3)
+            "}
+            .trim_end(),
+        );
+
+        // With both outputs dead, every seed is a structural zero, but the live reference destination keeps the call
+        // live, so the transposed call consumes `r̄` alone and returns `x̄` read back from it.
+        let transposed =
+            program.with_outputs(&[]).unwrap().transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:ref<f64[]> .
+                let %1:ref<f64[]>, %2:f64[] = jit_call %0 [
+                    callee={
+                        lambda %0:ref<f64[]> .
+                        let %1:f64[] = reference_read %0
+                        in (%0, %1)
+                    },
+                ]
+                in (%0, %2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_jit_call_transposition_keeps_dead_seeds_structural_in_nested_scans() {
+        // The callee runs the scan `(c, x) ↦ (c + x, c)` over three items and returns its final carry and its stacked
+        // outputs, of which only the final carry is live. The dead stack's seed reaches the scan inside the callee as a
+        // structural zero, so neither the transposed call nor its reversed scan receives a zero stack.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let stack_type = ArrayIrType::Array(ArrayType::new_static(DataType::F64, [3]));
+        let body = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let carry = builder.add_input(scalar_type.clone());
+            let item = builder.add_input(scalar_type.clone());
+            let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, item], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![next, carry], vec![Placeholder; 3], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let body = builder.import_region(body.entry_region_ref());
+            let carry = builder.add_input(scalar_type.clone());
+            let items = builder.add_input(stack_type.clone());
+            let outputs = builder
+                .add_instruction(Operation::Scan(ScanOperation::new(1, 3)), vec![body], vec![carry, items], None)
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let carry = builder.add_input(scalar_type);
+        let items = builder.add_input(stack_type);
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![carry, items], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[], %2:f64[3] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        let %1:f64[], %2:f64[3] = scan [carry_count=1, iteration_count=3, reverse=true] %0 [
+                            body={
+                                lambda %0:i64[], %1:f64[] .
+                                in (%1, %1)
+                            },
+                        ]
+                        in (%1, %2)
+                    },
+                ]
+                in (%1, %2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(&execution_client(), &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[])
+                .unwrap(),
+            vec![MixedValue::Array(vec![2.0], vec![]), MixedValue::Array(vec![2.0, 2.0, 2.0], vec![3])],
+        );
+    }
+
+    #[test]
+    fn test_jit_call_transposition_keeps_dead_seeds_structural_in_nested_conditions() {
+        // The callee selects on `c > 0` between the branches `x ↦ (x, x + x)` and `x ↦ (x + x, x)` and only the first
+        // output is live. The dead output's seed reaches the condition inside the callee as a structural zero, so each
+        // transposed branch consumes the live seed alone, giving `x̄ = ȳ₀` when `c > 0` and `x̄ = 2ȳ₀` otherwise.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let branch = |doubled_output: usize| {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            let doubled =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            let outputs = if doubled_output == 0 { vec![doubled, input] } else { vec![input, doubled] };
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let callee = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let true_branch = builder.import_region(branch(1).entry_region_ref());
+            let false_branch = builder.import_region(branch(0).entry_region_ref());
+            let selector = builder.add_input(scalar_type.clone());
+            let input = builder.add_input(scalar_type.clone());
+            let zero = builder
+                .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![selector], None)
+                .unwrap()[0];
+            let predicate = builder
+                .add_instruction(
+                    Operation::Array(ArrayOperation::Compare(CompareOperation::<ArrayType>::new(
+                        ComparisonDirection::GreaterThan,
+                    ))),
+                    Vec::new(),
+                    vec![selector, zero],
+                    None,
+                )
+                .unwrap()[0];
+            let outputs = builder
+                .add_instruction(
+                    Operation::Condition(ConditionOperation::new()),
+                    vec![true_branch, false_branch],
+                    vec![predicate, input],
+                    None,
+                )
+                .unwrap()
+                .to_vec();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let selector = builder.add_input(scalar_type.clone());
+        let input = builder.add_input(scalar_type);
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![selector, input], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[1], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = jit_call %0 %1 [
+                    callee={
+                        lambda %0:f64[], %1:f64[] .
+                        let %2:f64[] = zero_like %1
+                            %3:bool[] = compare [direction=GreaterThan] %1 %2
+                            %4:f64[] = condition %3 %0 [
+                                true={
+                                    lambda %0:f64[] .
+                                    in (%0)
+                                },
+                                false={
+                                    lambda %0:f64[] .
+                                    let %1:f64[] = add %0 %0
+                                    in (%1)
+                                },
+                            ]
+                        in (%4)
+                    },
+                ]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        let client = execution_client();
+        for (selector, expected) in [(1.0, 3.0), (-1.0, 6.0)] {
+            assert_eq!(
+                execute_mixed_program(
+                    &client,
+                    &transposed,
+                    &[MixedValue::Array(vec![3.0], vec![]), MixedValue::Array(vec![selector], vec![])],
+                    &[],
+                )
+                .unwrap(),
+                vec![MixedValue::Array(vec![expected], vec![])],
+            );
+        }
+    }
+
+    #[test]
+    fn test_jit_call_transposition_keeps_dead_seeds_structural_across_rematerializations() {
+        // A rematerialization inside a `jit_call` callee and a `jit_call` operation inside a rematerialization both map
+        // `x` to `(x, x + x)`, and only `x + x` is live. In both nestings the dead output's seed stays a structural
+        // zero across both boundaries. The outer transposed region consumes the live seed alone, the inner one receives
+        // it alone, and `x̄ = ȳ₁ + ȳ₁`.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
+        let doubling = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(scalar_type.clone());
+            let doubled =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![input, doubled], vec![Placeholder], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let rematerialize = || RematerializeOperation::new(ResidualPolicyReference::new(NothingSavable));
+        let nest = |outer: Operation, inner: Operation| {
+            let inner_program = {
+                let mut builder = ArrayIrProgramBuilder::new();
+                let region = builder.import_region(doubling.entry_region_ref());
+                let input = builder.add_input(scalar_type.clone());
+                let outputs = builder.add_instruction(inner, vec![region], vec![input], None).unwrap().to_vec();
+                builder
+                    .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder; 2])
+                    .unwrap()
+            };
+            let mut builder = ArrayIrProgramBuilder::new();
+            let region = builder.import_region(inner_program.entry_region_ref());
+            let input = builder.add_input(scalar_type.clone());
+            let outputs = builder.add_instruction(outer, vec![region], vec![input], None).unwrap().to_vec();
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![outputs[1]], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let client = execution_client();
+
+        let program = nest(Operation::JitCall(JitCallOperation::new(0)), rematerialize().into());
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = jit_call %0 [
+                    callee={
+                        lambda %0:f64[] .
+                        let %1:f64[] = rematerialize %0 [
+                            body={
+                                lambda %0:f64[] .
+                                let %1:f64[] = add %0 %0
+                                in (%1)
+                            },
+                        ]
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            vec![MixedValue::Array(vec![4.0], vec![])],
+        );
+
+        let program = nest(rematerialize().into(), Operation::JitCall(JitCallOperation::new(0)));
+        let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            transposed.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = rematerialize %0 [
+                    body={
+                        lambda %0:f64[] .
+                        let %1:f64[] = jit_call %0 [
+                            callee={
+                                lambda %0:f64[] .
+                                let %1:f64[] = add %0 %0
+                                in (%1)
+                            },
+                        ]
+                        in (%1)
+                    },
+                ]
+                in (%1)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            execute_mixed_program(&client, &transposed, &[MixedValue::Array(vec![2.0], vec![])], &[]).unwrap(),
+            vec![MixedValue::Array(vec![4.0], vec![])],
+        );
+    }
+
+    #[test]
+    fn test_jit_call_transposition_omits_disconnected_symbolic_cotangent() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut callee_builder = ArrayIrProgramBuilder::new();
+        callee_builder.add_input(dynamic_type.clone().into());
+        let live = callee_builder.add_input(scalar_type.clone().into());
+        let callee = callee_builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ArrayIrProgramBuilder::new();
+        let disconnected = builder.add_input(dynamic_type.into());
+        let live = builder.add_input(scalar_type.into());
+        let callee = builder.import_region(callee.entry_region_ref());
+        let outputs = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee], vec![disconnected, live], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        let pullback = linearization.pullback().unwrap();
+        assert_eq!(pullback.cotangents(), &[TransposedProgramCotangent::Zero, TransposedProgramCotangent::Output]);
+        assert_eq!(
+            pullback.program().to_string(),
+            indoc! {"
+            lambda %0:f32[] .
+            let %1:f32[] = jit_call %0 [
+                callee={
+                    lambda %0:f32[] .
+                    in (%0)
+                },
+            ]
+            in (%1)
+        "}
+            .trim_end()
+        );
+    }
+
+    #[test]
+    fn test_jit_call_transposition_omits_zero_space_seeds_of_mixed_outputs() {
+        // The predicate output's cotangent is a zero space that arrives as a structural zero, so the transposed callee
+        // has no input for it and the transposed call consumes the value output's seed alone.
+        let value_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4)]));
+        let predicate_type = ArrayType::new(DataType::Boolean, Shape::new(vec![CoreDimension::Static(4)]));
+        let value_program_type = ArrayIrType::Array(value_type.clone());
+        let predicate_program_type = ArrayIrType::Array(predicate_type.clone());
+        let source = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let value = builder.add_input(value_program_type.clone());
+            let predicate =
+                builder.add_constant(Constant::Captured(CaptureReference::new(0, predicate_program_type.clone())));
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![value, predicate], vec![Placeholder], vec![Placeholder; 2])
+                .unwrap()
+        };
+        let transposed = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let value_cotangent = builder.add_input(value_program_type.clone());
+            builder
+                .build::<Vec<Constant>, Vec<Constant>>(vec![value_cotangent], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let driver = TestTranspositionDriver { source, transposed };
+        let mut context = TracingContext::<Constant, Operation>::new();
+        let value_cotangent = context.input(value_program_type.clone());
+
+        let contributions = transpose_primal_jit_call(
+            &JitCallOperation::new(0),
+            &mut context,
+            &driver,
+            &[PartialValue::Unknown(value_program_type.clone())],
+            &[
+                MaybeZero::Value(value_cotangent.clone()),
+                MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
+            ],
+            &CotangentDestinations::without_references([true]),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(&contributions[..], [MaybeZero::Value(value)] if value.r#type().as_ref() == &value_program_type)
+        );
+        let builder = context.builder().borrow();
+        let [call] = builder.instructions() else {
+            panic!("expected the transposed call to be the only staged instruction");
+        };
+        assert!(matches!(call.operation(), Operation::JitCall(_)));
+        assert_eq!(call.inputs(), &[value_cotangent.atom_id().unwrap()]);
+    }
+
+    #[test]
+    fn test_jit_call_operation_lower_ignores_nested_call_capture_namespaces() {
+        // The inner callee establishes its own two-slot capture namespace. Its first two inputs are its lifted
+        // captures, and its body resolves the constant `Captured(1)` against that prefix. Deriving the OUTER call's
+        // capture prefix from capture-constant indices anywhere in the callee arena would conflate the namespaces
+        // and reject this program with a false missing-capture error, because the operation payload is authoritative.
+        let array_type = test_vector_type(4);
+        let inner = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let first_capture = builder.add_input(array_type.clone().into());
+            let _second_capture = builder.add_input(array_type.clone().into());
+            let second = builder.add_constant(Constant::Captured(CaptureReference::new(1, array_type.clone().into())));
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![first_capture, second], None).unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                    .unwrap(),
+            )
+        };
+        let outer = {
+            let mut builder = ArrayIrProgramBuilder::new();
+            let input = builder.add_input(array_type.clone().into());
+            let callee_region = builder.intern_callee(&inner, None).unwrap();
+            let output = builder
+                .add_instruction(
+                    Operation::JitCall(JitCallOperation::new(2)),
+                    vec![callee_region],
+                    vec![input, input],
+                    None,
+                )
+                .unwrap()[0];
+            Arc::new(
+                builder
+                    .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+                    .unwrap(),
+            )
+        };
+        let mut builder = ArrayIrProgramBuilder::new();
+        let input = builder.add_input(array_type.clone().into());
+        let callee_region = builder.intern_callee(&outer, None).unwrap();
+        let output = builder
+            .add_instruction(Operation::JitCall(JitCallOperation::new(0)), vec![callee_region], vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let input_types = vec![array_type.clone()];
+        let output_types = vec![array_type];
+        let stablehlo =
+            to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
@@ -7223,7 +7599,7 @@ mod tests {
         let local = ArrayIrType::from(DimensionType::new("local", bounds));
         let inputs = vec![input.clone()];
         let outputs = vec![input.clone(), local.clone(), local.clone()];
-        assert_eq!(CallTypeBindings::fresh(&inputs, &inputs).unwrap(), None,);
+        assert_eq!(CallTypeBindings::fresh(&inputs, &inputs).unwrap(), None);
 
         // One local family is exported once even when several results share it. Separate calls allocate separate
         // families, while forwarded input names stay shared.
@@ -7247,7 +7623,10 @@ mod tests {
         let retained = first.pruned(&[true], &[true, false, true]).unwrap();
         assert_eq!(retained.outputs(), &[input.clone(), first.outputs()[2].clone()]);
         assert_eq!(retained.definitions(), first.definitions());
-        assert!(first.pruned(&[], &[true; 3]).is_err());
+        assert_eq!(
+            first.pruned(&[], &[true; 3]),
+            Err(TypeError::invalid("call result declaration pruning masks have incompatible arity")),
+        );
 
         // A declaration cannot export the callee's private name verbatim or rename a forwarded input.
         assert_eq!(
@@ -7255,8 +7634,14 @@ mod tests {
             Err(TypeError::invalid("call local result declarations must use fresh identities")),
         );
         let other = ArrayIrType::from(DimensionType::new("other", bounds));
-        assert!(CallTypeBindings::with_outputs(&inputs, &inputs, vec![other]).is_err());
-        assert!(CallTypeBindings::with_outputs(&inputs, &outputs, first.outputs().to_vec()).is_ok());
+        assert_eq!(
+            CallTypeBindings::with_outputs(&inputs, &inputs, vec![other]),
+            Err(TypeError::invalid("call result declarations must preserve forwarded input identities")),
+        );
+        assert_eq!(
+            CallTypeBindings::with_outputs(&inputs, &outputs, first.outputs().to_vec()),
+            Ok(Some(first.clone()))
+        );
     }
 
     #[test]

@@ -1,21 +1,21 @@
 //! Lowering of [`ScanOperation`] to [StableHLO `while`](https://openxla.org/stablehlo/spec#while).
 //!
-//! A scan lowers only from the [`ArrayIrType`] operation family, which stores its body region; the homogeneous
+//! A scan lowers only from the [`ArrayIrType`] operation family, which stores its body region. The homogeneous
 //! [`ArrayType`] payload carries no region and is rejected. StableHLO has no scan primitive, so a scan lowers to a
-//! `stablehlo.while` over the loop state `[counter, carries..., stacks..., ys...]`: an `i64` counter, the
-//! carries, the stacked inputs, and one zero accumulator per stacked output, preallocated at the declared stacked
-//! output type. Logical iteration `i` reads one slice of every stacked input at its iteration index (`i`, or
-//! `length - 1 - i` when the scan is reversed) with `stablehlo.dynamic_slice`, inlines the body program over
-//! `[index, carries..., slices...]`, and writes each stacked output slice into its accumulator with
+//! `stablehlo.while` over the loop state `[counter, carries..., stacks..., stacked_output_values...]`, which holds an
+//! `i64` counter, the carries, the stacked inputs, and one zero accumulator per stacked output, preallocated at the
+//! declared stacked output type. Logical iteration `i` reads one slice of every stacked input at its iteration index
+//! (i.e., `i`, or `length - 1 - i` when the scan is reversed) with `stablehlo.dynamic_slice`, inlines the body program
+//! over `[index, carries..., slices...]`, and writes each stacked output slice into its accumulator with
 //! `stablehlo.dynamic_update_slice`.
 //!
 //! Each loop trip runs `unroll` consecutive logical iterations, and the iterations that do not fill a whole trip follow
-//! the loop: as straight-line body copies at static iteration indices for a static length, and as a second loop with
-//! one body copy per trip for a dynamic length. A scan whose unroll factor covers its static length lowers to
+//! the loop. They become straight-line body copies at static iteration indices for a static length, and a second loop
+//! with one body copy per trip for a dynamic length. A scan whose unroll factor covers its static length lowers to
 //! straight-line body copies only, and a scan whose length admits no iteration lowers to its initial carries and empty
 //! accumulators. On every path, an entry guard first checks the input relationships that the actual input types leave
-//! unproven, including those with the runtime length of a dynamic-length scan. Every ordered effect class that the body
-//! uses is threaded through the loop state as one trailing token, the results are normalized to the refined output
+//! unproven, including those with the runtime length of a scan of dynamic length. Every ordered effect class that the
+//! body uses is threaded through the loop state as one trailing token, the results are normalized to the refined output
 //! types of the scan, and results whose types place them over explicit mesh axes are constrained to that placement.
 //! Reference state is discharged before lowering.
 
@@ -48,364 +48,15 @@ use crate::operations::control_flow::{
 use crate::operations::jit_call::JitCallFunctionMap;
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
-/// Trip count of the loops that lower one scan.
-#[derive(Copy, Clone)]
-enum ScanLoopLength<'b, 'c: 'b, 't: 'c> {
-    /// Static trip count.
-    Static(usize),
-
-    /// Lowered runtime length value of a dynamic trip count.
-    Dynamic(ValueRef<'b, 'c, 't>),
-}
-
-/// Inputs of the lowering of one scan that its accumulators, its straight-line iterations, and its loops share.
-struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O> {
-    /// Lowered body program over `[index, carries..., x_slices...]`.
-    body: &'o FlatProgram<O>,
-
-    /// Number of loop-carried state leaves.
-    carry_count: usize,
-
-    /// Per-iteration slice types of the stacked inputs.
-    x_slice_types: Vec<ArrayType>,
-
-    /// Per-iteration slice types of the stacked outputs.
-    y_slice_types: Vec<ArrayType>,
-
-    /// Declared types of the stacked outputs (refer to [`ScanOperation::declared_output_types`]), which keep the
-    /// sharding and memory placement of their slices and which their accumulators therefore take.
-    y_stack_types: Vec<ArrayType>,
-
-    /// Types of the loop state `[counter, carries..., stacks..., ys...]`, excluding effect tokens.
-    state_types: Vec<ArrayIrType>,
-
-    /// Trip count of the scan.
-    length: ScanLoopLength<'b, 'c, 't>,
-
-    /// Whether logical iteration `i` reads and writes iteration index `length - 1 - i`.
-    reverse: bool,
-
-    /// Ordered effect classes whose tokens the loops carry as trailing state elements (refer to
-    /// [`lowered_effect_classes`]). Straight-line body copies advance the tokens of the enclosing scope directly.
-    threaded_effects: EffectClasses,
-
-    /// MLIR context that owns the emitted operations.
-    context: &'c MlirContext<'t>,
-
-    /// Location of the emitted operations.
-    location: LocationRef<'c, 't>,
-
-    /// Lowered values of the enclosing function's captures.
-    captured_values: &'o [ValueRef<'b, 'c, 't>],
-
-    /// Nested functions that `jit_call` operations in the body lower against.
-    nested_functions: Option<&'o Rc<JitCallFunctionMap<O>>>,
-
-    /// Collective lowering state shared with the enclosing function.
-    collective_state: &'o CollectiveLoweringState,
-}
-
-impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b, 'c, 't, O> {
-    /// Lowers one zero accumulator per stacked output. Each accumulator is allocated at the physical bound of the scan
-    /// length and, for a dynamic length, given the runtime length as the runtime extent of its leading axis with
-    /// `stablehlo.set_dimension_size`.
-    fn lower_accumulators(&self, block: &mut BlockRef<'b, 'c, 't>) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let (context, location) = (self.context, self.location);
-        let mut accumulators = Vec::with_capacity(self.y_stack_types.len());
-        for stack_type in &self.y_stack_types {
-            let mut physical_dimensions = stack_type.shape().dimensions().to_vec();
-            let length = &physical_dimensions[0];
-            let physical_length = match length {
-                CoreDimension::Static(length) => *length,
-                CoreDimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| {
-                    Error::Lowering(LoweringError::UnsupportedOperation {
-                        operation: SCAN_OPERATION_NAME.to_string(),
-                        reason: format!(
-                            "`{SCAN_OPERATION_NAME}` iteration count `{length}` needs a finite upper bound \
-                             to allocate its stacked outputs",
-                        ),
-                    })
-                })?,
-            };
-            physical_dimensions[0] = CoreDimension::Static(physical_length);
-            let physical_type = stack_type.clone().with_shape(Shape::new(physical_dimensions));
-            let accumulator =
-                lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
-            let ScanLoopLength::Dynamic(runtime_length) = self.length else {
-                accumulators.push(accumulator);
-                continue;
-            };
-            let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
-            let converted = block.append_operation(stable_hlo::convert(runtime_length, i32_scalar_type, location)?)?;
-            let refined = block.append_operation(stable_hlo::set_dimension_size(
-                accumulator,
-                converted.result(0).unwrap().as_ref(),
-                lower_tensor_type(stack_type, context, location)?,
-                0,
-                location,
-            )?)?;
-            accumulators.push(refined.result(0).unwrap().as_ref());
-        }
-        Ok(accumulators)
-    }
-
-    /// Emits logical iterations `first_iteration..length` of a scan of the static `length` as straight-line body copies
-    /// at static iteration indices, which read and write the same stacked inputs and accumulators that a loop threads
-    /// through its state, and returns the final carries followed by the final accumulators. The body copies advance
-    /// the `effect_tokens` of the enclosing scope directly.
-    fn lower_static_iterations(
-        &self,
-        first_iteration: usize,
-        length: usize,
-        mut carries: Vec<ValueRef<'b, 'c, 't>>,
-        x_stacks: &[ValueRef<'b, 'c, 't>],
-        mut y_accumulators: Vec<ValueRef<'b, 'c, 't>>,
-        block: &mut BlockRef<'b, 'c, 't>,
-        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let zero_index = lower_static_index_constants(&[0], block, self.context, self.location)?[0];
-        for iteration in first_iteration..length {
-            let index = if self.reverse { length - 1 - iteration } else { iteration };
-            let index_value = lower_static_index_constants(&[index], block, self.context, self.location)?[0];
-            (carries, y_accumulators) =
-                self.lower_iteration(index_value, zero_index, carries, x_stacks, y_accumulators, block, effect_tokens)?;
-        }
-        carries.extend(y_accumulators);
-        Ok(carries)
-    }
-
-    /// Emits one `stablehlo.while` over the loop state `[counter, carries..., stacks..., ys...]` that starts at
-    /// `state_values` and runs `unroll` consecutive logical iterations (body copies) per trip while a whole trip fits
-    /// (`counter + unroll - 1 < length`), advancing the counter by `unroll` per trip. The tokens of the threaded effect
-    /// classes ride at the end of the loop state. The function returns the final loop state without the tokens, which
-    /// it installs into `effect_tokens` instead.
-    fn lower_loop(
-        &self,
-        mut state_values: Vec<ValueRef<'b, 'c, 't>>,
-        unroll: usize,
-        block: &mut BlockRef<'b, 'c, 't>,
-        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let (context, location) = (self.context, self.location);
-        let state_count = self.state_types.len();
-        let mut state_types = self
-            .state_types
-            .iter()
-            .map(|r#type| lower_array_ir_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        append_loop_effect_tokens(
-            self.threaded_effects,
-            effect_tokens,
-            &mut state_values,
-            &mut state_types,
-            block,
-            context,
-            location,
-        )?;
-        let block_arguments = state_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
-        let length_value = |block: &mut BlockRef<'b, 'c, 't>| -> Result<ValueRef<'b, 'c, 't>, Error> {
-            match self.length {
-                ScanLoopLength::Static(length) => {
-                    Ok(lower_static_index_constants(&[length], block, context, location)?[0])
-                }
-                ScanLoopLength::Dynamic(length) => Ok(length),
-            }
-        };
-
-        let mut condition_region = context.region();
-        let condition_block = context.block(block_arguments.as_slice());
-        {
-            let mut condition_block_ref = condition_block.as_ref();
-            let counter = condition_block_ref.argument(0).unwrap().as_ref();
-            let length_value = length_value(&mut condition_block_ref)?;
-            // Subtract the last copy's offset from the length instead of adding it to the counter: after the final full
-            // trip, `counter + unroll - 1` can overflow even though both the length and counter are valid `i64`
-            // extents. This subtraction remains representable when a dynamic length is smaller than the unroll factor,
-            // too.
-            let counter_limit = if unroll == 1 {
-                length_value
-            } else {
-                let offset =
-                    lower_static_index_constants(&[unroll - 1], &mut condition_block_ref, context, location)?[0];
-                let subtraction =
-                    condition_block_ref.append_operation(stable_hlo::subtract(length_value, offset, location)?)?;
-                subtraction.result(0).unwrap().as_ref()
-            };
-            let predicate = lower_compare_to_mlir(
-                ComparisonDirection::LessThan,
-                counter,
-                counter_limit,
-                &mut condition_block_ref,
-                location,
-            )?;
-            condition_block_ref.append_operation(stable_hlo::r#return(&[predicate], location)?)?;
-        }
-        condition_region.append_block(condition_block)?;
-
-        let mut body_region = context.region();
-        let body_block = context.block(block_arguments.as_slice());
-        {
-            let mut body_block_ref = body_block.as_ref();
-            let arguments =
-                (0..state_count).map(|index| body_block_ref.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
-            let mut body_effect_tokens = EffectTokens::default();
-            set_threaded_effect_tokens(&mut body_effect_tokens, self.threaded_effects, |offset| {
-                body_block_ref.argument(state_count + offset).unwrap().as_ref()
-            });
-            let entry_effect_tokens = body_effect_tokens;
-            let counter = arguments[0];
-            let zero_index = lower_static_index_constants(&[0], &mut body_block_ref, context, location)?[0];
-            // When the visit order is reversed, logical iteration `i` reads iteration `length - 1 - i` (a zero-length
-            // reversed scan never runs its body, so the saturated limit constant is inert).
-            let reverse_limit = if self.reverse {
-                let length_value = length_value(&mut body_block_ref)?;
-                let one = lower_static_index_constants(&[1], &mut body_block_ref, context, location)?[0];
-                let limit = body_block_ref.append_operation(stable_hlo::subtract(length_value, one, location)?)?;
-                Some(limit.result(0).unwrap().as_ref())
-            } else {
-                None
-            };
-
-            // Each loop trip runs `unroll` consecutive logical iterations (`counter + copy` for each body copy).
-            let x_end = 1 + self.carry_count + self.x_slice_types.len();
-            let mut carries = arguments[1..1 + self.carry_count].to_vec();
-            let x_stacks = &arguments[1 + self.carry_count..x_end];
-            let mut y_accumulators = arguments[x_end..].to_vec();
-            for copy in 0..unroll {
-                let iteration = if copy == 0 {
-                    counter
-                } else {
-                    let offset = lower_static_index_constants(&[copy], &mut body_block_ref, context, location)?[0];
-                    let addition = body_block_ref.append_operation(stable_hlo::add(counter, offset, location)?)?;
-                    addition.result(0).unwrap().as_ref()
-                };
-                let index_value = match reverse_limit {
-                    Some(limit) => {
-                        let subtraction =
-                            body_block_ref.append_operation(stable_hlo::subtract(limit, iteration, location)?)?;
-                        subtraction.result(0).unwrap().as_ref()
-                    }
-                    None => iteration,
-                };
-                (carries, y_accumulators) = self.lower_iteration(
-                    index_value,
-                    zero_index,
-                    carries,
-                    x_stacks,
-                    y_accumulators,
-                    &mut body_block_ref,
-                    &mut body_effect_tokens,
-                )?;
-            }
-            validate_unthreaded_effect_tokens(entry_effect_tokens, body_effect_tokens, self.threaded_effects)?;
-
-            // Assemble the next state: advance the counter by the unroll factor, thread the new carries, pass the input
-            // stacks through unchanged, and thread the updated accumulators and effect tokens.
-            let step = lower_static_index_constants(&[unroll], &mut body_block_ref, context, location)?[0];
-            let next_counter = body_block_ref.append_operation(stable_hlo::add(counter, step, location)?)?;
-            let mut next_state = vec![next_counter.result(0).unwrap().as_ref()];
-            next_state.extend(carries);
-            next_state.extend_from_slice(x_stacks);
-            next_state.extend(y_accumulators);
-            next_state.extend(threaded_effect_token_values(body_effect_tokens, self.threaded_effects));
-            body_block_ref.append_operation(stable_hlo::r#return(next_state.as_slice(), location)?)?;
-        }
-        body_region.append_block(body_block)?;
-
-        let operation = block.append_operation(stable_hlo::r#while(
-            state_values.as_slice(),
-            condition_region.into(),
-            body_region.into(),
-            location,
-        )?)?;
-        set_threaded_effect_tokens(effect_tokens, self.threaded_effects, |offset| {
-            operation.result(state_count + offset).unwrap().as_ref()
-        });
-        Ok((0..state_count).map(|index| operation.result(index).unwrap().as_ref()).collect())
-    }
-
-    /// Emits one scan iteration at iteration index `index_value` into `block`: reads slice `index_value` of every
-    /// stacked input (dropping the unit iteration axis), inlines the body program over `[index, carries...,
-    /// x_slices...]`, writes each stacked output slice into its accumulator at `index_value`, and returns the new
-    /// carries and accumulators.
-    fn lower_iteration(
-        &self,
-        index_value: ValueRef<'b, 'c, 't>,
-        zero_index: ValueRef<'b, 'c, 't>,
-        carries: Vec<ValueRef<'b, 'c, 't>>,
-        x_stacks: &[ValueRef<'b, 'c, 't>],
-        y_accumulators: Vec<ValueRef<'b, 'c, 't>>,
-        block: &mut BlockRef<'b, 'c, 't>,
-        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
-    ) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), Error> {
-        let location = self.location;
-        let mut iteration_inputs = Vec::with_capacity(1 + self.carry_count + self.x_slice_types.len());
-        iteration_inputs.push(index_value);
-        iteration_inputs.extend(carries);
-        for (x_stack, x_slice_type) in x_stacks.iter().zip(&self.x_slice_types) {
-            let slice_dimensions = static_dimensions(x_slice_type)?;
-            let mut sizes = vec![1];
-            sizes.extend(slice_dimensions.iter().copied());
-            let mut start_values = vec![index_value];
-            start_values.extend(std::iter::repeat_n(zero_index, slice_dimensions.len()));
-            let iteration = block.append_operation(stable_hlo::dynamic_slice(
-                *x_stack,
-                start_values.as_slice(),
-                sizes.as_slice(),
-                location,
-            )?)?;
-            let squeezed = block.append_operation(stable_hlo::reshape(
-                iteration.result(0).unwrap().as_ref(),
-                slice_dimensions.as_slice(),
-                location,
-            )?)?;
-            iteration_inputs.push(squeezed.result(0).unwrap().as_ref());
-        }
-
-        let mut body_outputs = lower_nested_program_inline(
-            self.body,
-            iteration_inputs.as_slice(),
-            block,
-            self.context,
-            location,
-            self.captured_values,
-            &RematerializationOptimizationBarrier::None,
-            self.nested_functions,
-            self.collective_state,
-            effect_tokens,
-        )?;
-        let y_outputs = body_outputs.split_off(self.carry_count);
-        let mut new_accumulators = Vec::with_capacity(self.y_slice_types.len());
-        for ((y_output, y_slice_type), y_accumulator) in
-            y_outputs.into_iter().zip(&self.y_slice_types).zip(y_accumulators)
-        {
-            let slice_dimensions = static_dimensions(y_slice_type)?;
-            let mut expanded_dimensions = vec![1];
-            expanded_dimensions.extend(slice_dimensions.iter().copied());
-            let expanded =
-                block.append_operation(stable_hlo::reshape(y_output, expanded_dimensions.as_slice(), location)?)?;
-            let mut start_values = vec![index_value];
-            start_values.extend(std::iter::repeat_n(zero_index, slice_dimensions.len()));
-            let updated = block.append_operation(stable_hlo::dynamic_update_slice(
-                y_accumulator,
-                expanded.result(0).unwrap().as_ref(),
-                start_values.as_slice(),
-                location,
-            )?)?;
-            new_accumulators.push(updated.result(0).unwrap().as_ref());
-        }
-        Ok((body_outputs, new_accumulators))
-    }
-}
-
 impl LowerableOperation for ScanOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        _input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (lowerer, input_values, input_types, output_types);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
@@ -434,15 +85,19 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
         //      guard precedes every path below.
         //   3. A scan whose length admits no iteration returns its carries and empty accumulators, and a scan whose
         //      unroll factor covers its static length runs straight-line body copies. Any other scan runs a loop whose
-        //      trips run `unroll` body copies each, followed by its remaining iterations (refer to `ScanLoopInputs`).
+        //      trips run `unroll` body copies each, followed by its remaining iterations, as `ScanLoopInputs` emits
+        //      them.
         //   4. The carries and the accumulators are normalized to the refined `output_types` of the scan, and each
         //      result whose type places it over an explicit mesh axis is constrained to that placement.
         //
         // The program that attaches the scan validated its region and input counts, so a mismatch here is an internal
         // error, reported as the operation's own region contract and input count would report it.
-        self.validate_region_count(lowerer.regions.len())?;
-        let body = &lowerer.regions[0];
-        let (context, location) = (lowerer.context, lowerer.location);
+        self.validate_region_count(lowerer.regions().len())?;
+        let (context, location) = (lowerer.context(), lowerer.location());
+        let block = &mut lowerer.block();
+        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
+            lowerer.split_effect_tokens();
+        let body = &regions[0];
         let (carry_count, length) = (self.carry_count(), self.iteration_count());
         let body_input_types = body.input_types();
         let body_output_types = body.output_types();
@@ -457,9 +112,9 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
         let declared_output_types = self.declared_output_types(&body_output_types).map_err(ProgramError::from)?;
 
         // Each iteration reads and writes one slice per stack at a static shape. A body that was not specialized to the
-        // scan's input types may still declare dynamic slice types (refined only at the instruction boundary), which
-        // this lowering does not adapt per iteration. A scan whose length admits no iteration never slices, so it is
-        // lowered without its body.
+        // scan's input types may still declare dynamic slice types, which are refined only at the instruction boundary
+        // and which this lowering does not adapt per iteration. A scan whose length admits no iteration never slices,
+        // so it is lowered without its body.
         let static_length = length.value();
         let admits_iterations = static_length != Some(0) && stable_hlo_dynamic_dimension_bound(length) != Some(0);
         if admits_iterations {
@@ -508,18 +163,19 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ProgramError::from)
         };
-        let y_stack_types = &declared_output_types[carry_count..];
-        let mut state_types = Vec::with_capacity(1 + stack_end + y_stack_types.len());
+        let stacked_output_types = &declared_output_types[carry_count..];
+        let mut state_types = Vec::with_capacity(1 + stack_end + stacked_output_types.len());
         state_types.push(ArrayType::scalar(DataType::I64).into());
         state_types.extend_from_slice(&entry_types[..stack_end]);
-        state_types.extend_from_slice(y_stack_types);
-        let region_output_types = entry_types[..carry_count].iter().chain(y_stack_types).cloned().collect::<Vec<_>>();
+        state_types.extend_from_slice(stacked_output_types);
+        let region_output_types =
+            entry_types[..carry_count].iter().chain(stacked_output_types).cloned().collect::<Vec<_>>();
         let inputs = ScanLoopInputs {
             body,
             carry_count,
-            x_slice_types: array_types(&body_input_types[1 + carry_count..])?,
-            y_slice_types: array_types(&body_output_types[carry_count..])?,
-            y_stack_types: array_types(y_stack_types)?,
+            stacked_input_slice_types: array_types(&body_input_types[1 + carry_count..])?,
+            stacked_output_slice_types: array_types(&body_output_types[carry_count..])?,
+            stacked_output_types: array_types(stacked_output_types)?,
             state_types,
             length: match length {
                 CoreDimension::Static(length) => ScanLoopLength::Static(*length),
@@ -529,16 +185,14 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
             threaded_effects: lowered_effect_classes(body)?,
             context,
             location,
-            captured_values: lowerer.captured_values.as_slice(),
-            nested_functions: lowerer.nested_functions.as_ref(),
-            collective_state: &lowerer.collective_state,
+            captured_values,
+            nested_functions,
+            collective_state,
         };
-        let block = &mut lowerer.block;
-        let effect_tokens = &mut lowerer.effect_tokens;
 
         // Initial carries only need to refine the carry types, so each one is converted to the lowered type of its
-        // carry first. Stacked inputs are converted only where the loop state stacks them over the declared length
-        // (below).
+        // carry first. Stacked inputs are converted only where the loop state stacks them over the declared length,
+        // which happens below.
         let mut carries = input_values[..carry_count]
             .iter()
             .zip(input_types)
@@ -563,21 +217,29 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
 
         let results = if !admits_iterations {
             // A scan whose length admits no iteration returns its initial carries and empty stacked outputs. This also
-            // applies to a dynamic length whose bounds admit only zero: constructing a loop body would otherwise emit
-            // unit-length slice reads or writes against zero-sized physical stacks, which are invalid even in a dead
-            // body.
+            // applies to a dynamic length whose bounds admit only zero, because constructing a loop body would
+            // otherwise emit slice reads or writes of length one against empty physical stacks, which are invalid even
+            // in a dead body.
             carries.extend(inputs.lower_accumulators(block)?);
             carries
         } else if let Some(length) = static_length.filter(|length| unroll >= *length) {
-            let y_accumulators = inputs.lower_accumulators(block)?;
-            let x_stacks = &input_values[carry_count..stack_end];
-            inputs.lower_static_iterations(0, length, carries, x_stacks, y_accumulators, block, effect_tokens)?
+            let stacked_output_accumulators = inputs.lower_accumulators(block)?;
+            let stacked_inputs = &input_values[carry_count..stack_end];
+            inputs.lower_static_iterations(
+                0,
+                length,
+                carries,
+                stacked_inputs,
+                stacked_output_accumulators,
+                block,
+                effect_tokens,
+            )?
         } else {
             let mut state_values = vec![lower_static_index_constants(&[0], block, context, location)?[0]];
             state_values.extend(carries);
-            // An exact runtime length (e.g., that of an eager dimension value) refines the stacked inputs of a
-            // dynamic-length scan to static leading extents, while the loop state stacks them over the declared length,
-            // so each one is converted to its declared stacked type like the carries.
+            // An exact runtime length (e.g., that of an eager dimension value) refines the stacked inputs of a scan of
+            // dynamic length to static leading extents, while the loop state stacks them over the declared length, so
+            // each one is converted to its declared stacked type like the carries.
             for index in carry_count..stack_end {
                 state_values.push(lower_refined_region_input(
                     input_values[index],
@@ -591,13 +253,13 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
             state_values.extend(inputs.lower_accumulators(block)?);
             let mut state = inputs.lower_loop(state_values, unroll, block, effect_tokens)?;
 
-            // The iterations that do not fill a whole trip of the unrolled loop follow it: as a second loop with one
-            // body copy per trip for a dynamic length, and as straight-line body copies for a static length.
+            // The iterations that do not fill a whole trip of the unrolled loop follow it. They become a second loop
+            // with one body copy per trip for a dynamic length, and straight-line body copies for a static length.
             if static_length.is_none() && unroll > 1 {
                 state = inputs.lower_loop(state, 1, block, effect_tokens)?;
             }
-            let mut y_accumulators = state.split_off(1 + stack_end);
-            let x_stacks = state.split_off(1 + carry_count);
+            let mut stacked_output_accumulators = state.split_off(1 + stack_end);
+            let stacked_inputs = state.split_off(1 + carry_count);
             let mut carries = state.split_off(1);
             match static_length {
                 Some(length) if length % unroll != 0 => {
@@ -606,14 +268,14 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
                         first_iteration,
                         length,
                         carries,
-                        &x_stacks,
-                        y_accumulators,
+                        &stacked_inputs,
+                        stacked_output_accumulators,
                         block,
                         effect_tokens,
                     )?
                 }
                 _ => {
-                    carries.append(&mut y_accumulators);
+                    carries.append(&mut stacked_output_accumulators);
                     carries
                 }
             }
@@ -626,10 +288,370 @@ impl LowerableOperation for ScanOperation<ArrayIrType> {
         lower_explicit_sharding_constraints(
             results,
             output_types,
-            &lowerer.collective_state.bound_manual_axes,
+            collective_state.bound_manual_axes(),
             block,
             location,
         )
+    }
+}
+
+/// Trip count of the loops that lower one scan.
+#[derive(Copy, Clone)]
+enum ScanLoopLength<'b, 'c: 'b, 't: 'c> {
+    /// Static trip count.
+    Static(usize),
+
+    /// Lowered runtime length value of a dynamic trip count.
+    Dynamic(ValueRef<'b, 'c, 't>),
+}
+
+/// Inputs of the lowering of one scan that its accumulators, its straight-line iterations, and its loops share.
+struct ScanLoopInputs<'o, 'b, 'c: 'b, 't: 'c, O> {
+    /// Lowered body program over `[index, carries..., stacked_input_slices...]`.
+    body: &'o FlatProgram<O>,
+
+    /// Number of state leaves that the loop carries.
+    carry_count: usize,
+
+    /// Slice types that one iteration reads from the stacked inputs.
+    stacked_input_slice_types: Vec<ArrayType>,
+
+    /// Slice types that one iteration writes into the stacked outputs.
+    stacked_output_slice_types: Vec<ArrayType>,
+
+    /// Declared types of the stacked outputs, as [`ScanOperation::declared_output_types`] computes them. They keep the
+    /// sharding and memory placement of their slices, so their accumulators take them too.
+    stacked_output_types: Vec<ArrayType>,
+
+    /// Types of the loop state `[counter, carries..., stacks..., stacked_output_values...]`, excluding effect tokens.
+    state_types: Vec<ArrayIrType>,
+
+    /// Trip count of the scan.
+    length: ScanLoopLength<'b, 'c, 't>,
+
+    /// Whether logical iteration `i` reads and writes iteration index `length - 1 - i`.
+    reverse: bool,
+
+    /// Ordered effect classes whose tokens the loops carry as trailing state elements, as [`lowered_effect_classes`]
+    /// computes them. Straight-line body copies advance the tokens of the enclosing scope directly.
+    threaded_effects: EffectClasses,
+
+    /// MLIR context that owns the emitted operations.
+    context: &'c MlirContext<'t>,
+
+    /// Location of the emitted operations.
+    location: LocationRef<'c, 't>,
+
+    /// Lowered values of the enclosing function's captures.
+    captured_values: &'o [ValueRef<'b, 'c, 't>],
+
+    /// Nested functions that `jit_call` operations in the body lower against.
+    nested_functions: Option<&'o Rc<JitCallFunctionMap<O>>>,
+
+    /// Collective lowering state shared with the enclosing function.
+    collective_state: &'o CollectiveLoweringState,
+}
+
+impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b, 'c, 't, O> {
+    /// Lowers one zero accumulator per stacked output. Each accumulator is allocated at the physical bound of the scan
+    /// length and, for a dynamic length, given the runtime length as the runtime extent of its leading axis with
+    /// `stablehlo.set_dimension_size`.
+    fn lower_accumulators(&self, block: &mut BlockRef<'b, 'c, 't>) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let (context, location) = (self.context, self.location);
+        let mut accumulators = Vec::with_capacity(self.stacked_output_types.len());
+        for stack_type in &self.stacked_output_types {
+            let mut physical_dimensions = stack_type.shape().dimensions().to_vec();
+            let length = &physical_dimensions[0];
+            let physical_length = match length {
+                CoreDimension::Static(length) => *length,
+                CoreDimension::Dynamic(_) => stable_hlo_dynamic_dimension_bound(length).ok_or_else(|| {
+                    Error::Lowering(LoweringError::UnsupportedOperation {
+                        operation: SCAN_OPERATION_NAME.to_string(),
+                        reason: format!(
+                            "`{SCAN_OPERATION_NAME}` iteration count `{length}` needs a finite upper bound \
+                             to allocate its stacked outputs",
+                        ),
+                    })
+                })?,
+            };
+            physical_dimensions[0] = CoreDimension::Static(physical_length);
+            let physical_type = stack_type.clone().with_shape(Shape::new(physical_dimensions));
+            let accumulator =
+                lower_constant_output(std::slice::from_ref(&physical_type), 0, block, context, location)?.remove(0);
+            let ScanLoopLength::Dynamic(runtime_length) = self.length else {
+                accumulators.push(accumulator);
+                continue;
+            };
+            let i32_scalar_type = context.tensor_type(context.signless_integer_type(32), &[], None, location)?;
+            let converted = block.append_operation(stable_hlo::convert(runtime_length, i32_scalar_type, location)?)?;
+            let refined = block.append_operation(stable_hlo::set_dimension_size(
+                accumulator,
+                converted.result(0).unwrap().as_ref(),
+                lower_tensor_type(stack_type, context, location)?,
+                0,
+                location,
+            )?)?;
+            accumulators.push(refined.result(0).unwrap().as_ref());
+        }
+        Ok(accumulators)
+    }
+
+    /// Emits logical iterations `first_iteration..length` of a scan of the static `length` as straight-line body copies
+    /// at static iteration indices, which read and write the same stacked inputs and accumulators that a loop threads
+    /// through its state, and returns the final carries followed by the final accumulators. The body copies advance
+    /// the `effect_tokens` of the enclosing scope directly.
+    fn lower_static_iterations(
+        &self,
+        first_iteration: usize,
+        length: usize,
+        mut carries: Vec<ValueRef<'b, 'c, 't>>,
+        stacked_inputs: &[ValueRef<'b, 'c, 't>],
+        mut stacked_output_accumulators: Vec<ValueRef<'b, 'c, 't>>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let zero_index = lower_static_index_constants(&[0], block, self.context, self.location)?[0];
+        for iteration in first_iteration..length {
+            let index = if self.reverse { length - 1 - iteration } else { iteration };
+            let index_value = lower_static_index_constants(&[index], block, self.context, self.location)?[0];
+            (carries, stacked_output_accumulators) = self.lower_iteration(
+                index_value,
+                zero_index,
+                carries,
+                stacked_inputs,
+                stacked_output_accumulators,
+                block,
+                effect_tokens,
+            )?;
+        }
+        carries.extend(stacked_output_accumulators);
+        Ok(carries)
+    }
+
+    /// Emits one `stablehlo.while` over the loop state `[counter, carries..., stacks..., stacked_output_values...]`
+    /// that starts at `state_values` and runs `unroll` consecutive logical iterations (i.e., body copies) per trip
+    /// while a whole trip fits, which holds while `counter + unroll - 1 < length`, advancing the counter by `unroll`
+    /// per trip. The tokens of the threaded effect classes ride at the end of the loop state. The function returns the
+    /// final loop state without the tokens, which it installs into `effect_tokens` instead.
+    fn lower_loop(
+        &self,
+        mut state_values: Vec<ValueRef<'b, 'c, 't>>,
+        unroll: usize,
+        block: &mut BlockRef<'b, 'c, 't>,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let (context, location) = (self.context, self.location);
+        let state_count = self.state_types.len();
+        let mut state_types = self
+            .state_types
+            .iter()
+            .map(|r#type| lower_array_ir_type(r#type, context, location).map(|tensor_type| tensor_type.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        append_loop_effect_tokens(
+            self.threaded_effects,
+            effect_tokens,
+            &mut state_values,
+            &mut state_types,
+            block,
+            context,
+            location,
+        )?;
+        let block_arguments = state_types.iter().map(|r#type| (*r#type, location)).collect::<Vec<_>>();
+        let length_value = |block: &mut BlockRef<'b, 'c, 't>| -> Result<ValueRef<'b, 'c, 't>, Error> {
+            match self.length {
+                ScanLoopLength::Static(length) => {
+                    Ok(lower_static_index_constants(&[length], block, context, location)?[0])
+                }
+                ScanLoopLength::Dynamic(length) => Ok(length),
+            }
+        };
+
+        let mut condition_region = context.region();
+        let condition_block = context.block(block_arguments.as_slice());
+        {
+            let mut condition_block_ref = condition_block.as_ref();
+            let counter = condition_block_ref.argument(0).unwrap().as_ref();
+            let length_value = length_value(&mut condition_block_ref)?;
+            // Subtract the last copy's offset from the length instead of adding it to the counter, because after the
+            // final full trip, `counter + unroll - 1` can overflow even though both the length and counter are valid
+            // `i64` extents. This subtraction remains representable when a dynamic length is smaller than the unroll
+            // factor, too.
+            let counter_limit = if unroll == 1 {
+                length_value
+            } else {
+                let offset =
+                    lower_static_index_constants(&[unroll - 1], &mut condition_block_ref, context, location)?[0];
+                let subtraction =
+                    condition_block_ref.append_operation(stable_hlo::subtract(length_value, offset, location)?)?;
+                subtraction.result(0).unwrap().as_ref()
+            };
+            let predicate = lower_compare_to_mlir(
+                ComparisonDirection::LessThan,
+                counter,
+                counter_limit,
+                &mut condition_block_ref,
+                location,
+            )?;
+            condition_block_ref.append_operation(stable_hlo::r#return(&[predicate], location)?)?;
+        }
+        condition_region.append_block(condition_block)?;
+
+        let mut body_region = context.region();
+        let body_block = context.block(block_arguments.as_slice());
+        {
+            let mut body_block_ref = body_block.as_ref();
+            let arguments =
+                (0..state_count).map(|index| body_block_ref.argument(index).unwrap().as_ref()).collect::<Vec<_>>();
+            let mut body_effect_tokens = EffectTokens::default();
+            set_threaded_effect_tokens(&mut body_effect_tokens, self.threaded_effects, |offset| {
+                body_block_ref.argument(state_count + offset).unwrap().as_ref()
+            });
+            let entry_effect_tokens = body_effect_tokens;
+            let counter = arguments[0];
+            let zero_index = lower_static_index_constants(&[0], &mut body_block_ref, context, location)?[0];
+            // When the visit order is reversed, logical iteration `i` reads iteration `length - 1 - i`. A reversed scan
+            // of length zero never runs its body, so the saturated limit constant is inert.
+            let reverse_limit = if self.reverse {
+                let length_value = length_value(&mut body_block_ref)?;
+                let one = lower_static_index_constants(&[1], &mut body_block_ref, context, location)?[0];
+                let limit = body_block_ref.append_operation(stable_hlo::subtract(length_value, one, location)?)?;
+                Some(limit.result(0).unwrap().as_ref())
+            } else {
+                None
+            };
+
+            // Each loop trip runs `unroll` consecutive logical iterations (i.e., `counter + copy` for each body copy).
+            let stacked_input_end = 1 + self.carry_count + self.stacked_input_slice_types.len();
+            let mut carries = arguments[1..1 + self.carry_count].to_vec();
+            let stacked_inputs = &arguments[1 + self.carry_count..stacked_input_end];
+            let mut stacked_output_accumulators = arguments[stacked_input_end..].to_vec();
+            for copy in 0..unroll {
+                let iteration = if copy == 0 {
+                    counter
+                } else {
+                    let offset = lower_static_index_constants(&[copy], &mut body_block_ref, context, location)?[0];
+                    let addition = body_block_ref.append_operation(stable_hlo::add(counter, offset, location)?)?;
+                    addition.result(0).unwrap().as_ref()
+                };
+                let index_value = match reverse_limit {
+                    Some(limit) => {
+                        let subtraction =
+                            body_block_ref.append_operation(stable_hlo::subtract(limit, iteration, location)?)?;
+                        subtraction.result(0).unwrap().as_ref()
+                    }
+                    None => iteration,
+                };
+                (carries, stacked_output_accumulators) = self.lower_iteration(
+                    index_value,
+                    zero_index,
+                    carries,
+                    stacked_inputs,
+                    stacked_output_accumulators,
+                    &mut body_block_ref,
+                    &mut body_effect_tokens,
+                )?;
+            }
+            validate_unthreaded_effect_tokens(entry_effect_tokens, body_effect_tokens, self.threaded_effects)?;
+
+            // Assemble the next state, which advances the counter by the unroll factor, threads the new carries, passes
+            // the input stacks through unchanged, and threads the updated accumulators and effect tokens.
+            let step = lower_static_index_constants(&[unroll], &mut body_block_ref, context, location)?[0];
+            let next_counter = body_block_ref.append_operation(stable_hlo::add(counter, step, location)?)?;
+            let mut next_state = vec![next_counter.result(0).unwrap().as_ref()];
+            next_state.extend(carries);
+            next_state.extend_from_slice(stacked_inputs);
+            next_state.extend(stacked_output_accumulators);
+            next_state.extend(threaded_effect_token_values(body_effect_tokens, self.threaded_effects));
+            body_block_ref.append_operation(stable_hlo::r#return(next_state.as_slice(), location)?)?;
+        }
+        body_region.append_block(body_block)?;
+
+        let operation = block.append_operation(stable_hlo::r#while(
+            state_values.as_slice(),
+            condition_region.into(),
+            body_region.into(),
+            location,
+        )?)?;
+        set_threaded_effect_tokens(effect_tokens, self.threaded_effects, |offset| {
+            operation.result(state_count + offset).unwrap().as_ref()
+        });
+        Ok((0..state_count).map(|index| operation.result(index).unwrap().as_ref()).collect())
+    }
+
+    /// Emits one scan iteration at iteration index `index_value` into `block`. The iteration reads slice `index_value`
+    /// of every stacked input, dropping the unit iteration axis, inlines the body program over
+    /// `[index, carries..., stacked_input_slices...]`, writes each stacked output slice into its accumulator at
+    /// `index_value`, and returns the new carries and accumulators.
+    fn lower_iteration(
+        &self,
+        index_value: ValueRef<'b, 'c, 't>,
+        zero_index: ValueRef<'b, 'c, 't>,
+        carries: Vec<ValueRef<'b, 'c, 't>>,
+        stacked_inputs: &[ValueRef<'b, 'c, 't>],
+        stacked_output_accumulators: Vec<ValueRef<'b, 'c, 't>>,
+        block: &mut BlockRef<'b, 'c, 't>,
+        effect_tokens: &mut EffectTokens<'b, 'c, 't>,
+    ) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), Error> {
+        let location = self.location;
+        let mut iteration_inputs = Vec::with_capacity(1 + self.carry_count + self.stacked_input_slice_types.len());
+        iteration_inputs.push(index_value);
+        iteration_inputs.extend(carries);
+        for (stacked_input, stacked_input_slice_type) in stacked_inputs.iter().zip(&self.stacked_input_slice_types) {
+            let slice_dimensions = static_dimensions(stacked_input_slice_type)?;
+            let mut sizes = vec![1];
+            sizes.extend(slice_dimensions.iter().copied());
+            let mut start_values = vec![index_value];
+            start_values.extend(std::iter::repeat_n(zero_index, slice_dimensions.len()));
+            let iteration = block.append_operation(stable_hlo::dynamic_slice(
+                *stacked_input,
+                start_values.as_slice(),
+                sizes.as_slice(),
+                location,
+            )?)?;
+            let squeezed = block.append_operation(stable_hlo::reshape(
+                iteration.result(0).unwrap().as_ref(),
+                slice_dimensions.as_slice(),
+                location,
+            )?)?;
+            iteration_inputs.push(squeezed.result(0).unwrap().as_ref());
+        }
+
+        let mut body_outputs = lower_nested_program_inline(
+            self.body,
+            iteration_inputs.as_slice(),
+            block,
+            self.context,
+            location,
+            self.captured_values,
+            &RematerializationOptimizationBarrier::None,
+            self.nested_functions,
+            self.collective_state,
+            effect_tokens,
+        )?;
+        let stacked_outputs = body_outputs.split_off(self.carry_count);
+        let mut new_accumulators = Vec::with_capacity(self.stacked_output_slice_types.len());
+        for ((stacked_output, stacked_output_slice_type), stacked_output_accumulator) in
+            stacked_outputs.into_iter().zip(&self.stacked_output_slice_types).zip(stacked_output_accumulators)
+        {
+            let slice_dimensions = static_dimensions(stacked_output_slice_type)?;
+            let mut expanded_dimensions = vec![1];
+            expanded_dimensions.extend(slice_dimensions.iter().copied());
+            let expanded = block.append_operation(stable_hlo::reshape(
+                stacked_output,
+                expanded_dimensions.as_slice(),
+                location,
+            )?)?;
+            let mut start_values = vec![index_value];
+            start_values.extend(std::iter::repeat_n(zero_index, slice_dimensions.len()));
+            let updated = block.append_operation(stable_hlo::dynamic_update_slice(
+                stacked_output_accumulator,
+                expanded.result(0).unwrap().as_ref(),
+                start_values.as_slice(),
+                location,
+            )?)?;
+            new_accumulators.push(updated.result(0).unwrap().as_ref());
+        }
+        Ok((body_outputs, new_accumulators))
     }
 }
 
@@ -652,6 +674,7 @@ mod tests {
     use ryft_mlir::Location;
     use ryft_pjrt::{BufferType, ExecutionDeviceInputs, ExecutionInput, Layout, Program as PjrtProgram};
 
+    use crate::domains::tests::{domain_mesh, program_array, read_f32s, read_f64s};
     use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, ragged_dot_cpu_compilation_options, test_vector_type,
     };
@@ -660,7 +683,7 @@ mod tests {
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
     use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
+    use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::{
         Array, CompiledFunction, Constant, Error, FromPjrt, Options, Session, Value, compile, compile_statefully,
         to_mlir_module_for_program,
@@ -752,10 +775,11 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering() {
-        // A scan lowers to a `stablehlo.while` over `[counter, carries..., xs..., ys...]`: each iteration reads one
-        // slice of the stacked inputs with `stablehlo.dynamic_slice`, inlines the body, and writes the per-iteration
-        // outputs into preallocated zero accumulators with `stablehlo.dynamic_update_slice`.
+    fn test_scan_operation_lower() {
+        // A scan lowers to a `stablehlo.while` over
+        // `[counter, carries..., stacked_input_values..., stacked_output_values...]`. Each iteration reads one slice of
+        // the stacked inputs with `stablehlo.dynamic_slice`, inlines the body, and writes its stacked outputs into
+        // preallocated zero accumulators with `stablehlo.dynamic_update_slice`.
         assert_eq!(
             lowered_mixed_module(&product_scan_program(3, 1)),
             indoc! {"
@@ -791,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_rejects_malformed_instructions() {
+    fn test_scan_operation_lower_rejects_malformed_instructions() {
         let context = MlirContext::new();
         let location = context.unknown_location().as_ref();
         let block = context.block_with_no_arguments();
@@ -862,16 +886,16 @@ mod tests {
                 &input_types,
                 &output_types,
             ),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
-                if op == "`scan` iteration count `length` needs a finite upper bound to allocate its stacked outputs",
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason == "`scan` iteration count `length` needs a finite upper bound to allocate its stacked outputs",
         ));
     }
 
     #[test]
-    fn test_scan_lowering_rejects_dynamic_slice_types() {
+    fn test_scan_operation_lower_rejects_dynamic_slice_types() {
         // A static stacked input refines a body that declares the bounded slice type `f64[rows]`, so the scan
         // instruction type-checks. Its iterations would read slices at a dynamic shape, which this lowering does not
-        // adapt, so it is rejected with a precise error instead of an opaque tensor-type failure. A zero-length scan
+        // adapt, so it is rejected with a precise error instead of an opaque tensor type failure. A scan of length zero
         // never slices, so it still lowers.
         let slice_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let scan_program = |length: usize| {
@@ -904,8 +928,8 @@ mod tests {
         };
         assert!(matches!(
             scan_program(2),
-            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. }))
-                if op == "`scan` with the dynamic slice type `f64[rows]` for stacked input 0; lowering requires static \
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { reason, .. }))
+                if reason == "`scan` with the dynamic slice type `f64[rows]` for stacked input 0; lowering requires static \
                    slice types, so specialize the body to the scan's input types",
         ));
         let empty_module = scan_program(0).unwrap();
@@ -929,7 +953,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_rejects_unthreaded_token_advances() {
+    fn test_scan_loop_inputs_lower_loop_rejects_unthreaded_token_advances() {
         // The body prints its slice, which advances the ordered I/O token. A loop that threads ordered I/O carries the
         // advanced token through its state, whereas a loop that threads no class could not return it, so lowering it
         // would leave later I/O unordered with respect to the prints.
@@ -960,9 +984,9 @@ mod tests {
             let inputs = ScanLoopInputs {
                 body: &body,
                 carry_count: 0,
-                x_slice_types: vec![scalar_type.clone()],
-                y_slice_types: vec![scalar_type.clone()],
-                y_stack_types: vec![stack_type.clone()],
+                stacked_input_slice_types: vec![scalar_type.clone()],
+                stacked_output_slice_types: vec![scalar_type.clone()],
+                stacked_output_types: vec![stack_type.clone()],
                 state_types: state_types.clone(),
                 length: ScanLoopLength::Static(3),
                 reverse: false,
@@ -976,7 +1000,16 @@ mod tests {
             let state_values = (0..3).map(|index| block.as_ref().argument(index).unwrap().as_ref()).collect();
             inputs.lower_loop(state_values, 1, &mut block.as_ref(), &mut EffectTokens::default())
         };
-        assert!(lower(EffectClasses::single(EffectClass::OrderedIo)).is_ok());
+        assert_eq!(lower(EffectClasses::single(EffectClass::OrderedIo)).unwrap().len(), 3);
+        assert_eq!(
+            block
+                .as_ref()
+                .operations()
+                .unwrap()
+                .map(|operation| operation.unwrap().name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["stablehlo.after_all", "stablehlo.while"]
+        );
         let expected_message =
             "control-flow region lowering advanced the `ordered_io` token, which the region does not thread";
         assert!(matches!(
@@ -990,13 +1023,13 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_guards_entry() {
+    fn test_scan_operation_lower_execution_guards_entry() {
         // The body `(a, b) -> (a, a + b)` declares both carries `f64[rows]`, and the scan receives a bounded dynamic
         // `f64[rows]` initial carry and a static `f64[3]` one, which refines its carry type. The carry outputs take the
         // static extent that the inputs establish for `rows`, so the bounded loop results are sliced back to `f64[3]`,
         // and `n` iterations compute `[a, b + n * a]`. Eager entry validation checks that the runtime extent of `rows`
-        // is 3 whatever the trip count is, so a zero-length scan, a fully unrolled scan, and a looping scan all guard
-        // their entry and reject a runtime `rows` of 2.
+        // is 3 whatever the trip count is, so a scan of length zero, a fully unrolled scan, and a looping scan all
+        // guard their entry and reject a runtime `rows` of 2.
         let static_type = ArrayType::new_static(DataType::F64, [3]);
         let carry_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("rows", Some(5))]));
         let body = {
@@ -1055,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_guards_runtime_length() {
+    fn test_scan_operation_lower_execution_guards_runtime_length() {
         // The body declares its carry `f64[length]` with the identity of the scan length, so a static `f64[3]` initial
         // carry refines it only when the runtime length is 3. Neither input type proves that relationship, so an entry
         // guard checks it before the loop. The body `(i, c) -> (c + c)` doubles its carry once per iteration.
@@ -1154,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_guards_stacks_beside_a_symbolic_runtime_length() {
+    fn test_scan_operation_lower_execution_guards_stacks_beside_a_symbolic_runtime_length() {
         // The scan stacks a static `f64[3]` input over its nominal runtime length `dimension<length>`, so its declared
         // stacked type `f64[length]` relates the stack's leading extent to the runtime length. Neither input type
         // proves that relationship, so an entry guard checks that the runtime length is 3 before the loop, and the
@@ -1274,11 +1307,11 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_prunes_without_dropping_runtime_length_checks() {
+    fn test_scan_operation_lower_execution_prunes_without_dropping_runtime_length_checks() {
         // The body `(i, r, s) -> (r, s + s)` declares its carry `r` as `f64[length]` with the identity of the scan
         // length and receives a static `f64[3]` for it, so the scan checks the runtime length against 3 at its entry.
         // Only the doubled sum `s` is used, and `r` is an unused pass-through carry, but pruning keeps it because it is
-        // the only witness of that relationship: the pruned module still guards its entry, accepts a runtime length of
+        // the only witness of that relationship. The pruned module still guards its entry, accepts a runtime length of
         // 3, and rejects one of 2.
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -1384,8 +1417,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_zero_length() {
-        // A zero-length scan runs no iteration, regardless of its unroll factor: it returns its initial carry and an
+    fn test_scan_operation_lower_zero_length() {
+        // A scan of length zero runs no iteration, regardless of its unroll factor. It returns its initial carry and an
         // empty stacked output without emitting a `stablehlo.while` or any body copy.
         assert_eq!(
             lowered_mixed_module(&product_scan_program(0, 2)),
@@ -1401,7 +1434,7 @@ mod tests {
         );
 
         // A dynamic length whose bounds admit only zero has an output stack with a physical leading bound of zero, so
-        // an emitted loop body would contain an invalid unit-length update even though it could never execute.
+        // an emitted loop body would contain an invalid update of length one even though it could never execute.
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(1)).unwrap());
         let length_type = DimensionType::from(length.clone());
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -1468,7 +1501,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_unroll() {
+    fn test_scan_operation_lower_unroll() {
         // A scan whose unroll factor covers its length lowers to straight-line body copies, without a
         // `stablehlo.while`.
         assert_eq!(
@@ -1610,10 +1643,10 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_unrolled_static_length() {
+    fn test_scan_operation_lower_execution_unrolled_static_length() {
         // A static scan of length 5 unrolled by 2 runs two loop trips of two body copies each and then one
-        // straight-line body copy, which reads and writes the stacks at the static index of its iteration: index 4 for
-        // a forward scan and index 0 for a reversed scan.
+        // straight-line body copy, which reads and writes the stacks at the static index of its iteration, which is
+        // index 4 for a forward scan and index 0 for a reversed scan.
         assert_eq!(
             lowered_mixed_module(&binary_digits_scan_program(CoreDimension::Static(5), true, 2)),
             indoc! {"
@@ -1707,9 +1740,9 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_unroll_counter_does_not_overflow() {
+    fn test_scan_operation_lower_unroll_counter_does_not_overflow() {
         // A length of `i64::MAX` with an unroll factor of three leaves one remaining iteration. At the final loop
-        // condition, adding two to its counter (`i64::MAX - 1`) would wrap and incorrectly continue the loop.
+        // condition, adding two to its counter, which is `i64::MAX - 1`, would wrap and incorrectly continue the loop.
         // The body has only a scalar carry, so lowering this boundary case requires no enormous array allocations.
         let scalar_type = ArrayType::scalar(DataType::I64);
         let mut body_builder = ArrayIrProgramBuilder::new();
@@ -1771,7 +1804,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_dynamic_length() {
+    fn test_scan_operation_lower_dynamic_length() {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(9)).unwrap());
         let length_type = DimensionType::from(length.clone());
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -1857,7 +1890,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_dynamic_length_with_an_empty_reference_carry() {
+    fn test_scan_operation_lower_dynamic_length_with_an_empty_reference_carry() {
         // The body adds the element of an empty reference carry at its index to its sum carry, which is valid only when
         // no iteration runs. A runtime length whose bounds admit iterations keeps the body, whose discharged access
         // would slice the empty axis, so the reference discharge that compilation performs before lowering rejects the
@@ -1914,12 +1947,7 @@ mod tests {
                 in (%4)"},
         );
         let client = execution_client();
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
-            vec![device],
-        )
-        .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain();
         // Staging succeeds, so the error comes from the discharge that precedes lowering.
         let mut staged = false;
@@ -1948,11 +1976,11 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_dynamic_length() {
-        // Every lowered form of a dynamic-length scan (a loop with one body copy per trip, or an unrolled loop followed
-        // by a second loop with one body copy per trip) runs exactly the runtime number of iterations, from none up to
-        // the largest number that the bound admits. A reversed scan visits the items backwards while it writes each
-        // stacked output at its own iteration index.
+    fn test_scan_operation_lower_execution_dynamic_length() {
+        // Every lowered form of a scan of dynamic length (i.e., a loop with one body copy per trip, or an unrolled loop
+        // followed by a second loop with one body copy per trip) runs exactly the runtime number of iterations, from
+        // none up to the largest number that the bound admits. A reversed scan visits the items backwards while it
+        // writes each stacked output at its own iteration index.
         let length =
             CoreDimension::Dynamic(DimensionVariable::new("length", DimensionBounds::new(0, Some(6)).unwrap()));
 
@@ -2039,7 +2067,7 @@ mod tests {
         );
 
         let client = execution_client();
-        let xs = MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5]);
+        let stacked_input_values = MixedValue::Array(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5]);
         let forward = [
             (0, 0.0, vec![]),
             (1, 1.0, vec![0.0]),
@@ -2055,14 +2083,17 @@ mod tests {
         for (reverse, cases) in [(false, forward), (true, reversed)] {
             for unroll in [1, 2, 3, 5] {
                 let program = binary_digits_scan_program(length.clone(), reverse, unroll);
-                for (runtime_length, carry, ys) in cases.clone() {
-                    let inputs =
-                        [MixedValue::Array(vec![0.0], vec![]), xs.clone(), MixedValue::Dimension(runtime_length)];
+                for (runtime_length, carry, stacked_output_values) in cases.clone() {
+                    let inputs = [
+                        MixedValue::Array(vec![0.0], vec![]),
+                        stacked_input_values.clone(),
+                        MixedValue::Dimension(runtime_length),
+                    ];
                     assert_eq!(
                         execute_mixed_program(&client, &program, &inputs, &[runtime_length as i32]).unwrap(),
                         vec![
                             MixedValue::Array(vec![carry], vec![]),
-                            MixedValue::Array(ys, vec![runtime_length as u64]),
+                            MixedValue::Array(stacked_output_values, vec![runtime_length as u64]),
                             MixedValue::Dimension(runtime_length),
                         ],
                         "reverse {reverse}, unroll factor {unroll}, runtime length {runtime_length}",
@@ -2073,7 +2104,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_refines_stacks_of_exact_runtime_length() {
+    fn test_scan_operation_lower_execution_refines_stacks_of_exact_runtime_length() {
         // An exact runtime length refines the declared dynamic length, so a static `f64[4]` stacked input is valid,
         // while the loop state stacks it over the declared bounded length. A running sum computes
         // `(10, [1, 3, 6, 10])`.
@@ -2122,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_forwards_dimension_carries() {
+    fn test_scan_operation_lower_execution_forwards_dimension_carries() {
         // The scan carries a first-class dimension next to a vector whose extent it is, and forwards both, so the
         // vector keeps its runtime extent at every extent that its bound admits.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
@@ -2218,7 +2249,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_mapped_rng() {
+    fn test_scan_operation_lower_execution_mapped_rng() {
         // A random bit generator applied to each item of a batch of generator states is a scan over the states whose
         // length is the runtime batch size. Each item of the batch is generated independently of the others.
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
@@ -2413,8 +2444,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_threads_effect_class_union() {
-        // The scan body uses both ordered classes: the scalar check contributes an assertion and the print
+    fn test_scan_operation_lower_threads_effect_class_union() {
+        // The scan body uses both ordered classes, because the scalar check contributes an assertion and the print
         // contributes ordered I/O. The loop state carries two independent trailing tokens in canonical class order.
         let scalar_type = ArrayType::scalar(DataType::I64);
         let mut body_builder = ArrayIrProgramBuilder::new();
@@ -2506,12 +2537,12 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_threads_print_tokens() {
+    fn test_scan_operation_lower_execution_threads_print_tokens() {
         // A print inside a scan body makes the lowered `stablehlo.while` carry the effect token as one extra trailing
-        // state element: the entry token is created before the loop, both regions receive it as an extra block
+        // state element. The entry token is created before the loop, both regions receive it as an extra block
         // argument, the body threads it through the print custom call, and the loop's trailing result continues the
-        // chain (unused here because the program ends right after the scan). Each iteration prints its item, in
-        // iteration order.
+        // chain, which is unused here because the program ends right after the scan. Each iteration prints its item,
+        // in iteration order.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let mut builder = ArrayIrProgramBuilder::new();
         let body_region = builder.import_region(printing_sum_body().entry_region_ref());
@@ -2568,7 +2599,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_checks_body_assertions() {
+    fn test_scan_operation_lower_execution_checks_body_assertions() {
         // The body asserts that each item is positive before it adds the item to the sum. The assertion runs once per
         // iteration, so it fails at the first non-positive item within the runtime length and never checks the items
         // beyond it, including every item of a scan whose runtime length is zero.
@@ -2685,7 +2716,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_keeps_the_memory_placement_of_stacked_inputs() {
+    fn test_scan_operation_lower_keeps_the_memory_placement_of_stacked_inputs() {
         // The entry of a scan over host-pinned slices declares its stacked inputs in host-pinned memory too, exactly as
         // core `scan` validation does, so the entry check accepts host-pinned stacks whatever the trip count is, and
         // the accumulator of the stacked output is placed in host-pinned memory.
@@ -2783,7 +2814,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_admits_stacks_placed_over_auto_mesh_axes() {
+    fn test_scan_operation_lower_admits_stacks_placed_over_auto_mesh_axes() {
         // A stack whose scan axis is placed over an `Auto` mesh axis has a replicated type, because types record no
         // placement over auto mesh axes, and so its slices match a replicated body declaration whatever the trip count
         // is. The placement over the auto mesh axis is only an argument sharding of the lowered module.
@@ -2881,7 +2912,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_constrains_explicit_output_shardings() {
+    fn test_scan_operation_lower_constrains_explicit_output_shardings() {
         // The body negates each `f32[8]` row of an `f32[4, 8]` stack whose second axis is sharded over the explicit
         // mesh axis `x`. The accumulator keeps the sharding of its slices, and the result of the scan is constrained to
         // the placement that its type states.
@@ -2981,7 +3012,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_lowering_constrains_results_of_mixed_explicit_and_auto_meshes() {
+    fn test_scan_operation_lower_constrains_results_of_mixed_explicit_and_auto_meshes() {
         // The mesh has the explicit axis `x` of size 1 and the `Auto` axis `y` of size 2. The body passes a replicated
         // carry through and negates each `f32[8]` row of an `f32[4, 8]` stack whose second axis is placed over `y` by
         // the argument and result shardings of the module, so neither result places anything over the explicit axis
@@ -3124,7 +3155,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_in_shard_map() {
+    fn test_scan_operation_lower_execution_in_shard_map() {
         // Each of the two devices of a manual `shard_map` sums its own column of the `f32[2, 2]` items, which are
         // sharded along their second axis, into a sum that starts at its own entry of the `f32[2]` initial sums. The
         // body `(i, c, x) -> (c + x, c + x)` also stacks the running sums, so each device allocates and fills a local
@@ -3289,7 +3320,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_nested_in_condition() {
+    fn test_scan_operation_lower_execution_nested_in_condition() {
         // The `true` branch sums the items with a scan whose body prints each item, and the `false` branch returns the
         // initial sum. The condition must thread the ordered I/O token through the scan, so that the prints appear in
         // item order and only when the `true` branch runs.
@@ -3421,7 +3452,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_nested_in_while() {
+    fn test_scan_operation_lower_execution_nested_in_while() {
         // Each iteration of the loop sums the items into its running sum with a scan whose body prints each item. The
         // loop must thread the ordered I/O token through the scan, so that the prints appear in item order once per
         // loop iteration.
@@ -3562,7 +3593,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_batched() {
+    fn test_scan_operation_lower_execution_batched() {
         // The body `(i, c, x) -> (c + x, c)` sums the items and stacks the running sums that it received.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
@@ -3682,7 +3713,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_differentiated() {
+    fn test_scan_operation_lower_execution_differentiated() {
         // The body `(i, c, x) -> (c * x + 1)` makes the final carry of a forward scan from `c` over `[x0, x1, x2]`
         // equal to `((c * x0 + 1) * x1 + 1) * x2 + 1`, whose gradient with respect to the items needs the carry that
         // each iteration received as a residual stack. A reversed scan visits the items backwards. The primal and the
@@ -3746,7 +3777,8 @@ mod tests {
             MixedValue::Array(vec![1.0], vec![]),
         ];
 
-        // Forward: `c1 = 3`, `c2 = 10`, and `c3 = 41`, with gradient `[c0 x1 x2, c1 x2, c2] = [12, 12, 10]`.
+        // A forward scan computes `c1 = 3`, `c2 = 10`, and `c3 = 41`, with gradient
+        // `[c0 x1 x2, c1 x2, c2] = [12, 12, 10]`.
         let program = value_and_gradient(ScanOperation::new(1, 3), static_items_type.clone());
         assert_eq!(
             program.to_string(),
@@ -3777,7 +3809,8 @@ mod tests {
             vec![MixedValue::Array(vec![41.0], vec![]), MixedValue::Array(vec![12.0, 12.0, 10.0], vec![3])],
         );
 
-        // Reversed: `c1 = 5`, `c2 = 16`, and `c3 = 33`, with gradient `[c2, c1 x0, c0 x1 x0] = [16, 10, 6]`.
+        // A reversed scan computes `c1 = 5`, `c2 = 16`, and `c3 = 33`, with gradient
+        // `[c2, c1 x0, c0 x1 x0] = [16, 10, 6]`.
         let program = value_and_gradient(ScanOperation::new(1, 3).with_reverse(true), static_items_type);
         assert_eq!(
             program.to_string(),
@@ -3865,8 +3898,8 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_execution_transposed_without_cotangent_outputs_runs_backward_effects() {
-        // The body maps each item through a reverse-mode carrier whose backward rule prints its seed and returns a
+    fn test_scan_operation_lower_execution_transposed_without_cotangent_outputs_runs_backward_effects() {
+        // The body maps each item through a reverse mode carrier whose backward rule prints its seed and returns a
         // zero, so the transposed scan has no cotangent outputs and only its printing effect is observable.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let backward = {
@@ -3916,7 +3949,7 @@ mod tests {
         let client = execution_client();
         ensure_print_handler_registered(&client).unwrap();
 
-        // Live seeds: the reversed scan prints each seed in reverse visit order and returns no cotangent stack.
+        // With live seeds, the reversed scan prints each seed in reverse visit order and returns no cotangent stack.
         let transposed = program.entry_region_ref().transpose(&[0], &[], &[]).unwrap();
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
         let pullback = transposed.into_program();
@@ -3939,8 +3972,8 @@ mod tests {
         assert_eq!(outputs.unwrap(), Vec::new(),);
         assert_eq!(lines, vec!["backward: 3.0", "backward: 2.0", "backward: 1.0"]);
 
-        // Structural-zero seeds: the stacked output is dead, so its seeds stay symbolic and the reversed scan has no
-        // seed input, but the backward rule's effect still runs once per reversed iteration on a materialized zero.
+        // With structural zero seeds, the stacked output is dead, so its seeds stay symbolic and the reversed scan has
+        // no seed input, but the backward rule's effect still runs once per reversed iteration on a materialized zero.
         let transposed = program.with_outputs(&[]).unwrap().entry_region_ref().transpose(&[0], &[], &[]).unwrap();
         assert_eq!(transposed.cotangents(), &[TransposedProgramCotangent::Zero]);
         let pullback = transposed.into_program();
@@ -3964,7 +3997,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_execution() {
+    fn test_scan_operation_lower_frontend_execution() {
         // Tuple carries and output slices retain their parameter order through frontend tracing and XLA lowering.
         // Reversed scans stack suffix sums/products at the original input positions, including the unrolled tail.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F64));
@@ -4028,7 +4061,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_execution_dynamic_count() {
+    fn test_scan_operation_lower_frontend_execution_dynamic_count() {
         // The count value supplies the frontend's execution domain when there is no carry or stacked input. Its
         // runtime extent controls the output allocation's logical shape, including the empty result.
         let count_type = DimensionType::new("iterations", DimensionBounds::non_negative(Some(5)).unwrap());
@@ -4071,17 +4104,12 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_frontend_execution_through_compile() {
-        // The public array-only compilation facade projects its tracers into ArrayType; the frontend's nested body
-        // and its region must lift back into the backend's array IR operation family before lowering.
+    fn test_scan_operation_lower_frontend_execution_through_compile() {
+        // The public compilation facade, which only accepts arrays, projects its tracers into `ArrayType`, so the
+        // frontend's nested body and its region must lift back into the backend's array IR operation family before
+        // lowering.
         let client = execution_client();
-        let device = client.addressable_devices().unwrap().remove(0);
-        let device_id = device.id().unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
-            vec![Device::from_pjrt(&device).unwrap()],
-        )
-        .unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain();
         let scalar_type = ArrayType::scalar(DataType::F64)
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
@@ -4125,46 +4153,23 @@ mod tests {
         let carry = Array::from_host_buffer(&domain, scalar_type, mesh.clone(), values_to_bytes(&[0f64])).unwrap();
         let inputs = Array::from_host_buffer(&domain, inputs_type, mesh, values_to_bytes(&[1f64, 2.0, 3.0])).unwrap();
         let (sum, prefixes) = compiled.executable().execute(&domain, (carry, inputs)).unwrap();
-        let outputs = [sum, prefixes]
-            .into_iter()
-            .map(|output| {
-                let bytes = output
-                    .device_shard(device_id)
-                    .unwrap()
-                    .buffer()
-                    .unwrap()
-                    .copy_to_host(None)
-                    .unwrap()
-                    .r#await()
-                    .unwrap();
-                values_from_bytes::<f64>(bytes.as_slice())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(outputs, vec![vec![6.0], vec![1.0, 3.0, 6.0]]);
+        assert_eq!(read_f64s(&client, &sum), vec![6.0]);
+        assert_eq!(read_f64s(&client, &prefixes), vec![1.0, 3.0, 6.0]);
     }
 
     #[test]
-    fn test_scan_execution_batched_under_eager_parent() {
+    fn test_scan_operation_lower_execution_batched_under_eager_parent() {
         // Batching over eager array IR values threads the batch extent through the loop carry, so the batched scan that
         // eager dispatch compiles returns that first-class dimension, which eager dispatch rebuilds on the host.
         let client = execution_client();
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain();
         let value = |dimensions: &[usize], values: &[f32]| {
-            let r#type = ArrayType::new_static(DataType::F32, dimensions.to_vec())
-                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
-                .unwrap();
-            Value::Array(
-                Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(values).as_slice()).unwrap(),
-            )
+            Value::Array(replicated_array(&domain, &mesh, DataType::F32, dimensions, &values_to_bytes(values)))
         };
         let read = |value: Value<'_>| {
-            let Value::Array(array) = value else { panic!("expected an array result") };
-            let shard = array.addressable_shards().next().unwrap();
-            let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
-            (array.shape().dimensions().to_vec(), values_from_bytes::<f32>(bytes.as_slice()))
+            let array = program_array(&value);
+            (array.shape().dimensions().to_vec(), read_f32s(&client, array))
         };
         let (carry, prefixes) = batch(
             |(carry, items)| {

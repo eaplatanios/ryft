@@ -1,10 +1,10 @@
 //! Emits backend-neutral structural [`ProgramStatistics`] records for a fixed registry of traced Ryft workloads.
 //!
-//! This binary is the Rust side of the Ryft/JAX structural-statistics comparison workflow (see
-//! `python/scripts/compare_program_statistics_with_jax.py`). It prints deterministic JSON records containing only
-//! case metadata and [`ProgramStatistics`]; no raw IR is emitted. `--list` prints one case ID per line, and repeated
-//! `--case ID` arguments select individual cases. The case registry and its record and error types are private to
-//! this binary and are not public library API.
+//! This binary is the Rust side of the workflow that compares the structural statistics of Ryft and JAX programs,
+//! which `python/scripts/compare_program_statistics_with_jax.py` implements. It prints deterministic JSON records
+//! containing only case metadata and [`ProgramStatistics`], and no raw IR is emitted. `--list` prints one case ID per
+//! line, and repeated `--case ID` arguments select individual cases. The case registry and its record and error types
+//! are private to this binary and are not public library API.
 
 use std::env;
 use std::ops::{Add, Mul};
@@ -22,7 +22,7 @@ use ryft_xla::tracing::{ArrayTracer, TracedProgram, trace};
 
 // TODO(eaplatanios): Review this module.
 
-/// A requested structural-statistics case is absent from this binary's registry.
+/// A requested structural statistics case is absent from this binary's registry.
 #[derive(Debug, thiserror::Error)]
 #[error("unknown program statistics case `{case_id}`")]
 struct UnknownProgramStatisticsCase {
@@ -62,66 +62,68 @@ struct ProgramStatisticsCase {
     emit: fn() -> Result<ProgramStatistics, Error>,
 }
 
-/// Returns the stable case registry, asserting that its case IDs are unique.
-fn registry() -> Vec<ProgramStatisticsCase> {
-    let cases = vec![
-        ProgramStatisticsCase {
-            case_id: "scalar_bilinear_sin_jit",
-            category: "scalar",
-            surface: "jit",
-            emit: emit_scalar_bilinear_sin_jit,
-        },
-        ProgramStatisticsCase {
-            case_id: "scalar_bilinear_sin_vjp_pullback",
-            category: "scalar",
-            surface: "vjp_pullback",
-            emit: emit_scalar_bilinear_sin_vjp_pullback,
-        },
-        ProgramStatisticsCase {
-            case_id: "scalar_quartic_plus_sin_grad",
-            category: "scalar",
-            surface: "grad",
-            emit: emit_scalar_quartic_plus_sin_grad,
-        },
-        ProgramStatisticsCase {
-            case_id: "scalar_quartic_plus_sin_value_and_gradient",
-            category: "scalar",
-            surface: "value_and_gradient",
-            emit: emit_scalar_quartic_plus_sin_value_and_gradient,
-        },
-        ProgramStatisticsCase {
-            case_id: "scalar_quartic_plus_sin_linearize_pushforward",
-            category: "scalar",
-            surface: "linearize_pushforward",
-            emit: emit_scalar_quartic_plus_sin_linearize_pushforward,
-        },
-        ProgramStatisticsCase {
-            case_id: "shard_map_basic",
-            category: "xla",
-            surface: "program",
-            emit: emit_shard_map_basic,
-        },
-        ProgramStatisticsCase {
-            case_id: "shard_map_matmul",
-            category: "xla",
-            surface: "program",
-            emit: emit_shard_map_matmul,
-        },
-        ProgramStatisticsCase {
-            case_id: "nested_shard_map",
-            category: "xla",
-            surface: "program",
-            emit: emit_nested_shard_map,
-        },
-    ];
-    for (index, case) in cases.iter().enumerate() {
-        assert!(
-            cases[..index].iter().all(|previous| previous.case_id != case.case_id),
-            "duplicate program statistics case ID `{}`",
-            case.case_id,
-        );
+impl ProgramStatisticsCase {
+    /// Returns the stable case registry, asserting that its case IDs are unique.
+    fn registry() -> Vec<Self> {
+        let cases = vec![
+            ProgramStatisticsCase {
+                case_id: "scalar_bilinear_sin_jit",
+                category: "scalar",
+                surface: "jit",
+                emit: emit_scalar_bilinear_sin_jit,
+            },
+            ProgramStatisticsCase {
+                case_id: "scalar_bilinear_sin_vjp_pullback",
+                category: "scalar",
+                surface: "vjp_pullback",
+                emit: emit_scalar_bilinear_sin_vjp_pullback,
+            },
+            ProgramStatisticsCase {
+                case_id: "scalar_quartic_plus_sin_grad",
+                category: "scalar",
+                surface: "grad",
+                emit: emit_scalar_quartic_plus_sin_grad,
+            },
+            ProgramStatisticsCase {
+                case_id: "scalar_quartic_plus_sin_value_and_gradient",
+                category: "scalar",
+                surface: "value_and_gradient",
+                emit: emit_scalar_quartic_plus_sin_value_and_gradient,
+            },
+            ProgramStatisticsCase {
+                case_id: "scalar_quartic_plus_sin_linearize_pushforward",
+                category: "scalar",
+                surface: "linearize_pushforward",
+                emit: emit_scalar_quartic_plus_sin_linearize_pushforward,
+            },
+            ProgramStatisticsCase {
+                case_id: "shard_map_basic",
+                category: "xla",
+                surface: "program",
+                emit: emit_shard_map_basic,
+            },
+            ProgramStatisticsCase {
+                case_id: "shard_map_matmul",
+                category: "xla",
+                surface: "program",
+                emit: emit_shard_map_matmul,
+            },
+            ProgramStatisticsCase {
+                case_id: "nested_shard_map",
+                category: "xla",
+                surface: "program",
+                emit: emit_nested_shard_map,
+            },
+        ];
+        for (index, case) in cases.iter().enumerate() {
+            assert!(
+                cases[..index].iter().all(|previous| previous.case_id != case.case_id),
+                "duplicate program statistics case ID `{}`",
+                case.case_id,
+            );
+        }
+        cases
     }
-    cases
 }
 
 /// Emits the records for the requested case IDs, in deterministic `(case_id, surface)` order. When `case_ids` is
@@ -131,7 +133,7 @@ fn registry() -> Vec<ProgramStatisticsCase> {
 ///
 ///   - `case_ids`: Optional exact case IDs to emit.
 fn collect_records(case_ids: &[String]) -> Result<Vec<ProgramStatisticsRecord>, Error> {
-    let all_cases = registry();
+    let all_cases = ProgramStatisticsCase::registry();
     let selected_cases = if case_ids.is_empty() {
         all_cases
     } else {
@@ -164,7 +166,7 @@ fn collect_records(case_ids: &[String]) -> Result<Vec<ProgramStatisticsRecord>, 
 ///
 /// # Parameters
 ///
-///   - `x`: Rank-zero array input.
+///   - `x`: Rank-0 array input.
 fn quartic_plus_sin<T: Clone + Sin + Add<Output = T> + Mul<Output = T>>(x: T) -> T {
     x.clone() * x.clone() * x.clone() * x.clone() + x.sin().unwrap()
 }
@@ -193,7 +195,7 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, Error> {
     Ok(pullback.statistics())
 }
 
-/// Emits the staged scalar reverse-mode gradient case.
+/// Emits the staged scalar reverse mode gradient case.
 fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, Error> {
     let (_, program): (CoreArray, CoreProgram<CoreArray, ArrayOperation<CoreArray>, CoreArray, CoreArray>) =
         EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new().interpret_and_trace(
@@ -212,7 +214,7 @@ fn emit_scalar_quartic_plus_sin_grad() -> Result<ProgramStatistics, Error> {
     Ok(program.statistics())
 }
 
-/// Emits the staged scalar value-and-gradient case.
+/// Emits the staged scalar value and gradient case.
 fn emit_scalar_quartic_plus_sin_value_and_gradient() -> Result<ProgramStatistics, Error> {
     let (_, program): (
         (CoreArray, CoreArray),
@@ -261,7 +263,7 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatist
     Ok(closed_pushforward.statistics())
 }
 
-/// Returns the canonical single-axis manual mesh used by the shard-map cases.
+/// Returns the canonical single-axis manual mesh used by the `shard_map` cases.
 fn shard_map_mesh() -> LogicalMesh {
     LogicalMesh::new(vec![MeshAxis::new("x", 4, MeshAxisType::Manual).unwrap()]).unwrap()
 }
@@ -280,9 +282,9 @@ fn vector_type(size: usize) -> ArrayType {
 /// # Parameters
 ///
 ///   - `rows`: Matrix row count.
-///   - `cols`: Matrix column count.
-fn matrix_type(rows: usize, cols: usize) -> ArrayType {
-    ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(rows), CoreDimension::Static(cols)]))
+///   - `columns`: Matrix column count.
+fn matrix_type(rows: usize, columns: usize) -> ArrayType {
+    ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(rows), CoreDimension::Static(columns)]))
 }
 
 /// Emits the basic traced `shard_map` case.
@@ -309,22 +311,22 @@ fn emit_shard_map_basic() -> Result<ProgramStatistics, Error> {
     Ok(traced.statistics())
 }
 
-/// Emits the traced `shard_map` matrix-multiplication case.
+/// Emits the traced `shard_map` matrix multiplication case.
 fn emit_shard_map_matmul() -> Result<ProgramStatistics, Error> {
     let mesh = shard_map_mesh();
-    let lhs_sharding =
+    let left_sharding =
         Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap();
-    let rhs_sharding = Sharding::replicated(mesh.clone(), 2);
-    let output_sharding = lhs_sharding.clone();
+    let right_sharding = Sharding::replicated(mesh.clone(), 2);
+    let output_sharding = left_sharding.clone();
     let traced: TracedProgram<(ArrayType, ArrayType), ArrayType> = trace(
         {
             let mesh = mesh.clone();
             move |inputs| {
                 shard_map(
-                    |(lhs, rhs): (ArrayTracer, ArrayTracer)| lhs.dot(&rhs, &DotDimensionNumbers::matmul()),
+                    |(left, right): (ArrayTracer, ArrayTracer)| left.dot(&right, &DotDimensionNumbers::matmul()),
                     inputs,
                     mesh.clone(),
-                    (lhs_sharding.clone(), rhs_sharding.clone()),
+                    (left_sharding.clone(), right_sharding.clone()),
                     output_sharding.clone(),
                     ShardMapOptions::new(),
                 )
@@ -336,8 +338,8 @@ fn emit_shard_map_matmul() -> Result<ProgramStatistics, Error> {
     Ok(traced.statistics())
 }
 
-/// Emits the nested traced `shard_map` case: an outer map that makes only `x` manual around an inner map over the
-/// remaining manual axis `y` of the same mesh, which inherits `x` from the outer map.
+/// Emits the nested traced `shard_map` case, which is an outer map that makes only `x` manual around an inner map over
+/// the remaining manual axis `y` of the same mesh, which inherits `x` from the outer map.
 fn emit_nested_shard_map() -> Result<ProgramStatistics, Error> {
     let mesh = LogicalMesh::new(vec![
         MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
@@ -389,7 +391,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         match argument.as_str() {
             "--list" => list_cases = true,
             "--case" => {
-                let case_id = arguments.next().ok_or("expected a case ID after --case")?;
+                let case_id = arguments.next().ok_or("expected a case ID after `--case`")?;
                 case_ids.push(case_id);
             }
             other => {
@@ -399,7 +401,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if list_cases {
-        for case in registry() {
+        for case in ProgramStatisticsCase::registry() {
             println!("{}", case.case_id);
         }
         return Ok(());
@@ -428,10 +430,10 @@ mod tests {
         serde_json::to_value(&records[0].statistics).unwrap()
     }
 
-    /// Verifies that the registry contains exactly the expected case IDs, in deterministic order.
+    // Verifies that the registry contains exactly the expected case IDs, in deterministic order.
     #[test]
-    fn test_registry_case_ids_are_unique_and_deterministic() {
-        let case_ids = registry().into_iter().map(|case| case.case_id).collect::<Vec<_>>();
+    fn test_program_statistics_case_registry() {
+        let case_ids = ProgramStatisticsCase::registry().into_iter().map(|case| case.case_id).collect::<Vec<_>>();
         assert_eq!(
             case_ids,
             vec![
@@ -447,7 +449,35 @@ mod tests {
         );
     }
 
-    /// Verifies that selecting an unknown case fails with an error naming the offending ID.
+    // Verifies the exact serialized record schema for one full record.
+    #[test]
+    fn test_collect_records() {
+        let records = collect_records(&["scalar_bilinear_sin_jit".to_string()]).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&records[0]).unwrap(),
+            json!({
+                "case_id": "scalar_bilinear_sin_jit",
+                "category": "scalar",
+                "surface": "jit",
+                "statistics": {
+                    "regions": [
+                        {
+                            "input_count": 2,
+                            "output_count": 1,
+                            "constant_count": 0,
+                            "instruction_count": 3,
+                            "operation_counts": { "add": 1, "mul": 1, "sin": 1 },
+                            "maximum_output_dependency_depth": 2,
+                            "attached_regions": [],
+                        },
+                    ],
+                },
+            }),
+        );
+    }
+
+    // Verifies that selecting an unknown case fails with an error naming the offending ID.
     #[test]
     fn test_collect_records_rejects_unknown_case() {
         let error = collect_records(&["missing_case".to_string()]).unwrap_err();
@@ -455,9 +485,9 @@ mod tests {
         assert_eq!(error.downcast_custom::<UnknownProgramStatisticsCase>().unwrap().case_id, "missing_case");
     }
 
-    /// Verifies the exact expected statistics for every scalar case. These values are the primary structural
-    /// regression guard for the tracing and transform pipeline; every expectation below was hand-verified against
-    /// the corresponding staged program rendering before being pinned.
+    // Verifies the exact expected statistics for every scalar case. These values are the primary structural
+    // regression guard for the tracing and transform pipeline, and every expectation below was verified by hand
+    // against the corresponding staged program rendering before being pinned.
     #[test]
     fn test_scalar_case_statistics() {
         assert_eq!(
@@ -542,11 +572,11 @@ mod tests {
         );
     }
 
-    /// Verifies the exact expected statistics for every shard-map case, including the nested case's shared-arena
-    /// attachment edges. The `shard_map_basic` expectation is anchored against a program rendering by the
-    /// `test_traced_program_statistics` owner-module test in `ryft_xla::tracing`; the other two fixtures were
-    /// pinned from the binary's emitted values after checking them for internal consistency, so they serve as
-    /// change detectors rather than independently derived ground truth.
+    // Verifies the exact expected statistics for every `shard_map` case, including the region edges of the nested
+    // case's shared arena. The `shard_map_basic` expectation is anchored against a program rendering by the
+    // `test_traced_program_statistics` test of the owning `ryft_xla::tracing` module. The other two fixtures were
+    // pinned from the binary's emitted values after checking them for internal consistency, so they serve as change
+    // detectors rather than independently derived ground truth.
     #[test]
     fn test_shard_map_case_statistics() {
         assert_eq!(
@@ -663,34 +693,6 @@ mod tests {
                         ],
                     },
                 ],
-            }),
-        );
-    }
-
-    /// Verifies the exact serialized record schema for one full record.
-    #[test]
-    fn test_record_schema() {
-        let records = collect_records(&["scalar_bilinear_sin_jit".to_string()]).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(
-            serde_json::to_value(&records[0]).unwrap(),
-            json!({
-                "case_id": "scalar_bilinear_sin_jit",
-                "category": "scalar",
-                "surface": "jit",
-                "statistics": {
-                    "regions": [
-                        {
-                            "input_count": 2,
-                            "output_count": 1,
-                            "constant_count": 0,
-                            "instruction_count": 3,
-                            "operation_counts": { "add": 1, "mul": 1, "sin": 1 },
-                            "maximum_output_dependency_depth": 2,
-                            "attached_regions": [],
-                        },
-                    ],
-                },
             }),
         );
     }

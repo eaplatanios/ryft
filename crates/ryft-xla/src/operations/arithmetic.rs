@@ -11,66 +11,6 @@ use crate::lowering::types::{lower_constant_elements_attribute, lower_signed_one
 use crate::operations::{lower_accuracy, normalize_binary_elementwise_operands};
 use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, LoweringError};
 
-/// Recovers signed one-bit values before promotion and computes one-bit arithmetic in a byte carrier.
-fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    input_values: &[ValueRef<'b, 'c, 't>],
-    input_types: &[ArrayType],
-    output_types: &[ArrayType],
-    lowerer: &mut Lowerer<'b, 'c, 't, O>,
-) -> Result<[ValueRef<'b, 'c, 't>; 2], Error> {
-    check_count!("input", input_values, 2, ProgramError);
-    check_count!("output", output_types, 1, ProgramError);
-    let mut inputs = [input_values[0], input_values[1]];
-    for (input, input_type) in inputs.iter_mut().zip(input_types) {
-        if input_type.data_type() == DataType::I1 {
-            *input = lower_signed_one_bit_to_mlir(*input, &mut lowerer.block, lowerer.context, lowerer.location)?;
-        }
-    }
-    let output_type = match output_types[0].data_type() {
-        DataType::I1 => output_types[0].clone().with_data_type(DataType::I8),
-        DataType::U1 => output_types[0].clone().with_data_type(DataType::U8),
-        _ => output_types[0].clone(),
-    };
-    normalize_binary_elementwise_operands(
-        &inputs,
-        &[output_type],
-        &mut lowerer.block,
-        lowerer.context,
-        lowerer.location,
-    )
-}
-
-/// Restores wrapping one-bit arithmetic by retaining the low bit before converting to the predicate carrier.
-fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-    output: ValueRef<'b, 'c, 't>,
-    output_type: &ArrayType,
-    lowerer: &mut Lowerer<'b, 'c, 't, O>,
-) -> Result<ValueRef<'b, 'c, 't>, Error> {
-    if !matches!(output_type.data_type(), DataType::I1 | DataType::U1) {
-        return Ok(output);
-    }
-    // A direct integer-to-predicate conversion tests nonzero, which would incorrectly turn an even sum into one.
-    let tensor_type = output.r#type()?.cast::<TensorTypeRef>().unwrap();
-    let scalar_type = lowerer.context.tensor_type(tensor_type.element_type()?, &[], None, lowerer.location)?;
-    let data_type = if output_type.data_type() == DataType::I1 { DataType::I8 } else { DataType::U8 };
-    let one = lower_constant_elements_attribute(data_type, scalar_type, 1, lowerer.context)?;
-    let one = lowerer.block.append_operation(stable_hlo::constant(one, lowerer.location)?)?;
-    let one = normalize_binary_elementwise_operands(
-        &[one.result(0).unwrap().as_ref(), output],
-        &[output_type.clone().with_data_type(data_type)],
-        &mut lowerer.block,
-        lowerer.context,
-        lowerer.location,
-    )?[0];
-    let masked = lowerer.block.append_operation(stable_hlo::and(output, one, lowerer.location)?)?;
-    let narrowed = lowerer.block.append_operation(stable_hlo::convert(
-        masked.result(0).unwrap().as_ref(),
-        lower_tensor_type(output_type, lowerer.context, lowerer.location)?,
-        lowerer.location,
-    )?)?;
-    Ok(narrowed.result(0).unwrap().as_ref())
-}
-
 impl LowerableOperation for AddOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
@@ -80,7 +20,7 @@ impl LowerableOperation for AddOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
-        let result = lowerer.block.append_operation(stable_hlo::add(left, right, lowerer.location)?)?;
+        let result = lowerer.block().append_operation(stable_hlo::add(left, right, lowerer.location())?)?;
         Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
 }
@@ -94,7 +34,7 @@ impl LowerableOperation for SubOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
-        let result = lowerer.block.append_operation(stable_hlo::subtract(left, right, lowerer.location)?)?;
+        let result = lowerer.block().append_operation(stable_hlo::subtract(left, right, lowerer.location())?)?;
         Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
 }
@@ -111,11 +51,11 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
         let data_type = output_types[0].data_type();
         if data_type.is_unsigned() {
             // Clamping the subtrahend first avoids unsigned wraparound, including for U64.
-            let right = lowerer.block.append_operation(stable_hlo::minimum(left, right, lowerer.location)?)?;
-            let difference = lowerer.block.append_operation(stable_hlo::subtract(
+            let right = lowerer.block().append_operation(stable_hlo::minimum(left, right, lowerer.location())?)?;
+            let difference = lowerer.block().append_operation(stable_hlo::subtract(
                 left,
                 right.result(0).unwrap().as_ref(),
-                lowerer.location,
+                lowerer.location(),
             )?)?;
             return Ok(vec![lower_arithmetic_output(
                 difference.result(0).unwrap().as_ref(),
@@ -135,20 +75,21 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
         let width = data_type.bit_width();
         let minimum = i64::MIN >> (64 - width);
         let maximum = i64::MAX >> (64 - width);
-        let scalar_type = lower_tensor_type(&ArrayType::scalar(carrier_data_type), lowerer.context, lowerer.location)?;
+        let scalar_type =
+            lower_tensor_type(&ArrayType::scalar(carrier_data_type), lowerer.context(), lowerer.location())?;
         let constants = [minimum, maximum, 0]
             .into_iter()
             .map(|value| {
                 let elements =
-                    lower_constant_elements_attribute(carrier_data_type, scalar_type, value, lowerer.context)?;
-                let constant = lowerer.block.append_operation(stable_hlo::constant(elements, lowerer.location)?)?;
+                    lower_constant_elements_attribute(carrier_data_type, scalar_type, value, lowerer.context())?;
+                let constant = lowerer.block().append_operation(stable_hlo::constant(elements, lowerer.location())?)?;
                 // Broadcasting against a normalized input retains its runtime extents for bounded dynamic arrays.
                 Ok(normalize_binary_elementwise_operands(
                     &[constant.result(0).unwrap().as_ref(), left],
                     &[carrier_type.clone()],
-                    &mut lowerer.block,
-                    lowerer.context,
-                    lowerer.location,
+                    &mut lowerer.block(),
+                    lowerer.context(),
+                    lowerer.location(),
                 )?[0])
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -157,28 +98,28 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
         // Clamp the minuend to [MIN + max(right, 0), MAX + min(right, 0)] before subtracting. Each bound addition
         // stays in range, and the final difference cannot overflow. This also avoids assumptions about intermediate
         // wrapping in native sub-byte arithmetic, while I64 needs no wider representation.
-        let positive = lowerer.block.append_operation(stable_hlo::maximum(right, *zero, lowerer.location)?)?;
-        let negative = lowerer.block.append_operation(stable_hlo::minimum(right, *zero, lowerer.location)?)?;
-        let lower = lowerer.block.append_operation(stable_hlo::add(
+        let positive = lowerer.block().append_operation(stable_hlo::maximum(right, *zero, lowerer.location())?)?;
+        let negative = lowerer.block().append_operation(stable_hlo::minimum(right, *zero, lowerer.location())?)?;
+        let lower = lowerer.block().append_operation(stable_hlo::add(
             *minimum,
             positive.result(0).unwrap().as_ref(),
-            lowerer.location,
+            lowerer.location(),
         )?)?;
-        let upper = lowerer.block.append_operation(stable_hlo::add(
+        let upper = lowerer.block().append_operation(stable_hlo::add(
             *maximum,
             negative.result(0).unwrap().as_ref(),
-            lowerer.location,
+            lowerer.location(),
         )?)?;
-        let clamped = lowerer.block.append_operation(stable_hlo::clamp(
+        let clamped = lowerer.block().append_operation(stable_hlo::clamp(
             lower.result(0).unwrap().as_ref(),
             left,
             upper.result(0).unwrap().as_ref(),
-            lowerer.location,
+            lowerer.location(),
         )?)?;
-        let difference = lowerer.block.append_operation(stable_hlo::subtract(
+        let difference = lowerer.block().append_operation(stable_hlo::subtract(
             clamped.result(0).unwrap().as_ref(),
             right,
-            lowerer.location,
+            lowerer.location(),
         )?)?;
         Ok(vec![lower_arithmetic_output(difference.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
@@ -193,7 +134,7 @@ impl LowerableOperation for MulOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
-        let result = lowerer.block.append_operation(stable_hlo::multiply(left, right, lowerer.location)?)?;
+        let result = lowerer.block().append_operation(stable_hlo::multiply(left, right, lowerer.location())?)?;
         Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
 }
@@ -207,7 +148,7 @@ impl LowerableOperation for DivOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
-        let result = lowerer.block.append_operation(stable_hlo::divide(left, right, lowerer.location)?)?;
+        let result = lowerer.block().append_operation(stable_hlo::divide(left, right, lowerer.location())?)?;
         Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
 }
@@ -217,14 +158,15 @@ impl LowerableOperation for NegOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
+        input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
         if matches!(output_types[0].data_type(), DataType::I1 | DataType::U1) {
             return Ok(vec![input_values[0]]);
         }
-        let result = lowerer.block.append_operation(stable_hlo::negate(input_values[0], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.negate should return one result").as_ref()])
+        let result = lowerer.block().append_operation(stable_hlo::negate(input_values[0], lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -233,15 +175,16 @@ impl LowerableOperation for SqrtOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::sqrt(
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::sqrt(
             input_values[0],
             lower_accuracy(self.accuracy()),
-            lowerer.location,
+            lowerer.location(),
         )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.sqrt should return one result").as_ref()])
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -250,15 +193,16 @@ impl LowerableOperation for RsqrtOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::rsqrt(
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::rsqrt(
             input_values[0],
             lower_accuracy(self.accuracy()),
-            lowerer.location,
+            lowerer.location(),
         )?)?;
-        Ok(vec![result.result(0).expect("stablehlo.rsqrt should return one result").as_ref()])
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -267,18 +211,19 @@ impl LowerableOperation for PowOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
+        input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
         let [left, right] = normalize_binary_elementwise_operands(
             input_values,
             output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
         )?;
-        let result = lowerer.block.append_operation(stable_hlo::power(left, right, lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.power should return one result").as_ref()])
+        let result = lowerer.block().append_operation(stable_hlo::power(left, right, lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -287,14 +232,15 @@ impl LowerableOperation for SignOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
+        input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
         if matches!(output_types[0].data_type(), DataType::I1 | DataType::U1) {
             return Ok(vec![input_values[0]]);
         }
-        let result = lowerer.block.append_operation(stable_hlo::sign(input_values[0], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.sign should return one result").as_ref()])
+        let result = lowerer.block().append_operation(stable_hlo::sign(input_values[0], lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -307,7 +253,7 @@ impl LowerableOperation for RemOperation<ArrayType> {
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
         let [left, right] = normalize_arithmetic_inputs(input_values, input_types, output_types, lowerer)?;
-        let result = lowerer.block.append_operation(stable_hlo::remainder(left, right, lowerer.location)?)?;
+        let result = lowerer.block().append_operation(stable_hlo::remainder(left, right, lowerer.location())?)?;
         Ok(vec![lower_arithmetic_output(result.result(0).unwrap().as_ref(), &output_types[0], lowerer)?])
     }
 }
@@ -317,12 +263,74 @@ impl LowerableOperation for AbsOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let result = lowerer.block.append_operation(stable_hlo::abs(input_values[0], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.abs should return one result").as_ref()])
+        let _ = (input_types, output_types);
+        let result = lowerer.block().append_operation(stable_hlo::abs(input_values[0], lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
+}
+
+/// Recovers signed one-bit values before promotion and computes one-bit arithmetic in a byte carrier.
+fn normalize_arithmetic_inputs<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    input_values: &[ValueRef<'b, 'c, 't>],
+    input_types: &[ArrayType],
+    output_types: &[ArrayType],
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
+) -> Result<[ValueRef<'b, 'c, 't>; 2], Error> {
+    check_count!("input", input_values, 2, ProgramError);
+    check_count!("output", output_types, 1, ProgramError);
+    let mut inputs = [input_values[0], input_values[1]];
+    for (input, input_type) in inputs.iter_mut().zip(input_types) {
+        if input_type.data_type() == DataType::I1 {
+            *input = lower_signed_one_bit_to_mlir(*input, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        }
+    }
+    let output_type = match output_types[0].data_type() {
+        DataType::I1 => output_types[0].clone().with_data_type(DataType::I8),
+        DataType::U1 => output_types[0].clone().with_data_type(DataType::U8),
+        _ => output_types[0].clone(),
+    };
+    normalize_binary_elementwise_operands(
+        &inputs,
+        &[output_type],
+        &mut lowerer.block(),
+        lowerer.context(),
+        lowerer.location(),
+    )
+}
+
+/// Restores wrapping one-bit arithmetic by retaining the low bit before converting to the predicate carrier.
+fn lower_arithmetic_output<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+    output: ValueRef<'b, 'c, 't>,
+    output_type: &ArrayType,
+    lowerer: &mut Lowerer<'b, 'c, 't, O>,
+) -> Result<ValueRef<'b, 'c, 't>, Error> {
+    if !matches!(output_type.data_type(), DataType::I1 | DataType::U1) {
+        return Ok(output);
+    }
+    // A direct conversion from an integer to a predicate tests nonzero, which would incorrectly turn an even sum into
+    // one.
+    let tensor_type = output.r#type()?.cast::<TensorTypeRef>().unwrap();
+    let scalar_type = lowerer.context().tensor_type(tensor_type.element_type()?, &[], None, lowerer.location())?;
+    let data_type = if output_type.data_type() == DataType::I1 { DataType::I8 } else { DataType::U8 };
+    let one = lower_constant_elements_attribute(data_type, scalar_type, 1, lowerer.context())?;
+    let one = lowerer.block().append_operation(stable_hlo::constant(one, lowerer.location())?)?;
+    let one = normalize_binary_elementwise_operands(
+        &[one.result(0).unwrap().as_ref(), output],
+        &[output_type.clone().with_data_type(data_type)],
+        &mut lowerer.block(),
+        lowerer.context(),
+        lowerer.location(),
+    )?[0];
+    let masked = lowerer.block().append_operation(stable_hlo::and(output, one, lowerer.location())?)?;
+    let narrowed = lowerer.block().append_operation(stable_hlo::convert(
+        masked.result(0).unwrap().as_ref(),
+        lower_tensor_type(output_type, lowerer.context(), lowerer.location())?,
+        lowerer.location(),
+    )?)?;
+    Ok(narrowed.result(0).unwrap().as_ref())
 }
 
 #[cfg(test)]
@@ -333,18 +341,31 @@ mod tests {
     use num_complex::Complex;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Abs, Add, ConvertElementTypeOperation, Div, Mul, Neg, Placeholder, Rem, Sign, Sub, differentiate_at,
+        Abs, Add, ArrayOperation, ConvertElementTypeOperation, Div, Instruction, Mul, Neg, Placeholder, Rem, Sign, Sub,
+        differentiate_at,
     };
     use ryft_pjrt::{BufferType, Client, ExecutionDeviceInputs, ExecutionInput, Program as PjrtProgram};
 
     use crate::Session;
     use crate::domains::tests::domain_mesh;
-    use crate::lowering::tests::{ProgramBuilder, test_spmd_compilation_options};
+    use crate::lowering::tests::{ProgramBuilder, lowered_unary_module, test_spmd_compilation_options};
     use crate::lowering::to_mlir_module_for_plain_program;
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::values::ArrayConstant;
 
     use super::*;
+
+    /// Lowers one binary operation over two inputs of `data_type` and shape `[4]` to a rendered StableHLO module.
+    fn lowered_binary_module(operation: ArrayOperation<ArrayConstant>, data_type: DataType) -> String {
+        let mut builder = ProgramBuilder::new();
+        let left = builder.add_input(ArrayType::new_static(data_type, [4]));
+        let right = builder.add_input(ArrayType::new_static(data_type, [4]));
+        let output = builder.add_instruction(operation, Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        to_mlir_module_for_plain_program(&program, "main").unwrap()
+    }
 
     /// Executes subtraction after converting to `data_types`, using I64 boundary values to keep sub-byte integer
     /// transport out of the oracle. Unsigned U64 values above I64::MAX use the I64 encoding with the same bits.
@@ -415,6 +436,293 @@ mod tests {
             .remove(0);
         let bytes = outputs.outputs.remove(0).copy_to_host(None).unwrap().r#await().unwrap();
         values_from_bytes(bytes.as_slice())
+    }
+
+    #[test]
+    fn test_add_operation_lower() {
+        assert_eq!(
+            lowered_binary_module(ArrayOperation::Add(AddOperation::new()), DataType::F32),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.add %arg0, %arg1 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_sub_operation_lower() {
+        assert_eq!(
+            lowered_binary_module(ArrayOperation::Sub(SubOperation::new()), DataType::F32),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.subtract %arg0, %arg1 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_operation_lower() {
+        let mut builder = ProgramBuilder::new();
+        let left = builder.add_input(ArrayType::new_static(DataType::U8, [2]));
+        let right = builder.add_input(ArrayType::scalar(DataType::U8));
+        let output =
+            builder.add_instruction(SaturatingSubOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            to_mlir_module_for_plain_program(&program, "main").unwrap(),
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xui8>, %arg1: tensor<ui8>) -> tensor<2xui8> {
+                    %0 = stablehlo.broadcast_in_dim %arg1, dims = [] : (tensor<ui8>) -> tensor<2xui8>
+                    %1 = stablehlo.minimum %arg0, %0 : tensor<2xui8>
+                    %2 = stablehlo.subtract %arg0, %1 : tensor<2xui8>
+                    return %2 : tensor<2xui8>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
+    fn test_saturating_sub_operation_lower_signed_limits() {
+        let client = execution_client();
+        for data_type in
+            [DataType::I1, DataType::I2, DataType::I4, DataType::I8, DataType::I16, DataType::I32, DataType::I64]
+        {
+            let width = data_type.bit_width();
+            let minimum = i64::MIN >> (64 - width);
+            let maximum = i64::MAX >> (64 - width);
+            let left = [minimum, maximum, minimum, maximum, 0, minimum, 0];
+            let right = [maximum, minimum, minimum, maximum, minimum, 0, maximum];
+            let expected = [minimum, maximum, 0, 0, maximum, minimum, -maximum];
+            assert_eq!(execute_saturating_sub(&client, [data_type; 2], &left, &right, false), expected, "{data_type}");
+        }
+    }
+
+    #[test]
+    fn test_saturating_sub_operation_lower_unsigned_limits() {
+        let client = execution_client();
+        for data_type in
+            [DataType::U1, DataType::U2, DataType::U4, DataType::U8, DataType::U16, DataType::U32, DataType::U64]
+        {
+            let maximum = (u64::MAX >> (64 - data_type.bit_width())) as i64;
+            let left = [0, maximum, maximum, 0];
+            let right = [maximum, 0, maximum, 0];
+            assert_eq!(
+                execute_saturating_sub(&client, [data_type; 2], &left, &right, false),
+                [0, maximum, 0, 0],
+                "{data_type}",
+            );
+            assert_eq!(
+                execute_saturating_sub(&client, [data_type; 2], &[0, maximum], &[1], true),
+                [0, (maximum as u64).wrapping_sub(1) as i64],
+                "{data_type}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_saturating_sub_operation_lower_promoted_data_type() {
+        let client = execution_client();
+        assert_eq!(
+            execute_saturating_sub(&client, [DataType::I8, DataType::U8], &[-128, 127], &[255], true),
+            [-383, -128],
+        );
+        assert_eq!(execute_saturating_sub(&client, [DataType::I1, DataType::I8], &[-1, 0], &[-128], true), [127, 127],);
+        assert_eq!(execute_saturating_sub(&client, [DataType::I1, DataType::I2], &[-1, 0], &[-2], true), [1, 1]);
+        assert_eq!(execute_saturating_sub(&client, [DataType::I2, DataType::I4], &[-2, 1], &[-8], true), [6, 7]);
+    }
+
+    #[test]
+    fn test_saturating_sub_operation_lower_floating_point() {
+        // Saturation is only defined for integers, so unchecked programs over other data types fail to lower.
+        let mut builder = ProgramBuilder::new();
+        let left = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
+        let right = builder.add_input(ArrayType::new_static(DataType::F32, [2]));
+        let output = builder.add_variable(ArrayType::new_static(DataType::F32, [2]));
+        builder.add_instruction_unchecked(Instruction::new(
+            ArrayOperation::SaturatingSub(SaturatingSubOperation::new()),
+            vec![left, right],
+            vec![output],
+            Vec::new(),
+        ));
+        let program = builder
+            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert!(matches!(
+            to_mlir_module_for_plain_program(&program, "main"),
+            Err(Error::Lowering(LoweringError::UnsupportedElementType { data_type: DataType::F32, context }))
+                if context == "`saturating_sub` operation",
+        ));
+    }
+
+    #[test]
+    fn test_mul_operation_lower() {
+        assert_eq!(
+            lowered_binary_module(ArrayOperation::Mul(MulOperation::new()), DataType::F32),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.multiply %arg0, %arg1 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_div_operation_lower() {
+        assert_eq!(
+            lowered_binary_module(ArrayOperation::Div(DivOperation::new()), DataType::F32),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.divide %arg0, %arg1 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_neg_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Neg(NegOperation::new()), DataType::F32, vec![4]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.negate %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_sqrt_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Sqrt(SqrtOperation::new()), DataType::F32, vec![4]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.sqrt %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_rsqrt_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Rsqrt(RsqrtOperation::new()), DataType::F32, vec![4]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.rsqrt %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_pow_operation_lower() {
+        assert_eq!(
+            lowered_binary_module(ArrayOperation::Pow(PowOperation::new()), DataType::F32),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.power %arg0, %arg1 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_sign_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Sign(SignOperation::new()), DataType::F32, vec![4]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.sign %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_rem_operation_lower() {
+        assert_eq!(
+            lowered_binary_module(ArrayOperation::Rem(RemOperation::new()), DataType::I32),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xi32>, %arg1: tensor<4xi32>) -> tensor<4xi32> {
+                    %0 = stablehlo.remainder %arg0, %arg1 : tensor<4xi32>
+                    return %0 : tensor<4xi32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_abs_operation_lower() {
+        assert_eq!(
+            lowered_unary_module(ArrayOperation::Abs(AbsOperation::new()), DataType::F32, vec![4]).unwrap(),
+            indoc! {"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.abs %arg0 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_abs_operation_lower_differentiation_at_zero() {
+        let client = execution_client();
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+
+        // The JVP of `abs` uses its explicit origin convention after XLA compiles the comparison and selection that
+        // define it, rather than exposing the NaN of the undefined `0 / 0` formula. The real rule picks the right
+        // derivative.
+        let primal = replicated_array(&domain, &mesh, DataType::F32, &[], &values_to_bytes(&[0f32]));
+        let tangent = replicated_array(&domain, &mesh, DataType::F32, &[], &values_to_bytes(&[3f32]));
+        let (value, tangent) = differentiate_at(primal).jvp(tangent, |input| input.abs()).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), [0f32]);
+        assert_eq!(values_from_bytes::<f32>(&tangent.copy_to_host().unwrap()), [3f32]);
+
+        // The complex rule yields a zero tangent at the origin.
+        let primal = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[Complex::new(0f32, 0.0)]));
+        let tangent =
+            replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[Complex::new(1f32, 2.0)]));
+        let (value, tangent) = differentiate_at(primal).jvp(tangent, |input| input.abs()).unwrap();
+        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), [0f32]);
+        assert_eq!(values_from_bytes::<f32>(&tangent.copy_to_host().unwrap()), [0f32]);
     }
 
     #[test]
@@ -514,104 +822,5 @@ mod tests {
                 assert_eq!(left.rem(&zero).unwrap().copy_to_host().unwrap(), [0, 0, 1, 1], "{data_type}");
             }
         }
-    }
-
-    #[test]
-    fn test_saturating_sub_operation_lower() {
-        let mut builder = ProgramBuilder::new();
-        let left = builder.add_input(ArrayType::new_static(DataType::U8, [2]));
-        let right = builder.add_input(ArrayType::scalar(DataType::U8));
-        let output =
-            builder.add_instruction(SaturatingSubOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            to_mlir_module_for_plain_program(&program, "main").unwrap(),
-            indoc! {r#"
-                module {
-                  func.func @main(%arg0: tensor<2xui8>, %arg1: tensor<ui8>) -> tensor<2xui8> {
-                    %0 = stablehlo.broadcast_in_dim %arg1, dims = [] : (tensor<ui8>) -> tensor<2xui8>
-                    %1 = stablehlo.minimum %arg0, %0 : tensor<2xui8>
-                    %2 = stablehlo.subtract %arg0, %1 : tensor<2xui8>
-                    return %2 : tensor<2xui8>
-                  }
-                }
-            "#},
-        );
-    }
-
-    #[test]
-    fn test_saturating_sub_operation_lower_signed_limits() {
-        let client = execution_client();
-        for data_type in
-            [DataType::I1, DataType::I2, DataType::I4, DataType::I8, DataType::I16, DataType::I32, DataType::I64]
-        {
-            let width = data_type.bit_width();
-            let minimum = i64::MIN >> (64 - width);
-            let maximum = i64::MAX >> (64 - width);
-            let left = [minimum, maximum, minimum, maximum, 0, minimum, 0];
-            let right = [maximum, minimum, minimum, maximum, minimum, 0, maximum];
-            let expected = [minimum, maximum, 0, 0, maximum, minimum, -maximum];
-            assert_eq!(execute_saturating_sub(&client, [data_type; 2], &left, &right, false), expected, "{data_type}");
-        }
-    }
-
-    #[test]
-    fn test_saturating_sub_operation_lower_unsigned_limits() {
-        let client = execution_client();
-        for data_type in
-            [DataType::U1, DataType::U2, DataType::U4, DataType::U8, DataType::U16, DataType::U32, DataType::U64]
-        {
-            let maximum = (u64::MAX >> (64 - data_type.bit_width())) as i64;
-            let left = [0, maximum, maximum, 0];
-            let right = [maximum, 0, maximum, 0];
-            assert_eq!(
-                execute_saturating_sub(&client, [data_type; 2], &left, &right, false),
-                [0, maximum, 0, 0],
-                "{data_type}",
-            );
-            assert_eq!(
-                execute_saturating_sub(&client, [data_type; 2], &[0, maximum], &[1], true),
-                [0, (maximum as u64).wrapping_sub(1) as i64],
-                "{data_type}",
-            );
-        }
-    }
-
-    #[test]
-    fn test_saturating_sub_operation_lower_promoted_data_type() {
-        let client = execution_client();
-        assert_eq!(
-            execute_saturating_sub(&client, [DataType::I8, DataType::U8], &[-128, 127], &[255], true),
-            [-383, -128],
-        );
-        assert_eq!(execute_saturating_sub(&client, [DataType::I1, DataType::I8], &[-1, 0], &[-128], true), [127, 127],);
-        assert_eq!(execute_saturating_sub(&client, [DataType::I1, DataType::I2], &[-1, 0], &[-2], true), [1, 1]);
-        assert_eq!(execute_saturating_sub(&client, [DataType::I2, DataType::I4], &[-2, 1], &[-8], true), [6, 7]);
-    }
-
-    #[test]
-    fn test_abs_operation_lower_differentiation_at_zero() {
-        let client = execution_client();
-        let domain = Session::new(&client).domain();
-        let mesh = domain_mesh(&client, "x", 1);
-
-        // The JVP of `abs` uses its explicit origin convention after XLA compiles the comparison and selection that
-        // define it, rather than exposing the NaN of the undefined `0 / 0` formula. The real rule picks the right
-        // derivative.
-        let primal = replicated_array(&domain, &mesh, DataType::F32, &[], &values_to_bytes(&[0f32]));
-        let tangent = replicated_array(&domain, &mesh, DataType::F32, &[], &values_to_bytes(&[3f32]));
-        let (value, tangent) = differentiate_at(primal).jvp(tangent, |input| input.abs()).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), [0f32]);
-        assert_eq!(values_from_bytes::<f32>(&tangent.copy_to_host().unwrap()), [3f32]);
-
-        // The complex rule yields a zero tangent at the origin.
-        let primal = replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[Complex::new(0f32, 0.0)]));
-        let tangent =
-            replicated_array(&domain, &mesh, DataType::C64, &[], &values_to_bytes(&[Complex::new(1f32, 2.0)]));
-        let (value, tangent) = differentiate_at(primal).jvp(tangent, |input| input.abs()).unwrap();
-        assert_eq!(values_from_bytes::<f32>(&value.copy_to_host().unwrap()), [0f32]);
-        assert_eq!(values_from_bytes::<f32>(&tangent.copy_to_host().unwrap()), [0f32]);
     }
 }

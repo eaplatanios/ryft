@@ -23,7 +23,7 @@ use crate::lowering::types::{
 use crate::operations::FlatProgram;
 use crate::{Domain, Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 
-/// Traces the canonical scaled-dot decomposition for one validated operation boundary.
+/// Traces the canonical scaled dot decomposition for one validated operation boundary.
 pub(crate) fn trace_scaled_dot_composition(
     operation: &ScaledDotOperation,
     input_types: &[ArrayType],
@@ -31,179 +31,24 @@ pub(crate) fn trace_scaled_dot_composition(
     let input_types = named_composition_input_types(&scaled_dot_composite_input_types(operation, input_types)?)?;
     let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
         |inputs: Vec<Tracer<'static>>| {
-            let [lhs, rhs, lhs_scale, rhs_scale] = inputs.as_slice() else {
+            let [left, right, left_scale, right_scale] = inputs.as_slice() else {
                 return Err(ProgramError::InvalidInputCount { expected: 4, actual: inputs.len() });
             };
-            let mut inputs = vec![lhs.clone(), rhs.clone()];
-            inputs.extend(operation.has_lhs_scale().then(|| lhs_scale.clone()));
-            inputs.extend(operation.has_rhs_scale().then(|| rhs_scale.clone()));
-            operation.interpret_in_parent(&lhs.domain(), &EmptyRegionDriver, &inputs)
+            let mut inputs = vec![left.clone(), right.clone()];
+            inputs.extend(operation.has_lhs_scale().then(|| left_scale.clone()));
+            inputs.extend(operation.has_rhs_scale().then(|| right_scale.clone()));
+            operation.interpret_in_parent(&left.domain(), &EmptyRegionDriver, &inputs)
         },
         input_types,
     )?;
     Ok(program.into_simplified()?)
 }
 
-/// Returns the dummy scale type used by JAX's four-operand `xla.scaled_dot` boundary for one absent scale.
-fn scaled_dot_dummy_scale_type(elements: &ArrayType, contracting_dimensions: &[usize]) -> ArrayType {
-    ArrayType::new(
-        DataType::F8E8M0FNU,
-        Shape::new(
-            elements
-                .shape()
-                .dimensions()
-                .iter()
-                .enumerate()
-                .map(
-                    |(axis, dimension)| {
-                        if contracting_dimensions.contains(&axis) {
-                            CoreDimension::Static(1)
-                        } else {
-                            dimension.clone()
-                        }
-                    },
-                )
-                .collect(),
-        ),
-    )
-}
-
-/// Expands one public scaled-dot boundary to the exact four inputs consumed by the StableHLO composite.
-fn scaled_dot_composite_input_types(
-    operation: &ScaledDotOperation,
-    input_types: &[ArrayType],
-) -> Result<Vec<ArrayType>, Error> {
-    let expected_input_count = 2 + usize::from(operation.has_lhs_scale()) + usize::from(operation.has_rhs_scale());
-    check_count!("input", input_types, expected_input_count, ProgramError);
-    let mut scale_index = 2;
-    let lhs_scale = if operation.has_lhs_scale() {
-        let r#type = input_types[scale_index].clone();
-        scale_index += 1;
-        r#type
-    } else {
-        scaled_dot_dummy_scale_type(&input_types[0], operation.dimensions().lhs_contracting_dimensions())
-    };
-    let rhs_scale = if operation.has_rhs_scale() {
-        input_types[scale_index].clone()
-    } else {
-        scaled_dot_dummy_scale_type(&input_types[1], operation.dimensions().rhs_contracting_dimensions())
-    };
-    Ok(vec![input_types[0].clone(), input_types[1].clone(), lhs_scale, rhs_scale])
-}
-
-/// Returns whether scaled dot can use a physical CUDA composite boundary without losing a runtime contracting-axis
-/// requirement. Dynamic contracting element or scale dimensions retain the logical portable decomposition, whose
-/// ordinary dimension SSA proves their block ratio before computing the result.
-fn scaled_dot_uses_cuda_physical_boundary(
-    operation: &ScaledDotOperation,
-    input_types: &[ArrayType],
-    target_platform: Option<&str>,
-) -> Result<bool, Error> {
-    if target_platform != Some("cuda") {
-        return Ok(false);
-    }
-    let expected_input_count = 2 + usize::from(operation.has_lhs_scale()) + usize::from(operation.has_rhs_scale());
-    check_count!("input", input_types, expected_input_count, ProgramError);
-    let mut scale_index = 2;
-    for (element_index, has_scale, contracting_dimensions) in [
-        (0, operation.has_lhs_scale(), operation.dimensions().lhs_contracting_dimensions()),
-        (1, operation.has_rhs_scale(), operation.dimensions().rhs_contracting_dimensions()),
-    ] {
-        if contracting_dimensions
-            .iter()
-            .any(|axis| matches!(input_types[element_index].dimension(*axis), CoreDimension::Dynamic(_)))
-        {
-            return Ok(false);
-        }
-        if has_scale {
-            if contracting_dimensions
-                .iter()
-                .any(|axis| matches!(input_types[scale_index].dimension(*axis), CoreDimension::Dynamic(_)))
-            {
-                return Ok(false);
-            }
-            scale_index += 1;
-        }
-    }
-    Ok(true)
-}
-
-/// Returns the input permutations that bring one scaled dot to the `[batch, free, contracting]` layout (without
-/// `batch` when there is no batching dimension) of the `__op$block_scaled_dot` custom call, or [`None`] when the call
-/// does not qualify for it. On CUDA, XLA's `BlockScalingRewriter` expands that custom call to cuDNN's block-scaled
-/// matrix product when the device has compute capability 10 or higher and cuDNN is at least 9.10, and to a
-/// dequantized `dot_general` otherwise. Unlike the `xla.scaled_dot` composite, which the pinned XLA replaces only for
-/// `f8e8m0fnu` scales, this also covers NVFP4.
-///
-/// A call qualifies on CUDA when both scales are present, it accumulates at `f32` or `bf16`, its contracting extents
-/// are static (see [`scaled_dot_uses_cuda_physical_boundary`]), it has one contracting dimension and at most one
-/// batching dimension, and each side has exactly one free dimension. The pair of formats must also be one that cuDNN
-/// accepts, with the block size given by the ratio of the element and scale contracting extents. That is NVFP4 on both
-/// sides (i.e., `f4e2m1fn` elements with `f8e4m3fn` scales over blocks of 16), or MXFP8 (i.e., `f8e4m3fn` or `f8e5m2`
-/// elements with `f8e8m0fnu` scales over blocks of 32) unless both sides use `f8e5m2`. A call that fails these checks
-/// keeps the composite, so XLA never receives a custom call that it cannot hand to cuDNN on a capable device.
-fn block_scaled_dot_custom_call_permutations(
-    operation: &ScaledDotOperation,
-    input_types: &[ArrayType],
-    target_platform: Option<&str>,
-) -> Result<Option<[Vec<usize>; 2]>, Error> {
-    let dimensions = operation.dimensions();
-    let batching_dimension_count = dimensions.lhs_batching_dimensions().len();
-    if !operation.has_lhs_scale()
-        || !operation.has_rhs_scale()
-        || !matches!(operation.accumulation_type(), DataType::F32 | DataType::BF16)
-        || dimensions.lhs_contracting_dimensions().len() != 1
-        || batching_dimension_count > 1
-        || !scaled_dot_uses_cuda_physical_boundary(operation, input_types, target_platform)?
-    {
-        return Ok(None);
-    }
-    let mut formats = Vec::with_capacity(2);
-    let mut permutations = Vec::with_capacity(2);
-    for (element_index, scale_index, batching_dimensions, contracting_dimension) in [
-        (0, 2, dimensions.lhs_batching_dimensions(), dimensions.lhs_contracting_dimensions()[0]),
-        (1, 3, dimensions.rhs_batching_dimensions(), dimensions.rhs_contracting_dimensions()[0]),
-    ] {
-        let (elements, scales) = (&input_types[element_index], &input_types[scale_index]);
-        let rank = elements.rank();
-        if rank != batching_dimension_count + 2 {
-            return Ok(None);
-        }
-        let (CoreDimension::Static(element_extent), CoreDimension::Static(scale_extent)) =
-            (elements.dimension(contracting_dimension), scales.dimension(contracting_dimension))
-        else {
-            return Ok(None);
-        };
-        if scale_extent == 0 || element_extent % scale_extent != 0 {
-            return Ok(None);
-        }
-        formats.push((elements.data_type(), scales.data_type(), element_extent / scale_extent));
-        let free_dimension = (0..rank)
-            .find(|axis| *axis != contracting_dimension && !batching_dimensions.contains(axis))
-            .unwrap();
-        permutations.push(
-            batching_dimensions
-                .iter()
-                .copied()
-                .chain([free_dimension, contracting_dimension])
-                .collect::<Vec<_>>(),
-        );
-    }
-    let supported = matches!(
-        (formats[0], formats[1]),
-        ((DataType::F4E2M1FN, DataType::F8E4M3FN, 16), (DataType::F4E2M1FN, DataType::F8E4M3FN, 16))
-            | ((DataType::F8E4M3FN, DataType::F8E8M0FNU, 32), (DataType::F8E4M3FN, DataType::F8E8M0FNU, 32))
-            | ((DataType::F8E4M3FN, DataType::F8E8M0FNU, 32), (DataType::F8E5M2, DataType::F8E8M0FNU, 32))
-            | ((DataType::F8E5M2, DataType::F8E8M0FNU, 32), (DataType::F8E4M3FN, DataType::F8E8M0FNU, 32))
-    );
-    Ok(supported.then(|| permutations.try_into().unwrap()))
-}
-
-/// Returns the typed scaled-dot composition boundary used for the target platform, or [`None`] when the call lowers to
-/// the `__op$block_scaled_dot` custom call (see [`block_scaled_dot_custom_call_permutations`]) and needs no
-/// composition. XLA's CUDA block-scaled-dot replacement cannot propagate dynamic-dimension annotations through its
-/// fused HLO, so eligible CUDA calls use the bounded static carriers while the caller masks physical suffix lanes and
-/// restores the logical result dimensions. Other calls retain the logical boundary consumed by the portable
+/// Returns the typed scaled dot composition boundary used for the target platform, or [`None`] when the call lowers to
+/// the `__op$block_scaled_dot` custom call, as [`block_scaled_dot_custom_call_permutations`] decides, and needs no
+/// composition. XLA's CUDA block scaled dot replacement cannot propagate dynamic dimension annotations through its
+/// fused HLO, so eligible CUDA calls use the bounded static carriers while the caller masks physical suffix elements
+/// and restores the logical result dimensions. Other calls retain the logical boundary consumed by the portable
 /// decomposition.
 pub(crate) fn scaled_dot_composition_types(
     operation: &ScaledDotOperation,
@@ -223,13 +68,60 @@ pub(crate) fn scaled_dot_composition_types(
     )))
 }
 
-/// Lowers one scaled dot. On CUDA, calls whose formats cuDNN accepts lower to the `__op$block_scaled_dot` custom call
-/// (see [`block_scaled_dot_custom_call_permutations`]), which XLA hands to cuDNN's block-scaled matrix product on
-/// capable devices. Every other call lowers to the exact four-operand `stablehlo.composite "xla.scaled_dot"` boundary
-/// consumed by XLA's block-scaling replacement pass. Either scale omitted by the public Ryft call is represented by the
-/// same JAX-compatible identity scale used by the pinned composite contract. The typed decomposition remains the
-/// portable fallback when XLA does not replace the composite.
-pub(crate) fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
+/// Builds the canonical named composition identity for one scaled dot boundary.
+pub(crate) fn scaled_dot_composition_key(
+    operation: &ScaledDotOperation,
+    input_types: &[ArrayType],
+    output_types: &[ArrayType],
+) -> Result<NamedCompositionKey, Error> {
+    let dimensions = operation.dimensions();
+    Ok(NamedCompositionKey::new(
+        CompositeKey::new("xla.scaled_dot", 0)
+            .with_attribute(
+                "dimension_numbers",
+                vec![
+                    vec![
+                        dimensions.lhs_contracting_dimensions().to_vec(),
+                        dimensions.rhs_contracting_dimensions().to_vec(),
+                    ],
+                    vec![dimensions.lhs_batching_dimensions().to_vec(), dimensions.rhs_batching_dimensions().to_vec()],
+                ],
+            )
+            .with_attribute("preferred_element_type", operation.accumulation_type()),
+        scaled_dot_composite_input_types(operation, input_types)?,
+        output_types.to_vec(),
+    ))
+}
+
+impl LowerableOperation for ScaledDotOperation {
+    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
+        &self,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
+    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let collective_state = lowerer.collective_state().clone();
+        lower_scaled_dot_to_mlir(
+            self,
+            &collective_state,
+            input_values,
+            input_types,
+            output_types,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
+        )
+    }
+}
+
+/// Lowers one scaled dot. On CUDA, calls whose formats cuDNN accepts, as
+/// [`block_scaled_dot_custom_call_permutations`] decides, lower to the `__op$block_scaled_dot` custom call, which XLA
+/// hands to cuDNN's block-scaled matrix product on capable devices. Every other call lowers to the exact four-operand
+/// `stablehlo.composite "xla.scaled_dot"` boundary consumed by XLA's block-scaling replacement pass. Either scale
+/// omitted by the public Ryft call is represented by the same JAX-compatible identity scale used by the pinned
+/// composite contract. The typed decomposition remains the portable fallback when XLA does not replace the composite.
+fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &ScaledDotOperation,
     collective_state: &CollectiveLoweringState,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -264,7 +156,7 @@ pub(crate) fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     let (composition_input_types, composition_output_types) =
         scaled_dot_composition_types(operation, input_types, output_types, collective_state.target_platform())?
             .unwrap();
-    let decomposition = match collective_state.named_compositions.as_ref() {
+    let decomposition = match collective_state.named_compositions() {
         Some(functions) => functions.get(operation, &composition_input_types, &composition_output_types)?,
         None => None,
     };
@@ -336,7 +228,7 @@ pub(crate) fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
             0,
             Some(&attributes),
             composite_values.as_slice(),
-            function.symbol.as_str(),
+            function.symbol(),
             Vec::new(),
             result_types.as_slice(),
             location,
@@ -359,7 +251,7 @@ pub(crate) fn lower_scaled_dot_to_mlir<'b, 'c: 'b, 't: 'c>(
     Err(ProgramError::MalformedProgram(format!("missing typed decomposition for `{}`", operation.name())).into())
 }
 
-/// Places an optimization barrier on the scaled-dot inputs whose element types are narrow floating-point types. The
+/// Places an optimization barrier on the scaled dot inputs whose element types are narrow floating-point types. The
 /// decomposition converts these inputs to `bf16` before contracting them, and when no native kernel replaces the
 /// composite (e.g., on CPUs and on GPUs without block-scaled matrix units), XLA's floating-point conversion
 /// simplification can fold a producer's conversion to the narrow type into that conversion (e.g., `f32 → f4e2m1fn →
@@ -399,18 +291,17 @@ fn lower_scaled_dot_input_barrier<'b, 'c: 'b, 't: 'c>(
         .collect())
 }
 
-/// Lowers one qualifying scaled dot (see [`block_scaled_dot_custom_call_permutations`]) to
+/// Lowers one scaled dot that qualifies according to [`block_scaled_dot_custom_call_permutations`] to
 /// `stablehlo.custom_call @__op$block_scaled_dot(lhs, rhs, lhs_scale, rhs_scale)`. The inputs are first exposed as
 /// their bounded physical carriers, because XLA's block-scaling expansion cannot propagate dynamic dimension
-/// annotations. Elements are padded with zeros, so padded lanes contribute nothing to the result, and scales are
-/// padded with ones, which every scale type represents (unlike zero for `f8e8m0fnu`). Each element array and its scale
-/// array are then transposed by `permutations` to the `[batch, free, contracting]` layout that the custom call
-/// requires. XLA gives a transpose the permuted memory layout of its input, which makes it a bitcast, but
+/// annotations. Elements are padded with zeros, so padded elements contribute nothing to the result, and scales are
+/// padded with ones, which every scale type represents, whereas `f8e8m0fnu` cannot represent zero. Each element array
+/// and its scale array are then transposed by `permutations` to the `[batch, free, contracting]` layout that the
+/// custom call requires. XLA gives a transpose the permuted memory layout of its input, which makes it a bitcast, but
 /// `BlockScalingRewriter` hands only inputs with the default major-to-minor layout to cuDNN. The custom call therefore
 /// declares default input and result layouts, which makes XLA materialize every transposed input. The custom call
 /// returns its result in the `[batch, lhs free, rhs free]` order of `dot_general`, so only its logical dynamic extents
 /// need restoring.
-#[allow(clippy::too_many_arguments)]
 fn lower_block_scaled_dot_custom_call<'b, 'c: 'b, 't: 'c>(
     operation: &ScaledDotOperation,
     permutations: &[Vec<usize>; 2],
@@ -431,7 +322,7 @@ fn lower_block_scaled_dot_custom_call<'b, 'c: 'b, 't: 'c>(
             continue;
         }
         let transposed = block.append_operation(stable_hlo::transpose(value, permutation, location)?)?;
-        operands.push(transposed.result(0).expect("stablehlo.transpose should return one result").as_ref());
+        operands.push(transposed.result(0).unwrap().as_ref());
     }
     let output_type = lower_tensor_type(&physical_bound_type(&output_types[0])?, context, location)?;
     let default_layout = |rank: usize| (0..rank).rev().collect::<Vec<_>>();
@@ -451,7 +342,7 @@ fn lower_block_scaled_dot_custom_call<'b, 'c: 'b, 't: 'c>(
         &[output_type],
         location,
     )?)?;
-    let result = custom_call.result(0).expect("stablehlo.custom_call should return one result").as_ref();
+    let result = custom_call.result(0).unwrap().as_ref();
     Ok(vec![lower_restore_dynamic_dimensions(
         result,
         &output_types[0],
@@ -462,7 +353,7 @@ fn lower_block_scaled_dot_custom_call<'b, 'c: 'b, 't: 'c>(
     )?])
 }
 
-/// Returns the input value and axis that carry the runtime extent of each scaled-dot output dimension, in the
+/// Returns the input value and axis that carry the runtime extent of each scaled dot output dimension, in the
 /// `[batch, lhs free, rhs free]` output order of `dot_general`.
 fn scaled_dot_output_sources<'b, 'c: 'b, 't: 'c>(
     operation: &ScaledDotOperation,
@@ -485,56 +376,163 @@ fn scaled_dot_output_sources<'b, 'c: 'b, 't: 'c>(
         .collect()
 }
 
-/// Builds the canonical named-composition identity for one scaled-dot boundary.
-pub(crate) fn scaled_dot_composition_key(
+/// Expands one public scaled dot boundary to the exact four inputs consumed by the StableHLO composite.
+fn scaled_dot_composite_input_types(
     operation: &ScaledDotOperation,
     input_types: &[ArrayType],
-    output_types: &[ArrayType],
-) -> Result<NamedCompositionKey, Error> {
-    let dimensions = operation.dimensions();
-    Ok(NamedCompositionKey {
-        composite: CompositeKey::new("xla.scaled_dot", 0)
-            .with_attribute(
-                "dimension_numbers",
-                vec![
-                    vec![
-                        dimensions.lhs_contracting_dimensions().to_vec(),
-                        dimensions.rhs_contracting_dimensions().to_vec(),
-                    ],
-                    vec![dimensions.lhs_batching_dimensions().to_vec(), dimensions.rhs_batching_dimensions().to_vec()],
-                ],
-            )
-            .with_attribute("preferred_element_type", operation.accumulation_type()),
-        input_types: scaled_dot_composite_input_types(operation, input_types)?,
-        output_types: output_types.to_vec(),
-    })
+) -> Result<Vec<ArrayType>, Error> {
+    let expected_input_count = 2 + usize::from(operation.has_lhs_scale()) + usize::from(operation.has_rhs_scale());
+    check_count!("input", input_types, expected_input_count, ProgramError);
+    let mut scale_index = 2;
+    let left_scale = if operation.has_lhs_scale() {
+        let r#type = input_types[scale_index].clone();
+        scale_index += 1;
+        r#type
+    } else {
+        scaled_dot_dummy_scale_type(&input_types[0], operation.dimensions().lhs_contracting_dimensions())
+    };
+    let right_scale = if operation.has_rhs_scale() {
+        input_types[scale_index].clone()
+    } else {
+        scaled_dot_dummy_scale_type(&input_types[1], operation.dimensions().rhs_contracting_dimensions())
+    };
+    Ok(vec![input_types[0].clone(), input_types[1].clone(), left_scale, right_scale])
 }
 
-impl LowerableOperation for ScaledDotOperation {
-    fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
-        &self,
-        lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        input_values: &[ValueRef<'b, 'c, 't>],
-        input_types: &[ArrayType],
-        output_types: &[ArrayType],
-    ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let collective_state = lowerer.collective_state.clone();
-        lower_scaled_dot_to_mlir(
-            self,
-            &collective_state,
-            input_values,
-            input_types,
-            output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-        )
+/// Returns the dummy scale type used by JAX's four-operand `xla.scaled_dot` boundary for one absent scale.
+fn scaled_dot_dummy_scale_type(elements: &ArrayType, contracting_dimensions: &[usize]) -> ArrayType {
+    ArrayType::new(
+        DataType::F8E8M0FNU,
+        Shape::new(
+            elements
+                .shape()
+                .dimensions()
+                .iter()
+                .enumerate()
+                .map(
+                    |(axis, dimension)| {
+                        if contracting_dimensions.contains(&axis) {
+                            CoreDimension::Static(1)
+                        } else {
+                            dimension.clone()
+                        }
+                    },
+                )
+                .collect(),
+        ),
+    )
+}
+
+/// Returns whether scaled dot can use a physical CUDA composite boundary without losing a runtime contracting axis
+/// requirement. Dynamic contracting element or scale dimensions retain the logical portable decomposition, whose
+/// ordinary dimension SSA proves their block ratio before computing the result.
+fn scaled_dot_uses_cuda_physical_boundary(
+    operation: &ScaledDotOperation,
+    input_types: &[ArrayType],
+    target_platform: Option<&str>,
+) -> Result<bool, Error> {
+    if target_platform != Some("cuda") {
+        return Ok(false);
     }
+    let expected_input_count = 2 + usize::from(operation.has_lhs_scale()) + usize::from(operation.has_rhs_scale());
+    check_count!("input", input_types, expected_input_count, ProgramError);
+    let mut scale_index = 2;
+    for (element_index, has_scale, contracting_dimensions) in [
+        (0, operation.has_lhs_scale(), operation.dimensions().lhs_contracting_dimensions()),
+        (1, operation.has_rhs_scale(), operation.dimensions().rhs_contracting_dimensions()),
+    ] {
+        if contracting_dimensions
+            .iter()
+            .any(|axis| matches!(input_types[element_index].dimension(*axis), CoreDimension::Dynamic(_)))
+        {
+            return Ok(false);
+        }
+        if has_scale {
+            if contracting_dimensions
+                .iter()
+                .any(|axis| matches!(input_types[scale_index].dimension(*axis), CoreDimension::Dynamic(_)))
+            {
+                return Ok(false);
+            }
+            scale_index += 1;
+        }
+    }
+    Ok(true)
+}
+
+/// Returns the input permutations that bring one scaled dot to the `[batch, free, contracting]` layout of the
+/// `__op$block_scaled_dot` custom call, which omits `batch` when there is no batching dimension, or [`None`] when the
+/// call does not qualify for it. On CUDA, XLA's `BlockScalingRewriter` expands that custom call to cuDNN's block-scaled
+/// matrix product when the device has compute capability 10 or higher and cuDNN is at least 9.10, and to a
+/// dequantized `dot_general` otherwise. Unlike the `xla.scaled_dot` composite, which the pinned XLA replaces only for
+/// `f8e8m0fnu` scales, this also covers NVFP4.
+///
+/// A call qualifies on CUDA when both scales are present, it accumulates at `f32` or `bf16`, its contracting extents
+/// are static as [`scaled_dot_uses_cuda_physical_boundary`] requires, it has one contracting dimension and at most one
+/// batching dimension, and each side has exactly one free dimension. The pair of formats must also be one that cuDNN
+/// accepts, with the block size given by the ratio of the element and scale contracting extents. That is NVFP4 on both
+/// sides (i.e., `f4e2m1fn` elements with `f8e4m3fn` scales over blocks of 16), or MXFP8 (i.e., `f8e4m3fn` or `f8e5m2`
+/// elements with `f8e8m0fnu` scales over blocks of 32) unless both sides use `f8e5m2`. A call that fails these checks
+/// keeps the composite, so XLA never receives a custom call that it cannot hand to cuDNN on a capable device.
+fn block_scaled_dot_custom_call_permutations(
+    operation: &ScaledDotOperation,
+    input_types: &[ArrayType],
+    target_platform: Option<&str>,
+) -> Result<Option<[Vec<usize>; 2]>, Error> {
+    let dimensions = operation.dimensions();
+    let batching_dimension_count = dimensions.lhs_batching_dimensions().len();
+    if !operation.has_lhs_scale()
+        || !operation.has_rhs_scale()
+        || !matches!(operation.accumulation_type(), DataType::F32 | DataType::BF16)
+        || dimensions.lhs_contracting_dimensions().len() != 1
+        || batching_dimension_count > 1
+        || !scaled_dot_uses_cuda_physical_boundary(operation, input_types, target_platform)?
+    {
+        return Ok(None);
+    }
+    let mut formats = Vec::with_capacity(2);
+    let mut permutations = Vec::with_capacity(2);
+    for (element_index, scale_index, batching_dimensions, contracting_dimension) in [
+        (0, 2, dimensions.lhs_batching_dimensions(), dimensions.lhs_contracting_dimensions()[0]),
+        (1, 3, dimensions.rhs_batching_dimensions(), dimensions.rhs_contracting_dimensions()[0]),
+    ] {
+        let (elements, scales) = (&input_types[element_index], &input_types[scale_index]);
+        let rank = elements.rank();
+        if rank != batching_dimension_count + 2 {
+            return Ok(None);
+        }
+        let (CoreDimension::Static(element_extent), CoreDimension::Static(scale_extent)) =
+            (elements.dimension(contracting_dimension), scales.dimension(contracting_dimension))
+        else {
+            return Ok(None);
+        };
+        if scale_extent == 0 || element_extent % scale_extent != 0 {
+            return Ok(None);
+        }
+        formats.push((elements.data_type(), scales.data_type(), element_extent / scale_extent));
+        let free_dimension = (0..rank)
+            .find(|axis| *axis != contracting_dimension && !batching_dimensions.contains(axis))
+            .unwrap();
+        permutations.push(
+            batching_dimensions
+                .iter()
+                .copied()
+                .chain([free_dimension, contracting_dimension])
+                .collect::<Vec<_>>(),
+        );
+    }
+    let supported = matches!(
+        (formats[0], formats[1]),
+        ((DataType::F4E2M1FN, DataType::F8E4M3FN, 16), (DataType::F4E2M1FN, DataType::F8E4M3FN, 16))
+            | ((DataType::F8E4M3FN, DataType::F8E8M0FNU, 32), (DataType::F8E4M3FN, DataType::F8E8M0FNU, 32))
+            | ((DataType::F8E4M3FN, DataType::F8E8M0FNU, 32), (DataType::F8E5M2, DataType::F8E8M0FNU, 32))
+            | ((DataType::F8E5M2, DataType::F8E8M0FNU, 32), (DataType::F8E4M3FN, DataType::F8E8M0FNU, 32))
+    );
+    Ok(supported.then(|| permutations.try_into().unwrap()))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::LoweringError;
     use std::sync::Arc;
 
     use indoc::indoc;
@@ -543,7 +541,8 @@ mod tests {
         AddOperation, Array as CoreArray, ArrayIrType, ArrayOperation, BlockQuantize, BlockQuantizedValue,
         BlockScaledDotConfiguration, ConvertElementType, Device, DeviceMesh, DimensionBounds, DimensionVariable,
         DotDimensionNumbers, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProjectedContext,
-        RandomAlgorithm, ScaledDot, Sharding, Typed, block_scaled_dot, differentiate_at, f4e2m1fn, f8e4m3fn,
+        RandomAlgorithm, ScaledDot, ScaledDotOperation, Sharding, Typed, block_scaled_dot, differentiate_at, f4e2m1fn,
+        f8e4m3fn,
     };
 
     use crate::domains::tests::domain_mesh;
@@ -554,15 +553,16 @@ mod tests {
     use crate::operations::{Program, ProgramBuilder as ArrayIrProgramBuilder};
     use crate::tests::{execution_client, replicated_array, values_from_bytes, values_to_bytes};
     use crate::values::ArrayConstant;
-    use crate::{Array, CompiledFunction, Constant, Domain, FromPjrt, Session, compile, to_mlir_module_for_program};
+    use crate::{
+        Array, CompiledFunction, Constant, Domain, FromPjrt, LoweringError, Session, compile,
+        to_mlir_module_for_program,
+    };
 
     use super::*;
 
-    /// Builds the NVFP4 scaled-dot program shared by the platform-gated lowering fixtures below:
-    /// `f4e2m1fn [2, 16]` operands with `f8e4m3fn [2, 1]` scales over blocks of 16.
+    /// Builds the NVFP4 scaled dot program shared by the platform-gated lowering fixtures below, with
+    /// `f4e2m1fn [2, 16]` operands and `f8e4m3fn [2, 1]` scales over blocks of 16.
     fn scaled_dot_fixture_program() -> (Program<Vec<Constant>, Vec<Constant>>, Vec<ArrayType>, Vec<ArrayType>) {
-        use ryft_core::ScaledDotOperation;
-
         let element_type =
             ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(16)]));
         let scale_type =
@@ -597,10 +597,11 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_lowers_scaled_dot_composition_without_target_platform() {
-        // Target-independent StableHLO contains the exact named composite plus its portable typed decomposition;
-        // the eventual XLA target decides whether to replace that boundary. The narrow inputs pass through an
-        // optimization barrier, so their producers' conversions cannot fold into the decomposition's conversions.
+    fn test_scaled_dot_operation_lower() {
+        // StableHLO that does not depend on a target contains the exact named composite plus its portable typed
+        // decomposition, and the eventual XLA target decides whether to replace that boundary. The narrow inputs pass
+        // through an optimization barrier, so their producers' conversions cannot fold into the decomposition's
+        // conversions.
         let (program, input_types, output_types) = scaled_dot_fixture_program();
         let module =
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
@@ -633,10 +634,11 @@ mod tests {
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_materializes_absent_scaled_dot_scales() {
-        // The public optional-scale API still lowers to JAX's exact four-operand composite. Contracting dummy-scale
-        // axes have size one, noncontracting axes retain the corresponding element extents, and the decomposition
-        // ignores the identity operands rather than imposing block-ratio requirements on an absent scale.
+    fn test_scaled_dot_operation_lower_materializes_absent_scales() {
+        // The public API with optional scales still lowers to JAX's exact four-operand composite. Contracting dummy
+        // scale axes have size one, noncontracting axes retain the corresponding element extents, and the
+        // decomposition ignores the identity operands rather than imposing block ratio requirements on an absent
+        // scale.
         let element_type =
             ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(2)]));
         let output_type =
@@ -672,14 +674,33 @@ mod tests {
         )
         .unwrap();
 
-        assert!(module.contains(
-            "func.func private @xla.scaled_dot(%arg0: tensor<2x2xf8E4M3FN>, %arg1: tensor<2x2xf8E4M3FN>, \
-             %arg2: tensor<2x1xf8E8M0FNU>, %arg3: tensor<1x2xf8E8M0FNU>)",
-        ));
-        assert_eq!(module.matches("dense<1.000000e+00> : tensor<f8E8M0FNU>").count(), 2);
-        assert!(module.contains("stablehlo.optimization_barrier %arg0, %arg1 :"));
-        assert!(module.contains("stablehlo.composite \"xla.scaled_dot\" %0#0, %0#1"));
-        assert!(!module.contains("func.call @xla.scaled_dot"));
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func private @xla.scaled_dot(%arg0: tensor<2x2xf8E4M3FN>, %arg1: tensor<2x2xf8E4M3FN>, %arg2: \
+                      tensor<2x1xf8E8M0FNU>, %arg3: tensor<1x2xf8E8M0FNU>) -> tensor<2x2xf32> {
+                    %0 = stablehlo.convert %arg0 : (tensor<2x2xf8E4M3FN>) -> tensor<2x2xbf16>
+                    %1 = stablehlo.convert %arg1 : (tensor<2x2xf8E4M3FN>) -> tensor<2x2xbf16>
+                    %2 = stablehlo.dot_general %0, %1, contracting_dims = [1] x [0], precision = [DEFAULT, DEFAULT] : \
+                        (tensor<2x2xbf16>, tensor<2x2xbf16>) -> tensor<2x2xf32>
+                    return %2 : tensor<2x2xf32>
+                  }
+                  func.func @main(%arg0: tensor<2x2xf8E4M3FN>, %arg1: tensor<2x2xf8E4M3FN>) -> tensor<2x2xf32> {
+                    %0:2 = stablehlo.optimization_barrier %arg0, %arg1 : tensor<2x2xf8E4M3FN>, tensor<2x2xf8E4M3FN>
+                    %cst = stablehlo.constant dense<1.000000e+00> : tensor<f8E8M0FNU>
+                    %1 = stablehlo.broadcast_in_dim %cst, dims = [] : (tensor<f8E8M0FNU>) -> tensor<2x1xf8E8M0FNU>
+                    %cst_0 = stablehlo.constant dense<1.000000e+00> : tensor<f8E8M0FNU>
+                    %2 = stablehlo.broadcast_in_dim %cst_0, dims = [] : (tensor<f8E8M0FNU>) -> tensor<1x2xf8E8M0FNU>
+                    %3 = stablehlo.composite \"xla.scaled_dot\" %0#0, %0#1, %1, %2 {composite_attributes = \
+                        {dimension_numbers = [[[1], [0]], [[], []]], preferred_element_type = f32}, decomposition = \
+                        @xla.scaled_dot} : (tensor<2x2xf8E4M3FN>, tensor<2x2xf8E4M3FN>, tensor<2x1xf8E8M0FNU>, \
+                        tensor<1x2xf8E8M0FNU>) -> tensor<2x2xf32>
+                    return %3 : tensor<2x2xf32>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -701,8 +722,8 @@ mod tests {
             let values = values.map(|value| f8e4m3fn::from_f64(value).unwrap());
             CoreArray::from_elements(ArrayType::new_static(DataType::F8E4M3FN, [2, 1]), &values).unwrap()
         };
-        let reference_lhs = BlockQuantizedValue::new(elements(0), scales([0.5, 2.0]));
-        let reference_rhs = BlockQuantizedValue::new(elements(3), scales([2.0, 0.5]));
+        let reference_left = BlockQuantizedValue::new(elements(0), scales([0.5, 2.0]));
+        let reference_right = BlockQuantizedValue::new(elements(3), scales([2.0, 0.5]));
         let device = |value: &BlockQuantizedValue<CoreArray>| {
             BlockQuantizedValue::new(
                 replicated_array(&domain, &mesh, DataType::F4E2M1FN, &[2, 16], &value.elements.logical_bytes()),
@@ -711,8 +732,8 @@ mod tests {
         };
 
         let dimensions = DotDimensionNumbers::new(vec![1], vec![1], Vec::new(), Vec::new());
-        let product = device(&reference_lhs).scaled_dot(&device(&reference_rhs), Some(&dimensions), None).unwrap();
-        let reference_product = reference_lhs.scaled_dot(&reference_rhs, Some(&dimensions), None).unwrap();
+        let product = device(&reference_left).scaled_dot(&device(&reference_right), Some(&dimensions), None).unwrap();
+        let reference_product = reference_left.scaled_dot(&reference_right, Some(&dimensions), None).unwrap();
         assert_eq!(
             product.r#type().into_owned(),
             ArrayType::new_static(DataType::F32, [2, 2])
@@ -723,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_mlir_module_for_program_emits_block_scaled_dot_custom_call_on_cuda() {
+    fn test_scaled_dot_operation_lower_emits_block_scaled_dot_custom_call_on_cuda() {
         // On CUDA, NVFP4 inputs lower to the `__op$block_scaled_dot` custom call, which XLA hands to cuDNN's
         // block-scaled matrix product on capable devices, instead of the composite. The narrow inputs still pass
         // through the optimization barrier, because XLA's dequantized fallback for other devices would otherwise
@@ -732,7 +753,7 @@ mod tests {
         let module =
             lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
                 .unwrap()
-                .stable_hlo;
+                .into_stable_hlo();
         assert_eq!(
             module,
             indoc! {r#"
@@ -748,7 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_mlir_module_for_program_transposes_block_scaled_dot_custom_call_inputs_on_cuda() {
+    fn test_scaled_dot_operation_lower_transposes_block_scaled_dot_custom_call_inputs_on_cuda() {
         // A product that contracts the middle right dimension (e.g., the input gradient of a block-scaled dot)
         // transposes the right elements and scales to the `[batch, free, contracting]` layout of the custom call. The
         // left inputs already have that layout and stay untransposed.
@@ -780,7 +801,7 @@ mod tests {
         let module =
             lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
                 .unwrap()
-                .stable_hlo;
+                .into_stable_hlo();
         assert_eq!(
             module,
             indoc! {r#"
@@ -798,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_mlir_module_for_program_preserves_scaled_dot_composite_for_unsupported_formats_on_cuda() {
+    fn test_scaled_dot_operation_lower_preserves_composite_for_unsupported_formats_on_cuda() {
         // MXFP4 (i.e., `f4e2m1fn` elements with `f8e8m0fnu` scales over blocks of 32) is not a format pair that cuDNN
         // accepts, so CUDA lowering keeps the named composite and its private decomposition.
         let element_type = ArrayType::new_static(DataType::F4E2M1FN, [2, 32]);
@@ -828,34 +849,66 @@ mod tests {
         let module =
             lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
                 .unwrap()
-                .stable_hlo;
+                .into_stable_hlo();
 
-        assert!(module.contains("func.func private @xla.scaled_dot"));
-        assert!(module.contains("stablehlo.composite \"xla.scaled_dot\" %0#0, %0#1, %0#2, %0#3"));
-        assert!(!module.contains("stablehlo.custom_call @__op$block_scaled_dot"));
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func private @xla.scaled_dot(%arg0: tensor<2x32xf4E2M1FN>, %arg1: tensor<2x32xf4E2M1FN>, %arg2: \
+                      tensor<2x1xf8E8M0FNU>, %arg3: tensor<2x1xf8E8M0FNU>) -> tensor<2x2xf32> {
+                    %0 = stablehlo.convert %arg0 : (tensor<2x32xf4E2M1FN>) -> tensor<2x32xbf16>
+                    %1 = stablehlo.broadcast_in_dim %arg2, dims = [0, 1] : (tensor<2x1xf8E8M0FNU>) -> \
+                        tensor<2x1x32xf8E8M0FNU>
+                    %2 = stablehlo.reshape %1 : (tensor<2x1x32xf8E8M0FNU>) -> tensor<2x32xf8E8M0FNU>
+                    %3 = stablehlo.convert %2 : (tensor<2x32xf8E8M0FNU>) -> tensor<2x32xbf16>
+                    %4 = stablehlo.multiply %0, %3 : tensor<2x32xbf16>
+                    %5 = stablehlo.convert %arg1 : (tensor<2x32xf4E2M1FN>) -> tensor<2x32xbf16>
+                    %6 = stablehlo.broadcast_in_dim %arg3, dims = [0, 1] : (tensor<2x1xf8E8M0FNU>) -> \
+                        tensor<2x1x32xf8E8M0FNU>
+                    %7 = stablehlo.reshape %6 : (tensor<2x1x32xf8E8M0FNU>) -> tensor<2x32xf8E8M0FNU>
+                    %8 = stablehlo.convert %7 : (tensor<2x32xf8E8M0FNU>) -> tensor<2x32xbf16>
+                    %9 = stablehlo.multiply %5, %8 : tensor<2x32xbf16>
+                    %10 = stablehlo.dot_general %4, %9, contracting_dims = [1] x [1], precision = [DEFAULT, DEFAULT] : \
+                        (tensor<2x32xbf16>, tensor<2x32xbf16>) -> tensor<2x2xf32>
+                    return %10 : tensor<2x2xf32>
+                  }
+                  func.func @main(%arg0: tensor<2x32xf4E2M1FN>, %arg1: tensor<2x32xf4E2M1FN>, %arg2: \
+                      tensor<2x1xf8E8M0FNU>, %arg3: tensor<2x1xf8E8M0FNU>) -> tensor<2x2xf32> {
+                    %0:4 = stablehlo.optimization_barrier %arg0, %arg1, %arg2, %arg3 : tensor<2x32xf4E2M1FN>, \
+                        tensor<2x32xf4E2M1FN>, tensor<2x1xf8E8M0FNU>, tensor<2x1xf8E8M0FNU>
+                    %1 = stablehlo.composite \"xla.scaled_dot\" %0#0, %0#1, %0#2, %0#3 {composite_attributes = \
+                        {dimension_numbers = [[[1], [1]], [[], []]], preferred_element_type = f32}, decomposition = \
+                        @xla.scaled_dot} : (tensor<2x32xf4E2M1FN>, tensor<2x32xf4E2M1FN>, tensor<2x1xf8E8M0FNU>, \
+                        tensor<2x1xf8E8M0FNU>) -> tensor<2x2xf32>
+                    return %1 : tensor<2x2xf32>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
-    fn test_lower_mlir_module_for_program_physicalizes_dynamic_scaled_dot_on_cuda() {
+    fn test_scaled_dot_operation_lower_physicalizes_dynamic_inputs_on_cuda() {
         // XLA's block-scaling expansion requires a static boundary. Ryft masks the bounded physical inputs of the
         // MXFP8 custom call, padding elements with zeros and scales with ones, and restores the logical row extent on
         // the result.
         let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(5)).unwrap());
-        let lhs_type = ArrayType::new(
+        let left_type = ArrayType::new(
             DataType::F8E4M3FN,
             Shape::new(vec![CoreDimension::Dynamic(rows.clone()), CoreDimension::Static(32)]),
         );
-        let rhs_type =
+        let right_type =
             ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(32)]));
-        let lhs_scale_type = ArrayType::new(
+        let left_scale_type = ArrayType::new(
             DataType::F8E8M0FNU,
             Shape::new(vec![CoreDimension::Dynamic(rows.clone()), CoreDimension::Static(1)]),
         );
-        let rhs_scale_type =
+        let right_scale_type =
             ArrayType::new(DataType::F8E8M0FNU, Shape::new(vec![CoreDimension::Static(1), CoreDimension::Static(1)]));
         let output_type =
             ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(rows), CoreDimension::Static(1)]));
-        let input_types = vec![lhs_type, rhs_type, lhs_scale_type, rhs_scale_type];
+        let input_types = vec![left_type, right_type, left_scale_type, right_scale_type];
         let output_types = vec![output_type];
         let mut builder = ProgramBuilder::new();
         let inputs = input_types.iter().cloned().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
@@ -880,7 +933,7 @@ mod tests {
         let module =
             lower_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None, Some("cuda"))
                 .unwrap()
-                .stable_hlo;
+                .into_stable_hlo();
         assert_eq!(
             module,
             indoc! {r#"
@@ -920,9 +973,9 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_mlir_module_for_program_lowers_dynamic_scaled_dot_composition_on_cuda() {
+    fn test_scaled_dot_operation_lower_dynamic_composition_on_cuda() {
         // Dynamic contracting dimensions stay on the logical decomposition rather than CUDA's static fused
-        // boundary. A single block makes divisibility trivial; folding the dimension arithmetic also preserves
+        // boundary. A single block makes divisibility trivial, and folding the dimension arithmetic also preserves
         // the reshape extent identity without an equality assertion.
         for block_bound in [2, 3] {
             let elements = DimensionVariable::new("elements", DimensionBounds::new(32, Some(65)).unwrap());
@@ -980,13 +1033,13 @@ mod tests {
             if block_bound == 3 {
                 assert!(matches!(
                     module.err().unwrap(),
-                    Error::Lowering(LoweringError::UnsupportedOperation { reason: op, .. })
-                        if op == "reshape with unequal physical capacities (input 128, output 64); dynamic bounds must \
+                    Error::Lowering(LoweringError::UnsupportedOperation { reason, .. })
+                        if reason == "`reshape` with unequal physical capacities (input 128, output 64); dynamic bounds must \
                            preserve the physical element count",
                 ));
                 continue;
             }
-            let module = module.unwrap().stable_hlo;
+            let module = module.unwrap().into_stable_hlo();
 
             assert!(module.contains("call @xla.scaled_dot"));
             assert!(!module.contains("stablehlo.custom_call @ryft.assert"));
@@ -995,10 +1048,9 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_mlir_module_for_program_emits_block_scaled_dot_custom_call_in_shared_jit_call_callee() {
-        // A block-scaled-dot custom call nested inside a shared `jit_call` callee is emitted once, because the CUDA
+    fn test_scaled_dot_operation_lower_emits_block_scaled_dot_custom_call_in_shared_jit_call_callee() {
+        // A block scaled dot custom call nested inside a shared `jit_call` callee is emitted once, because the CUDA
         // target platform reaches the callee body, while both outer call sites reuse the same function.
-        use ryft_core::ScaledDotOperation;
 
         let element_type =
             ArrayType::new(DataType::F4E2M1FN, Shape::new(vec![CoreDimension::Static(2), CoreDimension::Static(16)]));
@@ -1055,12 +1107,35 @@ mod tests {
             Some("cuda"),
         )
         .unwrap()
-        .stable_hlo;
+        .into_stable_hlo();
 
-        assert_eq!(module.matches("func.func private @jit_call_0").count(), 1);
-        assert_eq!(module.matches("stablehlo.custom_call @__op$block_scaled_dot").count(), 1);
-        assert_eq!(module.matches("stablehlo.composite \"xla.scaled_dot\"").count(), 0);
-        assert_eq!(module.matches("call @jit_call_0").count(), 2);
+        assert_eq!(
+            module,
+            indoc! {"
+                module {
+                  func.func private @jit_call_0(%arg0: tensor<2x16xf4E2M1FN>, %arg1: tensor<2x16xf4E2M1FN>, %arg2: \
+                      tensor<2x1xf8E4M3FN>, %arg3: tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32> {
+                    %0:4 = stablehlo.optimization_barrier %arg0, %arg1, %arg2, %arg3 : tensor<2x16xf4E2M1FN>, \
+                        tensor<2x16xf4E2M1FN>, tensor<2x1xf8E4M3FN>, tensor<2x1xf8E4M3FN>
+                    %1 = stablehlo.custom_call @__op$block_scaled_dot(%0#0, %0#1, %0#2, %0#3) {operand_layouts = \
+                        [dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>, dense<[1, 0]> : \
+                        tensor<2xindex>, dense<[1, 0]> : tensor<2xindex>], result_layouts = [dense<[1, 0]> : \
+                        tensor<2xindex>]} : (tensor<2x16xf4E2M1FN>, tensor<2x16xf4E2M1FN>, tensor<2x1xf8E4M3FN>, \
+                        tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32>
+                    return %1 : tensor<2x2xf32>
+                  }
+                  func.func @main(%arg0: tensor<2x16xf4E2M1FN>, %arg1: tensor<2x16xf4E2M1FN>, %arg2: \
+                      tensor<2x1xf8E4M3FN>, %arg3: tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32> {
+                    %0 = call @jit_call_0(%arg0, %arg1, %arg2, %arg3) : (tensor<2x16xf4E2M1FN>, tensor<2x16xf4E2M1FN>, \
+                        tensor<2x1xf8E4M3FN>, tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32>
+                    %1 = call @jit_call_0(%arg0, %arg1, %arg2, %arg3) : (tensor<2x16xf4E2M1FN>, tensor<2x16xf4E2M1FN>, \
+                        tensor<2x1xf8E4M3FN>, tensor<2x1xf8E4M3FN>) -> tensor<2x2xf32>
+                    %2 = stablehlo.add %0, %1 : tensor<2x2xf32>
+                    return %2 : tensor<2x2xf32>
+                  }
+                }
+            "},
+        );
     }
 
     #[test]
@@ -1129,13 +1204,13 @@ mod tests {
             (ArrayType, ArrayType, ArrayType, ArrayType),
             (ArrayType, ArrayType, ArrayType),
         > = compile(
-            move |(lhs, rhs, seed, state)| {
-                let (output, pullback) = differentiate_at((lhs, rhs))
+            move |(left, right, seed, state)| {
+                let (output, pullback) = differentiate_at((left, right))
                     .with_captures(state)
-                    .vjp(|(lhs, rhs), state| function.call(lhs, rhs, None, None, None, Some(state)))
+                    .vjp(|(left, right), state| function.call(left, right, None, None, None, Some(state)))
                     .unwrap();
-                let (lhs_cotangent, rhs_cotangent) = pullback.apply_materialized(seed).unwrap();
-                (output, lhs_cotangent, rhs_cotangent)
+                let (left_cotangent, right_cotangent) = pullback.apply_materialized(seed).unwrap();
+                (output, left_cotangent, right_cotangent)
             },
             (
                 placed(DataType::F32, &[32, 32]),
@@ -1150,7 +1225,7 @@ mod tests {
         let values = |rows: usize, columns: usize, phase: f64| {
             (0..rows * columns).map(|index| (index as f64 * 0.37 + phase).sin() as f32).collect::<Vec<_>>()
         };
-        let (lhs, rhs, seed) = (values(32, 32, 0.1), values(16, 32, 0.7), values(32, 16, 1.3));
+        let (left, right, seed) = (values(32, 32, 0.1), values(16, 32, 0.7), values(32, 16, 1.3));
         let device = |data_type: DataType, shape: &[usize], bytes: Vec<u8>| {
             Array::from_host_buffer(&domain, placed(data_type, shape), mesh.clone(), bytes.as_slice()).unwrap()
         };
@@ -1159,8 +1234,8 @@ mod tests {
             .execute(
                 &domain,
                 (
-                    device(DataType::F32, &[32, 32], values_to_bytes(&lhs)),
-                    device(DataType::F32, &[16, 32], values_to_bytes(&rhs)),
+                    device(DataType::F32, &[32, 32], values_to_bytes(&left)),
+                    device(DataType::F32, &[16, 32], values_to_bytes(&right)),
                     device(DataType::F32, &[32, 16], values_to_bytes(&seed)),
                     device(DataType::U64, &[2], values_to_bytes(&[7u64, 0])),
                 ),
@@ -1178,14 +1253,16 @@ mod tests {
             CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, shape), values).unwrap()
         };
         let state = CoreArray::from_elements(RandomAlgorithm::ThreeFry.state_type(), &[7u64, 0]).unwrap();
-        let (reference_output, pullback) = differentiate_at((host([32, 32], &lhs), host([16, 32], &rhs)))
+        let (reference_output, pullback) = differentiate_at((host([32, 32], &left), host([16, 32], &right)))
             .with_captures(state)
-            .vjp(|(lhs, rhs), state| reference_function.call(lhs, rhs, None, None, None, Some(state)))
+            .vjp(|(left, right), state| reference_function.call(left, right, None, None, None, Some(state)))
             .unwrap();
-        let (reference_lhs, reference_rhs) = pullback.apply_materialized(host([32, 16], &seed)).unwrap();
-        for (actual, expected) in
-            [(read(&outputs.0), reference_output), (read(&outputs.1), reference_lhs), (read(&outputs.2), reference_rhs)]
-        {
+        let (reference_left, reference_right) = pullback.apply_materialized(host([32, 16], &seed)).unwrap();
+        for (actual, expected) in [
+            (read(&outputs.0), reference_output),
+            (read(&outputs.1), reference_left),
+            (read(&outputs.2), reference_right),
+        ] {
             let expected = expected.to_f64s();
             assert_eq!(actual.len(), expected.len());
             let magnitude = expected.iter().fold(0.0f64, |maximum, &value| maximum.max(f64::abs(value)));

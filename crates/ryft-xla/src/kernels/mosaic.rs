@@ -1,11 +1,11 @@
-//! Embedding of binary Mosaic GPU compiler inputs into the native PJRT-owned runtime.
+//! Embedding of binary Mosaic GPU compiler inputs into the native runtime owned by PJRT.
 //!
 //! The native `mosaic_gpu_v2` handler owns compilation, resource serialization, and execution. This integration
-//! fixes the host-buffer ABI and dense row-major layouts; it does not register a second launcher or cache.
+//! fixes the host buffer ABI and dense row-major layouts, and it does not register a second launcher or cache.
 //! Execution admission requires a pinned CUDA platform version. The native compilation provider checks the actual
-//! PTX compiler and LLVM support before selecting their common PTX ISA; native compilation and loading remain
+//! PTX compiler and LLVM support before selecting their common PTX ISA. Native compilation and loading remain
 //! responsible for driver compatibility because PJRT does not expose those provider or driver versions here.
-//! The `10.1` target spelling is restricted to the pinned CUDA 12.9 runtime; `11.0` requires the pinned CUDA 13.2
+//! The `10.1` target spelling is restricted to the pinned CUDA 12.9 runtime, and `11.0` requires the pinned CUDA 13.2
 //! runtime and PTX 9.0. These target names are checked against actual device facts rather than silently normalized.
 
 use ryft_core::{CustomCallOperation, EffectClass, Typed};
@@ -21,7 +21,7 @@ use crate::kernels::{KernelEmbeddingError, KernelOutputEmbedding, dense_memory_l
 
 // TODO(eaplatanios): Review this module.
 
-/// Embeds checked Mosaic GPU source using the pinned native binary-source and resource schemas.
+/// Embeds checked Mosaic GPU source using the pinned native schemas for binary sources and resources.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct MosaicGpuEmbedding;
 
@@ -29,8 +29,10 @@ impl<Extension: KernelExtension> KernelOutputEmbedding<CompiledKernel, Extension
     fn configuration_key(&self) -> Result<Vec<u8>, KernelEmbeddingError> {
         Ok(format!(
             "mosaic GPU embedding 2; target {MOSAIC_GPU_FFI_TARGET}; source {MOSAIC_GPU_SERDE_VERSION}; \
-             resources {MOSAIC_GPU_RESOURCE_SCHEMA_VERSION}; inputs then optional assertion token then outputs then optional assertion token; row-major; no collectives; no custom barrier"
-        ).into_bytes())
+             resources {MOSAIC_GPU_RESOURCE_SCHEMA_VERSION}; inputs then optional assertion token then outputs then \
+             optional assertion token; row-major; no collectives; no custom barrier"
+        )
+        .into_bytes())
     }
 
     fn custom_call(
@@ -108,28 +110,28 @@ impl<Extension: KernelExtension> KernelOutputEmbedding<CompiledKernel, Extension
 
 impl KernelTarget for Target {
     fn admit_execution(&self, facts: &KernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
-        if !facts.platform_name.eq_ignore_ascii_case("cuda")
-            || !facts.has_ffi_extension
-            || facts.pjrt_version != ryft_pjrt::VERSION
-            || facts.devices.is_empty()
+        if !facts.platform_name().eq_ignore_ascii_case("cuda")
+            || !facts.has_ffi_extension()
+            || facts.pjrt_version() != ryft_pjrt::VERSION
+            || facts.devices().is_empty()
         {
             return Err(KernelEmbeddingError::Invalid {
                 message: "mosaic GPU requires CUDA devices and the pinned PJRT FFI ABI".to_owned(),
             });
         }
-        if !matches!(facts.platform_version.as_str(), "cuda 12090" | "cuda 13020") {
+        if !matches!(facts.platform_version(), "cuda 12090" | "cuda 13020") {
             return Err(KernelEmbeddingError::Invalid {
                 message: "mosaic GPU requires pinned CUDA platform version `cuda 12090` or `cuda 13020`".to_owned(),
             });
         }
-        // The `sm_110` target name requires PTX 9.0; CUDA 12.9 only accepts PTX through 8.8.
-        if self.compute_capability() == (11, 0) && facts.platform_version == "cuda 12090" {
+        // The `sm_110` target name requires PTX 9.0, but CUDA 12.9 only accepts PTX through 8.8.
+        if self.compute_capability() == (11, 0) && facts.platform_version() == "cuda 12090" {
             return Err(KernelEmbeddingError::Invalid {
                 message: "compute capability `11.0` requires PTX 9.0 and the pinned CUDA 13.2 runtime".to_owned(),
             });
         }
-        // CUDA 13 renamed `sm_101` to `sm_110`; it no longer accepts the former assembler target.
-        if self.compute_capability() == (10, 1) && facts.platform_version == "cuda 13020" {
+        // CUDA 13 renamed `sm_101` to `sm_110` and no longer accepts the former assembler target.
+        if self.compute_capability() == (10, 1) && facts.platform_version() == "cuda 13020" {
             return Err(KernelEmbeddingError::Invalid {
                 message: "compute capability `10.1` requires the pinned CUDA 12.9 runtime".to_owned(),
             });
@@ -141,8 +143,8 @@ impl KernelTarget for Target {
         }
         let (major, minor) = self.compute_capability();
         let expected = format!("{major}.{minor}");
-        for device in &facts.devices {
-            if device.attributes.get("compute_capability") != Some(&ryft_pjrt::Value::String(expected.clone())) {
+        for device in facts.devices() {
+            if device.attributes().get("compute_capability") != Some(&ryft_pjrt::Value::String(expected.clone())) {
                 return Err(KernelEmbeddingError::Invalid {
                     message: format!("mosaic GPU requires exact device compute capability `{expected}`"),
                 });
@@ -157,40 +159,62 @@ mod tests {
     use std::collections::BTreeMap;
 
     use pretty_assertions::assert_eq;
-    use ryft_core::{ArrayType, CustomCallAttribute, DataType};
-    use ryft_kernels::{KernelSchedule, VerifiedKernel};
+    use ryft_core::{
+        ArrayIrOperation, ArrayType, Context, CustomCallAttribute, DataType, DimensionBounds,
+        DimensionFromScalarOperation, DimensionVariable, ReferenceRead, ReferenceWrite,
+    };
+    use ryft_kernels::{
+        Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, KernelSchedule, NoKernelExtension,
+        VerifiedKernel, whole_array_parameter,
+    };
     use ryft_mosaic::kernels::gpu::{Compiler, Options};
 
     use crate::kernels::staging::KernelDeviceFacts;
 
     use super::*;
 
-    /// Complete deterministic live-device facts without loading a hardware plugin.
-    fn facts() -> KernelExecutionFacts {
-        KernelExecutionFacts {
-            platform_name: "CUDA".to_owned(),
-            platform_version: "cuda 13020".to_owned(),
-            pjrt_version: ryft_pjrt::VERSION,
-            has_ffi_extension: true,
-            attributes: BTreeMap::new(),
-            devices: vec![KernelDeviceFacts {
-                kind: "fixture GPU".to_owned(),
-                attributes: BTreeMap::from([(
+    /// Deterministic device facts with the provided platform version, PJRT version, FFI extension availability, and
+    /// compute capability of the one device, without loading a hardware plugin.
+    fn facts_with(
+        platform_version: &str,
+        pjrt_version: ryft_pjrt::Version,
+        has_ffi_extension: bool,
+        compute_capability: &str,
+    ) -> KernelExecutionFacts {
+        KernelExecutionFacts::new(
+            "CUDA",
+            platform_version,
+            pjrt_version,
+            has_ffi_extension,
+            BTreeMap::new(),
+            vec![KernelDeviceFacts::new(
+                "fixture GPU",
+                BTreeMap::from([(
                     "compute_capability".to_owned(),
-                    ryft_pjrt::Value::String("9.0".to_owned()),
+                    ryft_pjrt::Value::String(compute_capability.to_owned()),
                 )]),
-            }],
-        }
+            )],
+        )
+    }
+
+    /// Complete deterministic live device facts without loading a hardware plugin.
+    fn facts() -> KernelExecutionFacts {
+        facts_with("cuda 13020", ryft_pjrt::VERSION, true, "9.0")
     }
 
     #[test]
     fn test_mosaic_gpu_embedding_configuration_key() {
         let key = <MosaicGpuEmbedding as KernelOutputEmbedding<CompiledKernel>>::configuration_key(&MosaicGpuEmbedding)
             .unwrap();
-        assert_eq!(key, format!(
-            "mosaic GPU embedding 2; target {MOSAIC_GPU_FFI_TARGET}; source {MOSAIC_GPU_SERDE_VERSION}; \
-             resources {MOSAIC_GPU_RESOURCE_SCHEMA_VERSION}; inputs then optional assertion token then outputs then optional assertion token; row-major; no collectives; no custom barrier"
-        ).into_bytes());
+        assert_eq!(
+            key,
+            format!(
+                "mosaic GPU embedding 2; target {MOSAIC_GPU_FFI_TARGET}; source {MOSAIC_GPU_SERDE_VERSION}; \
+             resources {MOSAIC_GPU_RESOURCE_SCHEMA_VERSION}; inputs then optional assertion token then outputs then \
+             optional assertion token; row-major; no collectives; no custom barrier"
+            )
+            .into_bytes()
+        );
     }
 
     #[test]
@@ -226,14 +250,6 @@ mod tests {
 
     #[test]
     fn test_mosaic_gpu_embedding_custom_call_preserves_assertions() {
-        use ryft_core::{
-            ArrayIrOperation, Context, DimensionBounds, DimensionFromScalarOperation, DimensionVariable, ReferenceRead,
-            ReferenceWrite,
-        };
-        use ryft_kernels::{
-            Grid, KernelCallOperation, KernelDefinition, KernelParameterAccess, NoKernelExtension,
-            whole_array_parameter,
-        };
         let call = KernelCallOperation::new(
             Grid::new(vec![]).unwrap(),
             vec![whole_array_parameter(ArrayType::scalar(DataType::I64), KernelParameterAccess::ReadWrite).unwrap()],
@@ -266,27 +282,46 @@ mod tests {
     }
 
     #[test]
+    fn test_mosaic_gpu_embedding_custom_call_rejects_different_boundary() {
+        let definition = crate::kernels::tests::definition();
+        let verified = VerifiedKernel::new(&definition, 1).unwrap();
+        let call = KernelCallOperation::new(
+            Grid::new(vec![]).unwrap(),
+            vec![whole_array_parameter(ArrayType::scalar(DataType::F32), KernelParameterAccess::ReadWrite).unwrap()],
+        )
+        .unwrap();
+        let other = KernelDefinition::<NoKernelExtension>::trace(call, |(references, _)| {
+            references[0].write(&references[0].read()?)?;
+            Ok(())
+        })
+        .unwrap();
+        let output = VerifiedKernel::new(&other, 1)
+            .unwrap()
+            .compile(&Compiler, &Target::new(9, 0).unwrap(), &Options::default(), &KernelSchedule::default())
+            .unwrap();
+        assert!(matches!(
+            MosaicGpuEmbedding.custom_call(&verified, &output),
+            Err(KernelEmbeddingError::Invalid { message })
+                if message == "mosaic GPU host-buffer ABI differs from the logical kernel boundary",
+        ));
+    }
+
+    #[test]
     fn test_target_admit_execution() {
         let target = Target::new(9, 0).unwrap();
-        let mut execution = facts();
-        target.admit_execution(&execution).unwrap();
-        execution.devices[0]
-            .attributes
-            .insert("compute_capability".to_owned(), ryft_pjrt::Value::String("9.1".to_owned()));
+        target.admit_execution(&facts()).unwrap();
+        let execution = facts_with("cuda 13020", ryft_pjrt::VERSION, true, "9.1");
         assert!(matches!(target.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
             if message == "mosaic GPU requires exact device compute capability `9.0`"));
-        execution = facts();
-        execution.platform_version = "cuda 12090".to_owned();
-        target.admit_execution(&execution).unwrap();
-        execution.platform_version = "cuda 13010".to_owned();
+        target.admit_execution(&facts_with("cuda 12090", ryft_pjrt::VERSION, true, "9.0")).unwrap();
+        let execution = facts_with("cuda 13010", ryft_pjrt::VERSION, true, "9.0");
         assert!(matches!(target.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
             if message == "mosaic GPU requires pinned CUDA platform version `cuda 12090` or `cuda 13020`"));
-        execution = facts();
-        execution.has_ffi_extension = false;
+        let execution = facts_with("cuda 13020", ryft_pjrt::VERSION, false, "9.0");
         assert!(matches!(target.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
             if message == "mosaic GPU requires CUDA devices and the pinned PJRT FFI ABI"));
-        execution = facts();
-        execution.pjrt_version.minor += 1;
+        let later_version = ryft_pjrt::Version { minor: ryft_pjrt::VERSION.minor + 1, ..ryft_pjrt::VERSION };
+        let execution = facts_with("cuda 13020", later_version, true, "9.0");
         assert!(matches!(target.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
             if message == "mosaic GPU requires CUDA devices and the pinned PJRT FFI ABI"));
         assert!(matches!(target.with_maximum_shared_memory_bytes(49 * 1024).unwrap().admit_execution(&facts()),
@@ -297,24 +332,15 @@ mod tests {
     #[test]
     fn test_target_admit_execution_ptx_version() {
         let target = Target::new(11, 0).unwrap();
-        let mut execution = facts();
-        execution.devices[0]
-            .attributes
-            .insert("compute_capability".to_owned(), ryft_pjrt::Value::String("11.0".to_owned()));
-        target.admit_execution(&execution).unwrap();
-        execution.platform_version = "cuda 12090".to_owned();
+        target.admit_execution(&facts_with("cuda 13020", ryft_pjrt::VERSION, true, "11.0")).unwrap();
+        let execution = facts_with("cuda 12090", ryft_pjrt::VERSION, true, "11.0");
         assert!(matches!(target.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
             if message == "compute capability `11.0` requires PTX 9.0 and the pinned CUDA 13.2 runtime"));
-        execution.devices[0]
-            .attributes
-            .insert("compute_capability".to_owned(), ryft_pjrt::Value::String("12.1".to_owned()));
+        let execution = facts_with("cuda 12090", ryft_pjrt::VERSION, true, "12.1");
         Target::new(12, 1).unwrap().admit_execution(&execution).unwrap();
-        execution.devices[0]
-            .attributes
-            .insert("compute_capability".to_owned(), ryft_pjrt::Value::String("10.1".to_owned()));
         let legacy = Target::new(10, 1).unwrap();
-        legacy.admit_execution(&execution).unwrap();
-        execution.platform_version = "cuda 13020".to_owned();
+        legacy.admit_execution(&facts_with("cuda 12090", ryft_pjrt::VERSION, true, "10.1")).unwrap();
+        let execution = facts_with("cuda 13020", ryft_pjrt::VERSION, true, "10.1");
         assert!(matches!(legacy.admit_execution(&execution), Err(KernelEmbeddingError::Invalid { message })
             if message == "compute capability `10.1` requires the pinned CUDA 12.9 runtime"));
     }

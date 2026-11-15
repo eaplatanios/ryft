@@ -33,9 +33,9 @@ use super::{SCHEMA, collective_compilation_options, f32_values_from_bytes};
 #[serde(deny_unknown_fields)]
 pub(super) struct RaggedCase {
     /// Stable observation identifier.
-    pub(super) id: String,
+    id: String,
 
-    /// Logical participant count; the single-GPU suite requires one.
+    /// Logical participant count, which the single-GPU suite requires to be one.
     participants: usize,
 
     /// Physical operand shape, including a leading mapped dimension for batching.
@@ -63,207 +63,58 @@ pub(super) struct RaggedCase {
     transform: String,
 }
 
-/// Reads and validates the manifest without loading a CUDA plugin.
-pub(super) fn registry() -> Result<Vec<RaggedCase>, Box<dyn Error>> {
-    let cases: Vec<RaggedCase> = serde_json::from_str(include_str!("ragged_cases.json"))?;
-    for (index, case) in cases.iter().enumerate() {
-        if cases[..index].iter().any(|previous| previous.id == case.id) {
-            return Err(format!("duplicate CUDA collective case `{}`", case.id).into());
-        }
-        if case.participants != 1
-            || case.local_shape.is_empty()
-            || case.output_shape.is_empty()
-            || case.local_shape.contains(&0)
-            || case.output_shape.contains(&0)
-            || !matches!(case.metadata_type.as_str(), "i32" | "u64")
-            || !matches!(case.transform.as_str(), "primal" | "batch" | "jvp" | "vjp")
-            || case.input_offsets.is_empty()
-            || [case.send_sizes.len(), case.output_offsets.len(), case.receive_sizes.len()]
-                .iter()
-                .any(|length| *length != case.input_offsets.len())
-        {
-            return Err(format!("invalid CUDA collective descriptor `{}`", case.id).into());
-        }
-        let batch_axis = usize::from(case.transform == "batch");
-        if case.local_shape.len() <= batch_axis
-            || case.output_shape.len() <= batch_axis
-            || case.local_shape[batch_axis + 1..] != case.output_shape[batch_axis + 1..]
-            || (batch_axis == 1
-                && (case.local_shape[0] != case.output_shape[0] || case.input_offsets.len() % case.local_shape[0] != 0))
-        {
-            return Err(format!("invalid CUDA collective shapes in `{}`", case.id).into());
-        }
-        for transfer in 0..case.input_offsets.len() {
-            if case.send_sizes[transfer] != case.receive_sizes[transfer]
-                || case.input_offsets[transfer]
-                    .checked_add(case.send_sizes[transfer])
-                    .is_none_or(|end| end > case.local_shape[batch_axis] as u64)
-                || case.output_offsets[transfer]
-                    .checked_add(case.receive_sizes[transfer])
-                    .is_none_or(|end| end > case.output_shape[batch_axis] as u64)
-            {
-                return Err(format!("invalid single-participant transfer in `{}`", case.id).into());
-            }
-        }
-    }
-    Ok(cases)
-}
-
 impl RaggedCase {
-    /// Metadata shape for ordinary transfers or an unrelated leading batch dimension.
-    #[cfg(any(test, feature = "cuda-13"))]
-    fn metadata_shape(&self) -> Vec<usize> {
-        if self.transform == "batch" {
-            vec![self.local_shape[0], self.input_offsets.len() / self.local_shape[0]]
-        } else {
-            vec![self.input_offsets.len()]
+    /// Reads and validates the manifest without loading a CUDA plugin.
+    pub(super) fn registry() -> Result<Vec<Self>, Box<dyn Error>> {
+        let cases: Vec<Self> = serde_json::from_str(include_str!("ragged_cases.json"))?;
+        for (index, case) in cases.iter().enumerate() {
+            if cases[..index].iter().any(|previous| previous.id == case.id) {
+                return Err(format!("duplicate CUDA collective case `{}`", case.id).into());
+            }
+            if case.participants != 1
+                || case.local_shape.is_empty()
+                || case.output_shape.is_empty()
+                || case.local_shape.contains(&0)
+                || case.output_shape.contains(&0)
+                || !matches!(case.metadata_type.as_str(), "i32" | "u64")
+                || !matches!(case.transform.as_str(), "primal" | "batch" | "jvp" | "vjp")
+                || case.input_offsets.is_empty()
+                || [case.send_sizes.len(), case.output_offsets.len(), case.receive_sizes.len()]
+                    .iter()
+                    .any(|length| *length != case.input_offsets.len())
+            {
+                return Err(format!("invalid CUDA collective descriptor `{}`", case.id).into());
+            }
+            let batch_axis = usize::from(case.transform == "batch");
+            if case.local_shape.len() <= batch_axis
+                || case.output_shape.len() <= batch_axis
+                || case.local_shape[batch_axis + 1..] != case.output_shape[batch_axis + 1..]
+                || (batch_axis == 1
+                    && (case.local_shape[0] != case.output_shape[0]
+                        || case.input_offsets.len() % case.local_shape[0] != 0))
+            {
+                return Err(format!("invalid CUDA collective shapes in `{}`", case.id).into());
+            }
+            for transfer in 0..case.input_offsets.len() {
+                if case.send_sizes[transfer] != case.receive_sizes[transfer]
+                    || case.input_offsets[transfer]
+                        .checked_add(case.send_sizes[transfer])
+                        .is_none_or(|end| end > case.local_shape[batch_axis] as u64)
+                    || case.output_offsets[transfer]
+                        .checked_add(case.receive_sizes[transfer])
+                        .is_none_or(|end| end > case.output_shape[batch_axis] as u64)
+                {
+                    return Err(format!("invalid single-participant transfer in `{}`", case.id).into());
+                }
+            }
         }
+        Ok(cases)
     }
 
-    /// Stages a transform while retaining all four metadata arrays as runtime arguments.
-    #[cfg(any(test, feature = "cuda-13"))]
-    fn transformed(&self, inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
-        match self.transform.as_str() {
-            "primal" => Ok(vec![
-                inputs[0]
-                    .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])?,
-            ]),
-            "batch" => {
-                // The leading physical axis maps independent exchanges. The unrelated named axis adds a batch
-                // dimension, whose lowering merges transfers and rebases row offsets, exercising the GPU's widened
-                // `u64` metadata path.
-                let output = batch(
-                    |inputs: Vec<_>| {
-                        inputs[0]
-                            .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
-                    },
-                    inputs,
-                    vec![BatchAxis::new(0); 6],
-                    BatchAxis::new(0),
-                    BatchAxisSpecification::named("y"),
-                )?;
-                Ok(vec![output])
-            }
-            "jvp" => {
-                // Both floating data inputs are active; integer transfer metadata are fixed runtime captures.
-                let active = vec![inputs[0].clone().into_value(), inputs[1].clone().into_value()];
-                let captures = inputs[2..6].iter().cloned().map(ArrayTracer::into_value).collect::<Vec<_>>();
-                let (primal, tangent) =
-                    inputs[0].clone().into_value().domain().differentiate_at(active).with_captures(captures).jvp(
-                        vec![inputs[6].clone().into_value(), inputs[7].clone().into_value()],
-                        |active, captures| {
-                            let active = active
-                                .into_iter()
-                                .map(ValueProjection::<ArrayType>::into_projected)
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let captures = captures
-                                .into_iter()
-                                .map(ValueProjection::<ArrayType>::into_projected)
-                                .collect::<Result<Vec<_>, _>>()?;
-                            Ok(active[0]
-                                .parallel_ragged_all_to_all(
-                                    "x",
-                                    &active[1],
-                                    &captures[0],
-                                    &captures[1],
-                                    &captures[2],
-                                    &captures[3],
-                                )?
-                                .into_value())
-                        },
-                    )?;
-                Ok(vec![
-                    ValueProjection::<ArrayType>::into_projected(primal)?,
-                    ValueProjection::<ArrayType>::into_projected(tangent)?,
-                ])
-            }
-            "vjp" => {
-                let active = vec![inputs[0].clone().into_value(), inputs[1].clone().into_value()];
-                let captures = inputs[2..6].iter().cloned().map(ArrayTracer::into_value).collect::<Vec<_>>();
-                let (primal, pullback) =
-                    inputs[0].clone().into_value().domain().differentiate_at(active).with_captures(captures).vjp(
-                        |active, captures| {
-                            let active = active
-                                .into_iter()
-                                .map(ValueProjection::<ArrayType>::into_projected)
-                                .collect::<Result<Vec<_>, _>>()?;
-                            let captures = captures
-                                .into_iter()
-                                .map(ValueProjection::<ArrayType>::into_projected)
-                                .collect::<Result<Vec<_>, _>>()?;
-                            Ok(active[0]
-                                .parallel_ragged_all_to_all(
-                                    "x",
-                                    &active[1],
-                                    &captures[0],
-                                    &captures[1],
-                                    &captures[2],
-                                    &captures[3],
-                                )?
-                                .into_value())
-                        },
-                    )?;
-                let cotangents = pullback.apply_materialized(inputs[6].clone().into_value())?;
-                Ok(vec![
-                    ValueProjection::<ArrayType>::into_projected(primal)?,
-                    ValueProjection::<ArrayType>::into_projected(cotangents[0].clone())?,
-                    ValueProjection::<ArrayType>::into_projected(cotangents[1].clone())?,
-                ])
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    /// Lowers the finite experiment; this is also available for CPU-only staging coverage.
-    #[cfg(any(test, feature = "cuda-13"))]
-    fn stage(&self) -> Result<(String, Vec<Vec<usize>>), Box<dyn Error>> {
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual)?])?;
-        let sharding = |shape: &[usize]| -> Result<Sharding, Box<dyn Error>> {
-            let mut dimensions = vec![ShardingDimension::replicated(); shape.len()];
-            dimensions[0] = ShardingDimension::sharded(["x"]);
-            Ok(Sharding::new(mesh.clone(), dimensions)?)
-        };
-        let mut shapes = vec![self.local_shape.clone(), self.output_shape.clone()];
-        shapes.extend(vec![self.metadata_shape(); 4]);
-        if self.transform == "jvp" {
-            shapes.extend([self.local_shape.clone(), self.output_shape.clone()]);
-        } else if self.transform == "vjp" {
-            shapes.push(self.output_shape.clone());
-        }
-        let mut output_shapes = vec![self.output_shape.clone()];
-        if self.transform == "jvp" {
-            output_shapes.push(self.output_shape.clone());
-        } else if self.transform == "vjp" {
-            output_shapes.extend([self.local_shape.clone(), self.output_shape.clone()]);
-        }
-        let metadata_type = if self.metadata_type == "u64" { DataType::U64 } else { DataType::I32 };
-        let types = shapes
-            .iter()
-            .enumerate()
-            .map(|(index, shape)| {
-                ArrayType::new_static(
-                    if (2..6).contains(&index) { metadata_type } else { DataType::F32 },
-                    shape.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let input_shardings = shapes.iter().map(|shape| sharding(shape)).collect::<Result<Vec<_>, _>>()?;
-        let output_shardings = output_shapes.iter().map(|shape| sharding(shape)).collect::<Result<Vec<_>, _>>()?;
-        let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
-            |inputs: Vec<ArrayTracer>| {
-                shard_map(
-                    |inputs| self.transformed(inputs),
-                    inputs,
-                    mesh.clone(),
-                    input_shardings.clone(),
-                    output_shardings.clone(),
-                    ShardMapOptions::new(),
-                )
-                .unwrap()
-            },
-            types,
-        )?;
-        Ok((traced.to_mlir_module("main")?, output_shapes))
+    /// Returns the stable observation identifier.
+    #[inline]
+    pub(super) fn id(&self) -> &str {
+        &self.id
     }
 
     /// Executes this case exclusively through the CUDA plugin rather than selecting an available default backend.
@@ -353,6 +204,7 @@ impl RaggedCase {
                     Some(file!()),
                     None,
                     None,
+                    &[],
                 )?
                 .block_until_ready()?;
             if outputs.len() != 1 || outputs[0].outputs.len() != output_shapes.len() {
@@ -386,17 +238,174 @@ impl RaggedCase {
             })
         }
     }
+
+    /// Metadata shape for ordinary transfers or an unrelated leading batch dimension.
+    #[cfg(any(test, feature = "cuda-13"))]
+    fn metadata_shape(&self) -> Vec<usize> {
+        if self.transform == "batch" {
+            vec![self.local_shape[0], self.input_offsets.len() / self.local_shape[0]]
+        } else {
+            vec![self.input_offsets.len()]
+        }
+    }
+
+    /// Stages a transform while retaining all four metadata arrays as runtime arguments.
+    #[cfg(any(test, feature = "cuda-13"))]
+    fn transformed(&self, inputs: Vec<ArrayTracer>) -> Result<Vec<ArrayTracer>, ProgramError> {
+        match self.transform.as_str() {
+            "primal" => Ok(vec![
+                inputs[0]
+                    .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])?,
+            ]),
+            "batch" => {
+                // The leading physical axis maps independent exchanges. The unrelated named axis adds a batch
+                // dimension, whose lowering merges transfers and rebases row offsets, exercising the GPU's widened
+                // `u64` metadata path.
+                let output = batch(
+                    |inputs: Vec<_>| {
+                        inputs[0]
+                            .parallel_ragged_all_to_all("x", &inputs[1], &inputs[2], &inputs[3], &inputs[4], &inputs[5])
+                    },
+                    inputs,
+                    vec![BatchAxis::new(0); 6],
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("y"),
+                )?;
+                Ok(vec![output])
+            }
+            "jvp" => {
+                // Both floating data inputs are active, while integer transfer metadata are fixed runtime captures.
+                let active = vec![inputs[0].clone().into_value(), inputs[1].clone().into_value()];
+                let captures = inputs[2..6].iter().cloned().map(ArrayTracer::into_value).collect::<Vec<_>>();
+                let (primal, tangent) =
+                    inputs[0].clone().into_value().domain().differentiate_at(active).with_captures(captures).jvp(
+                        vec![inputs[6].clone().into_value(), inputs[7].clone().into_value()],
+                        |active, captures| {
+                            let active = active
+                                .into_iter()
+                                .map(ValueProjection::<ArrayType>::into_projected)
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let captures = captures
+                                .into_iter()
+                                .map(ValueProjection::<ArrayType>::into_projected)
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(active[0]
+                                .parallel_ragged_all_to_all(
+                                    "x",
+                                    &active[1],
+                                    &captures[0],
+                                    &captures[1],
+                                    &captures[2],
+                                    &captures[3],
+                                )?
+                                .into_value())
+                        },
+                    )?;
+                Ok(vec![
+                    ValueProjection::<ArrayType>::into_projected(primal)?,
+                    ValueProjection::<ArrayType>::into_projected(tangent)?,
+                ])
+            }
+            "vjp" => {
+                let active = vec![inputs[0].clone().into_value(), inputs[1].clone().into_value()];
+                let captures = inputs[2..6].iter().cloned().map(ArrayTracer::into_value).collect::<Vec<_>>();
+                let (primal, pullback) =
+                    inputs[0].clone().into_value().domain().differentiate_at(active).with_captures(captures).vjp(
+                        |active, captures| {
+                            let active = active
+                                .into_iter()
+                                .map(ValueProjection::<ArrayType>::into_projected)
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let captures = captures
+                                .into_iter()
+                                .map(ValueProjection::<ArrayType>::into_projected)
+                                .collect::<Result<Vec<_>, _>>()?;
+                            Ok(active[0]
+                                .parallel_ragged_all_to_all(
+                                    "x",
+                                    &active[1],
+                                    &captures[0],
+                                    &captures[1],
+                                    &captures[2],
+                                    &captures[3],
+                                )?
+                                .into_value())
+                        },
+                    )?;
+                let cotangents = pullback.apply_materialized(inputs[6].clone().into_value())?;
+                Ok(vec![
+                    ValueProjection::<ArrayType>::into_projected(primal)?,
+                    ValueProjection::<ArrayType>::into_projected(cotangents[0].clone())?,
+                    ValueProjection::<ArrayType>::into_projected(cotangents[1].clone())?,
+                ])
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Lowers the finite experiment. This is also available for staging coverage on the CPU alone.
+    #[cfg(any(test, feature = "cuda-13"))]
+    fn stage(&self) -> Result<(String, Vec<Vec<usize>>), Box<dyn Error>> {
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual)?])?;
+        let sharding = |shape: &[usize]| -> Result<Sharding, Box<dyn Error>> {
+            let mut dimensions = vec![ShardingDimension::replicated(); shape.len()];
+            dimensions[0] = ShardingDimension::sharded(["x"]);
+            Ok(Sharding::new(mesh.clone(), dimensions)?)
+        };
+        let mut shapes = vec![self.local_shape.clone(), self.output_shape.clone()];
+        shapes.extend(vec![self.metadata_shape(); 4]);
+        if self.transform == "jvp" {
+            shapes.extend([self.local_shape.clone(), self.output_shape.clone()]);
+        } else if self.transform == "vjp" {
+            shapes.push(self.output_shape.clone());
+        }
+        let mut output_shapes = vec![self.output_shape.clone()];
+        if self.transform == "jvp" {
+            output_shapes.push(self.output_shape.clone());
+        } else if self.transform == "vjp" {
+            output_shapes.extend([self.local_shape.clone(), self.output_shape.clone()]);
+        }
+        let metadata_type = if self.metadata_type == "u64" { DataType::U64 } else { DataType::I32 };
+        let types = shapes
+            .iter()
+            .enumerate()
+            .map(|(index, shape)| {
+                ArrayType::new_static(
+                    if (2..6).contains(&index) { metadata_type } else { DataType::F32 },
+                    shape.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let input_shardings = shapes.iter().map(|shape| sharding(shape)).collect::<Result<Vec<_>, _>>()?;
+        let output_shardings = output_shapes.iter().map(|shape| sharding(shape)).collect::<Result<Vec<_>, _>>()?;
+        let traced: TracedProgram<Vec<ArrayType>, Vec<ArrayType>> = trace(
+            |inputs: Vec<ArrayTracer>| {
+                shard_map(
+                    |inputs| self.transformed(inputs),
+                    inputs,
+                    mesh.clone(),
+                    input_shardings.clone(),
+                    output_shardings.clone(),
+                    ShardMapOptions::new(),
+                )
+                .unwrap()
+            },
+            types,
+        )?;
+        Ok((traced.to_mlir_module("main")?, output_shapes))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use super::*;
 
     #[test]
-    fn test_registry() {
-        let cases = registry().unwrap();
+    fn test_ragged_case_registry() {
+        let cases = RaggedCase::registry().unwrap();
         assert!(cases.iter().all(|case| case.participants == 1));
         for transform in ["primal", "batch", "jvp", "vjp"] {
             assert!(cases.iter().any(|case| case.transform == transform));
@@ -408,9 +417,39 @@ mod tests {
 
     #[test]
     fn test_ragged_case_stage() {
-        for case in registry().unwrap() {
-            let (module, shapes) = case.stage().unwrap();
-            assert!(module.contains("ragged_all_to_all"), "{}", case.id);
+        let cases = RaggedCase::registry().unwrap();
+        let case = cases.iter().find(|case| case.id == "cuda_ragged_seed_holes_i32").unwrap();
+        assert_eq!(
+            case.stage().unwrap(),
+            (
+                indoc! {"
+                module {
+                  sdy.mesh @mesh = <[\"x\"=1]>
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<5xf32>, %arg2: tensor<3xi32>, %arg3: \
+                      tensor<3xi32>, %arg4: tensor<3xi32>, %arg5: tensor<3xi32>) -> (tensor<5xf32> {sdy.sharding = \
+                      #sdy.sharding<@mesh, [{\"x\"}]>}) {
+                    %0 = sdy.manual_computation(%arg0, %arg1, %arg2, %arg3, %arg4, %arg5) in_shardings=[<@mesh, \
+                        [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, <@mesh, [{\"x\"}]>, \
+                        <@mesh, [{\"x\"}]>] out_shardings=[<@mesh, [{\"x\"}]>] manual_axes={\"x\"} (%arg6: \
+                        tensor<4xf32>, %arg7: tensor<5xf32>, %arg8: tensor<3xi32>, %arg9: tensor<3xi32>, %arg10: \
+                        tensor<3xi32>, %arg11: tensor<3xi32>) {
+                      %1 = stablehlo.custom_call @ragged_all_to_all(%arg6, %arg7, %arg8, %arg9, %arg10, %arg11) \
+                          {api_version = 4 : i32, backend_config = {channel_id = 1 : i64, replica_groups = dense<0> : \
+                          tensor<1x1xi64>}} : (tensor<4xf32>, tensor<5xf32>, tensor<3xi32>, tensor<3xi32>, \
+                          tensor<3xi32>, tensor<3xi32>) -> tensor<5xf32>
+                      sdy.return %1 : tensor<5xf32>
+                    } : (tensor<4xf32>, tensor<5xf32>, tensor<3xi32>, tensor<3xi32>, tensor<3xi32>, tensor<3xi32>) -> \
+                        tensor<5xf32>
+                    return %0 : tensor<5xf32>
+                  }
+                }
+                "}
+                .to_owned(),
+                vec![vec![5]],
+            ),
+        );
+        for case in cases {
+            let (_, shapes) = case.stage().unwrap();
             assert_eq!(shapes[0], case.output_shape);
             assert_eq!(
                 shapes.len(),

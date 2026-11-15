@@ -2,15 +2,15 @@
 //!
 //! Bundles carry checked portable source, lowering diagnostics, compatibility metadata, and the complete serialized
 //! PJRT executable, including backend artifacts. Import never recompiles. Source eligibility is the core codec's
-//! contract; callers can explicitly recompile the retained source when compatibility changes. Checksums detect
-//! corruption, not an untrusted producer: executable bundles must come from a trusted source.
+//! contract, and callers can explicitly recompile the retained source when compatibility changes. Checksums detect
+//! corruption, not an untrusted producer, so executable bundles must come from a trusted source.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ryft_core::{
     AnalyzableCompilationDomain, ArrayIrType, ArrayType, CompilationCacheDomain, CompilationTracer, DeviceMesh,
-    StagedFunction as CoreStagedFunction,
+    EffectClass, StagedFunction as CoreStagedFunction,
 };
 use ryft_kernels::{KernelDefinition, VerifiedKernel};
 use ryft_pjrt::Execution;
@@ -63,50 +63,81 @@ impl From<KernelAotError> for crate::Error {
 
 /// Timings and compiler diagnostics correlated with one exact kernel definition.
 ///
-/// Lowering includes adapter compilation; compilation includes the ordinary executable cache lookup. These are host
-/// wall times, not device launch durations. PJRT's existing analysis retains optional counters and raw properties;
-/// unsupported register, spill, occupancy, and TMEM measurements must not be inferred from other memory counters.
+/// Lowering includes adapter compilation, and compilation includes the ordinary executable cache lookup. These are
+/// host wall times, not device launch durations. PJRT's existing analysis retains optional counters and raw
+/// properties. Unsupported register, spill, occupancy, and TMEM measurements must not be inferred from other memory
+/// counters.
 #[derive(Clone, Debug, Serialize)]
 pub struct KernelCompilationReport {
     /// SHA-256 of the canonical semantic identity.
-    pub semantic_digest: String,
-    /// SHA-256 of the selected compiler/target/options/embedding identity.
-    pub configuration_digest: String,
+    semantic_digest: String,
+
+    /// SHA-256 of the identity of the selected compiler, target, options, and embedding.
+    configuration_digest: String,
+
     /// Instruction provenance descriptions, in source order.
-    pub provenance: Vec<String>,
+    provenance: Vec<String>,
+
     /// Host time in source staging and lowering, including adapter selection.
-    pub lowering_duration: Duration,
+    lowering_duration: Duration,
+
     /// Host time in the XLA compilation or executable cache lookup.
-    pub compilation_duration: Duration,
+    compilation_duration: Duration,
+
     /// Existing typed PJRT analysis, preserving unsupported properties as absent.
-    pub analysis: CompilationAnalysis,
+    analysis: CompilationAnalysis,
 }
 
-/// Private, versioned bundle metadata. Binary source/executable sections avoid JSON byte-array expansion.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Manifest {
-    /// Exact compiler binding configuration, without querying its compiler installation.
-    configuration: Vec<u8>,
-    /// Exact live platform, plugin, and selected-device facts.
-    execution: Vec<u8>,
-    /// Canonical semantic digest, checked after decoding the source.
-    semantic_digest: String,
-    /// StableHLO emitted by the ordinary lowering, including selected artifacts and source locations.
-    stable_hlo: String,
-    /// Existing report's JSON representation, retained for offline inspection without a second analysis schema.
-    report: serde_json::Value,
+impl KernelCompilationReport {
+    /// Returns the SHA-256 of the canonical semantic identity.
+    #[inline]
+    pub fn semantic_digest(&self) -> &str {
+        &self.semantic_digest
+    }
+
+    /// Returns the SHA-256 of the identity of the selected compiler, target, options, and embedding.
+    #[inline]
+    pub fn configuration_digest(&self) -> &str {
+        &self.configuration_digest
+    }
+
+    /// Returns the instruction provenance descriptions, in source order.
+    #[inline]
+    pub fn provenance(&self) -> &[String] {
+        &self.provenance
+    }
+
+    /// Returns the host time in source staging and lowering, including adapter selection.
+    #[inline]
+    pub fn lowering_duration(&self) -> Duration {
+        self.lowering_duration
+    }
+
+    /// Returns the host time in the XLA compilation or executable cache lookup.
+    #[inline]
+    pub fn compilation_duration(&self) -> Duration {
+        self.compilation_duration
+    }
+
+    /// Returns the existing typed PJRT analysis, preserving unsupported properties as absent.
+    #[inline]
+    pub fn analysis(&self) -> &CompilationAnalysis {
+        &self.analysis
+    }
 }
 
 /// Relocatable, validated source and executable bundle. No path or runtime pointer is an artifact identifier.
 #[derive(Clone, Debug)]
 pub struct KernelAotBundle {
-    /// Decoded canonical source; callers cannot mutate it behind its executable.
+    /// Decoded canonical source, which callers cannot mutate behind its executable.
     definition: KernelDefinition,
-    /// Exact already-validated transport bytes for source and diagnostic provenance.
+
+    /// Exact transport bytes, already validated, for source and diagnostic provenance.
     source: Vec<u8>,
+
     /// Existing XLA persistence envelope, including native backend resources.
     executable: Vec<u8>,
+
     /// Compatibility and inspection data protected by the outer checksum.
     manifest: Manifest,
 }
@@ -114,10 +145,13 @@ pub struct KernelAotBundle {
 impl KernelAotBundle {
     /// Bundle schema independent of the core source and XLA executable schemas, each validated by its owner.
     const MAGIC: &[u8; 8] = b"RYFTKA01";
-    /// Maximum accepted/exported total bundle size, including source, metadata, and executable.
+
+    /// Maximum total size of an accepted or exported bundle, including source, metadata, and executable.
     const MAXIMUM_BYTES: usize = 256 * 1024 * 1024;
+
     /// Maximum encoded source and metadata section sizes, checked before their JSON decoders run.
     const MAXIMUM_JSON_BYTES: usize = 64 * 1024 * 1024;
+
     /// Magic, three section lengths, and SHA-256 over all section lengths and contents.
     const HEADER_BYTES: usize = 8 + 3 * 8 + 32;
 
@@ -125,8 +159,8 @@ impl KernelAotBundle {
     ///
     /// Source serialization and core verification precede compiler invocation. `options` must select a kernel
     /// compiler and the kernel must have at least one ordinary input. Unsupported source codecs or PJRT serialization
-    /// are explicit errors; no fallback is selected.
-    /// `maximum_programs` bounds source verification, not native compilation; adapter compiler deadlines remain active.
+    /// are explicit errors, and no fallback is selected. `maximum_programs` bounds source verification, not native
+    /// compilation, so adapter compiler deadlines remain active.
     pub fn compile<'c>(
         definition: &KernelDefinition,
         domain: &Domain<'c>,
@@ -141,10 +175,9 @@ impl KernelAotBundle {
         if source.len() > Self::MAXIMUM_JSON_BYTES {
             return Err(Self::invalid("source exceeds the bundle size limit"));
         }
-        let binding =
-            options.kernel_compiler.as_ref().ok_or_else(|| Self::invalid("a compiler binding is required"))?;
+        let binding = options.kernel_compiler().ok_or_else(|| Self::invalid("a compiler binding is required"))?;
         let configuration = binding.configuration().to_vec();
-        let facts = KernelExecutionFacts::from_target(domain.target()?, &options.mesh)?;
+        let facts = KernelExecutionFacts::from_target(domain.target()?, options.mesh())?;
         let execution = facts.configuration_key()?;
         let start = Instant::now();
         let staged = CoreStagedFunction::<Domain<'_>, Vec<ArrayIrType>, Vec<ArrayIrType>>::stage(
@@ -155,11 +188,11 @@ impl KernelAotBundle {
             definition.operation().input_types(),
             options,
         )?;
-        let lowered = staged.lower(&domain)?;
+        let lowered = staged.lower(domain)?;
         let stable_hlo = lowered.lowered_program().stable_hlo().to_owned();
         let lowering_duration = start.elapsed();
         let start = Instant::now();
-        let compiled = lowered.compile(&domain)?;
+        let compiled = lowered.compile(domain)?;
         let compilation_duration = start.elapsed();
         let executable = domain
             .serialize_program(compiled.compiled_program())?
@@ -197,7 +230,7 @@ impl KernelAotBundle {
         Ok(bundle)
     }
 
-    /// Decodes a size-bounded bundle and revalidates its checksum, canonical source, and executable core proof.
+    /// Decodes a bundle of bounded size and revalidates its checksum, canonical source, and executable core proof.
     /// Native executable loading occurs only in [`Self::load`], after checking live compatibility.
     pub fn from_bytes(bytes: &[u8], maximum_programs: usize) -> Result<Self, KernelAotError> {
         if bytes.len() < Self::HEADER_BYTES || bytes.len() > Self::MAXIMUM_BYTES || &bytes[..8] != Self::MAGIC {
@@ -226,7 +259,7 @@ impl KernelAotBundle {
             return Err(Self::invalid("empty section or trailing bundle bytes"));
         }
         if sections[0].len() > Self::MAXIMUM_JSON_BYTES || sections[1].len() > Self::MAXIMUM_JSON_BYTES {
-            return Err(Self::invalid("JSON section exceeds the size limit"));
+            return Err(Self::invalid("encoded JSON section exceeds the size limit"));
         }
         let manifest: Manifest = serde_json::from_slice(sections[0])?;
         let definition: KernelDefinition = serde_json::from_slice(sections[1])?;
@@ -252,11 +285,11 @@ impl KernelAotBundle {
         &self.manifest.report
     }
 
-    /// Encodes the complete bundle with a versioned checksum; no external artifact paths are required.
+    /// Encodes the complete bundle with a versioned checksum. No external artifact paths are required.
     pub fn to_bytes(&self) -> Result<Vec<u8>, KernelAotError> {
         let manifest = serde_json::to_vec(&self.manifest)?;
         if manifest.len() > Self::MAXIMUM_JSON_BYTES || self.source.len() > Self::MAXIMUM_JSON_BYTES {
-            return Err(Self::invalid("JSON section exceeds the size limit"));
+            return Err(Self::invalid("encoded JSON section exceeds the size limit"));
         }
         let sections = [manifest.as_slice(), self.source.as_slice(), self.executable.as_slice()];
         let size = sections
@@ -282,7 +315,7 @@ impl KernelAotBundle {
 
     /// Loads through the existing XLA persistence decoder after exact compiler and live device checks.
     ///
-    /// The binding is used only for identity; its compiler is never called. The mesh must name the intended live
+    /// The binding is used only for identity, and its compiler is never called. The mesh must name the intended live
     /// devices in the same order. XLA additionally validates its build identity, flags, platform, and executable ABI.
     pub fn load<'c>(
         &self,
@@ -333,31 +366,39 @@ impl KernelAotBundle {
         Ok(hex::encode(Sha256::digest(definition.semantic_key().map_err(|error| Self::invalid(error.to_string()))?)))
     }
 
-    /// Constructs an exact bundle-owned diagnostic.
+    /// Constructs an exact diagnostic owned by the bundle.
     fn invalid(message: impl Into<String>) -> KernelAotError {
         KernelAotError::Invalid { message: message.into() }
     }
 }
 
-/// An AOT-loaded kernel using the existing XLA domain and whole-execution fence.
+/// A kernel loaded ahead of time, using the existing XLA domain and the fence over the whole execution.
 #[derive(Clone)]
 pub struct LoadedKernel<'c> {
-    /// Session owning CUDA resources and ordinary invocation/effect policy.
+    /// Session owning native runtime resources and the ordinary invocation and effect policy.
     domain: Domain<'c>,
+
     /// Existing PJRT executable and its validated invocation metadata.
     program: Arc<CompiledProgram<'c>>,
-    /// Exact source and compiler-binding identity used by distributed preflight.
+
+    /// Exact identity of the source and the compiler binding, used by distributed preflight.
     identity: Vec<u8>,
+
     /// Live plugin and local topology identity checked by the AOT loader.
     execution: Vec<u8>,
+
     /// Canonical source effects, retained for stricter functional distributed admission.
     effects: ryft_core::EffectsSummary,
 }
 
 impl<'c> LoadedKernel<'c> {
+    /// Borrows the existing domain, canonical boundary, and identities for execution coordinated by the host.
+    pub(crate) fn distributed_parts(&self) -> (&Domain<'c>, &[ArrayType], &DeviceMesh, &[u8], &[u8]) {
+        (&self.domain, self.program.input_types(), self.program.mesh(), &self.identity, &self.execution)
+    }
+
     /// Rejects external effects which cannot be rolled back by discarding functional outputs.
     pub(crate) fn validate_distributed_effects(&self) -> Result<(), KernelAotError> {
-        use ryft_core::EffectClass;
         if self.effects.has_explicit_ordered_state() {
             return Err(KernelEmbeddingError::UnsupportedEffect { effect: EffectClass::OrderedState }.into());
         }
@@ -369,31 +410,56 @@ impl<'c> LoadedKernel<'c> {
         Ok(())
     }
 
-    /// Borrows the existing domain, canonical boundary and identities for host-coordinated execution.
-    pub(crate) fn distributed_parts(&self) -> (&Domain<'c>, &[ArrayType], &DeviceMesh, &[u8], &[u8]) {
-        (&self.domain, self.program.input_types(), self.program.mesh(), &self.identity, &self.execution)
-    }
-
-    /// Submits ordinary array inputs and returns the existing completion-bearing execution handle.
+    /// Submits ordinary array inputs and returns the existing execution handle that carries the completion.
     /// Pending uploads, input retention, aliases, and device failures use XLA's canonical invocation path.
     pub fn call(&self, inputs: Vec<Array<'c>>) -> Result<Execution<Vec<Array<'c>>>, KernelAotError> {
         Ok(self.domain.execute_compiled_async(&self.program, inputs)?)
     }
 }
 
+/// Private, versioned bundle metadata. Binary source and executable sections avoid expanding bytes into JSON arrays.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Manifest {
+    /// Exact compiler binding configuration, without querying its compiler installation.
+    configuration: Vec<u8>,
+
+    /// Exact live platform, plugin, and selected device facts.
+    execution: Vec<u8>,
+
+    /// Canonical semantic digest, checked after decoding the source.
+    semantic_digest: String,
+
+    /// StableHLO emitted by the ordinary lowering, including selected artifacts and source locations.
+    stable_hlo: String,
+
+    /// Existing report's JSON representation, retained for offline inspection without a second analysis schema.
+    report: serde_json::Value,
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use pretty_assertions::assert_eq;
-    use ryft_core::{DataType, Device, LogicalMesh, Typed};
-    use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
+    use ryft_core::{DataType, Device, EffectClass, EffectClasses, Effects, LogicalMesh, Typed};
+    use ryft_kernels::{Grid, KernelCallOperation};
 
     use crate::kernels::staging::tests::binding;
     use crate::kernels::tests::definition;
+    use crate::tests::execution_client;
     use crate::{FromPjrt, Session};
 
     use super::*;
 
-    /// Builds transport-only bytes. The opaque executable is never submitted to a native decoder.
+    /// Builds the mesh without axes over the first addressable device of `client`.
+    fn single_device_mesh(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
+        DeviceMesh::new(
+            LogicalMesh::new(vec![]).unwrap(),
+            vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
+        )
+        .unwrap()
+    }
+
+    /// Builds bytes intended only for transport. The opaque executable is never submitted to a native decoder.
     fn bundle() -> KernelAotBundle {
         let definition = definition();
         KernelAotBundle {
@@ -454,7 +520,7 @@ pub(crate) mod tests {
             Options::new(mesh.clone()),
         )
         .unwrap();
-        let compiled = staged.lower(&domain).unwrap().compile(&domain).unwrap();
+        let compiled = staged.lower(domain).unwrap().compile(domain).unwrap();
         let mut bundle = bundle();
         bundle.manifest.configuration = compiler.configuration().to_vec();
         bundle.executable = domain.serialize_program(compiled.compiled_program()).unwrap().unwrap();
@@ -496,9 +562,9 @@ pub(crate) mod tests {
 
     #[test]
     fn test_kernel_aot_bundle_compile_missing_binding() {
-        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let domain = Session::new(&client).domain();
-        let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(0, 0)]).unwrap();
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         assert!(matches!(
             KernelAotBundle::compile(&definition(), &domain, Options::new(mesh), 1),
             Err(KernelAotError::Invalid { message }) if message == "a compiler binding is required",
@@ -507,13 +573,11 @@ pub(crate) mod tests {
 
     #[test]
     fn test_kernel_aot_bundle_compile_without_inputs() {
-        use ryft_kernels::{Grid, KernelCallOperation};
-
         let operation = KernelCallOperation::new(Grid::new(vec![]).unwrap(), vec![]).unwrap();
         let definition: KernelDefinition = KernelDefinition::trace(operation, |_| Ok(())).unwrap();
-        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let domain = Session::new(&client).domain();
-        let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(0, 0)]).unwrap();
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         assert!(matches!(
             KernelAotBundle::compile(&definition, &domain, Options::new(mesh), 1),
             Err(KernelAotError::Invalid { message })
@@ -613,20 +677,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_kernel_aot_bundle_to_bytes() {
+        let bundle = bundle();
+        let bytes = bundle.to_bytes().unwrap();
+        let manifest = serde_json::to_vec(&bundle.manifest).unwrap();
+        let section_lengths = bytes[8..32]
+            .chunks(8)
+            .map(|length| u64::from_le_bytes(length.try_into().unwrap()) as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(&bytes[..8], KernelAotBundle::MAGIC);
+        assert_eq!(section_lengths, vec![manifest.len(), bundle.source.len(), bundle.executable.len()]);
+        assert_eq!(bytes.len(), KernelAotBundle::HEADER_BYTES + section_lengths.iter().sum::<usize>());
+        assert_eq!(&bytes[KernelAotBundle::HEADER_BYTES..][..manifest.len()], manifest.as_slice());
+        assert_eq!(&bytes[bytes.len() - bundle.executable.len()..], bundle.executable.as_slice());
+    }
+
+    #[test]
     fn test_kernel_aot_bundle_to_bytes_size_limit() {
         let mut oversized = bundle();
         oversized.source.resize(KernelAotBundle::MAXIMUM_JSON_BYTES + 1, 0);
         assert!(matches!(
             oversized.to_bytes(),
-            Err(KernelAotError::Invalid { message }) if message == "JSON section exceeds the size limit",
+            Err(KernelAotError::Invalid { message }) if message == "encoded JSON section exceeds the size limit",
         ));
     }
 
     #[test]
     fn test_kernel_aot_bundle_load_configuration() {
-        let client = load_cpu_plugin().unwrap().client(ClientOptions::CPU(CpuClientOptions::default())).unwrap();
-        let domain = Session::new(&client).domain();
-        let mesh = DeviceMesh::new(LogicalMesh::new(vec![]).unwrap(), vec![Device::new(0, 0)]).unwrap();
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
+        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         assert!(matches!(
             bundle().load(&domain, &binding(2), &mesh),
             Err(KernelAotError::Invalid { message }) if message == "compiler binding configuration mismatch",
@@ -635,12 +715,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_kernel_aot_bundle_load_live_facts() {
-        let client = crate::tests::execution_client();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![]).unwrap(),
-            vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
-        )
-        .unwrap();
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         assert!(matches!(
             bundle().load(&domain, &binding(1), &mesh),
@@ -650,15 +726,8 @@ pub(crate) mod tests {
 
     #[test]
     fn test_kernel_aot_bundle_load_stateless_boundary() {
-        let plugin = load_cpu_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
-            .unwrap();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![]).unwrap(),
-            vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
-        )
-        .unwrap();
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let original = executable_bundle(&domain, &mesh, DataType::I32, false, &binding(1));
         let decoded = KernelAotBundle::from_bytes(&original.to_bytes().unwrap(), 1).unwrap();
@@ -694,16 +763,11 @@ pub(crate) mod tests {
             Err(KernelAotError::Invalid { message }) if message == expected,
         ));
     }
+
     #[test]
     fn test_loaded_kernel_validate_distributed_effects() {
-        use ryft_core::{EffectClass, EffectClasses, Effects};
-
-        let client = crate::tests::execution_client();
-        let mesh = DeviceMesh::new(
-            LogicalMesh::new(vec![]).unwrap(),
-            vec![Device::from_pjrt(client.addressable_devices().unwrap().remove(0)).unwrap()],
-        )
-        .unwrap();
+        let client = execution_client();
+        let mesh = single_device_mesh(&client);
         let domain = Session::new(&client).domain().with_mesh(mesh.clone());
         let bundle = executable_bundle(&domain, &mesh, DataType::I32, false, &binding(1));
         let mut loaded = bundle.load(&domain, &binding(1), &mesh).unwrap();

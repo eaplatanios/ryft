@@ -10,13 +10,14 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer, Loweri
 impl LowerableOperation for StopGradientOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        // `stop_gradient` only affects differentiation; by lowering time it is the identity, so
-        // forward every operand without emitting any MLIR operation (matching JAX's lowering).
+        let _ = (lowerer, input_types, output_types);
+        // `stop_gradient` only affects differentiation, so by lowering time it is the identity and every operand is
+        // forwarded without emitting any MLIR operation, which matches JAX's lowering.
         Ok(input_values.to_vec())
     }
 }
@@ -24,11 +25,12 @@ impl LowerableOperation for StopGradientOperation<ArrayType> {
 impl LowerableOperation for RematerializeOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        _input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (lowerer, input_values, input_types, output_types);
         Err(ProgramError::UnsupportedOperation {
             message: "higher-order operation must be stored directly in the enclosing backend operation family"
                 .to_string(),
@@ -40,11 +42,12 @@ impl LowerableOperation for RematerializeOperation<ArrayType> {
 impl LowerableOperation for LinearCallOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        _input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (lowerer, input_values, input_types, output_types);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
@@ -60,38 +63,41 @@ impl LowerableOperation for RematerializeOperation<ArrayIrType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayIrType],
-        _output_types: &[ArrayIrType],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        let [body] = lowerer.regions.as_slice() else {
+        let _ = (input_types, output_types);
+        let [_] = lowerer.regions() else {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: self.name().to_string(),
                 reason: format!(
-                    "{} expected 1 attached region but got {}",
-                    REMATERIALIZE_OPERATION_NAME,
-                    lowerer.regions.len(),
+                    "`{REMATERIALIZE_OPERATION_NAME}` expected 1 attached region but got {}",
+                    lowerer.regions().len(),
                 ),
             }));
         };
-        // Rematerialized bodies are traced through fresh-root contexts and lower with an empty capture namespace; refer
-        // to the `CompositeOperation` lowering for the rationale. A differentiated call recomputes values that the
-        // original computation also computes, so a barrier on its selected inputs keeps XLA from merging the two
+        // Rematerialized bodies are traced through contexts with fresh roots and lower with an empty capture namespace,
+        // for the reasons that the `CompositeOperation` lowering explains. A differentiated call recomputes values that
+        // the original computation also computes, so a barrier on its selected inputs keeps XLA from merging the two
         // computations or from scheduling the recomputation before those inputs are available.
         let optimization_barrier = match self.differentiated() {
             true => self.optimization_barrier(),
             false => &RematerializationOptimizationBarrier::None,
         };
+        let (mut block, context, location) = (lowerer.block(), lowerer.context(), lowerer.location());
+        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
+            lowerer.split_effect_tokens();
         lower_nested_program_inline(
-            body,
+            &regions[0],
             input_values,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
-            lowerer.collective_state.session_values(lowerer.captured_values.as_slice()),
+            &mut block,
+            context,
+            location,
+            collective_state.session_values(captured_values),
             optimization_barrier,
-            lowerer.nested_functions.as_ref(),
-            &lowerer.collective_state,
-            &mut lowerer.effect_tokens,
+            nested_functions,
+            collective_state,
+            effect_tokens,
         )
     }
 }
@@ -101,11 +107,12 @@ impl LowerableOperation for LinearCallOperation<ArrayIrType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayIrType],
-        _output_types: &[ArrayIrType],
+        input_types: &[ArrayIrType],
+        output_types: &[ArrayIrType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
-        // The forward region is nested-traced, so it shares the enclosing capture scope. The transpose region is
-        // dormant under lowering.
+        let _ = (input_types, output_types);
+        // The forward region is traced as a nested program, so it shares the enclosing capture scope. The transpose
+        // region is dormant under lowering.
         if lowerer.regions().len() != 2 {
             return Err(Error::Lowering(LoweringError::UnsupportedOperation {
                 operation: self.name().to_string(),
@@ -124,22 +131,130 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrType, ArrayOperation, ArrayType, CaptureReference, Context, CosOperation, DataType,
-        DomainTracingContext, Memory, MulOperation, Placeholder, ProgramError, RematerializationOptimizationBarrier,
-        SinOperation, TypedProgram,
+        AddOperation, ArrayOperation, CaptureReference, Context, CosOperation, DataType, DomainTracingContext,
+        EverythingSavable, Memory, MulOperation, NothingSavable, Placeholder, PrintOperation, ResidualPolicyReference,
+        SaveAndOffloadOnlyTheseNames, SinOperation, StopGradient, TagOperation, TypedProgram, Value as CoreValue,
+        differentiate_at, rematerialize,
     };
 
+    use ryft_mlir::{Block, Context as MlirContext, Location, Value as MlirValue};
+
     use crate::domains::Tracer;
+    use crate::domains::tests::{domain_mesh, read_f32s, replicated_vector_type};
     use crate::lowering::tests::test_vector_type;
-    use crate::operations::{Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::{Constant, Domain, Error, LoweringError, to_mlir_module_for_program};
+    use crate::lowering::types::lower_tensor_type;
+    use crate::operations::{FlatProgram, Operation, Program, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::tests::{execution_client, values_to_bytes};
+    use crate::{Array, CompiledFunction, Constant, Domain, Session, compile, to_mlir_module_for_program};
+
+    use super::*;
 
     #[test]
-    fn test_rematerialize_lowering_inlines_body_effects_on_the_enclosing_token_chain() {
-        use ryft_core::{NothingSavable, PrintOperation, RematerializeOperation, ResidualPolicyReference};
+    fn test_stop_gradient_operation_lower() {
+        // A gradient barrier is the identity by lowering time, so it forwards every operand without emitting anything.
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let tensor_type = lower_tensor_type(&scalar_type, &context, location).unwrap();
+        let block = context.block(&[(tensor_type, location), (tensor_type, location)]);
+        let inputs = [0, 1].map(|index| block.as_ref().argument(index).unwrap().as_ref());
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let types = [scalar_type.clone(), scalar_type];
+        assert_eq!(
+            StopGradientOperation::<ArrayType>::new().lower(&mut lowerer, &inputs, &types, &types).unwrap(),
+            inputs.to_vec(),
+        );
+        assert!(block.as_ref().is_empty());
+    }
 
+    #[test]
+    fn test_stop_gradient_operation_lower_executes_as_the_identity() {
+        let client = execution_client();
+        let mesh = domain_mesh(&client, "x", 1);
+        let engine = Session::new(&client).domain();
+
+        let input_type = replicated_vector_type(&mesh, 4);
+        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+            compile(|x| x.clone() * x.stop_gradient().unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
+
+        let values = [0.0f32, 0.5, 1.0, 1.5];
+        let source = Array::from_host_buffer(
+            &engine,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
+        let output = compiled.executable().execute(&engine, source).unwrap();
+
+        let observed = read_f32s(&client, &output);
+        for (got, &input) in observed.iter().zip(values.iter()) {
+            let expected = input * input;
+            assert!((got - expected).abs() < 1e-5, "got {got}, expected ~{expected}");
+        }
+
+        // Lowering preserves every result of one variadic barrier without materializing an MLIR operation.
+        let variadic: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
+            |(first, second)| {
+                let context = first.domain();
+                let mut outputs = context.bind(StopGradientOperation::new(), Vec::new(), &[first, second]).unwrap();
+                let second = outputs.pop().unwrap();
+                let first = outputs.pop().unwrap();
+                (first, second)
+            },
+            (input_type.clone(), input_type.clone()),
+            &engine,
+            mesh.clone(),
+        )
+        .unwrap();
+        let other_values = [4.0f32, 3.0, 2.0, 1.0];
+        let first = Array::from_host_buffer(
+            &engine,
+            input_type.clone(),
+            mesh.clone(),
+            values_to_bytes::<f32>(&values).as_slice(),
+        )
+        .unwrap();
+        let second =
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes::<f32>(&other_values).as_slice())
+                .unwrap();
+        let (first, second) = variadic.executable().execute(&engine, (first, second)).unwrap();
+        assert_eq!(read_f32s(&client, &first), values);
+        assert_eq!(read_f32s(&client, &second), other_values);
+    }
+
+    #[test]
+    fn test_rematerialize_operation_lower_rejects_malformed_instructions() {
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let block = context.block_with_no_arguments();
+        let operation = RematerializeOperation::<ArrayIrType>::new(ResidualPolicyReference::new(NothingSavable));
+
+        // The plain array family cannot carry the body region.
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        assert!(matches!(
+            RematerializeOperation::<ArrayType>::new(ResidualPolicyReference::new(NothingSavable))
+                .lower(&mut lowerer, &[], &[], &[]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == "higher-order operation must be stored directly in the enclosing backend operation \
+                        family",
+            ),
+        ));
+
+        // An array IR call needs exactly its body region.
+        assert!(matches!(
+            operation.lower(&mut lowerer, &[], &[], &[]),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "rematerialize" && reason == "`rematerialize` expected 1 attached region but got 0",
+        ));
+    }
+
+    #[test]
+    fn test_rematerialize_operation_lower_inlines_body_effects_on_the_enclosing_token_chain() {
         // Rematerialization is a transform boundary, not an execution boundary. Lowering inlines its body, so prints
-        // immediately before, inside, and after the call must form one ordered-I/O token chain.
+        // immediately before, inside, and after the call must form one ordered I/O token chain.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let body = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -174,22 +289,26 @@ mod tests {
         let stablehlo =
             to_mlir_module_for_program(&program, &[], &scalar_type, &scalar_type, "main", None, None).unwrap();
 
-        assert_eq!(stablehlo.matches("stablehlo.after_all").count(), 1, "{stablehlo}");
-        assert_eq!(stablehlo.matches("@ryft.print").count(), 3, "{stablehlo}");
-        let print_lines = stablehlo.lines().filter(|line| line.contains("@ryft.print")).collect::<Vec<_>>();
-        assert!(print_lines[0].contains("label = \"before\""), "{stablehlo}");
-        assert!(print_lines[1].contains("label = \"body\""), "{stablehlo}");
-        assert!(print_lines[2].contains("label = \"after\""), "{stablehlo}");
-        assert!(print_lines[1].contains("%1)"), "{stablehlo}");
-        assert!(print_lines[2].contains("%2)"), "{stablehlo}");
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<f64>) -> tensor<f64> {
+                    %0 = stablehlo.after_all  : !stablehlo.token
+                    %1 = stablehlo.custom_call @ryft.print(%arg0, %0) {api_version = 4 : i32, backend_config = {label = "before"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                    %2 = stablehlo.custom_call @ryft.print(%arg0, %1) {api_version = 4 : i32, backend_config = {label = "body"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                    %3 = stablehlo.custom_call @ryft.print(%arg0, %2) {api_version = 4 : i32, backend_config = {label = "after"}, has_side_effect = true} : (tensor<f64>, !stablehlo.token) -> !stablehlo.token
+                    return %arg0 : tensor<f64>
+                  }
+                }
+            "#},
+        );
     }
 
     #[test]
-    fn test_rematerialize_lowering_rejects_capture_constants_in_its_body() {
-        use ryft_core::{NothingSavable, RematerializeOperation, ResidualPolicyReference};
-
-        // Rematerialized bodies are traced through fresh-root contexts and can therefore never legally reference the
-        // enclosing function's captures. A capture constant smuggled into such a body must fail loudly instead of
+    fn test_rematerialize_operation_lower_rejects_capture_constants_in_its_body() {
+        // Rematerialized bodies are traced through contexts with fresh roots and can therefore never legally reference
+        // the enclosing function's captures. A capture constant smuggled into such a body must fail loudly instead of
         // silently resolving against the enclosing function's capture prefix, which would alias whichever captured
         // value happens to occupy the referenced slot.
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -230,13 +349,11 @@ mod tests {
             None,
             None,
         );
-        assert!(matches!(result, Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: 0 })),));
+        assert!(matches!(result, Err(Error::Lowering(LoweringError::MissingCapturedConstant { index: 0 }))));
     }
 
     #[test]
-    fn test_rematerialize_lowering_places_an_input_barrier_on_differentiated_calls() {
-        use ryft_core::{NothingSavable, RematerializeOperation, ResidualPolicyReference};
-
+    fn test_rematerialize_operation_lower_places_an_input_barrier_on_differentiated_calls() {
         // Only a differentiated call whose optimization barrier is enabled wraps its inputs in a barrier, which keeps
         // XLA from merging the recomputation with the original computation.
         let scalar_type = ArrayType::scalar(DataType::F64);
@@ -292,9 +409,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialized_gradient_lowers_with_an_input_barrier_on_its_recomputation() {
-        use ryft_core::{differentiate_at, rematerialize};
-
+    fn test_rematerialize_operation_lower_gradient_with_an_input_barrier_on_its_recomputation() {
         // `jit(grad(rematerialize(x ↦ sin(x²))))` saves only `x`, so the backward computation recomputes `cos(x²)`
         // inside the differentiated call. Its optimization barrier, which is placed on the inputs of that call unless
         // it is disabled, keeps XLA from reusing the forward computation instead. When the barrier selects no input of
@@ -377,11 +492,9 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialized_higher_order_derivatives_lower_with_their_input_barriers() {
-        use ryft_core::{differentiate_at, rematerialize};
-
+    fn test_rematerialize_operation_lower_higher_order_derivatives_with_their_input_barriers() {
         // Differentiating the staged gradient of `rematerialize(x ↦ sin(x²))` again, in forward mode (i.e., a
-        // forward-over-reverse Hessian-vector product) or in reverse mode (i.e., the gradient of the gradient), keeps
+        // forward over reverse Hessian-vector product) or in reverse mode (i.e., the gradient of the gradient), keeps
         // differentiated calls, whose recomputations therefore stay behind optimization barriers.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let function = rematerialize(|x: Tracer<'static>| -> Result<Tracer<'static>, ProgramError> {
@@ -473,9 +586,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialized_gradient_lowers_with_rounded_bf16_residuals() {
-        use ryft_core::{EverythingSavable, differentiate_at, rematerialize};
-
+    fn test_rematerialize_operation_lower_gradient_with_rounded_bf16_residuals() {
         // Saving everything for `x ↦ sin(x)²` over `bf16` saves `sin(x)`, which the forward computation also squares.
         // It is rounded to `bf16` right after it is computed, so that XLA cannot use a more precise value for the
         // forward computation than the one that the backward computation receives.
@@ -514,9 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialized_gradient_lowers_with_offloaded_residuals() {
-        use ryft_core::{SaveAndOffloadOnlyTheseNames, TagOperation, differentiate_at, rematerialize};
-
+    fn test_rematerialize_operation_lower_gradient_with_offloaded_residuals() {
         // Offloading the value tagged `sine` of `x ↦ cos(tag(sin(x), "sine"))` to pinned host memory moves it to the
         // host once it is computed and back to the device right before the backward computation uses it.
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -558,9 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn test_executable_linear_call_lowering_inlines_only_the_forward_program() {
-        use ryft_core::LinearCallOperation;
-
+    fn test_linear_call_operation_lower_inlines_only_the_forward_program() {
         let vector_type = test_vector_type(4);
         let forward = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -608,8 +715,43 @@ mod tests {
             None,
         )
         .unwrap();
+        assert_eq!(
+            module,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<4xf32>, %arg1: tensor<4xf32>) -> tensor<4xf32> {
+                    %0 = stablehlo.multiply %arg0, %arg1 : tensor<4xf32>
+                    return %0 : tensor<4xf32>
+                  }
+                }
+            "#},
+        );
+    }
 
-        assert!(module.contains("stablehlo.multiply"), "{module}");
-        assert!(!module.contains("stablehlo.add"), "{module}");
+    #[test]
+    fn test_linear_call_operation_lower_rejects_malformed_instructions() {
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let block = context.block_with_no_arguments();
+
+        // The plain array family cannot carry the forward and transpose regions.
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        let expected_message =
+            "higher-order operation `linear_call` must be stored directly in the enclosing backend operation family";
+        assert!(matches!(
+            LinearCallOperation::<ArrayType>::new(1).lower(&mut lowerer, &[], &[], &[]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == expected_message,
+            ),
+        ));
+
+        // An array IR call needs exactly its forward and transpose regions.
+        assert!(matches!(
+            LinearCallOperation::<ArrayIrType>::new(1).lower(&mut lowerer, &[], &[], &[]),
+            Err(Error::Lowering(LoweringError::UnsupportedOperation { operation, reason }))
+                if operation == "linear_call" && reason == "`linear_call` expected 2 attached regions but got 0",
+        ));
     }
 }

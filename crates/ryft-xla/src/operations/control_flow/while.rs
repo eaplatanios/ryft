@@ -1,17 +1,17 @@
 //! Lowering of [`WhileOperation`] to [StableHLO `while`](https://openxla.org/stablehlo/spec#while).
 //!
-//! A while loop lowers only from the [`ArrayIrType`] operation family, which stores its condition and body regions; the
+//! A while loop lowers only from the [`ArrayIrType`] operation family, which stores its condition and body regions. The
 //! homogeneous [`ArrayType`] payload carries no regions and is rejected. The loop state of the lowered
-//! `stablehlo.while` is `[counter?, states..., predicate?, tokens...]`: an `i64` iteration counter when the loop has an
-//! iteration bound, the loop states, the carried predicate when the loop threads its predicate through its state, and
-//! one token per ordered effect class that either region uses. The predicate is threaded for a batched (non-scalar)
-//! predicate, which lowers with masked state updates, for an effectful condition, whose effects a `stablehlo.while`
-//! condition region cannot thread, and for a bounded loop, whose condition must not run once the bound is reached. A
-//! threaded predicate is evaluated once before the loop and once after each body run, while the pure condition of an
-//! unbounded loop with a scalar predicate is evaluated in the condition region directly. An entry guard checks the
-//! input relationships that the actual input types leave unproven before the loop, the results are normalized to the
-//! refined output types of the loop, and results whose types place them over explicit mesh axes are constrained to that
-//! placement. Reference state is discharged before lowering.
+//! `stablehlo.while` is `[counter?, states..., predicate?, tokens...]`, which holds an `i64` iteration counter when the
+//! loop has an iteration bound, the loop states, the carried predicate when the loop threads its predicate through its
+//! state, and one token per ordered effect class that either region uses. The predicate is threaded for a batched
+//! (i.e., non-scalar) predicate, which lowers with masked state updates, for an effectful condition, whose effects a
+//! `stablehlo.while` condition region cannot thread, and for a bounded loop, whose condition must not run once the
+//! bound is reached. A threaded predicate is evaluated once before the loop and once after each body run, while the
+//! pure condition of an unbounded loop with a scalar predicate is evaluated in the condition region directly. An entry
+//! guard checks the input relationships that the actual input types leave unproven before the loop, the results are
+//! normalized to the refined output types of the loop, and results whose types place them over explicit mesh axes are
+//! constrained to that placement. Reference state is discharged before lowering.
 
 use ryft_core::{
     ArrayIrType, ArrayType, ComparisonDirection, DataType, EffectClasses, Operation as CoreOperation, ProgramError,
@@ -39,11 +39,12 @@ use crate::{Error, LowerableOperation, LowerableOperationFamily, Lowerer};
 impl LowerableOperation for WhileOperation<ArrayType> {
     fn lower<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
         &self,
-        _lowerer: &mut Lowerer<'b, 'c, 't, O>,
-        _input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
-        _output_types: &[ArrayType],
+        lowerer: &mut Lowerer<'b, 'c, 't, O>,
+        input_values: &[ValueRef<'b, 'c, 't>],
+        input_types: &[ArrayType],
+        output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = (lowerer, input_values, input_types, output_types);
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "higher-order operation `{}` must be stored directly in the enclosing backend operation family",
@@ -69,9 +70,9 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
         //      is then converted from its actual type to its state type.
         //   2. A threaded predicate is evaluated once on the entry state, and the tokens of the threaded effect classes
         //      enter the loop state after it.
-        //   3. The condition region reads (and reduces) a threaded predicate or evaluates a pure condition, and
-        //      conjoins the iteration bound. The body region runs the body, masks the state updates of a batched
-        //      predicate, and re-evaluates a threaded predicate unless the bound is reached.
+        //   3. The condition region reads a threaded predicate, which it reduces when the predicate is batched, or
+        //      evaluates a pure condition, and conjoins the iteration bound. The body region runs the body, masks the
+        //      state updates of a batched predicate, and re-evaluates a threaded predicate unless the bound is reached.
         //   4. The trailing token results become the current tokens of the enclosing scope, the state results are
         //      normalized to the refined `output_types` of the loop, and each result whose type places it over an
         //      explicit mesh axis is constrained to that placement.
@@ -79,9 +80,12 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
         // The program that attaches the loop validated its regions, their signatures, and its input count, so a
         // mismatch here is an internal error, reported as the operation's own region contract and input count would
         // report it.
-        self.validate_region_count(lowerer.regions.len())?;
-        let (condition, body) = (&lowerer.regions[0], &lowerer.regions[1]);
-        let (context, location) = (lowerer.context, lowerer.location);
+        self.validate_region_count(lowerer.regions().len())?;
+        let (context, location) = (lowerer.context(), lowerer.location());
+        let block = &mut lowerer.block();
+        let (effect_tokens, regions, captured_values, nested_functions, collective_state) =
+            lowerer.split_effect_tokens();
+        let (condition, body) = (&regions[0], &regions[1]);
         let state_types = body.input_types();
         let state_count = state_types.len();
         for actual in [input_values.len(), input_types.len()] {
@@ -89,11 +93,6 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
                 return Err(ProgramError::InvalidInputCount { expected: state_count, actual }.into());
             }
         }
-        let captured_values = lowerer.captured_values.as_slice();
-        let nested_functions = lowerer.nested_functions.as_ref();
-        let collective_state = &lowerer.collective_state;
-        let block = &mut lowerer.block;
-        let effect_tokens = &mut lowerer.effect_tokens;
 
         // The condition and the body share the loop state's declared types. Guarding the initial entry before the loop
         // checks what eager entry validation checks, because later iterations enter with the body's own typed outputs.
@@ -117,23 +116,24 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let input_values = input_values.as_slice();
-        // A batched (non-scalar) predicate lowers with the masked semantics owned by this primitive, mirroring JAX's
-        // `_while_lowering`. Rather than re-evaluating the condition in both regions, the per-item predicate is
-        // threaded through the loop state as one extra carried value (JAX's `(pred, ..., carry)` layout): the condition
-        // region only reduces the carried predicate with a Boolean `or` into the scalar continuation decision, and the
-        // body region selects per state element between the body's candidate update and the carried (incoming-state)
-        // predicate, then recomputes the predicate on the updated state for the next iteration. The condition is
-        // therefore evaluated exactly once per iteration (plus once before the loop to seed the initial predicate),
-        // never twice. A batched-predicate loop is always pure (the while signature validation rejects effects in a
-        // batched-predicate loop, since observable effects cannot be masked for finished items), so predicate threading
-        // and token threading never coexist.
+        // A batched (i.e., non-scalar) predicate lowers with the masked semantics owned by this primitive, mirroring
+        // JAX's `_while_lowering`. Rather than re-evaluating the condition in both regions, the predicate of each batch
+        // item is threaded through the loop state as one extra carried value, as in JAX's `(pred, ..., carry)` layout.
+        // The condition region only reduces the carried predicate with a Boolean `or` into the scalar continuation
+        // decision, and the body region selects per state element between the body's candidate update and the carried
+        // predicate of the incoming state, then recomputes the predicate on the updated state for the next iteration.
+        // The condition is therefore evaluated exactly once per iteration, plus once before the loop to seed the
+        // initial predicate, and never twice. A loop with a batched predicate is always pure, because the while
+        // signature validation rejects its effects, which cannot be masked for finished batch items. Predicate
+        // threading and token threading therefore never coexist.
         let condition_output_types = condition.output_types();
         let predicate_type = <&ArrayType>::try_from(&condition_output_types[0]).map_err(ProgramError::from)?.clone();
         let batched_predicate = predicate_type.rank() > 0;
-        // StableHLO's while-condition region can return only the continuation predicate, not updated effect tokens.
-        // Therefore, an effectful scalar condition is evaluated before the loop and after each body execution, with its
-        // predicate carried through the loop state. This preserves exactly-once condition effects and lets the body
-        // return their updated tokens. Batched predicates already use the same carried-predicate shape for masking.
+        // The condition region of a StableHLO `while` can return only the continuation predicate, not updated effect
+        // tokens. Therefore, an effectful scalar condition is evaluated before the loop and after each body execution,
+        // with its predicate carried through the loop state. This runs the condition effects exactly once per
+        // evaluation and lets the body return their updated tokens. Batched predicates already carry their predicate
+        // the same way for masking.
         let condition_effects = lowered_effect_classes(condition)?;
         let iteration_bound = self.iteration_bound();
         // Bounded loops also thread pure predicates so reaching the bound skips the condition computation entirely,
@@ -142,15 +142,17 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
         let predicate_dimensions = (0..predicate_type.rank()).collect::<Vec<_>>();
         let predicate_offset = if threaded_predicate { 1 } else { 0 };
         // A semantic iteration bound is enforced by threading an internal `i64` iteration counter through the
-        // `stablehlo.while` state (element 0, starting at zero and incremented once per body run) and conjoining
-        // `counter < bound` into the lowered condition. The counter is internal extra state: the operation's outputs
-        // remain exactly the original state elements. Unbounded loops emit no counter machinery at all.
+        // `stablehlo.while` state as element 0, which starts at zero and is incremented once per body run, and by
+        // conjoining `counter < bound` into the lowered condition. The counter is internal extra state, so the
+        // operation's outputs remain exactly the original state elements. Unbounded loops emit no counter machinery at
+        // all.
         let counter_offset = if iteration_bound.is_some() { 1 } else { 0 };
         // Carry one trailing token for each ordered class used by either nested program. Each class advances
-        // independently through the body; a body that is pure for one active class returns that class's entry token
-        // unchanged.
+        // independently through the body, and a body that is pure for one active class returns that class's entry
+        // token unchanged.
         let threaded_effects = condition_effects.union(lowered_effect_classes(body)?);
-        // State layout: `[counter?, states..., predicate?, ordered-effect tokens...]`.
+        // The loop state is laid out as `[counter?, states..., predicate?, tokens...]`, with one token per threaded
+        // ordered effect class.
         let predicate_index = counter_offset + state_count;
         let token_start_index = counter_offset + state_count + predicate_offset;
         let mut full_state_types = Vec::with_capacity(counter_offset + state_count + predicate_offset);
@@ -204,7 +206,7 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
         {
             let mut condition_block_ref = condition_block.as_ref();
             // A threaded predicate is read from the loop state. Batched predicates are reduced with Boolean `or`, so
-            // the loop continues while any mapped item remains active; effectful scalar predicates are already scalar.
+            // the loop continues while any batch item remains active. Effectful scalar predicates are already scalar.
             // Pure unbounded scalar predicates retain the smaller representation and are evaluated directly in this
             // region.
             let loop_predicate = if threaded_predicate {
@@ -297,8 +299,8 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
                 collective_state,
                 &mut body_effect_tokens,
             )?;
-            // For a batched predicate, mask each carry update under the carried (incoming-state) predicate so finished
-            // items freeze. A scalar loop uses the body outputs directly.
+            // For a batched predicate, mask each carry update under the carried predicate of the incoming state, so
+            // finished batch items freeze. A scalar loop uses the body outputs directly.
             let next_state_values = if batched_predicate {
                 let carried_predicate = body_block_ref.argument(predicate_index).unwrap().as_ref();
                 body_outputs
@@ -306,16 +308,16 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
                     .zip(body_inputs.iter())
                     .zip(state_types.iter())
                     .map(|((candidate, carried), state_type)| {
-                        // A first-class dimension carry is loop-invariant under a batched predicate (the contract
-                        // documented on `WhileType`), so masking it is the identity and the body's candidate result is
-                        // threaded on directly. This matches eager interpretation, whose `select` returns equal
-                        // dimension carries unchanged.
+                        // A first-class dimension carry is loop invariant under a batched predicate, which is the
+                        // contract that `WhileType` documents, so masking it is the identity and the body's candidate
+                        // result is threaded on directly. This matches eager interpretation, whose `select` returns
+                        // equal dimension carries unchanged.
                         if matches!(state_type, ArrayIrType::Dimension(_)) {
                             return Ok(candidate);
                         }
                         let state_type = <&ArrayType>::try_from(state_type).map_err(ProgramError::from)?;
-                        // The predicate broadcasts to each state element's shape along its leading (prefix) axes; a
-                        // state element already shaped like the predicate reuses it directly.
+                        // The predicate broadcasts to each state element's shape along its leading axes, and a state
+                        // element already shaped like the predicate reuses it directly.
                         let element_mask = if state_type.shape() == predicate_type.shape() {
                             carried_predicate
                         } else {
@@ -409,9 +411,9 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
             } else {
                 None
             };
-            // Recompute a threaded predicate after the body. At the semantic bound, the condition must not run again:
-            // eager interpretation checks the bound before evaluating it. An extra evaluation could cause observable
-            // effects or diverge even when the condition is pure.
+            // Recompute a threaded predicate after the body. At the semantic bound, the condition must not run again,
+            // because eager interpretation checks the bound before evaluating it. An extra evaluation could cause
+            // observable effects or diverge even when the condition is pure.
             // The guarded branch returns the predicate and every active token, forwarding the incoming tokens unchanged
             // when the bound is reached. The carried predicate is immaterial then because the counter ends the loop.
             let next_predicate = if threaded_predicate {
@@ -497,7 +499,13 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
         let results =
             (0..state_count).map(|index| operation.result(counter_offset + index).unwrap().as_ref()).collect();
         let results = lower_refined_region_outputs(results, &state_types, output_types, block, context, location)?;
-        lower_explicit_sharding_constraints(results, output_types, &collective_state.bound_manual_axes, block, location)
+        lower_explicit_sharding_constraints(
+            results,
+            output_types,
+            collective_state.bound_manual_axes(),
+            block,
+            location,
+        )
     }
 }
 
@@ -506,12 +514,14 @@ mod tests {
     use indoc::{formatdoc, indoc};
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, AddOperation, AssertOperation, BatchAxis, Compare, CompareOperation, Device, DeviceMesh,
-        Dimension as CoreDimension, DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable,
-        DynamicBroadcastOperation, LogicalMesh, MeshAxis, MeshAxisType, NegOperation, OneLikeOperation, Placeholder,
-        PrintOperation, Shape, Sharding, ShardingDimension, SubOperation, TypedProgram, WhileOptions, batch, r#while,
+        Add, AddOperation, AssertOperation, BatchAxis, Compare, CompareOperation, Dimension as CoreDimension,
+        DimensionBounds, DimensionSizeOperation, DimensionType, DimensionVariable, DynamicBroadcastOperation,
+        MeshAxisType, NegOperation, OneLikeOperation, Placeholder, PrintOperation, Shape, Sharding, ShardingDimension,
+        SubOperation, WhileOptions, batch, r#while,
     };
+    use ryft_mlir::{Context as MlirContext, Location};
 
+    use crate::domains::tests::{domain_mesh, program_array, read_f32s};
     use crate::lowering::tests::{
         MixedValue, dynamic_dimension, execute_mixed_program, identity_branch, unproject_plain_program,
     };
@@ -519,14 +529,14 @@ mod tests {
         compare, execute_on_two_devices, lowered_mixed_module, positive, two_device_mesh,
     };
     use crate::operations::debugging::{ensure_print_handler_registered, with_captured_prints};
-    use crate::operations::{Operation, ProgramBuilder as ArrayIrProgramBuilder};
-    use crate::tests::{execution_client, values_from_bytes, values_to_bytes};
-    use crate::{Array, Constant, FromPjrt, Session, Value, to_mlir_module_for_program};
+    use crate::operations::{FlatProgram, Operation, ProgramBuilder as ArrayIrProgramBuilder};
+    use crate::tests::{execution_client, replicated_array, values_to_bytes};
+    use crate::{Constant, Session, Value, to_mlir_module_for_program};
 
     use super::*;
 
     #[test]
-    fn test_while_lowering() {
+    fn test_while_operation_lower() {
         // An unbounded loop with a pure scalar condition evaluates its condition in the condition region and threads
         // only its states through the loop.
         let state_type = ArrayType::scalar(DataType::Boolean);
@@ -566,8 +576,55 @@ mod tests {
     }
 
     #[test]
-    fn test_while_lowering_bounded() {
-        // A semantic iteration bound threads an internal i64 counter through the `stablehlo.while` state: the
+    fn test_while_operation_lower_rejects_malformed_instructions() {
+        let context = MlirContext::new();
+        let location = context.unknown_location().as_ref();
+        let block = context.block_with_no_arguments();
+        let state_type = ArrayType::scalar(DataType::Boolean);
+        let regions = vec![
+            unproject_plain_program(identity_branch(state_type.clone())),
+            unproject_plain_program(identity_branch(state_type)),
+        ];
+
+        // The plain array family cannot carry the condition and body regions, so loops lower only from the array IR
+        // family.
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(regions.clone());
+        let expected_message =
+            "higher-order operation `while` must be stored directly in the enclosing backend operation family";
+        assert!(matches!(
+            WhileOperation::<ArrayType>::new().lower(&mut lowerer, &[], &[], &[]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::UnsupportedOperation { message })
+                    if *message == expected_message,
+            ),
+        ));
+
+        // An array IR loop needs exactly one condition region and one body region.
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(Vec::<FlatProgram>::new());
+        assert!(matches!(
+            WhileOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::MalformedProgram(message))
+                    if *message == "operation `while` declares 2 region slots but 0 regions were attached",
+            ),
+        ));
+
+        // It also needs one input per loop state.
+        let mut lowerer = Lowerer::new(block.as_ref(), &context, location).with_regions(regions);
+        assert!(matches!(
+            WhileOperation::<ArrayIrType>::new().lower(&mut lowerer, &[], &[], &[]),
+            Err(Error::Core(core_error)) if matches!(
+                core_error.as_ref(),
+                ryft_core::Error::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_while_operation_lower_bounded() {
+        // A semantic iteration bound threads an internal `i64` counter through the `stablehlo.while` state. The
         // condition region conjoins `counter < bound` into the original predicate via `stablehlo.compare` plus
         // `stablehlo.and`, and the body region increments the counter via `stablehlo.add`. The operation's outputs
         // remain the original state elements.
@@ -618,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_lowering_forwards_dimension_carries() {
+    fn test_while_operation_lower_forwards_dimension_carries() {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
         let dynamic_vector_type =
@@ -717,10 +774,10 @@ mod tests {
     }
 
     #[test]
-    fn test_while_execution_converts_refined_static_state_inputs() {
+    fn test_while_operation_lower_execution_converts_refined_static_state_inputs() {
         // A loop input only needs to refine its state type, so a static `f64[3]` initial state feeds a loop state with
         // the bounded dynamic type `f64[rows]`. The static input is padded to the bound of the state type and given its
-        // extent as its runtime size before it enters the loop. Because `rows` is loop-invariant, the outputs take its
+        // extent as its runtime size before it enters the loop. Because `rows` is loop invariant, the outputs take its
         // static extent, so the bounded loop results are sliced back to `f64[3]`. One iteration computes `[a, a + b]`.
         // The dynamic input leaves `rows = 3` unproven, so an entry guard checks its runtime size before the loop.
         let static_type = ArrayType::new_static(DataType::F64, [3]);
@@ -853,7 +910,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_execution_converts_partially_refined_state_inputs() {
+    fn test_while_operation_lower_execution_converts_partially_refined_state_inputs() {
         // The second state has the type `f64[rows, cols]` and is fed an `f64[rows, 3]` input, so only `cols` is refined
         // while `rows` stays dynamic. The input conversion keeps the runtime size of `rows` and gives `cols` its static
         // extent, and the outputs take the type `f64[rows, 3]`, so the results are sliced along `cols` while keeping
@@ -923,7 +980,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_lowering_threads_effectful_conditions() {
+    fn test_while_operation_lower_threads_effectful_conditions() {
         // StableHLO condition regions cannot return tokens. The lowering therefore evaluates an effectful scalar
         // condition once before the loop and once after each body execution, carrying its predicate through the loop
         // state so assertions and prints remain on their independent enclosing effect chains.
@@ -1011,7 +1068,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_execution_stops_condition_effects_at_the_bound() {
+    fn test_while_operation_lower_execution_stops_condition_effects_at_the_bound() {
         // A false entry predicate runs the condition once, natural termination runs it once more than the body,
         // and truncation at the bound runs it only before each permitted body execution.
         let state_type = ArrayType::scalar(DataType::F64);
@@ -1069,14 +1126,15 @@ mod tests {
     }
 
     #[test]
-    fn test_while_execution_batched_predicate() {
-        // A batched (per-item) predicate lowers with masked semantics: the loop carries the `bool[3]` predicate through
-        // its state, so the condition is evaluated once before the loop and once after each body run, the condition
-        // region `or`-reduces the carried predicate into the scalar continuation decision, and the body selects per
-        // item between the body's candidate update and the carried state, freezing finished items. The predicate shape
-        // equals the state shape here, so no broadcast is needed for the mask. The countdown `while (x > 0) { x - 1 }`
-        // over the items `[3, 1, 2]` terminates them after 3, 1, and 2 iterations, so all of them land at 0, whereas a
-        // masking bug (or a rejoining finished item) would leave nonzero or negative items.
+    fn test_while_operation_lower_execution_batched_predicate() {
+        // A batched predicate, which holds one value per batch item, lowers with masked semantics. The loop carries the
+        // `bool[3]` predicate through its state, so the condition is evaluated once before the loop and once after
+        // each body run, the condition region `or`-reduces the carried predicate into the scalar continuation
+        // decision, and the body selects per batch item between the body's candidate update and the carried state,
+        // freezing finished batch items. The predicate shape equals the state shape here, so no broadcast is needed for
+        // the mask. The countdown `while (x > 0) { x - 1 }` over the items `[3, 1, 2]` terminates them after 3, 1, and
+        // 2 iterations, so all of them land at 0, whereas a masking bug or a finished item that rejoins the loop would
+        // leave nonzero or negative items.
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![CoreDimension::Static(3)]));
         let condition = {
             let mut builder = ArrayIrProgramBuilder::new();
@@ -1152,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_lowering_batched_predicate_broadcasts_masks_over_dynamic_axes() {
+    fn test_while_operation_lower_batched_predicate_broadcasts_masks_over_dynamic_axes() {
         // A bounded state axis gives each dynamic mask axis the actual extent of the state with
         // `stablehlo.set_dimension_size`, rather than its capacity, and an unbounded one broadcasts the mask to the
         // runtime shape of the state with `stablehlo.dynamic_broadcast_in_dim`.
@@ -1330,11 +1388,11 @@ mod tests {
     }
 
     #[test]
-    fn test_while_lowering_batched_predicate_passes_loop_invariant_dimensions() {
-        // A batched-predicate loop may also carry a first-class dimension, which the relaxed `WhileType` contract
-        // requires to be loop-invariant. Masking a loop-invariant carry is the identity, so the lowering threads the
-        // body's dimension result on directly: only the array carry gets a `stablehlo.select`, while the condition
-        // region still `or`-reduces the per-item predicate into the scalar continuation decision.
+    fn test_while_operation_lower_batched_predicate_passes_loop_invariant_dimensions() {
+        // A loop with a batched predicate may also carry a first-class dimension, which the relaxed `WhileType`
+        // contract requires to be loop invariant. Masking a carry that is loop invariant is the identity, so the
+        // lowering threads the body's dimension result on directly. Only the array carry gets a `stablehlo.select`,
+        // while the condition region still `or`-reduces the batched predicate into the scalar continuation decision.
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let extent_type = DimensionType::from(extent.clone());
         let dynamic_vector_type = ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Dynamic(extent)]));
@@ -1402,7 +1460,7 @@ mod tests {
         .unwrap();
 
         // The condition region `or`-reduces the carried `tensor<3xi1>` predicate, the array carry takes one
-        // `stablehlo.select` against the carried predicate, and the dimension carry (`%iterArg`) is returned
+        // `stablehlo.select` against the carried predicate, and the dimension carry (i.e., `%iterArg`) is returned
         // unmasked exactly as the body produced it.
         assert_eq!(
             stablehlo,
@@ -1438,7 +1496,7 @@ mod tests {
     }
 
     #[test]
-    fn test_while_lowering_constrains_explicit_output_shardings() {
+    fn test_while_operation_lower_constrains_explicit_output_shardings() {
         // The body negates an `f32[8]` vector sharded over the explicit mesh axis `x` while it counts its iterations up
         // to a replicated limit. Each result of the loop is constrained to the placement that its type states.
         let (client, mesh) = two_device_mesh(MeshAxisType::Explicit);
@@ -1563,27 +1621,18 @@ mod tests {
     }
 
     #[test]
-    fn test_while_execution_batched_under_eager_parent() {
+    fn test_while_operation_lower_execution_batched_under_eager_parent() {
         // Batching over eager array IR values threads the batch extent through the loop state, so the batched loop that
         // eager dispatch compiles returns that first-class dimension, which eager dispatch rebuilds on the host.
         let client = execution_client();
-        let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
-        let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
-        let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain();
         let value = |dimensions: &[usize], values: &[f32]| {
-            let r#type = ArrayType::new_static(DataType::F32, dimensions.to_vec())
-                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
-                .unwrap();
-            Value::Array(
-                Array::from_host_buffer(&domain, r#type, mesh.clone(), values_to_bytes(values).as_slice()).unwrap(),
-            )
+            Value::Array(replicated_array(&domain, &mesh, DataType::F32, dimensions, &values_to_bytes(values)))
         };
         let read = |value: Value<'_>| {
-            let Value::Array(array) = value else { panic!("expected an array result") };
-            let shard = array.addressable_shards().next().unwrap();
-            let bytes = shard.buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
-            (array.shape().dimensions().to_vec(), values_from_bytes::<f32>(bytes.as_slice()))
+            let array = program_array(&value);
+            (array.shape().dimensions().to_vec(), read_f32s(&client, array))
         };
         let (state, limit) = batch(
             |(state, limit)| {

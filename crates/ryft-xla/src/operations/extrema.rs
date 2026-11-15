@@ -13,28 +13,29 @@ impl LowerableOperation for MaxOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
+        input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
         let [left, right] = normalize_binary_elementwise_operands(
             input_values,
             output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
         )?;
         // Floating-point values take the form of the target, because the native operation does not propagate NaNs
         // or order the signed zeros on every backend (e.g., XLA's CPU backend returns its left-hand side input when
         // the right-hand side one is a NaN and for a tie between the signed zeros).
-        let form = FloatExtremumForm::for_elementwise(lowerer.collective_state.target_platform());
+        let form = FloatExtremumForm::for_elementwise(lowerer.collective_state().target_platform());
         Ok(vec![lower_extremum_to_mlir(
             true,
             output_types[0].data_type(),
             left,
             right,
             form,
-            &mut lowerer.block,
-            lowerer.location,
+            &mut lowerer.block(),
+            lowerer.location(),
         )?])
     }
 }
@@ -44,28 +45,29 @@ impl LowerableOperation for MinOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
+        input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
         let [left, right] = normalize_binary_elementwise_operands(
             input_values,
             output_types,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
         )?;
         // Floating-point values take the form of the target, because the native operation does not propagate NaNs
         // or order the signed zeros on every backend (e.g., XLA's CPU backend returns its left-hand side input when
         // the right-hand side one is a NaN and for a tie between the signed zeros).
-        let form = FloatExtremumForm::for_elementwise(lowerer.collective_state.target_platform());
+        let form = FloatExtremumForm::for_elementwise(lowerer.collective_state().target_platform());
         Ok(vec![lower_extremum_to_mlir(
             false,
             output_types[0].data_type(),
             left,
             right,
             form,
-            &mut lowerer.block,
-            lowerer.location,
+            &mut lowerer.block(),
+            lowerer.location(),
         )?])
     }
 }
@@ -75,18 +77,19 @@ impl LowerableOperation for ClampOperation<ArrayType> {
         &self,
         lowerer: &mut Lowerer<'b, 'c, 't, O>,
         input_values: &[ValueRef<'b, 'c, 't>],
-        _input_types: &[ArrayType],
+        input_types: &[ArrayType],
         output_types: &[ArrayType],
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, Error> {
+        let _ = input_types;
         check_count!("input", input_values, 3, ProgramError);
         check_count!("output", output_types, 1, ProgramError);
         let output_type = &output_types[0];
         let input = normalize_elementwise_operand(
             input_values[1],
             output_type,
-            &mut lowerer.block,
-            lowerer.context,
-            lowerer.location,
+            &mut lowerer.block(),
+            lowerer.context(),
+            lowerer.location(),
         )?;
         let data_type = output_type.data_type();
         if data_type.is_complex() || data_type.is_floating_point() {
@@ -96,25 +99,31 @@ impl LowerableOperation for ClampOperation<ArrayType> {
             // lowerings below propagate the NaNs of the input and of both bounds, order the signed zeros, and order
             // complex values lexicographically like the reference backend.
             let [lower, upper] = [input_values[0], input_values[2]].map(|bound| {
-                normalize_elementwise_operand(bound, output_type, &mut lowerer.block, lowerer.context, lowerer.location)
+                normalize_elementwise_operand(
+                    bound,
+                    output_type,
+                    &mut lowerer.block(),
+                    lowerer.context(),
+                    lowerer.location(),
+                )
             });
             let (lower, upper) = (lower?, upper?);
-            let form = FloatExtremumForm::for_elementwise(lowerer.collective_state.target_platform());
+            let form = FloatExtremumForm::for_elementwise(lowerer.collective_state().target_platform());
             let clamped_below =
-                lower_extremum_to_mlir(true, data_type, input, lower, form, &mut lowerer.block, lowerer.location)?;
+                lower_extremum_to_mlir(true, data_type, input, lower, form, &mut lowerer.block(), lowerer.location())?;
             return Ok(vec![lower_extremum_to_mlir(
                 false,
                 data_type,
                 clamped_below,
                 upper,
                 form,
-                &mut lowerer.block,
-                lowerer.location,
+                &mut lowerer.block(),
+                lowerer.location(),
             )?]);
         }
 
         // Integer and Boolean values use one `stablehlo.clamp`, which accepts scalar bounds or bounds with the
-        // operand's shape, so rank-zero bounds keep their rank and only convert their element type, while every other
+        // operand's shape, so rank-0 bounds keep their rank and only convert their element type, while every other
         // bound is broadcast to the result type.
         let mut bounds = [input_values[0], input_values[2]];
         for bound in &mut bounds {
@@ -123,14 +132,16 @@ impl LowerableOperation for ClampOperation<ArrayType> {
             *bound = normalize_elementwise_operand(
                 *bound,
                 &bound_type,
-                &mut lowerer.block,
-                lowerer.context,
-                lowerer.location,
+                &mut lowerer.block(),
+                lowerer.context(),
+                lowerer.location(),
             )?;
         }
         let result =
-            lowerer.block.append_operation(stable_hlo::clamp(bounds[0], input, bounds[1], lowerer.location)?)?;
-        Ok(vec![result.result(0).expect("stablehlo.clamp should return one result").as_ref()])
+            lowerer
+                .block()
+                .append_operation(stable_hlo::clamp(bounds[0], input, bounds[1], lowerer.location())?)?;
+        Ok(vec![result.result(0).unwrap().as_ref()])
     }
 }
 
@@ -163,7 +174,7 @@ impl FloatExtremumForm {
     /// Returns the [`FloatExtremumForm`] of scalar combiner bodies (e.g., of reductions) that are lowered for the
     /// PJRT platform named `target_platform`. CUDA uses [`FloatExtremumForm::Native`], because XLA's GPU compiler
     /// fuses reductions and the elementwise operations around them into Triton kernels (e.g., a maximum reduction
-    /// that is followed by the rest of a softmax), and its Triton code generation fails on the total-order
+    /// that is followed by the rest of a softmax), and its Triton code generation fails on the total order
     /// comparisons of [`FloatExtremumForm::TotalOrder`], which makes every such program fail to compile. Every other
     /// target, and the absence of a target, uses [`FloatExtremumForm::TotalOrder`]. The native form is not a combiner
     /// that XLA can distribute, so the lowering of a reduction whose dimensions can be sharded prefers the integer
@@ -183,10 +194,10 @@ impl FloatExtremumForm {
     }
 }
 
-/// Lowers one JAX-compatible minimum or maximum. Integer and Boolean values use the corresponding StableHLO
-/// operation. Floating-point values use the provided [`FloatExtremumForm`] and explicit NaN propagation, so that every
-/// XLA backend preserves IEEE signed-zero and NaN semantics. Complex values use JAX's lexicographic
-/// `(real, imaginary)` compare/select sequence.
+/// Lowers one minimum or maximum that is compatible with JAX. Integer and Boolean values use the corresponding
+/// StableHLO operation. Floating-point values use the provided [`FloatExtremumForm`] and explicit NaN propagation, so
+/// that every XLA backend preserves the IEEE semantics of signed zeros and NaNs. Complex values use JAX's
+/// lexicographic `(real, imaginary)` compare/select sequence.
 pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
     maximum: bool,
     element_type: DataType,
@@ -202,7 +213,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
         } else {
             block.append_operation(stable_hlo::minimum(left, right, location)?)?
         };
-        return Ok(result.result(0).expect("stablehlo extremum should return one result").as_ref());
+        return Ok(result.result(0).unwrap().as_ref());
     }
     if element_type.is_floating_point() {
         let direction = if maximum {
@@ -219,7 +230,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
                 };
                 let ordered =
                     block.append_operation(stable_hlo::compare(left, right, direction, comparison_type, location)?)?;
-                let ordered = ordered.result(0).expect("stablehlo.compare should return one result").as_ref();
+                let ordered = ordered.result(0).unwrap().as_ref();
                 block.append_operation(stable_hlo::select(ordered, left, right, location)?)?
             }
             FloatExtremumForm::Native if maximum => {
@@ -227,7 +238,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
             }
             FloatExtremumForm::Native => block.append_operation(stable_hlo::minimum(left, right, location)?)?,
         };
-        let mut result = result.result(0).expect("stablehlo extremum should return one result").as_ref();
+        let mut result = result.result(0).unwrap().as_ref();
 
         if form == FloatExtremumForm::Arithmetic {
             // The ordinary comparison treats the signed zeros as equal, so a tie between two zeros is resolved by
@@ -236,7 +247,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
             // only when both are, which is their maximum, and the negated difference `-((-left) - right)` is positive
             // zero only when both are, which is their minimum.
             let negated_left = block.append_operation(stable_hlo::negate(left, location)?)?;
-            let negated_left = negated_left.result(0).expect("stablehlo.negate should return one result").as_ref();
+            let negated_left = negated_left.result(0).unwrap().as_ref();
             let equal = block.append_operation(stable_hlo::compare(
                 left,
                 right,
@@ -244,7 +255,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
                 stable_hlo::ComparisonType::Float,
                 location,
             )?)?;
-            let equal = equal.result(0).expect("stablehlo.compare should return one result").as_ref();
+            let equal = equal.result(0).unwrap().as_ref();
             let left_is_zero = block.append_operation(stable_hlo::compare(
                 left,
                 negated_left,
@@ -252,19 +263,19 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
                 stable_hlo::ComparisonType::Float,
                 location,
             )?)?;
-            let left_is_zero = left_is_zero.result(0).expect("stablehlo.compare should return one result").as_ref();
+            let left_is_zero = left_is_zero.result(0).unwrap().as_ref();
             let both_zero = block.append_operation(stable_hlo::and(equal, left_is_zero, location)?)?;
-            let both_zero = both_zero.result(0).expect("stablehlo.and should return one result").as_ref();
+            let both_zero = both_zero.result(0).unwrap().as_ref();
             let zero = if maximum {
                 block.append_operation(stable_hlo::add(left, right, location)?)?
             } else {
                 let difference = block.append_operation(stable_hlo::subtract(negated_left, right, location)?)?;
-                let difference = difference.result(0).expect("stablehlo.subtract should return one result").as_ref();
+                let difference = difference.result(0).unwrap().as_ref();
                 block.append_operation(stable_hlo::negate(difference, location)?)?
             };
-            let zero = zero.result(0).expect("stablehlo arithmetic should return one result").as_ref();
+            let zero = zero.result(0).unwrap().as_ref();
             let selected = block.append_operation(stable_hlo::select(both_zero, zero, result, location)?)?;
-            result = selected.result(0).expect("stablehlo.select should return one result").as_ref();
+            result = selected.result(0).unwrap().as_ref();
         }
 
         // Some XLA backends implement native min/max using instructions that drop NaNs or do not distinguish signed
@@ -277,7 +288,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
             stable_hlo::ComparisonType::Float,
             location,
         )?)?;
-        let left_is_nan = left_is_nan.result(0).expect("stablehlo.compare should return one result").as_ref();
+        let left_is_nan = left_is_nan.result(0).unwrap().as_ref();
         let right_is_nan = block.append_operation(stable_hlo::compare(
             right,
             right,
@@ -285,21 +296,21 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
             stable_hlo::ComparisonType::Float,
             location,
         )?)?;
-        let right_is_nan = right_is_nan.result(0).expect("stablehlo.compare should return one result").as_ref();
+        let right_is_nan = right_is_nan.result(0).unwrap().as_ref();
         let right_or_result = block.append_operation(stable_hlo::select(right_is_nan, right, result, location)?)?;
-        let right_or_result = right_or_result.result(0).expect("stablehlo.select should return one result").as_ref();
+        let right_or_result = right_or_result.result(0).unwrap().as_ref();
         let result = block.append_operation(stable_hlo::select(left_is_nan, left, right_or_result, location)?)?;
-        return Ok(result.result(0).expect("stablehlo.select should return one result").as_ref());
+        return Ok(result.result(0).unwrap().as_ref());
     }
 
     let left_real = block.append_operation(stable_hlo::real(left, location)?)?;
-    let left_real = left_real.result(0).expect("stablehlo.real should return one result").as_ref();
+    let left_real = left_real.result(0).unwrap().as_ref();
     let right_real = block.append_operation(stable_hlo::real(right, location)?)?;
-    let right_real = right_real.result(0).expect("stablehlo.real should return one result").as_ref();
+    let right_real = right_real.result(0).unwrap().as_ref();
     let left_imaginary = block.append_operation(stable_hlo::imag(left, location)?)?;
-    let left_imaginary = left_imaginary.result(0).expect("stablehlo.imag should return one result").as_ref();
+    let left_imaginary = left_imaginary.result(0).unwrap().as_ref();
     let right_imaginary = block.append_operation(stable_hlo::imag(right, location)?)?;
-    let right_imaginary = right_imaginary.result(0).expect("stablehlo.imag should return one result").as_ref();
+    let right_imaginary = right_imaginary.result(0).unwrap().as_ref();
     let real_equal = block.append_operation(stable_hlo::compare(
         left_real,
         right_real,
@@ -307,7 +318,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
         stable_hlo::ComparisonType::Float,
         location,
     )?)?;
-    let real_equal = real_equal.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let real_equal = real_equal.result(0).unwrap().as_ref();
     let direction =
         if maximum { stable_hlo::ComparisonDirection::GreaterThan } else { stable_hlo::ComparisonDirection::LessThan };
     let real_ordered = block.append_operation(stable_hlo::compare(
@@ -317,7 +328,7 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
         stable_hlo::ComparisonType::Float,
         location,
     )?)?;
-    let real_ordered = real_ordered.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let real_ordered = real_ordered.result(0).unwrap().as_ref();
     let imaginary_ordered = block.append_operation(stable_hlo::compare(
         left_imaginary,
         right_imaginary,
@@ -325,11 +336,11 @@ pub(crate) fn lower_extremum_to_mlir<'b, 'c: 'b, 't: 'c>(
         stable_hlo::ComparisonType::Float,
         location,
     )?)?;
-    let imaginary_ordered = imaginary_ordered.result(0).expect("stablehlo.compare should return one result").as_ref();
+    let imaginary_ordered = imaginary_ordered.result(0).unwrap().as_ref();
     let ordered = block.append_operation(stable_hlo::select(real_equal, imaginary_ordered, real_ordered, location)?)?;
-    let ordered = ordered.result(0).expect("stablehlo.select should return one result").as_ref();
+    let ordered = ordered.result(0).unwrap().as_ref();
     let result = block.append_operation(stable_hlo::select(ordered, left, right, location)?)?;
-    Ok(result.result(0).expect("stablehlo.select should return one result").as_ref())
+    Ok(result.result(0).unwrap().as_ref())
 }
 
 #[cfg(test)]
@@ -371,8 +382,8 @@ mod tests {
         (left, right, left_array, right_array)
     }
 
-    /// Uploads `f32` operands whose order is decided by their values, by signed zeros that compare equal (in both
-    /// operand orders and with equal signs), by a NaN payload in the left operand, in the right operand, and in both,
+    /// Uploads `f32` operands whose order is decided by their values, by signed zeros that compare equal in both
+    /// operand orders and with equal signs, by a NaN payload in the left operand, in the right operand, and in both,
     /// and by equal infinities.
     fn real_operands<'c>(domain: &Domain<'c>, mesh: &DeviceMesh) -> (Array<'c>, Array<'c>) {
         let left = [
@@ -534,6 +545,48 @@ mod tests {
     }
 
     #[test]
+    fn test_min_and_max_operations_lower_dynamic_differentiation() {
+        let client = execution_client();
+        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("size", Some(5))]));
+        let mut builder = ArrayIrProgramBuilder::new();
+        let left = builder.add_input(input_type.clone().into());
+        let right = builder.add_input(input_type.into());
+        let minimum = builder.add_instruction(MinOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let maximum = builder.add_instruction(MaxOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Constant>, Vec<Constant>>(vec![minimum, maximum], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap()
+            .jvp()
+            .unwrap();
+
+        // The fourth element is padding. Both selection and tie weights must preserve the runtime extent.
+        assert_eq!(
+            execute_mixed_program(
+                &client,
+                &program,
+                &[
+                    MixedValue::Array(vec![1.0, 3.0, 2.0, 0.0], vec![4]),
+                    MixedValue::Array(vec![2.0, 1.0, 2.0, 0.0], vec![4]),
+                    MixedValue::Array(vec![2.0, 4.0, 6.0, 0.0], vec![4]),
+                    MixedValue::Array(vec![8.0, 10.0, 12.0, 0.0], vec![4]),
+                ],
+                &[3, 3, 3, 3],
+            )
+            .unwrap(),
+            vec![
+                MixedValue::Array(vec![1.0, 1.0, 2.0], vec![3]),
+                MixedValue::Array(vec![2.0, 3.0, 2.0], vec![3]),
+                MixedValue::Array(vec![2.0, 10.0, 9.0], vec![3]),
+                MixedValue::Array(vec![8.0, 4.0, 9.0], vec![3]),
+                MixedValue::Dimension(3),
+                MixedValue::Dimension(3),
+                MixedValue::Dimension(3),
+                MixedValue::Dimension(3),
+            ],
+        );
+    }
+
+    #[test]
     fn test_clamp_operation_lower() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
@@ -627,56 +680,20 @@ mod tests {
     }
 
     #[test]
-    fn test_float_extremum_form() {
-        // Only CUDA uses the native form. Elsewhere, and without a target, scalar combiner bodies use the total-order
-        // form and elementwise operations use the arithmetic one, which supports bounded dynamic shapes.
+    fn test_float_extremum_form_for_combiner() {
+        // Only CUDA uses the native form. Elsewhere, and without a target, scalar combiner bodies use the total order
+        // form.
         assert_eq!(FloatExtremumForm::for_combiner(Some("cuda")), FloatExtremumForm::Native);
         assert_eq!(FloatExtremumForm::for_combiner(Some("cpu")), FloatExtremumForm::TotalOrder);
         assert_eq!(FloatExtremumForm::for_combiner(None), FloatExtremumForm::TotalOrder);
-        assert_eq!(FloatExtremumForm::for_elementwise(Some("cuda")), FloatExtremumForm::Native);
-        assert_eq!(FloatExtremumForm::for_elementwise(Some("cpu")), FloatExtremumForm::Arithmetic);
-        assert_eq!(FloatExtremumForm::for_elementwise(None), FloatExtremumForm::Arithmetic);
     }
 
     #[test]
-    fn test_to_mlir_module_for_program_extrema_dynamic_differentiation() {
-        let client = execution_client();
-        let input_type = ArrayType::new(DataType::F64, Shape::new(vec![dynamic_dimension("size", Some(5))]));
-        let mut builder = ArrayIrProgramBuilder::new();
-        let left = builder.add_input(input_type.clone().into());
-        let right = builder.add_input(input_type.into());
-        let minimum = builder.add_instruction(MinOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
-        let maximum = builder.add_instruction(MaxOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Constant>, Vec<Constant>>(vec![minimum, maximum], vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap()
-            .jvp()
-            .unwrap();
-
-        // The fourth element is padding. Both selection and tie weights must preserve the runtime extent.
-        assert_eq!(
-            execute_mixed_program(
-                &client,
-                &program,
-                &[
-                    MixedValue::Array(vec![1.0, 3.0, 2.0, 0.0], vec![4]),
-                    MixedValue::Array(vec![2.0, 1.0, 2.0, 0.0], vec![4]),
-                    MixedValue::Array(vec![2.0, 4.0, 6.0, 0.0], vec![4]),
-                    MixedValue::Array(vec![8.0, 10.0, 12.0, 0.0], vec![4]),
-                ],
-                &[3, 3, 3, 3],
-            )
-            .unwrap(),
-            vec![
-                MixedValue::Array(vec![1.0, 1.0, 2.0], vec![3]),
-                MixedValue::Array(vec![2.0, 3.0, 2.0], vec![3]),
-                MixedValue::Array(vec![2.0, 10.0, 9.0], vec![3]),
-                MixedValue::Array(vec![8.0, 4.0, 9.0], vec![3]),
-                MixedValue::Dimension(3),
-                MixedValue::Dimension(3),
-                MixedValue::Dimension(3),
-                MixedValue::Dimension(3),
-            ],
-        );
+    fn test_float_extremum_form_for_elementwise() {
+        // Only CUDA uses the native form. Elsewhere, and without a target, elementwise operations use the arithmetic
+        // form, which supports bounded dynamic shapes.
+        assert_eq!(FloatExtremumForm::for_elementwise(Some("cuda")), FloatExtremumForm::Native);
+        assert_eq!(FloatExtremumForm::for_elementwise(Some("cpu")), FloatExtremumForm::Arithmetic);
+        assert_eq!(FloatExtremumForm::for_elementwise(None), FloatExtremumForm::Arithmetic);
     }
 }

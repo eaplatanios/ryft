@@ -1,9 +1,9 @@
-//! Bounded schedule measurements using whole-invocation completion and the existing auxiliary disk cache.
+//! Bounded schedule measurements using completion of whole invocations and the existing auxiliary disk cache.
 //!
 //! Samples measure host submission through [`StatefulExecution::await`], including dispatch and synchronization.
 //! They are not device timestamps. Preparation and warmup are excluded from samples but included in the deadline.
-//! Cancellation and deadlines are cooperative: submitted work is always awaited, and its buffers must remain owned
-//! by the runner until completion. Share one [`KernelTuner`] for a device to serialize measurements; other processes
+//! Cancellation and deadlines are cooperative, so submitted work is always awaited, and its buffers must remain owned
+//! by the runner until completion. Share one [`KernelTuner`] for a device to serialize measurements. Other processes
 //! and unrelated device workloads remain the caller's responsibility. No golden performance threshold is assumed.
 
 use std::num::NonZeroUsize;
@@ -71,7 +71,7 @@ impl From<KernelTuningError> for crate::Error {
     }
 }
 
-/// Explicit limits shared by admission, execution, and persisted-result validation.
+/// Explicit limits shared by admission, execution, and validation of persisted results.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct KernelTuningBudget {
     /// Maximum number of candidate schedules, capped at 256.
@@ -83,12 +83,12 @@ pub struct KernelTuningBudget {
     /// Completed measured invocations per candidate, in `1..=1000`.
     repeats: usize,
 
-    /// Cooperative total wall-time budget, including candidate preparation.
+    /// Cooperative total wall time budget, including candidate preparation.
     maximum_time: Duration,
 }
 
 impl KernelTuningBudget {
-    /// Validates explicit count and time limits. Zero warmup is allowed; zero time is rejected.
+    /// Validates explicit count and time limits. Zero warmup is allowed, but zero time is rejected.
     pub fn new(
         maximum_candidates: usize,
         warmups: usize,
@@ -124,12 +124,12 @@ pub struct KernelTuningRequest {
 impl KernelTuningRequest {
     /// Fingerprints a verified definition and finite schedules using side-effect-free configuration queries.
     /// Compiler admission is deliberately deferred to the runner's budgeted preparation, because it may invoke tools.
-    /// Target validation must inspect only the supplied immutable execution facts; configuration queries must not
+    /// Target validation must inspect only the supplied immutable execution facts, and configuration queries must not
     /// launch compiler processes. Existing Mosaic and cuTile configuration queries satisfy this contract.
     ///
-    /// `environment` must identify workload inputs, driver/runtime settings not covered by `facts`, contention policy,
-    /// and any preparation behavior that can affect measurements. Reuse is valid only for identical workloads and
-    /// environments. The compiler and embedding supply their existing complete configuration identities.
+    /// `environment` must identify workload inputs, driver or runtime settings not covered by `facts`, contention
+    /// policy, and any preparation behavior that can affect measurements. Reuse is valid only for identical workloads
+    /// and environments. The compiler and embedding supply their existing complete configuration identities.
     pub fn new<Extension, Compiler, Embedding>(
         kernel: &VerifiedKernel<'_, Extension>,
         compiler: &Compiler,
@@ -182,7 +182,7 @@ impl KernelTuningRequest {
             &budget,
             keys,
         ))?;
-        // A JSON byte needs at most four bytes; a Duration sample needs fewer than 64. Reject requests
+        // A JSON byte needs at most four bytes, and a Duration sample needs fewer than 64. Reject requests
         // whose complete bounded result could exceed storage limits before running any workload.
         let maximum_record = identity
             .len()
@@ -196,7 +196,7 @@ impl KernelTuningRequest {
         Ok(Self { candidates, budget, identity })
     }
 
-    /// Returns candidates in the exact order used for warmup, measurement, and equal-median tie breaking.
+    /// Returns candidates in the exact order used for warmup, measurement, and breaking ties between equal medians.
     pub fn candidates(&self) -> &[KernelSchedule] {
         &self.candidates
     }
@@ -205,12 +205,12 @@ impl KernelTuningRequest {
 /// Execution integration for one fixed workload. Preparation must select the supplied fingerprinted schedule.
 ///
 /// Each invocation must use equivalent inputs. Mutable workloads must include deterministic reset in `execute` and
-/// its measured completion; functional workloads can reuse immutable inputs. `prepare` must run normal compiler
+/// its measured completion, while functional workloads can reuse immutable inputs. `prepare` must run normal compiler
 /// admission through [`VerifiedKernel::compile`] or the XLA compiler binding before artifact reuse or execution. It
 /// may compile and allocate, but must finish asynchronous setup before returning. `execute` must return the existing
-/// whole-invocation completion, retaining all needed buffers until it completes. The tuner always awaits it; returning
-/// an already-ready wrapper for merely submitted device work violates this contract. Compilation that can be cancelled
-/// should use the same cancellation signal supplied to [`KernelTuner::run`].
+/// completion of the whole invocation, retaining all needed buffers until it completes. The tuner always awaits it,
+/// so returning a wrapper that is already ready for merely submitted device work violates this contract. Compilation
+/// that can be cancelled should use the same cancellation signal supplied to [`KernelTuner::run`].
 pub trait KernelTuningRunner {
     /// Prepares one candidate outside sample timing, including deterministic input initialization.
     fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError>;
@@ -219,32 +219,15 @@ pub trait KernelTuningRunner {
     fn execute(&mut self) -> StatefulExecution<(), KernelTuningError>;
 }
 
-/// Private persistence record, decoded only through request-aware validation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MeasurementRecord {
-    /// Measurement encoding version.
-    version: u32,
-
-    /// Exact fingerprinted request, including methodology and limits.
-    identity: Vec<u8>,
-
-    /// Submission-through-completion samples, ordered by candidate then repetition.
-    samples: Vec<Vec<Duration>>,
-
-    /// Lowest upper median, with ties resolved by the first candidate.
-    best_candidate: usize,
-}
-
 /// Complete measurements in candidate order. Loading validates the complete private persistence record.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelTuningResult {
-    /// Request-validated measured samples and ranking.
+    /// Measured samples and ranking, validated against the request.
     record: MeasurementRecord,
 }
 
 impl KernelTuningResult {
-    /// Returns completed wall-time samples; no warmup or compilation times are included.
+    /// Returns completed wall time samples. No warmup or compilation times are included.
     pub fn samples(&self) -> &[Vec<Duration>] {
         &self.record.samples
     }
@@ -292,15 +275,12 @@ impl KernelTuningResult {
     }
 }
 
-/// Maximum decoded measurement payload, before JSON allocation. DiskCache separately bounds decompression.
-const MAXIMUM_RECORD_BYTES: usize = 8 * 1024 * 1024;
-
 /// Serialized per-device measurements with optional atomic, checksummed auxiliary persistence.
 ///
 /// A busy tuner rejects immediately rather than waiting outside the caller's deadline. Separate processes may
-/// atomically replace complete records; they must coordinate device exclusivity themselves for meaningful timings.
+/// atomically replace complete records, but they must coordinate device exclusivity themselves for meaningful timings.
 pub struct KernelTuner {
-    /// Exclusive measurement gate; never protects partially published results.
+    /// Exclusive measurement gate, which never protects partially published results.
     gate: Mutex<()>,
 
     /// Existing persistent storage, using a distinct namespace and metadata entries instead of executables.
@@ -313,7 +293,7 @@ impl KernelTuner {
         Self { gate: Mutex::new(()), cache }
     }
 
-    /// Loads only a complete compatible measurement record; corruption remains an explicit error.
+    /// Loads only a complete compatible measurement record. Corruption remains an explicit error.
     pub fn load(&self, request: &KernelTuningRequest) -> Result<Option<KernelTuningResult>, KernelTuningError> {
         let Some(cache) = &self.cache else {
             return Ok(None);
@@ -331,8 +311,9 @@ impl KernelTuner {
 
     /// Measures every candidate and publishes only after all invocations complete within the budget.
     ///
-    /// This function deliberately does not consult the cache: callers explicitly choose `load` or a new experiment.
-    /// Cancellation and timeout never interrupt submitted work; they reject its measurement after awaiting completion.
+    /// This function deliberately does not consult the cache, because callers explicitly choose
+    /// [`KernelTuner::load`] or a new experiment. Cancellation and timeout never interrupt submitted work. They reject
+    /// its measurement after awaiting completion.
     /// Invocation failures abort the entire experiment. No partial record replaces an earlier successful result.
     pub fn run(
         &self,
@@ -341,7 +322,7 @@ impl KernelTuner {
         cancelled: &AtomicBool,
     ) -> Result<KernelTuningResult, KernelTuningError> {
         let started = Instant::now();
-        let check = || {
+        let validate_progress = || {
             if cancelled.load(Ordering::Acquire) {
                 Err(KernelTuningError::Cancelled)
             } else if started.elapsed() >= request.budget.maximum_time {
@@ -350,7 +331,7 @@ impl KernelTuner {
                 Ok(())
             }
         };
-        check()?;
+        validate_progress()?;
         let _guard = match self.gate.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return Err(KernelTuningError::Busy),
@@ -358,20 +339,20 @@ impl KernelTuner {
         };
         let mut samples = Vec::with_capacity(request.candidates.len());
         for schedule in &request.candidates {
-            check()?;
+            validate_progress()?;
             runner.prepare(schedule)?;
-            check()?;
+            validate_progress()?;
             for _ in 0..request.budget.warmups {
                 runner.execute().r#await()?;
-                check()?;
+                validate_progress()?;
             }
             let mut candidate = Vec::with_capacity(request.budget.repeats);
             for _ in 0..request.budget.repeats {
-                check()?;
+                validate_progress()?;
                 let submitted = Instant::now();
                 runner.execute().r#await()?;
                 let elapsed = submitted.elapsed();
-                check()?;
+                validate_progress()?;
                 candidate.push(elapsed);
             }
             samples.push(candidate);
@@ -389,12 +370,32 @@ impl KernelTuner {
         if bytes.len() > MAXIMUM_RECORD_BYTES {
             return Err(KernelTuningError::Invalid { message: "measurement record exceeds size limit".into() });
         }
-        check()?;
+        validate_progress()?;
         if let Some(cache) = &self.cache {
             cache.put_auxiliary("kernel-tuning-v1", &request.identity, &bytes)?;
         }
         Ok(result)
     }
+}
+
+/// Maximum decoded measurement payload, before JSON allocation. [`DiskCache`] separately bounds decompression.
+const MAXIMUM_RECORD_BYTES: usize = 8 * 1024 * 1024;
+
+/// Private persistence record, decoded only through validation against the request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MeasurementRecord {
+    /// Measurement encoding version.
+    version: u32,
+
+    /// Exact fingerprinted request, including methodology and limits.
+    identity: Vec<u8>,
+
+    /// Samples from submission through completion, ordered by candidate then repetition.
+    samples: Vec<Vec<Duration>>,
+
+    /// Lowest upper median, with ties resolved by the first candidate.
+    best_candidate: usize,
 }
 
 #[cfg(test)]
@@ -410,15 +411,6 @@ mod tests {
     /// Minimal compiler whose options and schedules have independent exact identities.
     struct Compiler;
 
-    /// Explicit local fixture execution target.
-    struct Target;
-
-    impl KernelTarget for Target {
-        fn admit_execution(&self, _facts: &KernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
-            Ok(())
-        }
-    }
-
     impl KernelCompiler for Compiler {
         type Target = Target;
         type Options = u8;
@@ -427,30 +419,43 @@ mod tests {
 
         fn admit(
             &self,
-            _kernel: &VerifiedKernel<'_>,
-            _target: &Target,
-            _options: &u8,
-            _schedule: &KernelSchedule,
+            kernel: &VerifiedKernel<'_>,
+            target: &Target,
+            options: &u8,
+            schedule: &KernelSchedule,
         ) -> Result<(), KernelCompilationError<Self::Error>> {
+            let _ = (kernel, target, options, schedule);
             panic!("constructing or loading measurements must not invoke compiler admission")
         }
 
         fn configuration_key(
             &self,
-            _target: &Target,
+            target: &Target,
             options: &u8,
-            _schedule: &KernelSchedule,
+            schedule: &KernelSchedule,
         ) -> Result<Vec<u8>, KernelCompilationError<Self::Error>> {
+            let _ = (target, schedule);
             Ok(vec![*options])
         }
 
         fn compile(
             &self,
-            _kernel: &VerifiedKernel<'_>,
-            _target: &Target,
-            _options: &u8,
-            _schedule: &KernelSchedule,
+            kernel: &VerifiedKernel<'_>,
+            target: &Target,
+            options: &u8,
+            schedule: &KernelSchedule,
         ) -> Result<(), KernelCompilationError<Self::Error>> {
+            let _ = (kernel, target, options, schedule);
+            Ok(())
+        }
+    }
+
+    /// Explicit local fixture execution target.
+    struct Target;
+
+    impl KernelTarget for Target {
+        fn admit_execution(&self, facts: &KernelExecutionFacts) -> Result<(), KernelEmbeddingError> {
+            let _ = facts;
             Ok(())
         }
     }
@@ -465,10 +470,50 @@ mod tests {
 
         fn custom_call(
             &self,
-            _kernel: &VerifiedKernel<'_>,
-            _output: &(),
+            kernel: &VerifiedKernel<'_>,
+            output: &(),
         ) -> Result<CustomCallOperation, KernelEmbeddingError> {
+            let _ = (kernel, output);
             Ok(CustomCallOperation::new("fixture", vec![]))
+        }
+    }
+
+    /// Counts actual completion observation separately from submission.
+    struct Completion(Arc<AtomicUsize>);
+
+    impl ReferenceCompletionBackend for Completion {
+        fn r#await(&self) -> Result<(), Arc<str>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn is_ready(&self) -> Result<bool, Arc<str>> {
+            Ok(false)
+        }
+    }
+
+    /// Executes completed CPU work through the canonical completion wrapper without supplying fabricated timings.
+    #[derive(Default)]
+    struct Runner {
+        /// Schedule preparation order.
+        schedules: Vec<KernelSchedule>,
+
+        /// Independently observed completions.
+        completed: Arc<AtomicUsize>,
+    }
+
+    impl KernelTuningRunner for Runner {
+        fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
+            self.schedules.push(schedule.clone());
+            Ok(())
+        }
+
+        fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
+            StatefulExecution::pending(
+                Ok(()),
+                CoreReferenceCompletion::new(Completion(self.completed.clone())),
+                |message| KernelTuningError::Invalid { message: message.to_string() },
+            )
         }
     }
 
@@ -502,55 +547,18 @@ mod tests {
             &Target,
             &options,
             &Embedding(embedding),
-            &KernelExecutionFacts {
-                platform_name: "fixture".into(),
-                platform_version: platform_version.into(),
-                pjrt_version: ryft_pjrt::Version { major: 0, minor: 115 },
-                has_ffi_extension: false,
-                attributes: Default::default(),
-                devices: vec![],
-            },
+            &KernelExecutionFacts::new(
+                "fixture",
+                platform_version,
+                ryft_pjrt::Version { major: 0, minor: 115 },
+                false,
+                Default::default(),
+                vec![],
+            ),
             environment,
             candidates,
             KernelTuningBudget::new(2, 1, 2, Duration::from_secs(10)).unwrap(),
         )
-    }
-
-    /// Counts actual completion observation separately from submission.
-    struct Completion(Arc<AtomicUsize>);
-
-    impl ReferenceCompletionBackend for Completion {
-        fn r#await(&self) -> Result<(), Arc<str>> {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-        fn is_ready(&self) -> Result<bool, Arc<str>> {
-            Ok(false)
-        }
-    }
-
-    /// Executes completed CPU work through the canonical completion wrapper without supplying fabricated timings.
-    #[derive(Default)]
-    struct Runner {
-        /// Schedule preparation order.
-        schedules: Vec<KernelSchedule>,
-
-        /// Independently observed completions.
-        completed: Arc<AtomicUsize>,
-    }
-
-    impl KernelTuningRunner for Runner {
-        fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
-            self.schedules.push(schedule.clone());
-            Ok(())
-        }
-        fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
-            StatefulExecution::pending(
-                Ok(()),
-                CoreReferenceCompletion::new(Completion(self.completed.clone())),
-                |message| KernelTuningError::Invalid { message: message.to_string() },
-            )
-        }
     }
 
     #[test]
@@ -609,28 +617,21 @@ mod tests {
     }
 
     #[test]
+    fn test_kernel_tuning_request_new_rejects_oversized_identity() {
+        let environment = vec![u8::MAX; MAXIMUM_RECORD_BYTES / 4];
+        assert!(matches!(
+            request_with(1, 2, "1", &environment, vec![KernelSchedule::default()]),
+            Err(KernelTuningError::Invalid { message })
+                if message == "request identity or sample budget exceeds size limit",
+        ));
+    }
+
+    #[test]
     fn test_kernel_tuning_request_candidates() {
         assert_eq!(
             request().candidates(),
             &[KernelSchedule::default(), KernelSchedule::default().with_maximum_scratch_bytes(0)]
         );
-    }
-
-    #[test]
-    fn test_kernel_tuning_runner_prepare() {
-        let mut runner = Runner::default();
-        runner.prepare(&KernelSchedule::default()).unwrap();
-        assert_eq!(runner.schedules, vec![KernelSchedule::default()]);
-        assert_eq!(runner.completed.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn test_kernel_tuning_runner_execute() {
-        let mut runner = Runner::default();
-        let execution = runner.execute();
-        assert_eq!(runner.completed.load(Ordering::SeqCst), 0);
-        execution.r#await().unwrap();
-        assert_eq!(runner.completed.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -643,7 +644,8 @@ mod tests {
     #[test]
     fn test_kernel_tuning_result_best_candidate() {
         let request = request();
-        // Hand-authored persisted data tests ranking only; these values are never presented as measured execution.
+        // Persisted data written by hand tests ranking only, and these values are never presented as measured
+        // execution.
         let result = KernelTuningResult {
             record: MeasurementRecord {
                 version: 1,
@@ -699,7 +701,14 @@ mod tests {
                 if message == "stale or inconsistent measurement record",
         ));
         cache.put_auxiliary("kernel-tuning-v1", &request.identity, b"corrupt").unwrap();
-        assert!(matches!(tuner.load(&request), Err(KernelTuningError::Payload(_))));
+        assert!(matches!(tuner.load(&request), Err(KernelTuningError::Payload(error)) if error.is_syntax()));
+        cache
+            .put_auxiliary("kernel-tuning-v1", &request.identity, &vec![b' '; MAXIMUM_RECORD_BYTES + 1])
+            .unwrap();
+        assert!(matches!(
+            tuner.load(&request),
+            Err(KernelTuningError::Invalid { message }) if message == "measurement record exceeds size limit",
+        ));
     }
 
     #[test]
@@ -730,11 +739,14 @@ mod tests {
     fn test_kernel_tuner_run_preparation_deadline() {
         /// Preparation exceeds its explicit deadline without submitting work.
         struct SlowPreparation;
+
         impl KernelTuningRunner for SlowPreparation {
-            fn prepare(&mut self, _schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
+            fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
+                let _ = schedule;
                 std::thread::sleep(Duration::from_millis(20));
                 Ok(())
             }
+
             fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
                 panic!("expired preparation must not submit work")
             }
@@ -751,10 +763,13 @@ mod tests {
     fn test_kernel_tuner_run_failure_preserves_completed_record() {
         /// Fails during completion, after submission has succeeded.
         struct FailedRunner;
+
         impl KernelTuningRunner for FailedRunner {
-            fn prepare(&mut self, _schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
+            fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
+                let _ = schedule;
                 Ok(())
             }
+
             fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
                 StatefulExecution::pending(
                     Ok(()),
@@ -774,20 +789,24 @@ mod tests {
         ));
         assert_eq!(tuner.load(&request).unwrap(), Some(previous));
     }
+
     #[test]
     fn test_kernel_tuner_run_cancellation_awaits_submitted_work() {
         /// Cancels during submission while returning a completion that still must be observed.
-        struct CancellingRunner<'a> {
+        struct CancellingRunner<'o> {
             /// Shared cooperative cancellation signal.
-            cancelled: &'a AtomicBool,
+            cancelled: &'o AtomicBool,
 
             /// Completion counter independent of cancellation.
             completed: Arc<AtomicUsize>,
         }
+
         impl KernelTuningRunner for CancellingRunner<'_> {
-            fn prepare(&mut self, _schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
+            fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
+                let _ = schedule;
                 Ok(())
             }
+
             fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
                 self.cancelled.store(true, Ordering::Release);
                 StatefulExecution::pending(
@@ -811,15 +830,18 @@ mod tests {
             /// Announces that preparation owns the gate.
             entered: std::sync::mpsc::Sender<()>,
 
-            /// Explicit release, avoiding timing-dependent sleeps.
+            /// Explicit release, avoiding sleeps that depend on timing.
             release: std::sync::mpsc::Receiver<()>,
         }
+
         impl KernelTuningRunner for BlockingRunner {
-            fn prepare(&mut self, _schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
+            fn prepare(&mut self, schedule: &KernelSchedule) -> Result<(), KernelTuningError> {
+                let _ = schedule;
                 self.entered.send(()).unwrap();
                 self.release.recv().unwrap();
                 Ok(())
             }
+
             fn execute(&mut self) -> StatefulExecution<(), KernelTuningError> {
                 StatefulExecution::ready(Ok(()))
             }

@@ -52,7 +52,10 @@ const SCHEMA: &str = "ryft-jax-differential-v1";
 #[serde(tag = "status", rename_all = "snake_case")]
 enum StagingObservation {
     /// The program staged successfully with the rendered type of its first result.
-    Supported { output_type: String },
+    Supported {
+        /// Rendered type of the first result of the staged program.
+        output_type: String,
+    },
 }
 
 /// One Ryft-side case record consumed by the Python comparison harness.
@@ -113,51 +116,61 @@ struct DifferentialCase {
     suite: Suite,
 }
 
-/// Returns the fixed case registry and verifies that case IDs are unique.
-fn registry() -> Vec<DifferentialCase> {
-    let mut cases = vec![
-        DifferentialCase {
-            case_id: "grouped_shape_changing_collectives",
-            emit: emit_grouped_collectives,
-            suite: Suite::Collectives,
-        },
-        DifferentialCase { case_id: "pshuffle", emit: emit_parallel_shuffle, suite: Suite::Collectives },
-        DifferentialCase { case_id: "pswapaxes", emit: emit_parallel_swap_axes, suite: Suite::Collectives },
-        DifferentialCase {
-            case_id: "data_dependent_prefix_take",
-            emit: emit_data_dependent_prefix_take,
-            suite: Suite::General,
-        },
-        DifferentialCase { case_id: "scaled_dot_and_matmul", emit: emit_scaled_dot_and_matmul, suite: Suite::General },
-        DifferentialCase { case_id: "block_scaled_dot", emit: emit_block_scaled_dot, suite: Suite::General },
-        DifferentialCase { case_id: "dot_product_attention", emit: emit_dot_product_attention, suite: Suite::General },
-        DifferentialCase {
-            case_id: "negative_dynamic_slice",
-            emit: emit_negative_dynamic_slice,
-            suite: Suite::General,
-        },
-        DifferentialCase {
-            case_id: "condition_varying_predicate_gradient",
-            emit: emit_condition_varying_predicate_gradient,
-            suite: Suite::General,
-        },
-    ];
-    cases.extend(rematerialization::CASES.map(|(case_id, emit)| DifferentialCase {
-        case_id,
-        emit,
-        suite: Suite::Rematerialization,
-    }));
-    for (index, case) in cases.iter().enumerate() {
-        assert!(
-            cases[..index].iter().all(|previous| previous.case_id != case.case_id),
-            "duplicate differential-testing case ID `{}`",
-            case.case_id,
-        );
+impl DifferentialCase {
+    /// Returns the fixed case registry and verifies that case IDs are unique.
+    fn registry() -> Vec<Self> {
+        let mut cases = vec![
+            DifferentialCase {
+                case_id: "grouped_shape_changing_collectives",
+                emit: emit_grouped_collectives,
+                suite: Suite::Collectives,
+            },
+            DifferentialCase { case_id: "pshuffle", emit: emit_parallel_shuffle, suite: Suite::Collectives },
+            DifferentialCase { case_id: "pswapaxes", emit: emit_parallel_swap_axes, suite: Suite::Collectives },
+            DifferentialCase {
+                case_id: "data_dependent_prefix_take",
+                emit: emit_data_dependent_prefix_take,
+                suite: Suite::General,
+            },
+            DifferentialCase {
+                case_id: "scaled_dot_and_matmul",
+                emit: emit_scaled_dot_and_matmul,
+                suite: Suite::General,
+            },
+            DifferentialCase { case_id: "block_scaled_dot", emit: emit_block_scaled_dot, suite: Suite::General },
+            DifferentialCase {
+                case_id: "dot_product_attention",
+                emit: emit_dot_product_attention,
+                suite: Suite::General,
+            },
+            DifferentialCase {
+                case_id: "negative_dynamic_slice",
+                emit: emit_negative_dynamic_slice,
+                suite: Suite::General,
+            },
+            DifferentialCase {
+                case_id: "condition_varying_predicate_gradient",
+                emit: emit_condition_varying_predicate_gradient,
+                suite: Suite::General,
+            },
+        ];
+        cases.extend(rematerialization::CASES.map(|(case_id, emit)| DifferentialCase {
+            case_id,
+            emit,
+            suite: Suite::Rematerialization,
+        }));
+        for (index, case) in cases.iter().enumerate() {
+            assert!(
+                cases[..index].iter().all(|previous| previous.case_id != case.case_id),
+                "duplicate differential-testing case ID `{}`",
+                case.case_id,
+            );
+        }
+        cases
     }
-    cases
 }
 
-/// Converts a slice of plain-old-data values to native-endian bytes for PJRT host transfers.
+/// Converts a slice of plain old data values to native-endian bytes for PJRT host transfers.
 fn values_to_bytes<V: Copy>(values: &[V]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(size_of_val(values));
     for value in values {
@@ -208,16 +221,16 @@ fn collective_compilation_options(partition_count: usize) -> CompilationOptions 
     }
 }
 
-/// Executes one already-lowered collective module and returns flattened outputs in device order.
+/// Executes one collective module that is already lowered and returns flattened outputs in device order.
 ///
 /// # Parameters
 ///
 ///   - `client`: CPU PJRT client with one device per participant.
 ///   - `device_mesh`: Physical devices arranged according to [`collective_mesh`].
 ///   - `sharding`: Global input sharding over the manual mesh axis.
-///   - `module`: StableHLO/Shardy module to compile.
+///   - `module`: StableHLO and Shardy module to compile.
 ///   - `global_shape`: Global logical input shape.
-///   - `local_shape`: Per-device input-buffer shape.
+///   - `local_shape`: Per-device input buffer shape.
 ///   - `values`: One flattened local input vector per device.
 ///   - `expected_output_shapes`: Physical output shapes checked against returned PJRT buffers before decoding.
 fn execute_collective_module(
@@ -319,7 +332,8 @@ fn execute_collective_inputs(
     Ok(observations)
 }
 
-/// Creates the CPU client, logical-to-physical mesh, and sharding shared by collective emitters.
+/// Creates the CPU client, the mesh that maps logical to physical devices, and the sharding shared by collective
+/// emitters.
 fn collective_runtime() -> Result<(Client<'static>, DeviceMesh, Sharding), Box<dyn Error>> {
     let plugin = load_cpu_plugin()?;
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))?;
@@ -561,7 +575,7 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
         let [ArrayIrValue::Array(output)]: [ArrayIrValue<CoreArray>; 1] = program
             .interpret(vec![
                 ArrayIrValue::Array(CoreArray::vector(mask)?),
-                ArrayIrValue::Array(CoreArray::vector(vec![10.0_f32, 20.0, 30.0, 40.0])?),
+                ArrayIrValue::Array(CoreArray::vector(vec![10.0f32, 20.0, 30.0, 40.0])?),
             ])?
             .try_into()
             .unwrap()
@@ -582,14 +596,14 @@ fn emit_data_dependent_prefix_take() -> Result<DifferentialObservation, Box<dyn 
     })
 }
 
-/// Emits generalized scaled-dot and rank-three scaled-matmul values plus the named-composite StableHLO contract.
+/// Emits generalized scaled dot and rank-3 scaled matmul values plus the StableHLO contract of the named composite.
 fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error>> {
     /// Binds the primitive directly so the differential fixture covers its optional block-scale inputs.
     fn bind_scaled_dot<V: CoreValue<Type = ArrayType>>(
-        lhs: &V,
-        rhs: &V,
-        lhs_scale: Option<&V>,
-        rhs_scale: Option<&V>,
+        left: &V,
+        right: &V,
+        left_scale: Option<&V>,
+        right_scale: Option<&V>,
         dimensions: &DotDimensionNumbers,
         accumulation_type: DataType,
     ) -> Result<V, ProgramError>
@@ -597,56 +611,72 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
         V::Domain: Context<Operation: From<ScaledDotOperation>>,
     {
         let operation =
-            ScaledDotOperation::new(dimensions.clone(), accumulation_type, lhs_scale.is_some(), rhs_scale.is_some());
-        let inputs = std::iter::once(lhs)
-            .chain(std::iter::once(rhs))
-            .chain(lhs_scale)
-            .chain(rhs_scale)
+            ScaledDotOperation::new(dimensions.clone(), accumulation_type, left_scale.is_some(), right_scale.is_some());
+        let inputs = std::iter::once(left)
+            .chain(std::iter::once(right))
+            .chain(left_scale)
+            .chain(right_scale)
             .cloned()
             .collect::<Vec<_>>();
-        Ok(lhs.domain().bind(operation, Vec::new(), &inputs)?.remove(0))
+        Ok(left.domain().bind(operation, Vec::new(), &inputs)?.remove(0))
     }
 
-    let lhs = CoreArray::from_elements::<f32>(
+    let left = CoreArray::from_elements::<f32>(
         ArrayType::new_static(DataType::F32, [2, 4]),
         &(1..=8).map(|value| value as f32).collect::<Vec<_>>(),
     )?;
-    let rhs = CoreArray::from_elements::<f32>(
+    let right = CoreArray::from_elements::<f32>(
         ArrayType::new_static(DataType::F32, [4, 3]),
         &(1..=12).map(|value| value as f32).collect::<Vec<_>>(),
     )?;
-    let lhs_scale =
+    let left_scale =
         CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 2]), &[1.0, 2.0, 0.5, 1.0])?;
-    let rhs_scale =
+    let right_scale =
         CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [2, 3]), &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0])?;
     let dimensions = DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new());
     let values = |value: CoreArray| value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>();
 
-    let matmul_lhs = CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 4]), &[1.0; 4])?;
-    let matmul_rhs = CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 4]), &[1.0; 8])?;
-    let matmul_lhs_scale = CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[1.0; 2])?;
-    let matmul_rhs_scale = CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 2]), &[1.0; 4])?;
+    let matmul_left = CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 4]), &[1.0; 4])?;
+    let matmul_right = CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 4]), &[1.0; 8])?;
+    let matmul_left_scale =
+        CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 1, 2]), &[1.0; 2])?;
+    let matmul_right_scale =
+        CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, [1, 2, 2]), &[1.0; 4])?;
     let observations = BTreeMap::from([
         (
             "both_scales",
-            vec![values(bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), &dimensions, DataType::F32)?)],
+            vec![values(bind_scaled_dot(
+                &left,
+                &right,
+                Some(&left_scale),
+                Some(&right_scale),
+                &dimensions,
+                DataType::F32,
+            )?)],
         ),
-        ("lhs_scale", vec![values(bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), None, &dimensions, DataType::F32)?)]),
-        ("rhs_scale", vec![values(bind_scaled_dot(&lhs, &rhs, None, Some(&rhs_scale), &dimensions, DataType::F32)?)]),
-        ("unscaled", vec![values(bind_scaled_dot(&lhs, &rhs, None, None, &dimensions, DataType::F32)?)]),
+        (
+            "lhs_scale",
+            vec![values(bind_scaled_dot(&left, &right, Some(&left_scale), None, &dimensions, DataType::F32)?)],
+        ),
+        (
+            "rhs_scale",
+            vec![values(bind_scaled_dot(&left, &right, None, Some(&right_scale), &dimensions, DataType::F32)?)],
+        ),
+        ("unscaled", vec![values(bind_scaled_dot(&left, &right, None, None, &dimensions, DataType::F32)?)]),
         (
             "scaled_matmul",
             vec![values(
-                BlockQuantizedValue::new(matmul_lhs, matmul_lhs_scale)
-                    .scaled_matmul(&BlockQuantizedValue::new(matmul_rhs, matmul_rhs_scale), None)?,
+                BlockQuantizedValue::new(matmul_left, matmul_left_scale)
+                    .scaled_matmul(&BlockQuantizedValue::new(matmul_right, matmul_right_scale), None)?,
             )],
         ),
     ]);
     let traced: TracedProgram<(ArrayType, ArrayType, ArrayType, ArrayType), ArrayType> = trace(
         {
             let dimensions = dimensions.clone();
-            move |(lhs, rhs, lhs_scale, rhs_scale): (ArrayTracer, ArrayTracer, ArrayTracer, ArrayTracer)| {
-                bind_scaled_dot(&lhs, &rhs, Some(&lhs_scale), Some(&rhs_scale), &dimensions, DataType::F32).unwrap()
+            move |(left, right, left_scale, right_scale): (ArrayTracer, ArrayTracer, ArrayTracer, ArrayTracer)| {
+                bind_scaled_dot(&left, &right, Some(&left_scale), Some(&right_scale), &dimensions, DataType::F32)
+                    .unwrap()
             }
         },
         (
@@ -666,8 +696,8 @@ fn emit_scaled_dot_and_matmul() -> Result<DifferentialObservation, Box<dyn Error
 }
 
 /// Returns the shared `block_scaled_dot` inputs of the JAX registry, whose quantized arithmetic is exact in both
-/// frameworks. The NVFP4 left input clips at its global scale `2^-9`, and every MXFP8 block contains `4`, whose power of
-/// two scale is the same under the OCP and JAX scale rounding.
+/// frameworks. The NVFP4 left-hand side input clips at its global scale `2^-9`, and every MXFP8 block contains `4`,
+/// whose power of two scale is the same under the OCP and JAX scale rounding.
 fn block_scaled_dot_inputs() -> Result<[CoreArray; 6], ProgramError> {
     let values = |shape: &[usize], value: &dyn Fn(usize) -> f64| {
         let count = shape.iter().product::<usize>();
@@ -675,7 +705,7 @@ fn block_scaled_dot_inputs() -> Result<[CoreArray; 6], ProgramError> {
         CoreArray::from_elements::<f32>(ArrayType::new_static(DataType::F32, shape.to_vec()), &values)
     };
     let modulo = |value: usize, modulus: usize| (value % modulus) as f64;
-    let mx = |seed: &dyn Fn(usize, usize) -> f64, stride: usize| {
+    let mxfp8_matrix = |seed: &dyn Fn(usize, usize) -> f64, stride: usize| {
         values(&[32, 32], &|index| {
             let (row, column) = (index / 32, index % 32);
             if column == (stride * row) % 32 { 4.0 } else { seed(row, column) }
@@ -685,59 +715,66 @@ fn block_scaled_dot_inputs() -> Result<[CoreArray; 6], ProgramError> {
         values(&[2, 4, 32], &|index| modulo(index * 7, 13) - 6.0)?,
         values(&[2, 32, 8], &|index| (modulo(index * 5, 11) - 5.0) / 2.0)?,
         values(&[2, 4, 8], &|index| (modulo(index * 3, 5) - 2.0) / 2.0)?,
-        mx(&|row, column| (modulo(row * 7 + column * 3, 7) - 3.0) / 2.0, 3)?,
-        mx(&|row, column| (modulo(row * 5 + column, 5) - 2.0) / 2.0, 5)?,
-        mx(&|row, column| (modulo(row + 2 * column, 9) - 4.0) / 4.0, 7)?,
+        mxfp8_matrix(&|row, column| (modulo(row * 7 + column * 3, 7) - 3.0) / 2.0, 3)?,
+        mxfp8_matrix(&|row, column| (modulo(row * 5 + column, 5) - 2.0) / 2.0, 5)?,
+        mxfp8_matrix(&|row, column| (modulo(row + 2 * column, 9) - 4.0) / 4.0, 7)?,
     ])
 }
 
 /// Emits `block_scaled_dot` values and gradients for the default NVFP4 and MXFP8 configurations, which match
 /// `jax.nn.scaled_dot_general`, plus the StableHLO of the staged NVFP4 training step.
 fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
-    let [nvfp4_lhs, nvfp4_rhs, nvfp4_seed, mxfp8_lhs, mxfp8_rhs, mxfp8_seed] = block_scaled_dot_inputs()?;
+    let [nvfp4_left, nvfp4_right, nvfp4_seed, mxfp8_left, mxfp8_right, mxfp8_seed] = block_scaled_dot_inputs()?;
     let nvfp4_dimensions = DotDimensionNumbers::new(vec![2], vec![1], vec![0], vec![0]);
     let nvfp4 = BlockScaledDotConfiguration::new(nvfp4_dimensions, BlockScaleFormat::nvfp4());
     let mxfp8 = BlockScaledDotConfiguration::new(DotDimensionNumbers::matmul(), BlockScaleFormat::mxfp8());
-    let lhs_global_scale = CoreArray::scalar(2.0f32.powi(-9))?;
+    let left_global_scale = CoreArray::scalar(2.0f32.powi(-9))?;
     let values = |value: CoreArray| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
     let mut observations = BTreeMap::new();
-    for (names, configuration, lhs, rhs, seed, global_scale) in [
+    for (names, configuration, left, right, seed, global_scale) in [
         (
             ["nvfp4_output", "nvfp4_lhs_gradient", "nvfp4_rhs_gradient"],
             nvfp4.clone(),
-            nvfp4_lhs,
-            nvfp4_rhs,
+            nvfp4_left,
+            nvfp4_right,
             nvfp4_seed,
-            Some(lhs_global_scale),
+            Some(left_global_scale),
         ),
-        (["mxfp8_output", "mxfp8_lhs_gradient", "mxfp8_rhs_gradient"], mxfp8, mxfp8_lhs, mxfp8_rhs, mxfp8_seed, None),
+        (
+            ["mxfp8_output", "mxfp8_lhs_gradient", "mxfp8_rhs_gradient"],
+            mxfp8,
+            mxfp8_left,
+            mxfp8_right,
+            mxfp8_seed,
+            None,
+        ),
     ] {
         let function = block_scaled_dot::<EagerContext<CoreArray, ArrayOperation<CoreArray>>>(configuration)?;
-        let (output, (lhs_gradient, rhs_gradient)) = match global_scale {
+        let (output, (left_gradient, right_gradient)) = match global_scale {
             Some(global_scale) => {
-                let (output, pullback) = differentiate_at((lhs, rhs))
+                let (output, pullback) = differentiate_at((left, right))
                     .with_captures(global_scale)
-                    .vjp(|(lhs, rhs), scale| function.call(lhs, rhs, Some(scale), None, None, None))?;
+                    .vjp(|(left, right), scale| function.call(left, right, Some(scale), None, None, None))?;
                 (output, pullback.apply_materialized(seed)?)
             }
             None => {
-                let (output, pullback) =
-                    differentiate_at((lhs, rhs)).vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))?;
+                let (output, pullback) = differentiate_at((left, right))
+                    .vjp(|(left, right)| function.call(left, right, None, None, None, None))?;
                 (output, pullback.apply_materialized(seed)?)
             }
         };
-        for (name, value) in names.into_iter().zip([output, lhs_gradient, rhs_gradient]) {
+        for (name, value) in names.into_iter().zip([output, left_gradient, right_gradient]) {
             observations.insert(name, values(value));
         }
     }
     let function = block_scaled_dot::<ProjectedContext<Domain<'static>, ArrayType>>(nvfp4)?;
     let traced: TracedProgram<(ArrayType, ArrayType, ArrayType), (ArrayType, ArrayType, ArrayType)> = trace(
-        move |(lhs, rhs, seed): (ArrayTracer, ArrayTracer, ArrayTracer)| {
-            let (output, pullback) = differentiate_at((lhs, rhs))
-                .vjp(|(lhs, rhs)| function.call(lhs, rhs, None, None, None, None))
+        move |(left, right, seed): (ArrayTracer, ArrayTracer, ArrayTracer)| {
+            let (output, pullback) = differentiate_at((left, right))
+                .vjp(|(left, right)| function.call(left, right, None, None, None, None))
                 .unwrap();
-            let (lhs_gradient, rhs_gradient) = pullback.apply_materialized(seed).unwrap();
-            (output, lhs_gradient, rhs_gradient)
+            let (left_gradient, right_gradient) = pullback.apply_materialized(seed).unwrap();
+            (output, left_gradient, right_gradient)
         },
         (
             ArrayType::new_static(DataType::F32, [2, 4, 32]),
@@ -754,7 +791,7 @@ fn emit_block_scaled_dot() -> Result<DifferentialObservation, Box<dyn Error>> {
     })
 }
 
-/// Emits the portable rank-three MQA attention surface plus its semantic StableHLO composition.
+/// Emits the portable rank-3 MQA attention surface plus its semantic StableHLO composition.
 fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error>> {
     let query_type = ArrayType::new_static(DataType::F32, [2, 2, 1]);
     let key_value_type = ArrayType::new_static(DataType::F32, [2, 1, 1]);
@@ -768,8 +805,8 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         value: CoreArray::from_elements::<f32>(key_value_type.clone(), &[3.0, 9.0])?,
         bias: Some(CoreArray::from_elements::<f32>(bias_type.clone(), &[0.0])?),
         mask: Some(CoreArray::from_elements(mask_type.clone(), &[true, false, false, true])?),
-        query_sequence_lengths: Some(CoreArray::from_elements(lengths_type.clone(), &[2_i32])?),
-        key_value_sequence_lengths: Some(CoreArray::from_elements(lengths_type.clone(), &[2_i32])?),
+        query_sequence_lengths: Some(CoreArray::from_elements(lengths_type.clone(), &[2i32])?),
+        key_value_sequence_lengths: Some(CoreArray::from_elements(lengths_type.clone(), &[2i32])?),
         dropout_state: None,
     };
     let (output, residual) = dot_product_attention::<EagerContext<CoreArray, ArrayOperation<CoreArray>>>(configuration)
@@ -789,7 +826,7 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
         bias: None,
         mask: None,
         query_sequence_lengths: None,
-        key_value_sequence_lengths: Some(CoreArray::from_elements(lengths_type.clone(), &[2_i32])?),
+        key_value_sequence_lengths: Some(CoreArray::from_elements(lengths_type.clone(), &[2i32])?),
         dropout_state: None,
     })?;
     let observations = BTreeMap::from([
@@ -838,8 +875,8 @@ fn emit_dot_product_attention() -> Result<DifferentialObservation, Box<dyn Error
 /// Emits dynamic slicing values at negative and out-of-range starts under both negative-index policies, plus the
 /// StableHLO of a traced dynamic slice whose signed start wraps before the native clamp.
 fn emit_negative_dynamic_slice() -> Result<DifferentialObservation, Box<dyn Error>> {
-    let vector = CoreArray::vector(vec![10.0_f32, 20.0, 30.0, 40.0])?;
-    let update = CoreArray::vector(vec![1.0_f32, 2.0])?;
+    let vector = CoreArray::vector(vec![10.0f32, 20.0, 30.0, 40.0])?;
+    let update = CoreArray::vector(vec![1.0f32, 2.0])?;
     let start = |value: i32| -> Result<CoreArray, ProgramError> { CoreArray::scalar(value) };
     let values = |value: CoreArray| vec![value.to_f64s().into_iter().map(|value| value as f32).collect::<Vec<_>>()];
     let observations = BTreeMap::from([
@@ -869,12 +906,12 @@ fn emit_negative_dynamic_slice() -> Result<DifferentialObservation, Box<dyn Erro
 
 /// Emits the value and gradients of a `condition` whose predicate varies across the devices of a manual region.
 ///
-/// Each device of a four-device `x` mesh holds one element of `values = [1, -2, 3, -4]` and the replicated `weight
-/// = [2]`. Each device takes the `true` branch, `weight * values`, when its element is positive and the `false` branch,
-/// `values`, otherwise, and the result is summed over the mesh. [`Condition::condition`] varies the invariant weight
-/// before the branches, so the gradient of the weight is summed across devices after the transposed condition rather
-/// than inside the branch that only some devices take. The value is `2 - 2 + 6 - 4 = 2`, the weight gradient is the sum
-/// of the positive elements, `4`, and the values gradient is `[2, 1, 2, 1]`.
+/// Each device of a four-device `x` mesh holds one element of `values = [1, -2, 3, -4]` and the replicated
+/// `weight = [2]`. Each device takes the `true` branch, `weight * values`, when its element is positive and the
+/// `false` branch, `values`, otherwise, and the result is summed over the mesh. [`Condition::condition`] varies the
+/// invariant weight before the branches, so the gradient of the weight is summed across devices after the transposed
+/// condition rather than inside the branch that only some devices take. The value is `2 - 2 + 6 - 4 = 2`, the weight
+/// gradient is the sum of the positive elements, `4`, and the values gradient is `[2, 1, 2, 1]`.
 fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation, Box<dyn Error>> {
     let (client, device_mesh, sharded) = collective_runtime()?;
     let mesh = device_mesh.logical_mesh().clone();
@@ -960,7 +997,7 @@ fn emit_condition_varying_predicate_gradient() -> Result<DifferentialObservation
 
 /// Parses selected case IDs, emits deterministic JSON records, and returns an error for an unknown case.
 fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let cases = registry();
+    let cases = DifferentialCase::registry();
     let mut requested = Vec::new();
     let mut list = false;
     let mut suite = None;
@@ -997,7 +1034,8 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             }
             argument => {
                 return Err(format!(
-                    "expected `--list`, `--case CASE_ID`, or `--suite SUITE`, `--distributed-worker RANK`, or `--coordinator ADDRESS` but got `{argument}`"
+                    "expected `--list`, `--case CASE_ID`, or `--suite SUITE`, `--distributed-worker RANK`, or \
+                    `--coordinator ADDRESS` but got `{argument}`"
                 )
                 .into());
             }
@@ -1011,18 +1049,18 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             println!("{}", case.case_id);
         }
         if suite.is_none() || suite == Some("collectives") {
-            for case in collectives::registry()? {
-                println!("{}", case.id);
+            for case in collectives::CollectiveCase::registry()? {
+                println!("{}", case.id());
             }
         }
         if suite == Some("cuda-collectives") {
-            for case in ragged::registry()? {
-                println!("{}", case.id);
+            for case in ragged::RaggedCase::registry()? {
+                println!("{}", case.id());
             }
         }
         if suite == Some("cuda-distributed-collectives") {
-            for case in distributed_collectives::registry()? {
-                println!("{}", case.id);
+            for case in distributed_collectives::DistributedCollectiveCase::registry()? {
+                println!("{}", case.id());
             }
         }
         return Ok(());
@@ -1040,14 +1078,16 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if coordinator.is_some() {
         return Err("`--coordinator` requires `--distributed-worker RANK`".into());
     }
-    let distributed_cases = distributed_collectives::registry()?;
+    let distributed_cases = distributed_collectives::DistributedCollectiveCase::registry()?;
     if suite == Some("cuda-distributed-collectives")
-        || requested.iter().any(|id| distributed_cases.iter().any(|case| case.id == *id))
+        || requested.iter().any(|id| distributed_cases.iter().any(|case| case.id() == *id))
     {
-        return Err("suite `cuda-distributed-collectives` requires the two-process launcher or `--distributed-worker RANK --coordinator ADDRESS`".into());
+        return Err("suite `cuda-distributed-collectives` requires the two-process launcher or \
+            `--distributed-worker RANK --coordinator ADDRESS`"
+            .into());
     }
-    let collective_cases = collectives::registry()?;
-    let ragged_cases = ragged::registry()?;
+    let collective_cases = collectives::CollectiveCase::registry()?;
+    let ragged_cases = ragged::RaggedCase::registry()?;
     let requested = if requested.is_empty() {
         cases
             .iter()
@@ -1057,9 +1097,9 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 collective_cases
                     .iter()
                     .filter(|_| suite.is_none() || suite == Some("collectives"))
-                    .map(|case| case.id.as_str()),
+                    .map(|case| case.id()),
             )
-            .chain(ragged_cases.iter().filter(|_| suite == Some("cuda-collectives")).map(|case| case.id.as_str()))
+            .chain(ragged_cases.iter().filter(|_| suite == Some("cuda-collectives")).map(|case| case.id()))
             .collect()
     } else {
         requested
@@ -1071,12 +1111,12 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 return Err(format!("case `{case_id}` is not in suite `{suite}`").into());
             }
             records.push((case.emit)()?);
-        } else if let Some(case) = collective_cases.iter().find(|case| case.id == case_id) {
+        } else if let Some(case) = collective_cases.iter().find(|case| case.id() == case_id) {
             if let Some(suite) = suite.filter(|suite| *suite != "collectives") {
                 return Err(format!("case `{case_id}` is not in suite `{suite}`").into());
             }
             records.push(case.emit().map_err(|error| format!("collective case `{case_id}` failed: {error}"))?);
-        } else if let Some(case) = ragged_cases.iter().find(|case| case.id == case_id) {
+        } else if let Some(case) = ragged_cases.iter().find(|case| case.id() == case_id) {
             if let Some(suite) = suite.filter(|suite| *suite != "cuda-collectives") {
                 return Err(format!("case `{case_id}` is not in suite `{suite}`").into());
             }
@@ -1090,6 +1130,8 @@ fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Runs the cases selected by the command line arguments and exits with status 1 after printing the error when running
+/// them fails.
 fn main() {
     if let Err(error) = run(&env::args().skip(1).collect::<Vec<_>>()) {
         eprintln!("{error}");
@@ -1104,9 +1146,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_registry() {
+    fn test_differential_case_registry() {
         assert_eq!(
-            registry().into_iter().map(|case| case.case_id).collect::<Vec<_>>(),
+            DifferentialCase::registry().into_iter().map(|case| case.case_id).collect::<Vec<_>>(),
             vec![
                 "grouped_shape_changing_collectives",
                 "pshuffle",
@@ -1140,8 +1182,49 @@ mod tests {
             ],
         );
         assert_eq!(
-            registry().into_iter().map(|case| case.suite.name()).collect::<Vec<_>>(),
+            DifferentialCase::registry().into_iter().map(|case| case.suite.name()).collect::<Vec<_>>(),
             [[Some("collectives"); 3].as_slice(), &[None; 6], &[Some("rematerialization"); 20]].concat(),
+        );
+    }
+
+    #[test]
+    fn test_emit_data_dependent_prefix_take() {
+        assert_eq!(
+            emit_data_dependent_prefix_take().unwrap(),
+            DifferentialObservation {
+                schema: SCHEMA,
+                case_id: "data_dependent_prefix_take".into(),
+                observations: BTreeMap::from(
+                    [("two_matches", vec![vec![10.0, 20.0]]), ("zero_matches", vec![vec![]]),]
+                ),
+                staging: Some(StagingObservation::Supported { output_type: "f32[count]".to_string() }),
+                stablehlo: None,
+            },
+        );
+    }
+
+    #[test]
+    fn test_run_rejects_unknown_argument() {
+        assert_eq!(
+            run(&["--verbose".into()]).unwrap_err().to_string(),
+            "expected `--list`, `--case CASE_ID`, or `--suite SUITE`, `--distributed-worker RANK`, or \
+             `--coordinator ADDRESS` but got `--verbose`",
+        );
+    }
+
+    #[test]
+    fn test_run_rejects_list_with_case() {
+        assert_eq!(
+            run(&["--list".into(), "--case".into(), "pshuffle".into()]).unwrap_err().to_string(),
+            "`--list` cannot be combined with `--case` or distributed worker options",
+        );
+    }
+
+    #[test]
+    fn test_run_rejects_unknown_case() {
+        assert_eq!(
+            run(&["--case".into(), "missing".into()]).unwrap_err().to_string(),
+            "unknown differential-testing case `missing`",
         );
     }
 
@@ -1196,7 +1279,8 @@ mod tests {
     fn test_run_requires_cuda_feature() {
         assert_eq!(
             run(&["--suite".into(), "cuda-collectives".into()]).unwrap_err().to_string(),
-            "CUDA collective case `cuda_ragged_seed_holes_i32` failed: suite `cuda-collectives` requires the `cuda-13` Cargo feature",
+            "CUDA collective case `cuda_ragged_seed_holes_i32` failed: suite `cuda-collectives` requires the `cuda-13` \
+             Cargo feature",
         );
     }
 
@@ -1204,7 +1288,8 @@ mod tests {
     fn test_run_requires_distributed_worker() {
         assert_eq!(
             run(&["--suite".into(), "cuda-distributed-collectives".into()]).unwrap_err().to_string(),
-            "suite `cuda-distributed-collectives` requires the two-process launcher or `--distributed-worker RANK --coordinator ADDRESS`",
+            "suite `cuda-distributed-collectives` requires the two-process launcher or `--distributed-worker RANK \
+             --coordinator ADDRESS`",
         );
     }
 
@@ -1223,22 +1308,6 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "distributed workers require suite `cuda-distributed-collectives`",
-        );
-    }
-
-    #[test]
-    fn test_data_dependent_prefix_take() {
-        assert_eq!(
-            emit_data_dependent_prefix_take().unwrap(),
-            DifferentialObservation {
-                schema: SCHEMA,
-                case_id: "data_dependent_prefix_take".into(),
-                observations: BTreeMap::from(
-                    [("two_matches", vec![vec![10.0, 20.0]]), ("zero_matches", vec![vec![]]),]
-                ),
-                staging: Some(StagingObservation::Supported { output_type: "f32[count]".to_string() }),
-                stablehlo: None,
-            },
         );
     }
 }
