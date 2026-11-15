@@ -863,7 +863,11 @@ mod tests {
         let input_type =
             ArrayType::new_static(DataType::C64, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![16])));
         assert_eq!(
-            Operation::infer_output_types(&ConjugateOperation::<ArrayType>::new(), &[input_type.clone()], &[]),
+            Operation::infer_output_types(
+                &ConjugateOperation::<ArrayType>::new(),
+                std::slice::from_ref(&input_type),
+                &[]
+            ),
             Ok(vec![input_type]),
         );
     }

@@ -2260,7 +2260,7 @@ impl<P: Parameter, K: Clone + Debug + Eq + Ord + Hash, V: Parameterized<P>, S: C
 
     fn named_parameters(&self) -> Self::NamedParameterIterator<'_, P> {
         let mut sorted_entries = self.iter().collect::<Vec<_>>();
-        sorted_entries.sort_unstable_by(|(l, _), (r, _)| l.cmp(r));
+        sorted_entries.sort_unstable_by_key(|(l, _)| *l);
         sorted_entries.into_iter().flat_map(|(key, value)| {
             PathPrefixedParameterIterator::new(value.named_parameters(), ParameterPathSegment::Key(format!("{key:?}")))
         })
@@ -2519,8 +2519,8 @@ impl<P: Parameter, S: Parameterized<P>> Parameterwise<P, S> {
     /// Applies `function` to every parameter of this structure in parameter order, and returns the structure that
     /// holds the outputs, with the static fields of this structure. Stops at the first error that `function` returns.
     /// A structure without parameters is reconstructed without calling `function`.
-    pub fn map<F: FnMut(&P) -> Result<P, ProgramError>>(&self, mut function: F) -> Result<Self, ProgramError> {
-        let parameters = self.value.parameters().map(|parameter| function(parameter)).collect::<Result<Vec<_>, _>>()?;
+    pub fn map<F: FnMut(&P) -> Result<P, ProgramError>>(&self, function: F) -> Result<Self, ProgramError> {
+        let parameters = self.value.parameters().map(function).collect::<Result<Vec<_>, _>>()?;
         Ok(Self::new(S::from_parameters(self.value.parameter_structure(), parameters)?))
     }
 
@@ -2645,8 +2645,8 @@ mod tests {
             name: &'static str,
         }
 
-        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
         #[allow(dead_code)]
+        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
         enum Controller<P: Parameter> {
             Identity,
             Blend { alpha: P, branch: Block<P> },

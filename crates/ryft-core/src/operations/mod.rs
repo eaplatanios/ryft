@@ -680,7 +680,10 @@ mod tests {
 
         let operation = TestElementwiseArrayOperation { input_count: 1 };
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        assert_eq!(Operation::infer_output_types(&operation, &[input_type.clone()], &[]), Ok(vec![input_type]));
+        assert_eq!(
+            Operation::infer_output_types(&operation, std::slice::from_ref(&input_type), &[]),
+            Ok(vec![input_type])
+        );
         assert_eq!(
             Operation::infer_output_types(&operation, &[], &[]),
             Err(TypeError::invalid("expected 1 input but got 0".to_string())),

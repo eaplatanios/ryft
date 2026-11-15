@@ -681,7 +681,7 @@ impl EinsumOptions {
     /// contraction to the types that it computes with and accumulates at its own type, so the inputs are not
     /// converted first and every accumulation type is supported (e.g., `i16` inputs are contracted at `f32` by the
     /// `F32_F32_F32` preset and the result is converted to an `f16` accumulation type). Two inputs of different
-    /// element types are converted to the type that they promote to.
+    /// element types are converted to the types that the algorithm computes with.
     ///
     /// This is the `preferred_element_type` argument of `jax.numpy.einsum`.
     #[inline]
@@ -1892,9 +1892,10 @@ impl<S> EinsumExecution<'_, S> {
     /// An algorithm converts its inputs to the element types that it computes with and accumulates at its own type,
     /// so its inputs are contracted as they are, like in JAX. Converting them to the accumulation type first would
     /// round them before the algorithm does (e.g., `i16` inputs at an `f16` accumulation type, which the
-    /// `F32_F32_F32` preset contracts at `f32`). Only inputs of different element types are converted, to the type
-    /// that they promote to. A floating-point accumulation type is then produced by the `dot` itself. Every other
-    /// one is converted from the type that the algorithm accumulates at, which keeps the `dot` differentiable.
+    /// `F32_F32_F32` preset contracts at `f32`). Only inputs of different element types are converted, to the types
+    /// that the algorithm computes with, because a `dot` requires one input type. A floating-point accumulation
+    /// type is then produced by the `dot` itself. Every other one is converted from the type that the algorithm
+    /// accumulates at, which keeps the `dot` differentiable.
     fn contract<V: Clone>(
         &mut self,
         lhs: &V,
@@ -1915,10 +1916,17 @@ impl<S> EinsumExecution<'_, S> {
             let (lhs, rhs, lhs_type, rhs_type) = if lhs_type == rhs_type || is_native_f8_pair {
                 (lhs.clone(), rhs.clone(), lhs_type, rhs_type)
             } else {
-                let common_type = DataType::promoted(&[lhs_type, rhs_type]).unwrap_or(accumulation_type);
-                let lhs = self.convert(lhs.clone(), common_type)?;
-                let rhs = self.convert(rhs.clone(), common_type)?;
-                (lhs, rhs, common_type, common_type)
+                // The types that the algorithm computes with differ only when it supports both input types or
+                // rounds its two inputs differently. Their promotion then loses nothing that the algorithm keeps.
+                let (lhs_type, rhs_type, _) = self.precision.computation_types(lhs_type, rhs_type, accumulation_type);
+                let (lhs_type, rhs_type) = match DataType::promoted(&[lhs_type, rhs_type]) {
+                    _ if lhs_type == rhs_type => (lhs_type, rhs_type),
+                    common_type => {
+                        let common_type = common_type.unwrap_or(accumulation_type);
+                        (common_type, common_type)
+                    }
+                };
+                (self.convert(lhs.clone(), lhs_type)?, self.convert(rhs.clone(), rhs_type)?, lhs_type, rhs_type)
             };
             if accumulation_type.is_floating_point() {
                 return self.steps.contract(&lhs, &rhs, dimensions, Some(accumulation_type), output_sharding);
@@ -6925,6 +6933,108 @@ mod tests {
             Ok(Array::scalar(5.0f64).unwrap()),
         );
 
+        // An algorithm contracts its inputs as they are and converts its result, so an accumulation type never
+        // rounds them first and may be of any kind. The `i16` inputs below are exact at `f32`, while `2049` rounds
+        // to `2048` at `f16`, which is what the conversion without an algorithm does. JAX computes the same values.
+        let narrow = Array::vector(vec![2049i16, -2048]).unwrap();
+        let ones = Array::vector(vec![1i16, 1]).unwrap();
+        let specification = "i,i->".parse::<EinsumSpecification>().unwrap();
+        let preset = EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32);
+        let contract = |options: &EinsumOptions, accumulation_type: DataType| {
+            let options = options.clone().with_accumulation_type(accumulation_type);
+            Array::einsum_with_options(&specification, [&narrow, &ones], &options)
+        };
+        assert_eq!(contract(&preset, DataType::F16), Ok(Array::scalar(f16::from_f32(1.0)).unwrap()));
+        assert_eq!(contract(&EinsumOptions::new(), DataType::F16), Ok(Array::scalar(f16::from_f32(0.0)).unwrap()));
+        assert_eq!(contract(&preset, DataType::I8), Ok(Array::scalar(1i8).unwrap()));
+        assert_eq!(contract(&preset, DataType::U8), Ok(Array::scalar(1u8).unwrap()));
+        assert_eq!(contract(&preset, DataType::C64), Ok(Array::scalar(Complex::new(1.0f32, 0.0)).unwrap()));
+        assert_eq!(contract(&preset, DataType::Boolean), Ok(Array::scalar(true).unwrap()));
+        let fraction = Array::vector(vec![1.4140625f32]).unwrap();
+        assert_eq!(
+            Array::einsum_with_options(
+                &specification,
+                [&fraction, &fraction],
+                &preset.clone().with_accumulation_type(DataType::C64),
+            ),
+            Ok(Array::scalar(Complex::new(1.99957275390625f32, 0.0)).unwrap()),
+        );
+
+        // The same holds for inputs of different element types, which are converted to the types that the algorithm
+        // computes with, where their promotion to `f16` would round them. An earlier result at the accumulation
+        // type meets an input like that as well.
+        let halves = Array::vector(vec![f16::from_f32(1.0), f16::from_f32(1.0)]).unwrap();
+        assert_eq!(
+            Array::einsum_with_options(&specification, [&narrow, &halves], &preset),
+            Ok(Array::scalar(f16::from_f32(1.0)).unwrap()),
+        );
+        assert_eq!(
+            Array::einsum_with_options(&specification, [&narrow, &halves], &EinsumOptions::new()),
+            Ok(Array::scalar(f16::from_f32(0.0)).unwrap()),
+        );
+        assert_eq!(
+            Array::einsum_with_options(
+                &specification,
+                [&halves, &narrow],
+                &preset.clone().with_accumulation_type(DataType::I32),
+            ),
+            Ok(Array::scalar(1i32).unwrap()),
+        );
+        let chain = "i,i,i->".parse::<EinsumSpecification>().unwrap();
+        let path = EinsumPathStrategy::explicit([(0, 1), (0, 1)]);
+        let options = preset.clone().with_path(path.clone()).with_accumulation_type(DataType::F16);
+        assert_eq!(
+            Array::einsum_with_options(&chain, [&ones, &ones, &narrow], &options),
+            Ok(Array::scalar(f16::from_f32(1.0)).unwrap()),
+        );
+        let options = EinsumOptions::new().with_path(path).with_accumulation_type(DataType::F16);
+        assert_eq!(
+            Array::einsum_with_options(&chain, [&ones, &ones, &narrow], &options),
+            Ok(Array::scalar(f16::from_f32(0.0)).unwrap()),
+        );
+
+        // A floating-point accumulation type is produced by the contraction itself. Every other one is converted
+        // from the type that the algorithm accumulates at.
+        let input_types = vec![ArrayType::new_static(DataType::I16, [2]); 2];
+        let stage = |accumulation_type: DataType| {
+            let options = preset.clone().with_accumulation_type(accumulation_type);
+            let (_, program) = ArrayContext::trace(
+                |inputs: Vec<DomainTracer<ArrayContext>>| {
+                    DomainTracer::<ArrayContext>::einsum_with_options(&specification, inputs.iter(), &options)
+                },
+                input_types.clone(),
+            )
+            .unwrap();
+            program.to_string()
+        };
+        assert_eq!(
+            stage(DataType::F16),
+            indoc! {"
+                lambda %0:i16[2], %1:i16[2] .
+                let %2:f16[] = dot [
+                    dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    precision=f32_f32_f32,
+                    accumulation_type=f16,
+                ] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+        assert_eq!(
+            stage(DataType::I8),
+            indoc! {"
+                lambda %0:i16[2], %1:i16[2] .
+                let %2:f32[] = dot [
+                    dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    precision=f32_f32_f32,
+                    accumulation_type=f32,
+                ] %0 %1
+                    %3:i8[] = convert_element_type [data_type=i8] %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+
         // A precision that the inputs do not support is rejected by the contraction.
         let options = EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32);
         assert_eq!(
@@ -7250,6 +7360,24 @@ mod tests {
             )),
         );
 
+        // A contraction under an algorithm stays differentiable when its accumulation type is of another kind,
+        // because that type is converted from the floating-point result of the algorithm.
+        let specification = "i,i->".parse::<EinsumSpecification>().unwrap();
+        let options = EinsumOptions::new()
+            .with_precision(DotAlgorithmPreset::F32_F32_F32)
+            .with_accumulation_type(DataType::C64);
+        let lhs = Array::vector(vec![1.5f32, 2.0]).unwrap();
+        let rhs = Array::vector(vec![4.0f32, 0.5]).unwrap();
+        let tangent = Array::vector(vec![1.0f32, 2.0]).unwrap();
+        assert_eq!(
+            differentiate_at(lhs).with_captures(rhs).jvp(tangent, |lhs, rhs| Einsum::einsum_with_options(
+                &specification,
+                [&lhs, &rhs],
+                &options
+            )),
+            Ok((Array::scalar(Complex::new(7.0f32, 0.0)).unwrap(), Array::scalar(Complex::new(5.0f32, 0.0)).unwrap(),)),
+        );
+
         // Reverse mode transposes every step, including the diagonal of a repeated label and a multiple step path.
         check_gradient!(
             |input| Einsum::einsum(
@@ -7426,6 +7554,76 @@ mod tests {
         .unwrap();
         let square = reference_input(0, &[2, 2]);
         assert_eq!(program.interpret(vec![square.clone()]), Array::einsum("ii->i", [&square]));
+
+        // A label that two inputs share may likewise have distinct dimensions whose extents are provably equal, as
+        // a contracted label and as a label that the output keeps.
+        let extent = Dimension::Dynamic(DimensionVariable::new("p", DimensionBounds::new(2, Some(3)).unwrap()));
+        let proven_type = ArrayType::new(DataType::F64, Shape::new(vec![extent]));
+        let static_type = ArrayType::new_static(DataType::F64, [2]);
+        let vectors = [reference_input(0, &[2]), reference_input(1, &[2])];
+        for subscripts in ["i,i->", "i,i->i", "i,i,i->i"] {
+            let input_types = [vec![proven_type.clone(), static_type.clone()], vec![static_type.clone(); 2]].concat();
+            let count = subscripts.split(',').count();
+            let (_, program) = ArrayContext::trace(
+                |inputs: Vec<DomainTracer<ArrayContext>>| Einsum::einsum(subscripts, inputs.iter()),
+                input_types[..count].to_vec(),
+            )
+            .unwrap();
+            let inputs = [&vectors[0], &vectors[1], &vectors[0]];
+            assert_eq!(
+                program.interpret(inputs[..count].iter().map(|input| (*input).clone()).collect()),
+                Array::einsum(subscripts, inputs[..count].iter().copied()),
+                "{subscripts}",
+            );
+        }
+
+        // The output keeps the static dimension of such a label, and reverse mode transposes its contraction with
+        // respect to either input.
+        let input_types = [proven_type, static_type.clone()];
+        let plan = "i,i->i".parse::<EinsumSpecification>().unwrap().plan(&input_types, &EinsumOptions::new());
+        assert_eq!(plan.unwrap().output_type(), Ok(static_type));
+        for (linear, known) in [(0, 1), (1, 0)] {
+            let (_, program) = ArrayContext::trace(
+                |inputs: Vec<DomainTracer<ArrayContext>>| {
+                    differentiate_at(inputs[linear].clone())
+                        .with_captures(inputs[known].clone())
+                        .gradient(|linear, known| Einsum::einsum("i,i->", [&linear, &known]))
+                        .map_err(ProgramError::from)
+                },
+                input_types.to_vec(),
+            )
+            .unwrap();
+            assert_eq!(program.interpret(vectors.to_vec()), Ok(vectors[known].clone()));
+        }
+
+        // A dynamic extent whose bounds admit only one is broadcast like a static extent of one. Its axis is summed
+        // away, because a reshape cannot remove a dynamic axis.
+        let extent = Dimension::Dynamic(DimensionVariable::new("s", DimensionBounds::new(1, Some(2)).unwrap()));
+        let singleton_type = ArrayType::new(DataType::F64, Shape::new(vec![extent, 3.into()]));
+        let matrix_type = ArrayType::new_static(DataType::F64, [2, 3]);
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<DomainTracer<ArrayContext>>| Einsum::einsum("ij,ij->i", inputs.iter()),
+            vec![singleton_type, matrix_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[s, 3], %1:f64[2, 3] .
+                let %2:f64[3] = reduce [kind=sum, axes=[0]] %0
+                    %3:f64[2] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[1], lhs_batching=[], rhs_batching=[]),
+                    ] %2 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        let singleton = reference_input(0, &[1, 3]);
+        let matrix = reference_input(1, &[2, 3]);
+        assert_eq!(
+            program.interpret(vec![singleton.clone(), matrix.clone()]),
+            Array::einsum("ij,ij->i", [&singleton, &matrix]),
+        );
 
         // Homogeneous array values with a dynamic extent stage the same sum, including through a composite.
         let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));

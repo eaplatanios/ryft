@@ -237,6 +237,7 @@ struct NamedCompositeOutputCacheEntry<V: Typed + Parameter, O, InputStructure, O
 }
 
 /// Named composite configuration of a [`Composite`]. Refer to [`Composite::with_named_composite`] for more information.
+#[allow(clippy::type_complexity)]
 struct NamedCompositeConfiguration<T, InputStructure, OutputStructure> {
     /// Semantic identity of the definition that the function registers for calls with the provided input parameter
     /// structure.
@@ -2113,7 +2114,7 @@ mod tests {
     /// avoid constant lifting), which makes visible whether a batched computation and each of its derivatives go
     /// through the rule. The rule maps its output exactly when its input is mapped.
     fn doubled_sine_when_batched() -> BatchedComposite<Array, ArrayOperation<Array>, ArrayTracer, ArrayTracer> {
-        composite(|x: ArrayTracer| Ok(x.sin()?)).with_name("sine").with_batching(
+        composite(|x: ArrayTracer| x.sin()).with_name("sine").with_batching(
             |x: ArrayTracer, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer>| Ok((x.sin()? + x.sin()?, axis)),
         )
     }
@@ -2574,7 +2575,7 @@ mod tests {
         // Without a name, calls are labeled by the operation name. Renaming a function that was already called must not
         // reuse the definition registered by that call, which carries the previous name. A function with only
         // reverse mode rules rejects forward mode and names itself in the diagnostic.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?));
+        let function = composite(|x: ArrayTracer| x.sin());
         let (_, program) = ArrayContext::trace(|x| function.call(x), ArrayType::scalar(DataType::F64)).unwrap();
         assert_eq!(
             program.to_string(),
@@ -2625,7 +2626,7 @@ mod tests {
     fn test_composite_with_rule_axes() {
         // A function declares no rule axes until it is configured to, an empty declaration differs from no declaration,
         // and the declaration survives later configurations, including the configuration of rules.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?));
+        let function = composite(|x: ArrayTracer| x.sin());
         assert_eq!(function.rule_axes(), None);
         let function = function.with_rule_axes(Vec::<String>::new());
         assert_eq!(function.rule_axes(), Some(&[] as &[String]));
@@ -2648,7 +2649,7 @@ mod tests {
         };
         let named = HiddenAxes::Named(vec!["x".to_string()]);
 
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?));
+        let function = composite(|x: ArrayTracer| x.sin());
         let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
         assert_eq!(hidden_axes(program.instructions()), vec![HiddenAxes::None]);
         let function = function.with_rule_axes(["x"]);
@@ -2658,7 +2659,7 @@ mod tests {
         let jvp = |x: ArrayTracer, tangent: ArrayTracer| -> Result<(ArrayTracer, ArrayTracer), ProgramError> {
             Ok((x.sin()?, x.cos()? * tangent))
         };
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_jvp(jvp);
+        let function = composite(|x: ArrayTracer| x.sin()).with_jvp(jvp);
         let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
         assert_eq!(hidden_axes(program.instructions()), vec![HiddenAxes::Unknown]);
         let function = function.with_rule_axes(["x"]);
@@ -2672,7 +2673,7 @@ mod tests {
             .0;
         assert_eq!(hidden_axes(batched.instructions()), vec![named.clone()]);
 
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_vjp(|x| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
             .with_rule_axes(["x"]);
         let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type.clone()).unwrap();
@@ -2683,7 +2684,7 @@ mod tests {
             .unwrap();
         assert_eq!(hidden_axes(linearization.tangent().instructions()), vec![named.clone()]);
 
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_batching(|x: ArrayTracer, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer>| Ok((x.sin()?, axis)))
             .with_rule_axes(["x"]);
         let (_, program) = ArrayContext::trace(|x| function.call(x), scalar_type).unwrap();
@@ -2926,7 +2927,7 @@ mod tests {
     fn test_composite_with_jvp() {
         // An explicit JVP rule governs forward mode and, by transposition, reverse mode. The rule doubles the true
         // derivative (expressed through addition to avoid constant lifting), which proves that the rule is in control.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_jvp(|x, tangent| {
+        let function = composite(|x: ArrayTracer| x.sin()).with_jvp(|x, tangent| {
             let tangent = x.cos()? * tangent;
             Ok((x.sin()?, tangent.clone() + tangent))
         });
@@ -2944,7 +2945,7 @@ mod tests {
     fn test_composite_with_jvp_zero_space_inputs() {
         // The tangent of an integer input belongs to a zero differential space, so it is always a structural zero,
         // which the specialization materializes for a rule that receives materialized tangents.
-        let function = composite(|(x, _): (ArrayTracer, ArrayTracer)| Ok(x.sin()?)).with_jvp(
+        let function = composite(|(x, _): (ArrayTracer, ArrayTracer)| x.sin()).with_jvp(
             |(x, _): (ArrayTracer, ArrayTracer), (tangent, count_tangent): (ArrayTracer, ArrayTracer)| {
                 assert_eq!(count_tangent.r#type().into_owned(), ArrayType::scalar(DataType::Zero));
                 Ok((x.sin()?, x.cos()? * tangent))
@@ -3120,7 +3121,7 @@ mod tests {
         // Fixed tuple structures are checked statically, but array shapes and collection lengths require runtime
         // validation. This rule produces a scalar tangent for a vector output, which fails signature validation when
         // the rule is first traced (i.e., by the first derivative request) rather than when the function is called.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_jvp(|x, tangent| Ok((x.sin()?, tangent.dot(&tangent, &DotDimensionNumbers::inner_product())?)));
         let (_, program) =
             ArrayContext::trace(|x| function.call(x), ArrayType::new_static(DataType::F64, [2])).unwrap();
@@ -3189,7 +3190,7 @@ mod tests {
                         let (extent, output) = broadcast(&dimension, x)?;
                         let extent_tangent = extent.context().zero(&extent.r#type().tangent()?)?;
                         let output_tangent = match shares_extent {
-                            true => tangent.dynamic_broadcast(&[extent.clone()], &[])?,
+                            true => tangent.dynamic_broadcast(std::slice::from_ref(&extent), &[])?,
                             false => broadcast(&dimension, tangent)?.1,
                         };
                         Ok(((extent, output), (extent_tangent, output_tangent)))
@@ -3409,7 +3410,7 @@ mod tests {
             let gradient = cosine * cotangent;
             Ok(gradient.clone() + gradient.clone() + gradient)
         };
-        let primal = |x: ArrayTracer| Ok(x.sin()?);
+        let primal = |x: ArrayTracer| x.sin();
         let jvp_first = composite(primal).with_jvp(doubled_jvp).with_vjp(forward, tripled_backward);
         let vjp_first = composite(primal).with_vjp(forward, tripled_backward).with_jvp(doubled_jvp);
         assert_eq!(
@@ -3434,7 +3435,7 @@ mod tests {
     fn test_composite_with_jvp_from_primal() {
         // Deriving the forward mode rule from the primal yields the true derivative in both modes, unless reverse mode
         // rules are configured as well, in which case they govern reverse mode (and triple the derivative here).
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_jvp_from_primal();
+        let function = composite(|x: ArrayTracer| x.sin()).with_jvp_from_primal();
         assert_eq!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
             Ok((Array::scalar(2.0f64.sin()).unwrap(), Array::scalar(2.0f64.cos()).unwrap())),
@@ -3573,7 +3574,7 @@ mod tests {
     fn test_composite_with_vjp() {
         // Reverse mode rules govern reverse mode, while forward mode rejects the call because no forward mode rule was
         // configured.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_vjp(
+        let function = composite(|x: ArrayTracer| x.sin()).with_vjp(
             |x| Ok((x.sin()?, x.cos()?)),
             |cosine, cotangent| {
                 let gradient = cosine * cotangent;
@@ -3598,7 +3599,7 @@ mod tests {
         // Specializations of one call structure may return differently structured residuals. Here, the forward rule
         // saves `cos(x)` and one more copy of it per input dimension, so the scalar and vector specializations save one
         // and two residuals, respectively.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_vjp(
+        let function = composite(|x: ArrayTracer| x.sin()).with_vjp(
             |x| {
                 let cosine = x.cos()?;
                 Ok((x.sin()?, (cosine.clone(), vec![cosine; x.r#type().rank()])))
@@ -3618,7 +3619,7 @@ mod tests {
 
         // Residual structures are recorded by their flat residual types, so two specializations whose residuals have
         // identical flat types but different structures are ambiguous. Here, the residual type is always `f64[]`.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_vjp(
+        let function = composite(|x: ArrayTracer| x.sin()).with_vjp(
             |x| {
                 let total = x.cos()?.reduce(&(0..x.r#type().rank()).collect::<Vec<_>>(), ReductionKind::Sum)?;
                 let residuals = if x.r#type().rank() == 0 { vec![vec![total]] } else { vec![vec![], vec![total]] };
@@ -3786,7 +3787,7 @@ mod tests {
         // Interpreting a staged call runs only its primal, while reverse mode runs the backward rule
         // `backward(residual, cotangent) = 3 * residual * cotangent`, which triples the true gradient (expressed
         // through addition to avoid constant lifting) and so proves that the rule is in control.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_vjp(
+        let function = composite(|x: ArrayTracer| x.sin()).with_vjp(
             |x| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| {
                 let product = residual * cotangent;
@@ -4020,7 +4021,7 @@ mod tests {
         // Extracting the stored pullback must preserve the custom backward rule and its residual inputs. The forward
         // rule saves `cos(x)`, and the backward rule returns `2 * residual * cotangent`, so a unit cotangent at
         // `x = 0.7` produces `2 * cos(0.7)` rather than the mathematical derivative.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_vjp(
+        let function = composite(|x: ArrayTracer| x.sin()).with_vjp(
             |x| Ok((x.sin()?, x.cos()?)),
             |residual, cotangent| Ok((residual.clone() + residual) * cotangent),
         );
@@ -4216,7 +4217,7 @@ mod tests {
         // A forward rule that saves nothing (i.e., `Residual = ()`) exercises a carrier without residuals. The backward
         // rule depends only on the output cotangent, so the custom rule `backward(cotangent) = 2 * cotangent` makes the
         // gradient the constant `2` instead of `cos(x)`.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_vjp(|x| Ok((x.sin()?, ())), |(), cotangent| Ok(cotangent.clone() + cotangent));
         assert_eq!(
             differentiate_at(Array::scalar(2.0).unwrap()).value_and_gradient(|x| function.call(x).unwrap()),
@@ -4481,7 +4482,7 @@ mod tests {
         // existing trace, so it can return a structural zero without recovering a context from a live input.
         let invocations = Arc::new(AtomicUsize::new(0));
         let function =
-            composite(|x: ArrayTracer| Ok(x.sin()?)).with_symbolic_zero_vjp(|x: ArrayTracer| Ok((x.sin()?, ())), {
+            composite(|x: ArrayTracer| x.sin()).with_symbolic_zero_vjp(|x: ArrayTracer| Ok((x.sin()?, ())), {
                 let invocations = invocations.clone();
                 move |(): (), seed: MaybeZero<ArrayTracer>| {
                     invocations.fetch_add(1, Ordering::SeqCst);
@@ -4631,7 +4632,7 @@ mod tests {
         let value = Array::scalar(0.5f64.sin()).unwrap();
         let seed = Array::scalar(2.0f64).unwrap();
         let gradient = Array::scalar(2.0 * 0.5f64.cos()).unwrap();
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_name("sine")
             .with_vjp(|x: ArrayTracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent));
         let (output, pullback) = differentiate_at(x.clone()).vjp(|x| function.call(x)).unwrap();
@@ -4659,7 +4660,7 @@ mod tests {
         let value = Array::scalar(0.5f64.sin()).unwrap();
         let seed = Array::scalar(2.0f64).unwrap();
         let gradient = Array::scalar(2.0 * 0.5f64.cos()).unwrap();
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_symbolic_zero_vjp(
                 |x: ArrayTracer| Ok((x.sin()?, x.cos()?)),
                 |cosine: ArrayTracer, seed: MaybeZero<ArrayTracer>| match seed {
@@ -4683,7 +4684,7 @@ mod tests {
         let value = Array::scalar(0.5f64.sin()).unwrap();
         let seed = Array::scalar(2.0f64).unwrap();
         let gradient = Array::scalar(2.0 * 0.5f64.cos()).unwrap();
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_accumulating_vjp(
                 |x: ArrayTracer| Ok((x.sin()?, x.cos()?)),
                 |context: &mut TranspositionContext<Array, ArrayOperation<Array>>,
@@ -5027,7 +5028,7 @@ mod tests {
     #[test]
     fn test_composite_with_batching_differentiation() {
         // A function with only a batching rule (i.e., bare `custom_vmap`) differentiates its primal in both modes.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_batching(|x: ArrayTracer, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer>| Ok((x.sin()?, axis)));
         assert_eq!(
             differentiate_at(Array::scalar(2.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| function.call(x)),
@@ -5433,7 +5434,7 @@ mod tests {
     fn test_composite_with_batching_differentiate_then_batch_zero_space_inputs() {
         // Inputs whose tangents belong to a zero differential space (e.g., integers) have no tangents, so a derived
         // call receives none for them, while the rule still receives them with their batch axes.
-        let function = composite(|(x, _): (ArrayTracer, ArrayTracer)| Ok(x.sin()?))
+        let function = composite(|(x, _): (ArrayTracer, ArrayTracer)| x.sin())
             .with_name("sine")
             .with_batching(|(x, _), (axis, _), _| Ok((x.sin()? + x.sin()?, axis)));
         let (_, program) = ArrayContext::trace(
@@ -5541,7 +5542,7 @@ mod tests {
     fn test_composite_with_batching_differentiate_then_batch_projection() {
         // Projections of array IR contexts lift the regions of the member operations that they bind, so a function
         // written against a projection stages its derived call in the array IR family.
-        let function = composite(|x: DomainTracer<ProjectedContext<EagerArrayIrContext, ArrayType>>| Ok(x.sin()?))
+        let function = composite(|x: DomainTracer<ProjectedContext<EagerArrayIrContext, ArrayType>>| x.sin())
             .with_batching(|x, axis, _| Ok((x.sin()? + x.sin()?, axis)));
         let (_, program) = EagerArrayIrContext::trace(
             |x: ArrayIrTracer| {
@@ -5903,7 +5904,7 @@ mod tests {
             Ok(Array::scalar(0.5f64.cos()).unwrap()),
         );
 
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_jvp_from_primal()
             .with_vjp(
                 |x| Ok((x.sin()?, x.cos()?)),
@@ -6641,7 +6642,7 @@ mod tests {
     fn test_composite_with_batched_output_axes_batching_rule() {
         // A custom batching rule declares the batch axes of its outputs itself, so configuring one discards the batch
         // axes declared before it, and the batched call maps its output as the rule declares.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_batched_output_axes(vec![BatchAxis::replicated()])
             .with_batching(|x: ArrayTracer, axis: BatchAxis, _: BatchingLevelExtent<ArrayTracer>| Ok((x.sin()?, axis)));
         assert_eq!(
@@ -6685,7 +6686,7 @@ mod tests {
         // Nothing but the primal is traced when the function is called. Calls that share a call structure share one
         // registered definition, whose rule is traced once per specialization and cached while the function lives.
         let traces = Arc::new(AtomicUsize::new(0));
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_jvp({
+        let function = composite(|x: ArrayTracer| x.sin()).with_jvp({
             let traces = traces.clone();
             move |x, tangent| {
                 traces.fetch_add(1, Ordering::SeqCst);
@@ -6959,8 +6960,7 @@ mod tests {
         // Rules traced under different named axes may differ, so a call under a named batch axis registers its own
         // definition, while a call under an unnamed batch axis sees the same named axes as an unbatched call and
         // shares its definition.
-        let function =
-            composite(|x: ArrayTracer| Ok(x.sin()?)).with_jvp(|x, tangent| Ok((x.sin()?, x.cos()? * tangent)));
+        let function = composite(|x: ArrayTracer| x.sin()).with_jvp(|x, tangent| Ok((x.sin()?, x.cos()? * tangent)));
         let (_, program) = ArrayContext::trace(
             |x: ArrayTracer| {
                 let unbatched = function.call(x.clone())?;
@@ -7011,7 +7011,7 @@ mod tests {
         );
 
         // The non-differentiated count cannot exceed the number of input leaves.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_jvp(|x, tangent| Ok((x.sin()?, x.cos()? * tangent)))
             .with_non_differentiated_count(2);
         assert_eq!(
@@ -7020,7 +7020,7 @@ mod tests {
                 "`composite` non-differentiated input count 2 exceeds input count 1".to_string(),
             ))),
         );
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?))
+        let function = composite(|x: ArrayTracer| x.sin())
             .with_vjp(|x| Ok((x.sin()?, x.cos()?)), |residual, cotangent| Ok(residual * cotangent))
             .with_non_differentiated_count(2);
         assert_eq!(
@@ -7053,7 +7053,7 @@ mod tests {
     #[test]
     fn test_composite_debug() {
         // Debug output names each configuration kind and the function, but not the closures.
-        let function = composite(|x: ArrayTracer| Ok(x.sin()?)).with_name("sine");
+        let function = composite(|x: ArrayTracer| x.sin()).with_name("sine");
         assert_eq!(
             format!("{function:?}"),
             "Composite { name: \"sine\", jvp: DefaultJvp, vjp: DefaultVjp, batching: DefaultBatching, \

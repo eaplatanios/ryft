@@ -194,7 +194,7 @@ impl<O: Operation<Type = ArrayType>> One<Array> for EagerContext<Array, O> {
                 Err(TypeError::invalid(format!("data type `{}` cannot represent one", r#type.data_type())).into())
             }
             data_type => dispatch_on_array_element_type!(data_type, |Element| {
-                Array::from_fn_elements(r#type.clone(), |_| Ok(Element::one()?))
+                Array::from_fn_elements(r#type.clone(), |_| Element::one())
             }),
         }
     }
@@ -743,7 +743,7 @@ mod tests {
     fn test_one_transposition() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F64));
-        let input_cotangents = OneOperation::new(ArrayType::scalar(DataType::F64))
+        OneOperation::new(ArrayType::scalar(DataType::F64))
             .transpose(
                 &mut TranspositionContext::new(context),
                 &EmptyRegionDriver,
@@ -752,7 +752,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(input_cotangents, ());
+        assert_eq!((), ());
     }
 
     #[test]
@@ -954,7 +954,7 @@ mod tests {
         for data_type in [DataType::Token, DataType::Zero] {
             let r#type = ArrayType::new(data_type, Shape::new(vec![size.clone().into()]));
             assert_eq!(
-                context.dynamic_one(&r#type, &[dimension.clone()]).unwrap_err(),
+                context.dynamic_one(&r#type, std::slice::from_ref(&dimension)).unwrap_err(),
                 ProgramError::Type(TypeError::invalid(format!("data type `{data_type}` cannot represent one"))),
             );
             assert!(context.builder().borrow().instructions().is_empty());

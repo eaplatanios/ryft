@@ -112,6 +112,13 @@ impl<T: Type> SelectOperation<T> {
     }
 }
 
+impl<T: Type> Default for SelectOperation<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Type> Copy for SelectOperation<T> {}
 
 impl<T: Type> Display for SelectOperation<T> {

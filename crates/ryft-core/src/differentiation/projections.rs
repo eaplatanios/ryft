@@ -572,7 +572,7 @@ where
     ///   - `inputs`: Per-input primal knowledge, preserving whether each primal is known or is a linear unknown.
     ///   - `outputs`: Heterogeneous output cotangents, represented as live traced values or structural zeros.
     ///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by this context.
-    pub fn transpose_projected_operation<T: DifferentiableType, P: Operation<Type = T>>(
+    pub fn transpose_projected_operation<T: DifferentiableType, P>(
         &mut self,
         operation: &P,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
@@ -582,7 +582,7 @@ where
     where
         V: ValueProjection<T, Projected: Value<Type = T>>,
         V::Type: DifferentiableType + From<T>,
-        P: TransposableOperation<<V as ValueProjection<T>>::Projected, P>,
+        P: Operation<Type = T> + TransposableOperation<<V as ValueProjection<T>>::Projected, P>,
         O: OperationProjection<T, Projected = P> + OperationProvider<V::Type, AddOperation<V::Type>, Operation = O>,
         TracingContext<<V as ValueProjection<T>>::Projected, P>:
             StagingContext<Type = T, Constant = <V as ValueProjection<T>>::Projected, Operation = P>,

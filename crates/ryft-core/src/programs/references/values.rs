@@ -2191,6 +2191,8 @@ mod tests {
         alias.hash(&mut alias_hasher);
         assert_eq!(reference_hasher.finish(), alias_hasher.finish());
 
+        // References hash and compare by their allocation's identity, not by the allocation's mutable state.
+        #[allow(clippy::mutable_key_type)]
         let references = HashMap::from([(reference.clone(), "allocation")]);
         assert_eq!(references.get(&alias), Some(&"allocation"));
         assert_eq!(references.get(&distinct), None);

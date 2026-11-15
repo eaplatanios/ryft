@@ -231,7 +231,7 @@ impl Operation for ParallelPermuteOperation {
         OperationFormatter::new(formatter, indentation, PARALLEL_PERMUTE_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("axes", format_args!("{:?}", self.axes))?;
             operation.field("axis_size", self.axis_size)?;
-            operation.field("source_target_pairs", format_args!("{:?}", &self.source_target_pairs))?;
+            operation.field("source_target_pairs", format_args!("{:?}", self.source_target_pairs))?;
             if let Some(value) = &self.mesh {
                 operation.field("mesh", value)?;
             }
@@ -1274,7 +1274,7 @@ mod tests {
                     BatchAxis::new(0),
                     BatchAxisSpecification::named("x"),
                 )?;
-                Ok(shifted.reduce(&[0], ReductionKind::Sum)?)
+                shifted.reduce(&[0], ReductionKind::Sum)
             }),
             Ok((Array::scalar(3.0).unwrap(), Array::vector(vec![1.0, 1.0, 0.0]).unwrap())),
         );

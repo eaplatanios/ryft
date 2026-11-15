@@ -1735,14 +1735,14 @@ where
 }
 
 /// Validates both representations and infers the contraction output before any operations are staged.
-fn validate_scaled_dot_inputs<P: Parameter>(
+fn validate_scaled_dot_inputs<P>(
     lhs: &BlockQuantizedValue<P>,
     rhs: &BlockQuantizedValue<P>,
     dimensions: Option<&DotDimensionNumbers>,
     accumulation_type: Option<DataType>,
 ) -> Result<ArrayType, ProgramError>
 where
-    P: Typed<Type: ArrayMemberType>,
+    P: Parameter + Typed<Type: ArrayMemberType>,
 {
     for (name, global_scale) in [("left", &lhs.global_scale), ("right", &rhs.global_scale)] {
         if let Some(global_scale) = global_scale {
@@ -1797,12 +1797,12 @@ where
 }
 
 /// Validates the rank-3 element and block-scale arrays required by the matrix-product frontend.
-fn validate_scaled_matmul_inputs<P: Parameter>(
+fn validate_scaled_matmul_inputs<P>(
     lhs: &BlockQuantizedValue<P>,
     rhs: &BlockQuantizedValue<P>,
 ) -> Result<(), ProgramError>
 where
-    P: Typed<Type: ArrayMemberType>,
+    P: Parameter + Typed<Type: ArrayMemberType>,
 {
     for value in [&lhs.elements, &rhs.elements, &lhs.scales, &rhs.scales] {
         if value.r#type().as_array_type()?.rank() != 3 {
@@ -5124,12 +5124,12 @@ mod tests {
         );
         assert_eq!(
             BlockQuantizedValue::new(elements.clone(), scales.clone()).block_dequantize(Axes::default(), DataType::F32),
-            Ok(Array::scalar(1.0078277587890625f32).unwrap()),
+            Ok(Array::scalar(1.007_827_8_f32).unwrap()),
         );
         assert_eq!(
             BlockQuantizedValue::new(ArrayIrValue::Array(elements), ArrayIrValue::Array(scales))
                 .block_dequantize(Axes::default(), DataType::F32),
-            Ok(ArrayIrValue::Array(Array::scalar(1.0078277587890625f32).unwrap())),
+            Ok(ArrayIrValue::Array(Array::scalar(1.007_827_8_f32).unwrap())),
         );
 
         // Boolean elements dequantize to zero or their block scale.
@@ -6473,9 +6473,9 @@ mod tests {
             Array::matrix(1, 1, vec![1.0f32]).unwrap(),
         );
         for (lhs_global_scale, rhs_global_scale, expected) in [
-            (Some(1.00390625f32), None, 3.015625f32),
-            (None, Some(1.00390625f32), 3.015625),
-            (Some(1.00390625f32), Some(1.00390625f32), 3.03125),
+            (Some(1.003_906_3_f32), None, 3.015625f32),
+            (None, Some(1.003_906_3_f32), 3.015625),
+            (Some(1.003_906_3_f32), Some(1.003_906_3_f32), 3.03125),
         ] {
             let lhs = BlockQuantizedValue {
                 global_scale: lhs_global_scale.map(|scale| Array::scalar(scale).unwrap()),
@@ -7176,7 +7176,7 @@ mod tests {
                 Array::matrix(1, 2, vec![0.5f32, 0.0]).unwrap(),
                 Array::matrix(2, 1, vec![6.0234375f32, 0.0]).unwrap(),
                 None,
-                Some(Array::scalar(1.00390625f32).unwrap()),
+                Some(Array::scalar(1.003_906_3_f32).unwrap()),
                 None,
                 None,
             ),
@@ -8028,7 +8028,8 @@ mod tests {
         let expected = (0..16)
             .flat_map(|row: u32| {
                 (0..16u32).map(move |column| {
-                    expected_signs[row as usize] * if (row & column).count_ones() % 2 == 0 { 0.25 } else { -0.25 }
+                    expected_signs[row as usize]
+                        * if (row & column).count_ones().is_multiple_of(2) { 0.25 } else { -0.25 }
                 })
             })
             .collect::<Vec<_>>();

@@ -2718,7 +2718,8 @@ pub(crate) fn is_dot_accumulation_type(input_type: DataType, accumulation_type: 
 ///
 /// Each pair of batching dimensions and each pair of contracting dimensions must provably have equal extents (refer
 /// to [`Dimension::has_equal_extents`]), which includes a dynamic dimension whose bounds admit only the extent of
-/// its static counterpart. A batching dimension of the output is the one of the left-hand side input.
+/// its static counterpart. A batching dimension of the output is the static one of its pair when only one of them
+/// is static, and the one of the left-hand side input otherwise.
 ///
 /// The output [`Sharding`] follows the `dot_general` sharding rule of JAX (i.e., `_dot_general_sharding_rule`
 /// in the [JAX implementation](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/lax.py)). The StableHLO
@@ -2816,10 +2817,17 @@ pub(crate) fn infer_dot_output_type(
 
     let lhs_result = dimensions.lhs_result_dimensions(lhs.rank());
     let rhs_result = dimensions.rhs_result_dimensions(rhs.rank());
-    let output_dimensions: Vec<Dimension> = lhs_batching
-        .iter()
-        .chain(&lhs_result)
-        .map(|axis| lhs.dimension(*axis))
+
+    // The dimensions of a batching pair provably have equal extents, so the static one is kept when only one of
+    // them is static, because it is the more informative of the two.
+    let batching = lhs_batching.iter().zip(rhs_batching).map(|(lhs_axis, rhs_axis)| {
+        match (lhs.dimension(*lhs_axis), rhs.dimension(*rhs_axis)) {
+            (Dimension::Dynamic(_), rhs_dimension @ Dimension::Static(_)) => rhs_dimension,
+            (lhs_dimension, _) => lhs_dimension,
+        }
+    });
+    let output_dimensions: Vec<Dimension> = batching
+        .chain(lhs_result.iter().map(|axis| lhs.dimension(*axis)))
         .chain(rhs_result.iter().map(|axis| rhs.dimension(*axis)))
         .collect();
 
@@ -4057,7 +4065,7 @@ mod tests {
                     )],
                 },
                 // Pairs of a static and a dynamic dimension and pairs of distinct dynamic dimensions keep erroring
-                // under the strict size equality used for batching and contracting dimensions.
+                // when their extents are not provably equal.
                 {
                     input_types = [lhs.clone(), static_rhs],
                     error = format!(
@@ -4071,6 +4079,32 @@ mod tests {
                         "`{DOT_OPERATION_NAME}` batching dimension sizes do not match (left-hand side axis 0, \
                          right-hand side axis 0)",
                     ),
+                },
+            ],
+        );
+
+        // A dynamic dimension whose bounds admit one extent provably has the extent of its static counterpart, so
+        // the two contract and batch together. A batching dimension of the output is then the static one.
+        let proven = Dimension::Dynamic(DimensionVariable::new("proven", DimensionBounds::new(4, Some(5)).unwrap()));
+        let proven_lhs = ArrayType::new(DataType::F64, Shape::new(vec![proven, Dimension::Static(2)]));
+        let static_rhs = ArrayType::new_static(DataType::F64, [4, 2]);
+        check_operation_type_inference!(
+            operation = DotOperation::new(DotDimensionNumbers::new(vec![0], vec![0], vec![], vec![])),
+            cases = [{
+                input_types = [proven_lhs.clone(), static_rhs.clone()],
+                output_types = [ArrayType::new_static(DataType::F64, [2, 2])],
+            }],
+        );
+        check_operation_type_inference!(
+            operation = DotOperation::new(DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0])),
+            cases = [
+                {
+                    input_types = [proven_lhs.clone(), static_rhs.clone()],
+                    output_types = [ArrayType::new_static(DataType::F64, [4])],
+                },
+                {
+                    input_types = [static_rhs, proven_lhs],
+                    output_types = [ArrayType::new_static(DataType::F64, [4])],
                 },
             ],
         );
@@ -4235,6 +4269,56 @@ mod tests {
             cases = [{
                 input_types = [f64_input.clone(), f64_input.clone()],
                 output_types = [ArrayType::new_static(DataType::BF16, [2, 2])],
+            }],
+        );
+
+        // An algorithm that accumulates at a type of its own converts its result, so it supports every accumulation
+        // type, including ones that its inputs cannot accumulate at themselves.
+        check_operation_type_inference!(
+            operation = DotOperation::matmul()
+                .with_precision(DotAlgorithmPreset::F32_F32_F32)
+                .with_accumulation_type(DataType::F16),
+            cases = [{
+                input_types = [i32_input.clone(), i32_input.clone()],
+                output_types = [ArrayType::new_static(DataType::F16, [2, 2])],
+            }],
+        );
+        check_operation_type_inference!(
+            operation = DotOperation::matmul()
+                .with_precision(DotAlgorithm::new(DataType::F32, DataType::F32, DataType::F32))
+                .with_accumulation_type(DataType::I8),
+            cases = [
+                {
+                    input_types = [i32_input.clone(), i32_input.clone()],
+                    output_types = [ArrayType::new_static(DataType::I8, [2, 2])],
+                },
+                {
+                    input_types = [f64_input.clone(), f64_input.clone()],
+                    output_types = [ArrayType::new_static(DataType::I8, [2, 2])],
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            operation = DotOperation::matmul()
+                .with_precision(DotAlgorithmPreset::F32_F32_F32)
+                .with_accumulation_type(DataType::C64),
+            cases = [{
+                input_types = [f64_input.clone(), f64_input.clone()],
+                output_types = [ArrayType::new_static(DataType::C64, [2, 2])],
+            }],
+        );
+
+        // A preset that produces the output type directly still needs an accumulation type that its inputs
+        // accumulate at.
+        check_operation_type_inference!(
+            operation = DotOperation::matmul()
+                .with_precision(DotAlgorithmPreset::Any_F8_Any_F8_Any)
+                .with_accumulation_type(DataType::I32),
+            cases = [{
+                input_types = [f8_input.clone(), f8_input.clone()],
+                error = format!(
+                    "`{DOT_OPERATION_NAME}` input data type `f8e4m3fn` cannot accumulate at data type `i32`",
+                ),
             }],
         );
 
@@ -4978,6 +5062,35 @@ mod tests {
             ),
             Ok(Array::scalar(1.0009765625f32).unwrap()),
         );
+
+        // A preset converts its result to an accumulation type of any kind, so that type never rounds the inputs. The
+        // `i16` inputs below are exact at `f32`, while `2049` rounds to `2048` at `f16`. JAX computes the same values.
+        let lhs = Array::vector(vec![2049i16, -2048]).unwrap();
+        let rhs = Array::vector(vec![1i16, 1]).unwrap();
+        let contract = |lhs: &Array, rhs: &Array, accumulation_type: Option<DataType>| {
+            lhs.dot_with_configuration(
+                rhs,
+                &DotDimensionNumbers::inner_product(),
+                DotAlgorithmPreset::F32_F32_F32.into(),
+                accumulation_type,
+                None,
+            )
+        };
+        assert_eq!(contract(&lhs, &rhs, Some(DataType::F16)), Ok(Array::scalar(f16::from_f32(1.0)).unwrap()));
+        assert_eq!(contract(&lhs, &rhs, Some(DataType::I8)), Ok(Array::scalar(1i8).unwrap()));
+        assert_eq!(contract(&lhs, &rhs, Some(DataType::Boolean)), Ok(Array::scalar(true).unwrap()));
+        let lhs = Array::vector(vec![1.4140625f32]).unwrap();
+        assert_eq!(
+            contract(&lhs, &lhs, Some(DataType::C64)),
+            Ok(Array::scalar(ComplexNumber::new(1.99957275390625f32, 0.0)).unwrap()),
+        );
+        assert_eq!(contract(&lhs, &lhs, Some(DataType::I32)), Ok(Array::scalar(1i32).unwrap()));
+        let lhs = Array::vector(vec![0.5f32]).unwrap();
+        assert_eq!(contract(&lhs, &lhs, Some(DataType::Boolean)), Ok(Array::scalar(true).unwrap()));
+        let lhs = Array::vector(vec![true, true, false]).unwrap();
+        let rhs = Array::vector(vec![true, true, true]).unwrap();
+        assert_eq!(contract(&lhs, &rhs, None), Ok(Array::scalar(true).unwrap()));
+        assert_eq!(contract(&lhs, &rhs, Some(DataType::I32)), Ok(Array::scalar(2i32).unwrap()));
 
         // An explicit algorithm rounds the inputs to its precision types and the result to its accumulation type. The
         // `f32` input `1 + 2⁻¹²` rounds to `1` at `f16`.

@@ -533,7 +533,7 @@ mod tests {
     fn test_constant_transposition() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F64));
-        let input_cotangents = ConstantOperation::new(Array::scalar(3.5).unwrap())
+        ConstantOperation::new(Array::scalar(3.5).unwrap())
             .transpose(
                 &mut TranspositionContext::new(context),
                 &EmptyRegionDriver,
@@ -542,7 +542,7 @@ mod tests {
                 &[],
             )
             .unwrap();
-        assert_eq!(input_cotangents, ());
+        assert_eq!((), ());
     }
 
     #[test]

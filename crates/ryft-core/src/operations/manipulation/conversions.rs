@@ -2022,7 +2022,7 @@ impl CastType for ArrayIrType {
             _ => {
                 return Err(TypeError::invalid(format!(
                     "`{}` cannot convert type `{}` to unrelated type `{}`",
-                    CAST_OPERATION_NAME, &input_types[0], &operation.output_type,
+                    CAST_OPERATION_NAME, input_types[0], operation.output_type,
                 )));
             }
         }
@@ -2654,7 +2654,7 @@ mod tests {
             .with_memory(Memory::Host { pinned: true });
         assert_eq!(
             ConvertElementTypeOperation::<ArrayType>::new(DataType::U32, true)
-                .infer_output_types(&[input.clone()], &[]),
+                .infer_output_types(std::slice::from_ref(&input), &[]),
             Ok(vec![input.clone().with_data_type(DataType::U32)]),
         );
         let output = input
@@ -2682,7 +2682,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ConvertElementTypeOperation::<ArrayType>::new(DataType::U16, true)
-                .infer_output_types(&[input.clone()], &[]),
+                .infer_output_types(std::slice::from_ref(&input), &[]),
             Ok(vec![output.clone()]),
         );
         assert_eq!(
@@ -2799,7 +2799,7 @@ mod tests {
         // Signed zero and NaN payloads survive without numeric conversion or canonicalization.
         let input = Array::vector(vec![0x80000000u32, 0x7fc01234]).unwrap();
         let output = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32, true)
-            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[input.clone()])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap()
             .remove(0);
         assert_eq!(output.logical_bytes(), input.logical_bytes());
@@ -3692,7 +3692,7 @@ mod tests {
     fn test_reduce_precision_interpretation() {
         // `1 + 2^-11` is a tie between two `f16` mantissas and rounds to the even one.
         let output = ReducePrecisionOperation::<ArrayType>::new(5, 10)
-            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(1.00048828125f32).unwrap()])
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(1.000_488_3_f32).unwrap()])
             .unwrap();
         assert_eq!(output, vec![Array::scalar(1.0f32).unwrap()]);
     }
@@ -3701,7 +3701,7 @@ mod tests {
     fn test_reduce_precision_partial_evaluation() {
         check_operation_partial_evaluation!(
             operation = ReducePrecisionOperation::<ArrayType>::new(5, 10),
-            inputs = [Array::vector(vec![1.00048828125f32, 1e10]).unwrap()],
+            inputs = [Array::vector(vec![1.000_488_3_f32, 1e10]).unwrap()],
             expected = Array::vector(vec![1.0f32, f32::INFINITY]).unwrap(),
         );
     }
@@ -3715,7 +3715,7 @@ mod tests {
             operation = array_operation,
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 0), Array::vector(vec![1.00048828125f32, 1e10]).unwrap())],
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.000_488_3_f32, 1e10]).unwrap())],
                 outputs = [(@mapped(axis = 0), Array::vector(vec![1.0f32, f32::INFINITY]).unwrap())],
             }],
         );
@@ -3724,7 +3724,7 @@ mod tests {
             operation = array_operation,
             axis_size = 2,
             cases = [{
-                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.00048828125f32, 1e10]).unwrap())],
+                inputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.000_488_3_f32, 1e10]).unwrap())],
                 outputs = [(@mapped(axis = 1), Array::matrix(1, 2, vec![1.0f32, f32::INFINITY]).unwrap())],
             }],
         );
@@ -3774,7 +3774,7 @@ mod tests {
             operation = ReducePrecisionOperation::new(5, 10),
             cases = [{
                 inputs = [(@linear(type = ArrayType::scalar(DataType::F32)))],
-                output_cotangents = [Array::scalar(1.00048828125f32).unwrap()],
+                output_cotangents = [Array::scalar(1.000_488_3_f32).unwrap()],
                 input_cotangents = [Array::scalar(1.0f32).unwrap()],
                 pullback = indoc! {"
                     lambda %0:f32[] .
@@ -3820,7 +3820,7 @@ mod tests {
     #[test]
     fn test_array_reduce_precision() {
         // Host arrays keep their type while rounding every element.
-        let input = Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1.00048828125f32, 1e10]).unwrap();
+        let input = Array::from_elements(ArrayType::new_static(DataType::F32, [2]), &[1.000_488_3_f32, 1e10]).unwrap();
         let output = input.reduce_precision(5, 10).unwrap();
         assert_eq!(output.r#type(), input.r#type());
         assert_eq!(output, Array::vector(vec![1.0f32, f32::INFINITY]).unwrap());
@@ -3847,9 +3847,9 @@ mod tests {
         // Each case lists an input encoding and its expected encoding after reduction to `f16` precision.
         let cases = [
             // Ties round to the even mantissa, and other values round to nearest.
-            (1.00048828125f32.to_bits(), 1.0f32.to_bits()),
-            (1.00146484375f32.to_bits(), 1.001953125f32.to_bits()),
-            (0x3f801008, 1.0009765625f32.to_bits()),
+            (1.000_488_3_f32.to_bits(), 1.0f32.to_bits()),
+            (1.001_464_8_f32.to_bits(), 1.001_953_1_f32.to_bits()),
+            (0x3f801008, 1.000_976_6_f32.to_bits()),
             // Values above the largest finite `f16` overflow after rounding, keeping their sign.
             (65519.0f32.to_bits(), 65504.0f32.to_bits()),
             (65520.0f32.to_bits(), f32::INFINITY.to_bits()),
@@ -4025,23 +4025,27 @@ mod tests {
         // Actual types that prove the relationship turn a checked cast into an unchecked one, an unproven narrowing
         // keeps its check, and an unchecked cast is returned unchanged.
         assert_eq!(
-            CastOperation::checked(laid_out.clone(), vec![exact.clone()]).unwrap().normalized(&[exact.clone()]),
+            CastOperation::checked(laid_out.clone(), vec![exact.clone()])
+                .unwrap()
+                .normalized(std::slice::from_ref(&exact)),
             CastOperation::unchecked(laid_out, vec![exact.clone()]).unwrap(),
         );
         assert_eq!(
-            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).unwrap().normalized(&[exact.clone()]),
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()])
+                .unwrap()
+                .normalized(std::slice::from_ref(&exact)),
             CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]).unwrap(),
         );
         assert_eq!(
             CastOperation::checked(exact.clone(), vec![symbolic.clone()])
                 .unwrap()
-                .normalized(&[symbolic.clone()]),
+                .normalized(std::slice::from_ref(&symbolic)),
             CastOperation::checked(exact.clone(), vec![symbolic.clone()]).unwrap(),
         );
         assert_eq!(
             CastOperation::unchecked(exact.clone(), vec![symbolic.clone()])
                 .unwrap()
-                .normalized(&[symbolic.clone()]),
+                .normalized(std::slice::from_ref(&symbolic)),
             CastOperation::unchecked(exact.clone(), vec![symbolic.clone()]).unwrap(),
         );
 
@@ -4069,7 +4073,7 @@ mod tests {
 
         // Each family-independent requirement is reported in turn.
         assert_eq!(
-            widening.validate_declaration(&[exact.clone()]),
+            widening.validate_declaration(std::slice::from_ref(&exact)),
             Err(TypeError::invalid("expected 2 inputs but got 1")),
         );
         let reference: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
@@ -4082,7 +4086,7 @@ mod tests {
         assert_eq!(
             CastOperation::checked(n.clone().into(), vec![exact.clone()])
                 .unwrap()
-                .validate_declaration(&[exact.clone()]),
+                .validate_declaration(std::slice::from_ref(&exact)),
             Err(TypeError::invalid("`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity")),
         );
         let wrong: ArrayIrType = ArrayType::new_static(DataType::F32, [3]).into();
@@ -4194,11 +4198,11 @@ mod tests {
 
         // Concrete extents prove the relationship and the inferred representation is returned, in both modes.
         let narrowing = CastOperation::checked(exact.clone(), vec![symbolic.clone()]).unwrap();
-        assert_eq!(narrowing.infer_interpreted_output_type(&[exact.clone()], &[]), Ok(exact.clone()));
+        assert_eq!(narrowing.infer_interpreted_output_type(std::slice::from_ref(&exact), &[]), Ok(exact.clone()));
         assert_eq!(
             CastOperation::unchecked(laid_out.clone(), vec![exact.clone()])
                 .unwrap()
-                .infer_interpreted_output_type(&[exact.clone()], &[]),
+                .infer_interpreted_output_type(std::slice::from_ref(&exact), &[]),
             Ok(laid_out),
         );
 
@@ -4208,7 +4212,7 @@ mod tests {
                       bind the operation through its context"
                 .to_owned(),
         });
-        assert_eq!(narrowing.infer_interpreted_output_type(&[symbolic.clone()], &[]), unproven);
+        assert_eq!(narrowing.infer_interpreted_output_type(std::slice::from_ref(&symbolic), &[]), unproven);
         assert_eq!(
             CastOperation::unchecked(exact.clone(), vec![symbolic.clone()])
                 .unwrap()
@@ -4223,7 +4227,7 @@ mod tests {
         );
         assert_eq!(
             narrowing.infer_interpreted_output_type(
-                &[exact.clone()],
+                std::slice::from_ref(&exact),
                 &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)],
             ),
             Err(ProgramError::Type(TypeError::invalid("expected 0 regions but got 1"))),
@@ -4295,21 +4299,27 @@ mod tests {
         // representation is unchanged.
         let folded = Ok(Some(vec![OperationFoldOutput::Input(0)]));
         assert_eq!(
-            CastOperation::checked(exact.clone(), vec![symbolic.clone()]).unwrap().fold(&[exact.clone()], &[]),
+            CastOperation::checked(exact.clone(), vec![symbolic.clone()])
+                .unwrap()
+                .fold(std::slice::from_ref(&exact), &[]),
             folded
         );
         assert_eq!(
-            CastOperation::unchecked(exact.clone(), vec![exact.clone()]).unwrap().fold(&[exact.clone()], &[]),
+            CastOperation::unchecked(exact.clone(), vec![exact.clone()])
+                .unwrap()
+                .fold(std::slice::from_ref(&exact), &[]),
             folded
         );
         assert_eq!(
-            CastOperation::checked(laid_out, vec![exact.clone()]).unwrap().fold(&[exact.clone()], &[]),
+            CastOperation::checked(laid_out, vec![exact.clone()])
+                .unwrap()
+                .fold(std::slice::from_ref(&exact), &[]),
             Ok(None)
         );
         assert_eq!(
             CastOperation::checked(exact.clone(), vec![symbolic.clone()])
                 .unwrap()
-                .fold(&[symbolic.clone()], &[]),
+                .fold(std::slice::from_ref(&symbolic), &[]),
             Ok(None),
         );
         assert_eq!(
@@ -4323,7 +4333,7 @@ mod tests {
         assert_eq!(
             CastOperation::checked(exact.clone(), vec![exact.clone()])
                 .unwrap()
-                .fold(&[exact.clone()], &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)]),
+                .fold(std::slice::from_ref(&exact), &[RegionInterface::new(vec![], vec![], EffectClasses::NONE)]),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
         assert_eq!(
@@ -4563,7 +4573,9 @@ mod tests {
         ] {
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
                 assert_eq!(
-                    constructor(output.clone(), vec![input.clone()]).unwrap().infer_output_types(&[input.clone()], &[]),
+                    constructor(output.clone(), vec![input.clone()])
+                        .unwrap()
+                        .infer_output_types(std::slice::from_ref(&input), &[]),
                     Ok(vec![output.clone()]),
                 );
             }
@@ -4661,7 +4673,7 @@ mod tests {
             let infer = |output: &ArrayType, declared: &ArrayType, actual: &ArrayType| {
                 constructor(output.clone(), vec![declared.clone()])
                     .unwrap()
-                    .infer_output_types(&[actual.clone()], &[])
+                    .infer_output_types(std::slice::from_ref(actual), &[])
             };
             assert_eq!(infer(&varying, &plain, &varying), Err(refinement(&varying)));
             assert_eq!(infer(&unreduced, &plain, &unreduced), Err(refinement(&unreduced)));
@@ -4672,28 +4684,28 @@ mod tests {
                 infer(&unreduced, &plain, &plain),
                 Err(TypeError::invalid(format!(
                     "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
-                    &plain, &unreduced,
+                    plain, unreduced,
                 )))
             );
             assert_eq!(
                 infer(&plain, &unreduced, &unreduced),
                 Err(TypeError::invalid(format!(
                     "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
-                    &unreduced, &plain,
+                    unreduced, plain,
                 )))
             );
             assert_eq!(
                 infer(&reduced, &plain, &plain),
                 Err(TypeError::invalid(format!(
                     "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
-                    &plain, &reduced,
+                    plain, reduced,
                 )))
             );
             assert_eq!(
                 infer(&plain, &reduced, &reduced),
                 Err(TypeError::invalid(format!(
                     "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
-                    &reduced, &plain,
+                    reduced, plain,
                 )))
             );
         }
@@ -4711,7 +4723,7 @@ mod tests {
                 .infer_output_types(&[reduced.clone().into()], &[]),
             Err(TypeError::invalid(format!(
                 "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
-                &reduced, &plain,
+                reduced, plain,
             ))),
         );
     }
@@ -4781,7 +4793,9 @@ mod tests {
             let expected = expected.map(|()| vec![output.clone()]);
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
                 assert_eq!(
-                    constructor(output.clone(), vec![input.clone()]).unwrap().infer_output_types(&[input.clone()], &[]),
+                    constructor(output.clone(), vec![input.clone()])
+                        .unwrap()
+                        .infer_output_types(std::slice::from_ref(&input), &[]),
                     expected,
                 );
             }
@@ -4908,7 +4922,9 @@ mod tests {
             let expected = expected.map(|()| vec![output.clone()]);
             for constructor in [CastOperation::checked, CastOperation::unchecked] {
                 assert_eq!(
-                    constructor(output.clone(), vec![input.clone()]).unwrap().infer_output_types(&[input.clone()], &[]),
+                    constructor(output.clone(), vec![input.clone()])
+                        .unwrap()
+                        .infer_output_types(std::slice::from_ref(&input), &[]),
                     expected,
                 );
             }
@@ -5054,13 +5070,15 @@ mod tests {
         let target_sharding = plain.clone().with_sharding(Sharding::replicated(other_mesh, 1)).unwrap();
         for constructor in [CastOperation::checked, CastOperation::unchecked] {
             assert_eq!(
-                constructor(target.clone(), vec![plain.clone()]).unwrap().infer_output_types(&[actual.clone()], &[]),
+                constructor(target.clone(), vec![plain.clone()])
+                    .unwrap()
+                    .infer_output_types(std::slice::from_ref(&actual), &[]),
                 Ok(vec![target.clone()]),
             );
             assert_eq!(
                 constructor(target_sharding.clone(), vec![plain.clone()])
                     .unwrap()
-                    .infer_output_types(&[actual_sharding.clone()], &[]),
+                    .infer_output_types(std::slice::from_ref(&actual_sharding), &[]),
                 Ok(vec![target_sharding.clone()]),
             );
         }
@@ -5296,7 +5314,7 @@ mod tests {
             ArrayType::new_static(DataType::F32, [2]).with_layout(Layout::Strided(StridedLayout::new(vec![4])));
         let symbolic = context.input(ArrayType::new(DataType::F32, Shape::new(vec![a.simplified_dimension()])));
         let operation = CastOperation::checked(narrowed, vec![symbolic.r#type().into_owned()]).unwrap();
-        assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[symbolic.clone()]), expected);
+        assert_eq!(operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&symbolic)), expected);
 
         // Equal bounds do not prove a different nominal output identity, and interpretation must not stage it.
         let fresh = DimensionType::new("fresh", bounds);
@@ -5308,7 +5326,7 @@ mod tests {
                 Err(TypeError::invalid("`cast` output identity `fresh` is not carried by a declared input")),
             );
             assert_eq!(
-                operation.interpret(&context, &EmptyRegionDriver, &[symbolic.clone()]),
+                operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&symbolic)),
                 Err(ProgramError::Type(TypeError::invalid(
                     "`cast` output identity `fresh` is not carried by a declared input",
                 ))),
@@ -5332,14 +5350,15 @@ mod tests {
                 constructor(output.clone(), vec![output.clone().with_layout(None).with_sharding(None).unwrap()])
                     .unwrap();
             assert_eq!(
-                ArrayType::infer_cast_output_type(&operation, &[plain.clone()]),
+                ArrayType::infer_cast_output_type(&operation, std::slice::from_ref(&plain)),
                 Ok((exact_output.clone(), Some(exact_output.clone()))),
             );
             // The original declaration carries the output name, and the exact input proves its extent. Only the
             // representation change is staged, with no unbound identity after concretization.
             let (inferred, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
                 |value| {
-                    let mut outputs = operation.interpret(value.context(), &EmptyRegionDriver, &[value.clone()])?;
+                    let mut outputs =
+                        operation.interpret(value.context(), &EmptyRegionDriver, std::slice::from_ref(&value))?;
                     Ok(outputs.remove(0))
                 },
                 plain.clone(),
@@ -5398,7 +5417,10 @@ mod tests {
 
         // A cast that preserves its declared type accepts rectangular shapes.
         let operation = CastOperation::checked(input.clone(), vec![input]).unwrap();
-        assert_eq!(operation.interpret(&context, &EmptyRegionDriver, &[rectangular.clone()]), Ok(vec![rectangular]));
+        assert_eq!(
+            operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(&rectangular)),
+            Ok(vec![rectangular])
+        );
     }
 
     #[test]
@@ -5568,7 +5590,7 @@ mod tests {
                     constructor(output_type.clone(), vec![plain.clone()]).unwrap().interpret(
                         &EagerContext::<Array, ArrayOperation<Array>>::new(),
                         &EmptyRegionDriver,
-                        &[input.clone()],
+                        std::slice::from_ref(&input),
                     ),
                     Ok(vec![expected.clone()]),
                 );
@@ -5701,8 +5723,11 @@ mod tests {
         let target: ArrayIrType = ArrayType::new(DataType::F32, Shape::new(vec![n.simplified_dimension()])).into();
         let value = ArrayIrValue::Array(Array::vector(vec![1f32, 2f32]).unwrap());
         let dimension = |extent: usize| ArrayIrValue::Dimension(DimensionValue::constant(extent).unwrap());
-        let constructors: [(fn(ArrayIrType, Vec<ArrayIrType>) -> Result<CastOperation<ArrayIrType>, TypeError>, &str);
-            2] = [(CastOperation::checked, ", checked=true"), (CastOperation::unchecked, "")];
+        #[allow(clippy::type_complexity)]
+        let constructors: [(
+            fn(ArrayIrType, Vec<ArrayIrType>) -> Result<CastOperation<ArrayIrType>, TypeError>,
+            &str,
+        ); 2] = [(CastOperation::checked, ", checked=true"), (CastOperation::unchecked, "")];
         for (constructor, mode) in constructors {
             let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
             let input = builder.add_input(source.clone());
@@ -5880,7 +5905,7 @@ mod tests {
                 let %1:f32[b, a] = cast [type=f32[b, a], inputs=[f32[a, b]], checked=true] %0
                 in (%1)"},
         );
-        assert_eq!(residual.interpret(&context, &[rectangular.clone()]), Err(mismatch.clone()));
+        assert_eq!(residual.interpret(&context, std::slice::from_ref(&rectangular)), Err(mismatch.clone()));
 
         // A fully proven identity also folds when effect folding is disabled. Contradictory concrete shapes must still
         // fail before the operation can be omitted.
@@ -6277,9 +6302,9 @@ mod tests {
         let source = BatchingTracer::new(context.clone(), ArrayBatch::new(value.clone(), BatchAxis::new(0)).unwrap());
         let witness = BatchingTracer::new(context, ArrayBatch::replicated(Array::vector(vec![0f32; 2]).unwrap()));
         assert_eq!(source.r#type().as_ref(), &exact);
-        let output = source.cast(exact.clone(), &[witness.clone()]).unwrap().into_batch();
+        let output = source.cast(exact.clone(), std::slice::from_ref(&witness)).unwrap().into_batch();
         assert_eq!(output, ArrayBatch::new(value.clone(), BatchAxis::new(0)).unwrap());
-        let output = source.cast_unchecked(exact.clone(), &[witness.clone()]).unwrap().into_batch();
+        let output = source.cast_unchecked(exact.clone(), std::slice::from_ref(&witness)).unwrap().into_batch();
         assert_eq!(output, ArrayBatch::new(value, BatchAxis::new(0)).unwrap());
         let error = source.cast(symbolic, &[witness]).unwrap_err();
         assert_eq!(
@@ -6376,7 +6401,7 @@ mod tests {
             // Lifting may erase layouts, but must still reject an invalid element-type change in the original cast.
             let operation = constructor(conflicting.clone(), vec![declared.clone()]).unwrap();
             assert_eq!(
-                operation.batch(&context, &EmptyRegionDriver, &[input.clone()]).map(|_| ()),
+                operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).map(|_| ()),
                 Err(TypeError::invalid(
                     "`cast` cannot convert type `f32[2][layout=strided{4}]` \
                      to unrelated type `f64[2][layout=strided{8}]`",
@@ -6615,7 +6640,7 @@ mod tests {
             assert_eq!(
                 CastOperation::checked(declared.clone(), vec![declared])
                     .unwrap()
-                    .batch(&context, &EmptyRegionDriver, &[input.clone()])
+                    .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input))
                     .map(|_| ()),
                 Err(ProgramError::Type(TypeError::invalid(message)).into()),
             );
@@ -8151,7 +8176,7 @@ mod tests {
                     ),
                     Err(TypeError::invalid(format!(
                         "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
-                        &array, &output,
+                        array, output,
                     ))),
                 );
             }
@@ -8180,12 +8205,15 @@ mod tests {
 
         // Conditional narrowing can be staged, while nominal identity and concrete extents prove the relationship.
         let narrowing = CastOperation::checked(exact(2), vec![symbolic.clone()]).unwrap();
-        assert_eq!(ArrayType::infer_cast_output_type(&narrowing, &[symbolic.clone()]), Ok((exact(2), None)));
+        assert_eq!(
+            ArrayType::infer_cast_output_type(&narrowing, std::slice::from_ref(&symbolic)),
+            Ok((exact(2), None))
+        );
         assert_eq!(ArrayType::infer_cast_output_type(&narrowing, &[exact(2)]), Ok((exact(2), Some(exact(2)))));
         assert_eq!(
             ArrayType::infer_cast_output_type(
                 &CastOperation::checked(symbolic.clone(), vec![symbolic.clone()]).unwrap(),
-                &[symbolic.clone()],
+                std::slice::from_ref(&symbolic),
             ),
             Ok((symbolic.clone(), Some(symbolic.clone()))),
         );
@@ -8202,7 +8230,7 @@ mod tests {
             assert_eq!(
                 ArrayType::infer_cast_output_type(
                     &constructor(annotated.clone(), vec![plain.clone()]).unwrap(),
-                    &[plain.clone()],
+                    std::slice::from_ref(&plain),
                 ),
                 Ok((annotated.clone(), Some(annotated.clone()))),
             );
@@ -8236,14 +8264,14 @@ mod tests {
             ),
             Err(TypeError::invalid(format!(
                 "`{CAST_OPERATION_NAME}` cannot convert type `{}` to unrelated type `{}`",
-                &dimension,
-                &DimensionType::from(Dimension::Static(3))
+                dimension,
+                DimensionType::from(Dimension::Static(3))
             ))),
         );
         assert_eq!(
             DimensionType::infer_cast_output_type(
                 &CastOperation::checked(n, vec![dimension.clone()]).unwrap(),
-                &[dimension.clone()],
+                std::slice::from_ref(&dimension),
             ),
             Err(TypeError::invalid("`cast` output type `dimension<n ∈ [1, 8)>` cannot define a type identity")),
         );

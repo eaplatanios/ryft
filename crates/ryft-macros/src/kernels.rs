@@ -343,14 +343,17 @@ impl KernelCodeGenerator {
     /// passing a single cloned input triggers.
     fn generate_callable(&self, function: &syn::ItemFn) -> TokenStream {
         let Self { kernels, core, .. } = self;
-        let attributes = &function.attrs;
+        // The lint attribute of the generated function goes below its documentation and above its other attributes.
+        let (documentation, attributes): (Vec<_>, Vec<_>) =
+            function.attrs.iter().partition(|attribute| attribute.path().is_ident("doc"));
         let visibility = &function.vis;
         let name = &function.sig.ident;
         let inputs = self.inputs.iter().map(|input| &input.name).collect::<Vec<_>>();
         let types = inputs.iter().map(|input| format_ident!("__kernel_{}_type", input)).collect::<Vec<_>>();
         quote! {
-            #(#attributes)*
+            #(#documentation)*
             #[allow(clippy::cloned_ref_to_slice_refs)]
+            #(#attributes)*
             #visibility fn #name<__KernelValue: #kernels::KernelCall>(#(#inputs: &__KernelValue),*)
                 -> ::core::result::Result<__KernelValue, #core::programs::ProgramError>
             {
@@ -440,8 +443,8 @@ impl KernelCodeGenerator {
                 #[allow(unused_imports)]
                 use super::*;
 
-                #[allow(clippy::cloned_ref_to_slice_refs, clippy::needless_question_mark)]
                 #[doc = #definition_documentation]
+                #[allow(clippy::cloned_ref_to_slice_refs, clippy::needless_question_mark)]
                 pub fn definition(#(#inputs: &#core::arrays::ArrayType),*)
                     -> ::core::result::Result<#kernels::KernelDefinition, #kernels::KernelError>
                 {
@@ -1416,8 +1419,8 @@ mod tests {
                     #[allow(unused_imports)]
                     use super::*;
 
-                    #[allow(clippy::cloned_ref_to_slice_refs, clippy::needless_question_mark)]
                     #[doc = #definition_documentation]
+                    #[allow(clippy::cloned_ref_to_slice_refs, clippy::needless_question_mark)]
                     pub fn definition(input: &kernels::__private::core::arrays::ArrayType)
                         -> ::core::result::Result<kernels::KernelDefinition, kernels::KernelError>
                     {
@@ -1731,8 +1734,8 @@ mod tests {
                     #[allow(unused_imports)]
                     use super::*;
 
-                    #[allow(clippy::cloned_ref_to_slice_refs, clippy::needless_question_mark)]
                     #[doc = #definition_documentation]
+                    #[allow(clippy::cloned_ref_to_slice_refs, clippy::needless_question_mark)]
                     pub fn definition(
                         left: &kernels::__private::core::arrays::ArrayType,
                         indices: &kernels::__private::core::arrays::ArrayType

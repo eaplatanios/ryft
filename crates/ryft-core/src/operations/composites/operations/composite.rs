@@ -2779,7 +2779,7 @@ mod tests {
         let (outputs, pullback) = TestContext::new().vjp(
             |x, ()| {
                 let operation = CompositeOperation::new(definition.reference());
-                x.context().bind(operation, vec![cube_program(&r#type)], &[x.clone()])
+                x.context().bind(operation, vec![cube_program(&r#type)], std::slice::from_ref(&x))
             },
             x,
             (),
@@ -2861,6 +2861,8 @@ mod tests {
         assert_eq!(hash_of(&jvp), hash_of(&ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, false)));
         assert_ne!(jvp, combined);
         assert_ne!(operation, derived);
+        // Composite operations hash and compare by their rule definitions' immutable IDs, not their mutable caches.
+        #[allow(clippy::mutable_key_type)]
         let map = HashMap::from([(jvp.clone(), "jvp"), (vjp.clone(), "vjp")]);
         assert_eq!(map.get(&ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, false)), Some(&"jvp"));
         assert_eq!(map.get(&combined), None);
@@ -2911,6 +2913,8 @@ mod tests {
         let twin = ArrayComposite::new(twin_definition.reference());
         assert_ne!(operation, twin);
         assert_eq!(operation.to_string(), twin.to_string());
+        // Composite operations hash and compare by their rule definitions' immutable IDs, not their mutable caches.
+        #[allow(clippy::mutable_key_type)]
         let map = HashMap::from([(operation.clone(), "original")]);
         assert_eq!(map.get(&operation.clone()), Some(&"original"));
         assert_eq!(map.get(&twin), None);
@@ -3178,7 +3182,7 @@ mod tests {
         let combined = ArrayComposite::from_rule_regions(CompositeJvpRule::Explicit, true);
         let interfaces = vec![primal.clone(), jvp.clone(), forward.clone(), backward];
         assert_eq!(
-            combined.infer_region_input_types(&[scalar_type.clone()], &interfaces),
+            combined.infer_region_input_types(std::slice::from_ref(&scalar_type), &interfaces),
             Ok(vec![
                 Some(vec![scalar_type.clone()]),
                 Some(vec![scalar_type.clone(), scalar_type.clone()]),
@@ -3186,15 +3190,18 @@ mod tests {
                 Some(vec![scalar_type.clone(), scalar_type.clone()]),
             ]),
         );
-        assert_eq!(combined.infer_output_types(&[scalar_type.clone()], &interfaces), Ok(vec![scalar_type.clone()]));
         assert_eq!(
-            combined.infer_output_types(&[scalar_type.clone()], &[primal.clone(), jvp, forward]),
+            combined.infer_output_types(std::slice::from_ref(&scalar_type), &interfaces),
+            Ok(vec![scalar_type.clone()])
+        );
+        assert_eq!(
+            combined.infer_output_types(std::slice::from_ref(&scalar_type), &[primal.clone(), jvp, forward]),
             Err(TypeError::invalid("expected 4 regions but got 3")),
         );
 
         // A forward mode rule derived from the primal region has no region to validate.
         let derived = ArrayComposite::from_rule_regions(CompositeJvpRule::Derived, false);
-        assert_eq!(derived.infer_output_types(&[scalar_type.clone()], &[primal]), Ok(vec![scalar_type]));
+        assert_eq!(derived.infer_output_types(std::slice::from_ref(&scalar_type), &[primal]), Ok(vec![scalar_type]));
     }
 
     #[test]
@@ -3697,11 +3704,11 @@ mod tests {
         let region = RegionInterface::new(vec![scalar_type.clone()], vec![scalar_type.clone()], EffectClasses::NONE);
         let operation = ArrayComposite::new(definition.reference());
         assert_eq!(
-            operation.infer_output_types(&[scalar_type.clone()], std::slice::from_ref(&region)),
+            operation.infer_output_types(std::slice::from_ref(&scalar_type), std::slice::from_ref(&region)),
             Ok(vec![scalar_type.clone()]),
         );
         assert_eq!(
-            operation.infer_output_types(&[scalar_type.clone()], &[]),
+            operation.infer_output_types(std::slice::from_ref(&scalar_type), &[]),
             Err(TypeError::invalid("expected 1 region but got 0")),
         );
         assert_eq!(
@@ -4712,7 +4719,7 @@ mod tests {
                 batch(
                     |item| {
                         let operation = ArrayOperation::Composite(operation.clone());
-                        Ok(item.context().bind(operation, regions.clone(), &[item.clone()])?.remove(0))
+                        Ok(item.context().bind(operation, regions.clone(), std::slice::from_ref(&item))?.remove(0))
                     },
                     x,
                     BatchAxis::new(0),
@@ -4729,7 +4736,7 @@ mod tests {
                 let mapped = batch(
                     |item| {
                         let operation = ArrayOperation::Composite(operation.clone());
-                        Ok(item.context().bind(operation, regions.clone(), &[item.clone()])?.remove(0))
+                        Ok(item.context().bind(operation, regions.clone(), std::slice::from_ref(&item))?.remove(0))
                     },
                     x,
                     BatchAxis::new(0),
@@ -4752,7 +4759,7 @@ mod tests {
         let output: Array = batch(
             |x| {
                 let operation = ArrayOperation::Composite(operation.clone());
-                Ok(x.context().bind(operation, regions.clone(), &[x.clone()])?.remove(0))
+                Ok(x.context().bind(operation, regions.clone(), std::slice::from_ref(&x))?.remove(0))
             },
             Array::vector(vec![0.5, 1.0, 1.5]).unwrap(),
             BatchAxis::new(0),
@@ -4769,7 +4776,7 @@ mod tests {
                 let mapped = batch(
                     |item| {
                         let operation = ArrayOperation::Composite(operation.clone());
-                        Ok(item.context().bind(operation, regions.clone(), &[item.clone()])?.remove(0))
+                        Ok(item.context().bind(operation, regions.clone(), std::slice::from_ref(&item))?.remove(0))
                     },
                     x,
                     BatchAxis::new(0),
@@ -5024,7 +5031,7 @@ mod tests {
         let output: Array = batch(
             |x| {
                 let operation = ArrayOperation::Composite(operation.clone());
-                Ok(x.context().bind(operation, regions.clone(), &[x.clone()])?.remove(0))
+                Ok(x.context().bind(operation, regions.clone(), std::slice::from_ref(&x))?.remove(0))
             },
             Array::vector(vec![0.5, 1.0, 1.5]).unwrap(),
             BatchAxis::new(0),
@@ -5041,7 +5048,7 @@ mod tests {
                 let mapped = batch(
                     |item| {
                         let operation = ArrayOperation::Composite(operation.clone());
-                        Ok(item.context().bind(operation, regions.clone(), &[item.clone()])?.remove(0))
+                        Ok(item.context().bind(operation, regions.clone(), std::slice::from_ref(&item))?.remove(0))
                     },
                     x,
                     BatchAxis::new(0),
@@ -5790,7 +5797,7 @@ mod tests {
             );
             let input = ArrayIrBatch::new(ArrayIrValue::Array(values), BatchAxis::new(0)).unwrap();
             assert_eq!(
-                CompositeOperation::new(definition.reference()).batch(&context, &driver, &[input.clone()]),
+                CompositeOperation::new(definition.reference()).batch(&context, &driver, std::slice::from_ref(&input)),
                 Ok(vec![input]),
             );
         }
@@ -5901,7 +5908,7 @@ mod tests {
             let regions = sin_regions(&operation);
             let result = differentiate_at(Array::scalar(x).unwrap()).jvp(Array::scalar(1f64).unwrap(), |x| {
                 Ok(x.context()
-                    .bind(ArrayOperation::Composite(operation.clone()), regions.clone(), &[x.clone()])?
+                    .bind(ArrayOperation::Composite(operation.clone()), regions.clone(), std::slice::from_ref(&x))?
                     .remove(0))
             });
             match tangent {
@@ -5922,7 +5929,7 @@ mod tests {
             let result = differentiate_at(Array::scalar(x).unwrap())
                 .vjp(|x| {
                     Ok(x.context()
-                        .bind(ArrayOperation::Composite(operation.clone()), regions.clone(), &[x.clone()])?
+                        .bind(ArrayOperation::Composite(operation.clone()), regions.clone(), std::slice::from_ref(&x))?
                         .remove(0))
                 })
                 .and_then(|(value, pullback)| Ok((value, pullback.apply_materialized(Array::scalar(1f64).unwrap())?)));
@@ -5953,7 +5960,7 @@ mod tests {
                     Ok(differentiate_at(x)
                         .gradient(|y| {
                             let operation = ArrayOperation::Composite(operation.clone());
-                            y.context().bind(operation, regions.clone(), &[y.clone()]).unwrap().remove(0)
+                            y.context().bind(operation, regions.clone(), std::slice::from_ref(&y)).unwrap().remove(0)
                         })
                         .unwrap())
                 })
@@ -5970,7 +5977,7 @@ mod tests {
         let operation = ArrayOperation::Composite(operation);
         assert_eq!(
             differentiate_at(Array::scalar(0.7).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| {
-                Ok(x.context().bind(operation.clone(), regions.clone(), &[x.clone()])?.remove(0))
+                Ok(x.context().bind(operation.clone(), regions.clone(), std::slice::from_ref(&x))?.remove(0))
             }),
             Ok((Array::scalar(0.7f64.sin()).unwrap(), Array::scalar(2.0 * 0.7f64.cos()).unwrap())),
         );
@@ -5978,7 +5985,7 @@ mod tests {
         // Reverse mode transposes the linearized custom rule, so the doubled derivative carries over.
         assert_eq!(
             differentiate_at(Array::scalar(0.7).unwrap()).value_and_gradient(|x| {
-                x.context().bind(operation.clone(), regions.clone(), &[x.clone()]).unwrap().remove(0)
+                x.context().bind(operation.clone(), regions.clone(), std::slice::from_ref(&x)).unwrap().remove(0)
             }),
             Ok((Array::scalar(0.7f64.sin()).unwrap(), Array::scalar(2.0 * 0.7f64.cos()).unwrap())),
         );
@@ -5990,7 +5997,12 @@ mod tests {
         assert_eq!(
             differentiate_at(Array::scalar(0.7).unwrap()).value_and_gradient(|x| {
                 differentiate_at(x)
-                    .gradient(|y| y.context().bind(operation.clone(), regions.clone(), &[y.clone()]).unwrap().remove(0))
+                    .gradient(|y| {
+                        y.context()
+                            .bind(operation.clone(), regions.clone(), std::slice::from_ref(&y))
+                            .unwrap()
+                            .remove(0)
+                    })
                     .unwrap()
             }),
             Ok((Array::scalar(2.0 * 0.7f64.cos()).unwrap(), Array::scalar(-2.0 * 0.7f64.sin()).unwrap())),
@@ -5998,7 +6010,12 @@ mod tests {
         assert_eq!(
             differentiate_at(Array::scalar(0.7).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| {
                 Ok(differentiate_at(x)
-                    .gradient(|y| y.context().bind(operation.clone(), regions.clone(), &[y.clone()]).unwrap().remove(0))
+                    .gradient(|y| {
+                        y.context()
+                            .bind(operation.clone(), regions.clone(), std::slice::from_ref(&y))
+                            .unwrap()
+                            .remove(0)
+                    })
                     .unwrap())
             }),
             Ok((Array::scalar(2.0 * 0.7f64.cos()).unwrap(), Array::scalar(-2.0 * 0.7f64.sin()).unwrap())),
@@ -6008,7 +6025,7 @@ mod tests {
                 let direction = x.context().lift(Array::scalar(1.0).unwrap()).unwrap();
                 differentiate_at(x)
                     .jvp(direction, |y| {
-                        Ok(y.context().bind(operation.clone(), regions.clone(), &[y.clone()])?.remove(0))
+                        Ok(y.context().bind(operation.clone(), regions.clone(), std::slice::from_ref(&y))?.remove(0))
                     })
                     .unwrap()
                     .1
@@ -6020,7 +6037,7 @@ mod tests {
                 let direction = x.context().lift(Array::scalar(1.0).unwrap())?;
                 Ok(differentiate_at(x)
                     .jvp(direction, |y| {
-                        Ok(y.context().bind(operation.clone(), regions.clone(), &[y.clone()])?.remove(0))
+                        Ok(y.context().bind(operation.clone(), regions.clone(), std::slice::from_ref(&y))?.remove(0))
                     })
                     .unwrap()
                     .1)
@@ -6034,7 +6051,9 @@ mod tests {
             differentiate_at(Array::scalar(3.0).unwrap()).jvp(Array::scalar(1.0).unwrap(), |seed| {
                 let input = seed.context().lift(Array::scalar(0.7).unwrap())?;
                 let (_, pullback) = differentiate_at(input)
-                    .vjp(|y| Ok(y.context().bind(operation.clone(), regions.clone(), &[y.clone()])?.remove(0)))
+                    .vjp(|y| {
+                        Ok(y.context().bind(operation.clone(), regions.clone(), std::slice::from_ref(&y))?.remove(0))
+                    })
                     .unwrap();
                 pullback.apply_materialized(seed)
             }),
@@ -6752,12 +6771,13 @@ mod tests {
         // Value linearization and reverse mode use the same custom rule boundary.
         let (_, pushforward) = differentiate_at(Array::scalar(2.0).unwrap())
             .linearize(|input| {
-                Ok(input.context().bind(operation.clone(), regions.clone(), &[input.clone()])?.remove(0))
+                Ok(input.context().bind(operation.clone(), regions.clone(), std::slice::from_ref(&input))?.remove(0))
             })
             .unwrap();
         assert_eq!(pushforward.apply(Array::scalar(7.0).unwrap()), Ok(Array::scalar(0.0).unwrap()));
-        let gradient = differentiate_at(Array::scalar(2.0).unwrap())
-            .gradient(|input| input.context().bind(operation, regions, &[input.clone()]).unwrap().remove(0));
+        let gradient = differentiate_at(Array::scalar(2.0).unwrap()).gradient(|input| {
+            input.context().bind(operation, regions, std::slice::from_ref(&input)).unwrap().remove(0)
+        });
         assert_eq!(gradient, Ok(Array::scalar(0.0).unwrap()));
     }
 
@@ -6789,7 +6809,7 @@ mod tests {
         // Value linearization enforces the same rule contract before exposing a reusable pushforward.
         assert!(matches!(
             differentiate_at(Array::scalar(2.0).unwrap())
-                .linearize(|input| Ok(input.context().bind(operation, regions, &[input.clone()])?.remove(0))),
+                .linearize(|input| Ok(input.context().bind(operation, regions, std::slice::from_ref(&input))?.remove(0))),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message))) if message == expected,
         ));
     }
@@ -6940,7 +6960,7 @@ mod tests {
         let operation = ArrayOperation::Composite(operation);
         assert_eq!(
             differentiate_at(Array::scalar(0.7).unwrap()).value_and_gradient(|x| {
-                x.context().bind(operation.clone(), regions.clone(), &[x.clone()]).unwrap().remove(0)
+                x.context().bind(operation.clone(), regions.clone(), std::slice::from_ref(&x)).unwrap().remove(0)
             }),
             Ok((Array::scalar(0.7f64.sin()).unwrap(), Array::scalar(3.0 * 0.7f64.cos()).unwrap())),
         );
@@ -6952,7 +6972,12 @@ mod tests {
         assert_eq!(
             differentiate_at(Array::scalar(0.7).unwrap()).value_and_gradient(|x| {
                 differentiate_at(x)
-                    .gradient(|y| y.context().bind(operation.clone(), regions.clone(), &[y.clone()]).unwrap().remove(0))
+                    .gradient(|y| {
+                        y.context()
+                            .bind(operation.clone(), regions.clone(), std::slice::from_ref(&y))
+                            .unwrap()
+                            .remove(0)
+                    })
                     .unwrap()
             }),
             Ok((Array::scalar(3.0 * 0.7f64.cos()).unwrap(), Array::scalar(-3.0 * 0.7f64.sin()).unwrap())),
@@ -6960,7 +6985,12 @@ mod tests {
         assert_eq!(
             differentiate_at(Array::scalar(0.7).unwrap()).jvp(Array::scalar(1.0).unwrap(), |x| {
                 Ok(differentiate_at(x)
-                    .gradient(|y| y.context().bind(operation.clone(), regions.clone(), &[y.clone()]).unwrap().remove(0))
+                    .gradient(|y| {
+                        y.context()
+                            .bind(operation.clone(), regions.clone(), std::slice::from_ref(&y))
+                            .unwrap()
+                            .remove(0)
+                    })
                     .unwrap())
             }),
             Ok((Array::scalar(3.0 * 0.7f64.cos()).unwrap(), Array::scalar(-3.0 * 0.7f64.sin()).unwrap())),
@@ -6979,7 +7009,7 @@ mod tests {
                 let direction = x.context().lift(Array::scalar(1.0).unwrap())?;
                 Ok(differentiate_at(x)
                     .jvp(direction, |y| {
-                        Ok(y.context().bind(operation.clone(), regions.clone(), &[y.clone()])?.remove(0))
+                        Ok(y.context().bind(operation.clone(), regions.clone(), std::slice::from_ref(&y))?.remove(0))
                     })?
                     .1)
             }),
@@ -7003,7 +7033,7 @@ mod tests {
                     sin_forward_program(&vector_type),
                     tripled_sin_backward_program(&vector_type),
                 ];
-                Ok(x.context().bind(operation, regions, &[x.clone()])?.remove(0))
+                Ok(x.context().bind(operation, regions, std::slice::from_ref(&x))?.remove(0))
             })
             .unwrap();
         let blocks = jacobian.iter_blocks().collect::<Vec<_>>();
@@ -7617,7 +7647,7 @@ mod tests {
                             let operation = ArrayOperation::Composite(CompositeOperation::new(definition.reference()));
                             input
                                 .context()
-                                .bind(operation, vec![cube_program(&scalar_type)], &[input.clone()])
+                                .bind(operation, vec![cube_program(&scalar_type)], std::slice::from_ref(&input))
                                 .unwrap()
                                 .remove(0)
                         })
@@ -7668,7 +7698,7 @@ mod tests {
             .vjp(
                 |x, ()| {
                     let operation = CompositeOperation::new(definition.reference());
-                    x.context().bind(operation, vec![cube_program(&r#type)], &[x.clone()])
+                    x.context().bind(operation, vec![cube_program(&r#type)], std::slice::from_ref(&x))
                 },
                 x,
                 (),
@@ -8088,7 +8118,7 @@ mod tests {
         // the same.
         type Tracer = DomainTracer<ArrayContext>;
         let sine = || {
-            composite(|x: Tracer| Ok(x.sin()?))
+            composite(|x: Tracer| x.sin())
                 .with_vjp(|x: Tracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
         };
         let x = Array::scalar(0.5f64).unwrap();
@@ -8113,7 +8143,7 @@ mod tests {
         // A forward rule that prints would print in the backward pass, out of order, so reverse mode rejects it before
         // staging anything, while ordinary execution of the call, which runs only the primal, is unaffected.
         type Tracer = DomainTracer<ArrayContext>;
-        let function = composite(|x: Tracer| Ok(x.sin()?))
+        let function = composite(|x: Tracer| x.sin())
             .with_name("sine")
             .with_vjp(|x: Tracer| Ok((x.sin()?, x.print("x")?.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
             .with_deferred_forward();
@@ -8133,7 +8163,7 @@ mod tests {
         // The pullback replays the forward and backward rules as ordinary operations, so differentiating the gradient
         // `cos(x) ȳ` again, in reverse or in forward mode, differentiates the recomputed residual `cos(x)`.
         type Tracer = DomainTracer<ArrayContext>;
-        let sine = composite(|x: Tracer| Ok(x.sin()?))
+        let sine = composite(|x: Tracer| x.sin())
             .with_vjp(|x: Tracer| Ok((x.sin()?, x.cos()?)), |cosine, cotangent| Ok(cosine * cotangent))
             .with_deferred_forward();
         let x = Array::scalar(0.7f64).unwrap();
@@ -8252,7 +8282,7 @@ mod tests {
         );
 
         // Specializing the boundary to a static extent replays the call at the refined type.
-        let specialized = program.specialize(&[static_type.clone()]).unwrap().linearize().unwrap();
+        let specialized = program.specialize(std::slice::from_ref(&static_type)).unwrap().linearize().unwrap();
         assert_eq!(
             specialized.tangent().to_string(),
             indoc! {"
@@ -8306,7 +8336,7 @@ mod tests {
                     x.context().bind(
                         CompositeOperation::new(definition.reference()),
                         vec![primal.clone()],
-                        &[x.clone()],
+                        std::slice::from_ref(&x),
                     )
                 },
                 Array::scalar(2f64).unwrap(),
@@ -8321,7 +8351,7 @@ mod tests {
                         x.context().bind(
                             CompositeOperation::new(definition.reference()),
                             vec![primal.clone()],
-                            &[x.clone()],
+                            std::slice::from_ref(&x),
                         )
                     },
                     Array::scalar(2f64).unwrap(),

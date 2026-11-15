@@ -344,7 +344,7 @@ impl Operation for ParallelSumScatterOperation {
         OperationFormatter::new(formatter, indentation, PARALLEL_SUM_SCATTER_OPERATION_NAME)?.bracketed(|operation| {
             operation.field("axes", format_args!("{:?}", self.axes))?;
             operation.field("axis_size", self.axis_size)?;
-            operation.field("scatter_axis", format_args!("{:?}", &self.scatter_axis))?;
+            operation.field("scatter_axis", format_args!("{:?}", self.scatter_axis))?;
             operation.field("options", format_args!("{:?}", self.options.mode()))?;
             if let Some(axis_index_groups) = self.options.axis_index_groups() {
                 operation.field("axis_index_groups", format_args!("{axis_index_groups:?}"))?;
@@ -1326,7 +1326,7 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::F32, [2])
             .with_layout(Layout::Strided(StridedLayout::new(vec![4])))
             .with_memory(Memory::Host { pinned: true });
-        assert_eq!(operation.infer_output_types(&[input_type.clone()], &[]), Ok(vec![input_type.clone()]));
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input_type), &[]), Ok(vec![input_type.clone()]));
         assert_eq!(
             operation.infer_parent_output_types(
                 &[input_type.clone().into(), DimensionValue::constant(2).unwrap().r#type().into_owned().into()],

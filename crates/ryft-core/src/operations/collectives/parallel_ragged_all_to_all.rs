@@ -1980,7 +1980,7 @@ mod tests {
                 BatchAxis::new(0),
                 BatchAxisSpecification::named("x"),
             )?;
-            Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum)?)
+            exchanged.reduce(&[0, 1], ReductionKind::Sum)
         }};
     }
 
@@ -4268,7 +4268,7 @@ mod tests {
         // Two structural zeros yield a structural zero of the result type next to the exchanged primal.
         let zero = operation
             .jvp(
-                &DifferentiationContext::fused(context.clone()),
+                &DifferentiationContext::fused(context),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new_with_zero_tangent(operand.clone()).unwrap(),
@@ -4290,7 +4290,7 @@ mod tests {
         // A live `operand` tangent is exchanged into a zero `output` tangent.
         let operand_only = operation
             .jvp(
-                &DifferentiationContext::fused(context.clone()),
+                &DifferentiationContext::fused(context),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new(operand.clone(), MaybeZero::Value(operand_tangent.clone())).unwrap(),
@@ -4308,7 +4308,7 @@ mod tests {
         // A live `output` tangent survives outside the received region, which the zero `operand` tangent overwrites.
         let output_only = operation
             .jvp(
-                &DifferentiationContext::fused(context.clone()),
+                &DifferentiationContext::fused(context),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new_with_zero_tangent(operand.clone()).unwrap(),
@@ -5024,7 +5024,7 @@ mod tests {
                     BatchAxis::new(0),
                     BatchAxisSpecification::named("x"),
                 )?;
-                Ok(exchanged.mul(&cotangent)?.reduce(&[0, 1, 2], ReductionKind::Sum)?)
+                exchanged.mul(&cotangent)?.reduce(&[0, 1, 2], ReductionKind::Sum)
             })
             .unwrap();
         assert_eq!(

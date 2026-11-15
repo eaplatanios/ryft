@@ -2160,7 +2160,7 @@ mod tests {
             outputs.push(
                 builder
                     .add_instruction(
-                        ArrayIrOperation::Zero(ZeroOperation::new(output_type.into())),
+                        ArrayIrOperation::Zero(ZeroOperation::new(output_type)),
                         Vec::new(),
                         vec![result],
                         None,

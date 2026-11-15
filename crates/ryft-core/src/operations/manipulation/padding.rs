@@ -619,9 +619,8 @@ where
             padding_value.batch_axis(),
         )?;
 
-        let Some(batch_axis) = input
-            .batch_axis_position()
-            .or(Some(0).filter(|_| !padding_value_batch.batch_axis().is_replicated()))
+        let Some(batch_axis) =
+            input.batch_axis_position().or((!padding_value_batch.batch_axis().is_replicated()).then_some(0))
         else {
             let mut outputs = context.parent().bind(
                 self.clone(),

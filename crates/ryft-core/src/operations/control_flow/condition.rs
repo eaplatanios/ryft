@@ -3202,12 +3202,13 @@ mod tests {
 
     /// Returns a branch with no outputs that doubles the referent of `reference` in place when `mutate` is set and
     /// only reads it otherwise.
-    fn manual_mutation_branch<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>>(
+    fn manual_mutation_branch<V: Value<Type = ArrayIrType>, O>(
         builder: &mut ProgramBuilder<V, O>,
         reference: AtomId,
         mutate: bool,
     ) where
-        O: From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
+        O: Operation<Type = ArrayIrType>
+            + From<ReferenceReadOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
             + From<ReferenceWriteOperation<ArrayType, ArrayIrType, ArrayReferenceTransform>>
             + From<AddOperation<ArrayType>>,
     {
@@ -8166,7 +8167,7 @@ mod tests {
         let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
         let predicate = TestIrValue::Array(Array::scalar(true).unwrap());
         let extent = TestIrValue::Dimension(DimensionValue::new(dimension.clone(), 2).unwrap());
-        let direct = PartialEvaluationContext::new(context.clone()).with_reference_placement(ReferencePlacement::Stage);
+        let direct = PartialEvaluationContext::new(context).with_reference_placement(ReferencePlacement::Stage);
         let known_reference =
             PartialTracer::new(direct.clone(), direct.known_value(TestIrValue::Reference(reference.clone())));
         let inputs = vec![
@@ -8250,7 +8251,7 @@ mod tests {
             ]
         };
         let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
-        let direct = PartialEvaluationContext::new(context.clone()).with_reference_placement(ReferencePlacement::Stage);
+        let direct = PartialEvaluationContext::new(context).with_reference_placement(ReferencePlacement::Stage);
         let unknown = PartialTracer::new(direct.clone(), direct.unknown_input(array_type.clone().into(), 0));
         let known_reference =
             PartialTracer::new(direct.clone(), direct.known_value(TestIrValue::Reference(reference.clone())));
@@ -8307,11 +8308,13 @@ mod tests {
         // An earlier use that materializes the handle at its exact type shares that residual input with the inlined
         // selected branch, instead of giving the residual program two aliasing reference inputs.
         let reference = ArrayReference::new(Array::vector(vec![1f32; 2]).unwrap());
-        let direct = PartialEvaluationContext::new(context.clone()).with_reference_placement(ReferencePlacement::Stage);
+        let direct = PartialEvaluationContext::new(context).with_reference_placement(ReferencePlacement::Stage);
         let unknown = PartialTracer::new(direct.clone(), direct.unknown_input(array_type.into(), 0));
         let known_reference =
             PartialTracer::new(direct.clone(), direct.known_value(TestIrValue::Reference(reference.clone())));
-        let read = direct.bind(ReferenceReadOperation::new(), Vec::new(), &[known_reference.clone()]).unwrap();
+        let read = direct
+            .bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(&known_reference))
+            .unwrap();
         let inputs = condition_inputs(&direct, &unknown, known_reference);
         assert_eq!(
             direct.bind(ConditionOperation::new(), vec![branch.clone(), branch.clone()], &inputs),
@@ -12891,7 +12894,7 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![n.dimension().clone()]));
         let (_, program) = TracingContext::<Array, ArrayOperation<Array>>::trace(
             |(predicate, input): (ArrayTracer, ArrayTracer)| {
-                predicate.condition(|input| Ok(input.clone() * input), |input| Ok(input), input)
+                predicate.condition(|input| Ok(input.clone() * input), Ok, input)
             },
             (ArrayType::scalar(DataType::Boolean), vector_type),
         )
@@ -16942,7 +16945,7 @@ mod tests {
                         let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
                         Ok(reference
                             .context()
-                            .bind(TestIrOperation::from(read), Vec::new(), &[reference.clone()])?
+                            .bind(TestIrOperation::from(read), Vec::new(), std::slice::from_ref(&reference))?
                             .remove(0))
                     },
                     inputs[1].clone(),
@@ -17094,23 +17097,25 @@ mod tests {
         let trace = |mutate_invariant: bool| {
             TracingContext::<TestIrValue, TestIrOperation>::trace_with_named_axes(
                 |inputs: Vec<Tracer<_>>| {
-                    let access =
-                        |reference: &Tracer<NestedTracingContext<TracingContext<TestIrValue, TestIrOperation>>>,
-                         mutate: bool| {
-                            let context = reference.context();
-                            let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
-                            let value = context.bind(TestIrOperation::from(read), Vec::new(), &[reference.clone()])?;
-                            if mutate {
-                                let write =
-                                    ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
-                                context.bind(
-                                    TestIrOperation::from(write),
-                                    Vec::new(),
-                                    &[reference.clone(), value[0].clone()],
-                                )?;
-                            }
-                            Ok::<_, ProgramError>(())
-                        };
+                    let access = |reference: &Tracer<
+                        NestedTracingContext<TracingContext<TestIrValue, TestIrOperation>>,
+                    >,
+                                  mutate: bool| {
+                        let context = reference.context();
+                        let read = ReferenceReadOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                        let value =
+                            context.bind(TestIrOperation::from(read), Vec::new(), std::slice::from_ref(reference))?;
+                        if mutate {
+                            let write =
+                                ReferenceWriteOperation::<ArrayType, ArrayIrType, ArrayReferenceTransform>::new();
+                            context.bind(
+                                TestIrOperation::from(write),
+                                Vec::new(),
+                                &[reference.clone(), value[0].clone()],
+                            )?;
+                        }
+                        Ok::<_, ProgramError>(())
+                    };
                     inputs[0].condition(
                         |inputs| {
                             access(&inputs[0], false)?;

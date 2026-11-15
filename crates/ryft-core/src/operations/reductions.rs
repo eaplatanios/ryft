@@ -1525,7 +1525,8 @@ impl ArrayType {
                     .dimensions()
                     .iter()
                     .enumerate()
-                    .filter_map(|(axis, dimension)| (!reduce_mask[axis]).then(|| dimension.clone()))
+                    .filter(|&(axis, _)| !reduce_mask[axis])
+                    .map(|(_, dimension)| dimension.clone())
                     .collect::<Vec<_>>();
                 Sharding::new(sharding.mesh().clone(), dimensions)
                     .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
@@ -2840,14 +2841,13 @@ mod tests {
 
         // The empty product is constant, so its tangent is zero even for an explicitly materialized empty seed.
         let input = Array::vector(Vec::<f64>::new()).unwrap();
-        let (output, tangent) =
-            differentiate_at(input.clone()).jvp(input, |input| Ok(input.reduce_product(&[0])?)).unwrap();
+        let (output, tangent) = differentiate_at(input.clone()).jvp(input, |input| input.reduce_product(&[0])).unwrap();
         assert_eq!(output.elements::<f64>(), Ok(vec![1.0]));
         assert_eq!(tangent.elements::<f64>(), Ok(vec![0.0]));
 
         // Zero factors do not erase the mixed second derivative of the underlying polynomial.
         let input = Array::vector(vec![0.0f64, 0.0, 2.0]).unwrap();
-        let hessian = differentiate_at(input).hessian(|input| Ok(input.reduce_product(&[0])?)).unwrap();
+        let hessian = differentiate_at(input).hessian(|input| input.reduce_product(&[0])).unwrap();
         assert_eq!(
             hessian.iter_blocks().next().unwrap().value().elements::<f64>(),
             Ok(vec![0.0, 2.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0])
@@ -2860,7 +2860,7 @@ mod tests {
         )
         .unwrap();
         let (_, gradient) = differentiate_at(input)
-            .value_and_gradient(|input| Ok(input.reduce_product(&[0, 2])?.reduce_sum(&[0], None)?))
+            .value_and_gradient(|input| input.reduce_product(&[0, 2])?.reduce_sum(&[0], None))
             .unwrap();
         assert_eq!(gradient.elements::<f64>(), Ok(vec![60.0, 30.0, 224.0, 168.0, 12.0, 10.0, 96.0, 84.0]));
     }
@@ -2872,7 +2872,7 @@ mod tests {
         let input_type = ArrayType::new_static(DataType::F64, [4]).with_sharding(sharding).unwrap();
         let input = Array::from_elements(input_type.clone(), &[1.0f64, 2.0, 3.0, 4.0]).unwrap();
         let (output, gradient) =
-            differentiate_at(input).value_and_gradient(|input| Ok(input.reduce_product(&[0])?)).unwrap();
+            differentiate_at(input).value_and_gradient(|input| input.reduce_product(&[0])).unwrap();
         assert_eq!(output.elements::<f64>(), Ok(vec![24.0]));
         assert_eq!(gradient.r#type().as_ref(), &input_type);
         assert_eq!(gradient.elements::<f64>(), Ok(vec![24.0, 12.0, 8.0, 6.0]));
@@ -2912,13 +2912,13 @@ mod tests {
         for kind in [ReductionKind::Max, ReductionKind::Min] {
             let input = Array::vector(vec![1.0, 1.0]).unwrap();
             let (primal, tangent) = differentiate_at(input.clone())
-                .jvp(Array::vector(vec![1.0, 3.0]).unwrap(), |input| Ok(input.reduce(&[0], kind)?))
+                .jvp(Array::vector(vec![1.0, 3.0]).unwrap(), |input| input.reduce(&[0], kind))
                 .unwrap();
             assert_eq!(primal.elements::<f64>(), Ok(vec![1.0]));
             assert_eq!(tangent.elements::<f64>(), Ok(vec![2.0]));
 
             let (primal, gradient) =
-                differentiate_at(input).value_and_gradient(|input| Ok(input.reduce(&[0], kind)?)).unwrap();
+                differentiate_at(input).value_and_gradient(|input| input.reduce(&[0], kind)).unwrap();
             assert_eq!(primal.elements::<f64>(), Ok(vec![1.0]));
             assert_eq!(gradient.elements::<f64>(), Ok(vec![0.5, 0.5]));
         }

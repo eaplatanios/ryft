@@ -370,6 +370,7 @@ where
 /// program as a shared region (refer to [`CompositeOperation`](crate::CompositeOperation)), so a call with cached input
 /// types never traces the body again. Input types include their type identities, so calls whose inputs have fresh
 /// symbolic extents (e.g., in a new trace) trace the body again for those identities.
+#[allow(clippy::type_complexity)]
 pub struct NamedComposite<V: Typed + Parameter, O> {
     /// Semantic identity.
     key: CompositeKey,

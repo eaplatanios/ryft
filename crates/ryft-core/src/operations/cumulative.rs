@@ -353,6 +353,7 @@ impl_differentiable_operation! {
                 return Ok(vec![DifferentiationDual::new(primal, tangent)?]);
             };
 
+            #[allow(clippy::type_complexity)]
             let combine_fn: fn(
                 &Tracer<TracingContext<C::Constant, C::Operation>>,
                 &Tracer<TracingContext<C::Constant, C::Operation>>,
@@ -813,13 +814,11 @@ impl Array {
                 let index = |position: usize| base + position * inner + offset;
                 if reverse {
                     for position in (0..extent - 1).rev() {
-                        output[index(position)] =
-                            combine_fn(output[index(position + 1)].clone(), values[index(position)].clone())?;
+                        output[index(position)] = combine_fn(output[index(position + 1)], values[index(position)])?;
                     }
                 } else {
                     for position in 1..extent {
-                        output[index(position)] =
-                            combine_fn(output[index(position - 1)].clone(), values[index(position)].clone())?;
+                        output[index(position)] = combine_fn(output[index(position - 1)], values[index(position)])?;
                     }
                 }
             }
@@ -1576,7 +1575,7 @@ mod tests {
         // elementwise extrema, which split the tangent evenly between tied elements.
         for kind in [CumulativeKind::Max, CumulativeKind::Min] {
             let (primal, tangent) = differentiate_at(Array::vector(vec![1.0, 1.0]).unwrap())
-                .jvp(Array::vector(vec![1.0, 3.0]).unwrap(), |input| Ok(input.cumulative(0, kind, false)?))
+                .jvp(Array::vector(vec![1.0, 3.0]).unwrap(), |input| input.cumulative(0, kind, false))
                 .unwrap();
             assert_eq!(primal, Array::vector(vec![1.0, 1.0]).unwrap());
             assert_eq!(tangent, Array::vector(vec![1.0, 2.0]).unwrap());
@@ -1811,14 +1810,14 @@ mod tests {
         // operations that their decomposition stages, which finite differences independently confirm.
         assert_eq!(
             differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]).unwrap())
-                .gradient(|input| Ok(input.cumulative_sum(0)?.reduce_sum(&[0], None)?))
+                .gradient(|input| input.cumulative_sum(0)?.reduce_sum(&[0], None))
                 .unwrap(),
             Array::vector(vec![3.0, 2.0, 1.0]).unwrap(),
         );
         for kind in [CumulativeKind::Product, CumulativeKind::LogSumExp, CumulativeKind::Max, CumulativeKind::Min] {
             for reverse in [false, true] {
                 check_gradient!(
-                    |input| Ok(input.cumulative(0, kind, reverse)?.reduce_sum(&[0], None)?),
+                    |input| input.cumulative(0, kind, reverse)?.reduce_sum(&[0], None),
                     at = Array::vector(vec![1.0, 3.0, 2.0]).unwrap(),
                     step = 1e-3,
                     tolerance = 1e-6,

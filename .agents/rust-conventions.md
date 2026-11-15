@@ -166,6 +166,9 @@ ownership, and synchronization. These shared rules also apply to test code; deta
 - Prefer just `size_of::<T>()` instead of `std::mem::size_of<T>()` and do not `use std::mem::size_of` as it is built in.
 - In derive lists that include both `Copy` and `Clone`, list `Copy` before `Clone` and keep those two traits before
   any other derived traits.
+- Place `#[allow(...)]` and `#[expect(...)]` attributes before the other attributes of their item (e.g.,
+  `#[derive(...)]`, `#[cfg(...)]`, `#[inline]`, and `#[test]`), directly below the item's documentation comment.
+  A code comment that explains the attribute stays directly above it.
 - Precede every non-trivial declarative-macro branch with a concise code comment explaining the accepted public form
   or the internal generation role.
 

@@ -3556,6 +3556,8 @@ mod tests {
         }];
         assert_eq!(evaluations, ["start", "stop", "step"]);
         assert_eq!(selection, [IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(1), Some(9), 2)))]);
+        // The immediately called closure checks that a grouped start expression containing commas parses as one start.
+        #[allow(clippy::redundant_closure_call)]
         let grouped: [IndexSelector<'_, Array>; 1] = index![(|first, second| first + second)(1, 2)..9 by 2];
         assert_eq!(grouped, [IndexSelector::Basic(BasicIndex::Slice(IndexSlice::new(Some(3), Some(9), 2)))]);
     }

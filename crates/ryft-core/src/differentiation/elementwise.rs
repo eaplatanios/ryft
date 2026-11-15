@@ -1348,7 +1348,7 @@ mod tests {
             // extent and therefore never takes the replication path.
             let primals = (Array::matrix(rows, 2, values).unwrap(), Array::vector(scale_values.clone()).unwrap());
             let (eager_loss, eager_pullback) = differentiate_at(primals)
-                .vjp(|(input, scale)| Ok((input * scale).reduce(&[0, 1], ReductionKind::Sum)?))
+                .vjp(|(input, scale)| (input * scale).reduce(&[0, 1], ReductionKind::Sum))
                 .unwrap();
             let (input_cotangent, scale_cotangent) =
                 eager_pullback.apply_materialized(Array::scalar(1.0).unwrap()).unwrap();

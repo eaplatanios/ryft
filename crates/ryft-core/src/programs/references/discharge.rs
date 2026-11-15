@@ -4909,7 +4909,11 @@ mod tests {
         }
 
         fn read(context: &C, current: &C::Value, alias: &ListAlias) -> Result<C::Value, ProgramError> {
-            bind_list(context, ListOperation::Select { offset: alias.offset, length: alias.length }, &[current.clone()])
+            bind_list(
+                context,
+                ListOperation::Select { offset: alias.offset, length: alias.length },
+                std::slice::from_ref(current),
+            )
         }
 
         fn write(
@@ -5292,7 +5296,7 @@ mod tests {
                     Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
                 }
                 Self::Call | Self::ScopedCall { .. } => {
-                    context.discharge_positional_region_operation(self, driver, inputs, 0, |_, _| Ok(self.clone()))
+                    context.discharge_positional_region_operation(self, driver, inputs, 0, |_, _| Ok(*self))
                 }
             }
         }
@@ -9346,6 +9350,7 @@ mod tests {
     fn test_program_discharge_references_widens_positional_callee() {
         /// Array-IR family extended with one positional call, mirroring how a backend attaches a compiled callee
         /// region, forwards its inputs positionally, and reports its outputs positionally.
+        #[allow(clippy::large_enum_variant)]
         #[derive(Clone, Debug)]
         enum CallingOperation {
             /// Native array-IR operation.

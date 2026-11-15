@@ -2311,7 +2311,7 @@ mod tests {
 
         // The flat artifact owns its captures, so any domain instance can lower it.
         assert_eq!(staged.source_program().captures(), &[capture]);
-        assert_eq!(staged.input_types(), &[input_type.clone()]);
+        assert_eq!(staged.input_types(), std::slice::from_ref(&input_type));
         assert_eq!(staged.output_types(), &[input_type.clone(), input_type]);
         let lowered = TestDomain::new().lower(&staged).unwrap();
         assert_eq!(lowered.capture_count, 1);

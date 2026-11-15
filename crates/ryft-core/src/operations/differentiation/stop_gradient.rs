@@ -389,7 +389,7 @@ mod tests {
         // differentiation context instead of cloning the packed differentiation tracer.
         let (primal, tangent) = differentiate_at(Array::vector(vec![2.0, 3.0]).unwrap())
             .jvp(Array::vector(vec![5.0, 7.0]).unwrap(), |x| {
-                Ok(batch(|item| Ok(item.stop_gradient()?), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
+                Ok(batch(|item| item.stop_gradient(), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
             })
             .unwrap();
         assert_eq!(primal.to_f64s(), vec![2.0, 3.0]);
@@ -406,7 +406,7 @@ mod tests {
                     BatchAxis::new(0),
                     None,
                 )?;
-                Ok(mapped.reduce(&[0], ReductionKind::Sum)?)
+                mapped.reduce(&[0], ReductionKind::Sum)
             })
             .unwrap();
         assert_eq!(value.to_f64s(), vec![13.0]);
@@ -445,7 +445,7 @@ mod tests {
         // the tangent is severed.
         let (primal, tangent) = differentiate_at(vector(vec![2.0, 3.0]))
             .jvp(vector(vec![5.0, 7.0]), |x| {
-                Ok(batch(|item| Ok(item.stop_gradient()?), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
+                Ok(batch(|item| item.stop_gradient(), x, BatchAxis::new(0), BatchAxis::new(0), None)?)
             })
             .unwrap();
         assert_eq!(primal, vector(vec![2.0, 3.0]));
@@ -456,7 +456,7 @@ mod tests {
         let tangent = batch(
             |item| {
                 let (_, tangent) = differentiate_at(item.clone())
-                    .jvp(item, |x| Ok(x.add(&x.stop_gradient()?)?))
+                    .jvp(item, |x| x.add(&x.stop_gradient()?))
                     .map_err(ProgramError::from)?;
                 Ok(tangent)
             },
@@ -474,7 +474,7 @@ mod tests {
         // The JVP passes the primal through and severs the tangent. This intentionally differs from the numerical
         // derivative of the identity primal function, so the finite-difference operation helper does not apply.
         let (primal, tangent) = differentiate_at(Array::scalar(2.0).unwrap())
-            .jvp(Array::scalar(3.0).unwrap(), |x| Ok(x.stop_gradient()?))
+            .jvp(Array::scalar(3.0).unwrap(), |x| x.stop_gradient())
             .unwrap();
         assert_eq!(primal, Array::scalar(2.0).unwrap());
         assert_eq!(tangent, Array::scalar(0.0).unwrap());

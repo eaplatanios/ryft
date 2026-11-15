@@ -5629,9 +5629,8 @@ mod tests {
         let sum = add(&mut builder, AddOperation::new().into(), vec![sum, third]);
         let program = build(builder, vec![sum]);
         let rounding = |r#type: &ArrayIrType| {
-            Some(ErasedOperation::new(ReducePrecisionOperation::<ArrayType>::new(8, 7))).filter(
-                |_| matches!(r#type, ArrayIrType::Array(array_type) if array_type.data_type() == DataType::BF16),
-            )
+            matches!(r#type, ArrayIrType::Array(array_type) if array_type.data_type() == DataType::BF16)
+                .then(|| ErasedOperation::new(ReducePrecisionOperation::<ArrayType>::new(8, 7)))
         };
         let partition = program.partition(&[true, false]).unwrap();
         assert_eq!(
@@ -7345,7 +7344,7 @@ mod tests {
         let policy = policy("counted_save_dots", move |candidate| {
             let index = count.fetch_add(1, Ordering::Relaxed);
             let dot = candidate.producers()[0].payload::<DotOperation>().is_some();
-            assert_eq!(dot, index % 2 == 0);
+            assert_eq!(dot, index.is_multiple_of(2));
             Ok(if dot { ResidualDecision::<NoStorage>::Save } else { ResidualDecision::Recompute })
         });
         let mut replay = ResidualReplayAnalysis::new(&program, &policy);

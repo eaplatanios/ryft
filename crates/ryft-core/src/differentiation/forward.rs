@@ -1309,6 +1309,7 @@ pub trait DifferentiationDriver<C: Context>: RegionDriver<C::Constant, C::Operat
     ///   - `region`: Region to differentiate.
     ///   - `input_indices`: Unique region input indices in tangent-input order. Zero differential spaces contribute
     ///     no tangent argument. Duplicate or out-of-range indices are rejected; an empty slice selects no inputs.
+    #[allow(clippy::type_complexity)]
     fn jvp_program(
         &self,
         region: RegionRef<'_, C::Constant, C::Operation>,
@@ -4877,7 +4878,7 @@ pub(crate) mod tests {
             let reconstruction = ZeroBoundaryReconstruction::capture(
                 &context,
                 std::slice::from_ref(&output),
-                &[output_type.clone()],
+                std::slice::from_ref(&output_type),
                 reconstructed_slots,
             )?;
             let references = ReferenceBoundary::new_for_differentiation(&context, &[], &[], &[])?;
@@ -8245,10 +8246,7 @@ pub(crate) mod tests {
         );
 
         // Distinct tangent references are accepted and forwarded by identity.
-        assert_eq!(
-            differentiate_at(reference.clone()).jvp(tangent.clone(), |input| Ok(input)),
-            Ok((reference, tangent)),
-        );
+        assert_eq!(differentiate_at(reference.clone()).jvp(tangent.clone(), Ok), Ok((reference, tangent)),);
     }
 
     #[test]
@@ -8409,7 +8407,7 @@ pub(crate) mod tests {
         // arithmetic while constructing the enclosing program.
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
-                let (value, tangent) = differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |token| Ok(token))?;
+                let (value, tangent) = differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), Ok)?;
                 Ok(vec![value, tangent])
             },
             vec![ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Zero)],
@@ -8424,7 +8422,7 @@ pub(crate) mod tests {
         // structure is rejected.
         assert!(matches!(
             differentiate_at(vec![Array::scalar(1.0).unwrap()])
-                .jvp(vec![Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()], |x| Ok(x))
+                .jvp(vec![Array::scalar(1.0).unwrap(), Array::scalar(2.0).unwrap()], Ok)
                 .unwrap_err(),
             DifferentiationError::Program(ProgramError::Parameter(
                 ParameterError::MismatchedParameterStructures { .. },
@@ -8437,7 +8435,7 @@ pub(crate) mod tests {
         // With no leaf value to recover a context from, the builder's `jvp` terminal reports that differentiation
         // requires at least one input leaf.
         assert_eq!(
-            differentiate_at(Vec::<Array>::new()).jvp(Vec::new(), |x| Ok(x)).unwrap_err(),
+            differentiate_at(Vec::<Array>::new()).jvp(Vec::new(), Ok).unwrap_err(),
             DifferentiationError::EmptyInput,
         );
     }
@@ -8659,7 +8657,7 @@ pub(crate) mod tests {
 
         let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |inputs: Vec<_>| {
-                let (value, pushforward) = differentiate_at(inputs[0].clone()).linearize(|token| Ok(token))?;
+                let (value, pushforward) = differentiate_at(inputs[0].clone()).linearize(Ok)?;
                 let tangent = pushforward.apply(inputs[1].clone())?;
                 Ok(vec![value, tangent])
             },
@@ -8705,7 +8703,7 @@ pub(crate) mod tests {
         // With no leaf value to recover a context from, the builder's `linearize` terminal reports that differentiation
         // requires at least one input leaf.
         assert_eq!(
-            differentiate_at(Vec::<Array>::new()).linearize(|x| Ok(x)).map(|(outputs, _)| outputs).unwrap_err(),
+            differentiate_at(Vec::<Array>::new()).linearize(Ok).map(|(outputs, _)| outputs).unwrap_err(),
             DifferentiationError::EmptyInput
         );
     }

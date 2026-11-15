@@ -3000,7 +3000,7 @@ mod tests {
 
         // All-replicated inputs pin no batch size.
         let replicated = ArrayBatch::replicated(matrix.clone());
-        assert_eq!(ArrayBatch::common_batch_size(&[replicated.clone()]), Ok(None));
+        assert_eq!(ArrayBatch::common_batch_size(std::slice::from_ref(&replicated)), Ok(None));
 
         // A single batched input pins its own batch size, and a replicated input alongside it is ignored.
         let batched_axis_zero = ArrayBatch::new(matrix.clone(), Some(0)).unwrap();
@@ -6642,7 +6642,7 @@ mod tests {
             .batched(2, ShardingDimension::Replicated, &[BatchAxis::new(0)], ProgramBatchingOutputAxesPolicy::Natural)
             .unwrap()
             .into_parts();
-        assert_eq!(batched.input_types().into_owned(), &[batched_type.clone()]);
+        assert_eq!(batched.input_types().into_owned(), std::slice::from_ref(&batched_type));
         assert_eq!(batched.output_types().into_owned(), &[batched_type]);
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
 
@@ -6912,8 +6912,7 @@ mod tests {
 
         // The free transform infers its first-class mapped extent from the packed array input and can move
         // the mapped output axis without exposing the policy at the call site.
-        let moved: ArrayIrValue<Array> =
-            batch(|row| Ok(row), matrix.clone(), BatchAxis::new(0), BatchAxis::new(1), None)?;
+        let moved: ArrayIrValue<Array> = batch(Ok, matrix.clone(), BatchAxis::new(0), BatchAxis::new(1), None)?;
         assert_eq!(moved, ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f32, 4.0, 2.0, 5.0, 3.0, 6.0],).unwrap()),);
 
         // A replicated array output is dynamically broadcast with the inferred extent input.
@@ -6953,7 +6952,7 @@ mod tests {
         let empty_extent =
             BatchAxisSpecification::default().with_extent(ArrayIrValue::Dimension(DimensionValue::constant(0)?));
         let empty: ArrayIrValue<Array> = batch(
-            |replicated| Ok(replicated),
+            Ok,
             ArrayIrValue::Array(Array::vector(vec![7.0_f32, 8.0, 9.0]).unwrap()),
             BatchAxis::replicated(),
             BatchAxis::new(0),
@@ -6992,14 +6991,14 @@ mod tests {
         let mismatched_extent =
             BatchAxisSpecification::default().with_extent(ArrayIrValue::Dimension(DimensionValue::constant(3)?));
         let mismatched: Result<ArrayIrValue<Array>, BatchingError> =
-            batch(|row| Ok(row), matrix.clone(), BatchAxis::new(0), BatchAxis::new(0), mismatched_extent);
+            batch(Ok, matrix.clone(), BatchAxis::new(0), BatchAxis::new(0), mismatched_extent);
         let mismatched = mismatched.unwrap_err();
         assert!(matches!(mismatched, BatchingError::Program(ProgramError::Custom(_))));
         assert_eq!(mismatched.to_string(), "assertion failed: batch dimensions must agree; expected=3, actual=2",);
 
         // A first-class dimension itself cannot be declared mapped at the transform boundary.
         let mapped_input: Result<ArrayIrValue<Array>, BatchingError> = batch(
-            |extent| Ok(extent),
+            Ok,
             ArrayIrValue::Dimension(DimensionValue::constant(2)?),
             BatchAxis::new(0),
             BatchAxis::replicated(),
@@ -7034,7 +7033,7 @@ mod tests {
 
         // Nested public batching selects the array IR policy again from the outer batching context.
         let nested: ArrayIrValue<Array> = batch(
-            |row| batch(|item| Ok(item), row, BatchAxis::new(0), BatchAxis::new(0), None).map_err(Into::into),
+            |row| batch(Ok, row, BatchAxis::new(0), BatchAxis::new(0), None).map_err(Into::into),
             matrix.clone(),
             BatchAxis::new(0),
             BatchAxis::new(0),

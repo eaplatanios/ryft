@@ -2350,8 +2350,9 @@ mod tests {
         assert!(!configured.allow_effect_folding());
         // Enabling folding again must restore behavior, while preserving the previously created residual input.
         let initial = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32).unwrap()));
-        let allocated =
-            restored.fold_or_residualize(ReferenceNewOperation::new(), Vec::new(), &[initial.clone()]).unwrap();
+        let allocated = restored
+            .fold_or_residualize(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(&initial))
+            .unwrap();
         assert!(
             matches!(allocated[0].as_known(), Some(TestValue::Reference(reference)) if reference.read() == Ok(Array::scalar(2.0_f32).unwrap())),
         );
@@ -2463,7 +2464,7 @@ mod tests {
         assert!(!Rc::ptr_eq(&source.state.builder, &context.state.builder));
         assert!(!Rc::ptr_eq(&source.state.parent, &PartialEvaluationContext::new(parent.clone()).state.parent));
         let zero = context.lift(TestValue::Array(Array::scalar(0.0_f32).unwrap())).unwrap();
-        let allocated = context.bind(ReferenceNewOperation::new(), Vec::new(), &[zero.clone()]).unwrap();
+        let allocated = context.bind(ReferenceNewOperation::new(), Vec::new(), std::slice::from_ref(&zero)).unwrap();
         assert!(allocated[0].value().unwrap().is_unknown());
         assert!(parent.builder().borrow().instructions().is_empty());
 
@@ -2627,7 +2628,7 @@ mod tests {
         let target = source.deferred_sibling();
         let known = source.lift(Array::scalar(3.0).unwrap()).unwrap();
         assert_eq!(
-            source.bind(AddOperation::new(), Vec::new(), &[known.clone()]),
+            source.bind(AddOperation::new(), Vec::new(), std::slice::from_ref(&known)),
             Err(ProgramError::Type(TypeError::invalid("expected 2 inputs but got 1"))),
         );
         let imported = target.import_known(&known).unwrap();
@@ -2967,7 +2968,7 @@ mod tests {
         );
         assert_eq!(live.read(), Ok(Array::scalar(1.0_f32).unwrap()));
         let allocation = TestOperation::ReferenceNew(ReferenceNewOperation::new());
-        let allocated = context.fold_or_residualize(allocation, Vec::new(), &[initial.clone()]).unwrap();
+        let allocated = context.fold_or_residualize(allocation, Vec::new(), std::slice::from_ref(&initial)).unwrap();
         assert!(allocated[0].is_unknown());
         let product = TestOperation::from(ArrayOperation::from(MulOperation::new()));
         let folded = context.fold_or_residualize(product, Vec::new(), &[initial.clone(), initial.clone()]).unwrap();
@@ -3081,10 +3082,13 @@ mod tests {
 
         // Deferred work stays residual even when all inputs are known, whether the operation declares it directly
         // or carries it in an executable computation region, because folding it would discharge its obligation.
-        let direct = context.fold_or_residualize(TestRegionOperation::Deferred, Vec::new(), &[known.clone()]).unwrap();
+        let direct = context
+            .fold_or_residualize(TestRegionOperation::Deferred, Vec::new(), std::slice::from_ref(&known))
+            .unwrap();
         assert!(direct[0].is_unknown());
         let computation = TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] });
-        let computation = context.fold_or_residualize(computation, vec![body.clone()], &[known.clone()]).unwrap();
+        let computation =
+            context.fold_or_residualize(computation, vec![body.clone()], std::slice::from_ref(&known)).unwrap();
         assert!(computation[0].is_unknown());
         assert_eq!(context.state.builder.borrow().instructions().len(), 2);
         assert!(outer.builder().borrow().instructions().is_empty());
@@ -3245,7 +3249,7 @@ mod tests {
         // the value's shared materialization slot, so a value consumed by several residualized instructions yields a
         // single residual input.
         let shared = PartialEvaluationValue::known_input(Array::scalar(4.0).unwrap());
-        let first = context.residualize(NegOperation::new(), Vec::new(), &[shared.clone()]).unwrap();
+        let first = context.residualize(NegOperation::new(), Vec::new(), std::slice::from_ref(&shared)).unwrap();
         let second = context.residualize(AddOperation::new(), Vec::new(), &[shared.clone(), shared.clone()]).unwrap();
         assert_eq!(
             shared.materialization(),
@@ -3893,7 +3897,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![result, zero], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
         let parent = EagerContext::<TestValue, TestOperation>::new();
-        let context = PartialEvaluationContext::new(parent.clone());
+        let context = PartialEvaluationContext::new(parent);
         let input = context.unknown_input(q.clone().into(), 0);
         let first = context.inline_program(&program, vec![input.clone()]).unwrap();
         let second = context.inline_program(&program, vec![input]).unwrap();
@@ -4072,7 +4076,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
         let parent = EagerContext::<TestValue, TestOperation>::new();
-        let context = PartialEvaluationContext::new(parent.clone()).with_reference_placement(ReferencePlacement::Stage);
+        let context = PartialEvaluationContext::new(parent).with_reference_placement(ReferencePlacement::Stage);
         let dimension = context.unknown_input(q.into(), 0);
         let predicate = context.known_value(TestValue::Array(Array::scalar(true).unwrap()));
         let reference = ArrayReference::new(Array::scalar(7f32).unwrap());
