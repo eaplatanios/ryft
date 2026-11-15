@@ -33,11 +33,11 @@ use ryft_core::{
     Array as CoreArray, ArrayIrType, ArrayOperation, ArrayType, BroadcastLikeOperation, BroadcastOperation,
     CastOperation, CollectiveAxes, ConstrainShardingOperation, DataType, DimensionOperation, DimensionType,
     DimensionValue, DynamicBroadcastOperation, DynamicReshapeOperation, EffectClass, EffectClasses,
-    ExternalReferenceBinding, FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, LogicalMesh, Memory,
-    OneLikeOperation, Operation as CoreOperation, OperationPayloadProjection, Parameterized, ProgramError, Provenance,
-    RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation, ScatterOperation, Shape,
-    ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as RyftType, TypeError, Typed, TypedProgram,
-    Value as CoreValue, ZeroLikeOperation, ZeroOperation,
+    ExternalReferenceBinding, FillLikeOperation, GatherOperation, Instruction, IotaLikeOperation, IotaOperation,
+    LogicalMesh, Memory, OneLikeOperation, OneOperation, Operation as CoreOperation, OperationPayloadProjection,
+    Parameterized, ProgramError, Provenance, RematerializationOptimizationBarrier, ReshapeOperation, ReshardOperation,
+    ScatterOperation, Shape, ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Type as RyftType,
+    TypeError, Typed, TypedProgram, Value as CoreValue, ZeroLikeOperation, ZeroOperation,
 };
 use ryft_mlir::dialects::{func, shardy, stable_hlo};
 use ryft_mlir::{
@@ -1279,7 +1279,7 @@ pub(crate) fn serialize_lowered_module(
 /// Returns [`LoweringError::UnresolvedReference`] or [`LoweringError::UnresolvedState`] for programs with undischarged
 /// references or state, [`LoweringError::InvalidFunctionName`] for an invalid `function_name`, and other
 /// [`Error`]s for operations or types that cannot be lowered.
-pub fn to_mlir_module_for_program<'o, Input, Output, ProgramInput, ProgramOutput, S, O: LowerableOperationFamily>(
+pub fn to_mlir_module_for_program<Input, Output, ProgramInput, ProgramOutput, S, O: LowerableOperationFamily>(
     program: &Program<ProgramInput, ProgramOutput, O>,
     capture_types: &[ArrayType],
     global_input_types: &Input,
@@ -1404,6 +1404,7 @@ where
 /// mutation of the state buffer of the caller. Read-only state may be finite and bounded dynamic because it has no
 /// hidden alias. The validation here owns the physical alias contract, and the XLA domain additionally enforces the
 /// supported memory, sharding, and dynamic shape classes before calling it.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_mlir_module_for_program_with_reference_state<
     Input,
     Output,
@@ -1680,7 +1681,7 @@ pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy
         .iter()
         .map(|atom_id| {
             let input_atom = &program.atoms()[atom_id.index()];
-            lower_tensor_type(&input_atom.r#type().as_ref(), &context, location)
+            lower_tensor_type(input_atom.r#type().as_ref(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
     let output_tensor_types = program
@@ -1688,7 +1689,7 @@ pub(crate) fn to_mlir_module_for_plain_program_with_ragged_dot_lowering_strategy
         .iter()
         .map(|atom_id| {
             let output_atom = &program.atoms()[atom_id.index()];
-            lower_tensor_type(&output_atom.r#type().as_ref(), &context, location)
+            lower_tensor_type(output_atom.r#type().as_ref(), &context, location)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1827,6 +1828,8 @@ where
                             .projected_payload::<ScatterOperation>()
                             .is_some_and(|operation| operation.output_sharding().is_some())
                         || operation.projected_payload::<ZeroOperation<ArrayType>>().is_some()
+                        || operation.projected_payload::<OneOperation<ArrayType>>().is_some()
+                        || operation.projected_payload::<IotaOperation<ArrayType>>().is_some()
                         || operation.projected_payload::<ZeroLikeOperation<ArrayType>>().is_some()
                         || operation.projected_payload::<OneLikeOperation<ArrayType>>().is_some()
                         || operation.projected_payload::<FillLikeOperation<ArrayType>>().is_some()
@@ -1982,6 +1985,7 @@ fn value_shardings(shardings: Option<&[Sharding]>, count: usize) -> Vec<Option<S
 /// Lowers `program` to a [`LoweredModule`] for the lowering entry points above, validating its reference state
 /// aliases and entry boundary. When `export_effects` is set and the program has ordered I/O, the entry function also
 /// exports the runtime ordered I/O token chain as an extra argument and result.
+#[allow(clippy::too_many_arguments)]
 fn lower_mlir_module_for_program_with_effect_boundary<
     Input,
     Output,

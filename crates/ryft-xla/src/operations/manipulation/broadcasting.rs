@@ -528,7 +528,7 @@ mod tests {
                                 .buffer(
                                     values_to_bytes(&[extent]).as_slice(),
                                     BufferType::I32,
-                                    &[],
+                                    [],
                                     None,
                                     device.clone(),
                                     None,
@@ -1206,7 +1206,7 @@ mod tests {
                             .buffer(
                                 values_to_bytes(&integers).as_slice(),
                                 BufferType::I64,
-                                &[4],
+                                [4],
                                 None,
                                 device.clone(),
                                 None,
@@ -1221,7 +1221,7 @@ mod tests {
                             .buffer(
                                 values_to_bytes(&complex_components).as_slice(),
                                 BufferType::C64,
-                                &[4],
+                                [4],
                                 None,
                                 device.clone(),
                                 None,
@@ -1236,7 +1236,7 @@ mod tests {
                             .buffer(
                                 values_to_bytes(&[extent]).as_slice(),
                                 BufferType::I32,
-                                &[],
+                                [],
                                 None,
                                 device.clone(),
                                 None,
@@ -1251,7 +1251,7 @@ mod tests {
                             .buffer(
                                 values_to_bytes(&[extent]).as_slice(),
                                 BufferType::I32,
-                                &[],
+                                [],
                                 None,
                                 device.clone(),
                                 None,

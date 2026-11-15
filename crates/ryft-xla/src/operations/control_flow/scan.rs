@@ -568,8 +568,8 @@ impl<'o, 'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily> ScanLoopInputs<'o, 'b,
 
         let operation = block.append_operation(stable_hlo::r#while(
             state_values.as_slice(),
-            condition_region.into(),
-            body_region.into(),
+            condition_region,
+            body_region,
             location,
         )?)?;
         set_threaded_effect_tokens(effect_tokens, self.threaded_effects, |offset| {
@@ -924,7 +924,8 @@ mod tests {
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
             assert_eq!(program.output_types(), vec![ArrayIrType::Array(stacked_type.clone())]);
-            to_mlir_module_for_program(&program, &[], &[stacked_type.clone()], &[stacked_type], "main", None, None)
+            let stacked_types = [stacked_type];
+            to_mlir_module_for_program(&program, &[], &stacked_types, &stacked_types, "main", None, None)
         };
         assert!(matches!(
             scan_program(2),
@@ -2799,16 +2800,9 @@ mod tests {
             let program = builder
                 .build::<Vec<Constant>, Vec<Constant>>(outputs, vec![Placeholder], vec![Placeholder])
                 .unwrap();
-            let module = to_mlir_module_for_program(
-                &program,
-                &[],
-                &[stacked_type.clone()],
-                &[stacked_type.clone()],
-                "main",
-                None,
-                None,
-            )
-            .unwrap();
+            let stacked_types = [stacked_type.clone()];
+            let module =
+                to_mlir_module_for_program(&program, &[], &stacked_types, &stacked_types, "main", None, None).unwrap();
             assert_eq!(module, expected, "length {length}");
         }
     }
@@ -2897,10 +2891,11 @@ mod tests {
                 .unwrap();
             let output_type = program.output_types().into_owned().remove(0);
             let output_type = <&ArrayType>::try_from(&output_type).unwrap().clone();
+            let stacked_types = [stacked_type.clone()];
             let module = to_mlir_module_for_program(
                 &program,
                 &[],
-                &[stacked_type.clone()],
+                &stacked_types,
                 &[output_type],
                 "main",
                 Some(&stacked_sharding),

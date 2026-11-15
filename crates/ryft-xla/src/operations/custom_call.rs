@@ -891,7 +891,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(lowered.runtime_requirements().as_ref(), &[first, second]);
+        assert_eq!(lowered.runtime_requirements(), &[first, second]);
         assert_eq!(
             lowered.stable_hlo(),
             indoc! {"
@@ -1112,7 +1112,7 @@ mod tests {
             .get_or_init(|| {
                 client.register_ffi_handler(
                     TARGET,
-                    client.platform_name()?.into_owned(),
+                    &client.platform_name()?,
                     FfiHandler::from(handler as XLA_FFI_Handler),
                     FfiHandlerTraits::NONE,
                 )
@@ -1232,7 +1232,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(lowered.runtime_requirements().as_ref(), &[builtin_requirement("ryft.assert")]);
+        assert_eq!(lowered.runtime_requirements(), &[builtin_requirement("ryft.assert")]);
         // This direct lowering fixture has no ordered boundary slot and needs no transport admission.
         assert!(!lowered.signature().has_ordered_io());
         assert!(lowered.requires_assertion_handler());
@@ -1449,7 +1449,7 @@ mod tests {
             .get_or_init(|| {
                 client.register_ffi_handler(
                     TARGET,
-                    client.platform_name()?.into_owned(),
+                    &client.platform_name()?,
                     FfiHandler::from(handler as XLA_FFI_Handler),
                     FfiHandlerTraits::NONE,
                 )
@@ -1623,7 +1623,7 @@ mod tests {
             .get_or_init(|| {
                 client.register_ffi_handler(
                     TARGET,
-                    client.platform_name()?.into_owned(),
+                    &client.platform_name()?,
                     FfiHandler::from(handler as XLA_FFI_Handler),
                     FfiHandlerTraits::NONE,
                 )
@@ -1713,7 +1713,7 @@ mod tests {
             .get_or_init(|| {
                 client.register_ffi_handler(
                     TARGET,
-                    client.platform_name()?.into_owned(),
+                    &client.platform_name()?,
                     FfiHandler::from(handler as XLA_FFI_Handler),
                     FfiHandlerTraits::NONE,
                 )
@@ -1799,7 +1799,7 @@ mod tests {
             .get_or_init(|| {
                 client.register_ffi_handler(
                     TARGET,
-                    client.platform_name()?.into_owned(),
+                    &client.platform_name()?,
                     FfiHandler::from(handler as XLA_FFI_Handler),
                     FfiHandlerTraits::NONE,
                 )

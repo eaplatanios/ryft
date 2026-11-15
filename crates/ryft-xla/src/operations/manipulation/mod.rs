@@ -430,15 +430,18 @@ mod tests {
                     "reshape" => (vec![2, 2 * size], values.clone()),
                     "expand_dimensions" => (vec![1, size, 4], values.clone()),
                     "flatten" => (vec![size * 4], values.clone()),
-                    "slice_axis" => (vec![size, 2], values.chunks_exact(4).flat_map(|row| [row[1], row[2]]).collect()),
-                    "index_axis" => (vec![size], values.chunks_exact(4).map(|row| row[1]).collect()),
+                    "slice_axis" => {
+                        (vec![size, 2], values.as_chunks::<4>().0.iter().flat_map(|row| [row[1], row[2]]).collect())
+                    }
+                    "index_axis" => (vec![size], values.as_chunks::<4>().0.iter().map(|row| row[1]).collect()),
                     "broadcast" => (vec![2, size, 4], [values.clone(), values.clone()].concat()),
                     "concatenate" => (vec![2 * size, 4], [values.clone(), values.clone()].concat()),
                     "gather" | "gather_axis" => (vec![3, 4], [&values[4..8], &values[4..8], &values[12..16]].concat()),
                     "slice" => (vec![2, 4], values[4..12].to_vec()),
-                    "column_take" => {
-                        (vec![size, 3], values.chunks_exact(4).flat_map(|row| [row[1], row[1], row[3]]).collect())
-                    }
+                    "column_take" => (
+                        vec![size, 3],
+                        values.as_chunks::<4>().0.iter().flat_map(|row| [row[1], row[1], row[3]]).collect(),
+                    ),
                     "dynamic_gather_query" => {
                         let mut expected = [&values[4..8], &values[4..8]].concat();
                         if index_count == 3 {
@@ -448,7 +451,7 @@ mod tests {
                     }
                     "column_scatter_query" => {
                         let mut expected = values.clone();
-                        for row in expected.chunks_exact_mut(4) {
+                        for row in expected.as_chunks_mut::<4>().0 {
                             row[1] += 2.;
                             if index_count == 3 {
                                 row[3] += 1.;

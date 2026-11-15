@@ -868,11 +868,11 @@ where
         let operation = Self::new(self.capture_count() + 1).with_callee_region(callee.entry_region_ref())?;
         let outputs = context.parent().bind(operation, vec![callee], &values)?;
         check_count!("output", outputs, axes.len(), ProgramError);
-        Ok(outputs
+        outputs
             .into_iter()
             .zip(axes)
             .map(|(value, axis)| ArrayIrBatch::new(value, axis))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -929,11 +929,11 @@ where
             AttachedRegions::Callees(&[Arc::new(batched_callee)]),
             &physical_inputs,
         )?;
-        Ok(outputs
+        outputs
             .into_iter()
             .zip(output_axes)
             .map(|(output, axis)| ArrayBatch::new(output, BatchAxis::from_optional_position(axis)))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -1058,14 +1058,14 @@ where
             let mut outputs = context.primal().bind(operation, AttachedRegions::Callees(&[program]), &operands)?;
             check_count!("output", outputs, output_count + live_tangent_slots.len(), ProgramError);
             let mut tangents = outputs.split_off(output_count).into_iter();
-            return Ok(outputs
+            return outputs
                 .into_iter()
                 .zip(output_activity)
                 .map(|(primal, &live)| match live {
                     true => DifferentiationDual::new(primal, tangents.next().unwrap()),
                     false => DifferentiationDual::new_with_zero_tangent(primal),
                 })
-                .collect::<Result<Vec<_>, _>>()?);
+                .collect::<Result<Vec<_>, _>>();
         }
         let linearization = driver.linearize_program(callee, &input_indices, Some(&[]))?;
 
@@ -1164,7 +1164,7 @@ where
         check_count!("output", tangent_outputs, tangent_output_count, ProgramError);
 
         let mut tangent_outputs = tangent_outputs.into_iter();
-        Ok(primal_outputs
+        primal_outputs
             .into_iter()
             .zip(output_activity)
             .map(|(primal, active)| {
@@ -1174,7 +1174,7 @@ where
                     DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
                 }
             })
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -1303,10 +1303,10 @@ pub fn transpose_primal_jit_call<
         .iter()
         .map(|input| {
             let cotangent = if input.is_unknown() { input_cotangents.next().unwrap() } else { None };
-            if !input.r#type().is_reference() {
-                if let Some(cotangent) = cotangent {
-                    return Ok(cotangent);
-                }
+            if !input.r#type().is_reference()
+                && let Some(cotangent) = cotangent
+            {
+                return Ok(cotangent);
             }
             input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
         })
@@ -2251,20 +2251,20 @@ fn lower_jit_call<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     // Only pure callees are ever deduplicated (`collect_jit_call_functions` skips effectful programs), so the shared
     // function path below never interacts with the caller's effect tokens. Effectful callees always take the inline
     // path, which threads the caller's per-class tokens through the callee body in program order.
-    if let Some(map) = nested_functions {
-        if let Some(function) = map.get(program) {
-            // The `jit_call` operation's type inference already pins its operands to the callee input types, so a
-            // matching arity is the only guard needed before emitting the symbol call. Anything else inlines.
-            if input_values.len() == function.input_types.len() {
-                return lower_shared_function_call(
-                    &function.symbol,
-                    &function.output_types,
-                    input_values,
-                    block,
-                    context,
-                    location,
-                );
-            }
+    if let Some(map) = nested_functions
+        && let Some(function) = map.get(program)
+    {
+        // The `jit_call` operation's type inference already pins its operands to the callee input types, so a
+        // matching arity is the only guard needed before emitting the symbol call. Anything else inlines.
+        if input_values.len() == function.input_types.len() {
+            return lower_shared_function_call(
+                &function.symbol,
+                &function.output_types,
+                input_values,
+                block,
+                context,
+                location,
+            );
         }
     }
     if input_values.len() < capture_count {
@@ -2855,7 +2855,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(lowered.runtime_requirements().as_ref(), &[builtin_requirement("test.active")]);
+        assert_eq!(lowered.runtime_requirements(), &[builtin_requirement("test.active")]);
         assert_eq!(
             lowered.stable_hlo(),
             indoc! {r#"
@@ -3366,7 +3366,7 @@ mod tests {
                 .unwrap(),
             outputs
         );
-        assert_ne!(other.infer_output_types(&[input_type.clone()], &[interface]).unwrap(), outputs);
+        assert_ne!(other.infer_output_types(std::slice::from_ref(&input_type), &[interface]).unwrap(), outputs);
         let actual = ArrayType::new_static(DataType::F32, [2]);
         let callee_outputs = output_types
             .iter()
@@ -3412,7 +3412,8 @@ mod tests {
 
         // The call operands must match the callee boundary, which must cover the lifted capture prefix.
         assert_eq!(
-            JitCallOperation::new(2).infer_output_types(std::slice::from_ref(&dimension_type), &[interface.clone()]),
+            JitCallOperation::new(2)
+                .infer_output_types(std::slice::from_ref(&dimension_type), std::slice::from_ref(&interface)),
             Err(TypeError::invalid("`jit_call` lifted capture prefix 2 exceeds its 1 callee inputs")),
         );
         assert_eq!(
@@ -6622,7 +6623,7 @@ mod tests {
                 let mut primal_outputs = context
                     .stage_operation(
                         Operation::JitCall(JitCallOperation::new(0)),
-                        AttachedRegions::Callees(&[primal_half.clone()]),
+                        AttachedRegions::Callees(std::slice::from_ref(&primal_half)),
                         &[primal_input.into_value()],
                     )
                     .unwrap();
@@ -6634,7 +6635,7 @@ mod tests {
                 let tangent_output = context
                     .stage_operation(
                         Operation::JitCall(JitCallOperation::new(0)),
-                        AttachedRegions::Callees(&[tangent_half.clone()]),
+                        AttachedRegions::Callees(std::slice::from_ref(&tangent_half)),
                         tangent_inputs.as_slice(),
                     )
                     .unwrap()
@@ -7617,7 +7618,7 @@ mod tests {
 
         // Instantiating a forwarded input in another namespace must not rename the call's local result.
         let actual = ArrayIrType::from(DimensionType::new("actual", bounds));
-        let instantiated = first.instantiated(&[actual.clone()]).unwrap();
+        let instantiated = first.instantiated(std::slice::from_ref(&actual)).unwrap();
         assert_eq!(instantiated[0], actual);
         assert_eq!(&instantiated[1..], &first.outputs()[1..]);
         let retained = first.pruned(&[true], &[true, false, true]).unwrap();

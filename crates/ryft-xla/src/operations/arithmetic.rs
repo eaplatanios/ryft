@@ -86,7 +86,7 @@ impl LowerableOperation for SaturatingSubOperation<ArrayType> {
                 // Broadcasting against a normalized input retains its runtime extents for bounded dynamic arrays.
                 Ok(normalize_binary_elementwise_operands(
                     &[constant.result(0).unwrap().as_ref(), left],
-                    &[carrier_type.clone()],
+                    std::slice::from_ref(&carrier_type),
                     &mut lowerer.block(),
                     lowerer.context(),
                     lowerer.location(),
@@ -409,7 +409,7 @@ mod tests {
             .unwrap();
         let device = executable.addressable_devices().unwrap().remove(0);
         let left = client
-            .buffer(values_to_bytes(left).as_slice(), BufferType::I64, &[left.len() as u64], None, device.clone(), None)
+            .buffer(values_to_bytes(left).as_slice(), BufferType::I64, [left.len() as u64], None, device.clone(), None)
             .unwrap();
         let right_dimensions = if scalar_right { vec![] } else { vec![right.len() as u64] };
         let right = client

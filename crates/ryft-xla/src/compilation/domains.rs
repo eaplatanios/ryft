@@ -338,20 +338,14 @@ impl<'c> Domain<'c> {
             .enumerate()
             .map(|(index, array_type)| {
                 let placement = if index < source_capture_count {
-                    options
-                        .capture_placements()
-                        .as_deref()
-                        .and_then(|placements| placements.get(index).cloned().flatten())
+                    options.capture_placements().and_then(|placements| placements.get(index).cloned().flatten())
                 } else if index < lowered_capture_count {
                     let constant = &session_constants[index - source_capture_count];
                     Some(self.session().constant(self, constant)?.sharding().clone())
                 } else {
                     let index = index - lowered_capture_count;
                     options.input_shardings().and_then(|shardings| shardings.get(index).cloned()).or_else(|| {
-                        options
-                            .input_placements()
-                            .as_deref()
-                            .and_then(|placements| placements.get(index).cloned().flatten())
+                        options.input_placements().and_then(|placements| placements.get(index).cloned().flatten())
                     })
                 };
                 Ok(placement.or_else(|| array_type.sharding().cloned()).unwrap_or_else(|| {
@@ -397,7 +391,6 @@ impl<'c> Domain<'c> {
         let output_placement = |index: usize, array_type: &ArrayType| {
             options
                 .output_shardings()
-                .as_deref()
                 .and_then(|shardings| shardings.get(index).cloned())
                 .or_else(|| array_type.sharding().cloned())
         };
@@ -438,18 +431,18 @@ impl<'c> Domain<'c> {
                     .to_string(),
             }));
         }
-        if !use_shardy_partitioner && options.mesh().devices().len() > 1 {
-            if logical_argument_shardings
+        if !use_shardy_partitioner
+            && options.mesh().devices().len() > 1
+            && logical_argument_shardings
                 .iter()
                 .chain(output_types.iter().filter_map(ArrayType::sharding))
                 .any(|sharding| !sharding.is_replicated())
-            {
-                return Err(Error::Compilation(CompilationError::InvalidOptions {
-                    reason: "bounded-dynamic multi-device programs currently require fully replicated shardings \
+        {
+            return Err(Error::Compilation(CompilationError::InvalidOptions {
+                reason: "bounded-dynamic multi-device programs currently require fully replicated shardings \
                              because Shardy rejects dynamic tensors"
-                        .to_string(),
-                }));
-            }
+                    .to_string(),
+            }));
         }
         let compilation_options = jit_compilation_options(
             self.compilation_options(),
@@ -493,7 +486,7 @@ impl<'c> Domain<'c> {
             "main",
             lowered_argument_shardings,
             lowered_result_shardings,
-            target_platform.as_deref(),
+            target_platform,
             reference_states,
             options.ragged_dot_lowering_strategy(),
             &open_outputs,
@@ -915,8 +908,6 @@ fn resolve_output_shardings(
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
-    #[cfg(feature = "cuda-13")]
-    use std::time::Instant;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -935,14 +926,8 @@ mod tests {
         ShardMapBoundary, ShardMapOperation, Sharding, ShardingDimension, Sin, SliceOperation,
         StagedFunction as CoreStagedFunction, WhileOperation,
     };
-    #[cfg(feature = "cuda-13")]
-    use ryft_core::{AttentionConfiguration, AttentionInputs, DomainTracingContext, dot_product_attention};
-    #[cfg(feature = "cuda-13")]
-    use ryft_pjrt::{ClientOptions, GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
 
     use crate::compilation::functions::StatefulCompileTracer;
-    #[cfg(feature = "cuda-13")]
-    use crate::domains::Tracer;
     use crate::domains::tests::{
         boolean_scalar, domain_mesh, external_reference_read_program, f32_scalar, f32_vector, read_f32s, read_f64s,
         replicated_scalar_type, replicated_vector_type,
@@ -2662,7 +2647,7 @@ mod tests {
             "(tensor<3xf32> {sdy.sharding = #sdy.sharding<@mesh, [{}]>}) {",
         );
         let expected_update = concat!(
-            "      %5 = stablehlo.dynamic_update_slice %arg1, %4, %c : ",
+            "      %6 = stablehlo.dynamic_update_slice %arg1, %5, %c : ",
             "(tensor<3xf32>, tensor<1xf32>, tensor<i64>) -> tensor<3xf32>",
         );
         assert_eq!(
@@ -2673,13 +2658,14 @@ mod tests {
                 @SIGNATURE@
                     %0 = "stablehlo.if"(%arg0) ({
                       %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                      %1 = stablehlo.slice %arg1 [1:2] : (tensor<3xf32>) -> tensor<1xf32>
-                      %2 = stablehlo.reshape %1 : (tensor<1xf32>) -> tensor<f32>
-                      %3 = stablehlo.add %2, %cst : tensor<f32>
-                      %4 = stablehlo.reshape %3 : (tensor<f32>) -> tensor<1xf32>
+                      %1 = sdy.sharding_constraint %cst <@mesh, []> : tensor<f32>
+                      %2 = stablehlo.slice %arg1 [1:2] : (tensor<3xf32>) -> tensor<1xf32>
+                      %3 = stablehlo.reshape %2 : (tensor<1xf32>) -> tensor<f32>
+                      %4 = stablehlo.add %3, %1 : tensor<f32>
+                      %5 = stablehlo.reshape %4 : (tensor<f32>) -> tensor<1xf32>
                       %c = stablehlo.constant dense<1> : tensor<i64>
                 @UPDATE@
-                      stablehlo.return %5 : tensor<3xf32>
+                      stablehlo.return %6 : tensor<3xf32>
                     }, {
                       stablehlo.return %arg1 : tensor<3xf32>
                     }) : (tensor<i1>) -> tensor<3xf32>
@@ -2800,83 +2786,5 @@ mod tests {
             ),
         ));
         assert_eq!(required_consumer.compilation_context().statistics().compilations, 0);
-    }
-
-    #[cfg(feature = "cuda-13")]
-    #[test]
-    #[ignore = "hardware throughput benchmark; run explicitly on a CUDA system"]
-    fn test_cuda_fused_attention_throughput() {
-        let plugin = load_cuda_13_plugin().unwrap();
-        let client = plugin
-            .client(ClientOptions::GPU(GpuClientOptions {
-                platform: Some(GpuPlatform::CUDA),
-                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
-                ..Default::default()
-            }))
-            .unwrap();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain().with_mesh(mesh.clone());
-        let [batch, sequence, heads, head_dimension] = [4, 2048, 32, 128];
-        let r#type = ArrayType::new(
-            DataType::BF16,
-            Shape::new(vec![
-                CoreDimension::Static(batch),
-                CoreDimension::Static(sequence),
-                CoreDimension::Static(heads),
-                CoreDimension::Static(head_dimension),
-            ]),
-        )
-        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 4))
-        .unwrap();
-        let attention = dot_product_attention::<Domain<'static>>(
-            AttentionConfiguration::new().with_scale(1.0 / (head_dimension as f64).sqrt()),
-        );
-        let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
-            |inputs: Vec<Tracer<'static>>| {
-                let output =
-                    attention.call(AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone()))?;
-                Ok(vec![output])
-            },
-            vec![ArrayIrType::from(r#type.clone()); 3],
-        )
-        .unwrap();
-        let program = program.into_flat_program();
-        let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
-        assert!(lowered.stable_hlo().contains("__cudnn$fmhaSoftmax"));
-        let compilation_start = Instant::now();
-        let compiled = domain.compile_program(&lowered).unwrap();
-        let compilation_duration = compilation_start.elapsed();
-
-        let one = 0x3f80u16.to_ne_bytes();
-        let mut bytes = vec![0u8; batch * sequence * heads * head_dimension * size_of::<u16>()];
-        bytes.chunks_exact_mut(size_of::<u16>()).for_each(|element| element.copy_from_slice(&one));
-        let input = Array::from_host_buffer(&domain, r#type, mesh, bytes.as_slice()).unwrap();
-        input.block_until_ready().unwrap();
-        let execute = || {
-            let outputs = domain.execute_program(&compiled, vec![input.clone(), input.clone(), input.clone()])?;
-            outputs[0].block_until_ready()?;
-            Ok::<_, Error>(())
-        };
-        // The Spark idles at its lowest power state, so warm the fused kernel long enough for clocks to stabilize
-        // before collecting synchronized samples.
-        (0..20).for_each(|_| execute().unwrap());
-        let mut samples = (0..20)
-            .map(|_| {
-                let start = Instant::now();
-                execute().unwrap();
-                start.elapsed().as_nanos()
-            })
-            .collect::<Vec<_>>();
-        samples.sort_unstable();
-        let median_nanoseconds = samples[samples.len() / 2];
-        let floating_point_operations =
-            4.0 * batch as f64 * heads as f64 * sequence as f64 * sequence as f64 * head_dimension as f64;
-        let throughput_teraflops = floating_point_operations / (median_nanoseconds as f64 * 1e3);
-
-        eprintln!(
-            "fused attention b{batch} h{heads} s{sequence} d{head_dimension}: compile={compilation_duration:?}, \
-             median={:.3} ms, throughput={throughput_teraflops:.2} TFLOP/s",
-            median_nanoseconds as f64 / 1e6,
-        );
     }
 }

@@ -73,10 +73,10 @@ fn lower_sort_to_mlir<'b, 'c: 'b, 't: 'c>(
     // Each key contributes its comparison components in lexicographic order as left and right scalar values together
     // with their comparison type.
     let mut components = Vec::with_capacity(operation.key_count().get());
-    for key_index in 0..operation.key_count().get() {
+    for (key_index, key_type) in output_types.iter().enumerate().take(operation.key_count().get()) {
         let left_key = comparator_block.argument(2 * key_index)?.as_ref();
         let right_key = comparator_block.argument(2 * key_index + 1)?.as_ref();
-        let data_type = output_types[key_index].data_type();
+        let data_type = key_type.data_type();
         let comparison_type = match data_type {
             DataType::Boolean
             | DataType::U1

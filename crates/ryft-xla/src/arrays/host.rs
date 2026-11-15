@@ -501,6 +501,7 @@ fn merge_dense_shard_bytes(
 /// Recursively merges one shard's bytes into `global_bytes`, from dimension `dimension` onward and starting at the
 /// element offsets `base_global_element_offset` and `base_shard_element_offset` (refer to
 /// [`merge_dense_shard_bytes`]).
+#[allow(clippy::too_many_arguments)]
 fn merge_dense_shard_bytes_recursive(
     shard_bytes: &[u8],
     shard_slices: &[Range<usize>],
@@ -600,11 +601,15 @@ fn merge_dense_byte_segment(
         merged_end = merged_end.max(written_intervals[remove_end].end);
         remove_end += 1;
     }
+    // The replacement is one interval, not the elements of a range.
+    #[allow(clippy::single_range_in_vec_init)]
     written_intervals.splice(remove_start..remove_end, [merged_start..merged_end]);
     Ok(())
 }
 
+// Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{Device, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};

@@ -404,7 +404,7 @@ mod tests {
                 if operation == DOT_PRODUCT_ATTENTION_COMPOSITE_NAME
                     && reason == "the fused attention implementation is unavailable because the inputs are not `bf16`",
         ));
-        assert!(matches!(NamedCompositeImplementation::TestSquare.body_substitution_error(), None));
+        assert!(NamedCompositeImplementation::TestSquare.body_substitution_error().is_none());
     }
 
     #[test]
@@ -571,7 +571,7 @@ mod tests {
         assert_eq!(values_from_bytes::<f32>(&derivative.copy_to_host().unwrap()), vec![1f32, 2.0, 3.0]);
 
         let batched: Array<'_> =
-            batch(|x| Ok(function.call(x)?), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
+            batch(|x| function.call(x), input.clone(), BatchAxis::new(0), BatchAxis::new(0), None).unwrap();
         assert_eq!(values_from_bytes::<f32>(&batched.copy_to_host().unwrap()), vec![0.5f32, 2.0, 4.5]);
 
         let (value, derivative): (Array<'_>, Array<'_>) = batch(

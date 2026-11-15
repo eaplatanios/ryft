@@ -89,19 +89,18 @@ pub(crate) fn validate_data_dependent_compilation(program: &FlatProgram) -> Resu
             let consumes_data_derived_extent = instruction.inputs().iter().chain(instruction.outputs()).any(|atom| {
                 references_data_derived_dimension(region.atoms()[atom.index()].r#type().as_ref(), &variables)
             });
-            if consumes_data_derived_extent {
-                if let DataDependentPaddingDiscipline::Unsupported { reason } =
+            if consumes_data_derived_extent
+                && let DataDependentPaddingDiscipline::Unsupported { reason } =
                     data_dependent_padding_discipline(instruction.operation())
-                {
-                    return Err(ProgramError::UnsupportedOperation {
-                        message: format!(
-                            "operation `{}` cannot consume data-derived dimensions during XLA lowering because \
+            {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "operation `{}` cannot consume data-derived dimensions during XLA lowering because \
                              {reason}",
-                            instruction.operation().name(),
-                        ),
-                    }
-                    .into());
+                        instruction.operation().name(),
+                    ),
                 }
+                .into());
             }
         }
     }
@@ -614,7 +613,7 @@ mod tests {
             DataType::F8E4M3FN | DataType::F8E5M2 => 32,
             _ => 16,
         };
-        let attention_batch = DimensionVariable::new("attention_batch", extent.bounds().clone());
+        let attention_batch = DimensionVariable::new("attention_batch", extent.bounds());
         let scaled_lhs_type = ArrayType::new(
             scaled_element_type,
             Shape::new(vec![CoreDimension::Dynamic(extent.clone()), CoreDimension::Static(scaled_block_size)]),
@@ -644,16 +643,21 @@ mod tests {
         let (_, program) = DomainTracingContext::<Domain<'static>>::trace(
             |inputs: Vec<Tracer<'static>>| {
                 let size = &inputs[0];
-                let dimension = bind(size, DimensionFromScalarOperation::new(extent.clone().into()), &[size.clone()]);
-                let batch_dimension =
-                    bind(size, DimensionFromScalarOperation::new(attention_batch.clone().into()), &[size.clone()]);
+                let dimension =
+                    bind(size, DimensionFromScalarOperation::new(extent.clone().into()), std::slice::from_ref(size));
+                let batch_dimension = bind(
+                    size,
+                    DimensionFromScalarOperation::new(attention_batch.clone().into()),
+                    std::slice::from_ref(size),
+                );
 
                 // The runtime row extent of `scaled_dot` is not contracted. Both dynamic element and scale operands
                 // share it, while the static right-hand side input fixes one output column and the static block shape
                 // fixes `k` to the block size of the element type (i.e., 32 for FP8 elements and 16 otherwise).
-                let scaled_lhs = bind(size, OneOperation::new(scaled_lhs_type.clone()), &[dimension.clone()]);
+                let scaled_lhs =
+                    bind(size, OneOperation::new(scaled_lhs_type.clone()), std::slice::from_ref(&dimension));
                 let scaled_lhs_scales =
-                    bind(size, OneOperation::new(scaled_lhs_scale_type.clone()), &[dimension.clone()]);
+                    bind(size, OneOperation::new(scaled_lhs_scale_type.clone()), std::slice::from_ref(&dimension));
                 let scaled_rhs = bind(size, OneOperation::new(scaled_rhs_type.clone()), &[]);
                 let scaled_rhs_scales = bind(size, OneOperation::new(scaled_rhs_scale_type.clone()), &[]);
                 let scaled_dot = bind(
@@ -677,7 +681,7 @@ mod tests {
                 let key = bind(size, OneOperation::new(attention_type.clone()), &extents);
                 let value = bind(size, IotaOperation::new(attention_type.clone(), 1).unwrap(), &extents);
                 let output_cotangent = bind(size, OneOperation::new(attention_type.clone()), &extents);
-                let logical_length = bind(size, DimensionToScalarOperation, &[dimension.clone()]);
+                let logical_length = bind(size, DimensionToScalarOperation, std::slice::from_ref(&dimension));
                 let logical_length =
                     bind(size, ConvertElementTypeOperation::<ArrayType>::new(DataType::I32, false), &[logical_length]);
                 let one = CoreArray::from_elements(ArrayType::scalar(DataType::I32), &[1i32]).unwrap();
@@ -1089,7 +1093,7 @@ mod tests {
         assert_eq!(small[10].shape(), StaticShape::new(vec![2]));
         let log_sum_exp = read_f32s(&client, &small[10]);
         assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
-        assert!((log_sum_exp[1] - 4.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[1] - 4.440_19).abs() < 1e-4, "{log_sum_exp:?}");
 
         // The prefix scan runs along the static axis, so row `i` accumulates `[i, 2i + 1, 3i + 3, 4i + 6]` while the
         // data-derived extent rides through on the rows it never mixes.
@@ -1127,9 +1131,9 @@ mod tests {
         assert_eq!(at_bound[10].shape(), StaticShape::new(vec![4]));
         let log_sum_exp = read_f32s(&client, &at_bound[10]);
         assert!((log_sum_exp[0] - 3.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
-        assert!((log_sum_exp[1] - 4.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
-        assert!((log_sum_exp[2] - 5.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
-        assert!((log_sum_exp[3] - 6.440_189_7).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[1] - 4.440_19).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[2] - 5.440_19).abs() < 1e-4, "{log_sum_exp:?}");
+        assert!((log_sum_exp[3] - 6.440_19).abs() < 1e-4, "{log_sum_exp:?}");
         assert_eq!(at_bound[11].shape(), StaticShape::new(vec![4, 4]));
         assert_eq!(
             read_f32s(&client, &at_bound[11]),

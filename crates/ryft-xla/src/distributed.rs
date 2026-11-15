@@ -656,7 +656,7 @@ mod tests {
         let complete = |kind: UnreducedKind, reduction: ReductionKind| {
             let unreduced = replicated.clone().with_unreduced_axes(["x"]).unwrap().with_unreduced_kind(kind).unwrap();
             let candidates = shard_map(
-                |x| Ok(x),
+                Ok,
                 input.clone(),
                 manual_mesh.clone(),
                 sharded.clone(),
@@ -667,7 +667,7 @@ mod tests {
             assert_eq!(candidates.sharding(), &unreduced);
             shard_map(
                 |candidates: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| {
-                    Ok(candidates.parallel_reduce(reduction, "x")?)
+                    candidates.parallel_reduce(reduction, "x")
                 },
                 candidates,
                 manual_mesh.clone(),

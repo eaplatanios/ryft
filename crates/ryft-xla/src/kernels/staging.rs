@@ -320,7 +320,7 @@ impl<Extension: CoreOperation<Type = ArrayIrType> + Into<KernelExtension>> From<
     fn from(operation: PortableKernelOperation<Extension>) -> Self {
         // This conversion only widens a supported family and cannot fail. Map the conversion over the result
         // so it also works when no adapters are enabled and KernelExtension has no inhabited variants.
-        Self(operation.map_extension(|extension| Ok(extension).map(Into::into)).unwrap())
+        Self(operation.map_extension(|extension| Ok(Into::into(extension))).unwrap())
     }
 }
 
@@ -508,7 +508,6 @@ where
             .zip(axes)
             .map(|(value, axis)| ArrayIrBatch::new(value, axis.map(|axis| axis as isize)))
             .collect::<Result<Vec<_>, _>>()
-            .map(Into::into)
     }
 }
 
@@ -1070,7 +1069,8 @@ pub(crate) fn select_kernels(
             // A shared region must be safe under every executable caller, including an unbound caller.
             bound_axes = previous
                 .iter()
-                .filter_map(|(name, axis)| (bound_axes.get(name) == Some(axis)).then(|| (name.clone(), axis.clone())))
+                .filter(|&(name, axis)| bound_axes.get(name) == Some(axis))
+                .map(|(name, axis)| (name.clone(), axis.clone()))
                 .collect();
             if previous == &bound_axes {
                 continue;
@@ -1091,10 +1091,17 @@ pub(crate) fn select_kernels(
                     (name.clone(), map.mesh().axes()[index].clone())
                 }));
             }
-            pending.extend(instruction.regions().iter().copied().enumerate().filter_map(|(index, id)| {
-                (instruction.operation().region_role(index) == Some(ryft_core::RegionRole::Computation))
-                    .then(|| (id, child_axes.clone()))
-            }));
+            pending.extend(
+                instruction
+                    .regions()
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .filter(|&(index, _)| {
+                        instruction.operation().region_role(index) == Some(ryft_core::RegionRole::Computation)
+                    })
+                    .map(|(_, id)| (id, child_axes.clone())),
+            );
         }
     }
     if !has_kernel {
@@ -1114,32 +1121,31 @@ pub(crate) fn select_kernels(
                 .instructions()
                 .iter()
                 .map(|instruction| {
-                    if let Some(bound_axes) = executable_regions.get(&ryft_core::RegionId::new(index)) {
-                        if let Operation::Kernel(KernelOperation(PortableKernelOperation::Call(operation))) =
+                    if let Some(bound_axes) = executable_regions.get(&ryft_core::RegionId::new(index))
+                        && let Operation::Kernel(KernelOperation(PortableKernelOperation::Call(operation))) =
                             instruction.operation()
-                        {
-                            let body = ryft_core::RegionRef::new(program.regions(), instruction.regions()[0])
-                                .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
-                            let definition = definition_from_body(operation, body)
-                                .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
-                            validate_kernel_sharding(
-                                &operation
-                                    .parameters()
-                                    .iter()
-                                    .map(|parameter| parameter.r#type().into_owned())
-                                    .collect::<Vec<_>>(),
-                                bound_axes,
-                            )?;
-                            let compiled = binding.compile(&definition, &facts)?;
-                            selected = true;
-                            return Ok(Instruction::new(
-                                compiled.into(),
-                                instruction.inputs().to_vec(),
-                                instruction.outputs().to_vec(),
-                                vec![],
-                            )
-                            .with_provenance(instruction.provenance().clone()));
-                        }
+                    {
+                        let body = ryft_core::RegionRef::new(program.regions(), instruction.regions()[0])
+                            .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
+                        let definition = definition_from_body(operation, body)
+                            .map_err(|error| KernelEmbeddingError::Invalid { message: error.to_string() })?;
+                        validate_kernel_sharding(
+                            &operation
+                                .parameters()
+                                .iter()
+                                .map(|parameter| parameter.r#type().into_owned())
+                                .collect::<Vec<_>>(),
+                            bound_axes,
+                        )?;
+                        let compiled = binding.compile(&definition, &facts)?;
+                        selected = true;
+                        return Ok(Instruction::new(
+                            compiled.into(),
+                            instruction.inputs().to_vec(),
+                            instruction.outputs().to_vec(),
+                            vec![],
+                        )
+                        .with_provenance(instruction.provenance().clone()));
                     }
                     Ok(instruction.clone())
                 })
@@ -1778,7 +1784,7 @@ pub(crate) mod tests {
                     DimensionVariable::new("checked", DimensionBounds::new(0, Some(10)).unwrap()).into(),
                 )),
                 vec![],
-                &[value.clone()],
+                std::slice::from_ref(&value),
             )?;
             references[0].write(&value)?;
             Ok(())

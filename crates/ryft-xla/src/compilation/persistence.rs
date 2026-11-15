@@ -1964,7 +1964,7 @@ mod tests {
         assert_eq!(restored.input_types()[0].memory(), state_type.memory());
         assert_eq!(restored.output_count(), 1);
         assert_eq!(
-            restored.reference_states().as_ref(),
+            restored.reference_states(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
         );
 
@@ -2015,12 +2015,12 @@ mod tests {
             .unwrap();
         let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         let compiled = domain.compile_program(&lowered).unwrap();
-        assert_eq!(compiled.input_types().as_ref(), &[state_type.clone(), state_type.clone()]);
-        assert_eq!(compiled.all_output_types().as_ref(), &[state_type.clone(), state_type.clone()]);
-        assert_eq!(compiled.expected_argument_shardings().as_ref(), &[state_sharding.clone(), state_sharding]);
+        assert_eq!(compiled.input_types(), &[state_type.clone(), state_type.clone()]);
+        assert_eq!(compiled.all_output_types(), &[state_type.clone(), state_type.clone()]);
+        assert_eq!(compiled.expected_argument_shardings(), &[state_sharding.clone(), state_sharding]);
         assert_eq!(compiled.mesh(), &mesh);
         assert_eq!(
-            compiled.reference_states().as_ref(),
+            compiled.reference_states(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
         );
         match compiled.serialize().unwrap() {

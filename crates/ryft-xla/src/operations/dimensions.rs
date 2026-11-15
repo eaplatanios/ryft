@@ -357,6 +357,7 @@ fn lower_dimension_arithmetic<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
 }
 
 /// Lowers one runtime safety check for dimension arithmetic whose declared bounds do not prove totality.
+#[allow(clippy::too_many_arguments)]
 fn lower_dimension_arithmetic_assertion<'b, 'c: 'b, 't: 'c>(
     operation: &DimensionOperation<DimensionValue>,
     left_type: &DimensionType,

@@ -357,7 +357,7 @@ impl KernelAotBundle {
             program: Arc::new(program),
             identity: serde_json::to_vec(&(&self.manifest.semantic_digest, &self.manifest.configuration))?,
             execution: self.manifest.execution.clone(),
-            effects: self.definition.body().effects().clone(),
+            effects: self.definition.body().effects(),
         })
     }
 

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashSet};
 use ryft_core::{Device, DeviceId, DeviceMesh};
 use ryft_pjrt::{Client, Value as PjrtValue};
 
-use crate::{CompilationError, FromPjrt};
+use crate::{CompilationError, Error, FromPjrt};
 
 // TODO(eaplatanios): Review this module.
 
@@ -85,9 +85,9 @@ impl Target {
     ///
     /// # Errors
     ///
-    /// Returns the first [`ryft_pjrt::Error`] encountered while querying platform information, plugin attributes,
-    /// process identity, or device descriptions and addressability.
-    pub fn from_client(client: &Client<'_>) -> Result<Self, ryft_pjrt::Error> {
+    /// Returns the first PJRT error, as [`Error::Pjrt`], encountered while querying platform information, plugin
+    /// attributes, process identity, or device descriptions and addressability.
+    pub fn from_client(client: &Client<'_>) -> Result<Self, Error> {
         let addressable_device_ids =
             client.addressable_devices()?.iter().map(|device| device.id()).collect::<Result<HashSet<_>, _>>()?;
         let devices = client
@@ -106,7 +106,7 @@ impl Target {
                     addressable: addressable_device_ids.contains(&device_facts.id()),
                 })
             })
-            .collect::<Result<Vec<_>, ryft_pjrt::Error>>()?;
+            .collect::<Result<Vec<_>, Error>>()?;
         Ok(Self {
             platform_name: client.platform_name()?.into_owned(),
             platform_version: client.platform_version()?.into_owned(),

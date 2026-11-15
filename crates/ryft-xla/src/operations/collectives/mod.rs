@@ -305,13 +305,13 @@ mod tests {
                 [0.0, 2.0, 1.0, 3.0],
             ),
         ] {
-            assert_eq!(run(16, &|x| Ok(x.parallel_sum_scatter_tiled(axes, 0)?)), scatter);
-            assert_eq!(run(16, &|x| Ok(x.parallel_all_to_all_tiled(axes, 0, 0)?)), all_to_all);
-            assert_eq!(run(4, &|x| Ok(x.parallel_all_gather_tiled(axes, 0)?)), gather.repeat(4));
+            assert_eq!(run(16, &|x| x.parallel_sum_scatter_tiled(axes, 0)), scatter);
+            assert_eq!(run(16, &|x| x.parallel_all_to_all_tiled(axes, 0, 0)), all_to_all);
+            assert_eq!(run(4, &|x| x.parallel_all_gather_tiled(axes, 0)), gather.repeat(4));
         }
         let pairs = vec![(0, 1), (1, 2), (2, 3), (3, 0)];
-        assert_eq!(run(4, &|x| Ok(x.parallel_permute(["x", "y"], pairs.clone())?)), vec![3.0, 0.0, 1.0, 2.0]);
-        assert_eq!(run(4, &|x| Ok(x.parallel_permute(["y", "x"], pairs.clone())?)), vec![3.0, 2.0, 0.0, 1.0]);
+        assert_eq!(run(4, &|x| x.parallel_permute(["x", "y"], pairs.clone())), vec![3.0, 0.0, 1.0, 2.0]);
+        assert_eq!(run(4, &|x| x.parallel_permute(["y", "x"], pairs.clone())), vec![3.0, 2.0, 0.0, 1.0]);
     }
 
     #[test]
@@ -583,7 +583,7 @@ mod tests {
 
             let state = CollectiveLoweringState::new().enter_manual_region(checked.clone());
             assert!(matches!(
-                lower_state_cast(&operation, state, input_type.clone(), &[input_type.clone()]),
+                lower_state_cast(&operation, state, input_type.clone(), std::slice::from_ref(&input_type)),
                 Err(Error::Core(core_error)) if matches!(
                     core_error.as_ref(),
                     ryft_core::Error::Program(ProgramError::MalformedProgram(message))

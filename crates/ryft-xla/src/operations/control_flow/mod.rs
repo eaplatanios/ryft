@@ -219,12 +219,15 @@ pub(crate) fn lower_refined_region_input<'b, 'c: 'b, 't: 'c>(
     let rank = declared_type.rank();
     // Negative padding slices a physical buffer down to a smaller bound, which keeps every element within the runtime
     // size, because that size lies within both bounds.
-    let mut high_padding = vec![0; rank];
-    for axis in 0..rank {
-        let bound = physical_type.shape().dimensions()[axis].value().unwrap();
-        let extent = physical_input_type.shape().dimensions()[axis].value().unwrap();
-        high_padding[axis] = dimension_extent_i64(bound)? - dimension_extent_i64(extent)?;
-    }
+    let high_padding = physical_type
+        .shape()
+        .dimensions()
+        .iter()
+        .zip(physical_input_type.shape().dimensions())
+        .map(|(bound, extent)| {
+            Ok(dimension_extent_i64(bound.value().unwrap())? - dimension_extent_i64(extent.value().unwrap())?)
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
     let padding_value =
         lower_unplaced_constant_output(&[ArrayType::scalar(declared_type.data_type())], 0, block, context, location)?
             .remove(0);
@@ -346,6 +349,7 @@ pub(crate) fn lower_refined_region_outputs<'b, 'c: 'b, 't: 'c>(
 /// the lowering of `program` advances, as [`lowered_effect_classes`] computes them. The region cannot return the token
 /// of any other class, so an advanced token of such a class is reported as a [`ProgramError::MalformedProgram`] instead
 /// of being dropped, which would leave later effects of that class unordered with respect to the effects of the region.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_control_flow_region<'b, 'c: 'b, 't: 'c, O: LowerableOperationFamily>(
     program: &FlatProgram<O>,
     input_values: &[ValueRef<'b, 'c, 't>],
@@ -675,7 +679,7 @@ mod tests {
         )
         .unwrap();
         assert!(active.requires_assertion_handler());
-        assert_eq!(active.runtime_requirements().as_ref(), &[builtin_requirement("ryft.assert")],);
+        assert_eq!(active.runtime_requirements(), &[builtin_requirement("ryft.assert")],);
 
         let mut builder = ArrayIrProgramBuilder::new();
         let input = builder.add_input(array_type.clone().into());

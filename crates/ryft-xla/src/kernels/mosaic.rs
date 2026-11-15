@@ -262,7 +262,7 @@ mod tests {
                     DimensionVariable::new("checked", DimensionBounds::new(0, Some(10)).unwrap()).into(),
                 )),
                 vec![],
-                &[value.clone()],
+                std::slice::from_ref(&value),
             )?;
             references[0].write(&value)?;
             Ok(())

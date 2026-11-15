@@ -1038,7 +1038,7 @@ mod tests {
             .unwrap()
             .remove(0);
         assert_eq!(program_array(&broadcast).shape().as_slice(), &[4, 2, 3]);
-        assert_eq!(read_f32s(&client, program_array(&broadcast)), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0].repeat(4));
+        assert_eq!(read_f32s(&client, program_array(&broadcast)), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0].repeat(4));
         assert_eq!(domain.program_count(), 2);
 
         let repeated = domain
@@ -1072,7 +1072,7 @@ mod tests {
             } else {
                 CastOperation::unchecked(output_type.clone(), vec![output_type.clone()]).unwrap()
             };
-            let outputs = selected.bind(operation, Vec::new(), &[value.clone()]).unwrap();
+            let outputs = selected.bind(operation, Vec::new(), std::slice::from_ref(&value)).unwrap();
             assert_eq!(outputs, vec![value.clone()]);
             assert!(Arc::ptr_eq(&outputs[0].backend_domain().effect_scope, &selected.effect_scope));
         }
@@ -1108,12 +1108,16 @@ mod tests {
                 }))),
             );
             assert_eq!(
-                domain.bind(operation, Vec::new(), &[value.clone()]),
+                domain.bind(operation, Vec::new(), std::slice::from_ref(&value)),
                 Err(TypeError::invalid("expected 2 inputs but got 1").into()),
             );
             let mismatch = ArrayIrType::Dimension(DimensionType::from(CoreDimension::Static(3)));
             assert_eq!(
-                domain.bind(constructor(mismatch, vec![output_type.clone()]).unwrap(), Vec::new(), &[value.clone()]),
+                domain.bind(
+                    constructor(mismatch, vec![output_type.clone()]).unwrap(),
+                    Vec::new(),
+                    std::slice::from_ref(&value)
+                ),
                 Err(TypeError::invalid("`cast` cannot convert type `dimension<2>` to unrelated type `dimension<3>`")
                     .into()),
             );
@@ -1168,9 +1172,9 @@ mod tests {
                     })
                 );
                 let result = if checked {
-                    value.cast(output_type.clone(), &[witness.clone()])
+                    value.cast(output_type.clone(), std::slice::from_ref(&witness))
                 } else {
-                    value.cast_unchecked(output_type.clone(), &[witness.clone()])
+                    value.cast_unchecked(output_type.clone(), std::slice::from_ref(&witness))
                 };
                 assert_eq!(result, Err(ProgramError::InvalidArgument { message: "cast witness failed".to_owned() }),);
             }
@@ -1239,8 +1243,7 @@ mod tests {
         assert_eq!(misses(&domain), 4);
 
         // A domain with different compilation options does not reuse the entries of the default domain.
-        let mut compilation_options = CompilationOptions::default();
-        compilation_options.profile_version = 1;
+        let compilation_options = CompilationOptions { profile_version: 1, ..Default::default() };
         let sibling = domain.with_compilation_options(compilation_options);
         negate(&sibling, vector.clone().associate(&sibling).unwrap());
         assert_eq!(misses(&domain), 5);
@@ -1829,7 +1832,7 @@ mod tests {
             (true, usize::MAX, 0),
         ] {
             let initial =
-                Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), &(-1i64).to_ne_bytes()).unwrap();
+                Array::from_host_buffer(&domain, scalar_type.clone(), mesh.clone(), (-1i64).to_ne_bytes()).unwrap();
             let scan = ScanOperation::new(1, 4).with_reverse(reverse).with_unroll(unroll).unwrap();
             let outputs = domain.bind(Operation::Scan(scan), [body.clone()], &[Value::Array(initial)]).unwrap();
             assert_eq!(read_i64s(&client, program_array(&outputs[0])), vec![last_index]);
@@ -1972,7 +1975,11 @@ mod tests {
 
         let input = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let first = domain
-            .bind(operation.clone(), AttachedRegions::Callees(&[callee.clone()]), &[Value::Array(input.clone())])
+            .bind(
+                operation.clone(),
+                AttachedRegions::Callees(std::slice::from_ref(&callee)),
+                &[Value::Array(input.clone())],
+            )
             .unwrap();
         assert_eq!(first.len(), 1);
         assert_eq!(read_f32s(&client, program_array(&first[0])), vec![1.0, 4.0, 9.0, 16.0]);
@@ -2335,7 +2342,7 @@ mod tests {
         // An input that belongs to a session over a different client is rejected by client identity.
         let input = f32_vector(&foreign_domain, &foreign_mesh, &[1.0, 2.0]);
         assert!(matches!(
-            domain.bind(NegOperation::new(), Vec::new(), &[input.clone()]),
+            domain.bind(NegOperation::new(), Vec::new(), std::slice::from_ref(&input)),
             Err(ProgramError::InvalidArgument { message })
                 if message == "received incompatible devices for eager xla execution: input #0 is owned by a \
                     different PJRT client than this domain's client",
@@ -2695,7 +2702,7 @@ mod tests {
         let mesh = domain_mesh(&client, "x", 1);
         let domain = Session::new(&client).domain();
         let x = f32_vector(&domain, &mesh, &[1.0, 2.0, 3.0]);
-        let hessian = differentiate_at(x).hessian(|x| Ok(x.mul(&x)?.reduce(&[0], ReductionKind::Sum)?)).unwrap();
+        let hessian = differentiate_at(x).hessian(|x| x.mul(&x)?.reduce(&[0], ReductionKind::Sum)).unwrap();
         let block = hessian.iter_blocks().next().unwrap();
         assert_eq!(block.output_type().static_shape().unwrap().as_slice(), &[] as &[usize]);
         assert_eq!(block.first_input_type().static_shape().unwrap().as_slice(), &[3]);

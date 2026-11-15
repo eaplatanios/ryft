@@ -464,8 +464,10 @@ fn render_buffer(buffer: &FfiBuffer<'_>, memory: PrintBufferMemory) -> Result<St
     if element_type == FfiBufferType::F64 {
         let bytes = leading_bytes(buffer, memory, count * size_of::<f64>())?;
         let values = bytes
-            .chunks_exact(size_of::<f64>())
-            .map(|chunk| format!("{:?}", f64::from_ne_bytes(chunk.try_into().unwrap())))
+            .as_chunks::<{ size_of::<f64>() }>()
+            .0
+            .iter()
+            .map(|chunk| format!("{:?}", f64::from_ne_bytes(*chunk)))
             .collect::<Vec<_>>();
         return if buffer.rank() == 0 { Ok(values[0].clone()) } else { Ok(format!("[{}]", values.join(", "))) };
     }
@@ -638,7 +640,7 @@ mod tests {
                 inputs: &[ExecutionInput {
                     buffer: Arc::new(
                         client
-                            .buffer(input_bytes.as_slice(), BufferType::F64, &[2], None, device.clone(), None)
+                            .buffer(input_bytes.as_slice(), BufferType::F64, [2], None, device.clone(), None)
                             .unwrap(),
                     ),
                     donatable: false,
@@ -802,7 +804,7 @@ mod tests {
             } else {
                 vec![builtin_requirement(PRINT_CUSTOM_CALL_TARGET)]
             };
-            assert_eq!(lowered.runtime_requirements().as_ref(), requirements);
+            assert_eq!(lowered.runtime_requirements(), requirements);
             assert_eq!(lowered.signature().has_device_ordered_io(), effect_class == EffectClass::DeviceOrderedIo);
             assert_eq!(lowered.signature().has_unordered_io(), !ordered);
             assert!(lowered.signature().has_effects());

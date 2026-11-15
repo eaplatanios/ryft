@@ -130,6 +130,7 @@ impl KernelTuningRequest {
     /// `environment` must identify workload inputs, driver or runtime settings not covered by `facts`, contention
     /// policy, and any preparation behavior that can affect measurements. Reuse is valid only for identical workloads
     /// and environments. The compiler and embedding supply their existing complete configuration identities.
+    #[allow(clippy::too_many_arguments)]
     pub fn new<Extension, Compiler, Embedding>(
         kernel: &VerifiedKernel<'_, Extension>,
         compiler: &Compiler,
@@ -855,14 +856,14 @@ mod tests {
             let request = &request;
             let worker = scope.spawn(move || {
                 tuner.run(
-                    &request,
+                    request,
                     &mut BlockingRunner { entered: entered_sender, release: release_receiver },
                     &AtomicBool::new(false),
                 )
             });
             entered_receiver.recv().unwrap();
             assert!(matches!(
-                tuner.run(&request, &mut Runner::default(), &AtomicBool::new(false)),
+                tuner.run(request, &mut Runner::default(), &AtomicBool::new(false)),
                 Err(KernelTuningError::Busy)
             ));
             release_sender.send(()).unwrap();

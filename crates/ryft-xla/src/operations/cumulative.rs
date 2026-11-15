@@ -64,6 +64,7 @@ impl LowerableOperation for CumulativeOperation {
 /// they do in JAX. XLA imports the scan as an associative HLO `scan`, which leaves the choice of a scan implementation
 /// to the GPU backend. The pinned XLA version has no dedicated prefix sum kernel (e.g., one backed by CUB) and expands
 /// it into the same `reduce-window` tree with logarithmic depth as the window form.
+#[allow(clippy::too_many_arguments)]
 fn lower_cumulative_to_mlir<'b, 'c: 'b, 't: 'c>(
     kind: CumulativeKind,
     axis: usize,

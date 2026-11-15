@@ -904,7 +904,9 @@ pub(crate) mod tests {
     fn test_dense_memory_layouts() {
         let matrix = ArrayType::new_static(DataType::F32, [2, 3]);
         let scalar = ArrayType::new_static(DataType::F32, []);
-        let layouts = dense_memory_layouts(&[matrix.clone(), scalar.clone()], &[matrix.clone()], "mosaic GPU").unwrap();
+        let layouts =
+            dense_memory_layouts(&[matrix.clone(), scalar.clone()], std::slice::from_ref(&matrix), "mosaic GPU")
+                .unwrap();
         assert_eq!(layouts.operands, vec![vec![1, 0], vec![]]);
         assert_eq!(layouts.results, vec![vec![1, 0]]);
         let explicit = matrix.clone().with_layout(Layout::Tiled(TiledLayout::new(vec![1, 0], vec![])));
@@ -930,9 +932,9 @@ pub(crate) mod tests {
             .unwrap();
         let local = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharding).unwrap();
         let bound = BTreeMap::from([("device".to_owned(), mesh.axes()[0].clone())]);
-        validate_kernel_sharding(&[local.clone()], &bound).unwrap();
+        validate_kernel_sharding(std::slice::from_ref(&local), &bound).unwrap();
         assert!(matches!(
-            validate_kernel_sharding(&[local.clone()], &BTreeMap::new()),
+            validate_kernel_sharding(std::slice::from_ref(&local), &BTreeMap::new()),
             Err(KernelEmbeddingError::Invalid { message })
                 if message == "kernel parameter 0 requires a local shard with all partitioned axes bound by `shard_map`",
         ));

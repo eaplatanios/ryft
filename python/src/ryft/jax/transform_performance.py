@@ -397,7 +397,7 @@ def rust_transform_benchmark_command(case_ids: Sequence[str], iterations: int, w
         "--bin",
         "transform_benchmark",
         "--features",
-        "performance-benchmarking ndarray",
+        "performance-benchmarking",
         "--",
         "--iterations",
         str(iterations),

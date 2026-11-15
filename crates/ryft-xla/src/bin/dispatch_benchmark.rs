@@ -153,7 +153,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         results.insert("xla_dimension_add", measure(&arguments, || drop(xla_extent.add(&xla_extent).unwrap())));
     }
     if arguments.selects("host_dimension_add") {
-        results.insert("host_dimension_add", measure(&arguments, || drop(extent.add(&extent).unwrap())));
+        results.insert(
+            "host_dimension_add",
+            measure(&arguments, || {
+                std::hint::black_box(extent.add(&extent).unwrap());
+            }),
+        );
     }
 
     // Reference reads through a session-carrying `Value`, which binds the read through its domain, and through a

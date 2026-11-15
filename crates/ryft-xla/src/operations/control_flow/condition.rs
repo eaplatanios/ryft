@@ -124,8 +124,8 @@ impl LowerableOperation for ConditionOperation<ArrayIrType> {
         });
         let operation = block.append_operation(stable_hlo::r#if(
             input_values[0],
-            true_branch_region?.into(),
-            false_branch_region?.into(),
+            true_branch_region?,
+            false_branch_region?,
             location,
         )?)?;
         let output_count = output_types.len();
@@ -192,7 +192,7 @@ mod tests {
         let inputs = inputs
             .iter()
             .map(|(bytes, buffer_type)| ExecutionInput {
-                buffer: Arc::new(client.buffer(*bytes, *buffer_type, &[], None, device.clone(), None).unwrap()),
+                buffer: Arc::new(client.buffer(*bytes, *buffer_type, [], None, device.clone(), None).unwrap()),
                 donatable: false,
             })
             .collect::<Vec<_>>();
@@ -1030,7 +1030,7 @@ mod tests {
         builder.add_input(extent_type.clone().into());
         builder.add_input(dynamic_type.into());
         let output = builder
-            .add_instruction(ZeroOperation::new(static_type.clone().into()), Vec::new(), Vec::new(), None)
+            .add_instruction(ZeroOperation::new(static_type.clone()), Vec::new(), Vec::new(), None)
             .unwrap()[0];
         let false_branch = builder
             .build::<Vec<Constant>, Vec<Constant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])

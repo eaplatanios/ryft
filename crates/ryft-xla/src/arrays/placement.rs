@@ -11,7 +11,7 @@ use ryft_core::{
 };
 use ryft_macros::Parameter;
 use ryft_pjrt::extensions::cross_host_transfers::{CrossHostTransferKey, GlobalDeviceId};
-use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError};
+use ryft_pjrt::{Buffer, Client, DeviceId, Error as PjrtError, ExecutionFence};
 
 use crate::arrays::{Array, ArrayError, ArrayShard, ShardDescriptor, ShardIndex, ShardLayout};
 use crate::{CompiledFunction, Domain, Error, Options, ToPjrt};
@@ -239,7 +239,8 @@ impl<'o> Array<'o> {
     /// placement needs one. An array of [`DataType::Zero`](ryft_core::DataType::Zero) has no buffers, so only its
     /// placement metadata changes. For any other array, [`Self::exact_shard_buffers`] provides the destination
     /// shards. The result carries the execution fence of this array, so that errors of the execution that produced
-    /// this array still surface through the result.
+    /// this array still surface through the result. It also retains the completion fence of the cross-host sends that
+    /// this process issued, so that the readiness functions of the result surface the errors of those sends.
     fn place_exact_shards(
         &self,
         domain: &Domain<'o>,
@@ -251,11 +252,16 @@ impl<'o> Array<'o> {
             Self::from_zero_space(domain, r#type, Some(sharding.clone()), mesh.clone())?
         } else {
             let shape = self.shape();
-            let Some(buffers) = self.exact_shard_buffers(domain.client(), &shape, mesh, sharding)? else {
+            let Some((buffers, send_fence)) = self.exact_shard_buffers(domain.client(), &shape, mesh, sharding)? else {
                 return Ok(None);
             };
             let r#type = self.r#type().into_owned().with_shape(shape).with_sharding(None)?;
-            Self::from_shared_addressable_buffers(domain, r#type, sharding.clone(), mesh.clone(), buffers)?
+            let output =
+                Self::from_shared_addressable_buffers(domain, r#type, sharding.clone(), mesh.clone(), buffers)?;
+            match send_fence {
+                Some(fence) => output.with_send_fence(fence),
+                None => output,
+            }
         };
         Ok(Some(match self.execution_fence() {
             Some(fence) => output.with_execution_fence(fence.clone()),
@@ -269,13 +275,19 @@ impl<'o> Array<'o> {
     /// that shard. Other local source shards are copied between devices, and remote source shards arrive through
     /// the PJRT cross-host transfers extension. The result is `None` when the destination needs other shards or
     /// when a remote move needs the cross-host transfers extension and the plugin does not provide it.
+    ///
+    /// The buffers come with the completion fence of the cross-host sends that this process issues for the
+    /// destination shards of other processes, or `None` when it issues none. This function never waits for those
+    /// sends, because a send completes only once its receiver issues the matching receive, and the receiver may be
+    /// this same process further below or a process that is itself waiting for a send of its own. The caller retains
+    /// the fence in the placed array so that [`Self::ready`] and [`Self::block_until_ready`] surface send failures.
     fn exact_shard_buffers(
         &self,
         client: &'o Client<'_>,
         global_shape: &StaticShape,
         mesh: &DeviceMesh,
         sharding: &Sharding,
-    ) -> Result<Option<Vec<Arc<Buffer<'o>>>>, Error> {
+    ) -> Result<Option<(Vec<Arc<Buffer<'o>>>, Option<ExecutionFence>)>, Error> {
         let client_process_index = client.process_index()?;
         let plan = match self.plan_exact_shard_put(client_process_index, global_shape, mesh, sharding)? {
             Some(plan) => plan,
@@ -296,7 +308,7 @@ impl<'o> Array<'o> {
             addressable_device_by_id.insert(device.id()?, device);
         }
 
-        if !plan.cross_host_sends().is_empty() {
+        let send_fence = if !plan.cross_host_sends().is_empty() {
             let mut send_buffers = Vec::with_capacity(plan.cross_host_sends().len());
             let mut destination_devices = Vec::with_capacity(plan.cross_host_sends().len());
             let mut transfer_keys = Vec::with_capacity(plan.cross_host_sends().len());
@@ -316,13 +328,16 @@ impl<'o> Array<'o> {
                 destination_devices.push(cross_host_global_device_id(send_plan.destination_device_id())?);
                 transfer_keys.push(send_plan.transfer_key());
             }
-            let _send_events = client.cross_host_send_buffers(
+            let send_events = client.cross_host_send_buffers(
                 send_buffers.as_slice(),
                 destination_devices.as_slice(),
                 transfer_keys.as_slice(),
                 &[],
             )?;
-        }
+            Some(ExecutionFence::new(send_events))
+        } else {
+            None
+        };
 
         let mut addressable_buffers = Vec::new();
         for local_copy_plan in plan.local_copies() {
@@ -389,7 +404,7 @@ impl<'o> Array<'o> {
             addressable_buffers.extend(received_buffers.into_iter().map(Arc::new));
         }
 
-        Ok(Some(addressable_buffers))
+        Ok(Some((addressable_buffers, send_fence)))
     }
 
     /// Plans the moves of whole shards that place this array on `mesh` according to `sharding`, as seen from the
@@ -495,6 +510,8 @@ impl<'o> Array<'o> {
     ///
     /// A donated array must be the only handle of its buffers, so the compiled reshard on the mesh of this array
     /// consumes this array when `donate` is `true`. This array is then not returned if that execution fails.
+    // The error carries the unconsumed array back to the caller, which falls back to a host transfer with it.
+    #[allow(clippy::result_large_err)]
     fn reshard_on_devices_or_return(
         self,
         domain: &Domain<'o>,
@@ -605,7 +622,9 @@ impl<'o> Array<'o> {
 
     /// Copies this fully replicated array onto every device of `destination_mesh`, using copies between the devices of
     /// this process and PJRT cross-host transfers between processes, and then reshards the copy on
-    /// `destination_mesh` to `destination_sharding` with [`Self::reshard_on_same_mesh`].
+    /// `destination_mesh` to `destination_sharding` with [`Self::reshard_on_same_mesh`]. The result retains the
+    /// completion fence of the cross-host sends that this process issued, so that [`Self::ready`] and
+    /// [`Self::block_until_ready`] surface their errors without this function waiting for them.
     fn reshard_replicated_across_meshes(
         &self,
         domain: &Domain<'o>,
@@ -686,15 +705,19 @@ impl<'o> Array<'o> {
             client.cross_host_transfers_extension()?;
         }
 
-        // Issue cross-host sends, if any.
-        if !send_buffers.is_empty() {
-            client.cross_host_send_buffers(
+        // Issue cross-host sends, if any. Waiting for them here could deadlock, because a send completes only once its
+        // receiver issues the matching receive, so the returned array retains their completion fence instead.
+        let send_fence = if !send_buffers.is_empty() {
+            let send_events = client.cross_host_send_buffers(
                 send_buffers.as_slice(),
                 send_destination_devices.as_slice(),
                 send_transfer_keys.as_slice(),
                 &[],
             )?;
-        }
+            Some(ExecutionFence::new(send_events))
+        } else {
+            None
+        };
 
         // Issue cross-host receives, if any. Each call covers one destination device, matching the receives of
         // `Self::exact_shard_buffers`.
@@ -745,7 +768,11 @@ impl<'o> Array<'o> {
 
         // The intermediate is owned exclusively by this function and is never observed by callers.
         // Donating its buffers lets PJRT reuse their memory for the output of the final SPMD reshard.
-        intermediate.reshard_on_same_mesh(domain, destination_mesh, destination_sharding, true)
+        let output = intermediate.reshard_on_same_mesh(domain, destination_mesh, destination_sharding, true)?;
+        Ok(match send_fence {
+            Some(fence) => output.with_send_fence(fence),
+            None => output,
+        })
     }
 
     /// Reshards this sharded array onto a different destination mesh by composing two compiled SPMD programs.

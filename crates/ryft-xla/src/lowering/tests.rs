@@ -215,21 +215,16 @@ pub(crate) fn execute_mixed_program(
                 device.clone(),
                 None,
             )?,
-            MixedValue::Dimension(value) => client.buffer(
-                values_to_bytes(&[*value]).as_slice(),
-                BufferType::I64,
-                &[],
-                None,
-                device.clone(),
-                None,
-            )?,
+            MixedValue::Dimension(value) => {
+                client.buffer(values_to_bytes(&[*value]).as_slice(), BufferType::I64, [], None, device.clone(), None)?
+            }
         });
     }
     for extent in extents {
         buffers.push(client.buffer(
             values_to_bytes(&[*extent]).as_slice(),
             BufferType::I32,
-            &[],
+            [],
             None,
             device.clone(),
             None,
@@ -1421,7 +1416,7 @@ fn test_entry_alias_attribute_executes_in_place_on_cpu() {
         .unwrap();
     let device = executable.addressable_devices().unwrap().remove(0);
     let input = client
-        .buffer(values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(), BufferType::F32, &[4], None, device, None)
+        .buffer(values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(), BufferType::F32, [4], None, device, None)
         .unwrap();
     input.ready().unwrap().r#await().unwrap();
     // The input is ready and remains alive in `inputs` until execution completes, so comparing its opaque address
@@ -1493,10 +1488,13 @@ fn test_mlir_lowerable_value_to_dense_elements_attribute() {
     let integer_cases = vec![
         (CoreArray::vector(vec![-127i8, 126]).unwrap(), values_to_bytes(&[-127i8, 126])),
         (CoreArray::vector(vec![-0x1234i16, 0x2345]).unwrap(), values_to_bytes(&[-0x1234i16, 0x2345])),
-        (CoreArray::vector(vec![-0x1234_567i32, 0x2345_678]).unwrap(), values_to_bytes(&[-0x1234_567i32, 0x2345_678])),
         (
-            CoreArray::vector(vec![-0x1234_5678_9abc_defi64, 0x2345_6789_abcd_ef0]).unwrap(),
-            values_to_bytes(&[-0x1234_5678_9abc_defi64, 0x2345_6789_abcd_ef0]),
+            CoreArray::vector(vec![-0x0123_4567i32, 0x0234_5678]).unwrap(),
+            values_to_bytes(&[-0x0123_4567i32, 0x0234_5678]),
+        ),
+        (
+            CoreArray::vector(vec![-0x0123_4567_89ab_cdefi64, 0x0234_5678_9abc_def0]).unwrap(),
+            values_to_bytes(&[-0x0123_4567_89ab_cdefi64, 0x0234_5678_9abc_def0]),
         ),
         (CoreArray::vector(vec![0x12u8, 0xfe]).unwrap(), values_to_bytes(&[0x12u8, 0xfe])),
         (CoreArray::vector(vec![0x1234u16, 0xfedc]).unwrap(), values_to_bytes(&[0x1234u16, 0xfedc])),

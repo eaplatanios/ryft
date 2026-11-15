@@ -146,6 +146,7 @@ where
 ///
 /// Returns an [`Error`] wrapping [`ProgramError::InvalidInputCount`] when the number of `input_values` differs from
 /// the number of program inputs, and propagates the errors of lowering its constants and instructions.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_program_outputs_with_inputs<
     'b,
     'c: 'b,
@@ -523,7 +524,12 @@ mod tests {
             .unwrap();
         let program = unproject_plain_program(program);
         assert_eq!(
-            lower_nested_program_inline_behind_input_barrier(&program, &[array_type.clone()], &[array_type], true),
+            lower_nested_program_inline_behind_input_barrier(
+                &program,
+                std::slice::from_ref(&array_type),
+                std::slice::from_ref(&array_type),
+                true
+            ),
             indoc! {r#"
                 module {
                   func.func @main(%arg0: tensor<2xf32>) -> tensor<2xf32> {

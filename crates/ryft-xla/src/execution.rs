@@ -242,12 +242,12 @@ impl ExecutionPlan {
                     .iter()
                     .zip(output_shardings)
                     .map(|(output_type, sharding)| {
-                        Ok(ArrayOutputLayout::new(
+                        ArrayOutputLayout::new(
                             output_type.clone(),
                             Some(sharding.clone()),
                             Arc::clone(&mesh),
                             &addressable_device_ids,
-                        )?)
+                        )
                     })
                     .collect::<Result<Vec<_>, Error>>()?,
             )
@@ -1097,40 +1097,40 @@ impl<'c> Domain<'c> {
         let device = ordered.then(|| arguments.addressable_device_ids().to_vec());
         let mut reservation =
             if program.signature().has_effects() { Some(self.effect_scope().reserve(device)?) } else { None };
-        if let Some(reservation) = &reservation {
-            if ordered {
-                let predecessor = reservation
-                    .predecessor_carrier()
-                    .map_err(|reason| Error::Execution(ExecutionError::AsynchronousFailure { reason }))?;
-                let tokens = match predecessor {
-                    Some(tokens) => tokens,
-                    None => {
-                        let client = self.client();
-                        let devices = client.addressable_devices()?;
-                        let process_index = client.process_index()?;
-                        let mut tokens = Vec::with_capacity(addressable_device_count);
-                        for &device_id in arguments.addressable_device_ids() {
-                            let selected = devices
-                                .iter()
-                                .find(|candidate| {
-                                    Device::from_pjrt(*candidate).is_ok_and(|candidate| candidate.id() == device_id)
-                                })
-                                .ok_or(ArrayError::NonAddressableDevice { device_id, process_index })?;
-                            let manager = client.host_to_device_transfer_manager(
-                                vec![BufferSpecification::new(BufferType::Token, [])],
-                                selected.default_memory()?,
-                            )?;
-                            let token = manager.retrieve_buffer(0)?;
-                            // Only the initial creation of empty tokens is awaited. Predecessor carriers remain pending
-                            // inputs.
-                            manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true)?.r#await()?;
-                            tokens.push(Arc::new(token));
-                        }
-                        tokens
+        if let Some(reservation) = &reservation
+            && ordered
+        {
+            let predecessor = reservation
+                .predecessor_carrier()
+                .map_err(|reason| Error::Execution(ExecutionError::AsynchronousFailure { reason }))?;
+            let tokens = match predecessor {
+                Some(tokens) => tokens,
+                None => {
+                    let client = self.client();
+                    let devices = client.addressable_devices()?;
+                    let process_index = client.process_index()?;
+                    let mut tokens = Vec::with_capacity(addressable_device_count);
+                    for &device_id in arguments.addressable_device_ids() {
+                        let selected = devices
+                            .iter()
+                            .find(|candidate| {
+                                Device::from_pjrt(*candidate).is_ok_and(|candidate| candidate.id() == device_id)
+                            })
+                            .ok_or(ArrayError::NonAddressableDevice { device_id, process_index })?;
+                        let manager = client.host_to_device_transfer_manager(
+                            vec![BufferSpecification::new(BufferType::Token, [])],
+                            selected.default_memory()?,
+                        )?;
+                        let token = manager.retrieve_buffer(0)?;
+                        // Only the initial creation of empty tokens is awaited. Predecessor carriers remain pending
+                        // inputs.
+                        manager.transfer_data(0, Arc::new([] as [u8; 0]), 0, true)?.r#await()?;
+                        tokens.push(Arc::new(token));
                     }
-                };
-                arguments.push_input_buffers(tokens);
-            }
+                    tokens
+                }
+            };
+            arguments.push_input_buffers(tokens);
         }
         debug_assert!(
             arguments
@@ -1265,7 +1265,7 @@ impl<'c> Domain<'c> {
                 input.block_until_ready()?;
                 let carrier_type = physical_type.clone().with_data_type(DataType::Boolean);
                 let element_count = carrier_type.element_count()?.unwrap();
-                Ok(Array::from_host_buffer(self, carrier_type, input.mesh().clone(), vec![0u8; element_count])?)
+                Array::from_host_buffer(self, carrier_type, input.mesh().clone(), vec![0u8; element_count])
             })
             .collect()
     }
@@ -2614,7 +2614,9 @@ mod tests {
 
         // An input that already has the expected sharding passes through.
         let input = f32_vector(&domain, &mesh, &[1., 2., 3., 4.]);
-        let inputs = domain.reshard_inputs_if_needed(&mesh, &[replicated.clone()], vec![input.clone()]).unwrap();
+        let inputs = domain
+            .reshard_inputs_if_needed(&mesh, std::slice::from_ref(&replicated), vec![input.clone()])
+            .unwrap();
         assert_eq!(inputs, vec![input.clone()]);
 
         // An input on one device of the mesh is placed on every device by copying its shard, which compiles nothing.
@@ -2642,7 +2644,7 @@ mod tests {
         assert_eq!(domain.program_count(), 0);
 
         // An input whose shards have to be sliced goes through a compiled reshard.
-        let inputs = domain.reshard_inputs_if_needed(&mesh, &[sharded.clone()], vec![input]).unwrap();
+        let inputs = domain.reshard_inputs_if_needed(&mesh, std::slice::from_ref(&sharded), vec![input]).unwrap();
         assert_eq!(inputs[0].sharding(), &sharded);
         assert_eq!(device_values(&inputs[0]), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
         assert_eq!(domain.program_count(), 1);
@@ -2660,7 +2662,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reversed_input.sharding(), &sharded);
-        let inputs = domain.reshard_inputs_if_needed(&mesh, &[sharded.clone()], vec![reversed_input]).unwrap();
+        let inputs = domain
+            .reshard_inputs_if_needed(&mesh, std::slice::from_ref(&sharded), vec![reversed_input])
+            .unwrap();
         assert_eq!(inputs[0].mesh(), &mesh);
         assert_eq!(device_values(&inputs[0]), vec![vec![1.], vec![2.], vec![3.], vec![4.]]);
         assert_eq!(domain.program_count(), 1);

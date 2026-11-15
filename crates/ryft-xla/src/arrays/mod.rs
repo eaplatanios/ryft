@@ -201,6 +201,17 @@ pub struct Array<'o> {
     /// associated with the launch. Cloned output arrays share the same fence.
     execution_fence: Option<ExecutionFence>,
 
+    /// Completion fence of the PJRT cross-host sends that the placement which produced this array issued from the
+    /// current process, if it issued any. The data of this array does not depend on those sends, because they deliver
+    /// shards to the devices of other processes, but a send that fails after it was issued is otherwise only noticed
+    /// by its receiver. Retaining the fence here lets [`Self::ready`] and [`Self::block_until_ready`] surface that
+    /// failure on the sending process. A send completes only once its receiver has issued the matching receive, so
+    /// the placement must not wait for it, and only those explicit readiness functions do. Clones of this array share
+    /// the same fence. Dropping every handle of the fence neither cancels nor waits for the sends, and their errors
+    /// are then no longer observed by this process. Derived arrays (e.g., the results of operations on this array)
+    /// do not inherit the fence.
+    send_fence: Option<ExecutionFence>,
+
     /// [`Domain`] this array belongs to, retained across clones and derived values. It determines the session
     /// (and thus the PJRT client, compilation cache, and kernel runtimes), the effect scope, and the compilation
     /// options that receiver-based operations on this array execute with. Explicit domains select their own scope,
@@ -355,6 +366,7 @@ impl<'o> Array<'o> {
                 Arc::new(mesh),
             )),
             execution_fence: None,
+            send_fence: None,
             domain: domain.clone(),
         })
     }
@@ -411,6 +423,7 @@ impl<'o> Array<'o> {
                 Arc::new(mesh),
             )),
             execution_fence: None,
+            send_fence: None,
             domain: domain.clone(),
         })
     }
@@ -784,6 +797,7 @@ impl<'o> Array<'o> {
                 Arc::clone(&layout.mesh),
             )),
             execution_fence: Some(fence),
+            send_fence: None,
             domain: domain.clone(),
         }
     }
@@ -793,6 +807,15 @@ impl<'o> Array<'o> {
     #[inline]
     pub(crate) fn with_execution_fence(mut self, fence: ExecutionFence) -> Self {
         self.execution_fence = Some(fence);
+        self
+    }
+
+    /// Attaches the completion fence of the PJRT cross-host sends that the placement which produced this array
+    /// issued from the current process. This never waits, and [`Self::ready`] and [`Self::block_until_ready`] later
+    /// wait for the fence and return the first error of those sends.
+    #[inline]
+    pub(crate) fn with_send_fence(mut self, fence: ExecutionFence) -> Self {
+        self.send_fence = Some(fence);
         self
     }
 
@@ -979,8 +1002,10 @@ impl<'o> Array<'o> {
     }
 
     /// Waits asynchronously for every addressable shard buffer to become ready, then checks the whole-execution
-    /// fence so errors not tied to an individual output buffer are surfaced as well. Calling this function does not
-    /// copy data to the host.
+    /// fence so errors not tied to an individual output buffer are surfaced as well. When the placement that produced
+    /// this array sent shards to other processes, this function finally waits for those sends and returns the first
+    /// error among them. That wait blocks the calling thread until every receiving process has issued its matching
+    /// receive. Calling this function does not copy data to the host.
     pub async fn ready(&self) -> Result<(), Error> {
         for shard in self.addressable_shards() {
             if let Some(buffer) = shard.buffer() {
@@ -992,11 +1017,15 @@ impl<'o> Array<'o> {
             // checking it here preserves whole-execution errors without introducing a wait into device pipelines.
             fence.block_until_ready()?;
         }
+        if let Some(fence) = &self.send_fence {
+            fence.block_until_ready()?;
+        }
         Ok(())
     }
 
-    /// Blocks the current thread until this array and the whole execution that produced it are ready. This is an
-    /// explicit synchronization boundary and does not copy data to the host.
+    /// Blocks the current thread until this array and the whole execution that produced it are ready, and until the
+    /// sends to other processes that the placement which produced this array issued have completed. It returns the
+    /// first error of that work. This is an explicit synchronization boundary and does not copy data to the host.
     pub fn block_until_ready(&self) -> Result<(), Error> {
         if let Some(fence) = &self.execution_fence {
             fence.block_until_ready()?;
@@ -1005,6 +1034,9 @@ impl<'o> Array<'o> {
             if let Some(buffer) = shard.buffer() {
                 buffer.ready()?.r#await()?;
             }
+        }
+        if let Some(fence) = &self.send_fence {
+            fence.block_until_ready()?;
         }
         Ok(())
     }
@@ -1047,6 +1079,7 @@ impl<'o> Array<'o> {
             shard_index_by_device: Arc::clone(&self.parts.shard_index_by_device),
             mesh: Arc::clone(&self.parts.mesh),
             execution_fence: self.execution_fence.clone(),
+            send_fence: self.send_fence.clone(),
         }
     }
 
@@ -1220,6 +1253,7 @@ impl<'o> Clone for Array<'o> {
         Self {
             parts: Arc::clone(&self.parts),
             execution_fence: self.execution_fence.clone(),
+            send_fence: self.send_fence.clone(),
             domain: self.domain.clone(),
         }
     }
@@ -1324,6 +1358,11 @@ pub(crate) struct RetainedArray<'o> {
 
     /// Whole-execution completion fence of the launch that produced the retained array, if any.
     execution_fence: Option<ExecutionFence>,
+
+    /// Completion fence of the cross-host sends of the placement that produced the retained array, if any, which
+    /// arrays resolved through [`Self::to_array`] share with the retained array (refer to the `send_fence` field of
+    /// [`Array`]).
+    send_fence: Option<ExecutionFence>,
 }
 
 impl<'o> RetainedArray<'o> {
@@ -1351,6 +1390,7 @@ impl<'o> RetainedArray<'o> {
                 Arc::clone(&self.mesh),
             )),
             execution_fence: self.execution_fence.clone(),
+            send_fence: self.send_fence.clone(),
             domain: domain.clone(),
         }
     }
@@ -2276,10 +2316,14 @@ enum ArrayShardStorage<'o> {
     Buffer(Arc<Buffer<'o>>),
 }
 
+// Per-axis tile ranges are lists that often hold a single range, which this lint mistakes for a range to collect.
 #[cfg(test)]
+#[allow(clippy::single_range_in_vec_init)]
 mod tests {
     use std::collections::HashMap;
+    use std::pin::pin;
     use std::sync::Arc;
+    use std::task::{Context, Poll, Waker};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -2302,7 +2346,7 @@ mod tests {
 
     use super::{
         Array, ArrayError, ArrayOutputLayout, ArrayShard, ArrayTypeExtension, ConstantKind, ShardDescriptor,
-        ShardLayout, block_until_ready,
+        ShardLayout, block_until_ready, ready,
     };
 
     // Builds a rank-0 array whose sharding is unreduced along a two-device mesh axis `x`, with `kind` combining the
@@ -3093,6 +3137,62 @@ mod tests {
     }
 
     #[test]
+    fn test_array_with_send_fence() {
+        let client = cpu_client(1);
+        let domain = Session::new(&client).domain();
+        let mesh = domain_mesh(&client, "x", 1);
+        let r#type = ArrayType::new_static(DataType::F32, [2]);
+        let mut context = Context::from_waker(Waker::noop());
+
+        // Attaching the fence of pending sends never waits, and clones and retained copies share that fence.
+        let (event, promise) = client.event(()).unwrap();
+        let array = Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), values_to_bytes(&[1f32, 2.]))
+            .unwrap()
+            .with_send_fence(ExecutionFence::new(vec![event]));
+        let clone = array.clone();
+        let retained = array.retain().to_array(&domain);
+        let pending = [&array, &clone, &retained]
+            .map(|array| matches!(array.send_fence.as_ref().map(ExecutionFence::is_ready), Some(Ok(false))));
+        promise.set(Some(PjrtError::invalid_argument("cross-host send failed"))).unwrap();
+        assert_eq!(pending, [true; 3]);
+        assert!(array.execution_fence().is_none());
+
+        // Every readiness function of every array that shares the fence surfaces the failure of the sends. The
+        // asynchronous functions complete within one poll because the buffers and the fence are already complete.
+        for array in [&array, &clone, &retained] {
+            assert!(matches!(
+                array.block_until_ready(),
+                Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. })) if message == "cross-host send failed",
+            ));
+            assert!(matches!(
+                pin!(array.ready()).poll(&mut context),
+                Poll::Ready(Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. })))
+                    if message == "cross-host send failed",
+            ));
+        }
+        assert!(matches!(
+            block_until_ready(&vec![array.clone()]),
+            Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. })) if message == "cross-host send failed",
+        ));
+        assert!(matches!(
+            pin!(ready(&vec![array.clone()])).poll(&mut context),
+            Poll::Ready(Err(Error::Pjrt(PjrtError::InvalidArgument { message, .. })))
+                if message == "cross-host send failed",
+        ));
+
+        // Successful sends leave every readiness function successful.
+        let (event, promise) = client.event(()).unwrap();
+        let array = Array::from_host_buffer(&domain, r#type, mesh, values_to_bytes(&[1f32, 2.]))
+            .unwrap()
+            .with_send_fence(ExecutionFence::new(vec![event]));
+        promise.set(None).unwrap();
+        assert!(matches!(array.block_until_ready(), Ok(())));
+        assert!(matches!(block_until_ready(&vec![array.clone()]), Ok(())));
+        assert!(matches!(pin!(array.ready()).poll(&mut context), Poll::Ready(Ok(()))));
+        assert!(matches!(pin!(ready(&vec![array.clone()])).poll(&mut context), Poll::Ready(Ok(()))));
+    }
+
+    #[test]
     fn test_array_associate() {
         let client = cpu_client(1);
         let other_client = cpu_client(1);
@@ -3103,8 +3203,8 @@ mod tests {
 
         // Associating with a sibling domain of the same session switches the domain configuration (i.e., the
         // compilation options) while keeping the array's storage.
-        let mut compilation_options = CompilationOptions::default();
-        compilation_options.matrix_unit_operand_precision = Precision::Highest as i32;
+        let compilation_options =
+            CompilationOptions { matrix_unit_operand_precision: Precision::Highest as i32, ..Default::default() };
         let sibling = session.domain().with_compilation_options(compilation_options);
         let reassociated = array.clone().associate(&sibling).unwrap();
         assert!(Arc::ptr_eq(reassociated.backend_domain().session(), &session));

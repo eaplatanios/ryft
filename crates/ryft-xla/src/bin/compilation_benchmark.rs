@@ -1,9 +1,24 @@
-//! Matched lifecycle and execution benchmark for comparison with JAX.
+//! Compilation lifecycle and execution benchmarks, including a matched lifecycle benchmark for comparison with JAX.
 //!
-//! The workload is `sin(x * x + x)` over an `f32` vector on one CPU device. The benchmark measures the cold staging,
-//! lowering, and compilation times, the enqueue-only and synchronized execution times of the compiled function, the
-//! warm dispatch time of a [`jit`] dispatcher, and, with `--cache-dir`, the time to restore the compiled program from a
-//! persistent cache. It prints one JSON report whose schema is shared with the JAX side of the comparison.
+//! The `--scenario` flag selects one of the following scenarios, each of which prints one JSON report:
+//!
+//!   - **`lifecycle`** (the default): The workload is `sin(x * x + x)` over an `f32` vector on one CPU device. The
+//!     scenario measures the cold staging, lowering, and compilation times, the enqueue-only and synchronized execution
+//!     times of the compiled function, the warm dispatch time of a [`jit`] dispatcher, and, with `--cache-dir`, the
+//!     time to restore the compiled program from a persistent cache. Its report schema is shared with the JAX side of
+//!     the comparison.
+//!   - **`transforms`**: Measures, on one CPU device, the cold and warm calls of a [`jit`] dispatcher whose function
+//!     runs an eager reverse mode gradient, the repeated construction of [`CompiledFunction::gradient`] and
+//!     [`CompiledFunction::jvp`], which retain their derived functions after the first construction, and the cost of
+//!     transforming one shared `jit_call` callee for several distinct outer functions. The latter is split into the
+//!     backend compilation time that the shared compilation context records and the remaining frontend time, for a
+//!     short and a long callee, so that the frontend cost that grows with the callee is visible.
+//!   - **`attention`**: Measures the staging, lowering, and compilation times and the synchronized execution time and
+//!     throughput of bf16 scaled dot-product attention, on the CPU or, with the `cuda-13` feature and
+//!     `RYFT_BENCHMARK_PLATFORM=cuda-13`, on a CUDA GPU, where it lowers to cuDNN's fused attention kernel.
+//!
+//! Run it with `cargo run --release -p ryft-xla --features performance-benchmarking --bin compilation_benchmark`, and
+//! append `-- --scenario <scenario>` to select a scenario and `--smoke` to use small dimensions and iteration counts.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -13,14 +28,36 @@ use std::time::{Duration, Instant};
 use serde_json::{Value as JsonValue, json};
 
 use ryft_core::{
-    ArrayIrType, ArrayType, Compile, CompiledFunction as CoreCompiledFunction, DataType, Device, DeviceMesh,
-    Dimension as CoreDimension, DiskCache, DispatcherStatistics, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding,
-    Sin, StagedFunction as CoreStagedFunction, ValueProjection,
+    ArrayIrType, ArrayOperation, ArrayType, AttentionConfiguration, AttentionInputs, CompilationTracer, Compile,
+    CompiledFunction as CoreCompiledFunction, Cos, DataType, Device, DeviceMesh, Differentiate,
+    Dimension as CoreDimension, DiskCache, DispatcherStatistics, LogicalMesh, MeshAxis, MeshAxisType, Mul, Reduce,
+    ReductionKind, Shape, Sharding, Sin, StagedFunction as CoreStagedFunction, Value as CoreValue, ValueProjection,
+    dot_product_attention,
 };
 use ryft_pjrt::{Client, ClientOptions, CpuClientOptions, load_cpu_plugin};
-use ryft_xla::{Array, CompileTracer, CompiledFunctionDispatcher, Domain, FromPjrt, Options, Session, Value, jit};
+#[cfg(feature = "cuda-13")]
+use ryft_pjrt::{GpuClientOptions, GpuMemoryAllocator, GpuPlatform, load_cuda_13_plugin};
+use ryft_xla::{
+    Array, CompileTracer, CompiledFunction, CompiledFunctionDispatcher, Domain, FromPjrt, Operation, Options, Session,
+    Value, compile, jit,
+};
 
 // TODO(eaplatanios): Review this module.
+
+/// Number of distinct outer functions that stage a `jit_call` of one shared callee in the `transforms` scenario.
+const CALLEE_OUTER_SPECIALIZATIONS: usize = 4;
+
+/// Lengths of the short and long callee chains compared by the `transforms` scenario.
+const CALLEE_OPERATION_COUNTS: [usize; 2] = [2, 200];
+
+/// Lengths of the short and long callee chains compared by the `transforms` scenario with `--smoke`.
+const SMOKE_CALLEE_OPERATION_COUNTS: [usize; 2] = [2, 20];
+
+/// Batch size, sequence length, head count, and head dimension of the `attention` scenario.
+const ATTENTION_DIMENSIONS: [usize; 4] = [4, 2048, 32, 128];
+
+/// Batch size, sequence length, head count, and head dimension of the `attention` scenario with `--smoke`.
+const SMOKE_ATTENTION_DIMENSIONS: [usize; 4] = [1, 16, 2, 8];
 
 /// Staged benchmark workload.
 type BenchmarkStagedFunction<'c> = CoreStagedFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
@@ -28,9 +65,25 @@ type BenchmarkStagedFunction<'c> = CoreStagedFunction<Domain<'c>, ArrayIrType, A
 /// Compiled benchmark workload.
 type BenchmarkCompiledFunction<'c> = CoreCompiledFunction<Domain<'c>, ArrayIrType, ArrayIrType>;
 
+/// Benchmark scenario that `--scenario` selects.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Scenario {
+    /// Lifecycle and execution of the workload that is matched with JAX.
+    Lifecycle,
+
+    /// Dispatch of a JIT-compiled eager gradient and construction of derived compiled functions.
+    Transforms,
+
+    /// Compilation and synchronized execution of scaled dot-product attention.
+    Attention,
+}
+
 /// Command-line arguments of this benchmark.
 #[derive(Debug)]
 struct Arguments {
+    /// Benchmark scenario to run.
+    scenario: Scenario,
+
     /// Number of timed warm iterations of each execution measurement.
     iterations: usize,
 
@@ -46,7 +99,7 @@ struct Arguments {
 
 impl Default for Arguments {
     fn default() -> Self {
-        Self { iterations: 50, size: 1 << 20, smoke: false, cache_directory: None }
+        Self { scenario: Scenario::Lifecycle, iterations: 50, size: 1 << 20, smoke: false, cache_directory: None }
     }
 }
 
@@ -55,11 +108,15 @@ fn usage() -> &'static str {
     "Usage: compilation_benchmark [OPTIONS]\n\
      \n\
      Options:\n\
+       --scenario NAME    Scenario to run (`lifecycle`, `transforms`, or `attention`; default: `lifecycle`)\n\
        --iterations N     Timed warm iterations (default: 50)\n\
-       --size N           Number of f32 elements (default: 1048576)\n\
-       --cache-dir PATH   Measure persistent restore using PATH\n\
+       --size N           Number of f32 elements of the `lifecycle` workload (default: 1048576)\n\
+       --cache-dir PATH   Measure persistent restore of the `lifecycle` workload using PATH\n\
        --smoke            Use small defaults and assert cache invariants\n\
-       -h, --help         Print this help"
+       -h, --help         Print this help\n\
+     \n\
+     The `attention` scenario runs on the platform that `RYFT_BENCHMARK_PLATFORM` selects (`cpu` by default, or\n\
+     `cuda-13` with the `cuda-13` feature)."
 }
 
 /// Parses the command-line arguments, returning [`None`] when only the usage message was requested.
@@ -71,6 +128,14 @@ fn parse_arguments() -> Result<Option<Arguments>, String> {
             "-h" | "--help" => {
                 println!("{}", usage());
                 return Ok(None);
+            }
+            "--scenario" => {
+                arguments.scenario = match values.next().ok_or("expected a value after `--scenario`")?.as_str() {
+                    "lifecycle" => Scenario::Lifecycle,
+                    "transforms" => Scenario::Transforms,
+                    "attention" => Scenario::Attention,
+                    other => return Err(format!("unknown scenario `{other}`\n\n{}", usage())),
+                };
             }
             "--iterations" => {
                 arguments.iterations = values
@@ -263,11 +328,391 @@ fn persistent_restore(
     }))
 }
 
-/// Runs the benchmark and prints its JSON report.
+/// Returns the type of an `f32` array of `shape` that is replicated over `mesh`.
+fn replicated_f32_type(mesh: &DeviceMesh, shape: &[usize]) -> Result<ArrayType, Box<dyn std::error::Error>> {
+    Ok(ArrayType::new_static(DataType::F32, shape)
+        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), shape.len()))?)
+}
+
+/// Returns the cold duration of `construct`, the warm durations of `iterations` further calls, and the counters and
+/// durations of the compilation context of `domain` across them as JSON. The constructed values are dropped outside
+/// the timed region.
+fn repeated_construction<T>(
+    domain: &Domain<'_>,
+    iterations: usize,
+    mut construct: impl FnMut() -> Result<T, ryft_xla::Error>,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    domain.compilation_context().clear_statistics();
+    let start = Instant::now();
+    let constructed = construct()?;
+    let cold_nanoseconds = duration_nanoseconds(start);
+    drop(constructed);
+    let mut warm_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let constructed = construct()?;
+        warm_samples.push(duration_nanoseconds(start));
+        drop(constructed);
+    }
+    Ok(json!({
+        "cold_ns": cold_nanoseconds,
+        "warm": distribution(&warm_samples),
+        "compilation_cache": compilation_statistics(domain),
+        "retained_programs": domain.program_count(),
+    }))
+}
+
+/// Measures the cold call and `iterations` warm calls of a [`jit`] dispatcher whose function runs an eager reverse
+/// mode gradient of `x * x` at an `f32` scalar, and returns the measurement as JSON. The JIT boundary stages the eager
+/// transform once per specialization, so the retained specialization serves every warm call, which `smoke` asserts
+/// together with the computed gradients.
+fn jit_eager_gradient(
+    client: &Client<'_>,
+    mesh: &DeviceMesh,
+    iterations: usize,
+    smoke: bool,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let domain = Session::new(client).domain();
+    let r#type = replicated_f32_type(mesh, &[])?;
+    let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> = jit(
+        |_, input: CompileTracer<'_>| {
+            Ok(input.domain().differentiate_at(input).gradient(|value| Mul::mul(&value, &value))?)
+        },
+        &domain,
+        mesh.clone(),
+    );
+    domain.compilation_context().clear_statistics();
+    let input = |value: f32| Array::from_host_buffer(&domain, r#type.clone(), mesh.clone(), value.to_ne_bytes());
+
+    let mut samples = Vec::with_capacity(iterations + 1);
+    let mut cold_statistics = None;
+    for index in 0..=iterations {
+        let input = input(index as f32)?;
+        let start = Instant::now();
+        let output = function.execute((), input)?;
+        samples.push(duration_nanoseconds(start));
+        let gradient = f32::from_ne_bytes(output.copy_to_host()?.as_slice().try_into()?);
+        if smoke {
+            assert_eq!(gradient, 2.0 * index as f32, "the gradient of `x * x` must be `2 * x`");
+        }
+        cold_statistics.get_or_insert_with(|| function.statistics());
+    }
+    let statistics = function.statistics();
+    if smoke {
+        assert_eq!(statistics.dispatch_misses, 1, "only the cold call may miss the dispatch cache");
+        assert_eq!(statistics.dispatch_hits, iterations as u64, "every warm call must hit the dispatch cache");
+        assert_eq!(statistics.traces, 1, "the eager gradient must be traced exactly once");
+        assert_eq!(statistics.lowerings, 1, "the eager gradient must be lowered exactly once");
+        assert_eq!(statistics.compilation_requests, 1, "the eager gradient must be compiled exactly once");
+    }
+    Ok(json!({
+        "cold_call_ns": samples[0],
+        "warm_call": distribution(&samples[1..]),
+        "counters": {
+            "after_cold_call": dispatcher_statistics(cold_statistics.unwrap()),
+            "after_warm_calls": dispatcher_statistics(statistics),
+        },
+        "compilation_cache": compilation_statistics(&domain),
+        "retained_programs": domain.program_count(),
+    }))
+}
+
+/// Measures the forward mode and reverse mode transformation of one shared `jit_call` callee of `callee_operations`
+/// alternating `sin` and `cos` operations across [`CALLEE_OUTER_SPECIALIZATIONS`] distinct outer functions, and returns
+/// the measurement as JSON.
+///
+/// Every outer function stages a `jit_call` of the same callee and appends a different number of `sin` operations, so
+/// the outer functions are distinct specializations that cannot share the derived functions that a
+/// [`CompiledFunction`] retains. Each [`CompiledFunction::jvp`] runs the forward mode rule of the `jit_call` operation
+/// over the callee, and each [`CompiledFunction::gradient`] runs both its forward mode rule and its transposition rule.
+/// The transform cache of the callee region derives its linearizations and transpositions once and serves them to every
+/// later outer function, so the frontend cost that still grows with the callee is the work outside of the retained
+/// artifacts (e.g., replaying the derived programs into each outer function). Every construction is reported with its
+/// total time, the backend compilation time that the shared compilation context records during it, and the remaining
+/// frontend time. The derived programs of distinct outer functions are distinct compilations that no frontend cache
+/// can remove.
+fn shared_callee_transforms<'c>(
+    domain: &Domain<'c>,
+    mesh: &DeviceMesh,
+    callee_operations: usize,
+) -> Result<JsonValue, Box<dyn std::error::Error>> {
+    let r#type = replicated_f32_type(mesh, &[])?;
+    let callee: CompiledFunction<'c, ArrayType, ArrayType> = compile(
+        move |x| {
+            let mut value = x;
+            for index in 0..callee_operations {
+                value = if index % 2 == 0 { value.sin().unwrap() } else { value.cos().unwrap() };
+            }
+            value
+        },
+        r#type.clone(),
+        domain,
+        mesh.clone(),
+    )?;
+
+    let mut outers = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
+    for index in 0..CALLEE_OUTER_SPECIALIZATIONS {
+        let callee = callee.clone();
+        let outer: CompiledFunction<'c, ArrayType, ArrayType> = compile(
+            move |x| {
+                let mut value = callee.call(x).unwrap();
+                for _ in 0..=index {
+                    value = value.sin().unwrap();
+                }
+                value
+            },
+            r#type.clone(),
+            domain,
+            mesh.clone(),
+        )?;
+
+        // The callee must stay behind a `jit_call` boundary for the measurement to be meaningful, so the outer program
+        // must hold exactly one `jit_call` and none of the `cos` operations of the callee, which its epilogue of `sin`
+        // operations never produces.
+        let instructions = outer.source_program().program().instructions();
+        let jit_call_count = instructions
+            .iter()
+            .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
+            .count();
+        let inlined_cosine_count = instructions
+            .iter()
+            .filter(|instruction| matches!(instruction.operation(), Operation::Array(ArrayOperation::Cos(_))))
+            .count();
+        assert_eq!(jit_call_count, 1, "each outer function must stage one `jit_call` boundary");
+        assert_eq!(inlined_cosine_count, 0, "the outer functions must not inline the callee body");
+        outers.push(outer);
+    }
+
+    let compilation_duration = || domain.compilation_context().statistics().compilation_duration;
+    let mut constructions = serde_json::Map::new();
+    let mut mean_frontend_nanoseconds = serde_json::Map::new();
+    for transform in ["jvp", "gradient"] {
+        let mut rows = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
+        let mut frontend_sum = 0u64;
+        for outer in &outers {
+            let before = compilation_duration();
+            let start = Instant::now();
+            match transform {
+                "jvp" => drop(outer.jvp(domain)?),
+                _ => drop(outer.gradient(domain)?),
+            }
+            let total = duration_nanoseconds(start);
+            let backend = nanoseconds(compilation_duration() - before);
+            let frontend = total.saturating_sub(backend);
+            frontend_sum += frontend;
+            rows.push(json!({ "total_ns": total, "backend_ns": backend, "frontend_ns": frontend }));
+        }
+        constructions.insert(transform.to_string(), JsonValue::from(rows));
+        let mean = frontend_sum / CALLEE_OUTER_SPECIALIZATIONS as u64;
+        mean_frontend_nanoseconds.insert(transform.to_string(), JsonValue::from(mean));
+    }
+    Ok(json!({
+        "callee_operations": callee_operations,
+        "constructions": constructions,
+        "mean_frontend_ns": mean_frontend_nanoseconds,
+    }))
+}
+
+/// Runs the `transforms` scenario and prints its JSON report.
+fn transforms(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
+    let plugin = load_cpu_plugin()?;
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
+    let mesh = mesh(&client)?;
+
+    let jit_eager_gradient = jit_eager_gradient(&client, &mesh, arguments.iterations, arguments.smoke)?;
+
+    // Repeated reverse mode construction of the gradient of `sum(sin(x))` over an `f32[4, 4]` input.
+    let domain = Session::new(&client).domain();
+    let r#type = replicated_f32_type(&mesh, &[4, 4])?;
+    let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
+        |x| x.sin().unwrap().reduce(&[0, 1], ReductionKind::Sum).unwrap(),
+        r#type.clone(),
+        &domain,
+        mesh.clone(),
+    )?;
+    let gradient_construction = repeated_construction(&domain, arguments.iterations, || compiled.gradient(&domain))?;
+
+    // Repeated forward mode construction of the JVP of `cos(sin(x))` over an `f32[4, 4]` input.
+    let domain = Session::new(&client).domain();
+    let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
+        compile(|x| x.sin().unwrap().cos().unwrap(), r#type, &domain, mesh.clone())?;
+    let jvp_construction = repeated_construction(&domain, arguments.iterations, || compiled.jvp(&domain))?;
+
+    // Transformations of a short and a long shared callee, whose difference isolates the frontend cost that grows with
+    // the callee.
+    let domain = Session::new(&client).domain();
+    let callee_operation_counts = if arguments.smoke { SMOKE_CALLEE_OPERATION_COUNTS } else { CALLEE_OPERATION_COUNTS };
+    let callees = callee_operation_counts
+        .into_iter()
+        .map(|callee_operations| shared_callee_transforms(&domain, &mesh, callee_operations))
+        .collect::<Result<Vec<_>, _>>()?;
+    let added_operations = (callee_operation_counts[1] - callee_operation_counts[0]) as f64;
+    let growth = |transform: &str| {
+        let short = callees[0]["mean_frontend_ns"][transform].as_f64().unwrap();
+        let long = callees[1]["mean_frontend_ns"][transform].as_f64().unwrap();
+        json!({
+            "mean_frontend_delta_ns": long - short,
+            "mean_frontend_delta_per_callee_operation_ns": (long - short) / added_operations,
+        })
+    };
+
+    let report = json!({
+        "schema": "ryft-compilation-transforms-benchmark-v1",
+        "configuration": {
+            "iterations": arguments.iterations,
+            "smoke": arguments.smoke,
+            "outer_specializations": CALLEE_OUTER_SPECIALIZATIONS,
+            "callee_operation_counts": callee_operation_counts,
+        },
+        "metadata": {
+            "platform_name": client.platform_name()?.into_owned(),
+            "platform_version": client.platform_version()?.into_owned(),
+        },
+        "jit_eager_gradient": jit_eager_gradient,
+        "repeated_gradient_construction": gradient_construction,
+        "repeated_jvp_construction": jvp_construction,
+        "shared_callee_transforms": {
+            "callees": callees,
+            "frontend_growth": { "jvp": growth("jvp"), "gradient": growth("gradient") },
+            "compilation_cache": compilation_statistics(&domain),
+            "retained_programs": domain.program_count(),
+        },
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// Returns a client for the platform that `RYFT_BENCHMARK_PLATFORM` selects (i.e., `cpu`, which is the default, or
+/// `cuda-13` with the `cuda-13` feature) and whether that platform is a CUDA GPU.
+fn platform_client() -> Result<(Client<'static>, bool), Box<dyn std::error::Error>> {
+    match env::var("RYFT_BENCHMARK_PLATFORM").as_deref() {
+        #[cfg(feature = "cuda-13")]
+        Ok("cuda-13") => {
+            let options = GpuClientOptions {
+                platform: Some(GpuPlatform::CUDA),
+                allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: None },
+                ..Default::default()
+            };
+            Ok((Box::leak(Box::new(load_cuda_13_plugin()?)).client(ClientOptions::GPU(options))?, true))
+        }
+        Ok("cpu") | Err(_) => {
+            let options = CpuClientOptions { device_count: Some(1), ..Default::default() };
+            Ok((Box::leak(Box::new(load_cpu_plugin()?)).client(ClientOptions::CPU(options))?, false))
+        }
+        Ok(platform) => Err(format!("unsupported benchmark platform `{platform}`").into()),
+    }
+}
+
+/// Runs the `attention` scenario and prints its JSON report.
+fn attention(arguments: &Arguments) -> Result<(), Box<dyn std::error::Error>> {
+    let (client, cuda) = platform_client()?;
+    let client = Box::leak(Box::new(client));
+    let mesh = mesh(client)?;
+    let domain = Session::new(client).domain();
+    let dimensions @ [batch, sequence, heads, head_dimension] =
+        if arguments.smoke { SMOKE_ATTENTION_DIMENSIONS } else { ATTENTION_DIMENSIONS };
+    let r#type = ArrayType::new_static(DataType::BF16, dimensions)
+        .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))?;
+    let attention = dot_product_attention::<Domain<'static>>(
+        AttentionConfiguration::new().with_scale(1.0 / (head_dimension as f64).sqrt()),
+    );
+
+    let start = Instant::now();
+    let staged: CoreStagedFunction<Domain<'static>, Vec<ArrayIrType>, Vec<ArrayIrType>> = domain.stage(
+        |inputs: Vec<CompilationTracer<Domain<'static>>>| {
+            let inputs = AttentionInputs::new(inputs[0].clone(), inputs[1].clone(), inputs[2].clone());
+            vec![attention.call(inputs).unwrap()]
+        },
+        vec![ArrayIrType::from(r#type.clone()); 3],
+        Options::new(mesh.clone()),
+    )?;
+    let staging_nanoseconds = duration_nanoseconds(start);
+    let start = Instant::now();
+    let lowered = staged.lower(&domain)?;
+    let lowering_nanoseconds = duration_nanoseconds(start);
+    let fused = lowered.lowered_program().stable_hlo().contains("__cudnn$fmhaSoftmax");
+    if cuda {
+        assert!(fused, "attention must lower to cuDNN's fused attention kernel on CUDA");
+    }
+    let start = Instant::now();
+    let compiled: CoreCompiledFunction<Domain<'static>, Vec<ArrayIrType>, Vec<ArrayIrType>> =
+        lowered.compile(&domain)?;
+    let compilation_nanoseconds = duration_nanoseconds(start);
+
+    // Every input element is the bf16 encoding of one.
+    let element_count = dimensions.iter().product::<usize>();
+    let bytes = 0x3f80u16.to_ne_bytes().repeat(element_count);
+    let input = Array::from_host_buffer(&domain, r#type, mesh, bytes.as_slice())?;
+    input.block_until_ready()?;
+    let inputs = vec![Value::Array(input); 3];
+    let execute = || -> Result<(), Box<dyn std::error::Error>> {
+        match compiled.executable().execute(&domain, inputs.clone())?.remove(0) {
+            Value::Array(output) => Ok(output.block_until_ready()?),
+            _ => Err("attention benchmark produced a value that is not an array".into()),
+        }
+    };
+
+    // Accelerators may idle at a low power state, so the warm-up runs as many executions as the timed samples to let
+    // their clocks stabilize before the synchronized samples are collected.
+    for _ in 0..arguments.iterations {
+        execute()?;
+    }
+    let mut samples = Vec::with_capacity(arguments.iterations);
+    for _ in 0..arguments.iterations {
+        let start = Instant::now();
+        execute()?;
+        samples.push(duration_nanoseconds(start));
+    }
+    let mut sorted = samples.clone();
+    sorted.sort_unstable();
+    let median_nanoseconds = sorted[sorted.len() / 2];
+    let floating_point_operations =
+        4.0 * batch as f64 * heads as f64 * sequence as f64 * sequence as f64 * head_dimension as f64;
+
+    let report = json!({
+        "schema": "ryft-compilation-attention-benchmark-v1",
+        "workload": {
+            "name": "dot_product_attention",
+            "dtype": "bfloat16",
+            "batch_size": batch,
+            "sequence_length": sequence,
+            "head_count": heads,
+            "head_dimension": head_dimension,
+        },
+        "configuration": {
+            "iterations": arguments.iterations,
+            "smoke": arguments.smoke,
+            "synchronization": "Array::block_until_ready",
+        },
+        "metadata": {
+            "platform_name": client.platform_name()?.into_owned(),
+            "platform_version": client.platform_version()?.into_owned(),
+        },
+        "lifecycle": {
+            "cold_trace_ns": staging_nanoseconds,
+            "cold_lower_ns": lowering_nanoseconds,
+            "cold_compile_ns": compilation_nanoseconds,
+            "fused_kernel": fused,
+        },
+        "execution": {
+            "synchronized": distribution(&samples),
+            "median_throughput_tflops": floating_point_operations / (median_nanoseconds as f64 * 1e3),
+        },
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// Runs the selected benchmark scenario and prints its JSON report.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(arguments) = parse_arguments().map_err(std::io::Error::other)? else {
         return Ok(());
     };
+    match arguments.scenario {
+        Scenario::Lifecycle => {}
+        Scenario::Transforms => return transforms(&arguments),
+        Scenario::Attention => return attention(&arguments),
+    }
 
     let plugin = load_cpu_plugin()?;
     let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;

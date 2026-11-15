@@ -342,7 +342,7 @@ mod tests {
         // to an empty capture namespace this lowering silently forwarded that unrelated captured value.
         let result = to_mlir_module_for_program(
             &program,
-            &[scalar_type.clone()],
+            std::slice::from_ref(&scalar_type),
             &scalar_type,
             &scalar_type,
             "main",

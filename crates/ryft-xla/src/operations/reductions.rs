@@ -1174,7 +1174,7 @@ mod tests {
             ([0f32, 0., 4.], 0., vec![0., 0., 0.]),
         ] {
             let input =
-                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
             let output = compiled.executable().execute(&engine, input.clone()).unwrap();
             assert_eq!(read_f32s(&client, &output), vec![expected]);
             let output = gradient.executable().execute(&engine, input).unwrap();
@@ -1198,7 +1198,7 @@ mod tests {
             [([2f32, 3., 4., 5.], vec![60f32, 40., 30., 24.]), ([0f32, 3., 4., 5.], vec![60f32, 0., 0., 0.])]
         {
             let input =
-                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&values)).unwrap();
+                Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&values)).unwrap();
             let output = gradient.executable().execute(&engine, input).unwrap();
             assert_eq!(output.sharding(), input_type.sharding().unwrap());
             let mut observed = Vec::new();
@@ -1289,7 +1289,7 @@ mod tests {
             mesh.clone(),
         )
         .unwrap();
-        let input = Array::from_host_buffer(&engine, input_type, mesh, &[]).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, []).unwrap();
         let output = compiled.executable().execute(&engine, input).unwrap();
         assert!(read_f32s(&client, &output)[0].is_nan());
     }
@@ -1303,7 +1303,7 @@ mod tests {
         // Product retains the small growth of each factor, and the larger mean also needs a widened divisor.
         for (kind, count, input, expected) in [
             (ReductionKind::Sum, 4096, 1f32, 4096f32),
-            (ReductionKind::Product, 4096, 1.0009765625f32, 54.5f32),
+            (ReductionKind::Product, 4096, 1.000_976_6_f32, 54.5f32),
             (ReductionKind::Mean, 4096, 1f32, 1f32),
             (ReductionKind::Mean, 70000, 1f32, 1f32),
             (ReductionKind::LogSumExp, 4096, 0f32, 8.3203125f32),
@@ -1325,7 +1325,7 @@ mod tests {
             )
             .unwrap();
             let input =
-                Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&vec![input; count]))
+                Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&vec![input; count]))
                     .unwrap();
             let output = compiled.executable().execute(&engine, input).unwrap();
             assert_eq!(read_f32s(&client, &output), vec![expected]);
@@ -1754,7 +1754,7 @@ mod tests {
             let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
                 compile(|value| value.reduce(&[0], kind).unwrap(), input_type.clone(), &engine, mesh.clone()).unwrap();
             let input =
-                Array::from_host_buffer(&engine, input_type, mesh.clone(), &values_to_bytes(&components)).unwrap();
+                Array::from_host_buffer(&engine, input_type, mesh.clone(), values_to_bytes(&components)).unwrap();
             let output = compiled.executable().execute(&engine, input).unwrap();
             assert_eq!(read_f32s(&client, &output), expected);
         }
@@ -2344,13 +2344,13 @@ mod tests {
 
         // Rounding the primal output at a large offset must not erase the derivative's normalization.
         let input =
-            Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), &values_to_bytes(&[1e20f64, 1e20]))
+            Array::from_host_buffer(&engine, input_type.clone(), mesh.clone(), values_to_bytes(&[1e20f64, 1e20]))
                 .unwrap();
         let output = gradient.executable().execute(&engine, input).unwrap();
         assert_eq!(read_f32s(&client, &output.convert_element_type(DataType::F32).unwrap()), vec![0.5, 0.5]);
 
         // The compiled guard for finite shifts must retain the undefined weight at an infinite input.
-        let input = Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
+        let input = Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&[f64::INFINITY, 0.])).unwrap();
         let output = gradient.executable().execute(&engine, input).unwrap();
         let values = read_f32s(&client, &output.convert_element_type(DataType::F32).unwrap());
         assert!(values[0].is_nan());
@@ -2371,7 +2371,7 @@ mod tests {
         let differentiated = compiled.jvp(&engine).unwrap();
         // The normalization count exceeds the largest finite `f16`, so derivative intermediates must stay widened.
         let input =
-            Array::from_host_buffer(&engine, input_type, mesh, &values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
+            Array::from_host_buffer(&engine, input_type, mesh, values_to_bytes(&vec![0x3c00u16; 65536])).unwrap();
         let (_, tangent) = differentiated.executable().execute(&engine, (input.clone(), input)).unwrap();
         assert_eq!(read_f32s(&client, &tangent.convert_element_type(DataType::F32).unwrap()), vec![1.]);
     }

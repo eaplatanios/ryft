@@ -115,7 +115,7 @@ impl OpShardingExtension for OpSharding {
             // Try every axis that can still complete the prefix. An axis of size one cannot change the tile index, and
             // an axis whose size does not divide the remaining tile count would overshoot it.
             for axis in 0..axis_sizes.len() {
-                if used[axis] || axis_sizes[axis] == 1 || size % (product * axis_sizes[axis]) != 0 {
+                if used[axis] || axis_sizes[axis] == 1 || !size.is_multiple_of(product * axis_sizes[axis]) {
                     continue;
                 }
                 used[axis] = true;

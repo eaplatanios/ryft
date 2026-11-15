@@ -262,7 +262,7 @@ fn array<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, shape: &[usize], fan_in: us
 fn values(client: &Client<'_>, array: &Array<'_>) -> Vec<f32> {
     let device = client.addressable_devices().unwrap()[0].id().unwrap();
     let bytes = array.device_shard(device).unwrap().buffer().unwrap().copy_to_host(None).unwrap().r#await().unwrap();
-    bytes.chunks_exact(4).map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap())).collect()
+    bytes.as_chunks::<4>().0.iter().map(|bytes| f32::from_ne_bytes(*bytes)).collect()
 }
 
 /// Stages the gradient of the sum of the outputs of `apply` with respect to the parameters `(w₁, w₂)` of shapes

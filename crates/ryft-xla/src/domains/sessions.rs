@@ -96,7 +96,7 @@ pub struct Session<'c> {
 
     /// Compilation and execution target snapshot of [`Self::client`], read lazily and retained for the lifetime of the
     /// session, including a failed read.
-    target: OnceLock<Result<Target, ryft_pjrt::Error>>,
+    target: OnceLock<Result<Target, Error>>,
 
     /// Compilation cache of this session, which [`Self::compilation_context`] exposes. Cached artifacts contain no
     /// runtime execution association.
@@ -185,10 +185,7 @@ impl<'c> Session<'c> {
     /// Returns [`Error::Pjrt`] if querying the platform, plugin, or device facts from the client failed. The
     /// failure is retained, so every later call returns the same error.
     pub fn target(&self) -> Result<&Target, Error> {
-        self.target
-            .get_or_init(|| Target::from_client(self.client))
-            .as_ref()
-            .map_err(|error| error.clone().into())
+        self.target.get_or_init(|| Target::from_client(self.client)).as_ref().map_err(Clone::clone)
     }
 
     /// Returns the shared compilation cache.
@@ -638,8 +635,8 @@ mod tests {
         // Construct sibling domains of one session with two distinct base option templates. Different `Debug`
         // representations should produce different cache keys, so the same MLIR program compiles separately under each
         // domain even though both domains share the session's compilation cache.
-        let mut custom_options = CompilationOptions::default();
-        custom_options.matrix_unit_operand_precision = Precision::Highest as i32;
+        let custom_options =
+            CompilationOptions { matrix_unit_operand_precision: Precision::Highest as i32, ..Default::default() };
         let default_engine = Session::new(&client).domain();
         let custom_engine = default_engine.with_compilation_options(custom_options);
 

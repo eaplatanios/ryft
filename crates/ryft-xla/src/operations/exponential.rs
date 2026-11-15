@@ -395,7 +395,7 @@ pub(crate) fn lower_log_add_exp_to_mlir<'b, 'c: 'b, 't: 'c>(
             .result(0)
             .unwrap()
             .as_ref();
-        let one = lower_unplaced_constant_output(&[output_type.clone()], 1, block, context, location)?[0];
+        let one = lower_unplaced_constant_output(std::slice::from_ref(output_type), 1, block, context, location)?[0];
         let unit = block.append_operation(stable_hlo::add(ratio, one, location)?)?.result(0).unwrap().as_ref();
         let unit = block.append_operation(stable_hlo::multiply(rotation, unit, location)?)?.result(0).unwrap().as_ref();
         let unit_real = block.append_operation(stable_hlo::real(unit, location)?)?.result(0).unwrap().as_ref();
@@ -1073,7 +1073,7 @@ mod tests {
         );
         assert_eq!(
             values_from_bytes::<f16>(&left.log_add_exp(&right).unwrap().copy_to_host().unwrap()),
-            vec![f16::from_f32(1.4736328125), f16::from_f32(-4.30859375)],
+            vec![f16::from_f32(1.473_632_8), f16::from_f32(-4.308_593_8)],
         );
 
         // Infinities of the same sign and NaN operands take the plain `a + b` arm, so `+∞` absorbs, `-∞` is the

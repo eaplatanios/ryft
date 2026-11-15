@@ -100,7 +100,7 @@ mod tests {
              (after={after_construct}, baseline={constructed_baseline})",
         );
 
-        let clones: Vec<Array<'_>> = arrays.iter().cloned().collect();
+        let clones: Vec<Array<'_>> = arrays.to_vec();
         let after_clone = constructed_array_count();
         assert!(
             after_clone >= after_construct + 200,

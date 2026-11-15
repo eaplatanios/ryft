@@ -40,7 +40,6 @@ ryft-rocm = { workspace = true, optional = true }
 ryft-xla-sys.workspace = true
 half.workspace = true
 hex.workspace = true
-ndarray = { workspace = true, optional = true }
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -58,7 +57,6 @@ default = []
 program-statistics = []
 differential-testing = []
 performance-benchmarking = []
-ndarray = ["dep:ndarray"]
 cuda-12 = ["ryft-pjrt/cuda-12"]
 cuda-13 = ["ryft-pjrt/cuda-13"]
 cutile = ["ryft-cuda/cutile"]

@@ -199,6 +199,7 @@ pub(crate) fn lower_deliberately_false_assertion_predicate<'b, 'c: 'b, 't: 'c>(
 ///   - `input_values`: Compact extent operands of the declared dynamic axes.
 ///   - `input_types`: Dimension types of `input_values`.
 ///   - `output_types`: Refined output types, which must have the ranks of `declared_types`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_output_extent_validation<'b, 'c: 'b, 't: 'c>(
     name: &str,
     declared_types: &[ArrayType],
@@ -353,6 +354,7 @@ pub(crate) fn lower_guard<'b, 'c: 'b, 't: 'c>(
 ///   - `declared_types`: Declared types that express the relationships.
 ///   - `values`: Lowered values whose runtime extents must satisfy them.
 ///   - `actual_types`: Actual types of `values`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_type_relationship_checks<'b, 'c: 'b, 't: 'c>(
     actor: &str,
     site: &str,
@@ -729,6 +731,7 @@ impl<'c> RuntimeExtension<'c> for AssertionRuntime {}
 /// Emits an assertion with a literal message and named observations. Bounded element reports carry logical
 /// extents. Diagnostic buffers retain their element types so unsigned values and floating-point values reach the
 /// callback without lossy conversions.
+#[allow(clippy::too_many_arguments)]
 fn lower_assert_to_custom_call<'b, 'c: 'b, 't: 'c>(
     actor: &str,
     message: &str,
@@ -1312,16 +1315,15 @@ fn handle_assertion_elements(
     let observation_sources = observations
         .iter()
         .map(|buffer| {
-            if buffer.rank() != 0 {
-                if buffer.rank() != rank
+            if buffer.rank() != 0
+                && (buffer.rank() != rank
                     || extents.iter().zip(buffer.dimensions()).any(|(logical, physical)| {
                         usize::try_from(*physical).map_or(true, |physical| *logical > physical)
-                    })
-                {
-                    return Err(FfiError::invalid_argument(
-                        "assertion observation shape does not contain its logical elements",
-                    ));
-                }
+                    }))
+            {
+                return Err(FfiError::invalid_argument(
+                    "assertion observation shape does not contain its logical elements",
+                ));
             }
             let size = buffer_element_count(buffer)?
                 .checked_mul(observation_byte_count(buffer.element_type())?)
@@ -1677,7 +1679,7 @@ mod tests {
 
         // A symbolic extent operand of an axis that type inference refined to a static extent needs a runtime check,
         // also when other instruction inputs precede the extent operands.
-        assert!(validates_output_extents(&declared_types, &[symbolic.clone()], &refined).unwrap());
+        assert!(validates_output_extents(&declared_types, std::slice::from_ref(&symbolic), &refined).unwrap());
         assert!(validates_output_extents(&declared_types, &[refined[0].clone(), symbolic.clone()], &refined).unwrap());
 
         // An exact extent operand already proves the refined extent, and axes that remain dynamic need no check.
@@ -2318,7 +2320,7 @@ mod tests {
         )
         .unwrap();
         assert!(lowered.requires_assertion_handler());
-        assert_eq!(lowered.runtime_requirements().as_ref(), &[builtin_requirement(ASSERT_CUSTOM_CALL_TARGET)]);
+        assert_eq!(lowered.runtime_requirements(), &[builtin_requirement(ASSERT_CUSTOM_CALL_TARGET)]);
         assert!(lowered.signature().requires_assertion_handler());
         assert!(lowered.signature().has_effects());
         assert!(!lowered.signature().has_ordered_io());
@@ -2920,8 +2922,7 @@ mod tests {
             let compiled = domain.compile_program(&lowered).unwrap();
             for passed in [true, false] {
                 let mut inputs = vec![
-                    Array::from_host_buffer(&domain, predicate_type.clone(), mesh.clone(), &[u8::from(passed)])
-                        .unwrap(),
+                    Array::from_host_buffer(&domain, predicate_type.clone(), mesh.clone(), [u8::from(passed)]).unwrap(),
                 ];
                 for (_, data_type, bytes, _) in &observations {
                     inputs.push(
@@ -3041,8 +3042,7 @@ mod tests {
                 let inputs = [size, limit]
                     .into_iter()
                     .map(|value| {
-                        Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &value.to_ne_bytes())
-                            .unwrap()
+                        Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes()).unwrap()
                     })
                     .collect::<Vec<_>>();
                 assert!(domain.execute_program(&compiled, inputs).unwrap().is_empty());
@@ -3050,7 +3050,7 @@ mod tests {
             let inputs = [3i64, 1i64]
                 .into_iter()
                 .map(|value| {
-                    Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &value.to_ne_bytes()).unwrap()
+                    Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), value.to_ne_bytes()).unwrap()
                 })
                 .collect::<Vec<_>>();
             let error = domain.execute_program(&compiled, inputs).unwrap_err();
@@ -3121,11 +3121,10 @@ mod tests {
                 .unwrap();
             let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
             let compiled = domain.compile_program(&lowered).unwrap();
-            let empty =
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &0i64.to_ne_bytes()).unwrap();
+            let empty = Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 0i64.to_ne_bytes()).unwrap();
             assert!(domain.execute_program(&compiled, vec![empty]).unwrap().is_empty());
             let nonempty =
-                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), &3i64.to_ne_bytes()).unwrap();
+                Array::from_host_buffer(&domain, input_type.clone(), mesh.clone(), 3i64.to_ne_bytes()).unwrap();
             let error = domain.execute_program(&compiled, vec![nonempty]).unwrap_err();
             let expected = if bounded {
                 ryft_core::AssertionError::FailedElements {

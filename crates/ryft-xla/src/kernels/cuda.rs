@@ -970,7 +970,7 @@ mod tests {
                     DimensionVariable::new("index", DimensionBounds::new(0, Some(1))?).into(),
                 )),
                 vec![],
-                &[value.clone()],
+                std::slice::from_ref(&value),
             )?;
             references[0].write(&value)
         })

@@ -32,7 +32,7 @@ class TransformPerformanceTest(unittest.TestCase):
         command = rust_transform_benchmark_command(["scalar_jvp_direct"], iterations=10, warmup=1)
 
         features = command[command.index("--features") + 1]
-        self.assertEqual(features, "performance-benchmarking ndarray")
+        self.assertEqual(features, "performance-benchmarking")
 
     def test_comparison_table_marks_ratio_failures(self) -> None:
         ryft = RuntimeBenchmarkRecord(

@@ -173,13 +173,20 @@ impl LowerableOperation for IotaOperation<ArrayType> {
             lowerer.location(),
         )?)?;
         let result = result.result(0).unwrap().as_ref();
-        Ok(vec![annotate_output_memory(
+        let result = annotate_output_memory(
             result,
             &output_types[0],
             &mut lowerer.block(),
             lowerer.context(),
             lowerer.location(),
-        )?])
+        )?;
+        lower_constructor_sharding_constraint(
+            vec![result],
+            output_types.first(),
+            lowerer.collective_state().bound_manual_axes(),
+            &mut lowerer.block(),
+            lowerer.location(),
+        )
     }
 }
 
@@ -307,7 +314,15 @@ impl LowerableOperation for OneOperation<ArrayType> {
         if !input_values.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 0, actual: input_values.len() }.into());
         }
-        lower_constant_output(output_types, 1, &mut lowerer.block(), lowerer.context(), lowerer.location())
+        let result =
+            lower_constant_output(output_types, 1, &mut lowerer.block(), lowerer.context(), lowerer.location())?;
+        lower_constructor_sharding_constraint(
+            result,
+            output_types.first(),
+            lowerer.collective_state().bound_manual_axes(),
+            &mut lowerer.block(),
+            lowerer.location(),
+        )
     }
 }
 
@@ -394,7 +409,18 @@ impl MemberLowerableOperation<ArrayIrType> for OneOperation<ArrayType> {
         let input_values =
             dynamic_constructor_inputs(self.name(), self.r#type(), input_values, input_types, output_types, lowerer)?;
         let block = &mut lowerer.block();
-        lower_dynamic_constructor(self.name(), 1, &input_values, output_types, block, context, location)
+        let result = lower_dynamic_constructor(self.name(), 1, &input_values, output_types, block, context, location)?;
+        let output_type = match output_types {
+            [ArrayIrType::Array(output_type)] => Some(output_type),
+            _ => None,
+        };
+        lower_constructor_sharding_constraint(
+            result,
+            output_type,
+            lowerer.collective_state().bound_manual_axes(),
+            &mut lowerer.block(),
+            location,
+        )
     }
 }
 
@@ -415,7 +441,22 @@ impl MemberLowerableOperation<ArrayIrType> for IotaOperation<ArrayType> {
         let tensor_type = lower_tensor_type(&physical_type, context, location)?;
         let iota = block.append_operation(stable_hlo::iota(tensor_type, self.dimension(), location)?)?;
         let result = iota.result(0).unwrap().as_ref();
-        refine_dynamic_constructor_result(result, &input_values, &output_type, physical_type, block, context, location)
+        let result = refine_dynamic_constructor_result(
+            result,
+            &input_values,
+            &output_type,
+            physical_type,
+            block,
+            context,
+            location,
+        )?;
+        lower_constructor_sharding_constraint(
+            result,
+            Some(&output_type),
+            lowerer.collective_state().bound_manual_axes(),
+            &mut lowerer.block(),
+            location,
+        )
     }
 }
 
@@ -503,10 +544,11 @@ fn lower_exemplar_shape<'b, 'c: 'b, 't: 'c>(
     }
 }
 
-/// Constrains the result of a nullary zero constructor to the sharding that its type declares, if any, as
-/// [`lower_like_constant`] does for constructors with an exemplar. Staging lowers a `zero_like` whose type is static to
-/// such a constructor, so without the constraint an explicitly sharded zero would rely on sharding propagation rather
-/// than keep the placement that its type declares, just as JAX's `full` keeps an explicit sharding.
+/// Constrains the result of a nullary constructor (a zero, a one, or an iota) to the sharding that its type declares,
+/// if any, as the constructors with an exemplar do (refer to [`lower_like_constant`] and [`lower_exemplar_shape`]).
+/// Staging lowers a `zero_like` or an `iota_like` whose type is static to such a constructor, so without the
+/// constraint an explicitly sharded constant would rely on sharding propagation rather than keep the placement that its
+/// type declares, just as JAX's `full` keeps an explicit sharding.
 fn lower_constructor_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     result: Vec<ValueRef<'b, 'c, 't>>,
     output_type: Option<&ArrayType>,
@@ -1437,7 +1479,7 @@ mod tests {
                             .buffer(
                                 values_to_bytes(&[3f32, 1.0, 5.0, 2.0, 7.0, 3.0, 9.0, 4.0]).as_slice(),
                                 BufferType::C64,
-                                &[4],
+                                [4],
                                 None,
                                 device.clone(),
                                 None,
@@ -1452,7 +1494,7 @@ mod tests {
                             .buffer(
                                 values_to_bytes(&[extent]).as_slice(),
                                 BufferType::I32,
-                                &[],
+                                [],
                                 None,
                                 device.clone(),
                                 None,

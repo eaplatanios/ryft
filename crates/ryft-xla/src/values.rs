@@ -1598,7 +1598,7 @@ mod tests {
         let domain = Session::new(&client).domain();
         let mesh = mesh_on(&client, 0);
         let input = Value::Array(array(&domain, &mesh, DataType::F32, &[3.0f32, 1.0, 2.0], &[3]));
-        let sorted = Value::sort(&[input.clone()], 0, SortDirection::Ascending).unwrap();
+        let sorted = Value::sort(std::slice::from_ref(&input), 0, SortDirection::Ascending).unwrap();
         assert_eq!(read::<f32>(&sorted[0]), vec![1.0, 2.0, 3.0]);
         let indices = Value::Array(array(&domain, &mesh, DataType::I32, &[2i32, 0], &[2]));
         assert_eq!(read::<f32>(&input.gather_axis(&indices, 0, GatherMode::Clip).unwrap()), vec![2.0, 3.0]);
@@ -1732,7 +1732,7 @@ mod tests {
                 let mut outputs = state.domain().bind(
                     Operation::While(WhileOperation::new()),
                     vec![condition.clone(), body.clone()],
-                    &[state.clone()],
+                    std::slice::from_ref(&state),
                 )?;
                 Ok(outputs.remove(0))
             })

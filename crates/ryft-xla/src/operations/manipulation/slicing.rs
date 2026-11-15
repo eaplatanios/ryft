@@ -457,6 +457,7 @@ impl DynamicSliceAxisPlan {
 /// Normalizes scalar slice starts against logical input dimensions before native allocation-based clamping. Signed
 /// starts count from the end of their axis once when `allow_negative_indices` is set, unsigned indices are widened
 /// before clamping, and only then are bounded starts converted to the common signed i64 carrier.
+#[allow(clippy::too_many_arguments)]
 fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     input_type: &ArrayType,
@@ -498,7 +499,8 @@ fn lower_slice_start_indices<'b, 'c: 'b, 't: 'c>(
             .enumerate()
             .map(|(axis, (start, start_type))| {
                 let scalar_type = ArrayType::scalar(start_type.data_type());
-                let zero = lower_unplaced_constant_output(&[scalar_type.clone()], 0, block, context, location)?[0];
+                let zero =
+                    lower_unplaced_constant_output(std::slice::from_ref(&scalar_type), 0, block, context, location)?[0];
                 let extent = lower_unplaced_constant_output(
                     &[scalar_type],
                     static_shape[axis] as i64,
@@ -601,6 +603,7 @@ fn max_value(data_type: DataType) -> i64 {
 }
 
 /// Lowers one runtime bounds check for an axis of a first-class dynamic shape [`DynamicSliceOperation`].
+#[allow(clippy::too_many_arguments)]
 fn lower_dynamic_slice_assertion<'b, 'c: 'b, 't: 'c>(
     axis: usize,
     stride: usize,

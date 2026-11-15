@@ -131,7 +131,8 @@ fn lower_gather_to_mlir<'b, 'c: 'b, 't: 'c>(
 
     // Widen before comparing, because a legal input extent can exceed the range of an i8 or u8 index. In particular,
     // converting u64 indices to i64 would incorrectly turn its largest values into negative indices or wrap a clipping
-    // operation.
+    // operation. The bounds themselves are never negative, because type inference requires every slice size to fit the
+    // input extent, or the guaranteed minimum extent of a dynamic input axis.
     let mut upper_bounds = Vec::with_capacity(dimensions.start_index_map().len());
     for &axis in dimensions.start_index_map() {
         let extent = match input_types[0].shape().dimensions()[axis] {

@@ -205,10 +205,10 @@ mod tests {
         let output_sharding = sharding(&logical_mesh, &[Some("x")]);
         // Each device holds the rows of its position along `x`.
         let expected = vec![
-            vec![1.6829419136047363f32, 2.100834846496582],
-            vec![1.6829419136047363, 2.100834846496582],
-            vec![-3.4314537048339844, 0.7551422119140625],
-            vec![-3.4314537048339844, 0.7551422119140625],
+            vec![1.682_941_9_f32, 2.100_834_8],
+            vec![1.682_941_9, 2.100_834_8],
+            vec![-3.431_453_7, 0.755_142_2],
+            vec![-3.431_453_7, 0.755_142_2],
         ];
         let input = Array::from_host_buffer(
             &domain,
@@ -281,7 +281,7 @@ mod tests {
         // The output has the values of the JAX oracle `explicit_axes(x)`, whether the switch is compiled as one program
         // or executed eagerly. Its type is replicated, because types record no placement over auto mesh axes, while
         // the compiler chooses its runtime placement over them.
-        let expected = vec![1.5403022766113281f32, -1.4061393737792969, -0.36998140811920166, 1.7140724658966064];
+        let expected = vec![1.540_302_3_f32, -1.406_139_4, -0.369_981_4, 1.714_072_5];
         let read = |array: &Array<'_>| values_from_bytes::<f32>(&array.copy_to_host().unwrap());
         let compiled: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             {
@@ -347,7 +347,7 @@ mod tests {
         // Each device holds the sines of its `2x1` block of the doubled matrix, whose rows its position along `x` and
         // whose column its position along `y` selects.
         let expected =
-            [[0.0f32, -0.7568025], [0.9092974, -0.2794155], [0.98935825, -0.53657292], [-0.54402111, 0.99060736]];
+            [[0.0f32, -0.7568025], [0.9092974, -0.2794155], [0.98935825, -0.53657292], [-0.544_021_1, 0.990_607_4]];
         let actual = read_device_f32s(&output);
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(expected) {

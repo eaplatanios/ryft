@@ -1360,13 +1360,13 @@ where
     {
         {
             let slot = self.derived.gradient.lock().expect("derived-gradient retention slot mutex poisoned");
-            if let Some((witness, artifact)) = slot.as_ref() {
-                if witness.matches(domain) {
-                    return Ok(CompiledFunction {
-                        function: artifact.clone(),
-                        derived: Arc::new(DerivedFunctionSlots::new()),
-                    });
-                }
+            if let Some((witness, artifact)) = slot.as_ref()
+                && witness.matches(domain)
+            {
+                return Ok(CompiledFunction {
+                    function: artifact.clone(),
+                    derived: Arc::new(DerivedFunctionSlots::new()),
+                });
             }
         }
         let staged = self.function.staged();
@@ -1475,13 +1475,13 @@ where
     {
         {
             let slot = self.derived.jvp.lock().expect("derived-jvp retention slot mutex poisoned");
-            if let Some((witness, artifact)) = slot.as_ref() {
-                if witness.matches(domain) {
-                    return Ok(CompiledFunction {
-                        function: artifact.clone(),
-                        derived: Arc::new(DerivedFunctionSlots::new()),
-                    });
-                }
+            if let Some((witness, artifact)) = slot.as_ref()
+                && witness.matches(domain)
+            {
+                return Ok(CompiledFunction {
+                    function: artifact.clone(),
+                    derived: Arc::new(DerivedFunctionSlots::new()),
+                });
             }
         }
         let staged = self.function.staged();
@@ -1879,7 +1879,7 @@ where
 pub fn infer_output_types<F, In: Parameterized<ArrayType>, Out: Parameterized<ArrayType>>(
     function: F,
     input_types: In,
-) -> Result<Out, ProgramError>
+) -> Result<Out, Error>
 where
     F: FnOnce(In::To<CompileTracer<'static>>) -> Out::To<CompileTracer<'static>>,
     In::Family: ParameterizedFamily<ArrayType>
@@ -1922,7 +1922,7 @@ where
         .into_parameters()
         .map(|r#type| <&ArrayType>::try_from(&r#type).cloned().map_err(ProgramError::from))
         .collect::<Result<Vec<_>, _>>()?;
-    Out::from_parameters(output_structure, output_parameters).map_err(ProgramError::from)
+    Out::from_parameters(output_structure, output_parameters).map_err(Error::from)
 }
 
 /// Internal reparameterization of one public array parameter tree into the production array IR type family.
@@ -2295,38 +2295,29 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, OnceLock};
-    use std::time::{Duration, Instant};
+    use std::sync::Arc;
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        Add, AddOperation, ArgMax, Array as CoreArray, ArrayIrType, ArrayOperation, ArrayReference,
-        ArrayReferenceTransform, ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, Atan2, AttachedRegions,
-        AxisIndex, BatchAxis, BatchAxisSpecification, Broadcast, CaptureReference, Compare, ComparisonDirection,
-        Condition, Context, ConvertElementType, Cos, CotangentAccumulator, CotangentDestinationKind, CustomCall,
-        CustomCallOperation, DataType, DifferentiableType, Differentiate, DifferentiationError,
-        Dimension as CoreDimension, DimensionBounds, DimensionSize, DimensionSizeOperation, DimensionVariable, Div,
-        DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DotsSavable, DynamicSlice, DynamicUpdateSlice,
-        EagerContext, ErasedOperation, Error as CoreError, Exp, Fill, ForwardModeDifferentiate, Hessian,
-        ImportingContext, Iota, Jacobian, Logistic, MaybeZero, Memory, MeshAxisType, Mul, OneLike, Parameter,
-        Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError, ProjectedContext, ProjectedValue, Random,
-        Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
+        Add, AddOperation, Array as CoreArray, ArrayIrType, ArrayReference, ArrayReferenceTransform,
+        ArrayReferenceTransformIndex, ArraySliceAxis, ArrayType, Atan2, AttachedRegions, AxisIndex, BatchAxis,
+        BatchAxisSpecification, Broadcast, CaptureReference, Compare, ComparisonDirection, Condition, Context,
+        ConvertElementType, Cos, CotangentAccumulator, CotangentDestinationKind, DataType, DifferentiableType,
+        Differentiate, DifferentiationError, Dimension as CoreDimension, DimensionBounds, DimensionSize,
+        DimensionSizeOperation, DimensionVariable, DomainTracer, Dot, DotDimensionNumbers, DotsSavable,
+        ErasedOperation, Error as CoreError, ForwardModeDifferentiate, Hessian, ImportingContext, Jacobian, MaybeZero,
+        Memory, MeshAxisType, Mul, Parameter, Placeholder, ProgramBuilder as CoreProgramBuilder, ProgramError,
+        ProjectedContext, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
         ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceType, Reshape, ReshapeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy,
-        ResidualPolicyError, ResidualRejection, ResidualStorage, SaveAndOffloadOnlyTheseNames, ScanOperation,
-        ScanOptions, Select, Shape, Sharding, ShardingDimension, Sin, Slice, Softmax,
-        StagedFunction as CoreStagedFunction, StopGradient, Sub, Tag, TagOperation, Tanh, TopK, Trace, Tracer,
-        TracingContext, TranspositionContext, Typed, TypedProgram, Value as CoreValue, ValueProjection, WhileOperation,
-        ZeroLike, batch, batch_in_parent, composite, differentiate_at, differentiate_in_parent_at, rematerialize, scan,
+        ReferenceType, ReshapeOperation, ResidualCandidate, ResidualDecision, ResidualPolicy, ResidualPolicyError,
+        ResidualRejection, ResidualStorage, SaveAndOffloadOnlyTheseNames, ScanOperation, ScanOptions, Shape, Sharding,
+        ShardingDimension, Sin, Slice, Softmax, StagedFunction as CoreStagedFunction, StopGradient, Tag, TagOperation,
+        Trace, Tracer, TracingContext, TranspositionContext, Typed, TypedProgram, Value as CoreValue, ValueProjection,
+        batch, batch_in_parent, composite, differentiate_at, differentiate_in_parent_at, rematerialize, scan,
         softmax_cross_entropy_with_target_logits,
     };
     use ryft_macros::Parameterized;
-    use ryft_pjrt::Client;
-    use ryft_pjrt::extensions::ffi::{
-        FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput, FfiOutput,
-        FfiTypeId, XLA_FFI_Handler,
-    };
 
     use crate::compilation::CompilationError;
     use crate::compilation::options::Options;
@@ -2360,593 +2351,6 @@ mod tests {
         )
         .unwrap();
         program.into_flat_program()
-    }
-
-    /// Number of repeated derived function constructions and warm dispatches performed by the transform caching
-    /// baselines below.
-    const BASELINE_REPETITIONS: usize = 5;
-
-    /// Prints one baseline timing table with the cold (i.e., first) call, every warm call, and the warm mean.
-    fn print_baseline_durations(label: &str, durations: &[Duration]) {
-        println!("phase 0 baseline: {label} ({} calls)", durations.len());
-        for (index, duration) in durations.iter().enumerate() {
-            let tier = if index == 0 { "cold" } else { "warm" };
-            println!("  call {index} ({tier}): {:.3} ms", duration.as_secs_f64() * 1e3);
-        }
-        let warm = &durations[1..];
-        let warm_mean = warm.iter().map(Duration::as_secs_f64).sum::<f64>() / warm.len().max(1) as f64 * 1e3;
-        println!("  warm mean: {warm_mean:.3} ms");
-    }
-
-    /// Prints the compilation cache counters of `domain` observed across a baseline workload.
-    fn print_baseline_compilation_statistics(domain: &Domain<'_>) {
-        let statistics = domain.compilation_context().statistics();
-        println!(
-            "  compilation cache: memory_hits={} persistent_hits={} misses={} compilations={} waits={}",
-            statistics.memory_hits,
-            statistics.persistent_hits,
-            statistics.misses,
-            statistics.compilations,
-            statistics.waits,
-        );
-        println!(
-            "  compilation cache: retained_entries={} lookup_ms={:.3} compilation_ms={:.3}",
-            domain.program_count(),
-            statistics.memory_lookup_duration.as_secs_f64() * 1e3,
-            statistics.compilation_duration.as_secs_f64() * 1e3,
-        );
-    }
-
-    /// Number of distinct outer specializations that stage a `jit_call` of one shared callee in the callee
-    /// transformation measurement below.
-    const CALLEE_OUTER_SPECIALIZATIONS: usize = 4;
-
-    /// Callee chain lengths compared by the callee transformation measurement below.
-    const CALLEE_OPERATION_COUNTS: [usize; 2] = [2, 200];
-
-    /// Prints one group of rows of the callee transformation measurement. Each row holds the total construction time
-    /// of one outer function, the backend compilation time charged to the shared
-    /// [`CompilationContext`](ryft_core::compilation::CompilationContext) during it, and the frontend remainder that
-    /// contains the callee transformation.
-    fn print_callee_transformation_rows(transform: &str, totals: &[Duration], backends: &[Duration]) {
-        for (index, (total, backend)) in totals.iter().zip(backends.iter()).enumerate() {
-            println!(
-                "    {transform:<9} | {index:>5} | {:>8.3} | {:>10.3} | {:>11.3}",
-                total.as_secs_f64() * 1e3,
-                backend.as_secs_f64() * 1e3,
-                (*total - *backend).as_secs_f64() * 1e3,
-            );
-        }
-    }
-
-    /// Returns the mean of `totals - backends` in milliseconds, which is the frontend cost of each derived function
-    /// construction, excluding backend compilation served by the shared compilation context.
-    fn mean_frontend_milliseconds(totals: &[Duration], backends: &[Duration]) -> f64 {
-        let sum: f64 =
-            totals.iter().zip(backends.iter()).map(|(total, backend)| (*total - *backend).as_secs_f64()).sum();
-        sum / totals.len() as f64 * 1e3
-    }
-
-    /// Shape and sampling hyperparameters of the tiny decode loop demo model.
-    #[derive(Copy, Clone)]
-    struct DecodeConfiguration {
-        /// Vocabulary size (i.e., the number of token embeddings and output logits).
-        vocabulary: usize,
-
-        /// Model dimension shared by the embeddings, the attention cache rows, and the gated MLP.
-        dimension: usize,
-
-        /// Number of decode steps performed by the loop, which is also the capacity of the key and value caches.
-        steps: usize,
-
-        /// Number of logits with the highest probabilities that [`DecodeSampling::TopK`] sampling retains.
-        top_k: usize,
-    }
-
-    /// Token selection strategy of one decode step.
-    #[derive(Copy, Clone, PartialEq)]
-    enum DecodeSampling {
-        /// Deterministically selects the logit with the highest score.
-        Greedy,
-
-        /// Restricts the logits to their top-k entries and draws one categorically using the threaded ThreeFry
-        /// generator state.
-        TopK,
-    }
-
-    /// Attention implementation used by one decode step.
-    #[derive(Copy, Clone, PartialEq)]
-    enum DecodeAttention {
-        /// Masked scaled dot-product attention composed from `ryft` operations.
-        Composed,
-
-        /// A registered [`DECODE_ATTENTION_CUSTOM_CALL_TARGET`] XLA FFI kernel computing the same attention.
-        CustomCall,
-    }
-
-    /// Returns a static [`Shape`] with the provided dimensions.
-    fn static_shape(dimensions: &[usize]) -> Shape {
-        Shape::new(dimensions.iter().map(|&dimension| CoreDimension::Static(dimension)).collect())
-    }
-
-    /// Returns `count` deterministic pseudo-random weight values in `[-0.5, 0.5)` derived from `seed` with an
-    /// xorshift generator, so the demo model is reproducible without carrying literal weight tables in the test.
-    fn decode_weight_values(seed: u32, count: usize) -> Vec<f32> {
-        let mut state = seed | 1;
-        (0..count)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                ((state >> 8) as f32 / (1u32 << 24) as f32) - 0.5
-            })
-            .collect()
-    }
-
-    /// One decode step of the tiny language model with gated attention that the compiled decode loop demo and its
-    /// eager reference loop share. The step is written once against the value capability traits of `ryft`, so the
-    /// same function executes eagerly over reference [`CoreArray`](ryft_core::Array)s and stages symbolically over
-    /// [`CompileTracer`]s inside the compiled `While` body.
-    ///
-    /// The decode state is a vector of thirteen values. It holds the current position and token as `i32` scalars, the
-    /// `[steps, dimension]` key and value caches, the `[steps]` record of decoded tokens, the `ui64[2]` ThreeFry
-    /// generator state, and the seven weight matrices that stay invariant across the loop (i.e., the embeddings, the
-    /// query, key, and value projections, the hidden and gate MLP projections, and the output projection). One step
-    /// embeds the current token, appends its projected key and value rows to the caches at `position`, attends over
-    /// the visible cache prefix, applies the MLP gated by `tanh` and `logistic` and the output projection, selects the
-    /// next token according to `sampling`, records it, and advances the position.
-    fn decode_step<C, V>(
-        context: &C,
-        state: &[V],
-        configuration: &DecodeConfiguration,
-        sampling: DecodeSampling,
-        attention: DecodeAttention,
-    ) -> Result<Vec<V>, ProgramError>
-    where
-        V: Clone
-            + CoreValue<Type = ArrayType>
-            + Add
-            + Sub
-            + Mul
-            + Div
-            + Exp
-            + Tanh
-            + Logistic
-            + Dot
-            + Reduce
-            + Compare<V>
-            + Select
-            + TopK
-            + ArgMax
-            + DynamicSlice
-            + DynamicUpdateSlice
-            + Reshape
-            + Broadcast
-            + Random
-            + CustomCall
-            + OneLike
-            + ZeroLike,
-        C: Fill<f32, V> + Fill<i32, V> + Iota<V>,
-    {
-        let dimension = configuration.dimension;
-        let position = state[0].clone();
-        let token = state[1].clone();
-        let tokens = state[4].clone();
-        let generator = state[5].clone();
-        let embeddings = &state[6];
-        let query_weights = &state[7];
-        let key_weights = &state[8];
-        let value_weights = &state[9];
-        let hidden_weights = &state[10];
-        let gate_weights = &state[11];
-        let output_weights = &state[12];
-
-        // Embed the current token and append its projected key and value rows to the caches at `position`.
-        let zero_index = position.zero_like()?;
-        let embedding = embeddings
-            .dynamic_slice(&[token, zero_index.clone()], &[1, dimension])?
-            .reshape(static_shape(&[dimension]))?;
-        let vector_times_matrix = DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new());
-        let query = embedding.dot(query_weights, &vector_times_matrix).unwrap();
-        let key = embedding.dot(key_weights, &vector_times_matrix).unwrap();
-        let value = embedding.dot(value_weights, &vector_times_matrix).unwrap();
-        let cache_keys = state[2].dynamic_update_slice(
-            &key.reshape(static_shape(&[1, dimension]))?,
-            &[position.clone(), zero_index.clone()],
-        )?;
-        let cache_values = state[3]
-            .dynamic_update_slice(&value.reshape(static_shape(&[1, dimension]))?, &[position.clone(), zero_index])?;
-
-        // Masked scaled dot-product attention over the visible cache prefix `[0, position]`.
-        let attended = match attention {
-            DecodeAttention::Composed => {
-                let scores = cache_keys
-                    .dot(&query, &DotDimensionNumbers::new(vec![1], vec![0], Vec::new(), Vec::new()))
-                    .unwrap();
-                let scores_type = scores.r#type().into_owned();
-                let scale = context.fill(&scores_type, 1.0 / (dimension as f32).sqrt())?;
-                let scores = scores.mul(&scale)?;
-                let positions_type = tokens.r#type().into_owned();
-                let positions = context.iota(&positions_type, 0)?;
-                let visible = positions
-                    .compare(&position.broadcast(positions_type, &[])?, ComparisonDirection::LessThanOrEqual)?;
-                let masked = visible.select(&scores, &context.fill(&scores_type, -1.0e30f32)?)?;
-                let stabilized = masked
-                    .sub(&masked.reduce(&[0], ReductionKind::Max).unwrap().broadcast(scores_type.clone(), &[])?)?;
-                let exponentials = stabilized.exp()?;
-                let weights = exponentials
-                    .div(&exponentials.reduce(&[0], ReductionKind::Sum).unwrap().broadcast(scores_type, &[])?)?;
-                weights
-                    .dot(&cache_values, &DotDimensionNumbers::new(vec![0], vec![0], Vec::new(), Vec::new()))
-                    .unwrap()
-            }
-            DecodeAttention::CustomCall => {
-                let operation =
-                    CustomCallOperation::new(DECODE_ATTENTION_CUSTOM_CALL_TARGET, vec![query.r#type().into_owned()]);
-                let inputs = [cache_keys.clone(), cache_values.clone(), query, position.clone()];
-                V::custom_call(&operation, &inputs)?.remove(0)
-            }
-        };
-
-        // Gated multilayer perceptron, output projection, and selection of the next token.
-        let hidden = attended.dot(hidden_weights, &vector_times_matrix).unwrap().tanh()?;
-        let gate = attended.dot(gate_weights, &vector_times_matrix).unwrap().logistic()?;
-        let logits = hidden.mul(&gate)?.dot(output_weights, &vector_times_matrix).unwrap();
-        let (generator, next_token) = match sampling {
-            DecodeSampling::Greedy => (generator, logits.argmax(0)?),
-            DecodeSampling::TopK => {
-                let (top_logits, top_indices) = logits.top_k(configuration.top_k, 0)?;
-                let (generator, choice) = generator.random_categorical(&top_logits, 0)?;
-                let next_token = top_indices.dynamic_slice(&[choice], &[1])?.reshape(static_shape(&[]))?;
-                (generator, next_token)
-            }
-        };
-        let tokens = tokens.dynamic_update_slice(&next_token.reshape(static_shape(&[1]))?, &[position.clone()])?;
-        let position = position.add(&position.one_like()?)?;
-        Ok(vec![
-            position,
-            next_token,
-            cache_keys,
-            cache_values,
-            tokens,
-            generator,
-            embeddings.clone(),
-            query_weights.clone(),
-            key_weights.clone(),
-            value_weights.clone(),
-            hidden_weights.clone(),
-            gate_weights.clone(),
-            output_weights.clone(),
-        ])
-    }
-
-    /// Stages the decode loop demo as a `While` operation over the decode state of thirteen values. Both regions are
-    /// traced with [`decode_step`] and a `position < steps` condition through the public tracing API, and the staged
-    /// loop returns the decoded tokens together with the final key and value caches.
-    fn build_decode_loop<'c>(
-        inputs: Vec<CompileTracer<'c>>,
-        configuration: &DecodeConfiguration,
-        sampling: DecodeSampling,
-        attention: DecodeAttention,
-    ) -> Vec<CompileTracer<'c>> {
-        let context = inputs[0].value().context().clone();
-        let carry_types = inputs.iter().map(|input| input.value().r#type().into_owned()).collect::<Vec<ArrayIrType>>();
-        let steps = configuration.steps;
-
-        // The `While` condition and body region programs are staged in the XLA domain universe. Their tracers are
-        // `StatefulCompileTracer`s, whose `ArrayType` projections are `CompileTracer`s, so the shared `decode_step`
-        // model runs unchanged inside the staged regions and in the eager reference loop.
-        let (_, condition) = DomainTracingContext::<Domain<'c>, Value<'c>>::trace(
-            |state: Vec<StatefulCompileTracer<'c>>| {
-                let state = state
-                    .into_iter()
-                    .map(|value| ValueProjection::<ArrayType>::into_projected(value).unwrap())
-                    .collect::<Vec<_>>();
-                let position = &state[0];
-                let limit = position.domain().fill(&position.r#type().into_owned(), steps as i32)?;
-                Ok(vec![position.compare(&limit, ComparisonDirection::LessThan)?.into_value()])
-            },
-            carry_types.clone(),
-        )
-        .unwrap();
-        let (_, body) = DomainTracingContext::<Domain<'c>, Value<'c>>::trace(
-            |state: Vec<StatefulCompileTracer<'c>>| {
-                let state = state
-                    .into_iter()
-                    .map(|value| ValueProjection::<ArrayType>::into_projected(value).unwrap())
-                    .collect::<Vec<_>>();
-                let context = state[0].domain();
-                Ok(decode_step(&context, &state, configuration, sampling, attention)?
-                    .into_iter()
-                    .map(ProjectedValue::into_value)
-                    .collect::<Vec<_>>())
-            },
-            carry_types,
-        )
-        .unwrap();
-        let inputs = inputs.into_iter().map(ProjectedValue::into_value).collect::<Vec<_>>();
-        let outputs = context
-            .bind(Operation::While(WhileOperation::new()), vec![condition, body], inputs.as_slice())
-            .unwrap();
-        let outputs = outputs
-            .into_iter()
-            .map(|value| ValueProjection::<ArrayType>::into_projected(value).unwrap())
-            .collect::<Vec<_>>();
-        vec![outputs[4].clone(), outputs[2].clone(), outputs[3].clone()]
-    }
-
-    /// Runs the eager reference of the decode loop demo, which executes the same [`decode_step`] over reference
-    /// [`CoreArray`](ryft_core::Array) values in a plain Rust loop, without `While` staging, compilation, or XLA.
-    fn reference_decode_loop(
-        initial_state: Vec<CoreArray>,
-        configuration: &DecodeConfiguration,
-        sampling: DecodeSampling,
-    ) -> Vec<CoreArray> {
-        let context = EagerContext::<CoreArray, ArrayOperation<CoreArray>>::new();
-        let mut state = initial_state;
-        for _ in 0..configuration.steps {
-            state = decode_step(&context, &state, configuration, sampling, DecodeAttention::Composed).unwrap();
-        }
-        state
-    }
-
-    /// Name of the XLA custom call target registered by [`ensure_decode_attention_handler_registered`]. The target is
-    /// a masked scaled dot-product attention kernel over `(keys [steps, dimension], values [steps, dimension],
-    /// query [dimension], position i32[])` that produces the attended `[dimension]` vector, and it exercises a foreign
-    /// FFI kernel inside a compiled decode loop.
-    const DECODE_ATTENTION_CUSTOM_CALL_TARGET: &str = "ryft.test.decode_attention";
-
-    /// Registers the [`DECODE_ATTENTION_CUSTOM_CALL_TARGET`] XLA FFI handler with the plugin backing the provided
-    /// client. Registration is idempotent and global to the process, because the XLA runtime rejects registering the
-    /// same target name again, so the outcome is cached in a [`OnceLock`](std::sync::OnceLock).
-    fn ensure_decode_attention_handler_registered(client: &Client<'_>) -> Result<(), ryft_pjrt::Error> {
-        static DECODE_ATTENTION_HANDLER_REGISTRATION: OnceLock<Result<(), ryft_pjrt::Error>> = OnceLock::new();
-        DECODE_ATTENTION_HANDLER_REGISTRATION
-            .get_or_init(|| {
-                let platform_name = client.platform_name()?.into_owned();
-                client.register_ffi_handler(
-                    DECODE_ATTENTION_CUSTOM_CALL_TARGET,
-                    platform_name,
-                    FfiHandler::from(decode_attention_handler as XLA_FFI_Handler),
-                    FfiHandlerTraits::NONE,
-                )
-            })
-            .clone()
-    }
-
-    /// XLA FFI handler for [`DECODE_ATTENTION_CUSTOM_CALL_TARGET`] custom calls. It computes masked scaled
-    /// dot-product attention over the cache prefix `[0, position]`, matching the composed attention staged by
-    /// [`decode_step`].
-    unsafe extern "C" fn decode_attention_handler(
-        call_frame: *mut ryft_pjrt::extensions::ffi::XLA_FFI_CallFrame,
-    ) -> *mut ryft_pjrt::extensions::ffi::XLA_FFI_Error {
-        // SAFETY: The XLA runtime passes a call frame that is valid for the duration of this invocation, and all
-        // further unsafe access to it is localized in the safe `FfiCallFrame` wrapper and
-        // `handle_decode_attention_call_frame`.
-        unsafe {
-            match FfiCallFrame::from_c_api(call_frame) {
-                Err(_) => std::ptr::null_mut(),
-                Ok(call_frame) if call_frame.register_metadata(FfiTypeId::default()) => std::ptr::null_mut(),
-                Ok(call_frame) if call_frame.stage() != FfiExecutionStage::Execution => std::ptr::null_mut(),
-                Ok(call_frame) => match call_frame.api() {
-                    Err(_) => std::ptr::null_mut(),
-                    Ok(api) => match handle_decode_attention_call_frame(&call_frame) {
-                        Ok(()) => std::ptr::null_mut(),
-                        Err(error) => error.to_c_api(api),
-                    },
-                },
-            }
-        }
-    }
-
-    /// Decodes a [`DECODE_ATTENTION_CUSTOM_CALL_TARGET`] call frame and fills its `[dimension]` output buffer with
-    /// the masked scaled dot-product attention of the query over the `[0, position]` cache prefix, using the same
-    /// `-1e30` mask value and the same softmax stabilized by the maximum as the composed attention in [`decode_step`].
-    fn handle_decode_attention_call_frame(
-        call_frame: &ryft_pjrt::extensions::ffi::FfiCallFrame<'_>,
-    ) -> Result<(), ryft_pjrt::extensions::ffi::FfiError> {
-        let mut inputs = call_frame.inputs();
-        let mut next_buffer = |name: &str| match inputs.next() {
-            Some(Ok(FfiInput::Buffer { buffer })) => Ok(buffer),
-            _ => Err(FfiError::invalid_argument(format!(
-                "expected the `{name}` input buffer of the `{DECODE_ATTENTION_CUSTOM_CALL_TARGET}` custom call"
-            ))),
-        };
-        let keys = next_buffer("keys")?;
-        let values = next_buffer("values")?;
-        let query = next_buffer("query")?;
-        let position = next_buffer("position")?;
-        let mut outputs = call_frame.outputs();
-        let Some(Ok(FfiOutput::Buffer { buffer: output })) = outputs.next() else {
-            return Err(FfiError::invalid_argument(format!(
-                "expected the `{DECODE_ATTENTION_CUSTOM_CALL_TARGET}` custom call to have one output buffer"
-            )));
-        };
-        let &[steps, dimension] = keys.dimensions() else {
-            return Err(FfiError::invalid_argument(format!(
-                "expected the `keys` input of the `{DECODE_ATTENTION_CUSTOM_CALL_TARGET}` custom call to have rank 2"
-            )));
-        };
-        if keys.element_type() != FfiBufferType::F32
-            || values.element_type() != FfiBufferType::F32
-            || query.element_type() != FfiBufferType::F32
-            || position.element_type() != FfiBufferType::I32
-            || values.dimensions() != [steps, dimension]
-            || query.dimensions() != [dimension]
-            || !position.dimensions().is_empty()
-            || output.dimensions() != [dimension]
-        {
-            return Err(FfiError::invalid_argument(format!(
-                "unexpected `{DECODE_ATTENTION_CUSTOM_CALL_TARGET}` custom call buffer types or shapes"
-            )));
-        }
-        let steps = steps.max(0) as usize;
-        let dimension = dimension.max(0) as usize;
-        // SAFETY: All data pointers are provided by the XLA runtime, are valid for the duration of the handler
-        // invocation, and, according to the element type and shape checks above, are backed by allocations of the
-        // checked sizes. The runtime allocates inputs and outputs separately so they do not overlap.
-        unsafe {
-            let keys = std::slice::from_raw_parts(keys.data() as *const f32, steps * dimension);
-            let values = std::slice::from_raw_parts(values.data() as *const f32, steps * dimension);
-            let query = std::slice::from_raw_parts(query.data() as *const f32, dimension);
-            let position = *(position.data() as *const i32);
-            let output = std::slice::from_raw_parts_mut(output.data() as *mut f32, dimension);
-
-            let scale = 1.0f32 / (dimension as f32).sqrt();
-            let mut scores = vec![0.0f32; steps];
-            for step in 0..steps {
-                let row = &keys[step * dimension..(step + 1) * dimension];
-                let score = row.iter().zip(query).map(|(key, query)| key * query).sum::<f32>() * scale;
-                scores[step] = if step as i32 <= position { score } else { -1.0e30 };
-            }
-            let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let exponentials: Vec<f32> = scores.iter().map(|score| (score - maximum).exp()).collect();
-            let denominator: f32 = exponentials.iter().sum();
-            output.fill(0.0);
-            for step in 0..steps {
-                let weight = exponentials[step] / denominator;
-                let row = &values[step * dimension..(step + 1) * dimension];
-                for (accumulator, value) in output.iter_mut().zip(row) {
-                    *accumulator += weight * value;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads a replicated `i32` array back from the single test device.
-    fn read_i32_array(client: &Client<'_>, array: &Array<'_>) -> Vec<i32> {
-        let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
-        let shard_bytes = array
-            .device_shard(device_id)
-            .unwrap()
-            .buffer()
-            .unwrap()
-            .copy_to_host(None)
-            .unwrap()
-            .r#await()
-            .unwrap();
-        values_from_bytes::<i32>(shard_bytes.as_slice())
-    }
-
-    /// Shared driver of the decode loop demo tests. It traces the decode loop through the public API, compiles and
-    /// executes it on the CPU plugin, runs the same model eagerly over the reference backend, and compares the decoded
-    /// token sequence exactly, because the ThreeFry draws are bit-exact across backends, and the final key and value
-    /// caches within floating-point tolerance.
-    fn run_decode_loop_demo(sampling: DecodeSampling, attention: DecodeAttention) {
-        let client = cpu_client(1);
-        let mesh = domain_mesh(&client, "x", 1);
-        let engine = Session::new(&client).domain();
-        if attention == DecodeAttention::CustomCall {
-            ensure_decode_attention_handler_registered(&client).unwrap();
-        }
-
-        let configuration = DecodeConfiguration { vocabulary: 16, dimension: 8, steps: 6, top_k: 4 };
-        let DecodeConfiguration { vocabulary, dimension, steps, .. } = configuration;
-        let weight_dimensions: [&[usize]; 7] = [
-            &[vocabulary, dimension],
-            &[dimension, dimension],
-            &[dimension, dimension],
-            &[dimension, dimension],
-            &[dimension, dimension],
-            &[dimension, dimension],
-            &[dimension, vocabulary],
-        ];
-        let weights: Vec<Vec<f32>> = weight_dimensions
-            .iter()
-            .enumerate()
-            .map(|(index, dimensions)| decode_weight_values(index as u32 + 1, dimensions.iter().product()))
-            .collect();
-
-        let replicated = |data_type: DataType, dimensions: &[usize]| {
-            ArrayType::new_static(data_type, dimensions)
-                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), dimensions.len()))
-                .unwrap()
-        };
-        let mut input_types = vec![
-            replicated(DataType::I32, &[]),
-            replicated(DataType::I32, &[]),
-            replicated(DataType::F32, &[steps, dimension]),
-            replicated(DataType::F32, &[steps, dimension]),
-            replicated(DataType::I32, &[steps]),
-            replicated(DataType::U64, &[2]),
-        ];
-        input_types.extend(weight_dimensions.iter().map(|dimensions| replicated(DataType::F32, dimensions)));
-
-        let compiled: CompiledFunction<'_, Vec<ArrayType>, Vec<ArrayType>> = compile(
-            |inputs| build_decode_loop(inputs, &configuration, sampling, attention),
-            input_types.clone(),
-            &engine,
-            mesh.clone(),
-        )
-        .unwrap();
-
-        let device_input = |index: usize, bytes: Vec<u8>| {
-            Array::from_host_buffer(&engine, input_types[index].clone(), mesh.clone(), bytes.as_slice()).unwrap()
-        };
-        let mut device_inputs = vec![
-            device_input(0, values_to_bytes::<i32>(&[0])),
-            device_input(1, values_to_bytes::<i32>(&[3])),
-            device_input(2, values_to_bytes::<f32>(&vec![0.0; steps * dimension])),
-            device_input(3, values_to_bytes::<f32>(&vec![0.0; steps * dimension])),
-            device_input(4, values_to_bytes::<i32>(&vec![0; steps])),
-            device_input(5, values_to_bytes::<u64>(&[42, 0])),
-        ];
-        device_inputs
-            .extend(weights.iter().enumerate().map(|(index, values)| device_input(index + 6, values_to_bytes(values))));
-        let outputs = compiled.executable().execute(&engine, device_inputs).unwrap();
-        assert_eq!(outputs.len(), 3);
-        let device_tokens = read_i32_array(&client, &outputs[0]);
-        let device_cache_keys = read_f32s(&client, &outputs[1]);
-        let device_cache_values = read_f32s(&client, &outputs[2]);
-
-        let mut reference_state = vec![
-            CoreArray::from_elements(ArrayType::new_static(DataType::I32, []), &[0i32]).unwrap(),
-            CoreArray::from_elements(ArrayType::new_static(DataType::I32, []), &[3i32]).unwrap(),
-            CoreArray::from_elements(
-                ArrayType::new_static(DataType::F32, [steps, dimension]),
-                &vec![0.0f32; steps * dimension],
-            )
-            .unwrap(),
-            CoreArray::from_elements(
-                ArrayType::new_static(DataType::F32, [steps, dimension]),
-                &vec![0.0f32; steps * dimension],
-            )
-            .unwrap(),
-            CoreArray::from_elements(ArrayType::new_static(DataType::I32, [steps]), &vec![0i32; steps]).unwrap(),
-            CoreArray::from_elements(ArrayType::new_static(DataType::U64, [2]), &[42u64, 0]).unwrap(),
-        ];
-        reference_state.extend(weight_dimensions.iter().zip(&weights).map(|(dimensions, values)| {
-            CoreArray::from_elements(ArrayType::new_static(DataType::F32, *dimensions), values).unwrap()
-        }));
-        let reference_state = reference_decode_loop(reference_state, &configuration, sampling);
-        let reference_tokens = reference_state[4].elements::<i32>().unwrap();
-
-        // The decoded token sequences must agree exactly, because greedy selection and the categorical draws over
-        // bit-identical ThreeFry bits are only sensitive to floating-point differences at exact logit ties, which the
-        // deterministic pseudo-random weights avoid.
-        assert_eq!(device_tokens, reference_tokens);
-        assert!(reference_tokens.iter().all(|&token| (0..vocabulary as i32).contains(&token)));
-        // The decoded sequences are pinned as fixtures. They are deterministic functions of the pseudo-random weights
-        // and the ThreeFry seed, and pinning them guards against both backends drifting together. The
-        // greedy and sampled sequences differ, demonstrating that the categorical draws actually steer decoding.
-        let expected_tokens: &[i32] = match sampling {
-            DecodeSampling::Greedy => &[12, 8, 12, 8, 12, 8],
-            DecodeSampling::TopK => &[13, 12, 10, 10, 2, 15],
-        };
-        assert_eq!(device_tokens, expected_tokens);
-        for (state_index, device_cache) in [(2, &device_cache_keys), (3, &device_cache_values)] {
-            let reference_cache = reference_state[state_index].to_f64s();
-            assert_eq!(device_cache.len(), reference_cache.len());
-            for (index, (&device_value, &reference_value)) in
-                device_cache.iter().zip(reference_cache.iter()).enumerate()
-            {
-                assert!(
-                    (device_value as f64 - reference_value).abs() < 1e-4,
-                    "cache element {index}: device {device_value} vs reference {reference_value}",
-                );
-            }
-        }
     }
 
     #[test]
@@ -3018,72 +2422,6 @@ mod tests {
         assert_eq!(sharded_output.sharding(), &sharded);
         assert_eq!(replicated_output.sharding(), &replicated);
         assert_eq!(sharded_output.r#type(), replicated_output.r#type());
-    }
-
-    #[test]
-    #[ignore = "phase 0 baseline measurement"]
-    fn test_compiled_function_dispatcher_execute_caches_eager_transforms_baseline() {
-        // Measures a retained JIT dispatcher whose closure internally runs an eager reverse mode gradient. The JIT
-        // boundary stages the eager transform exactly once per specialization, so retained dispatch alone serves
-        // repeated calls with inputs of the same shape. The printed counters also show whether the staging and
-        // lowering fallback tiers ever hit under this workload.
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
-
-        let input_type = replicated_scalar_type(&mesh, DataType::F32);
-        let function: CompiledFunctionDispatcher<'_, _, (), ArrayType, ArrayType> = jit(
-            |_, input: CompileTracer<'_>| {
-                Ok(input.domain().differentiate_at(input).gradient(|value| Mul::mul(&value, &value))?)
-            },
-            &domain,
-            mesh.clone(),
-        );
-
-        domain.compilation_context().clear_statistics();
-        let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
-        for index in 0..BASELINE_REPETITIONS {
-            let input = Array::from_host_buffer(
-                &domain,
-                input_type.clone(),
-                mesh.clone(),
-                values_to_bytes::<f32>(&[index as f32]).as_slice(),
-            )
-            .unwrap();
-            let start = Instant::now();
-            let output = function.execute((), input).unwrap();
-            durations.push(start.elapsed());
-            assert_eq!(read_f32s(&client, &output), vec![2.0 * index as f32]);
-        }
-
-        // The JIT boundary caches the whole function, with one trace, one lowering, and one compilation request, and a
-        // retained specialization serves every later call with inputs of the same shape without touching the fallback
-        // tiers.
-        let statistics = function.statistics();
-        assert_eq!(statistics.dispatch_misses, 1);
-        assert_eq!(statistics.dispatch_hits, (BASELINE_REPETITIONS - 1) as u64);
-        assert_eq!(statistics.traces, 1);
-        assert_eq!(statistics.lowerings, 1);
-        assert_eq!(statistics.compilation_requests, 1);
-
-        print_baseline_durations("jit(eager gradient) repeated dispatch", &durations);
-        println!(
-            "  dispatcher: dispatch_hits={} dispatch_misses={} traces={} lowerings={} compilation_requests={}",
-            statistics.dispatch_hits,
-            statistics.dispatch_misses,
-            statistics.traces,
-            statistics.lowerings,
-            statistics.compilation_requests,
-        );
-        println!(
-            "  dispatcher: dispatch_preparation_ms={:.3} dispatch_lookup_ms={:.3} tracing_ms={:.3} \
-             lowering_ms={:.3}",
-            statistics.dispatch_preparation_duration.as_secs_f64() * 1e3,
-            statistics.dispatch_lookup_duration.as_secs_f64() * 1e3,
-            statistics.tracing_duration.as_secs_f64() * 1e3,
-            statistics.lowering_duration.as_secs_f64() * 1e3,
-        );
-        print_baseline_compilation_statistics(&domain);
     }
 
     #[test]
@@ -5087,7 +4425,7 @@ mod tests {
         // Batching array leaves in their array IR parent lets the batched closure call compiled functions, both on
         // eager arrays and on the array leaves of an enclosing compilation.
         let batched = batch_in_parent(
-            |x| Ok(function.call(x)?),
+            |x| function.call(x),
             array(&matrix_type, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
             BatchAxis::new(0),
             BatchAxis::new(0),
@@ -5098,7 +4436,7 @@ mod tests {
         let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
             |xs| {
                 batch_in_parent(
-                    |x| Ok(function.call(x)?),
+                    |x| function.call(x),
                     xs,
                     BatchAxis::new(0),
                     BatchAxis::new(1),
@@ -5145,13 +4483,13 @@ mod tests {
         // functions, and every derivative result keeps arrays at its boundary. `f(x) = x * c` has the Jacobian
         // `diag(c)`, and `x ↦ f(x) · x` has the gradient `2 * c * x`.
         let (output, tangent) = differentiate_in_parent_at(array(&[1.0, 2.0, 3.0]))
-            .jvp(array(&[1.0, 1.0, 2.0]), |x| Ok(function.call(x)?))
+            .jvp(array(&[1.0, 1.0, 2.0]), |x| function.call(x))
             .unwrap();
         assert_eq!((read(&output), read(&tangent)), (vec![2.0, -2.0, 1.5], vec![2.0, -1.0, 1.0]));
         let (_, pushforward) =
-            differentiate_in_parent_at(array(&[1.0, 2.0, 3.0])).linearize(|x| Ok(function.call(x)?)).unwrap();
+            differentiate_in_parent_at(array(&[1.0, 2.0, 3.0])).linearize(|x| function.call(x)).unwrap();
         assert_eq!(read(&pushforward.apply(array(&[1.0, 1.0, 2.0])).unwrap()), vec![2.0, -1.0, 1.0]);
-        let (_, pullback) = differentiate_in_parent_at(array(&[1.0, 2.0, 3.0])).vjp(|x| Ok(function.call(x)?)).unwrap();
+        let (_, pullback) = differentiate_in_parent_at(array(&[1.0, 2.0, 3.0])).vjp(|x| function.call(x)).unwrap();
         assert_eq!(read(&pullback.apply_materialized(array(&[1.0, 1.0, 2.0])).unwrap()), vec![2.0, -1.0, 1.0]);
         let MaybeZero::Value(cotangent) = pullback.apply(array(&[1.0, 1.0, 2.0])).unwrap() else {
             panic!("the cotangent of a connected input should not be a structural zero");
@@ -5190,22 +4528,19 @@ mod tests {
         .unwrap();
         assert_eq!(read(&cotangents), vec![2.0, -1.0, 1.0, 4.0, -2.0, 1.0]);
         let gradient = differentiate_in_parent_at(array(&[1.0, 2.0, 3.0]))
-            .gradient(|x| Ok(function.call(x.clone())?.dot(&x, &dimensions)?))
+            .gradient(|x| function.call(x.clone())?.dot(&x, &dimensions))
             .unwrap();
         assert_eq!(read(&gradient), vec![4.0, -4.0, 3.0]);
-        let jacobian = differentiate_in_parent_at(array(&[1.0, 2.0, 3.0]))
-            .jacobian_forward(|x| Ok(function.call(x)?))
-            .unwrap();
+        let jacobian =
+            differentiate_in_parent_at(array(&[1.0, 2.0, 3.0])).jacobian_forward(|x| function.call(x)).unwrap();
         assert_eq!(read(&jacobian.values()[0]), vec![2.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.5]);
 
         // The same entry point serves the array leaves of an enclosing compilation.
         let outer: CompiledFunction<'_, ArrayType, (ArrayType, ArrayType)> = compile(
             |x| {
-                let jacobian =
-                    differentiate_in_parent_at(x.clone()).jacobian_reverse(|x| Ok(function.call(x)?)).unwrap();
-                let hessian = differentiate_in_parent_at(x)
-                    .hessian(|x| Ok(function.call(x.clone())?.dot(&x, &dimensions)?))
-                    .unwrap();
+                let jacobian = differentiate_in_parent_at(x.clone()).jacobian_reverse(|x| function.call(x)).unwrap();
+                let hessian =
+                    differentiate_in_parent_at(x).hessian(|x| function.call(x.clone())?.dot(&x, &dimensions)).unwrap();
                 (jacobian.into_values().remove(0), hessian.into_values().remove(0))
             },
             vector_type.clone(),
@@ -5396,8 +4731,10 @@ mod tests {
                 let size = DimensionSizeOperation::new(elements.r#type().as_ref(), 0).unwrap();
                 let elements = elements.into_value();
                 let context = elements.context().clone();
-                let length =
-                    context.bind(Operation::DimensionSize(size), Vec::new(), &[elements.clone()]).unwrap().remove(0);
+                let length = context
+                    .bind(Operation::DimensionSize(size), Vec::new(), std::slice::from_ref(&elements))
+                    .unwrap()
+                    .remove(0);
                 let inputs = vec![initial.into_value(), elements, length];
                 let outputs = context
                     .bind(
@@ -5642,36 +4979,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "phase 0 baseline measurement"]
-    fn test_compiled_function_gradient_repeated_construction_baseline() {
-        // Measures repeated `CompiledFunction::gradient` construction, mirroring
-        // `test_compiled_function_jvp_repeated_construction_baseline` for the reverse mode path.
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
-
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]))
-                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
-                .unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile(|x| x.sin().unwrap().reduce(&[0, 1], ReductionKind::Sum).unwrap(), input_type, &domain, mesh)
-                .unwrap();
-
-        domain.compilation_context().clear_statistics();
-        let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
-        for _ in 0..BASELINE_REPETITIONS {
-            let start = Instant::now();
-            let derived: CompiledFunction<'_, ArrayType, ArrayType> = compiled.gradient(&domain).unwrap();
-            durations.push(start.elapsed());
-            assert_eq!(derived.output_types().len(), 1);
-        }
-
-        print_baseline_durations("repeated CompiledFunction::gradient", &durations);
-        print_baseline_compilation_statistics(&domain);
-    }
-
-    #[test]
     fn test_compiled_function_gradient_rejects_non_scalar_output() {
         let client = execution_client();
         let mesh = domain_mesh(&client, "x", 1);
@@ -5855,7 +5162,7 @@ mod tests {
         let jvp: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = outer.jvp(&engine).unwrap();
         assert_eq!(jvp.output_types(), &[input_type.clone(), input_type.clone()]);
         let gradient: CompiledFunction<'_, ArrayType, ArrayType> = outer.gradient(&engine).unwrap();
-        assert_eq!(gradient.output_types(), &[input_type.clone()]);
+        assert_eq!(gradient.output_types(), std::slice::from_ref(&input_type));
 
         // A reference chain evaluated in `f64` pins the gradient's value. Each step contributes its local derivative
         // at the value before the step, and the appended outer `sin` contributes the final `cos` factor.
@@ -5938,37 +5245,6 @@ mod tests {
         let chained_tangent = zero_identity.executable().execute(&engine, tangent_output).unwrap();
         assert_eq!(chained_tangent.r#type().as_ref(), &tangent_type);
         assert!(chained_tangent.addressable_shards().next().unwrap().buffer().is_none());
-    }
-
-    #[test]
-    #[ignore = "phase 0 baseline measurement"]
-    fn test_compiled_function_jvp_repeated_construction_baseline() {
-        // Measures repeated `CompiledFunction::jvp` construction. Only the cold call traces, lowers, and requests the
-        // compilation of the derived forward mode function, and warm calls reuse the derived function retained on the
-        // wrapper. The printed table records the cold call, the warm calls, and the compilation cache counters.
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
-
-        let input_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![CoreDimension::Static(4), CoreDimension::Static(4)]))
-                .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 2))
-                .unwrap();
-        let compiled: CompiledFunction<'_, ArrayType, ArrayType> =
-            compile(|x| x.sin().unwrap().cos().unwrap(), input_type, &domain, mesh).unwrap();
-
-        domain.compilation_context().clear_statistics();
-        let mut durations = Vec::with_capacity(BASELINE_REPETITIONS);
-        for _ in 0..BASELINE_REPETITIONS {
-            let start = Instant::now();
-            let derived: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
-                compiled.jvp(&domain).unwrap();
-            durations.push(start.elapsed());
-            assert_eq!(derived.output_types().len(), 2);
-        }
-
-        print_baseline_durations("repeated CompiledFunction::jvp", &durations);
-        print_baseline_compilation_statistics(&domain);
     }
 
     #[test]
@@ -6068,7 +5344,7 @@ mod tests {
             .unwrap();
         assert_eq!(batched.output_types(), std::slice::from_ref(&matrix_type));
         let uncompiled = batch(
-            |x| Ok(x.sin()?),
+            |x| x.sin(),
             Value::Array(matrix.clone()),
             BatchAxis::new(0),
             BatchAxis::new(0),
@@ -6097,160 +5373,6 @@ mod tests {
                     if *message == "compiled function batching requires an explicit static batch extent",
             ),
         ));
-    }
-
-    #[test]
-    #[ignore = "phase 5 gate measurement"]
-    fn test_compiled_function_transforms_of_shared_callee_baseline() {
-        // Measures the transformation of one shared `jit_call` callee across distinct outer specializations.
-        //
-        // Every outer function stages a `jit_call` of the same inner compiled function and appends a trivially
-        // different `sin` epilogue, so the outer functions are genuinely distinct specializations that cannot share a
-        // retention slot of `CompiledFunction`. Each `jvp` or `gradient` of an outer function runs the rules of
-        // `JitCallOperation` over the attached callee program. `jvp` exercises the forward mode rule, and `gradient`
-        // exercises both the forward mode rule and the transpose rule. Scaling the callee from a chain of two
-        // operations to a chain of two hundred operations isolates the part of that cost that grows with the callee.
-        //
-        // The transform cache of each `Region` derives the linearizations and transpositions of the callee once and
-        // serves them warm to every later outer function. The cost that still grows with the callee is the work
-        // outside the retained artifacts, such as replaying the derived programs into each outer function.
-        //
-        // Backend compilation is timed separately and subtracted, because the derived programs differ for each outer
-        // function and are therefore genuinely distinct compilations that no frontend cache can remove.
-        let client = execution_client();
-        let mesh = domain_mesh(&client, "x", 1);
-        let domain = Session::new(&client).domain();
-
-        let input_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()))
-            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
-            .unwrap();
-
-        println!(
-            "phase 5 gate: shared jit_call callee transformed for {CALLEE_OUTER_SPECIALIZATIONS} outer \
-             specializations, warm transforms served by the region transform cache",
-        );
-        println!("  compilation cache before:");
-        print_baseline_compilation_statistics(&domain);
-        domain.compilation_context().clear_statistics();
-
-        // For each callee size, record the cold forward mode and reverse mode construction of every outer function,
-        // split into the total elapsed time and the backend compilation time charged inside it.
-        let mut measurements: Vec<(usize, [Vec<Duration>; 2], [Vec<Duration>; 2])> = Vec::new();
-        for callee_operations in CALLEE_OPERATION_COUNTS {
-            let callee: CompiledFunction<'_, ArrayType, ArrayType> = compile(
-                move |x| {
-                    let mut value = x;
-                    for index in 0..callee_operations {
-                        value = if index % 2 == 0 { value.sin().unwrap() } else { value.cos().unwrap() };
-                    }
-                    value
-                },
-                input_type.clone(),
-                &domain,
-                mesh.clone(),
-            )
-            .unwrap();
-
-            let mut outers = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
-            for index in 0..CALLEE_OUTER_SPECIALIZATIONS {
-                let callee = callee.clone();
-                let outer: CompiledFunction<'_, ArrayType, ArrayType> = compile(
-                    move |x| {
-                        let mut value = callee.call(x).unwrap();
-                        for _ in 0..=index {
-                            value = value.sin().unwrap();
-                        }
-                        value
-                    },
-                    input_type.clone(),
-                    &domain,
-                    mesh.clone(),
-                )
-                .unwrap();
-
-                // The callee stays behind a `jit_call` boundary. The outer program holds exactly one `jit_call` and
-                // none of the callee's `cos` operations, which the epilogue of `sin` operations could never have
-                // produced.
-                let instructions = outer.source_program().program().instructions();
-                let jit_call_count = instructions
-                    .iter()
-                    .filter(|instruction| matches!(instruction.operation(), Operation::JitCall(_)))
-                    .count();
-                let inlined_cosine_count = instructions
-                    .iter()
-                    .filter(|instruction| matches!(instruction.operation(), Operation::Array(ArrayOperation::Cos(_))))
-                    .count();
-                assert_eq!(jit_call_count, 1, "each outer specialization should stage one `jit_call` boundary");
-                assert_eq!(inlined_cosine_count, 0, "the outer program should not inline the callee body");
-                outers.push(outer);
-            }
-
-            let mut jvp_totals = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
-            let mut jvp_backends = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
-            for outer in &outers {
-                let before = domain.compilation_context().statistics().compilation_duration;
-                let start = Instant::now();
-                let derived: CompiledFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> =
-                    outer.jvp(&domain).unwrap();
-                jvp_totals.push(start.elapsed());
-                let after = domain.compilation_context().statistics().compilation_duration;
-                jvp_backends.push(after - before);
-                assert_eq!(derived.output_types().len(), 2);
-            }
-
-            let mut gradient_totals = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
-            let mut gradient_backends = Vec::with_capacity(CALLEE_OUTER_SPECIALIZATIONS);
-            for outer in &outers {
-                let before = domain.compilation_context().statistics().compilation_duration;
-                let start = Instant::now();
-                let derived: CompiledFunction<'_, ArrayType, ArrayType> = outer.gradient(&domain).unwrap();
-                gradient_totals.push(start.elapsed());
-                let after = domain.compilation_context().statistics().compilation_duration;
-                gradient_backends.push(after - before);
-                assert_eq!(derived.output_types().len(), 1);
-            }
-
-            measurements.push((callee_operations, [jvp_totals, jvp_backends], [gradient_totals, gradient_backends]));
-        }
-
-        for (callee_operations, jvp, gradient) in &measurements {
-            println!("  callee with {callee_operations} operations (all times in milliseconds):");
-            println!("    transform | outer |    total |    backend |    frontend");
-            print_callee_transformation_rows("jvp", &jvp[0], &jvp[1]);
-            print_callee_transformation_rows("gradient", &gradient[0], &gradient[1]);
-        }
-
-        let (small_operations, small_jvp, small_gradient) = &measurements[0];
-        let (large_operations, large_jvp, large_gradient) = &measurements[1];
-        let small_jvp_mean = mean_frontend_milliseconds(&small_jvp[0], &small_jvp[1]);
-        let large_jvp_mean = mean_frontend_milliseconds(&large_jvp[0], &large_jvp[1]);
-        let small_gradient_mean = mean_frontend_milliseconds(&small_gradient[0], &small_gradient[1]);
-        let large_gradient_mean = mean_frontend_milliseconds(&large_gradient[0], &large_gradient[1]);
-        let added_operations = (large_operations - small_operations) as f64;
-        println!(
-            "  frontend-only summary (mean over {CALLEE_OUTER_SPECIALIZATIONS} distinct outer \
-             specializations, milliseconds):",
-        );
-        println!(
-            "    transform | {small_operations:>3}-op callee | {large_operations:>3}-op callee | \
-             delta/call | delta*outers | per callee op",
-        );
-        println!(
-            "    jvp       | {small_jvp_mean:>13.3} | {large_jvp_mean:>13.3} | {:>10.3} | {:>12.3} | \
-             {:>13.4}",
-            large_jvp_mean - small_jvp_mean,
-            (large_jvp_mean - small_jvp_mean) * CALLEE_OUTER_SPECIALIZATIONS as f64,
-            (large_jvp_mean - small_jvp_mean) / added_operations,
-        );
-        println!(
-            "    gradient  | {small_gradient_mean:>13.3} | {large_gradient_mean:>13.3} | {:>10.3} | \
-             {:>12.3} | {:>13.4}",
-            large_gradient_mean - small_gradient_mean,
-            (large_gradient_mean - small_gradient_mean) * CALLEE_OUTER_SPECIALIZATIONS as f64,
-            (large_gradient_mean - small_gradient_mean) / added_operations,
-        );
-        println!("  compilation cache after:");
-        print_baseline_compilation_statistics(&domain);
     }
 
     #[test]
@@ -6328,7 +5450,7 @@ mod tests {
         .unwrap();
         let executable = compiled.executable();
         assert_eq!(executable.function.input_types(), &[ArrayIrType::Array(input_type.clone())]);
-        assert_eq!(executable.output_types(), &[input_type.clone()]);
+        assert_eq!(executable.output_types(), std::slice::from_ref(&input_type));
 
         let input =
             Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes::<f32>(&[3.0]).as_slice()).unwrap();
@@ -6916,19 +6038,15 @@ mod tests {
         )
         .unwrap();
         let student_values = [2.0f32 - 1e-7, 1.0f32 + 1e-7, 0.0];
-        let logits = Array::from_host_buffer(
-            &domain,
-            vector_type.clone(),
-            mesh.clone(),
-            &values_to_bytes(&[9.0f32, -9.0, -9.0]),
-        )
-        .unwrap();
-        let labels = Array::from_host_buffer(&domain, label_type, mesh.clone(), &values_to_bytes(&[0i32])).unwrap();
+        let logits =
+            Array::from_host_buffer(&domain, vector_type.clone(), mesh.clone(), values_to_bytes(&[9.0f32, -9.0, -9.0]))
+                .unwrap();
+        let labels = Array::from_host_buffer(&domain, label_type, mesh.clone(), values_to_bytes(&[0i32])).unwrap();
         let student =
-            Array::from_host_buffer(&domain, vector_type.clone(), mesh.clone(), &values_to_bytes(&student_values))
+            Array::from_host_buffer(&domain, vector_type.clone(), mesh.clone(), values_to_bytes(&student_values))
                 .unwrap();
         let teacher =
-            Array::from_host_buffer(&domain, vector_type, mesh, &values_to_bytes(&[2.0f32, 1.0, 0.0])).unwrap();
+            Array::from_host_buffer(&domain, vector_type, mesh, values_to_bytes(&[2.0f32, 1.0, 0.0])).unwrap();
         let (loss, hard_gradient, soft_gradient) =
             compiled.executable().execute(&domain, (logits, labels, student, teacher)).unwrap();
 
@@ -6979,8 +6097,8 @@ mod tests {
         )
         .unwrap();
         let values = [9.0f32, -9.0, 1.0, -9.0];
-        let logits = Array::from_host_buffer(&engine, logits_type, mesh.clone(), &values_to_bytes(&values)).unwrap();
-        let labels = Array::from_host_buffer(&engine, label_type, mesh, &values_to_bytes(&[2i32])).unwrap();
+        let logits = Array::from_host_buffer(&engine, logits_type, mesh.clone(), values_to_bytes(&values)).unwrap();
+        let labels = Array::from_host_buffer(&engine, label_type, mesh, values_to_bytes(&[2i32])).unwrap();
         let (probabilities, loss, gradient) = compiled.executable().execute(&engine, (logits, labels)).unwrap();
         assert_eq!(probabilities.sharding(), &sharding);
         assert_eq!(gradient.sharding(), &sharding);
@@ -7049,14 +6167,14 @@ mod tests {
                 &domain,
                 replicated(ArrayType::new_static(DataType::F32, [rows, columns])),
                 mesh.clone(),
-                &values_to_bytes(&values),
+                values_to_bytes(&values),
             )
             .unwrap();
             let labels = Array::from_host_buffer(
                 &domain,
                 replicated(ArrayType::new_static(DataType::I32, [rows])),
                 mesh.clone(),
-                &values_to_bytes(&label_values),
+                values_to_bytes(&label_values),
             )
             .unwrap();
             let (log_probabilities, loss) = compiled.executable().execute(&domain, (logits, labels)).unwrap();
@@ -7372,29 +6490,6 @@ mod tests {
                 .zip(expected)
                 .all(|(observed, expected)| (observed - expected).abs() < 1e-5)
         );
-    }
-
-    #[test]
-    fn test_compile_decode_loop_greedy_matches_reference_backend() {
-        // A compiled `While` loop maintains `DynamicUpdateSlice` key and value caches with composed masked attention,
-        // an MLP gated by `tanh` and `logistic`, and greedy `argmax` sampling. It is traced through the public API and
-        // compared against the eager reference backend.
-        run_decode_loop_demo(DecodeSampling::Greedy, DecodeAttention::Composed);
-    }
-
-    #[test]
-    fn test_compile_decode_loop_top_k_sampling_matches_reference_backend() {
-        // Like the greedy demo, but tokens are selected with `top_k` and a categorical draw from the ThreeFry generator
-        // state threaded through the loop carry. This exercises `RngBitGenerator` inside a compiled `While` region
-        // with bit-exact token parity across backends.
-        run_decode_loop_demo(DecodeSampling::TopK, DecodeAttention::Composed);
-    }
-
-    #[test]
-    fn test_compile_decode_loop_custom_call_attention_matches_reference_backend() {
-        // The attention body is swapped for a registered XLA FFI custom call kernel, which exercises `custom_call`
-        // inside a compiled `While` region against the composed eager reference.
-        run_decode_loop_demo(DecodeSampling::Greedy, DecodeAttention::CustomCall);
     }
 
     #[test]

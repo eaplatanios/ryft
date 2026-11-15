@@ -179,7 +179,7 @@ mod tests {
             |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
-                    |input: ArrayTracer| Ok(input.parallel_broadcast("x", 1)?),
+                    |input: ArrayTracer| input.parallel_broadcast("x", 1),
                     input,
                     mesh.clone(),
                     sharded.clone(),
@@ -383,7 +383,7 @@ mod tests {
             |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
-                    |input: ArrayTracer| Ok(input.parallel_broadcast("y", 0)?),
+                    |input: ArrayTracer| input.parallel_broadcast("y", 0),
                     input,
                     mesh.clone(),
                     sharded.clone(),
@@ -428,7 +428,7 @@ mod tests {
                     |x: ArrayTracer| {
                         let x = x.parallel_broadcast(["x", "y"], 2)?;
                         let x = x.parallel_broadcast(["y", "x"], 2)?;
-                        Ok(x.parallel_broadcast("y", 1)?)
+                        x.parallel_broadcast("y", 1)
                     },
                     x,
                     mesh.clone(),

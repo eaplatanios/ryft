@@ -20,7 +20,7 @@ fn device_shards(array: &Array<'_>) -> Vec<Vec<f32>> {
         .map(|device| {
             let shard = array.device_shard(device.id()).unwrap().buffer().unwrap().copy_to_host(None).unwrap();
             let bytes = shard.r#await().unwrap();
-            bytes.chunks_exact(4).map(|chunk| f32::from_ne_bytes(chunk.try_into().unwrap())).collect()
+            bytes.as_chunks::<4>().0.iter().map(|chunk| f32::from_ne_bytes(*chunk)).collect()
         })
         .collect()
 }

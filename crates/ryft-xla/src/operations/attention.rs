@@ -333,7 +333,7 @@ pub(crate) fn lower_fused_attention<'b, 'c: 'b, 't: 'c>(
                 location,
             )?);
         }
-        return Ok(results);
+        Ok(results)
     }
 }
 
@@ -607,7 +607,7 @@ pub(crate) fn lower_fused_attention_backward<'b, 'c: 'b, 't: 'c>(
                 location,
             )?);
         }
-        return Ok(results);
+        Ok(results)
     }
 }
 

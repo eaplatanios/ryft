@@ -73,6 +73,7 @@ impl LowerableOperation for ShardMapOperation {
 /// remain local to an executable, and the only ordered I/O that reaches this function is per-device (i.e.,
 /// `DeviceOrderedIo`), because core `shard_map` boundary validation rejects bodies with the `OrderedIo` effect (refer
 /// to [`ShardMapError::OrderedIoNotSupported`]).
+#[allow(clippy::too_many_arguments)]
 fn lower_manual_computation<'b, 'c: 'b, 't: 'c, ProgramInput, ProgramOutput, O: LowerableOperationFamily>(
     block: &mut BlockRef<'b, 'c, 't>,
     outer_inputs: &[ValueRef<'b, 'c, 't>],
@@ -1135,9 +1136,9 @@ pub(crate) mod tests {
                         |x: ArrayTracer| {
                             Ok(shard_map(
                                 |y: ArrayTracer| {
-                                    Ok(y.parallel_all_gather(["x", "y"], 0)?
+                                    y.parallel_all_gather(["x", "y"], 0)?
                                         .parallel_reduce(ReductionKind::Sum, "x")?
-                                        .parallel_reduce(ReductionKind::Sum, "y")?)
+                                        .parallel_reduce(ReductionKind::Sum, "y")
                                 },
                                 x,
                                 inner_mesh.clone(),
@@ -1636,7 +1637,7 @@ pub(crate) mod tests {
             |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
-                    |input| Ok(input),
+                    Ok,
                     input,
                     mesh,
                     input_sharding.clone(),
@@ -1776,8 +1777,8 @@ pub(crate) mod tests {
             &input_types,
             &output_types,
             "main",
-            Some(&[replicated.clone()]),
-            Some(&[replicated]),
+            Some(std::slice::from_ref(&replicated)),
+            Some(std::slice::from_ref(&replicated)),
         )
         .unwrap();
         assert_eq!(
@@ -1960,7 +1961,7 @@ pub(crate) mod tests {
                         let w = w.parallel_cast("x", ParallelCastTarget::Reduced)?;
                         let w = w.parallel_cast("x", ParallelCastTarget::Varying)?;
                         let product = (w * v).parallel_cast("x", ParallelCastTarget::Unreduced)?;
-                        Ok(product.parallel_reduce(ReductionKind::Sum, "x")?)
+                        product.parallel_reduce(ReductionKind::Sum, "x")
                     },
                     (w, v),
                     mesh.clone(),
@@ -2016,7 +2017,7 @@ pub(crate) mod tests {
         let traced: TracedProgram<ArrayType, ArrayType> = trace_with_context(
             |_, x: ArrayTracer| {
                 let summands = shard_map(
-                    |x: ArrayTracer| Ok(x.parallel_cast("x", ParallelCastTarget::Unreduced)?),
+                    |x: ArrayTracer| x.parallel_cast("x", ParallelCastTarget::Unreduced),
                     x,
                     mesh.clone(),
                     sharded.clone(),
@@ -2024,7 +2025,7 @@ pub(crate) mod tests {
                     ShardMapOptions::new(),
                 )?;
                 Ok(shard_map(
-                    |summands: ArrayTracer| Ok(summands.parallel_reduce(ReductionKind::Sum, "x")?),
+                    |summands: ArrayTracer| summands.parallel_reduce(ReductionKind::Sum, "x"),
                     summands,
                     mesh.clone(),
                     unreduced.clone(),
@@ -2093,7 +2094,7 @@ pub(crate) mod tests {
                         ShardMapOptions::new().with_check_manual_variation(false),
                     )?;
                     Ok(shard_map(
-                        |candidates: ArrayTracer| Ok(candidates.parallel_reduce(reduction, "x")?),
+                        |candidates: ArrayTracer| candidates.parallel_reduce(reduction, "x"),
                         candidates,
                         mesh.clone(),
                         unreduced.clone(),
@@ -2162,7 +2163,7 @@ pub(crate) mod tests {
                             let reduced = input.parallel_cast("x", ParallelCastTarget::Reduced)?;
                             let varying = reduced.parallel_cast("x", ParallelCastTarget::Varying)?;
                             let summand = varying.exp()?.parallel_cast("x", ParallelCastTarget::Unreduced)?;
-                            Ok(summand.parallel_reduce(ReductionKind::Sum, "x")?)
+                            summand.parallel_reduce(ReductionKind::Sum, "x")
                         },
                         input,
                         mesh.clone(),
@@ -2186,29 +2187,30 @@ pub(crate) mod tests {
                   func.func @main(%arg0: tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>}) -> \
                       (tensor<f32> {sdy.sharding = #sdy.sharding<@mesh, [], replicated={\"x\"}>}) {
                     %cst = stablehlo.constant dense<1.000000e+00> : tensor<f32>
-                    %0 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [], replicated={\"x\"}>] \
+                    %0 = sdy.sharding_constraint %cst <@mesh, [], replicated={\"x\"}> : tensor<f32>
+                    %1 = sdy.manual_computation(%arg0) in_shardings=[<@mesh, [], replicated={\"x\"}>] \
                         out_shardings=[<@mesh, [{\"x\"}]>] manual_axes={\"x\"} (%arg1: tensor<f32>) {
-                      %2 = stablehlo.exponential %arg1 : tensor<f32>
-                      %3 = stablehlo.reshape %2 : (tensor<f32>) -> tensor<1xf32>
-                      %4 = sdy.sharding_constraint %3 <@mesh, [{}]> : tensor<1xf32>
-                      sdy.return %4 : tensor<1xf32>
+                      %3 = stablehlo.exponential %arg1 : tensor<f32>
+                      %4 = stablehlo.reshape %3 : (tensor<f32>) -> tensor<1xf32>
+                      %5 = sdy.sharding_constraint %4 <@mesh, [{}]> : tensor<1xf32>
+                      sdy.return %5 : tensor<1xf32>
                     } : (tensor<f32>) -> tensor<2xf32>
-                    %1 = sdy.manual_computation(%cst, %0) in_shardings=[<@mesh, [], replicated={\"x\"}>, <@mesh, [{\"x\"}]>] \
+                    %2 = sdy.manual_computation(%0, %1) in_shardings=[<@mesh, [], replicated={\"x\"}>, <@mesh, [{\"x\"}]>] \
                         out_shardings=[<@mesh, [], replicated={\"x\"}>] manual_axes={\"x\"} \
                         (%arg1: tensor<f32>, %arg2: tensor<1xf32>) {
-                      %2 = stablehlo.reshape %arg2 : (tensor<1xf32>) -> tensor<f32>
-                      %3 = sdy.sharding_constraint %2 <@mesh, []> : tensor<f32>
-                      %4 = stablehlo.multiply %3, %arg1 : tensor<f32>
-                      %5 = \"stablehlo.all_reduce\"(%4) <{channel_handle = \
+                      %3 = stablehlo.reshape %arg2 : (tensor<1xf32>) -> tensor<f32>
+                      %4 = sdy.sharding_constraint %3 <@mesh, []> : tensor<f32>
+                      %5 = stablehlo.multiply %4, %arg1 : tensor<f32>
+                      %6 = \"stablehlo.all_reduce\"(%5) <{channel_handle = \
                           #stablehlo.channel_handle<handle = 1, type = 1>, replica_groups = \
                           dense<[[0, 1]]> : tensor<1x2xi64>, use_global_device_ids}> ({
                       ^bb0(%arg3: tensor<f32>, %arg4: tensor<f32>):
-                        %6 = stablehlo.add %arg3, %arg4 : tensor<f32>
-                        stablehlo.return %6 : tensor<f32>
+                        %7 = stablehlo.add %arg3, %arg4 : tensor<f32>
+                        stablehlo.return %7 : tensor<f32>
                       }) : (tensor<f32>) -> tensor<f32>
-                      sdy.return %5 : tensor<f32>
+                      sdy.return %6 : tensor<f32>
                     } : (tensor<f32>, tensor<2xf32>) -> tensor<f32>
-                    return %1 : tensor<f32>
+                    return %2 : tensor<f32>
                   }
                 }
             "},
@@ -2236,7 +2238,7 @@ pub(crate) mod tests {
                         replicated.clone(),
                         ShardMapOptions::new(),
                     )?;
-                    Ok(positions.convert_element_type(DataType::F32)?)
+                    positions.convert_element_type(DataType::F32)
                 },
                 ArrayType::new_static(DataType::F32, [6]).with_sharding(sharded.clone()).unwrap(),
             )
@@ -2262,7 +2264,7 @@ pub(crate) mod tests {
             |inputs: Vec<Tracer<'static>>| {
                 let input = ValueProjection::<ArrayType>::into_projected(inputs[0].clone())?;
                 let output = shard_map(
-                    |input: ArrayTracer| Ok(input.parallel_broadcast("x", 1)?),
+                    |input: ArrayTracer| input.parallel_broadcast("x", 1),
                     input,
                     mesh.clone(),
                     sharded.clone(),
@@ -2275,14 +2277,15 @@ pub(crate) mod tests {
         )
         .unwrap();
         let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Return]).unwrap();
+        let global_types = [global_type];
         let module = to_mlir_module_for_program(
             &pullback,
             &[],
-            &[global_type.clone()],
-            &[global_type],
+            &global_types,
+            &global_types,
             "main",
-            Some(&[sharded.clone()]),
-            Some(&[sharded]),
+            Some(std::slice::from_ref(&sharded)),
+            Some(std::slice::from_ref(&sharded)),
         )
         .unwrap();
         assert_eq!(
@@ -3042,7 +3045,7 @@ pub(crate) mod tests {
         .unwrap();
         let lowered = domain.lower_program(&program, 0, &Options::new(mesh.clone())).unwrap();
         assert_eq!(
-            &*lowered.stable_hlo(),
+            lowered.stable_hlo(),
             indoc! {"
                 module {
                   sdy.mesh @mesh = <[\"x\"=2]>
@@ -4637,12 +4640,11 @@ pub(crate) mod tests {
             .compile(&PjrtProgram::Mlir { bytecode: program.into_bytes() }, &test_spmd_compilation_options(2))
             .unwrap();
         let inputs = vec![
-            Array::from_host_buffer(&domain, query_type, device_mesh.clone(), &values_to_bytes(&[0.0f32])).unwrap(),
-            Array::from_host_buffer(&domain, key_type, device_mesh.clone(), &values_to_bytes(&[0.0f32, 1.0, 0.0, 3.0]))
+            Array::from_host_buffer(&domain, query_type, device_mesh.clone(), values_to_bytes(&[0.0f32])).unwrap(),
+            Array::from_host_buffer(&domain, key_type, device_mesh.clone(), values_to_bytes(&[0.0f32, 1.0, 0.0, 3.0]))
                 .unwrap(),
-            Array::from_host_buffer(&domain, value_type, device_mesh.clone(), &values_to_bytes(&[2.0f32, 6.0]))
-                .unwrap(),
-            Array::from_host_buffer(&domain, seed_type, device_mesh, &values_to_bytes(&[2.0f32, 5.0])).unwrap(),
+            Array::from_host_buffer(&domain, value_type, device_mesh.clone(), values_to_bytes(&[2.0f32, 6.0])).unwrap(),
+            Array::from_host_buffer(&domain, seed_type, device_mesh, values_to_bytes(&[2.0f32, 5.0])).unwrap(),
         ];
         let device_ids = executable
             .addressable_devices()
@@ -5204,7 +5206,7 @@ pub(crate) mod tests {
             .map(|device| {
                 vec![ExecutionInput {
                     buffer: Arc::new(
-                        client.buffer(bytes.as_slice(), BufferType::F32, &[4], None, device.clone(), None).unwrap(),
+                        client.buffer(bytes.as_slice(), BufferType::F32, [4], None, device.clone(), None).unwrap(),
                     ),
                     donatable: false,
                 }]
@@ -5388,8 +5390,7 @@ pub(crate) mod tests {
         let options = ShardMapOptions::new().with_check_manual_variation(false);
         let input_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharded.clone()).unwrap();
         let input = Array::from_host_buffer(&domain, input_type, mesh, values_to_bytes(&[1f32, 2.])).unwrap();
-        let summands =
-            shard_map(|x| Ok(x), input, logical_mesh.clone(), sharded, unreduced.clone(), options.clone()).unwrap();
+        let summands = shard_map(Ok, input, logical_mesh.clone(), sharded, unreduced.clone(), options.clone()).unwrap();
         let squares = shard_map(
             |summand: ProjectedValue<ArrayType, DomainTracer<Domain<'_>>>| Ok(summand.clone() * summand),
             summands,

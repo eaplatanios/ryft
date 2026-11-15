@@ -49,13 +49,13 @@ use crate::operations::Capability;
 use crate::operations::collectives::parallel_vary::{
     ManualVariationAlignment, ParallelVaryOperation, manual_variation_axes, vary_over_missing_manual_axes,
 };
-use crate::operations::comparisons::Compare;
+use crate::operations::comparisons::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::composites::builders::{Composite, CompositeCallContext, composite};
 use crate::operations::composites::configurations::JvpFromPrimal;
 use crate::operations::composites::rules::definitions::{CompositeAttribute, CompositeKey};
-use crate::operations::constants::iota_like::IotaLike;
-use crate::operations::constants::zero_like::ZeroLike;
-use crate::operations::control_flow::select::Select;
+use crate::operations::constants::iota_like::{IotaLike, IotaLikeOperation};
+use crate::operations::constants::zero_like::{ZeroLike, ZeroLikeOperation};
+use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::dot::{
     Dot, DotDimensionNumbers, DotOperation, DotPrecision, is_dot_accumulation_type, is_native_f8_dot_type,
 };
@@ -86,11 +86,12 @@ pub enum EinsumLabel {
 
 impl EinsumLabel {
     /// Returns the label that the integer `index` of a label list denotes, or [`None`] if there are not that many
-    /// labels. Indices map to `a` through `z` and then `A` through `Z`, like the consecutive integer labels that
-    /// `jax.numpy.einsum` accepts in place of subscripts, and then to the alphabetic Unicode characters from `À` on in
-    /// the order of their code points, so that every returned label is valid in an [`EinsumSpecification`].
+    /// labels. Indices map to `A` through `Z` and then `a` through `z`, like in the label lists of NumPy, and then to
+    /// the alphabetic Unicode characters from `À` on in the order of their code points. Every returned label is valid
+    /// in an [`EinsumSpecification`], and labels are ordered like their indices, so an implicit output orders its
+    /// labels by their indices, like `jax.numpy.einsum` does for integer labels.
     pub fn from_index(index: usize) -> Option<Self> {
-        const LETTERS: &[u8; 52] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        const LETTERS: &[u8; 52] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         let label = match LETTERS.get(index) {
             Some(letter) => Some(char::from(*letter)),
             None => ('À'..=char::MAX).filter(|label| label.is_alphabetic()).nth(index - LETTERS.len()),
@@ -154,7 +155,7 @@ impl EinsumSpecification {
     /// # use ryft_core::{EinsumLabel, EinsumSpecification};
     /// let labels = |indices: &[usize]| indices.iter().flat_map(|index| EinsumLabel::from_index(*index)).collect();
     /// let inputs = vec![labels(&[0, 1]), labels(&[1, 2])];
-    /// assert_eq!(EinsumSpecification::from_labels(inputs, Some(labels(&[0, 2]))), "ab,bc->ac".parse());
+    /// assert_eq!(EinsumSpecification::from_labels(inputs, Some(labels(&[0, 2]))), "AB,BC->AC".parse());
     /// ```
     pub fn from_labels(inputs: Vec<Vec<EinsumLabel>>, output: Option<Vec<EinsumLabel>>) -> Result<Self, TypeError> {
         if inputs.is_empty() {
@@ -211,12 +212,14 @@ impl EinsumSpecification {
     /// [`EinsumPathStrategy`] of `options`. This is the analogue of `jax.numpy.einsum_path`, and the returned
     /// [`EinsumPlan`] can be executed or staged any number of times.
     ///
-    /// The inputs must have the same element type, because an einsum converts no input implicitly. The exception is
-    /// that inputs may have distinct 8-bit floating-point types when `options` request an accumulation type, like
-    /// the inputs of a [`DotOperation`], which contracts such pairs natively. Each label must
-    /// have one extent across all inputs that contain it, except that inputs may have extent one where others have
-    /// another extent (static or dynamic), in which case they are broadcast. The axes of a label that one input
-    /// repeats must have equal extents. Dynamic extents take part in the path search as extent 8, like in JAX.
+    /// Inputs of different element types are promoted to their common type, like the inputs of the elementwise
+    /// operations and of `jax.numpy.einsum` are. That type is then the accumulation type of the einsum, unless
+    /// `options` request one (refer to [`EinsumOptions::with_accumulation_type`] for the conversions). Element types
+    /// that promote to no common type (e.g., the 8-bit floating-point types with any other type) need a requested
+    /// accumulation type. Each label must have one extent across all inputs that contain it, except that inputs may
+    /// have extent one where others have another extent (static or dynamic), in which case they are broadcast. The
+    /// axes of a label that one input repeats must have equal extents. Dynamic extents take part in the path search
+    /// as extent 8, like in JAX.
     ///
     /// # Errors
     ///
@@ -233,52 +236,15 @@ impl EinsumSpecification {
             ))
             .into());
         }
-        let data_type = input_types[0].data_type();
-        let are_native_f8_types = options.accumulation_type.is_some()
-            && input_types.iter().all(|input_type| is_native_f8_dot_type(input_type.data_type()));
-        if let Some(other) = input_types.iter().map(ArrayType::data_type).find(|other| *other != data_type)
-            && !are_native_f8_types
-        {
-            return Err(TypeError::invalid(format!(
-                "`{EINSUM_NAME}` inputs must have the same element type but got `{data_type}` and `{other}`",
-            ))
-            .into());
+        if options.accumulation_type.is_none() {
+            promoted_type(input_types)?;
         }
         let ranks = input_types.iter().map(ArrayType::rank).collect::<Vec<_>>();
         let (input_names, output_names) = self.expand(&ranks)?;
 
-        // Every label has one extent across the inputs that contain it. An input may have extent one where another
-        // has a different extent, in which case its axis is squeezed away before the two are contracted, but the
-        // axes of a label that one input repeats must agree, because their diagonal is taken. The path search uses
-        // the largest extent of every label and treats a dynamic extent as extent 8, like JAX does.
-        let mut extents = BTreeMap::<char, Dimension>::new();
-        for (index, (names, input_type)) in input_names.iter().zip(input_types).enumerate() {
-            let mut input_extents = BTreeMap::<char, Dimension>::new();
-            for (axis, name) in names.iter().enumerate() {
-                let extent = input_type.dimension(axis);
-                if input_extents.get(name).is_some_and(|other| *other != extent) {
-                    return Err(TypeError::invalid(format!(
-                        "`{EINSUM_NAME}` label `{name}` is repeated in input {index} of type `{input_type}` along \
-                         axes with different extents",
-                    ))
-                    .into());
-                }
-                input_extents.insert(*name, extent.clone());
-                match extents.get(name) {
-                    Some(other) if *other == extent || extent == Dimension::Static(1) => {}
-                    Some(other) if *other != Dimension::Static(1) => {
-                        return Err(TypeError::invalid(format!(
-                            "`{EINSUM_NAME}` label `{name}` has extent `{extent}` in input {index} but extent \
-                             `{other}` in an earlier input",
-                        ))
-                        .into());
-                    }
-                    _ => {
-                        extents.insert(*name, extent);
-                    }
-                }
-            }
-        }
+        // The path search uses the largest extent of every label and treats a dynamic extent as extent 8, like JAX
+        // does.
+        let extents = label_extents(&input_names, input_types)?;
         let sizes = extents
             .iter()
             .map(|(name, extent)| (*name, extent.value().map_or(8, |extent| extent as u128)))
@@ -684,7 +650,9 @@ impl EinsumOptions {
         self
     }
 
-    /// Returns these options with the provided accumulation type, which is the element type of the output. Every
+    /// Returns these options with the provided accumulation type, which is the element type of the output. Without
+    /// one, inputs of one element type are never converted, and inputs of different element types accumulate at the
+    /// type that they promote to. Every
     /// pairwise contraction accumulates at it (refer to [`DotOperation::with_accumulation_type`]), and the output is
     /// converted to it last. Where a contraction or a sum cannot do that itself, element types are converted like
     /// JAX converts them:
@@ -879,14 +847,14 @@ impl EinsumPlan {
                 lhs.dot_with_configuration(rhs, dimensions, precision, accumulation_type, output_sharding)
             },
         };
-        self.execute(inputs, self.options.accumulation_type, precision, &mut steps)
+        self.execute(inputs, self.options.accumulation_type, true, precision, &mut steps)
     }
 
     /// Executes or stages this plan on `inputs` like [`Self::contract`], but with `contraction` as the pairwise
     /// contraction. This is the analogue of the experimental `_dot_general` argument of `jax.numpy.einsum`, and it
     /// lets an einsum use another bilinear contraction (e.g., a quantized dot). The precision and the accumulation
     /// type of the [`EinsumOptions`] of this plan are not used, because `contraction` selects its own, and no
-    /// element type is converted.
+    /// element type is converted, so inputs of different element types reach `contraction` as they are.
     ///
     /// # Parameters
     ///
@@ -918,7 +886,7 @@ impl EinsumPlan {
              dimensions: &DotDimensionNumbers,
              _: Option<DataType>,
              output_sharding: Option<&Sharding>| { contraction(lhs, rhs, dimensions, output_sharding) };
-        self.execute(inputs, None, DotPrecision::default(), &mut ValueSteps { contraction })
+        self.execute(inputs, None, false, DotPrecision::default(), &mut ValueSteps { contraction })
     }
 
     /// Infers the type of the output of [`Self::contract`] for the input types of this plan, together with the number
@@ -926,7 +894,8 @@ impl EinsumPlan {
     fn infer(&self) -> Result<(ArrayType, usize), ProgramError> {
         let mut steps = TypeSteps { precision: self.options.precision, instruction_count: 0 };
         let options = &self.options;
-        let output_type = self.execute(&self.input_types, options.accumulation_type, options.precision, &mut steps)?;
+        let output_type =
+            self.execute(&self.input_types, options.accumulation_type, true, options.precision, &mut steps)?;
         Ok((output_type, steps.instruction_count))
     }
 
@@ -937,6 +906,7 @@ impl EinsumPlan {
         &self,
         inputs: &[V],
         accumulation_type: Option<DataType>,
+        promotes_inputs: bool,
         precision: DotPrecision,
         steps: &mut S,
     ) -> Result<V, ProgramError> {
@@ -950,8 +920,9 @@ impl EinsumPlan {
             ))
             .into());
         }
-        for (index, (input, names)) in inputs.iter().zip(&self.input_labels).enumerate() {
-            let rank = steps.array_type(input).rank();
+        let input_types = inputs.iter().map(|input| steps.array_type(input)).collect::<Vec<_>>();
+        for (index, (input_type, names)) in input_types.iter().zip(&self.input_labels).enumerate() {
+            let rank = input_type.rank();
             if rank != names.len() {
                 return Err(TypeError::invalid(format!(
                     "`{}` subscript {} of `{}` does not match the rank {} of its input",
@@ -961,6 +932,17 @@ impl EinsumPlan {
             }
         }
 
+        // A plan that is reused for inputs of other types validates their label extents like a new plan would.
+        if input_types != self.input_types {
+            label_extents(&self.input_labels, &input_types)?;
+        }
+
+        // Inputs of different element types accumulate at the type that they promote to, unless an accumulation type
+        // is requested. A custom contraction receives its inputs as they are.
+        let accumulation_type = match accumulation_type {
+            None if promotes_inputs => promoted_type(&input_types)?,
+            accumulation_type => accumulation_type,
+        };
         let mut state = EinsumExecution { steps, accumulation_type, precision };
         let mut values = inputs.to_vec();
         for (index, step) in self.steps.iter().enumerate() {
@@ -1651,8 +1633,20 @@ impl EinsumSteps<ArrayType> for TypeSteps {
             value.diagonal(0, kept_axis, removed_axis)
         } else {
             self.instruction_count += 6;
+            let input = std::slice::from_ref(value);
+            let indices = |axis: usize| -> Result<ArrayType, ProgramError> {
+                let operation = IotaLikeOperation::<ArrayType>::new(axis, DataType::I64)?;
+                Ok(operation.infer_output_types(input, &[])?.remove(0))
+            };
+            let mask = CompareOperation::<ArrayType>::new(ComparisonDirection::Equal)
+                .infer_output_types(&[indices(kept_axis)?, indices(removed_axis)?], &[])?
+                .remove(0);
+            let zeros = ZeroLikeOperation::<ArrayType>::new().infer_output_types(input, &[])?.remove(0);
+            let diagonal = SelectOperation::<ArrayType>::new()
+                .infer_output_types(&[mask, value.clone(), zeros], &[])?
+                .remove(0);
             let operation = ReduceOperation::new(vec![removed_axis], sum_kind(value.data_type()));
-            Ok(operation.infer_output_types(std::slice::from_ref(value), &[])?.remove(0))
+            Ok(operation.infer_output_types(&[diagonal], &[])?.remove(0))
         }
     }
 
@@ -1731,24 +1725,32 @@ impl<S> EinsumExecution<'_, S> {
         }
     }
 
-    /// Sums `value` along `axes` after converting it to the accumulation type when one is requested, unless the
-    /// element type of `value` is the type that the two promote to. This is the conversion rule of JAX, which sums at
-    /// the element type of `value` only when the accumulation type adds nothing to it. Types without a common
-    /// promotion (i.e., the 8-bit floating-point types with any other type) are converted as well.
-    fn sum<V>(&mut self, value: V, axes: &[usize], output_sharding: Option<&Sharding>) -> Result<V, ProgramError>
+    /// Converts `value` to the accumulation type when one is requested, unless the element type of `value` is the
+    /// type that the two promote to. This is the conversion that JAX applies before it sums, which sums at the
+    /// element type of `value` only when the accumulation type adds nothing to it. Types without a common promotion
+    /// (i.e., the 8-bit floating-point types with any other type) are converted as well.
+    fn accumulated<V>(&mut self, value: V) -> Result<V, ProgramError>
     where
         S: EinsumSteps<V>,
     {
         let data_type = self.steps.array_type(&value).data_type();
-        let value = match self.accumulation_type {
+        match self.accumulation_type {
             Some(accumulation_type)
                 if data_type != accumulation_type
                     && DataType::promoted(&[data_type, accumulation_type]).ok() != Some(data_type) =>
             {
-                self.steps.convert_element_type(&value, accumulation_type)?
+                self.steps.convert_element_type(&value, accumulation_type)
             }
-            _ => value,
-        };
+            _ => Ok(value),
+        }
+    }
+
+    /// Sums `value` along `axes` after converting it like [`Self::accumulated`] does.
+    fn sum<V>(&mut self, value: V, axes: &[usize], output_sharding: Option<&Sharding>) -> Result<V, ProgramError>
+    where
+        S: EinsumSteps<V>,
+    {
+        let value = self.accumulated(value)?;
         self.steps.reduce_sum(&value, axes, output_sharding)
     }
 
@@ -1781,7 +1783,8 @@ impl<S> EinsumExecution<'_, S> {
     }
 
     /// Replaces every label that `counts` records as repeated in `value` by its diagonal, which takes the place of
-    /// the last axis of the label, and sums the diagonals of the labels that `keep_names` does not contain. With an
+    /// the last axis of the label, and sums the diagonals of the labels that `keep_names` does not contain. A diagonal
+    /// that is kept is converted like the input of a sum. With an
     /// `output`, which holds a requested output sharding and the labels of the axes that it describes, the sum of
     /// the last repeated label receives that sharding in the order of its own axes.
     fn sum_repeats<V>(
@@ -1811,6 +1814,10 @@ impl<S> EinsumExecution<'_, S> {
                     .map(|(sharding, output_names)| sharding_in_order(sharding, &names, output_names))
                     .transpose()?;
                 value = self.sum(value, &[axis], output_sharding.as_ref())?;
+            } else {
+                // JAX takes a kept diagonal with a sum over its masked input, which converts that input like every
+                // other sum, so the diagonal is converted as well.
+                value = self.accumulated(value)?;
             }
         }
         Ok((value, names))
@@ -2305,7 +2312,7 @@ impl<'o> PathSearch<'o> {
                 }
                 let first_size = size_of(&self.inputs[first], self.sizes);
                 let second_size = size_of(&self.inputs[second], self.sizes);
-                let cost = signed(result_size) - signed(first_size) - signed(second_size);
+                let cost = signed(result_size).saturating_sub(signed(first_size)).saturating_sub(signed(second_size));
                 candidates.push((cost, result_flops, new_flops, new_size, first, second, result));
             }
             if !candidates.is_empty() {
@@ -2434,7 +2441,9 @@ fn noisy_greedy_ssa_path(
                     })
                     .copied()
                     .collect::<LabelSet>();
-                let cost = signed(size_of(&result, sizes)) - signed(footprints[first]) - signed(footprints[second]);
+                let cost = signed(size_of(&result, sizes))
+                    .saturating_sub(signed(footprints[first]))
+                    .saturating_sub(signed(footprints[second]));
                 let (first, second) =
                     if remaining[first] > remaining[second] { (second, first) } else { (first, second) };
                 (cost, remaining[second], remaining[first], first.clone(), second.clone(), result)
@@ -2915,6 +2924,61 @@ fn ssa_to_linear(ssa_path: &[(usize, usize)]) -> Vec<(usize, usize)> {
     path
 }
 
+/// Returns the element type that inputs of the provided types are promoted to, or [`None`] if they all have one
+/// element type and need no promotion. The promotion is the one of the elementwise operations (refer to
+/// [`DataType::promoted`]).
+fn promoted_type(input_types: &[ArrayType]) -> Result<Option<DataType>, TypeError> {
+    let mut data_types = input_types.iter().map(ArrayType::data_type).collect::<Vec<_>>();
+    data_types.dedup();
+    if data_types.len() <= 1 {
+        return Ok(None);
+    }
+    DataType::promoted(&data_types).map(Some).map_err(|_| {
+        data_types.sort_by_key(ToString::to_string);
+        data_types.dedup();
+        let data_types = data_types.iter().map(|data_type| format!("`{data_type}`")).collect::<Vec<_>>().join(", ");
+        TypeError::invalid(format!(
+            "`{EINSUM_NAME}` inputs have the element types {data_types}, which promote to no common type, so they \
+             require an accumulation type",
+        ))
+    })
+}
+
+/// Returns the extent of every label of an einsum whose inputs have the provided labels and types, validating that
+/// each label has one extent across the inputs that contain it. An input may have extent one where another has a
+/// different extent, in which case its axis is squeezed away before the two are contracted, but the axes of a label
+/// that one input repeats must provably have equal extents, because their diagonal is taken. The extent of a label is
+/// the one of its axes that do not have extent one.
+fn label_extents(input_names: &[Vec<char>], input_types: &[ArrayType]) -> Result<BTreeMap<char, Dimension>, TypeError> {
+    let mut extents = BTreeMap::<char, Dimension>::new();
+    for (index, (names, input_type)) in input_names.iter().zip(input_types).enumerate() {
+        let mut input_extents = BTreeMap::<char, Dimension>::new();
+        for (axis, name) in names.iter().enumerate() {
+            let extent = input_type.dimension(axis);
+            if input_extents.get(name).is_some_and(|other| !other.has_equal_extents(&extent)) {
+                return Err(TypeError::invalid(format!(
+                    "`{EINSUM_NAME}` label `{name}` is repeated in input {index} of type `{input_type}` along axes \
+                     with different extents",
+                )));
+            }
+            input_extents.insert(*name, extent.clone());
+            match extents.get(name) {
+                Some(other) if other.has_equal_extents(&extent) || extent == Dimension::Static(1) => {}
+                Some(other) if *other != Dimension::Static(1) => {
+                    return Err(TypeError::invalid(format!(
+                        "`{EINSUM_NAME}` label `{name}` has extent `{extent}` in input {index} but extent `{other}` \
+                         in an earlier input",
+                    )));
+                }
+                _ => {
+                    extents.insert(*name, extent);
+                }
+            }
+        }
+    }
+    Ok(extents)
+}
+
 /// Returns `true` if every extent of `type` is static.
 fn is_static(r#type: &ArrayType) -> bool {
     r#type.shape().dimensions().iter().all(|dimension| dimension.value().is_some())
@@ -3092,7 +3156,7 @@ mod tests {
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::macros::check_gradient;
-    use crate::operations::arithmetic::Add;
+    use crate::operations::arithmetic::{Add, Mul};
     use crate::operations::dot::{DotAlgorithm, DotAlgorithmPreset};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::Provenance;
@@ -3126,10 +3190,10 @@ mod tests {
 
     #[test]
     fn test_einsum_label_from_index() {
-        assert_eq!(EinsumLabel::from_index(0), Some(EinsumLabel::Named('a')));
-        assert_eq!(EinsumLabel::from_index(25), Some(EinsumLabel::Named('z')));
-        assert_eq!(EinsumLabel::from_index(26), Some(EinsumLabel::Named('A')));
-        assert_eq!(EinsumLabel::from_index(51), Some(EinsumLabel::Named('Z')));
+        assert_eq!(EinsumLabel::from_index(0), Some(EinsumLabel::Named('A')));
+        assert_eq!(EinsumLabel::from_index(25), Some(EinsumLabel::Named('Z')));
+        assert_eq!(EinsumLabel::from_index(26), Some(EinsumLabel::Named('a')));
+        assert_eq!(EinsumLabel::from_index(51), Some(EinsumLabel::Named('z')));
         assert_eq!(EinsumLabel::from_index(52), Some(EinsumLabel::Named('À')));
 
         // Characters that are not alphabetic are skipped (e.g., `×` between `Ö` and `Ø`), so that every label is
@@ -3138,6 +3202,9 @@ mod tests {
         assert_eq!(EinsumLabel::from_index(75), Some(EinsumLabel::Named('Ø')));
         let labels = (0..200).flat_map(EinsumLabel::from_index).collect::<Vec<_>>();
         assert_eq!(labels.len(), 200);
+
+        // Labels are ordered like their indices, which is the order of an implicit output.
+        assert!(labels.is_sorted());
         assert!(EinsumSpecification::from_labels(vec![labels.clone()], Some(labels)).is_ok());
         assert_eq!(EinsumLabel::from_index(usize::MAX), None);
         assert_eq!(EinsumLabel::from('q'), EinsumLabel::Named('q'));
@@ -3159,7 +3226,15 @@ mod tests {
         let indices = |indices: &[usize]| indices.iter().flat_map(|index| EinsumLabel::from_index(*index)).collect();
         let implicit = EinsumSpecification::from_labels(vec![indices(&[0, 1]), indices(&[1, 2])], None).unwrap();
         assert_eq!(implicit.output(), None);
-        assert_eq!(implicit.to_string(), "ab,bc");
+        assert_eq!(implicit.to_string(), "AB,BC");
+
+        // An implicit output orders its labels by their indices, like JAX does for integer labels, so the labels
+        // `[26, 0]` of a matrix denote its transpose.
+        let transposed = EinsumSpecification::from_labels(vec![indices(&[26, 0])], None).unwrap();
+        let matrix_type = ArrayType::new_static(DataType::F64, [2, 3]);
+        let plan = transposed.plan(std::slice::from_ref(&matrix_type), &EinsumOptions::new()).unwrap();
+        assert_eq!(plan.output_labels(), &['A', 'a']);
+        assert_eq!(plan.output_type(), Ok(ArrayType::new_static(DataType::F64, [3, 2])));
         let ellipsis = vec![EinsumLabel::Ellipsis, EinsumLabel::Named('i')];
         let batched = EinsumSpecification::from_labels(vec![ellipsis.clone()], Some(vec![EinsumLabel::Ellipsis]));
         assert_eq!(batched.unwrap().to_string(), "...i->...");
@@ -3244,15 +3319,28 @@ mod tests {
                 "`einsum` subscript 0 of `...ij` does not match the rank 1 of its input",
             ))),
         );
+        // Inputs of different element types are promoted to their common type, and element types without one need
+        // an accumulation type.
         let specification = "ij,jk".parse::<EinsumSpecification>().unwrap();
+        let mixed = [ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::F64, [3, 4])];
         assert_eq!(
-            specification.plan(
-                &[ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::F64, [3, 4])],
-                &EinsumOptions::new(),
-            ),
+            specification.plan(&mixed, &EinsumOptions::new()).unwrap().output_type(),
+            Ok(ArrayType::new_static(DataType::F64, [2, 4])),
+        );
+        let narrow = [ArrayType::new_static(DataType::F8E5M2, [2, 3]), ArrayType::new_static(DataType::F32, [3, 4])];
+        assert_eq!(
+            specification.plan(&narrow, &EinsumOptions::new()),
             Err(ProgramError::Type(TypeError::invalid(
-                "`einsum` inputs must have the same element type but got `f32` and `f64`",
+                "`einsum` inputs have the element types `f32`, `f8e5m2`, which promote to no common type, so they \
+                 require an accumulation type",
             ))),
+        );
+        assert_eq!(
+            specification
+                .plan(&narrow, &EinsumOptions::new().with_accumulation_type(DataType::F32))
+                .unwrap()
+                .output_type(),
+            Ok(ArrayType::new_static(DataType::F32, [2, 4])),
         );
 
         // Every label has one extent, except for inputs of extent one, which are broadcast.
@@ -5643,6 +5731,19 @@ mod tests {
             planned_path(&subscripts, &shapes, EinsumPathStrategy::RandomGreedy(128)),
         );
 
+        // The costs of the searches saturate for sizes that no array can have, where they must not overflow.
+        let extent = 1usize << 43;
+        let shapes: &[&[usize]] = &[&[extent, extent, extent], &[extent, extent, extent, 1], &[1]];
+        for strategy in [
+            EinsumPathStrategy::Greedy,
+            EinsumPathStrategy::Branch(None),
+            EinsumPathStrategy::RandomGreedy(4),
+            EinsumPathStrategy::Optimal,
+            EinsumPathStrategy::DynamicProgramming,
+        ] {
+            assert_eq!(planned_path("abc,abcd,d->", shapes, strategy.clone()).len(), 2, "{strategy:?}");
+        }
+
         // Counts must be positive.
         let types = vec![ArrayType::new_static(DataType::F64, [2, 2]); 3];
         let plan = |strategy: EinsumPathStrategy| {
@@ -5914,6 +6015,46 @@ mod tests {
             plan.contract(&[inputs[0].clone(), Array::vector(vec![1.0, 2.0, 3.0]).unwrap()]),
             Err(ProgramError::Type(TypeError::invalid(
                 "`einsum` subscript 1 of `ij,jk->ik` does not match the rank 1 of its input",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_einsum_plan_contract_validation() {
+        // A plan that is reused for other inputs validates their ranks and label extents like a new plan would.
+        let plan = "ii->i"
+            .parse::<EinsumSpecification>()
+            .unwrap()
+            .plan(&[ArrayType::new_static(DataType::F64, [2, 2])], &EinsumOptions::new())
+            .unwrap();
+        assert_eq!(
+            plan.contract(&[reference_input(0, &[3, 3])]),
+            Array::einsum("ii->i", [&reference_input(0, &[3, 3])])
+        );
+        assert_eq!(
+            plan.contract(&[reference_input(0, &[2, 3])]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`einsum` label `i` is repeated in input 0 of type `f64[2, 3]` along axes with different extents",
+            ))),
+        );
+        assert_eq!(
+            plan.contract(&[reference_input(0, &[2])]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`einsum` subscript 0 of `ii->i` does not match the rank 1 of its input",
+            ))),
+        );
+        let plan = "ij,jk->ik"
+            .parse::<EinsumSpecification>()
+            .unwrap()
+            .plan(
+                &[ArrayType::new_static(DataType::F64, [2, 3]), ArrayType::new_static(DataType::F64, [3, 2])],
+                &EinsumOptions::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            plan.contract(&[reference_input(0, &[2, 3]), reference_input(1, &[4, 2])]),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`einsum` label `j` has extent `4` in input 1 but extent `3` in an earlier input",
             ))),
         );
     }
@@ -6636,7 +6777,8 @@ mod tests {
         assert_eq!(
             Array::einsum("ij,jk->ik", [&lhs, &rhs]),
             Err(ProgramError::Type(TypeError::invalid(
-                "`einsum` inputs must have the same element type but got `f8e4m3fn` and `f8e5m2`",
+                "`einsum` inputs have the element types `f8e4m3fn`, `f8e5m2`, which promote to no common type, so \
+                 they require an accumulation type",
             ))),
         );
 
@@ -6695,6 +6837,33 @@ mod tests {
             Array::einsum_with_options(&"i,i,i->".parse().unwrap(), [&complex, &complex, &complex], &options),
             Ok(Array::scalar(18.46875f32).unwrap()),
         );
+
+        // A diagonal that is kept is converted like the input of a sum, because JAX takes it with a sum. The complex
+        // diagonal below therefore loses its imaginary components before it is contracted.
+        let diagonal =
+            [Complex::new(1.0f32, 1.0), Complex::new(0.0, 0.0), Complex::new(0.0, 0.0), Complex::new(2.0, 1.0)];
+        let matrix = Array::matrix(2, 2, diagonal.to_vec()).unwrap();
+        let vector = Array::vector(vec![Complex::new(1.0f32, 1.0), Complex::new(2.0, 1.0)]).unwrap();
+        let options = EinsumOptions::new().with_accumulation_type(DataType::F64);
+        let specification = "ii,i->".parse::<EinsumSpecification>().unwrap();
+        assert_eq!(
+            Array::einsum_with_options(&specification, [&matrix, &vector], &options),
+            Ok(Array::scalar(5.0f64).unwrap()),
+        );
+        let function = einsum_with_options::<ArrayContext>(specification.clone(), options.clone()).unwrap();
+        assert_eq!(function.call(vec![matrix.clone(), vector.clone()]), Ok(Array::scalar(5.0f64).unwrap()));
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<DomainTracer<ArrayContext>>| {
+                DomainTracer::<ArrayContext>::einsum_with_options(&specification, inputs.iter(), &options)
+            },
+            vec![
+                ArrayType::new(DataType::C64, Shape::new(vec![extent.clone(), extent.clone()])),
+                ArrayType::new(DataType::C64, Shape::new(vec![extent])),
+            ],
+        )
+        .unwrap();
+        assert_eq!(program.interpret(vec![matrix, vector]), Ok(Array::scalar(5.0f64).unwrap()));
 
         // An algorithm converts integer and Boolean inputs to the types that it computes with, like in JAX.
         let integers = Array::vector(vec![1i32, 2]).unwrap();
@@ -6866,6 +7035,77 @@ mod tests {
             )
             .unwrap(),
         );
+    }
+
+    #[test]
+    fn test_einsum_promotion() {
+        // Inputs of different element types are promoted to their common type, like the inputs of the elementwise
+        // operations and of `jax.numpy.einsum` are.
+        let integers = Array::vector(vec![1i32, 2]).unwrap();
+        let floats = Array::vector(vec![1.5f32, 2.5]).unwrap();
+        let halves = Array::vector(vec![f16::from_f32(1.0), f16::from_f32(2.0)]).unwrap();
+        let mask = Array::vector(vec![true, false]).unwrap();
+        assert_eq!(Array::einsum("i,i->", [&integers, &floats]), Ok(Array::scalar(6.5f32).unwrap()));
+        assert_eq!(Array::einsum("i,i->", [&floats, &integers]), Ok(Array::scalar(6.5f32).unwrap()));
+        assert_eq!(Array::einsum("i,i->", [&floats, &halves]), Ok(Array::scalar(6.5f32).unwrap()));
+        assert_eq!(Array::einsum("i,i->i", [&mask, &floats]), Ok(Array::vector(vec![1.5f32, 0.0]).unwrap()));
+        assert_eq!(Array::einsum("i,i->i", [&integers, &floats]), integers.mul(&floats));
+
+        // Sums and repeated labels of an input are converted like in JAX, and inputs of one element type among
+        // inputs of other types are contracted at the promoted type.
+        let matrix = Array::matrix(2, 2, vec![1i32, 2, 3, 4]).unwrap();
+        assert_eq!(Array::einsum("ij,k->k", [&matrix, &floats]), Ok(Array::vector(vec![15.0f32, 25.0]).unwrap()));
+        assert_eq!(Array::einsum("ii,i->", [&matrix, &floats]), Ok(Array::scalar(11.5f32).unwrap()));
+        assert_eq!(
+            Array::einsum("ij,jk,k->i", [&matrix, &matrix, &floats]),
+            Ok(Array::vector(vec![35.5f32, 77.5]).unwrap()),
+        );
+
+        // A requested accumulation type takes the place of the promoted type.
+        let options = EinsumOptions::new().with_accumulation_type(DataType::F64);
+        assert_eq!(
+            Array::einsum_with_options(&"i,i->".parse().unwrap(), [&integers, &floats], &options),
+            Ok(Array::scalar(6.5f64).unwrap()),
+        );
+
+        // The staged program converts the inputs before it contracts them, and a composite does the same.
+        let input_types = vec![ArrayType::new_static(DataType::I32, [2]), ArrayType::new_static(DataType::F32, [2])];
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<DomainTracer<ArrayContext>>| Einsum::einsum("i,i->", inputs.iter()),
+            input_types.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i32[2], %1:f32[2] .
+                let %2:f32[2] = convert_element_type [data_type=f32] %0
+                    %3:f32[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                    ] %2 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        let plan = "i,i->".parse::<EinsumSpecification>().unwrap().plan(&input_types, &EinsumOptions::new()).unwrap();
+        assert_eq!(plan.output_type(), Ok(ArrayType::scalar(DataType::F32)));
+        assert_eq!(plan.infer().unwrap().1, program.instructions().len());
+        let function = einsum::<ArrayContext>("i,j,j->i").unwrap();
+        assert_eq!(
+            function.call(vec![integers.clone(), floats.clone(), integers.clone()]),
+            Ok(Array::vector(vec![6.5f32, 13.0]).unwrap()),
+        );
+
+        // A custom contraction receives inputs of different element types as they are.
+        let mut received = Vec::new();
+        let contracted = plan.contract_with(&[integers.clone(), floats.clone()], |lhs, rhs, dimensions, _| {
+            received.push((lhs.r#type().data_type(), rhs.r#type().data_type()));
+            lhs.convert_element_type(DataType::F32)?.dot(rhs, dimensions)
+        });
+        assert_eq!(contracted, Ok(Array::scalar(6.5f32).unwrap()));
+        assert_eq!(received.len(), 1);
+        assert!(received[0] == (DataType::I32, DataType::F32) || received[0] == (DataType::F32, DataType::I32));
     }
 
     #[test]
@@ -7116,6 +7356,34 @@ mod tests {
                 "{extent}",
             );
         }
+
+        // The inferred type of a plan validates every operation of the sum, like its execution does. An input that is
+        // unreduced over a mesh axis has no index arrays, so both reject it.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));
+        let unreduced_type = ArrayType::new(DataType::F64, Shape::new(vec![extent.clone(), extent]))
+            .with_sharding(Sharding::replicated(mesh, 2).with_unreduced_axes(["x"]).unwrap())
+            .unwrap();
+        let plan = "ii->i"
+            .parse::<EinsumSpecification>()
+            .unwrap()
+            .plan(std::slice::from_ref(&unreduced_type), &EinsumOptions::new())
+            .unwrap();
+        let staged =
+            ArrayContext::trace(|inputs: Vec<DomainTracer<ArrayContext>>| plan.contract(&inputs), vec![unreduced_type]);
+        assert!(plan.output_type().is_err());
+        assert_eq!(plan.output_type().err(), staged.err());
+
+        // The axes of a repeated label may have distinct dimensions whose extents are provably equal.
+        let extent = Dimension::Dynamic(DimensionVariable::new("p", DimensionBounds::new(2, Some(3)).unwrap()));
+        let proven_type = ArrayType::new(DataType::F64, Shape::new(vec![extent, 2.into()]));
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<DomainTracer<ArrayContext>>| Einsum::einsum("ii->i", inputs.iter()),
+            vec![proven_type],
+        )
+        .unwrap();
+        let square = reference_input(0, &[2, 2]);
+        assert_eq!(program.interpret(vec![square.clone()]), Array::einsum("ii->i", [&square]));
 
         // Homogeneous array values with a dynamic extent stage the same sum, including through a composite.
         let extent = Dimension::Dynamic(DimensionVariable::new("n", DimensionBounds::new(1, Some(8)).unwrap()));

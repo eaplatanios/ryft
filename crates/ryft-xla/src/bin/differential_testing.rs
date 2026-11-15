@@ -185,10 +185,7 @@ fn values_to_bytes<V: Copy>(values: &[V]) -> Vec<u8> {
 
 /// Decodes native-endian `f32` values copied from a PJRT buffer.
 fn f32_values_from_bytes(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(size_of::<f32>())
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().unwrap()))
-        .collect()
+    bytes.as_chunks::<{ size_of::<f32>() }>().0.iter().map(|bytes| f32::from_ne_bytes(*bytes)).collect()
 }
 
 /// Returns the four-device manual mesh shared by the collective cases.
@@ -457,7 +454,9 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
     };
     let surface_output = output
         .to_f64s()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|values| values.iter().map(|value| *value as f32).collect::<Vec<_>>())
         .collect::<Vec<_>>();
     let lowered_output = outputs.iter().map(|device| device[0].clone()).collect::<Vec<_>>();

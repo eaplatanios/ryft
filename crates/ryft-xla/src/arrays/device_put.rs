@@ -4,7 +4,8 @@
 
 use half::{bf16, f16};
 use ryft_core::{
-    ArrayType, DataType, Device, Dimension as CoreDimension, Parameter, Parameterized, ParameterizedFamily, Shape,
+    Array as CoreArray, ArrayType, DataType, Device, Dimension as CoreDimension, Parameter, Parameterized,
+    ParameterizedFamily, Shape, Typed,
 };
 
 use crate::arrays::placement::DevicePutTarget;
@@ -108,8 +109,8 @@ impl DevicePutOptions<DevicePutTarget, DevicePutTarget, bool, Option<bool>> {
 /// Leaf types accepted by [`Domain::device_put`].
 ///
 /// A [`DevicePutLeaf`] consumes one input leaf and materializes one runtime [`Array`] leaf. `ryft` currently provides
-/// implementations for runtime [`Array`] leaves, primitive scalar host values, and owned `ndarray::Array`s when the
-/// `ndarray` feature is enabled.
+/// implementations for runtime [`Array`] leaves, primitive scalar host values, and host arrays of the reference backend
+/// ([`ryft_core::Array`]), which are uploaded as dense arrays whatever their host layout is.
 pub trait DevicePutLeaf<'c>: Parameter {
     /// Converts `self` into one runtime [`Array`] using the provided leafwise placement options.
     ///
@@ -388,16 +389,11 @@ impl_scalar_dense_host_leaf!(f16);
 impl_scalar_dense_host_leaf!(f32);
 impl_scalar_dense_host_leaf!(f64);
 
-#[cfg(feature = "ndarray")]
-impl<T: Clone + DenseHostElement, D: ndarray::Dimension> DenseHostDevicePutLeaf for ndarray::Array<T, D> {
+impl DenseHostDevicePutLeaf for CoreArray {
     fn into_dense_host_array(self) -> (Vec<usize>, DataType, Vec<u8>) {
-        let standard_layout = self.as_standard_layout().to_owned();
-        let element_count = standard_layout.len();
-        let mut bytes = Vec::with_capacity(element_count * size_of::<T>());
-        for element in standard_layout.iter() {
-            element.append_ne_bytes(&mut bytes);
-        }
-        (standard_layout.shape().to_vec(), T::DATA_TYPE, bytes)
+        // A host array holds materialized storage, which only a type with static extents can describe.
+        let shape = self.r#type().static_shape().unwrap();
+        (shape.as_slice().to_vec(), self.r#type().data_type(), self.logical_bytes())
     }
 }
 
@@ -474,6 +470,19 @@ mod tests {
             .unwrap();
         assert_eq!(placed.mesh().devices(), [device]);
         assert_eq!(placed.copy_to_host().unwrap(), bf16::from_f32(1.5).to_bits().to_ne_bytes().to_vec());
+    }
+
+    #[test]
+    fn test_domain_device_put_uploads_reference_backend_arrays() {
+        let client = cpu_client(1);
+        let domain = Session::new(&client).domain();
+        let matrix = CoreArray::matrix(2, 3, vec![1f32, 2., 3., 4., 5., 6.]).unwrap();
+        let array = domain.device_put(matrix, DevicePutOptions::defaults()).unwrap();
+        assert_eq!(
+            array.r#type().into_owned().with_sharding(None).unwrap(),
+            ArrayType::new_static(DataType::F32, [2, 3]),
+        );
+        assert_eq!(values_from_bytes::<f32>(&array.copy_to_host().unwrap()), vec![1., 2., 3., 4., 5., 6.]);
     }
 
     #[test]

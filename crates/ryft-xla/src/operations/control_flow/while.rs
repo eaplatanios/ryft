@@ -451,8 +451,8 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
                     finished_region.append_block(finished_block)?;
                     let guarded_condition = body_block_ref.append_operation(stable_hlo::r#if(
                         evaluate_condition,
-                        condition_region.into(),
-                        finished_region.into(),
+                        condition_region,
+                        finished_region,
                         location,
                     )?)?;
                     set_threaded_effect_tokens(&mut body_effect_tokens, threaded_effects, |offset| {
@@ -489,8 +489,8 @@ impl LowerableOperation for WhileOperation<ArrayIrType> {
 
         let operation = block.append_operation(stable_hlo::r#while(
             state_values.as_slice(),
-            condition_region.into(),
-            body_region.into(),
+            condition_region,
+            body_region,
             location,
         )?)?;
         set_threaded_effect_tokens(effect_tokens, threaded_effects, |offset| {

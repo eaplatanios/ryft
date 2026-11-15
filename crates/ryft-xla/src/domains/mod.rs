@@ -451,7 +451,7 @@ pub(crate) mod tests {
     /// Uploads a replicated Boolean test scalar using one byte per element.
     pub(crate) fn boolean_scalar<'c>(domain: &Domain<'c>, mesh: &DeviceMesh, value: bool) -> Array<'c> {
         let r#type = replicated_scalar_type(mesh, DataType::Boolean);
-        Array::from_host_buffer(domain, r#type, mesh.clone(), &[u8::from(value)]).unwrap()
+        Array::from_host_buffer(domain, r#type, mesh.clone(), [u8::from(value)]).unwrap()
     }
 
     /// Reads the first addressable shard as native-endian `f32` values.
@@ -553,8 +553,7 @@ pub(crate) mod tests {
     fn test_domain_with_compilation_options() {
         let client = execution_client();
         let domain = Session::new(&client).domain();
-        let mut compilation_options = CompilationOptions::default();
-        compilation_options.compile_portable_executable = true;
+        let compilation_options = CompilationOptions { compile_portable_executable: true, ..Default::default() };
         let sibling = domain.with_compilation_options(compilation_options.clone());
         assert!(Arc::ptr_eq(domain.session(), sibling.session()));
         assert!(Arc::ptr_eq(&domain.effect_scope, &sibling.effect_scope));

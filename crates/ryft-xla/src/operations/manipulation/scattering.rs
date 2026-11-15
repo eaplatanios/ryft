@@ -108,9 +108,11 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
         let shape_source = indices_type.static_shape().is_none().then_some(input_values[1]);
         let mut upper_bounds = Vec::new();
         let mut sentinels = Vec::new();
+        let mut fits = None;
         for &axis in dimensions.scatter_dimensions_to_operand_dimensions() {
             let extent = lower_runtime_dimension_size_i64(input_values[0], axis, block, context, location)?;
-            let window = match window_axes.iter().position(|window_axis| *window_axis == axis) {
+            let position = window_axes.iter().position(|window_axis| *window_axis == axis);
+            let window = match position {
                 Some(position) => lower_runtime_dimension_size_i64(
                     input_values[2],
                     dimensions.update_window_dimensions()[position],
@@ -120,9 +122,47 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
                 )?,
                 None => lower_static_index_constants(&[1], block, context, location)?[0],
             };
-            upper_bounds.push(
-                block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref(),
-            );
+            let mut upper_bound =
+                block.append_operation(stable_hlo::subtract(extent, window, location)?)?.result(0).unwrap().as_ref();
+
+            // Type inference compares an update window with its input window only when both are static, and a dynamic
+            // update window must equal its input extent (see above). A static window can therefore exceed the runtime
+            // extent of a dynamic input axis whose minimum extent is smaller. No start fits such a window, and the
+            // negative bound would wrap when converted to an unsigned index type. `Clip` saturates the bound at zero,
+            // starting the window at zero, and `Drop` rejects every window. A window of one exceeds only an empty
+            // axis, whose output has no elements, so it needs neither.
+            let static_window = match position {
+                Some(position) => match input_types[2].dimension(dimensions.update_window_dimensions()[position]) {
+                    CoreDimension::Static(window) => window,
+                    CoreDimension::Dynamic(_) => 0,
+                },
+                None => 1,
+            };
+            if static_window > input_types[0].dimension(axis).bounds().lower().max(1) {
+                let zero = lower_static_index_constants(&[0], block, context, location)?[0];
+                if operation.mode() == ScatterMode::Clip {
+                    upper_bound = block
+                        .append_operation(stable_hlo::maximum(upper_bound, zero, location)?)?
+                        .result(0)
+                        .unwrap()
+                        .as_ref();
+                } else {
+                    let fit = lower_compare_to_mlir(
+                        ComparisonDirection::GreaterThanOrEqual,
+                        upper_bound,
+                        zero,
+                        block,
+                        location,
+                    )?;
+                    fits = Some(match fits {
+                        Some(fits) => {
+                            block.append_operation(stable_hlo::and(fits, fit, location)?)?.result(0).unwrap().as_ref()
+                        }
+                        None => fit,
+                    });
+                }
+            }
+            upper_bounds.push(upper_bound);
             if operation.mode() == ScatterMode::Drop {
                 let CoreDimension::Static(capacity) = physical_bound_type(&input_types[0])?.shape().dimensions()[axis]
                 else {
@@ -166,7 +206,20 @@ fn lower_scatter_to_mlir<'b, 'c: 'b, 't: 'c>(
             let lower = lower_compare_to_mlir(ComparisonDirection::GreaterThanOrEqual, indices, zero, block, location)?;
             let upper =
                 lower_compare_to_mlir(ComparisonDirection::LessThanOrEqual, indices, upper_bounds, block, location)?;
-            let mask = block.append_operation(stable_hlo::and(lower, upper, location)?)?.result(0).unwrap().as_ref();
+            let mut mask =
+                block.append_operation(stable_hlo::and(lower, upper, location)?)?.result(0).unwrap().as_ref();
+            if let Some(fits) = fits {
+                let fits = lower_index_broadcast(
+                    fits,
+                    &indices_type.clone().with_data_type(DataType::Boolean),
+                    shape_source,
+                    &[],
+                    block,
+                    context,
+                    location,
+                )?;
+                mask = block.append_operation(stable_hlo::and(mask, fits, location)?)?.result(0).unwrap().as_ref();
+            }
             let initial =
                 lower_unplaced_constant_output(&[ArrayType::scalar(DataType::Boolean)], 1, block, context, location)?
                     [0];
@@ -761,6 +814,251 @@ mod tests {
                 .remove(0)
                 .outputs;
             assert_eq!(outputs[0].copy_to_host(None).unwrap().r#await().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_scatter_operation_lower_window_exceeding_dynamic_extent() {
+        // Type inference admits a static update window that exceeds the guaranteed minimum extent of a dynamic input
+        // axis. When the runtime extent is smaller than the window, no start keeps the window in bounds. `Clip` then
+        // starts every window at zero, which matches the reference on the window prefix that fits the input, and
+        // `Drop` discards every window. Both hold for signed and unsigned indices alike. A runtime extent that fits
+        // the window matches the reference directly.
+        let client = execution_client();
+        let input_type = ArrayType::new(
+            DataType::I64,
+            Shape::new(vec![CoreDimension::Dynamic(DimensionVariable::new(
+                "rows",
+                DimensionBounds::new(1, Some(6)).unwrap(),
+            ))]),
+        );
+        let input_values = [10i64, 20, 30, 40, 50];
+        let update_values = [1i64, 2, 3, 4, 5, 6];
+        for mode in [ScatterMode::Clip, ScatterMode::Drop] {
+            for index_data_type in [DataType::I64, DataType::U64] {
+                let indices_type = ArrayType::new_static(index_data_type, [2, 1]);
+                let updates_type = ArrayType::new_static(DataType::I64, [2, 3]);
+                let operation = ScatterOperation::new(
+                    ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
+                    ScatterReductionKind::Add,
+                )
+                .with_mode(mode);
+                let mut builder = ProgramBuilder::new();
+                let inputs = [input_type.clone(), indices_type.clone(), updates_type.clone()]
+                    .into_iter()
+                    .map(|r#type| builder.add_input(r#type))
+                    .collect::<Vec<_>>();
+                let output = builder.add_instruction(operation.clone(), Vec::new(), inputs, None).unwrap()[0];
+                let program = unproject_plain_program(
+                    builder
+                        .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                            vec![output],
+                            vec![Placeholder; 3],
+                            vec![Placeholder],
+                        )
+                        .unwrap(),
+                );
+                let module = to_mlir_module_for_program(
+                    &program,
+                    &[],
+                    &vec![input_type.clone(), indices_type.clone(), updates_type],
+                    &vec![input_type.clone()],
+                    "main",
+                    None,
+                    None,
+                )
+                .unwrap();
+                let executable = client
+                    .compile(
+                        &PjrtProgram::Mlir { bytecode: module.into_bytes() },
+                        &ragged_dot_cpu_compilation_options(),
+                    )
+                    .unwrap();
+                let device = executable.addressable_devices().unwrap().remove(0);
+                let indices = if index_data_type == DataType::U64 {
+                    CoreArray::from_elements(indices_type.clone(), &[u64::MAX, 1]).unwrap()
+                } else {
+                    CoreArray::from_elements(indices_type.clone(), &[-1i64, 1]).unwrap()
+                };
+                for extent in [2usize, 4] {
+                    let inputs = [
+                        (values_to_bytes(&input_values), BufferType::I64, vec![5]),
+                        (indices.logical_bytes(), index_data_type.to_pjrt(), vec![2, 1]),
+                        (values_to_bytes(&update_values), BufferType::I64, vec![2, 3]),
+                        (values_to_bytes(&[extent as i32]), BufferType::I32, vec![]),
+                    ]
+                    .into_iter()
+                    .map(|(bytes, data_type, shape)| ExecutionInput {
+                        buffer: Arc::new(
+                            client
+                                .buffer(bytes.as_slice(), data_type, shape.as_slice(), None, device.clone(), None)
+                                .unwrap(),
+                        ),
+                        donatable: false,
+                    })
+                    .collect::<Vec<_>>();
+                    let outputs = executable
+                        .execute(
+                            vec![ExecutionDeviceInputs { inputs: &inputs, ..Default::default() }],
+                            vec![],
+                            0,
+                            None,
+                            None,
+                            None,
+                            None,
+                            &[],
+                        )
+                        .unwrap()
+                        .block_until_ready()
+                        .unwrap()
+                        .remove(0)
+                        .outputs;
+                    let bytes = outputs[0].copy_to_host(None).unwrap().r#await().unwrap();
+
+                    // The reference requires each window to fit its input, so it runs on the window prefix that fits.
+                    let window = extent.min(3);
+                    let reference_input = CoreArray::vector(input_values[..extent].to_vec()).unwrap();
+                    let reference_updates = CoreArray::from_elements(
+                        ArrayType::new_static(DataType::I64, [2, window]),
+                        &update_values.chunks(3).flat_map(|row| row[..window].to_vec()).collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                    let expected = if mode == ScatterMode::Drop && window < 3 {
+                        reference_input
+                    } else {
+                        reference_input
+                            .scatter(
+                                &indices,
+                                &reference_updates,
+                                operation.dimensions(),
+                                operation.kind(),
+                                operation.options(),
+                            )
+                            .unwrap()
+                    };
+                    assert_eq!(
+                        values_from_bytes::<i64>(&bytes[..extent * 8]),
+                        values_from_bytes::<i64>(&expected.logical_bytes()),
+                        "mode={mode}, indices={index_data_type}, extent={extent}",
+                    );
+                }
+            }
+        }
+
+        // `Clip` saturates the bound of the axis that the window may exceed at zero before converting it to the
+        // unsigned index type, and `Drop` conjoins its in-bounds mask with whether the window fits that axis.
+        let indices_type = ArrayType::new_static(DataType::U64, [2, 1]);
+        let updates_type = ArrayType::new_static(DataType::I64, [2, 3]);
+        for (mode, expected_module) in [
+            (
+                ScatterMode::Clip,
+                indoc! {r#"
+                    module {
+                      func.func @main(%arg0: tensor<5xi64>, %arg1: tensor<2x1xui64>, %arg2: tensor<2x3xi64>, %arg3: tensor<i32>) -> (tensor<?xi64, #stablehlo.bounds<5>>, tensor<i64>) {
+                        %0 = stablehlo.set_dimension_size %arg0, %arg3, dim = 0 : (tensor<5xi64>, tensor<i32>) -> tensor<?xi64, #stablehlo.bounds<5>>
+                        %1 = stablehlo.convert %arg1 : tensor<2x1xui64>
+                        %2 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xi64, #stablehlo.bounds<5>>) -> tensor<i32>
+                        %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                        %4 = stablehlo.get_dimension_size %arg2, dim = 1 : (tensor<2x3xi64>) -> tensor<i32>
+                        %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                        %6 = stablehlo.subtract %3, %5 : tensor<i64>
+                        %c = stablehlo.constant dense<0> : tensor<i64>
+                        %7 = stablehlo.maximum %6, %c : tensor<i64>
+                        %8 = stablehlo.reshape %7 : (tensor<i64>) -> tensor<1xi64>
+                        %9 = stablehlo.convert %8 : (tensor<1xi64>) -> tensor<1xui64>
+                        %10 = stablehlo.broadcast_in_dim %9, dims = [1] : (tensor<1xui64>) -> tensor<2x1xui64>
+                        %c_0 = stablehlo.constant dense<0> : tensor<ui64>
+                        %11 = stablehlo.broadcast_in_dim %c_0, dims = [] : (tensor<ui64>) -> tensor<2x1xui64>
+                        %12 = stablehlo.maximum %1, %11 : tensor<2x1xui64>
+                        %13 = stablehlo.minimum %12, %10 : tensor<2x1xui64>
+                        %14 = "stablehlo.scatter"(%0, %13, %arg2) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [1], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}> ({
+                        ^bb0(%arg4: tensor<i64>, %arg5: tensor<i64>):
+                          %17 = stablehlo.add %arg4, %arg5 : tensor<i64>
+                          stablehlo.return %17 : tensor<i64>
+                        }) : (tensor<?xi64, #stablehlo.bounds<5>>, tensor<2x1xui64>, tensor<2x3xi64>) -> tensor<?xi64, #stablehlo.bounds<5>>
+                        %15 = stablehlo.get_dimension_size %14, dim = 0 : (tensor<?xi64, #stablehlo.bounds<5>>) -> tensor<i32>
+                        %16 = stablehlo.convert %15 : (tensor<i32>) -> tensor<i64>
+                        return %14, %16 : tensor<?xi64, #stablehlo.bounds<5>>, tensor<i64>
+                      }
+                    }
+                "#},
+            ),
+            (
+                ScatterMode::Drop,
+                indoc! {r#"
+                    module {
+                      func.func @main(%arg0: tensor<5xi64>, %arg1: tensor<2x1xui64>, %arg2: tensor<2x3xi64>, %arg3: tensor<i32>) -> (tensor<?xi64, #stablehlo.bounds<5>>, tensor<i64>) {
+                        %0 = stablehlo.set_dimension_size %arg0, %arg3, dim = 0 : (tensor<5xi64>, tensor<i32>) -> tensor<?xi64, #stablehlo.bounds<5>>
+                        %1 = stablehlo.convert %arg1 : tensor<2x1xui64>
+                        %2 = stablehlo.get_dimension_size %0, dim = 0 : (tensor<?xi64, #stablehlo.bounds<5>>) -> tensor<i32>
+                        %3 = stablehlo.convert %2 : (tensor<i32>) -> tensor<i64>
+                        %4 = stablehlo.get_dimension_size %arg2, dim = 1 : (tensor<2x3xi64>) -> tensor<i32>
+                        %5 = stablehlo.convert %4 : (tensor<i32>) -> tensor<i64>
+                        %6 = stablehlo.subtract %3, %5 : tensor<i64>
+                        %c = stablehlo.constant dense<0> : tensor<i64>
+                        %7 = stablehlo.compare GE, %6, %c, SIGNED : (tensor<i64>, tensor<i64>) -> tensor<i1>
+                        %c_0 = stablehlo.constant dense<5> : tensor<i64>
+                        %8 = stablehlo.reshape %6 : (tensor<i64>) -> tensor<1xi64>
+                        %9 = stablehlo.convert %8 : (tensor<1xi64>) -> tensor<1xui64>
+                        %10 = stablehlo.broadcast_in_dim %9, dims = [1] : (tensor<1xui64>) -> tensor<2x1xui64>
+                        %c_1 = stablehlo.constant dense<0> : tensor<ui64>
+                        %11 = stablehlo.broadcast_in_dim %c_1, dims = [] : (tensor<ui64>) -> tensor<2x1xui64>
+                        %12 = stablehlo.compare GE, %1, %11, UNSIGNED : (tensor<2x1xui64>, tensor<2x1xui64>) -> tensor<2x1xi1>
+                        %13 = stablehlo.compare LE, %1, %10, UNSIGNED : (tensor<2x1xui64>, tensor<2x1xui64>) -> tensor<2x1xi1>
+                        %14 = stablehlo.and %12, %13 : tensor<2x1xi1>
+                        %15 = stablehlo.broadcast_in_dim %7, dims = [] : (tensor<i1>) -> tensor<2x1xi1>
+                        %16 = stablehlo.and %14, %15 : tensor<2x1xi1>
+                        %c_2 = stablehlo.constant dense<true> : tensor<i1>
+                        %17 = stablehlo.reduce(%16 init: %c_2) applies stablehlo.and across dimensions = [1] : (tensor<2x1xi1>, tensor<i1>) -> tensor<2xi1>
+                        %18 = stablehlo.broadcast_in_dim %17, dims = [0] : (tensor<2xi1>) -> tensor<2x1xi1>
+                        %19 = stablehlo.reshape %c_0 : (tensor<i64>) -> tensor<1xi64>
+                        %20 = stablehlo.convert %19 : (tensor<1xi64>) -> tensor<1xui64>
+                        %21 = stablehlo.broadcast_in_dim %20, dims = [1] : (tensor<1xui64>) -> tensor<2x1xui64>
+                        %22 = stablehlo.select %18, %1, %21 : tensor<2x1xi1>, tensor<2x1xui64>
+                        %23 = "stablehlo.scatter"(%0, %22, %arg2) <{indices_are_sorted = false, scatter_dimension_numbers = #stablehlo.scatter<update_window_dims = [1], scatter_dims_to_operand_dims = [0], index_vector_dim = 1>, unique_indices = false}> ({
+                        ^bb0(%arg4: tensor<i64>, %arg5: tensor<i64>):
+                          %26 = stablehlo.add %arg4, %arg5 : tensor<i64>
+                          stablehlo.return %26 : tensor<i64>
+                        }) : (tensor<?xi64, #stablehlo.bounds<5>>, tensor<2x1xui64>, tensor<2x3xi64>) -> tensor<?xi64, #stablehlo.bounds<5>>
+                        %24 = stablehlo.get_dimension_size %23, dim = 0 : (tensor<?xi64, #stablehlo.bounds<5>>) -> tensor<i32>
+                        %25 = stablehlo.convert %24 : (tensor<i32>) -> tensor<i64>
+                        return %23, %25 : tensor<?xi64, #stablehlo.bounds<5>>, tensor<i64>
+                      }
+                    }
+                "#},
+            ),
+        ] {
+            let mut builder = ProgramBuilder::new();
+            let inputs = [input_type.clone(), indices_type.clone(), updates_type.clone()]
+                .into_iter()
+                .map(|r#type| builder.add_input(r#type))
+                .collect::<Vec<_>>();
+            let operation = ScatterOperation::new(
+                ScatterDimensionNumbers::new(vec![1], vec![], vec![0]),
+                ScatterReductionKind::Add,
+            )
+            .with_mode(mode);
+            let output = builder.add_instruction(operation, Vec::new(), inputs, None).unwrap()[0];
+            let program = unproject_plain_program(
+                builder
+                    .build::<Vec<ArrayConstant>, Vec<ArrayConstant>>(
+                        vec![output],
+                        vec![Placeholder; 3],
+                        vec![Placeholder],
+                    )
+                    .unwrap(),
+            );
+            let module = to_mlir_module_for_program(
+                &program,
+                &[],
+                &vec![input_type.clone(), indices_type.clone(), updates_type.clone()],
+                &vec![input_type.clone()],
+                "main",
+                None,
+                None,
+            )
+            .unwrap();
+            assert_eq!(module, expected_module, "mode={mode}");
         }
     }
 

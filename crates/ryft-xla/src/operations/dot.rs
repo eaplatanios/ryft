@@ -463,6 +463,7 @@ fn lower_ragged_dot_group_intervals<'b, 'c: 'b, 't: 'c>(
 /// intervals are accumulated in `u64` and capped at the physical ragged extent so metadata arithmetic and iota indices
 /// cannot wrap. The intermediate order keeps the `group_sizes` prefix axes first so every broadcast dimension is
 /// monotonic, and a final transpose, when necessary, produces `[group, original axes...]` for the dense dot.
+#[allow(clippy::too_many_arguments)]
 fn lower_ragged_dot_expansion<'b, 'c: 'b, 't: 'c>(
     input: ValueRef<'b, 'c, 't>,
     input_type: &ArrayType,
@@ -851,7 +852,8 @@ mod tests {
 
         // The three terms `2⁻¹²` sum to three quarters of the distance from `1` to the next `f16` value, so a sum
         // that accumulates at `f32` and rounds once is `1 + 2⁻¹⁰`.
-        let reference_left = CoreArray::vector(vec![1.0f32, 0.000244140625, 0.000244140625, 0.000244140625]).unwrap();
+        let reference_left =
+            CoreArray::vector(vec![1.0f32, 0.000_244_140_63, 0.000_244_140_63, 0.000_244_140_63]).unwrap();
         let reference_right = CoreArray::vector(vec![1.0f32; 4]).unwrap();
         let left = replicated_array(&domain, &mesh, DataType::F32, &[4], &reference_left.logical_bytes());
         let right = replicated_array(&domain, &mesh, DataType::F32, &[4], &reference_right.logical_bytes());
@@ -859,7 +861,7 @@ mod tests {
         let product = left.dot_with_accumulation_type(&right, &dimensions, DataType::F16).unwrap();
         let reference_product =
             reference_left.dot_with_accumulation_type(&reference_right, &dimensions, DataType::F16).unwrap();
-        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[f16::from_f32(1.0009765625)]));
+        assert_eq!(product.copy_to_host().unwrap(), values_to_bytes(&[f16::from_f32(1.000_976_6)]));
         assert_eq!(product.copy_to_host().unwrap(), reference_product.logical_bytes());
     }
 
@@ -1853,7 +1855,7 @@ mod tests {
                 .buffer(
                     values_to_bytes(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]).as_slice(),
                     BufferType::F32,
-                    &[3, 3, 1],
+                    [3, 3, 1],
                     None,
                     device.clone(),
                     None,
@@ -1863,21 +1865,14 @@ mod tests {
                 .buffer(
                     values_to_bytes(&[10.0f32, 2.0, -9.0, 20.0, 3.0, -11.0]).as_slice(),
                     BufferType::F32,
-                    &[2, 3, 1, 1],
+                    [2, 3, 1, 1],
                     None,
                     device.clone(),
                     None,
                 )
                 .unwrap(),
             client
-                .buffer(
-                    values_to_bytes(&[1i32, 2, 2, 1, 5, 7]).as_slice(),
-                    BufferType::I32,
-                    &[3, 2],
-                    None,
-                    device,
-                    None,
-                )
+                .buffer(values_to_bytes(&[1i32, 2, 2, 1, 5, 7]).as_slice(), BufferType::I32, [3, 2], None, device, None)
                 .unwrap(),
         ]
         .into_iter()
@@ -2084,6 +2079,14 @@ mod tests {
             ("ij,jk->ik", &integers, EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32)),
             ("ij,jk->ik", &booleans, EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32)),
         ];
+        // Inputs of different element types are promoted before they are contracted.
+        let lhs = replicated_array(&domain, &mesh, DataType::U8, &[2, 2], &integers.logical_bytes());
+        let rhs = replicated_array(&domain, &mesh, DataType::F32, &[2, 2], &fractions.logical_bytes());
+        let output = Einsum::einsum("ij,jk->ik", [&lhs, &rhs]).unwrap();
+        let reference_output = CoreArray::einsum("ij,jk->ik", [&integers, &fractions]).unwrap();
+        assert_eq!(reference_output.r#type().data_type(), DataType::F32);
+        assert_eq!(output.copy_to_host().unwrap(), reference_output.logical_bytes());
+
         for (subscripts, reference, options) in cases {
             let input =
                 replicated_array(&domain, &mesh, reference.r#type().data_type(), &[2, 2], &reference.logical_bytes());
