@@ -70,8 +70,6 @@ use crate::tracing::{DomainTracer, DomainTracingContext};
 /// Name that diagnostics and provenance scopes of this module use for an einsum operation.
 const EINSUM_NAME: &str = "einsum";
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// One element of the subscript of an einsum input or output.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EinsumLabel {
@@ -89,10 +87,10 @@ impl EinsumLabel {
     /// labels. Indices map to `A` through `Z` and then `a` through `z`, like in the label lists of NumPy, and then to
     /// the alphabetic Unicode characters from `À` on in the order of their code points. Every returned label is valid
     /// in an [`EinsumSpecification`], and labels are ordered like their indices, so an implicit output orders its
-    /// labels by their indices, like `numpy.einsum` does for integer labels. `jax.numpy.einsum` does the same for
-    /// up to 26 distinct labels. With more, it orders the labels with the 27th smallest index and above before
-    /// the others, because `opt_einsum` renames the labels by their rank to `a` through `z` and then `A` through
-    /// `Z` before it orders them.
+    /// labels by their indices, like `numpy.einsum` does for integer labels. `jax.numpy.einsum` does the same for up to
+    /// 26 distinct labels. With more, it orders the labels with the 27th smallest index and above before the others,
+    /// because [`opt_einsum`](https://dgasmith.github.io/opt_einsum/paths/introduction/) renames the labels by their
+    /// rank to `a` through `z` and then `A` through `Z` before it orders them.
     pub fn from_index(index: usize) -> Option<Self> {
         const LETTERS: &[u8; 52] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         let label = match LETTERS.get(index) {
@@ -120,29 +118,31 @@ impl From<char> for EinsumLabel {
     }
 }
 
-/// Parsed subscripts of an einsum, which name the axes of every input and, optionally, of the output. The
-/// [`FromStr`] implementation parses the string form of NumPy's
-/// [`einsum`](https://numpy.org/doc/stable/reference/generated/numpy.einsum.html) (e.g., `"ij,jk->ik"` or
-/// `"...ij,...jk"`), and [`Self::from_labels`] builds a specification from label lists.
+/// Parsed subscripts of an einsum, which name the axes of every input and, optionally,
+/// of the output. The [`FromStr`] implementation parses the string form of NumPy's
+/// [`einsum`](https://numpy.org/doc/stable/reference/generated/numpy.einsum.html) (e.g., `"ij,jk->ik"`
+/// or `"...ij,...jk"`), and [`Self::from_labels`] builds a specification from label lists:
 ///
 ///   - **Inputs:** Each input subscript has one label for every axis of its input. At most one ellipsis may stand for
-///     the axes that no label names. A label that appears more than once in one input selects the diagonal along
-///     its axes.
-///   - **Output:** An explicit output lists every output axis once, in order, and every one of its labels must
-///     appear in an input. Labels that it omits are summed over. Without an output (i.e., the implicit form), the
-///     output consists of the axes of the ellipses followed by every label that appears exactly once across all
-///     inputs, in the order of their characters.
+///     the axes that no label names. A label that appears more than once in one input selects the diagonal along its
+///     axes.
+///   - **Output:** An explicit output lists every output axis once, in order, and every one of its labels must appear
+///     in an input. Labels that it omits are summed over. Without an output (i.e., the implicit form), the output
+///     consists of the axes of the ellipses followed by every label that appears exactly once across all inputs,
+///     in the order of their characters.
 ///
 /// A specification is independent of input types. [`Self::plan`] expands its ellipses and validates it against
 /// particular inputs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EinsumSpecification {
-    /// Subscript of each input.
+    /// Parsed input [`EinsumLabel`]s.
     inputs: Vec<Vec<EinsumLabel>>,
 
-    /// Subscript of the output, or [`None`] for the implicit form.
+    /// Parsed output [`EinsumLabel`], or [`None`] for the implicit form.
     output: Option<Vec<EinsumLabel>>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl EinsumSpecification {
     /// Creates a new [`EinsumSpecification`] from the label lists of its inputs and, optionally, of its output.
@@ -385,11 +385,18 @@ impl EinsumSpecification {
                 EinsumLabel::Ellipsis => None,
             })
             .collect::<BTreeSet<_>>();
+        let ellipsis_count = if has_ellipsis { ranks.iter().copied().max().unwrap_or(0) } else { 0 };
         let ellipsis_names = (0..)
-            .map(einsum_symbol)
+            .map_while(einsum_symbol)
             .filter(|symbol| !used.contains(symbol))
-            .take(if has_ellipsis { ranks.iter().copied().max().unwrap_or(0) } else { 0 })
+            .take(ellipsis_count)
             .collect::<Vec<_>>();
+        if ellipsis_names.len() < ellipsis_count {
+            return Err(TypeError::invalid(format!(
+                "`{EINSUM_NAME}` subscripts `{self}` need {ellipsis_count} labels for the axes of their ellipses, \
+                 which is more than there are",
+            )));
+        }
 
         let mut longest = 0;
         let mut input_names = Vec::with_capacity(self.inputs.len());
@@ -571,7 +578,10 @@ pub enum EinsumPathStrategy {
     AutoHighQuality,
 
     /// Explores the orders exhaustively like the `optimal` optimizer of `opt_einsum`, whose choice it reproduces,
-    /// aiming for the fewest scalar operations. Its cost grows factorially with the number of inputs.
+    /// aiming for the fewest scalar operations. That optimizer caches the cost of contracting two inputs by their
+    /// labels alone, so it can miss the minimum when several inputs have the same labels (e.g., it selects 864
+    /// scalar operations for `d,abcd,abcd,abcd,bc->ab` with the extents `a = 2`, `b = 3`, `c = 4`, and `d = 8`,
+    /// where [`Self::DynamicProgramming`] finds 816). Its cost grows factorially with the number of inputs.
     Optimal,
 
     /// Finds the pairwise contractions with the fewest scalar operations among the orders that take no outer product
@@ -1892,10 +1902,12 @@ impl<S> EinsumExecution<'_, S> {
     /// An algorithm converts its inputs to the element types that it computes with and accumulates at its own type,
     /// so its inputs are contracted as they are, like in JAX. Converting them to the accumulation type first would
     /// round them before the algorithm does (e.g., `i16` inputs at an `f16` accumulation type, which the
-    /// `F32_F32_F32` preset contracts at `f32`). Only inputs of different element types are converted, to the types
-    /// that the algorithm computes with, because a `dot` requires one input type. A floating-point accumulation
-    /// type is then produced by the `dot` itself. Every other one is converted from the type that the algorithm
-    /// accumulates at, which keeps the `dot` differentiable.
+    /// `F32_F32_F32` preset contracts at `f32`). Only inputs of different element types are converted, because a
+    /// `dot` requires one input type. Each is converted to the type that the algorithm computes with for it, and
+    /// when those types still differ, the rounded inputs are converted to their promotion (e.g., an `i32` input of
+    /// the `BF16_BF16_F32` preset is rounded to `bf16` before it meets an `f32` input at `f32`). A floating-point
+    /// accumulation type is then produced by the `dot` itself. Every other one is converted from the type that the
+    /// algorithm accumulates at, which keeps the `dot` differentiable.
     fn contract<V: Clone>(
         &mut self,
         lhs: &V,
@@ -1916,17 +1928,19 @@ impl<S> EinsumExecution<'_, S> {
             let (lhs, rhs, lhs_type, rhs_type) = if lhs_type == rhs_type || is_native_f8_pair {
                 (lhs.clone(), rhs.clone(), lhs_type, rhs_type)
             } else {
-                // The types that the algorithm computes with differ only when it supports both input types or
-                // rounds its two inputs differently. Their promotion then loses nothing that the algorithm keeps.
+                // Each input is first converted to the type that the algorithm computes with for it, which rounds
+                // it like the algorithm does. Those types differ only when the algorithm supports both input types
+                // or rounds its two inputs differently, and the rounded inputs are then converted to the promotion
+                // of the two, which loses nothing that the algorithm keeps.
                 let (lhs_type, rhs_type, _) = self.precision.computation_types(lhs_type, rhs_type, accumulation_type);
-                let (lhs_type, rhs_type) = match DataType::promoted(&[lhs_type, rhs_type]) {
-                    _ if lhs_type == rhs_type => (lhs_type, rhs_type),
-                    common_type => {
-                        let common_type = common_type.unwrap_or(accumulation_type);
-                        (common_type, common_type)
-                    }
-                };
-                (self.convert(lhs.clone(), lhs_type)?, self.convert(rhs.clone(), rhs_type)?, lhs_type, rhs_type)
+                let lhs = self.convert(lhs.clone(), lhs_type)?;
+                let rhs = self.convert(rhs.clone(), rhs_type)?;
+                if lhs_type == rhs_type || (is_native_f8_dot_type(lhs_type) && is_native_f8_dot_type(rhs_type)) {
+                    (lhs, rhs, lhs_type, rhs_type)
+                } else {
+                    let common_type = DataType::promoted(&[lhs_type, rhs_type]).unwrap_or(accumulation_type);
+                    (self.convert(lhs, common_type)?, self.convert(rhs, common_type)?, common_type, common_type)
+                }
             };
             if accumulation_type.is_floating_point() {
                 return self.steps.contract(&lhs, &rhs, dimensions, Some(accumulation_type), output_sharding);
@@ -2380,9 +2394,10 @@ impl<'o> PathSearch<'o> {
     }
 }
 
-/// Returns the pairwise contractions with the fewest scalar operations for the `inputs` and `output` of an einsum, in
-/// static single assignment form, by exploring every contraction order. This is a port of `opt_einsum.paths.optimal`
-/// without a memory limit.
+/// Returns the pairwise contractions with the fewest scalar operations that an exploration of every contraction
+/// order finds for the `inputs` and `output` of an einsum, in static single assignment form. This is a port of
+/// `opt_einsum.paths.optimal` without a memory limit, including its cache (refer to [`PathSearch`]), which can make
+/// the search miss the minimum when several inputs have the same labels.
 fn optimal_ssa_path(inputs: &[LabelSet], output: &LabelSet, sizes: &BTreeMap<char, u128>) -> Vec<(usize, usize)> {
     let mut search = PathSearch::new(inputs, output, sizes);
     search.iterate_optimal(&PythonIntegerSet::from_values(0..inputs.len()), 0);
@@ -3110,14 +3125,20 @@ fn count_of(counts: &[(char, usize)], name: &char) -> usize {
 }
 
 /// Returns the symbol with the provided index in the sequence of label symbols of `opt_einsum` (i.e., `a` through
-/// `z`, then `A` through `Z`, and then further Unicode characters).
-fn einsum_symbol(index: usize) -> char {
+/// `z`, then `A` through `Z`, and then the Unicode characters from `À` on in the order of their code points), or
+/// [`None`] after the last Unicode character. Every index has its own symbol. The sequence skips the surrogate code
+/// points, which are not characters, where `opt_einsum` produces them for the indices from 55,156 to 55,295. The
+/// symbols from there on therefore have other code points than in `opt_einsum`, but the same order.
+fn einsum_symbol(index: usize) -> Option<char> {
     const BASE: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-    match index {
-        ..52 => BASE[index] as char,
-        // The surrogate code points are skipped, because they are not characters.
-        55296.. => char::from_u32(index as u32 + 2048).unwrap_or(char::REPLACEMENT_CHARACTER),
-        _ => char::from_u32(index as u32 + 140).unwrap_or(char::REPLACEMENT_CHARACTER),
+    const SURROGATES: std::ops::Range<u32> = 0xD800..0xE000;
+    match BASE.get(index) {
+        Some(symbol) => Some(*symbol as char),
+        None => {
+            let code_point = u32::try_from(index).ok()?.checked_add(140)?;
+            let skipped = if code_point < SURROGATES.start { 0 } else { SURROGATES.len() as u32 };
+            char::from_u32(code_point.checked_add(skipped)?)
+        }
     }
 }
 
@@ -3560,6 +3581,42 @@ mod tests {
         assert_eq!(EinsumPathStep::Contraction(1, 0).to_string(), "(1, 0)");
         assert_eq!(EinsumPathStep::from(3), EinsumPathStep::Reduction(3));
         assert_eq!(EinsumPathStep::from((1, 2)), EinsumPathStep::Contraction(1, 2));
+
+        // The exhaustive search reproduces `opt_einsum`, whose cache of contraction costs by labels alone makes it
+        // miss the minimum for inputs with equal labels. The path below costs 864 scalar operations, while the
+        // dynamic programming search finds one that costs 816.
+        let shapes: &[&[usize]] = &[&[8], &[2, 3, 4, 8], &[2, 3, 4, 8], &[2, 3, 4, 8], &[3, 4]];
+        assert_eq!(
+            planned_path("d,abcd,abcd,abcd,bc->ab", shapes, EinsumPathStrategy::Optimal),
+            steps(&[(0, 4), (0, 1), (0, 1), (0, 1)]),
+        );
+        assert_eq!(
+            planned_path("d,abcd,abcd,abcd,bc->ab", shapes, EinsumPathStrategy::DynamicProgramming),
+            steps(&[(2, 3), (1, 3), (0, 2), (0, 1)]),
+        );
+    }
+
+    #[test]
+    fn test_einsum_symbol() {
+        // The symbols are the ASCII letters and then the Unicode characters from `À` on.
+        assert_eq!(einsum_symbol(0), Some('a'));
+        assert_eq!(einsum_symbol(25), Some('z'));
+        assert_eq!(einsum_symbol(26), Some('A'));
+        assert_eq!(einsum_symbol(51), Some('Z'));
+        assert_eq!(einsum_symbol(52), Some('À'));
+
+        // Every index has its own symbol, including across the surrogate code points, which are skipped.
+        assert_eq!(einsum_symbol(55155), Some('\u{D7FF}'));
+        assert_eq!(einsum_symbol(55156), Some('\u{E000}'));
+        assert_eq!(einsum_symbol(55157), Some('\u{E001}'));
+        let symbols = (52..60000).map(einsum_symbol).collect::<Option<Vec<_>>>().unwrap();
+        assert!(symbols.windows(2).all(|pair| pair[0] < pair[1]));
+
+        // The sequence ends with the last Unicode character.
+        let last = char::MAX as usize - 140 - 0x800;
+        assert_eq!(einsum_symbol(last), Some(char::MAX));
+        assert_eq!(einsum_symbol(last + 1), None);
+        assert_eq!(einsum_symbol(usize::MAX), None);
     }
 
     #[test]
@@ -6980,6 +7037,54 @@ mod tests {
             ),
             Ok(Array::scalar(1i32).unwrap()),
         );
+
+        // Each input is rounded like the algorithm rounds it before the two meet at a common type. The `i32` input
+        // below rounds to `33816576` at `bf16`, whatever the element type of the other input is, where a direct
+        // conversion to `f32` would keep `33685504`. JAX computes the same value.
+        let wide = Array::vector(vec![33685505i32]).unwrap();
+        let rounded = EinsumOptions::new()
+            .with_precision(DotAlgorithmPreset::BF16_BF16_F32)
+            .with_accumulation_type(DataType::F32);
+        let others = [
+            Array::vector(vec![1i32]).unwrap(),
+            Array::vector(vec![1.0f32]).unwrap(),
+            Array::vector(vec![bf16::from_f32(1.0)]).unwrap(),
+            Array::vector(vec![f16::from_f32(1.0)]).unwrap(),
+        ];
+        for other in &others {
+            for inputs in [[&wide, other], [other, &wide]] {
+                assert_eq!(
+                    Array::einsum_with_options(&specification, inputs, &rounded),
+                    Ok(Array::scalar(33816576.0f32).unwrap()),
+                    "{}",
+                    other.r#type().data_type(),
+                );
+            }
+        }
+        let input_types = vec![ArrayType::new_static(DataType::I32, [1]), ArrayType::new_static(DataType::F32, [1])];
+        let (_, program) = ArrayContext::trace(
+            |inputs: Vec<DomainTracer<ArrayContext>>| {
+                DomainTracer::<ArrayContext>::einsum_with_options(&specification, inputs.iter(), &rounded)
+            },
+            input_types,
+        )
+        .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:i32[1], %1:f32[1] .
+                let %2:bf16[1] = convert_element_type [data_type=bf16] %0
+                    %3:f32[1] = convert_element_type [data_type=f32] %2
+                    %4:f32[] = dot [
+                        dimensions=(lhs_contracting=[0], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        precision=bf16_bf16_f32,
+                        accumulation_type=f32,
+                    ] %3 %1
+                in (%4)
+            "}
+            .trim_end(),
+        );
+
         let chain = "i,i,i->".parse::<EinsumSpecification>().unwrap();
         let path = EinsumPathStrategy::explicit([(0, 1), (0, 1)]);
         let options = preset.clone().with_path(path.clone()).with_accumulation_type(DataType::F16);

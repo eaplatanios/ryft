@@ -2145,6 +2145,23 @@ mod tests {
             assert_eq!(CoreArray::einsum_with_options(&specification, [&wide, &ones], &options), Ok(expected));
         }
 
+        // Inputs of different element types are rounded like the algorithm rounds them before they meet at a common
+        // type. The `i32` input below rounds to `33816576` at `bf16`, where a direct conversion to `f32` would keep
+        // `33685504`.
+        let wide = CoreArray::vector(vec![33685505i32]).unwrap();
+        let unit = CoreArray::vector(vec![1.0f32]).unwrap();
+        let lhs = replicated_array(&domain, &mesh, DataType::I32, &[1], &wide.logical_bytes());
+        let rhs = replicated_array(&domain, &mesh, DataType::F32, &[1], &unit.logical_bytes());
+        let options = EinsumOptions::new()
+            .with_precision(DotAlgorithmPreset::BF16_BF16_F32)
+            .with_accumulation_type(DataType::F32);
+        let expected = CoreArray::scalar(33816576.0f32).unwrap();
+        let output = Einsum::einsum_with_options(&specification, [&lhs, &rhs], &options).unwrap();
+        assert_eq!(output.copy_to_host().unwrap(), expected.logical_bytes());
+        let output = Einsum::einsum_with_options(&specification, [&rhs, &lhs], &options).unwrap();
+        assert_eq!(output.copy_to_host().unwrap(), expected.logical_bytes());
+        assert_eq!(CoreArray::einsum_with_options(&specification, [&wide, &unit], &options), Ok(expected));
+
         for (subscripts, reference, options) in cases {
             let input =
                 replicated_array(&domain, &mesh, reference.r#type().data_type(), &[2, 2], &reference.logical_bytes());
