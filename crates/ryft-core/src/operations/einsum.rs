@@ -64,13 +64,17 @@ use crate::operations::manipulation::diagonal::Diagonal;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::reductions::{Reduce, ReduceOperation, ReductionKind};
+use crate::operations::sharding::reshard::{Reshard, ReshardOperation};
 use crate::programs::{Operation, ProgramError, ProvenanceScope, TypeError, Typed, Value, ValueProjection};
 use crate::tracing::{DomainTracer, DomainTracingContext};
 
 /// Name that diagnostics and provenance scopes of this module use for an einsum operation.
 const EINSUM_NAME: &str = "einsum";
 
-/// One element of the subscript of an einsum input or output.
+/// One element of the subscript of an einsum input or output. A label is any character other than the ones that the
+/// syntax of the subscripts uses (i.e., `,`, `-`, `>`, and `.`) and whitespace, so digits, punctuation, and symbols
+/// are labels as well, like in `jax.numpy.einsum`. JAX only removes spaces from its subscripts, so it also reads other
+/// whitespace (e.g., a tab) as a label, where the string form of an [`EinsumSpecification`] ignores all whitespace.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EinsumLabel {
     /// Label of one axis. Axes with the same label are aligned across inputs, and labels are ordered by their
@@ -147,8 +151,9 @@ impl EinsumSpecification {
     ///
     /// # Errors
     ///
-    /// Returns a [`TypeError`] if there is no input, a label is not alphabetic, a subscript contains more than one
-    /// ellipsis, the output repeats a label, or the output contains a label that no input contains.
+    /// Returns a [`TypeError`] if there is no input, a label is a character of the syntax of the subscripts (i.e.,
+    /// `,`, `-`, `>`, or `.`) or whitespace, a subscript contains more than one ellipsis, the output repeats a label,
+    /// or the output contains a label that no input contains.
     ///
     /// # Example
     ///
@@ -166,7 +171,7 @@ impl EinsumSpecification {
         for subscript in inputs.iter().chain(&output) {
             for label in subscript {
                 if let EinsumLabel::Named(label) = label
-                    && !label.is_alphabetic()
+                    && (matches!(label, ',' | '-' | '>' | '.') || label.is_whitespace())
                 {
                     return Err(TypeError::invalid(format!(
                         "`{EINSUM_NAME}` subscripts contain the invalid label `{label}`",
@@ -273,7 +278,7 @@ impl EinsumSpecification {
         let output_set = output_names.iter().copied().collect::<LabelSet>();
         let input_count = input_names.len();
         let pairwise = |path: Vec<(usize, usize)>| path.into_iter().map(EinsumPathStep::from).collect::<Vec<_>>();
-        let path = match options.path() {
+        let path = match options.path_strategy() {
             EinsumPathStrategy::Explicit(path) => {
                 let mut remaining = input_count;
                 for step in path {
@@ -311,7 +316,7 @@ impl EinsumSpecification {
                 return Err(TypeError::invalid(format!(
                     "`{}` path strategy `{:?}` requires a positive count",
                     EINSUM_NAME,
-                    options.path(),
+                    options.path_strategy(),
                 ))
                 .into());
             }
@@ -653,7 +658,7 @@ impl EinsumPathStrategy {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EinsumOptions {
     /// Strategy that selects the order of the pairwise contractions.
-    path: EinsumPathStrategy,
+    path_strategy: EinsumPathStrategy,
 
     /// Optional element type at which the einsum accumulates and which its output has.
     accumulation_type: Option<DataType>,
@@ -665,8 +670,6 @@ pub struct EinsumOptions {
     output_sharding: Option<Sharding>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl EinsumOptions {
     /// Creates new [`EinsumOptions`] with the [`EinsumPathStrategy::Auto`] strategy, no accumulation type, the default
     /// precision, and no requested output sharding.
@@ -677,17 +680,15 @@ impl EinsumOptions {
 
     /// Returns these options with the provided [`EinsumPathStrategy`].
     #[inline]
-    pub fn with_path(mut self, path: EinsumPathStrategy) -> Self {
-        self.path = path;
+    pub fn with_path_strategy(mut self, path_strategy: EinsumPathStrategy) -> Self {
+        self.path_strategy = path_strategy;
         self
     }
 
     /// Returns these options with the provided accumulation type, which is the element type of the output. Without
     /// one, inputs of one element type are never converted, and inputs of different element types accumulate at the
-    /// type that they promote to. Every
-    /// pairwise contraction accumulates at it (refer to [`DotOperation::with_accumulation_type`]), and the output is
-    /// converted to it last. Where a contraction or a sum cannot do that itself, element types are converted like
-    /// JAX converts them:
+    /// type that they promote to. Every pairwise contraction accumulates at it, and the output is converted to it last.
+    /// Where a contraction or a sum cannot do that itself, element types are converted like JAX converts them:
     ///
     ///   - A sum converts its input first, unless the element type of the input is the type that the two promote to
     ///     (e.g., `bf16` inputs are summed at an `f16` accumulation type and `f32` inputs are summed at `f32`). The
@@ -697,45 +698,46 @@ impl EinsumOptions {
     ///     type that is at least as wide (e.g., `u8` at `i32`, `i32` at `f32`, and Boolean inputs at `i32`, which
     ///     counts), and narrower types are rejected (e.g., `i32` at `i8`).
     ///   - Floating-point inputs are converted first for a complex accumulation type. For an integer or Boolean one
-    ///     they are contracted at the type that the precision computes with (i.e., their own type, or the
-    ///     accumulation type of an algorithm), and the result is converted (e.g., a product of `8.5` becomes `8` at
-    ///     `i32`).
-    ///   - Complex inputs are converted first for a wider complex accumulation type. For a real or integer one that
-    ///     is at least as wide as their components they are contracted at their own type, and the result is
-    ///     converted, which discards its imaginary component.
+    ///     they are contracted at the type that the precision computes with (i.e., their own type, or the accumulation
+    ///     type of an algorithm), and the result is converted (e.g., a product of `8.5` becomes `8` at `i32`).
+    ///   - Complex inputs are converted first for a wider complex accumulation type. For a real or integer one that is
+    ///     at least as wide as their components they are contracted at their own type, and the result is converted,
+    ///     which discards its imaginary component.
     ///   - A result at the accumulation type that meets an input of another type converts that input first.
     ///
-    /// An algorithm or a preset of the [`DotPrecision`] replaces the last four rules. It converts the inputs of a
-    /// contraction to the types that it computes with and accumulates at its own type, so the inputs are not
+    /// An algorithm or a preset of the [`DotPrecision`] replaces the last four rules. It converts the inputs of
+    /// a contraction to the types that it computes with and accumulates at its own type, so the inputs are not
     /// converted first and every accumulation type is supported (e.g., `i16` inputs are contracted at `f32` by the
-    /// `F32_F32_F32` preset and the result is converted to an `f16` accumulation type). Two inputs of different
-    /// element types are converted to the types that the algorithm computes with, after the algorithm is validated
-    /// for the types that they have, so complex inputs are rejected like they are by a `dot`. Real and Boolean
-    /// inputs support a complex accumulation type, which only the output is converted to.
-    ///
-    /// This is the `preferred_element_type` argument of `jax.numpy.einsum`.
+    /// `F32_F32_F32` preset and the result is converted to an `f16` accumulation type). Two inputs of different element
+    /// types are converted to the types that the algorithm computes with, after the algorithm is validated for the
+    /// types that they have, so complex inputs are rejected like they are by a `dot`. Real and Boolean inputs support
+    /// a complex accumulation type, which only the output is converted to.
     #[inline]
     pub fn with_accumulation_type<D: Into<Option<DataType>>>(mut self, accumulation_type: D) -> Self {
         self.accumulation_type = accumulation_type.into();
         self
     }
 
-    /// Returns these options with the provided [`DotPrecision`], which every pairwise contraction uses (refer to
-    /// [`DotOperation::with_precision`]). This is the `precision` argument of `jax.numpy.einsum`.
+    /// Returns these options with the provided [`DotPrecision`], which every pairwise contraction uses.
+    /// This is the `precision` argument of `jax.numpy.einsum`.
     #[inline]
     pub fn with_precision<P: Into<DotPrecision>>(mut self, precision: P) -> Self {
         self.precision = precision.into();
         self
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
     /// Returns these options with a requested output [`Sharding`], which the last operation of the last step
     /// receives, reordered to the order of its axes when a transpose follows it. That operation is the pairwise
     /// contraction of an [`EinsumPathStep::Contraction`] (refer to [`DotOperation::with_output_sharding`]) and the
     /// last sum of an [`EinsumPathStep::Reduction`] (refer to [`ReduceOperation::with_output_sharding`]), such as
-    /// the sum of an einsum of one input. A last step that ends with neither (e.g., the einsum `ij->ji`) rejects the
-    /// request, where JAX ignores it. The sharding must cover every axis of the output, and the results of the earlier
-    /// steps infer their shardings from their inputs. This is the `out_sharding` argument of `jax.numpy.einsum`,
-    /// which additionally accepts a sharding of fewer axes and stages its earlier steps with automatic sharding.
+    /// the sum of an einsum of one input. After a last step that ends with neither (e.g., the einsums `ij->ji`,
+    /// `ij->ij`, and `ii->i`), the output is resharded to the request with a [`Reshard`], where JAX accepts the
+    /// request and ignores it for the first two. The sharding must cover every axis of the output, like every
+    /// [`Sharding`] of a type, and the results of the earlier steps infer their shardings from their inputs. This
+    /// is the `out_sharding` argument of `jax.numpy.einsum`, which additionally accepts a sharding of fewer axes
+    /// and stages its earlier steps with automatic sharding.
     #[inline]
     pub fn with_output_sharding<S: Into<Option<Sharding>>>(mut self, output_sharding: S) -> Self {
         self.output_sharding = output_sharding.into();
@@ -744,8 +746,8 @@ impl EinsumOptions {
 
     /// Returns the [`EinsumPathStrategy`] of these options.
     #[inline]
-    pub fn path(&self) -> &EinsumPathStrategy {
-        &self.path
+    pub fn path_strategy(&self) -> &EinsumPathStrategy {
+        &self.path_strategy
     }
 
     /// Returns the optional accumulation type of these options.
@@ -874,6 +876,7 @@ impl EinsumPlan {
             + IotaLike
             + Reduce
             + Reshape
+            + Reshard
             + Select
             + Transpose
             + ZeroLike,
@@ -916,6 +919,7 @@ impl EinsumPlan {
             + IotaLike
             + Reduce
             + Reshape
+            + Reshard
             + Select
             + Transpose
             + ZeroLike,
@@ -989,6 +993,7 @@ impl EinsumPlan {
         for (index, step) in self.steps.iter().enumerate() {
             let is_last = index + 1 == self.steps.len();
             let output_sharding = if is_last { self.options.output_sharding.as_ref() } else { None };
+            let mut reshard_sharding = None;
             let (value, names) = match step.positions.as_slice() {
                 [position] => {
                     // Labels that appear once and are not in the output are summed with a single reduction, and
@@ -1004,20 +1009,20 @@ impl EinsumPlan {
                         .collect::<Vec<_>>();
 
                     // A requested output sharding goes to the sum that ends the step, which is the sum of the last
-                    // repeated label or, without repeated labels, the sum of the labels that appear once.
+                    // repeated label or, without repeated labels, the sum of the labels that appear once. A step
+                    // that ends with no sum (i.e., one that only keeps diagonals or reorders axes) has no operation
+                    // that takes the request, so its result is resharded to it instead.
                     let last_repeated = counts.iter().filter(|(_, count)| *count > 1).map(|(name, _)| name).next_back();
                     let ends_with_sum = match last_repeated {
                         Some(name) => !step.result_names.contains(name),
                         None => !uniques.is_empty(),
                     };
-                    if output_sharding.is_some() && !ends_with_sum {
-                        return Err(TypeError::invalid(format!(
-                            "`{EINSUM_NAME}` output sharding requires the last step to end with a contraction or a \
-                             sum",
-                        ))
-                        .into());
+                    if !ends_with_sum {
+                        reshard_sharding = output_sharding;
                     }
-                    let output = output_sharding.map(|output_sharding| (output_sharding, step.result_names.as_slice()));
+                    let output = output_sharding
+                        .filter(|_| ends_with_sum)
+                        .map(|output_sharding| (output_sharding, step.result_names.as_slice()));
                     let uniques_output = output.filter(|_| last_repeated.is_none());
                     let (value, names) = state.sum_uniques(value, names, uniques, uniques_output)?;
                     state.sum_repeats(value, names, &counts, &step.result_names, output)?
@@ -1124,6 +1129,10 @@ impl EinsumPlan {
                     .collect::<Vec<_>>();
                 state.steps.transpose(&value, permutation)?
             };
+            let value = match reshard_sharding {
+                Some(sharding) => state.steps.reshard(&value, sharding)?,
+                None => value,
+            };
             values.push(value);
         }
 
@@ -1213,6 +1222,7 @@ where
         + IotaLike
         + Reduce
         + Reshape
+        + Reshard
         + Select
         + Transpose
         + ZeroLike,
@@ -1347,6 +1357,7 @@ where
             + IotaLike
             + Reduce
             + Reshape
+            + Reshard
             + Select
             + Transpose
             + ZeroLike,
@@ -1391,8 +1402,17 @@ where
 pub fn einsum<D>(subscripts: &str) -> Result<EinsumComposite<D>, ProgramError>
 where
     D: Domain<Type = ArrayType, Constant: 'static, Operation: 'static>,
-    DomainTracer<D>:
-        Compare + ConvertElementType + Diagonal + Dot + IotaLike + Reduce + Reshape + Select + Transpose + ZeroLike,
+    DomainTracer<D>: Compare
+        + ConvertElementType
+        + Diagonal
+        + Dot
+        + IotaLike
+        + Reduce
+        + Reshape
+        + Reshard
+        + Select
+        + Transpose
+        + ZeroLike,
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     einsum_with_options(subscripts.parse()?, EinsumOptions::default())
@@ -1416,8 +1436,17 @@ pub fn einsum_with_options<D>(
 ) -> Result<EinsumComposite<D>, ProgramError>
 where
     D: Domain<Type = ArrayType, Constant: 'static, Operation: 'static>,
-    DomainTracer<D>:
-        Compare + ConvertElementType + Diagonal + Dot + IotaLike + Reduce + Reshape + Select + Transpose + ZeroLike,
+    DomainTracer<D>: Compare
+        + ConvertElementType
+        + Diagonal
+        + Dot
+        + IotaLike
+        + Reduce
+        + Reshape
+        + Reshard
+        + Select
+        + Transpose
+        + ZeroLike,
     DomainTracingContext<D>: StagingContext<Type = ArrayType, Constant = D::Constant, Operation = D::Operation>,
 {
     let key = einsum_composite_key(&specification, &options);
@@ -1561,6 +1590,9 @@ trait EinsumSteps<V> {
 
     /// Converts `value` to the provided element type.
     fn convert_element_type(&mut self, value: &V, data_type: DataType) -> Result<V, ProgramError>;
+
+    /// Reshards `value` to the provided sharding.
+    fn reshard(&mut self, value: &V, sharding: &Sharding) -> Result<V, ProgramError>;
 }
 
 /// [`EinsumSteps`] that compute or stage every step on values through their capabilities, with `Contraction` as the
@@ -1579,6 +1611,7 @@ where
         + IotaLike
         + Reduce
         + Reshape
+        + Reshard
         + Select
         + Transpose
         + ZeroLike,
@@ -1624,6 +1657,11 @@ where
     #[inline]
     fn convert_element_type(&mut self, value: &V, data_type: DataType) -> Result<V, ProgramError> {
         value.convert_element_type(data_type)
+    }
+
+    #[inline]
+    fn reshard(&mut self, value: &V, sharding: &Sharding) -> Result<V, ProgramError> {
+        value.reshard(sharding)
     }
 }
 
@@ -1737,6 +1775,12 @@ impl EinsumSteps<ArrayType> for TypeSteps {
     fn convert_element_type(&mut self, value: &ArrayType, data_type: DataType) -> Result<ArrayType, ProgramError> {
         self.instruction_count += 1;
         let operation = ConvertElementTypeOperation::<ArrayType>::new(data_type, false);
+        Ok(operation.infer_output_types(std::slice::from_ref(value), &[])?.remove(0))
+    }
+
+    fn reshard(&mut self, value: &ArrayType, sharding: &Sharding) -> Result<ArrayType, ProgramError> {
+        self.instruction_count += 1;
+        let operation = ReshardOperation::new(sharding.clone());
         Ok(operation.infer_output_types(std::slice::from_ref(value), &[])?.remove(0))
     }
 }
@@ -3205,7 +3249,7 @@ fn einsum_composite_key(specification: &EinsumSpecification, options: &EinsumOpt
                 .collect(),
         )
     };
-    let path = match &options.path {
+    let path = match &options.path_strategy {
         EinsumPathStrategy::Auto => vec![integer(0)],
         EinsumPathStrategy::Optimal => vec![integer(1)],
         EinsumPathStrategy::Greedy => vec![integer(2)],
@@ -3300,7 +3344,11 @@ mod tests {
         let input_types =
             shapes.iter().map(|shape| ArrayType::new_static(DataType::F32, shape.to_vec())).collect::<Vec<_>>();
         let specification = subscripts.parse::<EinsumSpecification>().unwrap();
-        specification.plan(&input_types, &EinsumOptions::new().with_path(strategy)).unwrap().path().to_vec()
+        specification
+            .plan(&input_types, &EinsumOptions::new().with_path_strategy(strategy))
+            .unwrap()
+            .path()
+            .to_vec()
     }
 
     #[test]
@@ -3359,10 +3407,19 @@ mod tests {
             EinsumSpecification::from_labels(Vec::new(), None),
             Err(TypeError::invalid("`einsum` subscripts must have at least one input")),
         );
-        assert_eq!(
-            EinsumSpecification::from_labels(vec![labels("i1")], None),
-            Err(TypeError::invalid("`einsum` subscripts contain the invalid label `1`")),
-        );
+        for label in [',', '-', '>', '.', ' ', '\t'] {
+            assert_eq!(
+                EinsumSpecification::from_labels(vec![vec!['i'.into(), label.into()]], None),
+                Err(TypeError::invalid(format!("`einsum` subscripts contain the invalid label `{label}`"))),
+            );
+        }
+
+        // Every other character is a label, like in JAX, and labels are ordered by their code points.
+        let specification = EinsumSpecification::from_labels(vec![labels("i1"), labels("_😀")], None).unwrap();
+        assert_eq!(specification.to_string(), "i1,_😀");
+        let input_types = [ArrayType::new_static(DataType::F32, [2, 3]), ArrayType::new_static(DataType::F32, [4, 5])];
+        let plan = specification.plan(&input_types, &EinsumOptions::new()).unwrap();
+        assert_eq!(plan.output_labels(), ['1', '_', 'i', '😀']);
         assert_eq!(
             EinsumSpecification::from_labels(vec![vec![EinsumLabel::Ellipsis, EinsumLabel::Ellipsis]], None),
             Err(TypeError::invalid("`einsum` subscripts contain more than one ellipsis in one subscript")),
@@ -3555,7 +3612,11 @@ mod tests {
                 Err(TypeError::invalid("`einsum` subscripts must contain at most one `->`, after all of the inputs")),
             );
         }
-        assert_eq!(parse("i2,2j"), Err(TypeError::invalid("`einsum` subscripts contain the invalid label `2`")));
+
+        // Digits, punctuation, and symbols are labels, like in JAX.
+        for subscripts in ["i2,2j", "0,0->", "_,_->", "😀,😀->", "%(,(*->%*", "...0,0->..."] {
+            assert_eq!(parse(subscripts).unwrap().to_string(), subscripts);
+        }
         assert_eq!(parse("ij->jj"), Err(TypeError::invalid("`einsum` output label `j` appears more than once")));
         assert_eq!(parse("ij->k"), Err(TypeError::invalid("`einsum` output label `k` does not appear in any input")),);
     }
@@ -3564,7 +3625,7 @@ mod tests {
     fn test_einsum_path_strategy() {
         // The default strategy is the automatic one.
         assert_eq!(EinsumPathStrategy::default(), EinsumPathStrategy::Auto);
-        assert_eq!(EinsumOptions::new().path(), &EinsumPathStrategy::Auto);
+        assert_eq!(EinsumOptions::new().path_strategy(), &EinsumPathStrategy::Auto);
 
         // The unoptimized strategy contracts from left to right, and an explicit path is used as it is.
         let shapes: &[&[usize]] = &[&[2, 3], &[3, 4], &[4, 5], &[5, 2]];
@@ -3583,10 +3644,10 @@ mod tests {
         // An explicit path must contract every input once with valid positions.
         let plan = |path: Vec<(usize, usize)>| {
             let types = shapes.iter().map(|shape| ArrayType::new_static(DataType::F32, shape.to_vec()));
-            "ij,jk,kl,lm->im"
-                .parse::<EinsumSpecification>()
-                .unwrap()
-                .plan(&types.collect::<Vec<_>>(), &EinsumOptions::new().with_path(EinsumPathStrategy::explicit(path)))
+            "ij,jk,kl,lm->im".parse::<EinsumSpecification>().unwrap().plan(
+                &types.collect::<Vec<_>>(),
+                &EinsumOptions::new().with_path_strategy(EinsumPathStrategy::explicit(path)),
+            )
         };
         assert_eq!(
             plan(vec![(0, 1), (0, 1)]).map(|_| ()),
@@ -3613,7 +3674,10 @@ mod tests {
         assert_eq!(planned_path("ij,jk", shapes, EinsumPathStrategy::explicit([(1, 0)])), steps(&[(1, 0)]));
         let types = shapes.iter().map(|shape| ArrayType::new_static(DataType::F32, shape.to_vec())).collect::<Vec<_>>();
         let plan = |path: EinsumPathStrategy| {
-            "ij,jk".parse::<EinsumSpecification>().unwrap().plan(&types, &EinsumOptions::new().with_path(path))
+            "ij,jk"
+                .parse::<EinsumSpecification>()
+                .unwrap()
+                .plan(&types, &EinsumOptions::new().with_path_strategy(path))
         };
         assert_eq!(
             plan(EinsumPathStrategy::Explicit(Vec::new())).map(|_| ()),
@@ -5861,7 +5925,7 @@ mod tests {
             EinsumPathStrategy::Branch(None),
             EinsumPathStrategy::Branch(Some(2)),
         ] {
-            let options = EinsumOptions::new().with_path(strategy.clone());
+            let options = EinsumOptions::new().with_path_strategy(strategy.clone());
             assert_eq!(
                 Array::einsum_with_options(&specification, inputs.iter(), &options),
                 Ok(expected.clone()),
@@ -5873,7 +5937,7 @@ mod tests {
         // and it searches every group of connected inputs on its own, so their total number is not limited.
         let empty = [reference_input(0, &[0]), reference_input(1, &[2]), reference_input(2, &[2])];
         for strategy in [EinsumPathStrategy::DynamicProgramming, EinsumPathStrategy::AutoHighQuality] {
-            let options = EinsumOptions::new().with_path(strategy.clone());
+            let options = EinsumOptions::new().with_path_strategy(strategy.clone());
             assert_eq!(
                 Array::einsum_with_options(&"a,b,b->".parse().unwrap(), empty.iter(), &options),
                 Ok(Array::scalar(0.0f64).unwrap()),
@@ -5882,7 +5946,7 @@ mod tests {
         }
         let scalars = vec![Array::scalar(1.0f64).unwrap(); 3];
         let inputs = empty.iter().chain(&scalars).collect::<Vec<_>>();
-        let options = EinsumOptions::new().with_path(EinsumPathStrategy::AutoHighQuality);
+        let options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::AutoHighQuality);
         assert_eq!(
             Array::einsum_with_options(&"a,b,b,,,->".parse().unwrap(), inputs, &options),
             Ok(Array::scalar(0.0f64).unwrap()),
@@ -5917,7 +5981,7 @@ mod tests {
         let types = vec![ArrayType::new_static(DataType::F64, [2, 2]); 3];
         let plan = |strategy: EinsumPathStrategy| {
             let specification = "ab,bc,cd".parse::<EinsumSpecification>().unwrap();
-            specification.plan(&types, &EinsumOptions::new().with_path(strategy)).map(|_| ())
+            specification.plan(&types, &EinsumOptions::new().with_path_strategy(strategy)).map(|_| ())
         };
         assert_eq!(
             plan(EinsumPathStrategy::Branch(Some(0))),
@@ -6104,17 +6168,17 @@ mod tests {
         let sharding = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
         let options = EinsumOptions::new();
         assert_eq!(options, EinsumOptions::default());
-        assert_eq!(options.path(), &EinsumPathStrategy::Auto);
+        assert_eq!(options.path_strategy(), &EinsumPathStrategy::Auto);
         assert_eq!(options.accumulation_type(), None);
         assert_eq!(options.precision(), DotPrecision::default());
         assert_eq!(options.output_sharding(), None);
 
         let options = EinsumOptions::new()
-            .with_path(EinsumPathStrategy::Greedy)
+            .with_path_strategy(EinsumPathStrategy::Greedy)
             .with_accumulation_type(DataType::F32)
             .with_precision(DotAlgorithmPreset::BF16_BF16_F32)
             .with_output_sharding(sharding.clone());
-        assert_eq!(options.path(), &EinsumPathStrategy::Greedy);
+        assert_eq!(options.path_strategy(), &EinsumPathStrategy::Greedy);
         assert_eq!(options.accumulation_type(), Some(DataType::F32));
         assert_eq!(options.precision(), DotPrecision::Preset(DotAlgorithmPreset::BF16_BF16_F32));
         assert_eq!(options.output_sharding(), Some(&sharding));
@@ -6523,21 +6587,39 @@ mod tests {
         let plan = "ijk,jl,l->ik".parse::<EinsumSpecification>().unwrap().plan(&input_types, &options).unwrap();
         assert_eq!(plan.output_type(), Ok(output_type));
 
-        // A last step that ends with neither a contraction nor a sum has nothing to place.
-        let plan = "ij->ji"
-            .parse::<EinsumSpecification>()
-            .unwrap()
-            .plan(
-                &[ArrayType::new_static(DataType::F64, [2, 4])],
-                &EinsumOptions::new().with_output_sharding(sharding(vec![ShardingDimension::Replicated; 2])),
+        // A last step that ends with neither a contraction nor a sum has no operation that takes the request, so
+        // its result is resharded to it. That covers a transpose, an einsum that returns its input, and a diagonal
+        // that is kept, for which JAX accepts the request as well.
+        let replicated = sharding(vec![ShardingDimension::Replicated; 2]);
+        let input_type = ArrayType::new_static(DataType::F64, [4, 4]).with_sharding(replicated).unwrap();
+        let matrix_sharding = sharding(vec![ShardingDimension::sharded(["y"]), ShardingDimension::sharded(["x"])]);
+        let vector_sharding = sharding(vec![ShardingDimension::sharded(["x"])]);
+        let square = reference_input(0, &[4, 4]);
+        let cases = [("ij->ji", &matrix_sharding), ("ij->ij", &matrix_sharding), ("ii->i", &vector_sharding)];
+        let mut programs = Vec::new();
+        for (subscripts, output_sharding) in cases {
+            let options = EinsumOptions::new().with_output_sharding(output_sharding.clone());
+            let specification = subscripts.parse::<EinsumSpecification>().unwrap();
+            let plan = specification.plan(std::slice::from_ref(&input_type), &options).unwrap();
+            let (output_type, program) = ArrayContext::trace(
+                |inputs: Vec<DomainTracer<ArrayContext>>| plan.contract(&inputs),
+                vec![input_type.clone()],
             )
             .unwrap();
-        assert_eq!(
-            plan.output_type(),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`einsum` output sharding requires the last step to end with a contraction or a sum",
-            ))),
-        );
+            assert_eq!(output_type.sharding(), Some(output_sharding), "{subscripts}");
+            assert_eq!(plan.output_type(), Ok(output_type), "{subscripts}");
+            let output = Array::einsum_with_options(&specification, [&square], &options).unwrap();
+            assert_eq!(output.r#type().sharding(), Some(output_sharding), "{subscripts}");
+            assert_eq!(
+                output.elements::<f64>().unwrap(),
+                Array::einsum(subscripts, [&square]).unwrap().elements::<f64>().unwrap(),
+                "{subscripts}",
+            );
+            programs.push(program.to_flat_program().to_string());
+        }
+        assert_eq!(programs[0], "TODO");
+        assert_eq!(programs[1], "TODO");
+        assert_eq!(programs[2], "TODO");
     }
 
     #[test]
@@ -6807,7 +6889,7 @@ mod tests {
             EinsumPathStrategy::Unoptimized,
             EinsumPathStrategy::explicit([(0, 2), (0, 1)]),
         ] {
-            let options = EinsumOptions::new().with_path(path.clone());
+            let options = EinsumOptions::new().with_path_strategy(path.clone());
             assert_eq!(
                 Array::einsum_with_options(&specification, inputs.iter(), &options),
                 Ok(expected.clone()),
@@ -7149,12 +7231,12 @@ mod tests {
 
         let chain = "i,i,i->".parse::<EinsumSpecification>().unwrap();
         let path = EinsumPathStrategy::explicit([(0, 1), (0, 1)]);
-        let options = preset.clone().with_path(path.clone()).with_accumulation_type(DataType::F16);
+        let options = preset.clone().with_path_strategy(path.clone()).with_accumulation_type(DataType::F16);
         assert_eq!(
             Array::einsum_with_options(&chain, [&ones, &ones, &narrow], &options),
             Ok(Array::scalar(f16::from_f32(1.0)).unwrap()),
         );
-        let options = EinsumOptions::new().with_path(path).with_accumulation_type(DataType::F16);
+        let options = EinsumOptions::new().with_path_strategy(path).with_accumulation_type(DataType::F16);
         assert_eq!(
             Array::einsum_with_options(&chain, [&ones, &ones, &narrow], &options),
             Ok(Array::scalar(f16::from_f32(0.0)).unwrap()),
@@ -7260,17 +7342,17 @@ mod tests {
             .with_precision(DotAlgorithmPreset::F32_F32_F32)
             .with_accumulation_type(DataType::C64);
         let complex_scalar = |real: f32| Ok(Array::scalar(Complex::new(real, 0.0)).unwrap());
-        let chain = options.clone().with_path(EinsumPathStrategy::explicit([(0, 1), (0, 1)]));
+        let chain = options.clone().with_path_strategy(EinsumPathStrategy::explicit([(0, 1), (0, 1)]));
         assert_eq!(
             Array::einsum_with_options(&"i,i,i->".parse().unwrap(), [&vector, &vector, &vector], &chain),
             complex_scalar(2.952_520_8),
         );
-        let pairs = options.clone().with_path(EinsumPathStrategy::explicit([(0, 1), (0, 1), (0, 1)]));
+        let pairs = options.clone().with_path_strategy(EinsumPathStrategy::explicit([(0, 1), (0, 1), (0, 1)]));
         assert_eq!(
             Array::einsum_with_options(&"i,i,i,i->".parse().unwrap(), [&vector; 4], &pairs),
             complex_scalar(4.060791015625),
         );
-        let summed = options.with_path(EinsumPathStrategy::explicit([(1, 2), (0, 1)]));
+        let summed = options.with_path_strategy(EinsumPathStrategy::explicit([(1, 2), (0, 1)]));
         assert_eq!(
             Array::einsum_with_options(&"ij,j,j->".parse().unwrap(), [&matrix, &vector, &vector], &summed),
             complex_scalar(7.701_666_4),
@@ -7283,7 +7365,7 @@ mod tests {
         // of one position that JAX accepts. The reduction sums the labels that nothing else needs.
         let specification = "ij,k->k".parse::<EinsumSpecification>().unwrap();
         let inputs = [reference_input(0, &[2, 3]), reference_input(1, &[4])];
-        let options = EinsumOptions::new().with_path(EinsumPathStrategy::Explicit(vec![
+        let options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Explicit(vec![
             EinsumPathStep::Reduction(0),
             EinsumPathStep::Contraction(0, 1),
         ]));
@@ -7319,7 +7401,7 @@ mod tests {
             vec![EinsumPathStep::Reduction(1), EinsumPathStep::Reduction(0), EinsumPathStep::Contraction(1, 0)],
             vec![EinsumPathStep::Contraction(0, 1), EinsumPathStep::Reduction(0)],
         ] {
-            let options = EinsumOptions::new().with_path(EinsumPathStrategy::Explicit(path.clone()));
+            let options = EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Explicit(path.clone()));
             assert_eq!(
                 Array::einsum_with_options(&specification, inputs.iter(), &options),
                 Array::einsum("iij,jk->k", inputs.iter()),
@@ -7896,7 +7978,9 @@ mod tests {
         assert_eq!(function.specification().to_string(), "ij,jk,kl->il");
         assert_eq!(function.options(), &EinsumOptions::new());
 
-        let options = EinsumOptions::new().with_path(EinsumPathStrategy::Greedy).with_accumulation_type(DataType::F32);
+        let options = EinsumOptions::new()
+            .with_path_strategy(EinsumPathStrategy::Greedy)
+            .with_accumulation_type(DataType::F32);
         let function = einsum_with_options::<ArrayContext>("ij,jk".parse().unwrap(), options.clone()).unwrap();
         assert_eq!(function.specification().to_string(), "ij,jk");
         assert_eq!(function.options(), &options);
@@ -8275,7 +8359,7 @@ mod tests {
             key(
                 "...i,i",
                 EinsumOptions::new()
-                    .with_path(EinsumPathStrategy::explicit([(0, 1)]))
+                    .with_path_strategy(EinsumPathStrategy::explicit([(0, 1)]))
                     .with_accumulation_type(DataType::F32)
                     .with_precision(DotAlgorithmPreset::BF16_BF16_F32),
             )
@@ -8308,22 +8392,22 @@ mod tests {
             key("ij,jk->ik", EinsumOptions::new()),
             key("ij,jk", EinsumOptions::new()),
             key("ij,jk->ki", EinsumOptions::new()),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Optimal)),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Greedy)),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Unoptimized)),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::explicit([(0, 1)]))),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Optimal)),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Greedy)),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Unoptimized)),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::explicit([(0, 1)]))),
             key("ij,jk->ik", EinsumOptions::new().with_accumulation_type(DataType::F64)),
             key("ij,jk->ik", EinsumOptions::new().with_precision(DotAlgorithmPreset::F32_F32_F32)),
             key("ij,jk->ik", EinsumOptions::new().with_output_sharding(sharding(ShardingDimension::sharded(["x"])))),
             key("ij,jk->ik", EinsumOptions::new().with_output_sharding(sharding(ShardingDimension::Replicated))),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::explicit([(1, 0)]))),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::explicit([1, 0]))),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::AutoHighQuality)),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::DynamicProgramming)),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Branch(None))),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::Branch(Some(2)))),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::RandomGreedy(32))),
-            key("ij,jk->ik", EinsumOptions::new().with_path(EinsumPathStrategy::RandomGreedy(128))),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::explicit([(1, 0)]))),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::explicit([1, 0]))),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::AutoHighQuality)),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::DynamicProgramming)),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Branch(None))),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::Branch(Some(2)))),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::RandomGreedy(32))),
+            key("ij,jk->ik", EinsumOptions::new().with_path_strategy(EinsumPathStrategy::RandomGreedy(128))),
         ];
         for (index, first) in keys.iter().enumerate() {
             for second in &keys[index + 1..] {
